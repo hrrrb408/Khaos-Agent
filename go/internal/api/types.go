@@ -1,0 +1,51 @@
+package api
+
+import "context"
+
+// ChatRequest is the REST request body for POST /api/chat.
+type ChatRequest struct {
+	SessionID string `json:"session_id"`
+	Mode      string `json:"mode"`
+	Message   string `json:"message"`
+}
+
+// ChatEvent is the gateway-neutral event shape streamed as SSE.
+type ChatEvent struct {
+	Event string         `json:"event"`
+	Data  map[string]any `json:"data"`
+}
+
+// AgentClient is implemented by the Python gRPC client and by tests.
+type AgentClient interface {
+	Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
+	ConfirmPermission(ctx context.Context, sessionID string, toolCallID string, approved bool, remember bool) error
+	SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error)
+}
+
+// Memory represents one memory record.
+type Memory struct {
+	ID         int64  `json:"id"`
+	Scope      string `json:"scope"`
+	Key        string `json:"key"`
+	Value      string `json:"value"`
+	TTL        int    `json:"ttl"`
+	Confidence int    `json:"confidence"`
+	AccessFreq int    `json:"access_freq"`
+	CreatedAt  string `json:"created_at"`
+	UpdatedAt  string `json:"updated_at"`
+}
+
+// MemoryClient is implemented by the Python memory service and by tests.
+type MemoryClient interface {
+	Get(ctx context.Context, scope string, key string) (Memory, error)
+	Set(ctx context.Context, memory Memory) (Memory, error)
+	Delete(ctx context.Context, id int64) error
+	Search(ctx context.Context, scope string, query string, topK int) ([]Memory, error)
+}
+
+// ConfigStore abstracts runtime config persistence.
+type ConfigStore interface {
+	Get() map[string]any
+	Set(map[string]any)
+}
+

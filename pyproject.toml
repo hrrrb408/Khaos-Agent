@@ -1,0 +1,23 @@
+[project]
+name = "khaos"
+version = "0.1.0"
+description = "Khaos AI Agent platform"
+requires-python = ">=3.11"
+dependencies = [
+    "aiosqlite>=0.19",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+khaos = "khaos.cli.main:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+pythonpath = ["python"]
+testpaths = ["python/tests"]
+

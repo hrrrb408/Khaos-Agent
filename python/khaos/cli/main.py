@@ -1,0 +1,183 @@
+"""Command line interface for the P0-A Khaos loop."""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import sys
+import uuid
+from pathlib import Path
+
+from khaos.agent import AgentConfig, AgentLoop
+from khaos.agent.compressor import ContextCompressor
+from khaos.agent.error_handler import ErrorHandler
+from khaos.cli.sse import encode_sse
+from khaos.db import Database
+from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
+from khaos.modes import ModeManager
+from khaos.permissions import PermissionEngine
+from khaos.routing.router import create_default_router
+from khaos.tools import create_runtime_registry
+from khaos.tools.scheduler import ToolScheduler
+
+
+async def run_once(args: argparse.Namespace) -> int:
+    """Run one user message and print SSE frames to stdout."""
+    db = Database(args.db)
+    await db.connect()
+    await db.run_migrations()
+
+    mode_manager = ModeManager(db, project_root=Path.cwd())
+    await mode_manager.load()
+    if args.mode:
+        await mode_manager.switch(ModeManager.parse(args.mode))
+
+    session_id = args.session_id or str(uuid.uuid4())
+    await db.create_session(session_id, mode_manager.current_mode.value)
+
+    router = create_default_router()
+    permission_engine = PermissionEngine(db)
+    await permission_engine.load_rules()
+    memory_store = MemoryStore(db)
+    memory_manager = MemoryManager(
+        memory_store,
+        budget=MemoryBudget(),
+        mode_getter=lambda: mode_manager.current_mode,
+        intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
+    )
+    scheduler = ToolScheduler(create_runtime_registry(), permission_engine)
+    compressor = ContextCompressor(router, memory_manager=memory_manager)
+    error_handler = ErrorHandler(db=db, router=router, compressor=compressor)
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        router,
+        db,
+        tool_scheduler=scheduler,
+        confirm_callback=_confirm_from_args(args),
+        context_compressor=compressor,
+        memory_manager=memory_manager,
+        error_handler=error_handler,
+    )
+
+    print(f"session_id: {session_id}", flush=True)
+    async for message in loop.run(args.message, session_id):
+        print(encode_sse(message), end="", flush=True)
+
+    await db.close()
+    return 0
+
+
+async def run_repl(args: argparse.Namespace) -> int:
+    """Run a tiny interactive shell for manual P0-A validation."""
+    db = Database(args.db)
+    await db.connect()
+    await db.run_migrations()
+
+    mode_manager = ModeManager(db, project_root=Path.cwd())
+    await mode_manager.load()
+    session_id = args.session_id or str(uuid.uuid4())
+    await db.create_session(session_id, mode_manager.current_mode.value)
+    router = create_default_router()
+    permission_engine = PermissionEngine(db)
+    await permission_engine.load_rules()
+    memory_store = MemoryStore(db)
+    memory_manager = MemoryManager(
+        memory_store,
+        budget=MemoryBudget(),
+        mode_getter=lambda: mode_manager.current_mode,
+        intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
+    )
+    scheduler = ToolScheduler(create_runtime_registry(), permission_engine)
+    compressor = ContextCompressor(router, memory_manager=memory_manager)
+    error_handler = ErrorHandler(db=db, router=router, compressor=compressor)
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        router,
+        db,
+        tool_scheduler=scheduler,
+        confirm_callback=_interactive_confirm(args),
+        context_compressor=compressor,
+        memory_manager=memory_manager,
+        error_handler=error_handler,
+    )
+
+    print(f"session_id: {session_id}")
+    print(f"mode: {mode_manager.current_mode.value}")
+    try:
+        while True:
+            user_input = input("> ").strip()
+            if user_input in {"/quit", "/exit"}:
+                break
+            if user_input.startswith("/mode "):
+                target = ModeManager.parse(user_input.removeprefix("/mode "))
+                await mode_manager.switch(target)
+                await db.create_session(session_id, target.value)
+                print(f"mode: {target.value}")
+                continue
+            if not user_input:
+                continue
+            async for message in loop.run(user_input, session_id):
+                print(encode_sse(message), end="", flush=True)
+    finally:
+        await db.close()
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Create the CLI argument parser."""
+    parser = argparse.ArgumentParser(prog="khaos")
+    parser.add_argument("--db", default="khaos.db", help="SQLite database path")
+    parser.add_argument("--session-id", help="Existing or new session id")
+    parser.add_argument("--mode", choices=["office", "coding"], help="Initial mode")
+    parser.add_argument("--message", help="Run one message and exit")
+    parser.add_argument("--yes", action="store_true", help="Approve permission prompts")
+    parser.add_argument("--remember", action="store_true", help="Remember approved permissions")
+    return parser
+
+
+def _confirm_from_args(args: argparse.Namespace):
+    def confirm(request: dict) -> dict:
+        if args.yes:
+            return {"approved": True, "remember": bool(args.remember)}
+        if sys.stdin.isatty():
+            answer = input(
+                f"Allow {request['name']} on {request['target']}? [y/N] "
+            ).strip().lower()
+            return {"approved": answer in {"y", "yes"}, "remember": bool(args.remember)}
+        return {"approved": False}
+
+    return confirm
+
+
+def _interactive_confirm(args: argparse.Namespace):
+    def confirm(request: dict) -> dict:
+        if args.yes:
+            return {"approved": True, "remember": bool(args.remember)}
+        answer = input(
+            f"Allow {request['name']} on {request['target']}? [y/N] "
+        ).strip().lower()
+        remember = bool(args.remember)
+        if answer in {"yr", "yes remember"}:
+            remember = True
+        return {"approved": answer in {"y", "yes", "yr", "yes remember"}, "remember": remember}
+
+    return confirm
+
+
+def main() -> None:
+    """CLI process entrypoint."""
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.message:
+        raise SystemExit(asyncio.run(run_once(args)))
+    if not sys.stdin.isatty():
+        args.message = sys.stdin.read().strip()
+        if args.message:
+            raise SystemExit(asyncio.run(run_once(args)))
+    raise SystemExit(asyncio.run(run_repl(args)))
+
+
+if __name__ == "__main__":
+    main()

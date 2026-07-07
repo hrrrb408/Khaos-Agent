@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+khaos.db
+*.db
+
+# Node
+node_modules/
+web/.next/
+
+# Go
+go/gateway
+
+# Rust
+target/
+
+# IDE
+.idea/
+.vscode/
+*.swp

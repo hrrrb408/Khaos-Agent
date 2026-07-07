@@ -1,0 +1,291 @@
+"""Permission-aware tool scheduling."""
+
+from __future__ import annotations
+
+import asyncio
+import inspect
+import time
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable
+
+from khaos.permissions import ApprovalMode, PermissionRule
+from khaos.tools.registry import ToolRegistry
+
+
+ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
+
+
+@dataclass
+class ToolResult:
+    """Normalized result for one tool call."""
+
+    tool_call_id: str
+    name: str
+    success: bool
+    output: Any = ""
+    error: str = ""
+    duration_ms: int = 0
+
+
+@dataclass
+class PermissionRequest:
+    """Permission request emitted before an ask-every call can execute."""
+
+    tool_call_id: str
+    name: str
+    arguments: dict
+    level: str
+    target: str
+    reason: str
+
+
+@dataclass
+class SchedulerEvent:
+    """Streaming scheduler event."""
+
+    event: str
+    result: ToolResult | None = None
+    permission_request: PermissionRequest | None = None
+
+
+@dataclass
+class ToolBudget:
+    """Tool execution budget."""
+
+    max_calls: int = 50
+    max_output_chars: int = 100000
+    _call_count: int = 0
+    _output_chars: int = 0
+
+    @property
+    def is_exhausted(self) -> bool:
+        """Return true once call or output budget is exhausted."""
+        return self._call_count >= self.max_calls or self._output_chars >= self.max_output_chars
+
+    def record(self, output_chars: int) -> None:
+        """Record one completed tool call."""
+        self._call_count += 1
+        self._output_chars += output_chars
+
+
+class ToolScheduler:
+    """Split, authorize, and execute tool calls."""
+
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        permission_engine,
+        budget: ToolBudget | None = None,
+    ):
+        self.registry = registry
+        self.permission_engine = permission_engine
+        self.budget = budget or ToolBudget()
+
+    async def execute_batch(
+        self,
+        tool_calls: list[dict],
+        mode: str,
+        session_id: str | None = None,
+        confirm_callback: ConfirmCallback | None = None,
+    ) -> list[ToolResult]:
+        """Execute a batch and return final tool results."""
+        results: list[ToolResult] = []
+        async for event in self.stream_batch(tool_calls, mode, session_id, confirm_callback):
+            if event.result is not None:
+                results.append(event.result)
+        return results
+
+    async def stream_batch(
+        self,
+        tool_calls: list[dict],
+        mode: str,
+        session_id: str | None = None,
+        confirm_callback: ConfirmCallback | None = None,
+    ):
+        """Execute a batch while yielding permission and result events."""
+        if self.budget.is_exhausted:
+            return
+
+        approved_calls: list[dict] = []
+        for call in tool_calls:
+            normalized = self._normalize_call(call)
+            tool = self.registry.get(normalized["name"])
+            if not self.registry.validate_call(tool.name, normalized["arguments"]):
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=tool.name,
+                        success=False,
+                        error="Invalid tool arguments",
+                    ),
+                )
+                continue
+
+            decision = await self.permission_engine.check(
+                tool_name=tool.name,
+                params=normalized["arguments"],
+                permission_level=tool.permission_level,
+                mode=mode,
+            )
+            if decision.approved == ApprovalMode.DENY:
+                await self.permission_engine.audit(
+                    tool.name,
+                    decision.target,
+                    "denied",
+                    {"reason": decision.reason},
+                    session_id,
+                )
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=tool.name,
+                        success=False,
+                        error=f"Permission denied: {decision.reason}",
+                    ),
+                )
+                continue
+
+            if decision.requires_user_confirm:
+                request = PermissionRequest(
+                    tool_call_id=normalized["id"],
+                    name=tool.name,
+                    arguments=normalized["arguments"],
+                    level=tool.permission_level,
+                    target=decision.target,
+                    reason=decision.reason,
+                )
+                yield SchedulerEvent(event="permission_request", permission_request=request)
+                confirmation = await self._confirm(request, confirm_callback)
+                if not confirmation.get("approved", False):
+                    await self.permission_engine.audit(
+                        tool.name,
+                        decision.target,
+                        "denied",
+                        {"reason": "user denied"},
+                        session_id,
+                    )
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=normalized["id"],
+                            name=tool.name,
+                            success=False,
+                            error="User denied permission",
+                        ),
+                    )
+                    continue
+                if confirmation.get("remember"):
+                    await self.permission_engine.grant_rule(
+                        PermissionRule(
+                            id=None,
+                            pattern=confirmation.get("pattern", decision.target),
+                            permission_level=tool.permission_level,
+                            approval=ApprovalMode.AUTO_APPROVE,
+                            mode=mode,
+                        )
+                    )
+            approved_calls.append(normalized)
+
+        parallel_calls, serial_calls = self.registry.get_parallel_tools(approved_calls)
+        if parallel_calls:
+            tasks = [self._execute_one(call, session_id) for call in parallel_calls]
+            for result in await asyncio.gather(*tasks):
+                yield SchedulerEvent(event="tool_result", result=result)
+        for call in serial_calls:
+            if self.budget.is_exhausted:
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=call["id"],
+                        name=call["name"],
+                        success=False,
+                        error="Tool budget exhausted",
+                    ),
+                )
+                break
+            yield SchedulerEvent(
+                event="tool_result",
+                result=await self._execute_one(call, session_id),
+            )
+
+    async def _execute_one(self, call: dict, session_id: str | None) -> ToolResult:
+        start = time.monotonic()
+        tool = self.registry.get(call["name"])
+        if tool.handler is None:
+            return ToolResult(
+                tool_call_id=call["id"],
+                name=call["name"],
+                success=False,
+                error="Tool has no handler",
+            )
+        try:
+            output = await asyncio.wait_for(
+                tool.handler(**call.get("arguments", {})),
+                timeout=tool.timeout,
+            )
+            self.budget.record(len(str(output)))
+            target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            await self.permission_engine.audit(
+                tool.name,
+                target,
+                "success",
+                {"tool_call_id": call["id"]},
+                session_id,
+            )
+            return ToolResult(
+                tool_call_id=call["id"],
+                name=tool.name,
+                success=True,
+                output=output,
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
+        except Exception as exc:
+            target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            await self.permission_engine.audit(
+                tool.name,
+                target,
+                "error",
+                {"error": str(exc), "tool_call_id": call["id"]},
+                session_id,
+            )
+            return ToolResult(
+                tool_call_id=call["id"],
+                name=tool.name,
+                success=False,
+                error=str(exc),
+                duration_ms=int((time.monotonic() - start) * 1000),
+            )
+
+    async def _confirm(
+        self,
+        request: PermissionRequest,
+        confirm_callback: ConfirmCallback | None,
+    ) -> dict:
+        if confirm_callback is None:
+            return {"approved": False}
+        value = confirm_callback(
+            {
+                "id": request.tool_call_id,
+                "name": request.name,
+                "arguments": request.arguments,
+                "level": request.level,
+                "target": request.target,
+                "reason": request.reason,
+            }
+        )
+        if inspect.isawaitable(value):
+            value = await value
+        if isinstance(value, bool):
+            return {"approved": value}
+        return dict(value)
+
+    @staticmethod
+    def _normalize_call(call: dict) -> dict:
+        return {
+            "id": str(call.get("id") or call.get("tool_call_id") or call.get("name")),
+            "name": str(call["name"]),
+            "arguments": dict(call.get("arguments") or {}),
+        }
+

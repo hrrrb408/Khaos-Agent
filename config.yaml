@@ -1,0 +1,42 @@
+database:
+  path: khaos.db
+
+routing:
+  provider: mock
+  functions:
+    agent_loop: mock-provider/mock-office
+    coding: mock-provider/mock-coding
+    compression: mock-provider/mock-compression
+
+providers:
+  mock-provider:
+    base_url: mock://local
+    api_key: ""
+    rpm_limit: 0
+    tpm_limit: 0
+    timeout: 120
+
+models:
+  mock-provider/mock-office:
+    provider: mock-provider
+    model: mock-provider/mock-office
+    max_context_tokens: 128000
+    supports_streaming: true
+    supports_tools: true
+  mock-provider/mock-coding:
+    provider: mock-provider
+    model: mock-provider/mock-coding
+    max_context_tokens: 128000
+    supports_streaming: true
+    supports_tools: true
+  mock-provider/mock-compression:
+    provider: mock-provider
+    model: mock-provider/mock-compression
+    max_context_tokens: 128000
+    supports_streaming: true
+    supports_tools: false
+
+defaults:
+  mode: office
+  stream_timeout: 120
+  compression_threshold: 128000
