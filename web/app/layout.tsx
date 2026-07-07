@@ -1,7 +1,10 @@
-import "./style.css";
+import "./styles/globals.css";
+import "./styles/markdown.css";
+import "highlight.js/styles/github-dark.css";
 
 export const metadata = {
   title: "Khaos",
+  description: "Khaos agent chat console",
 };
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -11,4 +14,3 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
     </html>
   );
 }
-
