@@ -145,7 +145,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db", default="khaos.db", help="SQLite database path")
     parser.add_argument("--session-id", help="Existing or new session id")
     parser.add_argument("--mode", choices=["office", "coding"], help="Initial mode")
-    parser.add_argument("--message", help="Run one message and exit")
+    parser.add_argument("--message", help="Run one message and exit (non-interactive)")
+    parser.add_argument("--no-tui", action="store_true", help="Use the line-oriented REPL instead of the full-screen TUI")
     parser.add_argument("--yes", action="store_true", help="Approve permission prompts")
     parser.add_argument("--remember", action="store_true", help="Remember approved permissions")
     return parser
@@ -180,8 +181,24 @@ def _interactive_confirm(args: argparse.Namespace):
     return confirm
 
 
+def _tui_available() -> bool:
+    """True when the optional textual TUI dependency is importable."""
+    try:
+        import textual  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
 def main() -> None:
-    """CLI process entrypoint."""
+    """CLI process entrypoint.
+
+    Resolution order:
+      1. ``--message`` or piped stdin -> single-shot SSE output (scriptable).
+      2. Interactive TTY, no ``--no-tui``, and textual installed -> full TUI.
+      3. Otherwise -> the line-oriented REPL (``run_repl``).
+    """
     parser = build_parser()
     args = parser.parse_args()
     if args.message:
@@ -190,6 +207,11 @@ def main() -> None:
         args.message = sys.stdin.read().strip()
         if args.message:
             raise SystemExit(asyncio.run(run_once(args)))
+    if not args.no_tui and _tui_available():
+        from khaos.tui.app import run_tui
+
+        run_tui(db_path=args.db, project_root=Path.cwd(), mode=args.mode or "")
+        return
     raise SystemExit(asyncio.run(run_repl(args)))
 
 
