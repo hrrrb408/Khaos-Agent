@@ -1,0 +1,7 @@
+# PyO3 extension modules on macOS need `-undefined dynamic_lookup` so the
+# linker defers Python C-API symbols to runtime (resolved when Python imports
+# the .so). PyO3's build script normally injects this for `extension-module`,
+# but a bare `cargo build --release` of a cdylib does not pick it up. This
+# config applies the flag for the khaos-core cdylib build.
+[target.'cfg(target_os="macos")']
+rustflags = ["-C", "link-arg=-undefined", "-C", "link-arg=dynamic_lookup"]

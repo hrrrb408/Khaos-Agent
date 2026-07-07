@@ -1,0 +1,27 @@
+[package]
+name = "khaos-core"
+version = "0.1.0"
+edition = "2021"
+description = "Khaos performance core: token counting and parallel tool execution."
+license = "MIT"
+
+[lib]
+name = "_khaos_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync", "macros"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+
+[features]
+default = ["pyo3"]
+# When building pure `cargo test` without a Python interpreter, disable pyo3:
+#   cargo test --no-default-features
+pyo3 = ["dep:pyo3"]
+
+[profile.release]
+lto = true
+codegen-units = 1
