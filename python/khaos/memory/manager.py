@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
+from datetime import datetime
 
 from khaos.agent.core import SimpleTokenEngine
-from khaos.memory.store import Memory, MemoryScope, MemoryStore
+from khaos.memory.store import Memory, MemoryScope, MemoryStore, extract_memories_from_messages
 from khaos.modes import Mode
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -37,17 +41,27 @@ class MemoryManager:
         self.intent_getter = intent_getter
 
     async def inject(self, session_id: str) -> str:
-        """Return formatted memory text within budget."""
+        """Return formatted memory text within budget.
+
+        L0 (global) is always injected so cross-session identity persists. L1
+        is the current mode's memories. L2 is the cross-mode residue, ranked by
+        relevance: higher confidence first, then access frequency (recency of
+        use), then recency of update.
+        """
         del session_id
         current_mode = self._current_scope()
         l0 = await self.store.list_by_scope(MemoryScope.GLOBAL)
         l1 = await self.store.list_by_scope(current_mode)
         all_memories = await self.store.list_all()
-        l2 = [
-            memory
-            for memory in all_memories
-            if memory.scope not in {MemoryScope.GLOBAL, current_mode}
-        ]
+        l2 = sorted(
+            (
+                memory
+                for memory in all_memories
+                if memory.scope not in {MemoryScope.GLOBAL, current_mode}
+            ),
+            key=lambda m: (m.confidence.value, m.access_freq, m.updated_at or datetime.min),
+            reverse=True,
+        )
         sections = [
             self._format_section("L0 全局记忆", l0, self.budget.l0_max_tokens),
             self._format_section("L1 模式记忆", l1, self.budget.l1_max_tokens),
@@ -64,9 +78,24 @@ class MemoryManager:
         return f"跨模式上下文: {old_mode.value} -> {new_mode.value}: {intent}"
 
     async def update_from_conversation(self, messages: list, mode: Mode) -> list[Memory]:
-        """Phase 1 does not perform proactive memory extraction."""
-        del messages, mode
-        return []
+        """Extract and persist memory-worthy facts from the conversation.
+
+        Scans user-role messages for declarative signals (name, preferences,
+        "remember X") and writes them with conflict resolution so a later,
+        higher-confidence statement supersedes an earlier one. Returns the
+        memories actually persisted (unresolved conflicts are skipped and
+        logged).
+        """
+        scope = MemoryScope(mode.value) if isinstance(mode, Mode) else MemoryScope.GLOBAL
+        candidates = extract_memories_from_messages(messages, scope=MemoryScope.GLOBAL)
+        persisted: list[Memory] = []
+        for memory in candidates:
+            stored = await self.store.set(memory, on_conflict="resolve")
+            if stored is not None:
+                persisted.append(stored)
+        if persisted:
+            logger.info("proactive memory extracted %d fact(s)", len(persisted))
+        return persisted
 
     def _current_scope(self) -> MemoryScope:
         if self.mode_getter is None:
