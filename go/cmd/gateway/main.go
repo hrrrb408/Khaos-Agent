@@ -56,6 +56,11 @@ func main() {
 		*apiKey,
 		rate.NewTokenBucket(60, 10),
 	)
+	// When talking to a real Python agent, also forward audit queries. The mock
+	// agent path leaves audit unconfigured (GET /api/audit returns []).
+	if !*mockAgent {
+		handler = handler.WithAudit(platform.PythonClient{Address: *pythonAddr})
+	}
 	log.Printf("Khaos gateway listening on %s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, handler.Routes()))
 }

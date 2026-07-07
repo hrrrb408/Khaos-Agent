@@ -243,6 +243,54 @@ class Database:
         )
         return [dict(row) for row in await cursor.fetchall()]
 
+    async def query_audit_logs(
+        self,
+        action: str | None = None,
+        result: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return audit logs matching the given filters, newest first.
+
+        Filters:
+        - ``action``: exact action match (e.g. "write_file", "terminal").
+        - ``result``: exact result match (e.g. "success", "denied", "error").
+        - ``since``/``until``: inclusive ISO timestamp bounds on ``created_at``.
+        - ``limit``: cap on rows (default 100).
+
+        ``created_at`` is stored as ``datetime('now')`` (UTC, 'YYYY-MM-DD HH:MM:SS')
+        so lexicographic comparison against ISO-ish strings works.
+        """
+        conn = await self._require_conn()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if action is not None:
+            clauses.append("action = ?")
+            params.append(action)
+        if result is not None:
+            clauses.append("result = ?")
+            params.append(result)
+        if since is not None:
+            clauses.append("created_at >= ?")
+            params.append(since)
+        if until is not None:
+            clauses.append("created_at <= ?")
+            params.append(until)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(limit)
+        cursor = await conn.execute(
+            f"""
+            SELECT id, action, target, result, detail, session_id, created_at
+            FROM audit_log
+            {where}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
     async def upsert_memory(
         self,
         scope: str,

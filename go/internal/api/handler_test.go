@@ -131,3 +131,74 @@ func TestRateLimit(t *testing.T) {
 		t.Fatalf("second status=%d", rec.Code)
 	}
 }
+
+type mockAudit struct {
+	entries  []AuditEntry
+	action   string
+	result   string
+	limit    int
+	failWith error
+}
+
+func (m *mockAudit) Query(ctx context.Context, action, result, since, until string, limit int) ([]AuditEntry, error) {
+	m.action = action
+	m.result = result
+	m.limit = limit
+	if m.failWith != nil {
+		return nil, m.failWith
+	}
+	return m.entries, nil
+}
+
+func TestAuditEndpointReturnsEntries(t *testing.T) {
+	audit := &mockAudit{entries: []AuditEntry{
+		{ID: 1, Action: "write_file", Target: "/x", Result: "success"},
+		{ID: 2, Action: "terminal", Target: "rm", Result: "denied"},
+	}}
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1000, 100))
+	handler = handler.WithAudit(audit)
+
+	rec := serve(handler.Routes(), http.MethodGet, "/api/audit?result=denied&limit=5", "", "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if audit.result != "denied" {
+		t.Fatalf("result filter not forwarded: %q", audit.result)
+	}
+	if audit.limit != 5 {
+		t.Fatalf("limit not forwarded: %d", audit.limit)
+	}
+	var got []AuditEntry
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(got) != 2 || got[0].Action != "write_file" {
+		t.Fatalf("unexpected entries: %+v", got)
+	}
+}
+
+func TestAuditEndpointWithoutClientReturnsEmpty(t *testing.T) {
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1000, 100))
+	// No WithAudit call -> audit client is nil.
+	rec := serve(handler.Routes(), http.MethodGet, "/api/audit", "", "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	body := strings.TrimSpace(rec.Body.String())
+	if body != "[]" {
+		t.Fatalf("expected empty array, got %q", body)
+	}
+}
+
+func TestAuditEndpointDefaultsLimit(t *testing.T) {
+	audit := &mockAudit{}
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1000, 100)).WithAudit(audit)
+
+	serve(handler.Routes(), http.MethodGet, "/api/audit", "", "")
+
+	if audit.limit != 100 {
+		t.Fatalf("default limit should be 100, got %d", audit.limit)
+	}
+}

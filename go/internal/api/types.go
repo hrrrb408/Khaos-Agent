@@ -43,6 +43,22 @@ type MemoryClient interface {
 	Search(ctx context.Context, scope string, query string, topK int) ([]Memory, error)
 }
 
+// AuditEntry is one audit log record returned from the audit query endpoint.
+type AuditEntry struct {
+	ID        int64          `json:"id"`
+	Action    string         `json:"action"`
+	Target    string         `json:"target"`
+	Result    string         `json:"result"`
+	Detail    map[string]any `json:"detail"`
+	SessionID string         `json:"session_id"`
+	CreatedAt string         `json:"created_at"`
+}
+
+// AuditClient queries audit records from the Python audit service.
+type AuditClient interface {
+	Query(ctx context.Context, action, result, since, until string, limit int) ([]AuditEntry, error)
+}
+
 // ConfigStore abstracts runtime config persistence.
 type ConfigStore interface {
 	Get() map[string]any

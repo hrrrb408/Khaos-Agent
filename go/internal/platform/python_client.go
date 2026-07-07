@@ -9,6 +9,12 @@ import (
 	"khaos/go/internal/api"
 )
 
+// Compile-time assertions that PythonClient satisfies the gateway interfaces.
+var (
+	_ api.AgentClient = PythonClient{}
+	_ api.AuditClient = PythonClient{}
+)
+
 // PythonClient talks to the Python AgentService JSON-line endpoint.
 type PythonClient struct {
 	Address string
@@ -80,4 +86,39 @@ func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMo
 		return "", err
 	}
 	return response["current_mode"], nil
+}
+
+// Query queries audit records through Python.
+func (c PythonClient) Query(ctx context.Context, action, result, since, until string, limit int) ([]api.AuditEntry, error) {
+	conn, err := net.Dial("tcp", c.Address)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	payload := map[string]any{
+		"limit": limit,
+	}
+	if action != "" {
+		payload["action"] = action
+	}
+	if result != "" {
+		payload["result"] = result
+	}
+	if since != "" {
+		payload["since"] = since
+	}
+	if until != "" {
+		payload["until"] = until
+	}
+	if err := json.NewEncoder(conn).Encode(map[string]any{
+		"method":  "AuditService.Query",
+		"payload": payload,
+	}); err != nil {
+		return nil, err
+	}
+	var entries []api.AuditEntry
+	if err := json.NewDecoder(conn).Decode(&entries); err != nil {
+		return nil, err
+	}
+	return entries, nil
 }

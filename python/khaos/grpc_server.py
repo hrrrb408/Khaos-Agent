@@ -17,6 +17,7 @@ from typing import AsyncIterator
 from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.error_handler import ErrorHandler
+from khaos.audit import AuditLogger
 from khaos.db import Database
 from khaos.memory import (
     Memory,
@@ -161,6 +162,26 @@ class MemoryService:
         return [_memory_to_dict(memory) for memory in await self.store.search(query, top_k)]
 
 
+class AuditService:
+    """Audit RPC service backed by AuditLogger."""
+
+    def __init__(self, logger: AuditLogger):
+        self.logger = logger
+
+    async def query(
+        self,
+        action: str | None = None,
+        result: str | None = None,
+        since: str | None = None,
+        until: str | None = None,
+        limit: int = 100,
+    ) -> list[dict]:
+        entries = await self.logger.query(
+            action=action, result=result, since=since, until=until, limit=limit
+        )
+        return [entry.to_dict() for entry in entries]
+
+
 async def serve_json_lines(
     host: str,
     port: int,
@@ -174,6 +195,7 @@ async def serve_json_lines(
     await db.run_migrations()
     agent = AgentService(db, project_root=project_root, config_path=config_path)
     memory = MemoryService(MemoryStore(db))
+    audit_service = AuditService(AuditLogger(db))
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -199,6 +221,9 @@ async def serve_json_lines(
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             elif method == "MemoryService.SearchMemory":
                 response = await memory.search_memory(**payload)
+                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "AuditService.Query":
+                response = await audit_service.query(**payload)
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             else:
                 writer.write(json.dumps({"error": "unknown method"}).encode("utf-8") + b"\n")

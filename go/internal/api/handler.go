@@ -19,6 +19,7 @@ import (
 type Handler struct {
 	agent     AgentClient
 	memory    MemoryClient
+	audit     AuditClient
 	config    ConfigStore
 	limiter   *rate.TokenBucket
 	apiKey    string
@@ -27,6 +28,12 @@ type Handler struct {
 	streams   map[string]<-chan ChatEvent
 	sessions  map[string]ChatRequest
 	tools     []map[string]any
+}
+
+// WithAudit attaches an audit client so GET /api/audit is served.
+func (h *Handler) WithAudit(audit AuditClient) *Handler {
+	h.audit = audit
+	return h
 }
 
 // NewHandler creates an API handler.
@@ -63,6 +70,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/sessions/{id}", h.handleSessionDetail)
 	mux.HandleFunc("GET /api/config", h.handleConfigGet)
 	mux.HandleFunc("PUT /api/config", h.handleConfigSet)
+	mux.HandleFunc("GET /api/audit", h.handleAudit)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
 	return h.cors(auth.Middleware(h.apiKey, h.rateLimit(mux)))
 }
@@ -276,6 +284,34 @@ func (h *Handler) handleConfigSet(w http.ResponseWriter, r *http.Request) {
 	}
 	h.config.Set(cfg)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h *Handler) handleAudit(w http.ResponseWriter, r *http.Request) {
+	if h.audit == nil {
+		writeJSON(w, http.StatusOK, []AuditEntry{})
+		return
+	}
+	query := r.URL.Query()
+	limit, _ := strconv.Atoi(query.Get("limit"))
+	if limit <= 0 || limit > 1000 {
+		limit = 100
+	}
+	entries, err := h.audit.Query(
+		r.Context(),
+		query.Get("action"),
+		query.Get("result"),
+		query.Get("since"),
+		query.Get("until"),
+		limit,
+	)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if entries == nil {
+		entries = []AuditEntry{}
+	}
+	writeJSON(w, http.StatusOK, entries)
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
