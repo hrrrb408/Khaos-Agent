@@ -181,7 +181,7 @@ class KhaosApp(App):
 
     def _echo_user(self, text: str) -> None:
         from rich.text import Text
-        t = Text.from_markup(f"[cyan]you:[/] {text}")
+        t = Text.assemble(("you:", "cyan"), " ", text)
         self.query_one(ChatPanel).write(t)
 
     # --- permission flow ---------------------------------------------------

@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+from io import StringIO
+
+from rich.console import Console
+from rich.markdown import Markdown
+
 from khaos.agent.core import Message
-from khaos.tui.markdown import RenderedLine, render_message, to_rich
+from khaos.tui.chat_panel import ChatPanel
+from khaos.tui.markdown import RenderedLine, markdown_to_rich, render_message, to_rich
 
 
 def test_renders_assistant_text():
@@ -133,3 +139,55 @@ def test_to_rich_returns_rich_text_when_available():
     # the plain string. Either way the content is present.
     rendered = str(out)
     assert "hello" in rendered
+
+
+def test_markdown_to_rich_renders_bold_list_chinese_and_emoji():
+    sample = (
+        "**自主编码** 的方式协助你：\n"
+        "- 🚀 实现: 根据你的需求直接生成完整、可运行的代码。\n"
+        "- 🧪 测试：自动编写测试用例并验证代码逻辑。"
+    )
+
+    renderable = markdown_to_rich(sample)
+    output = _render_to_text(renderable)
+
+    assert isinstance(renderable, Markdown)
+    assert "**" not in output
+    assert "自主编码" in output
+    assert "🚀 实现" in output
+    assert "🧪 测试" in output
+
+
+def test_markdown_to_rich_renders_fenced_code_blocks():
+    renderable = markdown_to_rich("```python\nprint('你好')\n```")
+    output = _render_to_text(renderable)
+
+    assert "print" in output
+    assert "你好" in output
+    assert "```" not in output
+
+
+def test_chat_panel_buffers_streamed_assistant_markdown_until_done(monkeypatch):
+    panel = ChatPanel()
+    writes = []
+    monkeypatch.setattr(panel, "write", lambda renderable: writes.append(renderable))
+
+    panel.append_message(Message(role="assistant", content="**自主"))
+    panel.append_message(Message(role="assistant", content="编码**\n- 🚀 实现"))
+
+    assert writes == []
+
+    panel.append_message(Message(role="system", content="done", event="done", stop_reason="end_turn"))
+
+    assert isinstance(writes[0], Markdown)
+    output = _render_to_text(writes[0])
+    assert "**" not in output
+    assert "自主编码" in output
+    assert "🚀 实现" in output
+
+
+def _render_to_text(renderable) -> str:
+    buffer = StringIO()
+    console = Console(file=buffer, force_terminal=True, color_system=None, width=100)
+    console.print(renderable)
+    return buffer.getvalue()
