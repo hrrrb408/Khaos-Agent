@@ -11,12 +11,14 @@ from pathlib import Path
 from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.error_handler import ErrorHandler
+from khaos.cli.skills_commands import handle_skills_command
 from khaos.cli.sse import encode_sse
 from khaos.db import Database
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
+from khaos.skills import SkillManager
 from khaos.tools import create_runtime_registry
 from khaos.tools.scheduler import ToolScheduler
 
@@ -91,6 +93,12 @@ async def run_repl(args: argparse.Namespace) -> int:
     scheduler = ToolScheduler(create_runtime_registry(), permission_engine)
     compressor = ContextCompressor(router, memory_manager=memory_manager)
     error_handler = ErrorHandler(db=db, router=router, compressor=compressor)
+    skill_manager = SkillManager()
+    skills_dir = Path.cwd() / "skills"
+    if skills_dir.is_dir():
+        loaded = skill_manager.load_from_dir(skills_dir)
+        if loaded:
+            print(f"loaded {len(loaded)} skill(s) from {skills_dir}")
     loop = AgentLoop(
         AgentConfig(),
         mode_manager,
@@ -101,6 +109,7 @@ async def run_repl(args: argparse.Namespace) -> int:
         context_compressor=compressor,
         memory_manager=memory_manager,
         error_handler=error_handler,
+        skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
     )
 
     print(f"session_id: {session_id}")
@@ -110,6 +119,11 @@ async def run_repl(args: argparse.Namespace) -> int:
             user_input = input("> ").strip()
             if user_input in {"/quit", "/exit"}:
                 break
+            if user_input.startswith("/skills"):
+                result = handle_skills_command(user_input, skill_manager)
+                if result.handled:
+                    print(result.message)
+                    continue
             if user_input.startswith("/mode "):
                 target = ModeManager.parse(user_input.removeprefix("/mode "))
                 await mode_manager.switch(target)

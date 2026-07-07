@@ -72,6 +72,7 @@ class AgentLoop:
         memory_manager=None,
         error_handler=None,
         token_engine: SimpleTokenEngine | None = None,
+        skill_manager=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -83,6 +84,7 @@ class AgentLoop:
         self.memory_manager = memory_manager
         self.error_handler = error_handler
         self.token_engine = token_engine or SimpleTokenEngine()
+        self.skill_manager = skill_manager
 
     async def run(self, user_input: str, session_id: str) -> AsyncIterator[Message]:
         """
@@ -94,7 +96,7 @@ class AgentLoop:
         """
         total_tokens = 0
         try:
-            messages = await self._build_context(session_id)
+            messages = await self._build_context(session_id, user_input)
             user_msg = Message(
                 role="user",
                 content=user_input,
@@ -245,26 +247,31 @@ class AgentLoop:
                     metadata={"code": "INTERNAL_ERROR", "message": str(exc)},
                 )
 
-    async def _build_context(self, session_id: str) -> list[Message]:
+    async def _build_context(self, session_id: str, user_input: str = "") -> list[Message]:
         """Build the P0-A context from mode prompt and persisted messages."""
         messages = [
             Message(
                 role="system",
-                content=await self._build_system_prompt(session_id),
+                content=await self._build_system_prompt(session_id, user_input),
                 token_count=0,
             )
         ]
         messages.extend(await self.db.list_messages(session_id))
         return messages
 
-    async def _build_system_prompt(self, session_id: str) -> str:
+    async def _build_system_prompt(self, session_id: str, user_input: str = "") -> str:
         prompt = await self.mode_manager.load_system_prompt()
-        if self.memory_manager is None:
-            return prompt
-        memory_text = await self.memory_manager.inject(session_id)
-        if not memory_text:
-            return prompt
-        return f"{prompt}\n\n{memory_text}"
+        if self.memory_manager is not None:
+            memory_text = await self.memory_manager.inject(session_id)
+            if memory_text:
+                prompt = f"{prompt}\n\n{memory_text}"
+        if self.skill_manager is not None:
+            mode = self.mode_manager.current_mode.value
+            matched = self.skill_manager.match(mode, user_input)
+            skill_text = self.skill_manager.format_for_prompt(matched)
+            if skill_text:
+                prompt = f"{prompt}\n\n{skill_text}"
+        return prompt
 
     async def _check_compression(self, messages: list[Message]) -> bool:
         total_tokens = sum(
