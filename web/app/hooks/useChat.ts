@@ -47,6 +47,19 @@ function statsFromPayload(payload: Record<string, unknown>): DoneStats {
   };
 }
 
+function errorFromPayload(payload: Record<string, unknown>): string {
+  const candidate = payload.error ?? payload.message ?? payload.detail;
+  if (typeof candidate === "string" && candidate.trim()) return candidate;
+  return "Stream failed.";
+}
+
+function requestErrorMessage(error: unknown, gatewayUrl: string): string {
+  if (error instanceof TypeError && error.message === "Failed to fetch") {
+    return `Cannot reach Khaos Gateway at ${gatewayUrl}. Start the Go gateway or update Gateway URL in Settings.`;
+  }
+  return error instanceof Error ? error.message : "Chat request failed.";
+}
+
 type UseChatArgs = {
   settings: ChatSettings;
   getSessionId: (mode: ChatMode) => string;
@@ -64,6 +77,7 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
   const sourceRef = useRef<EventSource | null>(null);
   const assistantMessageIdRef = useRef("");
   const assistantTextRef = useRef("");
+  const terminalEventSeenRef = useRef(false);
 
   const closeStream = useCallback(() => {
     sourceRef.current?.close();
@@ -105,6 +119,7 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
     )));
     assistantMessageIdRef.current = "";
     assistantTextRef.current = "";
+    terminalEventSeenRef.current = false;
   }, [updateMessages]);
 
   const addEventItem = useCallback((sessionId: string, event: StreamEventName, data: Record<string, unknown>) => {
@@ -173,13 +188,15 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
           }
           addEventItem(sessionId, eventName, data);
           if (eventName === "done") {
+            terminalEventSeenRef.current = true;
             finishAssistant(sessionId);
             setDoneStats(statsFromPayload(data));
             closeStream();
             setIsSending(false);
           }
           if (eventName === "error") {
-            const errorMessage = typeof data.error === "string" ? data.error : "Stream failed.";
+            terminalEventSeenRef.current = true;
+            const errorMessage = errorFromPayload(data);
             setLastError(errorMessage);
             closeStream();
             setIsSending(false);
@@ -188,6 +205,9 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
       }
 
       source.onerror = () => {
+        if (terminalEventSeenRef.current || sourceRef.current === null) {
+          return;
+        }
         const errorMessage = "Stream connection failed.";
         setLastError(errorMessage);
         addEventItem(sessionId, "error", { error: errorMessage });
@@ -196,7 +216,7 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
         setIsSending(false);
       };
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : "Chat request failed.";
+      const errorMessage = requestErrorMessage(error, settings.gatewayUrl);
       setLastError(errorMessage);
       addEventItem(sessionId, "error", { error: errorMessage });
       setIsSending(false);
