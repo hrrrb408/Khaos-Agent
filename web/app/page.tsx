@@ -27,24 +27,15 @@ export default function Page() {
     });
     const payload = await response.json();
     setSessionId(payload.session_id);
-    const stream = await fetch(`${gateway}/api/chat/${payload.session_id}/stream`, {
-      headers: { "X-Khaos-Key": apiKey },
-    });
-    const reader = stream.body?.getReader();
-    if (!reader) return;
-    const decoder = new TextDecoder();
-    let buffer = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
-      const frames = buffer.split("\n\n");
-      buffer = frames.pop() || "";
-      for (const frame of frames) {
-        const event = frame.match(/^event: (.+)$/m)?.[1] || "message";
-        const data = frame.match(/^data: (.+)$/m)?.[1] || "{}";
-        setEvents((prev) => [...prev, { event, data }]);
-      }
+    const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey)}` : "";
+    const source = new EventSource(`${gateway}/api/chat/${payload.session_id}/stream${keyParam}`);
+    for (const eventName of ["message", "tool_call", "tool_result", "permission_request", "error", "done"]) {
+      source.addEventListener(eventName, (event) => {
+        setEvents((prev) => [...prev, { event: eventName, data: (event as MessageEvent).data }]);
+        if (eventName === "done" || eventName === "error") {
+          source.close();
+        }
+      });
     }
   }
 
@@ -92,4 +83,3 @@ export default function Page() {
     </main>
   );
 }
-

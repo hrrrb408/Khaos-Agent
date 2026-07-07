@@ -54,10 +54,10 @@ func (c PythonClient) ConfirmPermission(ctx context.Context, sessionID string, t
 	return json.NewEncoder(conn).Encode(map[string]any{
 		"method": "AgentService.ConfirmPermission",
 		"payload": map[string]any{
-			"session_id":    sessionID,
-			"tool_call_id":  toolCallID,
-			"approved":      approved,
-			"remember":      remember,
+			"session_id":   sessionID,
+			"tool_call_id": toolCallID,
+			"approved":     approved,
+			"remember":     remember,
 		},
 	})
 }
@@ -70,7 +70,7 @@ func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMo
 	}
 	defer conn.Close()
 	if err := json.NewEncoder(conn).Encode(map[string]any{
-		"method": "AgentService.SwitchMode",
+		"method":  "AgentService.SwitchMode",
 		"payload": map[string]any{"session_id": sessionID, "target_mode": targetMode},
 	}); err != nil {
 		return "", err
@@ -81,4 +81,3 @@ func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMo
 	}
 	return response["current_mode"], nil
 }
-

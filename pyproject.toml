@@ -5,6 +5,8 @@ description = "Khaos AI Agent platform"
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.19",
+    "httpx>=0.28",
+    "PyYAML>=6",
 ]
 
 [project.optional-dependencies]
@@ -20,4 +22,3 @@ khaos = "khaos.cli.main:main"
 asyncio_mode = "auto"
 pythonpath = ["python"]
 testpaths = ["python/tests"]
-

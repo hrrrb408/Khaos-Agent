@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"os"
 	"time"
 
 	"khaos/go/internal/api"
@@ -33,13 +34,19 @@ func (m mockAgentClient) SwitchMode(ctx context.Context, sessionID string, targe
 }
 
 func main() {
+	defaultAPIKey := os.Getenv("KHAOS_API_KEY")
+	defaultPythonAgent := os.Getenv("KHAOS_PYTHON_AGENT")
+	if defaultPythonAgent == "" {
+		defaultPythonAgent = "127.0.0.1:50051"
+	}
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	apiKey := flag.String("api-key", "", "X-Khaos-Key value")
-	pythonAddr := flag.String("python-agent", "", "Python AgentService JSON-line address")
+	apiKey := flag.String("api-key", defaultAPIKey, "X-Khaos-Key value")
+	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService JSON-line address")
+	mockAgent := flag.Bool("mock-agent", false, "use in-process mock agent")
 	flag.Parse()
-	var agent api.AgentClient = mockAgentClient{}
-	if *pythonAddr != "" {
-		agent = platform.PythonClient{Address: *pythonAddr}
+	var agent api.AgentClient = platform.PythonClient{Address: *pythonAddr}
+	if *mockAgent {
+		agent = mockAgentClient{}
 	}
 
 	handler := api.NewHandler(

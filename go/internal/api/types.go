@@ -48,4 +48,3 @@ type ConfigStore interface {
 	Get() map[string]any
 	Set(map[string]any)
 }
-

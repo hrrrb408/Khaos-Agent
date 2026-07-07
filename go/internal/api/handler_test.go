@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -38,149 +37,97 @@ func (m *mockAgent) SwitchMode(ctx context.Context, sessionID string, targetMode
 	return targetMode, nil
 }
 
-func newTestServer(apiKey string) (*httptest.Server, *mockAgent) {
+func newTestHandler(apiKey string) (http.Handler, *mockAgent) {
 	agent := &mockAgent{}
 	handler := NewHandler(agent, NewMemoryMap(), NewMapConfig(map[string]any{"mode": "office"}), apiKey, rate.NewTokenBucket(1000, 100))
-	return httptest.NewServer(handler.Routes()), agent
+	return handler.Routes(), agent
+}
+
+func serve(handler http.Handler, method string, path string, body string, key string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if key != "" {
+		req.Header.Set("X-Khaos-Key", key)
+	}
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
 }
 
 func TestChatAndStream(t *testing.T) {
-	server, _ := newTestServer("")
-	defer server.Close()
-	body := bytes.NewBufferString(`{"session_id":"s1","message":"hello","mode":"office"}`)
-	resp, err := http.Post(server.URL+"/api/chat", "application/json", body)
-	if err != nil {
-		t.Fatal(err)
+	handler, _ := newTestHandler("")
+	rec := serve(handler, http.MethodPost, "/api/chat", `{"session_id":"s1","message":"hello","mode":"office"}`, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
-	}
-	stream, err := http.Get(server.URL + "/api/chat/s1/stream")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer stream.Body.Close()
-	scanner := bufio.NewScanner(stream.Body)
-	var lines []string
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	joined := strings.Join(lines, "\n")
-	if !strings.Contains(joined, "event: message") || !strings.Contains(joined, "event: done") {
-		t.Fatalf("unexpected stream: %s", joined)
+	stream := serve(handler, http.MethodGet, "/api/chat/s1/stream", "", "")
+	body := stream.Body.String()
+	if !strings.Contains(body, "event: message") || !strings.Contains(body, "event: done") {
+		t.Fatalf("unexpected stream: %s", body)
 	}
 }
 
 func TestAuthRequired(t *testing.T) {
-	server, _ := newTestServer("secret")
-	defer server.Close()
-	resp, err := http.Get(server.URL + "/api/health")
-	if err != nil {
-		t.Fatal(err)
+	handler, _ := newTestHandler("secret")
+	if rec := serve(handler, http.MethodGet, "/api/health", "", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d", rec.Code)
 	}
-	if resp.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if rec := serve(handler, http.MethodGet, "/api/health", "", "secret"); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
 	}
-	req, _ := http.NewRequest(http.MethodGet, server.URL+"/api/health", nil)
-	req.Header.Set("X-Khaos-Key", "secret")
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("status = %d", resp.StatusCode)
+	if rec := serve(handler, http.MethodGet, "/api/health?key=secret", "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("query key status = %d", rec.Code)
 	}
 }
 
 func TestConfirmAndMode(t *testing.T) {
-	server, agent := newTestServer("")
-	defer server.Close()
-	resp, err := http.Post(server.URL+"/api/chat/s1/confirm", "application/json", bytes.NewBufferString(`{"tool_call_id":"c1","approved":true}`))
-	if err != nil {
-		t.Fatal(err)
+	handler, agent := newTestHandler("")
+	rec := serve(handler, http.MethodPost, "/api/chat/s1/confirm", `{"tool_call_id":"c1","approved":true}`, "")
+	if rec.Code != http.StatusOK || !agent.confirmed {
+		t.Fatalf("confirm status=%d confirmed=%v", rec.Code, agent.confirmed)
 	}
-	if resp.StatusCode != http.StatusOK || !agent.confirmed {
-		t.Fatalf("confirm status=%d confirmed=%v", resp.StatusCode, agent.confirmed)
-	}
-	resp, err = http.Post(server.URL+"/api/mode", "application/json", bytes.NewBufferString(`{"session_id":"s1","target_mode":"coding"}`))
-	if err != nil {
-		t.Fatal(err)
-	}
+	rec = serve(handler, http.MethodPost, "/api/mode", `{"session_id":"s1","target_mode":"coding"}`, "")
 	var payload map[string]string
-	_ = json.NewDecoder(resp.Body).Decode(&payload)
+	_ = json.NewDecoder(rec.Body).Decode(&payload)
 	if payload["current_mode"] != "coding" || agent.mode != "coding" {
 		t.Fatalf("mode payload=%v agent=%s", payload, agent.mode)
 	}
 }
 
 func TestMemoryEndpoints(t *testing.T) {
-	server, _ := newTestServer("")
-	defer server.Close()
-	resp, err := http.Post(server.URL+"/api/memory", "application/json", bytes.NewBufferString(`{"scope":"global","key":"user","value":"Ruibang"}`))
-	if err != nil {
-		t.Fatal(err)
+	handler, _ := newTestHandler("")
+	if rec := serve(handler, http.MethodPost, "/api/memory", `{"scope":"global","key":"user","value":"Ruibang"}`, ""); rec.Code != http.StatusOK {
+		t.Fatalf("set status = %d", rec.Code)
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("set status = %d", resp.StatusCode)
+	if rec := serve(handler, http.MethodGet, "/api/memory?scope=global&key=user", "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("get status = %d", rec.Code)
 	}
-	resp, err = http.Get(server.URL + "/api/memory?scope=global&key=user")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("get status = %d", resp.StatusCode)
-	}
-	req, _ := http.NewRequest(http.MethodDelete, server.URL+"/api/memory/1", nil)
-	resp, err = http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("delete status = %d", resp.StatusCode)
+	if rec := serve(handler, http.MethodDelete, "/api/memory/1", "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("delete status = %d", rec.Code)
 	}
 }
 
 func TestConfigToolsSessionsHealth(t *testing.T) {
-	server, _ := newTestServer("")
-	defer server.Close()
+	handler, _ := newTestHandler("")
 	paths := []string{"/api/config", "/api/tools?mode=coding", "/api/sessions", "/api/health"}
 	for _, path := range paths {
-		resp, err := http.Get(server.URL + path)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			t.Fatalf("%s status=%d", path, resp.StatusCode)
+		if rec := serve(handler, http.MethodGet, path, "", ""); rec.Code != http.StatusOK {
+			t.Fatalf("%s status=%d", path, rec.Code)
 		}
 	}
-	req, _ := http.NewRequest(http.MethodPut, server.URL+"/api/config", bytes.NewBufferString(`{"mode":"coding"}`))
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("config put status=%d", resp.StatusCode)
+	if rec := serve(handler, http.MethodPut, "/api/config", `{"mode":"coding"}`, ""); rec.Code != http.StatusOK {
+		t.Fatalf("config put status=%d", rec.Code)
 	}
 }
 
 func TestRateLimit(t *testing.T) {
-	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1, 1))
-	server := httptest.NewServer(handler.Routes())
-	defer server.Close()
-	resp, err := http.Get(server.URL + "/api/health")
-	if err != nil {
-		t.Fatal(err)
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1, 1)).Routes()
+	if rec := serve(handler, http.MethodGet, "/api/health", "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("first status=%d", rec.Code)
 	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("first status=%d", resp.StatusCode)
-	}
-	resp, err = http.Get(server.URL + "/api/health")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resp.StatusCode != http.StatusTooManyRequests {
-		t.Fatalf("second status=%d", resp.StatusCode)
+	if rec := serve(handler, http.MethodGet, "/api/health", "", ""); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second status=%d", rec.Code)
 	}
 }
-

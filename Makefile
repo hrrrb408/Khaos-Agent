@@ -3,7 +3,7 @@
 PYTHON ?= python3.11
 
 dev:
-	PYTHONPATH=python $(PYTHON) -m khaos.cli.main
+	./start.sh
 
 build:
 	@echo "P0-A has no compiled artifacts yet"
@@ -14,7 +14,7 @@ test-python:
 	PYTHONPATH=python $(PYTHON) -m pytest python/tests
 
 test-go:
-	@if ! command -v go >/dev/null 2>&1; then echo "go: toolchain not installed, skipping"; elif [ -d go ] && find go -name '*.go' | grep -q .; then cd go && go test ./...; else echo "go: no tests"; fi
+	@if ! command -v go >/dev/null 2>&1; then echo "go: toolchain not installed, skipping"; elif [ -d go ] && find go -name '*.go' | grep -q .; then mkdir -p .cache/go-build && cd go && GOCACHE=$(CURDIR)/.cache/go-build go test ./...; else echo "go: no tests"; fi
 
 test-rust:
 	@if [ -d rust ] && find rust -name 'Cargo.toml' | grep -q .; then cd rust/khaos-core && cargo test; else echo "rust: no P0-A tests"; fi

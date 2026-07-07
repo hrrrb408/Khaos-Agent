@@ -11,6 +11,7 @@ from typing import AsyncIterator
 
 from khaos.agent.core import Message
 from khaos.exceptions import ModelUnavailableError
+from khaos.routing.model_client import ModelClient
 from khaos.routing.provider import ModelSpec, ProviderConfig, ProviderManager
 
 
@@ -27,9 +28,15 @@ class RoutingRule:
 class ModelRouter:
     """Function router with provider-aware fallback and mock streaming."""
 
-    def __init__(self, provider_manager: ProviderManager | None = None, mock_response: str = "Khaos mock response."):
+    def __init__(
+        self,
+        provider_manager: ProviderManager | None = None,
+        mock_response: str = "Khaos mock response.",
+        model_client: ModelClient | None = None,
+    ):
         self.provider_manager = provider_manager or _default_provider_manager()
         self.mock_response = mock_response
+        self.model_client = model_client or ModelClient()
         self._rules: dict[str, RoutingRule] = {}
 
     def set_rule(self, function: str, rule: RoutingRule) -> None:
@@ -60,7 +67,12 @@ class ModelRouter:
         **kwargs,
     ) -> AsyncIterator[Message]:
         """Stream mock model text chunks for the resolved function."""
-        await self.resolve_model(function)
+        model = await self.resolve_model(function)
+        provider = self.provider_manager.get_provider(model.provider)
+        if not provider.base_url.startswith("mock://"):
+            async for chunk in self.model_client.stream_chat(provider, model, messages, kwargs.get("tools")):
+                yield chunk
+            return
         tool_call = self._extract_tool_call(messages)
         if tool_call is not None:
             yield Message(role="assistant", content="", tool_calls=[tool_call], stop_reason="tool_use")
@@ -88,7 +100,13 @@ class ModelRouter:
             try:
                 if not self.provider_manager.is_model_available(model_name):
                     continue
-                async for chunk in self._call_resolved(messages, kwargs):
+                model = self.provider_manager.get_model(model_name)
+                provider = self.provider_manager.get_provider(model.provider)
+                if provider.base_url.startswith("mock://"):
+                    stream = self._call_resolved(messages, kwargs)
+                else:
+                    stream = self.model_client.stream_chat(provider, model, messages, kwargs.get("tools"))
+                async for chunk in stream:
                     yield chunk
                 return
             except Exception as exc:

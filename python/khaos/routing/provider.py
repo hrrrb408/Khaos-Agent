@@ -15,6 +15,7 @@ class ProviderConfig:
     name: str
     base_url: str
     api_key: str = ""
+    type: str = "openai_compatible"
     rpm_limit: int = 0
     tpm_limit: int = 0
     timeout: int = 120
@@ -46,6 +47,7 @@ class ProviderManager:
             name=config.name,
             base_url=self._expand_env(config.base_url),
             api_key=self._expand_env(config.api_key),
+            type=config.type,
             rpm_limit=config.rpm_limit,
             tpm_limit=config.tpm_limit,
             timeout=config.timeout,
@@ -79,10 +81,18 @@ class ProviderManager:
     def from_config(cls, config: dict[str, Any]) -> "ProviderManager":
         """Build manager from config.yaml-style dict."""
         manager = cls()
-        for name, provider_data in config.get("providers", {}).items():
+        providers_config = config.get("providers", {})
+        models_config = config.get("models", {})
+        if isinstance(models_config, dict) and "providers" in models_config:
+            providers_config = {
+                name: data
+                for name, data in models_config.get("providers", {}).items()
+            }
+        for name, provider_data in providers_config.items():
             manager.register_provider(
                 ProviderConfig(
                     name=name,
+                    type=str(provider_data.get("type", "openai_compatible")),
                     base_url=str(provider_data.get("base_url", "")),
                     api_key=str(provider_data.get("api_key", "")),
                     rpm_limit=int(provider_data.get("rpm_limit", 0)),
@@ -90,7 +100,20 @@ class ProviderManager:
                     timeout=int(provider_data.get("timeout", 120)),
                 )
             )
-        for name, model_data in config.get("models", {}).items():
+        if isinstance(models_config, dict) and "providers" in models_config:
+            flattened_models: dict[str, dict[str, Any]] = {}
+            for provider_name, provider_data in models_config.get("providers", {}).items():
+                for model_data in provider_data.get("models", []):
+                    model_name = str(model_data["name"])
+                    flattened_models[model_name] = {
+                        **model_data,
+                        "provider": provider_name,
+                        "model": model_name,
+                    }
+            models_config = flattened_models
+        for name, model_data in models_config.items():
+            if name in {"providers", "default_model", "router"}:
+                continue
             manager.register_model(
                 name,
                 ModelSpec(
@@ -109,4 +132,3 @@ class ProviderManager:
     def _expand_env(value: str) -> str:
         pattern = re.compile(r"\$\{([^}]+)\}")
         return pattern.sub(lambda match: os.environ.get(match.group(1), ""), value)
-

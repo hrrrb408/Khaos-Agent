@@ -1,42 +1,31 @@
 database:
   path: khaos.db
 
-routing:
-  provider: mock
-  functions:
-    agent_loop: mock-provider/mock-office
-    coding: mock-provider/mock-coding
-    compression: mock-provider/mock-compression
-
-providers:
-  mock-provider:
-    base_url: mock://local
-    api_key: ""
-    rpm_limit: 0
-    tpm_limit: 0
-    timeout: 120
-
 models:
-  mock-provider/mock-office:
-    provider: mock-provider
-    model: mock-provider/mock-office
-    max_context_tokens: 128000
-    supports_streaming: true
-    supports_tools: true
-  mock-provider/mock-coding:
-    provider: mock-provider
-    model: mock-provider/mock-coding
-    max_context_tokens: 128000
-    supports_streaming: true
-    supports_tools: true
-  mock-provider/mock-compression:
-    provider: mock-provider
-    model: mock-provider/mock-compression
-    max_context_tokens: 128000
-    supports_streaming: true
-    supports_tools: false
+  providers:
+    nvidia:
+      type: openai_compatible
+      base_url: "https://integrate.api.nvidia.com/v1"
+      api_key: "${NVIDIA_API_KEY}"
+      timeout: 120
+      models:
+        - name: "qwen/qwen3-8b"
+          max_context_tokens: 32768
+          supports_tools: true
+          supports_vision: false
+  default_model: "qwen/qwen3-8b"
+  router:
+    type: single
 
 defaults:
   mode: office
   stream_timeout: 120
   compression_threshold: 128000
+
+gateway:
+  api_key: "${KHAOS_API_KEY}"
+  python_agent: "127.0.0.1:50051"
+  listen: "127.0.0.1:8080"
+
+web:
+  port: 3000

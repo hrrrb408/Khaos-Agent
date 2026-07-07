@@ -9,11 +9,10 @@ func Middleware(apiKey string, next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.Header.Get("X-Khaos-Key") != apiKey {
+		if r.Header.Get("X-Khaos-Key") != apiKey && r.URL.Query().Get("key") != apiKey {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
 }
-

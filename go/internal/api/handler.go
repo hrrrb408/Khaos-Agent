@@ -17,16 +17,16 @@ import (
 
 // Handler serves Khaos Phase 2 REST and SSE endpoints.
 type Handler struct {
-	agent      AgentClient
-	memory     MemoryClient
-	config     ConfigStore
-	limiter    *rate.TokenBucket
-	apiKey     string
-	startedAt  time.Time
-	mu         sync.Mutex
-	streams    map[string]<-chan ChatEvent
-	sessions   map[string]ChatRequest
-	tools      []map[string]any
+	agent     AgentClient
+	memory    MemoryClient
+	config    ConfigStore
+	limiter   *rate.TokenBucket
+	apiKey    string
+	startedAt time.Time
+	mu        sync.Mutex
+	streams   map[string]<-chan ChatEvent
+	sessions  map[string]ChatRequest
+	tools     []map[string]any
 }
 
 // NewHandler creates an API handler.
@@ -64,7 +64,20 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/config", h.handleConfigGet)
 	mux.HandleFunc("PUT /api/config", h.handleConfigSet)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
-	return auth.Middleware(h.apiKey, h.rateLimit(mux))
+	return h.cors(auth.Middleware(h.apiKey, h.rateLimit(mux)))
+}
+
+func (h *Handler) cors(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Khaos-Key")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (h *Handler) rateLimit(next http.Handler) http.Handler {
@@ -90,7 +103,7 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	if req.SessionID == "" {
 		req.SessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
 	}
-	stream, err := h.agent.Chat(r.Context(), req)
+	stream, err := h.agent.Chat(context.Background(), req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -142,7 +155,7 @@ func (h *Handler) handleConfirm(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleMode(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		SessionID   string `json:"session_id"`
+		SessionID  string `json:"session_id"`
 		TargetMode string `json:"target_mode"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -363,4 +376,3 @@ func (c *MapConfig) Set(value map[string]any) {
 	defer c.mu.Unlock()
 	c.value = value
 }
-
