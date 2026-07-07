@@ -20,7 +20,7 @@ class ChatPanel(RichLog):
     """
 
     def __init__(self) -> None:
-        super().__init__(markup=True, wrap=True, auto_scroll=True)
+        super().__init__(wrap=True, auto_scroll=True)
 
     def append_message(self, message: Message) -> None:
         """Render one agent message into the log."""

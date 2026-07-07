@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import json
 import shlex
 import uuid
@@ -251,25 +252,58 @@ def _tool_call_from_parts(parts: list[str]) -> dict | None:
     return None
 
 
-def create_default_router() -> ModelRouter:
-    """Create the P0-A router with office and coding function rules."""
-    router = ModelRouter()
-    router.set_rule(
-        "agent_loop",
-        RoutingRule(function="agent_loop", primary_model="mock-provider/mock-office"),
-    )
-    router.set_rule(
-        "coding",
-        RoutingRule(
-            function="coding",
-            primary_model="mock-provider/mock-coding",
-            prefer_coding_model=True,
-        ),
-    )
-    router.set_rule(
-        "compression",
-        RoutingRule(function="compression", primary_model="mock-provider/mock-compression"),
-    )
+import os
+
+def create_default_router(config_path: str | None = None) -> ModelRouter:
+    """Create router from config.yaml, falling back to mock if no config.
+
+    Tests can set KHAOS_NO_CONFIG=1 to force mock mode.
+    """
+    import yaml
+
+    # Tests can force mock via env var
+    if os.environ.get("KHAOS_NO_CONFIG"):
+        return _mock_fallback()
+
+    paths = []
+    if config_path:
+        paths.append(config_path)
+    else:
+        paths.extend(["config.yaml", os.path.expanduser("~/.khaos/config.yaml")])
+    config = {}
+    for p in paths:
+        if os.path.isfile(p):
+            with open(p) as f:
+                config = yaml.safe_load(f) or {}
+            break
+
+    models_config = config.get("models", {})
+
+    # Try to build real providers from config
+    if models_config.get("providers"):
+        from khaos.routing.provider import ProviderManager
+
+        pm = ProviderManager.from_config(config)
+        default_model = models_config.get("default_model", "")
+
+        router = ModelRouter(provider_manager=pm)
+        if default_model:
+            router.set_rule("agent_loop", RoutingRule(function="agent_loop", primary_model=default_model))
+            router.set_rule("coding", RoutingRule(function="coding", primary_model=default_model, prefer_coding_model=True))
+            router.set_rule("compression", RoutingRule(function="compression", primary_model=default_model))
+        return router
+
+    # Fallback: mock provider for tests
+    return _mock_fallback()
+
+
+def _mock_fallback() -> ModelRouter:
+    from khaos.routing.provider import ProviderManager, ProviderConfig
+
+    router = ModelRouter(provider_manager=_default_provider_manager())
+    router.set_rule("agent_loop", RoutingRule(function="agent_loop", primary_model="mock-provider/mock-office"))
+    router.set_rule("coding", RoutingRule(function="coding", primary_model="mock-provider/mock-coding", prefer_coding_model=True))
+    router.set_rule("compression", RoutingRule(function="compression", primary_model="mock-provider/mock-compression"))
     return router
 
 

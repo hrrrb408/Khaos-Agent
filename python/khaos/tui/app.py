@@ -180,7 +180,9 @@ class KhaosApp(App):
         chat.append_message(message)
 
     def _echo_user(self, text: str) -> None:
-        self.query_one(ChatPanel).write(f"[cyan]you:[/] {text}", markup=True)
+        from rich.text import Text
+        t = Text.from_markup(f"[cyan]you:[/] {text}")
+        self.query_one(ChatPanel).write(t)
 
     # --- permission flow ---------------------------------------------------
 

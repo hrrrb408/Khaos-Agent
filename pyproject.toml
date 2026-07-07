@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "khaos"
 version = "0.1.0"
@@ -18,6 +22,10 @@ tui = [
     "textual>=0.47",
     "rich>=13",
 ]
+
+[tool.setuptools]
+package-dir = {"" = "python"}
+packages = {find = {where = ["python"]}}
 
 [project.scripts]
 khaos = "khaos.cli.main:main"
