@@ -17,7 +17,6 @@ from khaos.cli.skills_commands import handle_skills_command
 from khaos.cli.sse import encode_sse
 from khaos.config import (
     USER_CONFIG_PATH,
-    check_needs_setup,
     load_config,
     masked_config,
     reset_user_config,
@@ -254,9 +253,6 @@ def main() -> None:
         args.message = sys.stdin.read().strip()
         if args.message:
             raise SystemExit(asyncio.run(run_once(args)))
-    if check_needs_setup():
-        run_setup_wizard()
-        return
     if not args.no_tui and _tui_available():
         from khaos.tui.app import run_tui
 

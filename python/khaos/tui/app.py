@@ -15,6 +15,7 @@ from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.core import Message
 from khaos.agent.error_handler import ErrorHandler
+from khaos.config import PROVIDER_DEFAULTS, check_needs_setup, write_provider_config
 from khaos.db import Database
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
@@ -69,13 +70,15 @@ class KhaosApp(App):
         # Textual's own App attributes.
         self.db: Database | None = None
         self.mode_manager: ModeManager | None = None
-        self.router = create_default_router()
+        self.router = None
         self.memory_manager: MemoryManager | None = None
         self.skill_manager = SkillManager()
         self.agent_loop: AgentLoop | None = None
         self.session_id = str(uuid.uuid4())
         self._pending_confirmations: dict[str, asyncio.Future] = {}
         self._total_tokens = 0
+        self._setup_step = ""
+        self._setup_provider = ""
 
     # --- layout ------------------------------------------------------------
 
@@ -85,8 +88,17 @@ class KhaosApp(App):
         yield StatusBar()
 
     async def on_mount(self) -> None:  # type: ignore[override]
-        await self._bootstrap()
+        configured = await self._bootstrap()
         chat = self.query_one(ChatPanel)
+        if not configured:
+            chat.append_text(
+                f"Khaos ready. session [b]{self.session_id}[/], mode "
+                f"[b]{self._mode_label()}[/].",
+                markdown=False,
+            )
+            self._begin_setup_flow()
+            self._sync_status()
+            return
         chat.append_text(
             f"Khaos ready. session [b]{self.session_id}[/], mode "
             f"[b]{self._mode_label()}[/]. Type /help for commands.",
@@ -94,7 +106,7 @@ class KhaosApp(App):
         )
         self._sync_status()
 
-    async def _bootstrap(self) -> None:
+    async def _bootstrap(self) -> bool:
         self.db = Database(self.db_path)
         await self.db.connect()
         await self.db.run_migrations()
@@ -103,6 +115,15 @@ class KhaosApp(App):
         if self.mode_override:
             await self.mode_manager.switch(ModeManager.parse(self.mode_override))
         await self.db.create_session(self.session_id, self.mode_manager.current_mode.value)
+        if check_needs_setup():
+            return False
+        await self._bootstrap_agent_runtime()
+        return True
+
+    async def _bootstrap_agent_runtime(self) -> None:
+        if self.db is None or self.mode_manager is None:
+            return
+        self.router = create_default_router()
         permission_engine = PermissionEngine(self.db)
         await permission_engine.load_rules()
         memory_store = MemoryStore(self.db)
@@ -135,6 +156,9 @@ class KhaosApp(App):
         """Dispatch user input: commands synchronously, chat asynchronously."""
         value = event.value.strip()
         if not value:
+            return
+        if self._setup_step:
+            self._handle_setup_input(value)
             return
         if is_command(value):
             self._handle_command(value)
@@ -183,6 +207,88 @@ class KhaosApp(App):
         from rich.text import Text
         t = Text.assemble(("you:", "cyan"), " ", text)
         self.query_one(ChatPanel).write(t)
+
+    # --- first-run setup ---------------------------------------------------
+
+    def _begin_setup_flow(self) -> None:
+        self._setup_step = "provider"
+        self._setup_provider = ""
+        self._set_input_secret(False)
+        self._set_input_placeholder("选择 provider [1]")
+        self.query_one(ChatPanel).append_text(
+            "\n[b]检测到未配置模型 API Key[/]\n\n"
+            "支持的 Provider：\n"
+            "  1. NVIDIA NIM (免费额度，推荐)\n"
+            "  2. Anthropic Claude\n"
+            "  3. OpenAI\n\n"
+            "请输入 provider：1/nvidia、2/anthropic 或 3/openai。",
+            markdown=True,
+        )
+
+    def _handle_setup_input(self, value: str) -> None:
+        if self._setup_step == "provider":
+            provider = self._parse_setup_provider(value)
+            if provider is None:
+                self.query_one(ChatPanel).append_error("请输入 1/nvidia、2/anthropic 或 3/openai。")
+                return
+            self._setup_provider = provider
+            self._setup_step = "api_key"
+            self._set_input_secret(True)
+            self._set_input_placeholder("输入 API Key")
+            label = PROVIDER_DEFAULTS[provider]["label"]
+            self.query_one(ChatPanel).append_text(
+                f"已选择 [b]{label}[/]。\n请输入 API Key（输入框会隐藏显示）。",
+                markdown=True,
+            )
+            return
+
+        if self._setup_step == "api_key":
+            api_key = value.strip()
+            if len(api_key) <= 10:
+                self.query_one(ChatPanel).append_error("API Key 不能为空，且长度需要大于 10。")
+                return
+            write_provider_config(self._setup_provider, api_key)
+            self._setup_step = ""
+            self._setup_provider = ""
+            self._set_input_secret(False)
+            self._set_input_placeholder("Message Khaos…  (/help for commands)")
+            self.query_one(ChatPanel).append_text(
+                "✓ 已保存到 ~/.khaos/config.yaml，正在初始化 Agent…",
+                markdown=False,
+            )
+            self.run_worker(self._finish_setup())
+
+    async def _finish_setup(self) -> None:
+        try:
+            await self._bootstrap_agent_runtime()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("setup completed but runtime bootstrap failed")
+            self.query_one(ChatPanel).append_error(f"配置已保存，但 Agent 初始化失败: {exc}")
+            return
+        self.query_one(ChatPanel).append_text("配置完成。Type /help for commands.", markdown=False)
+        self._sync_status()
+
+    @staticmethod
+    def _parse_setup_provider(value: str) -> str | None:
+        aliases = {
+            "": "nvidia",
+            "1": "nvidia",
+            "nvidia": "nvidia",
+            "2": "anthropic",
+            "anthropic": "anthropic",
+            "claude": "anthropic",
+            "3": "openai",
+            "openai": "openai",
+        }
+        return aliases.get(value.strip().lower())
+
+    def _set_input_secret(self, secret: bool) -> None:
+        input_panel = self.query_one(InputPanel)
+        if hasattr(input_panel, "password"):
+            input_panel.password = secret
+
+    def _set_input_placeholder(self, placeholder: str) -> None:
+        self.query_one(InputPanel).placeholder = placeholder
 
     # --- permission flow ---------------------------------------------------
 
@@ -238,6 +344,9 @@ class KhaosApp(App):
         bar.set_mode(self._mode_label())
         bar.set_session(self.session_id)
         bar.set_tokens(self._total_tokens)
+        if self.router is None:
+            bar.set_model("setup")
+            return
         try:
             model = next(iter(self.router.provider_manager._models.keys()), "mock")
             bar.set_model(model)

@@ -28,7 +28,7 @@ def test_app_constructs_with_runtime(tmp_path):
 
     # Construction wires the runtime handles without needing a live DB.
     assert app.session_id  # a uuid was generated
-    assert app.router is not None
+    assert app.router is None
     assert app.skill_manager is not None
     # The default mode reflects the override-free state.
     assert app._mode_label() == "office"
