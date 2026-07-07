@@ -77,6 +77,27 @@ class ProviderManager:
         """Return whether a model can currently serve requests."""
         return self.get_model(name).available
 
+    def provider_clients(self):
+        """Build and cache a BaseProvider per registered provider.
+
+        Returns a dict of provider name -> provider instance. Lazily imports
+        the providers package so the type registry is populated on first use.
+        """
+        from khaos.routing.providers import build_provider
+
+        cached = getattr(self, "_provider_clients", None)
+        if cached is not None:
+            return cached
+        self._provider_clients = {
+            name: build_provider(config) for name, config in self._providers.items()
+        }
+        return self._provider_clients
+
+    def provider_for_model(self, model_name: str):
+        """Return the BaseProvider that serves ``model_name``."""
+        spec = self.get_model(model_name)
+        return self.provider_clients()[spec.provider]
+
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "ProviderManager":
         """Build manager from config.yaml-style dict."""

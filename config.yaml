@@ -13,6 +13,28 @@ models:
           max_context_tokens: 32768
           supports_tools: true
           supports_vision: false
+    # Anthropic Claude (Messages API). Uncomment and set ANTHROPIC_API_KEY to enable.
+    anthropic:
+      type: anthropic
+      base_url: "https://api.anthropic.com"
+      api_key: "${ANTHROPIC_API_KEY}"
+      timeout: 120
+      models:
+        - name: "claude-sonnet-4-20250514"
+          max_context_tokens: 200000
+          supports_tools: true
+          supports_vision: true
+    # Native OpenAI (wire-compatible with the OpenAI-compatible provider).
+    openai:
+      type: openai
+      base_url: "https://api.openai.com/v1"
+      api_key: "${OPENAI_API_KEY}"
+      timeout: 120
+      models:
+        - name: "gpt-4o"
+          max_context_tokens: 128000
+          supports_tools: true
+          supports_vision: true
   default_model: "qwen/qwen3-8b"
   router:
     type: single

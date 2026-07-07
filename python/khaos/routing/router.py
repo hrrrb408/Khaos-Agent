@@ -122,7 +122,10 @@ class ModelRouter:
         """Stream a response from a specific model by name.
 
         This is the per-model entry point used by the MoA runner; it bypasses
-        function routing and goes straight to the provider.
+        function routing and dispatches to the provider that owns the model.
+        OpenAI-compatible providers reuse the shared ModelClient; any other
+        registered provider type (e.g. Anthropic) is served by its own
+        BaseProvider implementation via ``provider_clients()``.
         """
         if not self.provider_manager.is_model_available(model_name):
             raise ModelUnavailableError(f"model not available: {model_name}")
@@ -130,6 +133,14 @@ class ModelRouter:
         provider = self.provider_manager.get_provider(model.provider)
         if provider.base_url.startswith("mock://"):
             async for chunk in self._call_resolved(messages, kwargs):
+                yield chunk
+            return
+        # Route non-OpenAI providers through their dedicated BaseProvider.
+        if provider.type not in {"", "openai_compatible", "openai"}:
+            client = self.provider_manager.provider_clients()[provider.name]
+            async for chunk in client.stream_chat(
+                model, messages, kwargs.get("tools")
+            ):
                 yield chunk
             return
         async for chunk in self.model_client.stream_chat(
