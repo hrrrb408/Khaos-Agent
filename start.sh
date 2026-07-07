@@ -9,6 +9,11 @@ GO_BIN="${GO:-go}"
 NPM_BIN="${NPM:-npm}"
 
 cd "$ROOT"
+mkdir -p "$ROOT/.cache"
+
+# start.sh does not clear or sandbox the environment. Variables exported in the
+# launching shell (for example NVIDIA_API_KEY) are inherited by both the Python
+# AgentService and the Go gateway processes below.
 
 PY_PID=""
 GO_PID=""

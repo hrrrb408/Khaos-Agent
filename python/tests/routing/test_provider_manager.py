@@ -2,6 +2,7 @@ import os
 
 import pytest
 
+from khaos.config import ConfigError
 from khaos.routing import ModelSpec, ProviderConfig, ProviderManager
 
 
@@ -14,6 +15,16 @@ def test_provider_expands_env_api_key(monkeypatch):
     )
 
     assert manager.get_provider("openai").api_key == "secret"
+
+
+def test_provider_missing_env_api_key_raises(monkeypatch):
+    monkeypatch.delenv("KHAOS_MISSING_KEY", raising=False)
+    manager = ProviderManager()
+
+    with pytest.raises(ConfigError, match="KHAOS_MISSING_KEY"):
+        manager.register_provider(
+            ProviderConfig(name="openai", base_url="https://api.example", api_key="${KHAOS_MISSING_KEY}")
+        )
 
 
 def test_register_model_requires_provider():

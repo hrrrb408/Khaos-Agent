@@ -11,6 +11,12 @@ from dataclasses import dataclass, field
 from typing import AsyncIterator
 
 from khaos.agent.core import Message
+from khaos.config import (
+    config_for_models,
+    expand_config_placeholders,
+    expand_env_placeholders,
+    load_config,
+)
 from khaos.exceptions import ModelUnavailableError
 from khaos.routing.model_client import ModelClient
 from khaos.routing.provider import ModelSpec, ProviderConfig, ProviderManager
@@ -251,18 +257,13 @@ def _tool_call_from_parts(parts: list[str]) -> dict | None:
         }
     return None
 
-
-import os
-
-def create_default_router(config_path: str | None = None) -> ModelRouter:
+def create_default_router(config_path: str | None = None, *, honor_no_config: bool = True) -> ModelRouter:
     """Create router from config.yaml, falling back to mock if no config.
 
     Tests can set KHAOS_NO_CONFIG=1 to force mock mode.
     """
-    import yaml
-
     # Tests can force mock via env var
-    if os.environ.get("KHAOS_NO_CONFIG"):
+    if honor_no_config and os.environ.get("KHAOS_NO_CONFIG"):
         return _mock_fallback()
 
     paths = []
@@ -272,9 +273,9 @@ def create_default_router(config_path: str | None = None) -> ModelRouter:
         paths.extend(["config.yaml", os.path.expanduser("~/.khaos/config.yaml")])
     config = {}
     for p in paths:
-        if os.path.isfile(p):
-            with open(p) as f:
-                config = yaml.safe_load(f) or {}
+        expanded_path = expand_env_placeholders(os.path.expanduser(p), source="router config path")
+        if os.path.isfile(expanded_path):
+            config = load_config(expanded_path, strict_env=False)
             break
 
     models_config = config.get("models", {})
@@ -283,8 +284,10 @@ def create_default_router(config_path: str | None = None) -> ModelRouter:
     if models_config.get("providers"):
         from khaos.routing.provider import ProviderManager
 
-        pm = ProviderManager.from_config(config)
         default_model = models_config.get("default_model", "")
+        active_config = config_for_models(config, {str(default_model)} if default_model else set())
+        active_config = expand_config_placeholders(active_config, strict=True)
+        pm = ProviderManager.from_config(active_config)
 
         router = ModelRouter(provider_manager=pm)
         if default_model:

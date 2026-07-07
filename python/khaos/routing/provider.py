@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import os
-import re
 from dataclasses import dataclass
 from typing import Any
+
+from khaos.config import expand_env_placeholders
 
 
 @dataclass(frozen=True)
@@ -40,6 +40,16 @@ class ProviderManager:
     def __init__(self):
         self._providers: dict[str, ProviderConfig] = {}
         self._models: dict[str, ModelSpec] = {}
+
+    @property
+    def providers(self) -> dict[str, ProviderConfig]:
+        """Registered provider configs keyed by provider name."""
+        return self._providers
+
+    @property
+    def models(self) -> dict[str, ModelSpec]:
+        """Registered model specs keyed by logical model name."""
+        return self._models
 
     def register_provider(self, config: ProviderConfig) -> None:
         """Register provider config."""
@@ -151,5 +161,4 @@ class ProviderManager:
 
     @staticmethod
     def _expand_env(value: str) -> str:
-        pattern = re.compile(r"\$\{([^}]+)\}")
-        return pattern.sub(lambda match: os.environ.get(match.group(1), ""), value)
+        return expand_env_placeholders(value, source="provider config")

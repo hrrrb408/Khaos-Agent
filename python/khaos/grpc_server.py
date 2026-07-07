@@ -31,7 +31,7 @@ from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.rust_bridge import get_token_engine
 from khaos.routing.router import create_default_router
-from khaos.routing import ModelRouter, ProviderManager, RoutingRule
+from khaos.routing import ModelRouter
 from khaos.skills import SkillManager
 from khaos.tools import create_runtime_registry
 from khaos.tools.scheduler import ToolScheduler
@@ -254,21 +254,7 @@ def load_router_from_config(config_path: Path) -> ModelRouter:
     """Load model router from config.yaml, falling back to mock when absent."""
     if not config_path.exists():
         return create_default_router()
-    import yaml
-
-    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    models_config = config.get("models")
-    if not isinstance(models_config, dict) or not models_config.get("providers"):
-        return create_default_router()
-    provider_manager = ProviderManager.from_config(config)
-    default_model = str(models_config.get("default_model", ""))
-    if not default_model:
-        return create_default_router()
-    router = ModelRouter(provider_manager)
-    router.set_rule("agent_loop", RoutingRule("agent_loop", default_model, []))
-    router.set_rule("coding", RoutingRule("coding", default_model, [], prefer_coding_model=True))
-    router.set_rule("compression", RoutingRule("compression", default_model, []))
-    return router
+    return create_default_router(str(config_path), honor_no_config=False)
 
 
 def _message_to_event(message) -> dict:
