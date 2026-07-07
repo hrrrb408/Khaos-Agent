@@ -16,6 +16,13 @@ models:
   default_model: "qwen/qwen3-8b"
   router:
     type: single
+  moa:
+    enabled: false
+    pipelines:
+      - name: "draft+review"
+        proposers: ["qwen/qwen3-8b"]
+        aggregator: "qwen/qwen3-8b"
+        rounds: 1
 
 defaults:
   mode: office

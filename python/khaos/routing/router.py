@@ -113,6 +113,64 @@ class ModelRouter:
                 errors.append(f"{model_name}: {exc}")
         raise ModelUnavailableError("; ".join(errors) or f"no available model for function: {function}")
 
+    async def call_model(
+        self,
+        model_name: str,
+        messages: list[Message],
+        **kwargs,
+    ) -> AsyncIterator[Message]:
+        """Stream a response from a specific model by name.
+
+        This is the per-model entry point used by the MoA runner; it bypasses
+        function routing and goes straight to the provider.
+        """
+        if not self.provider_manager.is_model_available(model_name):
+            raise ModelUnavailableError(f"model not available: {model_name}")
+        model = self.provider_manager.get_model(model_name)
+        provider = self.provider_manager.get_provider(model.provider)
+        if provider.base_url.startswith("mock://"):
+            async for chunk in self._call_resolved(messages, kwargs):
+                yield chunk
+            return
+        async for chunk in self.model_client.stream_chat(
+            provider, model, messages, kwargs.get("tools")
+        ):
+            yield chunk
+
+    async def call_moa(
+        self,
+        messages: list[Message],
+        moa_config,
+        pipeline_name: str | None = None,
+        **kwargs,
+    ) -> AsyncIterator[Message]:
+        """Run a Mixture-of-Agents pipeline.
+
+        ``moa_config`` is a :class:`~khaos.routing.moa.MoAConfig`. When it is
+        disabled or has no pipelines, this raises ModelUnavailableError so the
+        caller can decide whether to fall back to a normal ``call``.
+        """
+        from khaos.routing.moa import MoARunner
+
+        pipeline = moa_config.pipeline(pipeline_name) if moa_config else None
+        if pipeline is None:
+            raise ModelUnavailableError(
+                "MoA disabled or pipeline not found: "
+                f"{pipeline_name or '<default>'}"
+            )
+        runner = MoARunner(self._moa_caller(kwargs))
+        async for chunk in runner.run(pipeline, messages):
+            yield chunk
+
+    def _moa_caller(self, kwargs: dict):
+        """Build a (model_name, messages) -> stream callable bound to this router."""
+
+        async def caller(model_name: str, msgs: list[Message]):  # type: ignore[no-untyped-def]
+            async for chunk in self.call_model(model_name, msgs, **kwargs):
+                yield chunk
+
+        return caller
+
     async def _call_resolved(self, messages: list[Message], kwargs: dict) -> AsyncIterator[Message]:
         tool_call = self._extract_tool_call(messages)
         if tool_call is not None:
