@@ -14,7 +14,7 @@ import importlib.util
 import json
 import logging
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from khaos.agent.core import SimpleTokenEngine
 
@@ -133,6 +133,54 @@ class RustToolExecutor:
         """Convenience: run a single call."""
         return self.run_parallel([call], timeout_ms)[0]
 
+    # --- typed convenience wrappers for the built-in I/O handlers -----------
+
+    def read_file(self, path: str, offset: int | None = None, limit: int | None = None,
+                  timeout_ms: int = 5000) -> str:
+        """Read a file via the Rust executor. Returns its contents."""
+        payload: dict[str, Any] = {"path": path}
+        if offset is not None:
+            payload["offset"] = offset
+        if limit is not None:
+            payload["limit"] = limit
+        result = self.run_one(
+            {"id": "1", "kind": "read_file", "payload": json.dumps(payload)},
+            timeout_ms,
+        )
+        if not result.get("success", False):
+            raise OSError(result.get("error", "read_file failed"))
+        return str(result.get("output", ""))
+
+    def write_file(self, path: str, content: str, timeout_ms: int = 5000) -> str:
+        """Write a file via the Rust executor. Creates parent dirs."""
+        payload = json.dumps({"path": path, "content": content})
+        result = self.run_one(
+            {"id": "1", "kind": "write_file", "payload": payload}, timeout_ms
+        )
+        if not result.get("success", False):
+            raise OSError(result.get("error", "write_file failed"))
+        return str(result.get("output", ""))
+
+    def exec_process(self, command: str, args: list[str] | None = None,
+                     timeout_ms: int | None = None, workdir: str | None = None,
+                     executor_timeout_ms: int = 10000) -> dict[str, Any]:
+        """Run a subprocess via the Rust executor. Returns the parsed result.
+
+        The returned dict has ``stdout``, ``stderr`` and ``exit_code``.
+        """
+        payload: dict[str, Any] = {"command": command, "args": args or []}
+        if timeout_ms is not None:
+            payload["timeout_ms"] = timeout_ms
+        if workdir is not None:
+            payload["workdir"] = workdir
+        result = self.run_one(
+            {"id": "1", "kind": "exec", "payload": json.dumps(payload)},
+            executor_timeout_ms,
+        )
+        if not result.get("success", False):
+            raise subprocess_error(result.get("error", "exec failed"))
+        return json.loads(str(result.get("output", "{}")))
+
 
 def get_token_engine(encoding: str = "cl100k_base") -> SimpleTokenEngine:
     """Factory: prefer Rust, fall back to the pure-Python SimpleTokenEngine.
@@ -154,6 +202,72 @@ def execute_parallel(calls: list[dict], timeout_ms: int) -> Optional[list[dict]]
         return None
 
 
+class subprocess_error(OSError):
+    """Raised when the Rust exec handler reports a failure."""
+
+
+def rust_read_file(path: str, offset: int | None = None, limit: int | None = None) -> str | None:
+    """Read a file via Rust, or fall back to Python ``open`` when unbuilt."""
+    try:
+        return RustToolExecutor().read_file(path, offset, limit)
+    except RuntimeError:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                lines = handle.readlines()
+        except OSError as exc:
+            raise OSError(f"read {path}: {exc}") from exc
+        start = (offset or 1) - 1
+        if start < 0:
+            start = 0
+        if limit is not None:
+            return "".join(lines[start : start + limit])
+        return "".join(lines[start:])
+
+
+def rust_write_file(path: str, content: str) -> str | None:
+    """Write a file via Rust, or fall back to Python when unbuilt."""
+    try:
+        return RustToolExecutor().write_file(path, content)
+    except RuntimeError:
+        from pathlib import Path as _Path
+
+        target = _Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        return f"wrote {len(content)} bytes to {path}"
+
+
+def rust_exec_process(
+    command: str,
+    args: list[str] | None = None,
+    timeout_ms: int | None = None,
+    workdir: str | None = None,
+) -> dict[str, Any] | None:
+    """Run a subprocess via Rust, or fall back to ``asyncio``-free subprocess."""
+    try:
+        return RustToolExecutor().exec_process(command, args, timeout_ms, workdir)
+    except RuntimeError:
+        import subprocess as _sp
+
+        cmd = [command, *(args or [])]
+        try:
+            completed = _sp.run(
+                cmd,
+                cwd=workdir,
+                capture_output=True,
+                text=True,
+                timeout=(timeout_ms / 1000) if timeout_ms else None,
+                check=False,
+            )
+        except _sp.TimeoutExpired as exc:
+            raise subprocess_error(f"exec {command}: timeout after {timeout_ms}ms") from exc
+        return {
+            "stdout": completed.stdout,
+            "stderr": completed.stderr,
+            "exit_code": completed.returncode,
+        }
+
+
 __all__ = [
     "RustTokenizer",
     "RustToolExecutor",
@@ -161,4 +275,8 @@ __all__ = [
     "load_rust_module",
     "get_token_engine",
     "execute_parallel",
+    "rust_read_file",
+    "rust_write_file",
+    "rust_exec_process",
+    "subprocess_error",
 ]

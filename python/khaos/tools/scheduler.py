@@ -76,10 +76,17 @@ class ToolScheduler:
         registry: ToolRegistry,
         permission_engine,
         budget: ToolBudget | None = None,
+        use_rust_executor: bool = False,
     ):
         self.registry = registry
         self.permission_engine = permission_engine
         self.budget = budget or ToolBudget()
+        # When True and the Rust bridge is importable, read-only file reads in
+        # the parallel group are offloaded to the Rust executor for the bulk
+        # I/O; the result still flows through the normal Python handler so
+        # output formatting (line numbers, truncation) is unchanged. Writes and
+        # any tool without a Rust fast path keep using the asyncio handler.
+        self.use_rust_executor = use_rust_executor
 
     async def execute_batch(
         self,
