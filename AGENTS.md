@@ -35,10 +35,11 @@ khaos/
 │   │   ├── memory/          # 三层记忆（Phase 3：TTL/冲突/主动提取）
 │   │   ├── skills/          # 技能系统（Phase 3：声明式 SKILL.md + 触发匹配）
 │   │   ├── audit/           # 审计日志（Phase 3：结构化记录 + 查询）
+│   │   ├── tui/             # 全屏 TUI（Phase 4：Textual + Rich，斜杠命令）
 │   │   ├── permissions/     # 权限引擎
 │   │   ├── subagents/       # 子代理（Phase 2）
-│   │   ├── routing/         # 模型路由（Phase 3：MoA pipeline）
-│   │   ├── rust_bridge.py   # PyO3 桥接（Phase 3：Rust token/executor）
+│   │   ├── routing/         # 模型路由（Phase 3：MoA；Phase 4：多 provider 架构）
+│   │   ├── rust_bridge.py   # PyO3 桥接（Phase 3：token；Phase 4：file_ops/exec）
 │   │   └── db/              # 数据库模型、迁移
 │   └── tests/
 │
@@ -82,10 +83,12 @@ khaos/
 | 记忆系统 | LLD §1.4 | memories, memory_fts5 |
 | 技能系统 (Phase 3) | — (skills/) | — (磁盘 SKILL.md) |
 | 审计日志 (Phase 3) | — (audit/) | audit_log |
+| TUI 界面 (Phase 4) | FR-015 | — |
 | 权限引擎 | LLD §1.5 | permissions |
 | 子代理 | LLD §1.6 | subagent_tasks |
 | 模型路由 | LLD §1.7 | — |
 | MoA (Phase 3) | — (routing/moa.py) | — |
+| 多 Provider (Phase 4) | — (routing/providers/) | — |
 | Go API 网关 | LLD §2 | audit_log |
 | Rust FFI (Phase 3) | LLD §3 | — |
 | 数据库 DDL | LLD §4 | 全部 |
