@@ -29,8 +29,10 @@ from khaos.memory import (
 )
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
+from khaos.rust_bridge import get_token_engine
 from khaos.routing.router import create_default_router
 from khaos.routing import ModelRouter, ProviderManager, RoutingRule
+from khaos.skills import SkillManager
 from khaos.tools import create_runtime_registry
 from khaos.tools.scheduler import ToolScheduler
 
@@ -100,6 +102,15 @@ class AgentService:
             intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
         )
         compressor = ContextCompressor(router, memory_manager=memory_manager)
+        # Prefer the Rust tokenizer for accurate counts; transparently fall back
+        # to the pure-Python SimpleTokenEngine when the extension is not built.
+        token_engine = get_token_engine()
+        # Load any on-disk skills (skills/ at the project root). Empty registry
+        # means no skill_manager is wired, preserving prior behavior.
+        skill_manager = SkillManager()
+        skills_dir = self.project_root / "skills"
+        if skills_dir.is_dir():
+            skill_manager.load_from_dir(skills_dir)
         loop = AgentLoop(
             AgentConfig(),
             mode_manager,
@@ -110,6 +121,8 @@ class AgentService:
             context_compressor=compressor,
             memory_manager=memory_manager,
             error_handler=ErrorHandler(db=self.db, router=router, compressor=compressor),
+            token_engine=token_engine,
+            skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
         )
         return mode_manager, loop
 

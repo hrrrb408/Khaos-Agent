@@ -135,3 +135,53 @@ models:
 
     assert model.model == "qwen/qwen3-8b"
     assert provider.api_key == "secret"
+
+
+async def test_build_runtime_wires_token_engine_and_skills(tmp_path):
+    """_build_runtime must assemble a working token engine and (if present)
+    a skill_manager. The token engine is Rust when available, else the pure-
+    Python fallback; either way it must count tokens."""
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding", encoding="utf-8")
+    # Plant a skill on disk so the manager picks it up.
+    skills_dir = tmp_path / "skills"
+    skills_dir.mkdir()
+    (skills_dir / "SKILL.md").write_text(
+        "---\nname: py\ndescription: python.\ntriggers: [python]\n---\nuse type hints\n",
+        encoding="utf-8",
+    )
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+
+    _, loop = await service._build_runtime("s1", "office")
+
+    # Token engine works for ASCII text either way.
+    assert loop.token_engine.count_tokens("hello world") == 2
+    # Skill was loaded and matched the planted trigger.
+    assert loop.skill_manager is not None
+    matched = loop.skill_manager.match("office", "help with python")
+    assert any(s.name == "py" for s in matched)
+    await db.close()
+
+
+async def test_audit_service_query_roundtrip(tmp_path):
+    """The JSON-line AuditService.Query returns persisted records."""
+    from khaos.audit import AuditLogger
+    from khaos.grpc_server import AuditService
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    logger = AuditLogger(db)
+    service = AuditService(logger)
+
+    await logger.log("write_file", "/tmp/x", "success", {"size": 1})
+    entries = await service.query(limit=10)
+
+    assert len(entries) == 1
+    assert entries[0]["action"] == "write_file"
+    assert entries[0]["result"] == "success"
+    await db.close()

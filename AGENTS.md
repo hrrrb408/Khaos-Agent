@@ -32,27 +32,30 @@ khaos/
 │   │   ├── agent/           # Agent 核心循环、上下文、压缩
 │   │   ├── modes/           # 模式管理
 │   │   ├── tools/           # 工具注册、调度、实现
-│   │   ├── memory/          # 三层记忆
+│   │   ├── memory/          # 三层记忆（Phase 3：TTL/冲突/主动提取）
+│   │   ├── skills/          # 技能系统（Phase 3：声明式 SKILL.md + 触发匹配）
+│   │   ├── audit/           # 审计日志（Phase 3：结构化记录 + 查询）
 │   │   ├── permissions/     # 权限引擎
 │   │   ├── subagents/       # 子代理（Phase 2）
-│   │   ├── routing/         # 模型路由
+│   │   ├── routing/         # 模型路由（Phase 3：MoA pipeline）
+│   │   ├── rust_bridge.py   # PyO3 桥接（Phase 3：Rust token/executor）
 │   │   └── db/              # 数据库模型、迁移
 │   └── tests/
 │
 ├── go/                      # 中间层：API 网关
 │   ├── cmd/gateway/         # 入口
 │   └── internal/
-│       ├── api/             # REST/SSE 端点
+│       ├── api/             # REST/SSE 端点（含 /api/audit）
 │       ├── auth/            # 认证
 │       ├── rate/            # 限流
 │       └── platform/        # 平台接入
 │
 ├── rust/                    # 底层：性能瓶颈
-│   └── khaos-core/src/
-│       ├── token/           # Token 解析计数
-│       ├── executor/        # 工具并行执行
-│       ├── sandbox/         # Docker 沙箱
-│       └── fts/              # FTS5 全文索引
+│   └── khaos-core/          # Phase 3：PyO3 cdylib _khaos_core
+│       ├── src/
+│       │   ├── token.rs     # Token 启发式计数
+│       │   └── executor.rs  # 并行执行器（tokio）
+│       └── .cargo/config.toml # macOS dynamic_lookup 链接
 │
 ├── prompts/                 # System Prompt 文件
 │   ├── office.md
@@ -77,11 +80,14 @@ khaos/
 | 模式管理 | LLD §1.2 | user_config |
 | 工具系统 | LLD §1.3 | tools |
 | 记忆系统 | LLD §1.4 | memories, memory_fts5 |
+| 技能系统 (Phase 3) | — (skills/) | — (磁盘 SKILL.md) |
+| 审计日志 (Phase 3) | — (audit/) | audit_log |
 | 权限引擎 | LLD §1.5 | permissions |
 | 子代理 | LLD §1.6 | subagent_tasks |
 | 模型路由 | LLD §1.7 | — |
+| MoA (Phase 3) | — (routing/moa.py) | — |
 | Go API 网关 | LLD §2 | audit_log |
-| Rust FFI | LLD §3 | — |
+| Rust FFI (Phase 3) | LLD §3 | — |
 | 数据库 DDL | LLD §4 | 全部 |
 
 ---
