@@ -8,11 +8,22 @@ import sys
 import uuid
 from pathlib import Path
 
+import yaml
+
 from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.error_handler import ErrorHandler
 from khaos.cli.skills_commands import handle_skills_command
 from khaos.cli.sse import encode_sse
+from khaos.config import (
+    USER_CONFIG_PATH,
+    check_needs_setup,
+    load_config,
+    masked_config,
+    reset_user_config,
+    run_setup_wizard,
+    set_user_config_value,
+)
 from khaos.db import Database
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
@@ -152,6 +163,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def handle_config_command(argv: list[str]) -> int:
+    """Handle `khaos config` management commands."""
+    if not argv:
+        config = masked_config(load_config(strict_env=False))
+        print(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), end="")
+        return 0
+
+    command = argv[0]
+    if command == "setup":
+        run_setup_wizard()
+        return 0
+    if command == "set":
+        if len(argv) != 3:
+            print("usage: khaos config set <key> <value>", file=sys.stderr)
+            return 2
+        target = set_user_config_value(argv[1], argv[2])
+        print(f"✓ 已保存到 {target}")
+        return 0
+    if command == "reset":
+        removed = reset_user_config()
+        if removed:
+            print(f"✓ 已删除 {USER_CONFIG_PATH}")
+        else:
+            print(f"{USER_CONFIG_PATH} 不存在")
+        return 0
+
+    print("usage: khaos config [setup|set <key> <value>|reset]", file=sys.stderr)
+    return 2
+
+
 def _confirm_from_args(args: argparse.Namespace):
     def confirm(request: dict) -> dict:
         if args.yes:
@@ -199,14 +240,23 @@ def main() -> None:
       2. Interactive TTY, no ``--no-tui``, and textual installed -> full TUI.
       3. Otherwise -> the line-oriented REPL (``run_repl``).
     """
+    argv = sys.argv[1:]
+    if argv and argv[0] == "config":
+        raise SystemExit(handle_config_command(argv[1:]))
+    if argv and argv[0] == "chat":
+        argv = argv[1:]
+
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     if args.message:
         raise SystemExit(asyncio.run(run_once(args)))
     if not sys.stdin.isatty():
         args.message = sys.stdin.read().strip()
         if args.message:
             raise SystemExit(asyncio.run(run_once(args)))
+    if check_needs_setup():
+        run_setup_wizard()
+        return
     if not args.no_tui and _tui_available():
         from khaos.tui.app import run_tui
 

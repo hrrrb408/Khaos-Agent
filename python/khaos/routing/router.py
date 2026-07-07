@@ -266,17 +266,11 @@ def create_default_router(config_path: str | None = None, *, honor_no_config: bo
     if honor_no_config and os.environ.get("KHAOS_NO_CONFIG"):
         return _mock_fallback()
 
-    paths = []
     if config_path:
-        paths.append(config_path)
+        expanded_path = expand_env_placeholders(os.path.expanduser(config_path), source="router config path")
+        config = load_config(expanded_path, strict_env=False) if os.path.isfile(expanded_path) else {}
     else:
-        paths.extend(["config.yaml", os.path.expanduser("~/.khaos/config.yaml")])
-    config = {}
-    for p in paths:
-        expanded_path = expand_env_placeholders(os.path.expanduser(p), source="router config path")
-        if os.path.isfile(expanded_path):
-            config = load_config(expanded_path, strict_env=False)
-            break
+        config = load_config(strict_env=False)
 
     models_config = config.get("models", {})
 
