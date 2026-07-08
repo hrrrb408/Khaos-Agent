@@ -731,6 +731,87 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             parallel=True,
         )
     )
+    # ── Phase 8.3 orchestrator tools (subagent spawn / collect / plan) ──
+    registry.register(
+        ToolDefinition(
+            name="spawn_subagent",
+            description=(
+                "Spawn a subagent to execute a task in parallel. "
+                "The subagent runs independently with its own context and tool set."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "goal": {
+                        "type": "string",
+                        "description": "Task description for the subagent",
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Additional context for the subagent",
+                        "default": "",
+                    },
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Tools available to the subagent (empty = all tools)",
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Timeout in seconds (default 300)",
+                        "default": 300,
+                    },
+                },
+                "required": ["goal"],
+            },
+            modes=["office", "coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="collect_results",
+            description="Wait for all running subagents to complete and collect their results.",
+            parameters={"type": "object", "properties": {}},
+            modes=["office", "coding"],
+            permission_level="read",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="execute_plan",
+            description=(
+                "Execute a task plan (JSON) with dependencies. Tasks without "
+                "dependencies run in parallel; dependent tasks wait for their "
+                "upstream to complete."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "plan_json": {
+                        "type": "string",
+                        "description": "JSON task plan with tasks, dependencies, and context",
+                    },
+                },
+                "required": ["plan_json"],
+            },
+            modes=["office", "coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="subagent_status",
+            description="Check the status of all subagents without waiting.",
+            parameters={"type": "object", "properties": {}},
+            modes=["office", "coding"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
 
 
 def create_builtin_registry() -> ToolRegistry:
@@ -793,4 +874,11 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("todo_write").handler = todo_tools.todo_write
     registry.get("todo_read").handler = todo_tools.todo_read
     registry.get("todo_update").handler = todo_tools.todo_update
+    # Phase 8.3 orchestrator tools
+    from khaos.tools import orchestrator_tools
+
+    registry.get("spawn_subagent").handler = orchestrator_tools.spawn_subagent
+    registry.get("collect_results").handler = orchestrator_tools.collect_results
+    registry.get("execute_plan").handler = orchestrator_tools.execute_plan
+    registry.get("subagent_status").handler = orchestrator_tools.subagent_status
     return registry
