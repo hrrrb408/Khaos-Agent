@@ -205,6 +205,289 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     )
     registry.register(
         ToolDefinition(
+            name="list_directory",
+            description="List directory contents with structured info (dirs, files, sizes).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path (default: current directory)",
+                        "default": ".",
+                    }
+                },
+                "required": [],
+            },
+            modes=["office", "coding"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="file_info",
+            description=(
+                "Get detailed file/directory metadata "
+                "(size, type, modified date, mime type)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File or directory path"}
+                },
+                "required": ["path"],
+            },
+            modes=["office", "coding"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="tree_view",
+            description="Generate a tree view of a directory structure.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": "."},
+                    "max_depth": {
+                        "type": "integer",
+                        "description": "Max recursion depth (default 3)",
+                        "default": 3,
+                    },
+                },
+                "required": [],
+            },
+            modes=["office", "coding"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="copy_file",
+            description="Copy a file or directory.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                },
+                "required": ["src", "dst"],
+            },
+            modes=["office", "coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="move_file",
+            description="Move or rename a file or directory.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "src": {"type": "string"},
+                    "dst": {"type": "string"},
+                },
+                "required": ["src", "dst"],
+            },
+            modes=["office", "coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="file_search_content",
+            description=(
+                "Search file contents for a pattern (substring or regex). "
+                "Returns matching lines with file paths and line numbers."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search in",
+                        "default": ".",
+                    },
+                    "pattern": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 50},
+                },
+                "required": ["pattern"],
+            },
+            modes=["office", "coding"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="quick_note",
+            description="Quick capture a note with optional title and tags. Saved to ~/.khaos/notes/.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string"},
+                    "title": {"type": "string", "default": ""},
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "default": [],
+                    },
+                },
+                "required": ["content"],
+            },
+            modes=["office"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="search_notes",
+            description="Search notes by query string (matches title, tags, and content).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "default": 10},
+                },
+                "required": ["query"],
+            },
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="list_notes",
+            description="List recent notes, optionally filtered by tag.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "limit": {"type": "integer", "default": 20},
+                    "tag": {"type": "string", "default": ""},
+                },
+            },
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="delete_note",
+            description="Delete a note file. Only files under ~/.khaos/notes/ can be deleted.",
+            parameters={
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+            modes=["office"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="markdown_to_text",
+            description="Convert Markdown to plain text, stripping all formatting.",
+            parameters={
+                "type": "object",
+                "properties": {"markdown": {"type": "string"}},
+                "required": ["markdown"],
+            },
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="extract_headings",
+            description="Extract heading structure (TOC) from Markdown text.",
+            parameters={
+                "type": "object",
+                "properties": {"markdown": {"type": "string"}},
+                "required": ["markdown"],
+            },
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="count_words",
+            description=(
+                "Count words, characters, lines, paragraphs, "
+                "and estimate reading time."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="format_markdown_table",
+            description="Format structured data as a Markdown table.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "headers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+                "required": ["headers", "rows"],
+            },
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="clipboard_read",
+            description="Read the system clipboard content.",
+            parameters={"type": "object", "properties": {}},
+            modes=["office"],
+            permission_level="read",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="clipboard_write",
+            description="Write text to the system clipboard.",
+            parameters={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+            },
+            modes=["office"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="terminal",
             description="Run a foreground or background terminal command.",
             parameters={
@@ -825,9 +1108,12 @@ def create_runtime_registry() -> ToolRegistry:
     """Create a built-in registry with concrete P0-B tool handlers."""
     from khaos.tools import (
         browser_tools,
+        clipboard_tools,
         code_search_tools,
         file_tools,
         git_tools,
+        markdown_tools,
+        note_tools,
         sandbox_tools,
         terminal_tools,
         test_tools,
@@ -841,6 +1127,22 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("patch").handler = file_tools.patch
     registry.get("multi_edit").handler = file_tools.multi_edit
     registry.get("search_files").handler = file_tools.search_files
+    registry.get("list_directory").handler = file_tools.list_directory
+    registry.get("file_info").handler = file_tools.file_info
+    registry.get("tree_view").handler = file_tools.tree_view
+    registry.get("copy_file").handler = file_tools.copy_file
+    registry.get("move_file").handler = file_tools.move_file
+    registry.get("file_search_content").handler = file_tools.file_search_content
+    registry.get("quick_note").handler = note_tools.quick_note
+    registry.get("search_notes").handler = note_tools.search_notes
+    registry.get("list_notes").handler = note_tools.list_notes
+    registry.get("delete_note").handler = note_tools.delete_note
+    registry.get("markdown_to_text").handler = markdown_tools.markdown_to_text
+    registry.get("extract_headings").handler = markdown_tools.extract_headings
+    registry.get("count_words").handler = markdown_tools.count_words
+    registry.get("format_markdown_table").handler = markdown_tools.format_markdown_table
+    registry.get("clipboard_read").handler = clipboard_tools.clipboard_read
+    registry.get("clipboard_write").handler = clipboard_tools.clipboard_write
     registry.get("terminal").handler = terminal_tools.terminal
     registry.get("process").handler = terminal_tools.process
     registry.get("sandbox_exec").handler = sandbox_tools.sandbox_exec
