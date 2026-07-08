@@ -172,6 +172,48 @@ async def test_agent_loop_terminal_read_only_auto_approved(tmp_path):
     await db.close()
 
 
+async def test_agent_loop_passes_tool_schemas_to_router(tmp_path):
+    class ToolSchemaRouter:
+        def __init__(self):
+            self.seen_tools = None
+
+        async def call(self, function, messages, **kwargs):
+            del function, messages
+            self.seen_tools = kwargs.get("tools")
+            yield Message(role="assistant", content="ok")
+            yield Message(role="assistant", content="", stop_reason="end_turn")
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1", mode="coding")
+    mode_manager = ModeManager(db, project_root=tmp_path)
+    await mode_manager.switch(Mode.CODING)
+    scheduler = ToolScheduler(create_runtime_registry(), PermissionEngine(db))
+    router = ToolSchemaRouter()
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        router,
+        db,
+        tool_scheduler=scheduler,
+    )
+
+    [message async for message in loop.run("please inspect files", "s1")]
+
+    assert router.seen_tools is not None
+    read_file = next(
+        tool for tool in router.seen_tools if tool["function"]["name"] == "read_file"
+    )
+    assert read_file["type"] == "function"
+    assert read_file["function"]["description"]
+    assert read_file["function"]["parameters"]["required"] == ["path"]
+    await db.close()
+
+
 async def test_agent_loop_triggers_compression_before_model_call(tmp_path):
     class RecordingRouter:
         def __init__(self):
@@ -377,4 +419,3 @@ async def test_agent_loop_injection_order_project_before_memory_before_skill(tmp
     assert system_prompt.index("PROJECT_BLOCK") < system_prompt.index("MEMORY_BLOCK")
     assert system_prompt.index("MEMORY_BLOCK") < system_prompt.index("SKILL_BLOCK")
     await db.close()
-

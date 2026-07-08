@@ -153,10 +153,13 @@ class AgentLoop:
                     assistant_content = ""
                     tool_calls: list[dict] = []
                     stop_reason = StopReason.END_TURN.value
+                    tools_schema = self._build_tools_schema()
+                    call_kwargs = {"tools": tools_schema} if tools_schema is not None else {}
 
                     async for chunk in self.router.call(
                         self.mode_manager.mode_config.preferred_model_function,
                         messages,
+                        **call_kwargs,
                     ):
                         if chunk.content:
                             chunk.token_count = self.token_engine.count_tokens(chunk.content)
@@ -344,6 +347,29 @@ class AgentLoop:
             messages.append(relevant)
 
         return messages
+
+    def _build_tools_schema(self) -> list[dict] | None:
+        """Return provider-neutral function tool schemas for the current mode."""
+        if self.tool_scheduler is None:
+            return None
+        registry = getattr(self.tool_scheduler, "registry", None)
+        if registry is None:
+            return None
+        mode = self.mode_manager.current_mode.value
+        tool_defs = registry.list_by_mode(mode)
+        if not tool_defs:
+            return None
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool_def.name,
+                    "description": tool_def.description,
+                    "parameters": tool_def.parameters,
+                },
+            }
+            for tool_def in tool_defs
+        ]
 
     async def _build_system_prompt(self, session_id: str, user_input: str = "") -> str:
         # 注入顺序：项目约定文件 > memory > skill > 项目结构（见 AGENTS.md Phase 6）
