@@ -99,7 +99,7 @@ def _render_permission(meta: dict[str, Any]) -> RenderedLine:
 def _render_error(meta: dict[str, Any], fallback: str) -> RenderedLine:
     if meta:
         code = meta.get("code", "ERROR")
-        msg = meta.get("message", "")
+        msg = meta.get("message") or fallback or _summarize_arguments(meta.get("detail", {})) or "unknown error"
         return RenderedLine(text=f"✗ {code}: {msg}", style="error")
     return RenderedLine(text=fallback or "error", style="error")
 

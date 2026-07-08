@@ -54,6 +54,7 @@ def test_from_config_builds_providers_and_models(monkeypatch):
                     "provider": "local",
                     "model": "chat-1",
                     "max_context_tokens": 8192,
+                    "max_output_tokens": 2048,
                     "supports_tools": True,
                 }
             },
@@ -62,6 +63,7 @@ def test_from_config_builds_providers_and_models(monkeypatch):
 
     assert manager.get_provider("local").api_key == "abc"
     assert manager.get_model("chat").max_context_tokens == 8192
+    assert manager.get_model("chat").max_output_tokens == 2048
 
 
 def test_missing_provider_and_model_raise():
@@ -71,4 +73,3 @@ def test_missing_provider_and_model_raise():
         manager.get_provider("missing")
     with pytest.raises(KeyError):
         manager.get_model("missing")
-

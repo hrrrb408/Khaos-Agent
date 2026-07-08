@@ -18,12 +18,26 @@ class InputPanel(Input):
 
     DEFAULT_CSS = """
     InputPanel {
-        dock: bottom;
-        margin: 1 0 0 0;
-        border: round $accent;
+        height: 3;
+        margin: 0 2 0 2;
+        padding: 0 2;
+        border: round #8a5a12;
+        background: #15110a;
+        color: #f3f4f6;
+        text-style: bold;
     }
     InputPanel:focus {
-        border: round $accent-lighten-2;
+        border: round #f59e0b;
+        background: #1a1308;
+        color: #ffffff;
+    }
+    InputPanel > .input--placeholder {
+        color: #6b7280;
+        text-style: none;
+    }
+    InputPanel > .input--cursor {
+        background: #f59e0b;
+        color: #0d0d0d;
     }
     """
 
@@ -35,7 +49,7 @@ class InputPanel(Input):
             super().__init__()
 
     def __init__(self) -> None:
-        super().__init__(placeholder="Message Khaos…  (/help for commands)", id="input")
+        super().__init__(placeholder="› Message Khaos...  (/help for commands)", id="input")
 
     def _on_key(self, event: events.Key) -> None:  # type: ignore[override]
         # Enter submits; let Input handle everything else.

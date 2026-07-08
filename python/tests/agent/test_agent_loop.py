@@ -50,6 +50,65 @@ async def test_agent_loop_uses_coding_route(tmp_path):
     await db.close()
 
 
+async def test_agent_loop_retries_once_after_empty_model_response(tmp_path):
+    class EmptyThenOkRouter:
+        def __init__(self):
+            self.calls = 0
+
+        async def call(self, function, messages):
+            self.calls += 1
+            if self.calls == 1:
+                yield Message(role="assistant", content="", stop_reason="end_turn")
+                return
+            yield Message(role="assistant", content="ok")
+            yield Message(role="assistant", content="", stop_reason="end_turn")
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    mode_manager = ModeManager(db, project_root=tmp_path)
+    router = EmptyThenOkRouter()
+    loop = AgentLoop(AgentConfig(), mode_manager, router, db)
+
+    chunks = [message async for message in loop.run("hello", "s1")]
+    persisted = await db.list_messages("s1")
+
+    assert router.calls == 2
+    assert "".join(chunk.content for chunk in chunks if chunk.role == "assistant") == "ok"
+    assert chunks[-1].content == "done"
+    assert [message.role for message in persisted] == ["user", "assistant"]
+    assert persisted[1].content == "ok"
+    await db.close()
+
+
+async def test_agent_loop_reports_error_after_repeated_empty_model_response(tmp_path):
+    class EmptyRouter:
+        async def call(self, function, messages):
+            yield Message(role="assistant", content="", stop_reason="end_turn")
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    mode_manager = ModeManager(db, project_root=tmp_path)
+    loop = AgentLoop(AgentConfig(), mode_manager, EmptyRouter(), db)
+
+    chunks = [message async for message in loop.run("hello", "s1")]
+    persisted = await db.list_messages("s1")
+
+    assert chunks[-1].event == "error"
+    assert chunks[-1].metadata["code"] == "EMPTY_MODEL_RESPONSE"
+    assert [message.role for message in persisted] == ["user"]
+    await db.close()
+
+
 async def test_agent_loop_executes_real_read_file_tool(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")

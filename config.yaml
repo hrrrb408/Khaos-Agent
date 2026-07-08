@@ -11,6 +11,7 @@ models:
       models:
         - name: "qwen/qwen3.5-122b-a10b"
           max_context_tokens: 131072
+          max_output_tokens: 4096
           supports_tools: true
           supports_vision: false
     # Anthropic Claude (Messages API). Uncomment and set ANTHROPIC_API_KEY to enable.
@@ -22,6 +23,7 @@ models:
       models:
         - name: "claude-sonnet-4-20250514"
           max_context_tokens: 200000
+          max_output_tokens: 4096
           supports_tools: true
           supports_vision: true
     # Native OpenAI (wire-compatible with the OpenAI-compatible provider).
@@ -33,6 +35,7 @@ models:
       models:
         - name: "gpt-4o"
           max_context_tokens: 128000
+          max_output_tokens: 4096
           supports_tools: true
           supports_vision: true
   default_model: "qwen/qwen3.5-122b-a10b"

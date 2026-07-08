@@ -137,6 +137,47 @@ models:
     assert provider.api_key == "secret"
 
 
+async def test_load_router_from_project_config_merges_user_config(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    project_config = tmp_path / "config.yaml"
+    project_config.write_text(
+        """
+models:
+  providers:
+    nvidia:
+      type: openai_compatible
+      base_url: "https://integrate.api.nvidia.com/v1"
+      api_key: "${NVIDIA_API_KEY}"
+      models:
+        - name: "qwen/qwen3-8b"
+          max_context_tokens: 32768
+          supports_tools: true
+          supports_vision: false
+  default_model: "qwen/qwen3-8b"
+  router:
+    type: single
+""",
+        encoding="utf-8",
+    )
+    user_config = tmp_path / ".khaos" / "config.yaml"
+    user_config.parent.mkdir()
+    user_config.write_text(
+        """
+models:
+  providers:
+    nvidia:
+      api_key: "user-config-key-123"
+""",
+        encoding="utf-8",
+    )
+
+    router = load_router_from_config(project_config, project_root=tmp_path)
+    provider = router.provider_manager.get_provider("nvidia")
+
+    assert provider.api_key == "user-config-key-123"
+
+
 async def test_build_runtime_wires_token_engine_and_skills(tmp_path):
     """_build_runtime must assemble a working token engine and (if present)
     a skill_manager. The token engine is Rust when available, else the pure-

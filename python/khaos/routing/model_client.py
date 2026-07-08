@@ -39,6 +39,7 @@ class ModelClient:
             "model": model.model,
             "messages": [_message_to_openai(message) for message in messages],
             "stream": True,
+            "max_tokens": model.max_output_tokens,
         }
         if tools and model.supports_tools:
             payload["tools"] = tools
@@ -72,7 +73,10 @@ class ModelClient:
                     await response.aread()
                     await asyncio.sleep(self.base_delay * (2**attempt))
                     continue
-                response.raise_for_status()
+                if response.is_error:
+                    body = (await response.aread()).decode("utf-8", errors="replace").strip()
+                    detail = f": {body[:500]}" if body else ""
+                    raise RuntimeError(f"model provider returned HTTP {response.status_code}{detail}")
                 parser = _OpenAIStreamParser()
                 async for line in response.aiter_lines():
                     if not line.startswith("data:"):
@@ -106,7 +110,7 @@ class _OpenAIStreamParser:
         delta = choice.get("delta") or {}
         finish_reason = choice.get("finish_reason")
         if finish_reason:
-            self.stop_reason = "tool_use" if finish_reason in {"tool_calls", "function_call"} else "end_turn"
+            self.stop_reason = _map_finish_reason(str(finish_reason))
         content = delta.get("content")
         if content:
             return Message(role="assistant", content=str(content))
@@ -179,3 +183,10 @@ def _message_to_openai(message: Message) -> dict[str, Any]:
         ]
     return item
 
+
+def _map_finish_reason(finish_reason: str) -> str:
+    if finish_reason in {"tool_calls", "function_call"}:
+        return "tool_use"
+    if finish_reason == "length":
+        return "max_tokens"
+    return "end_turn"

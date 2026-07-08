@@ -28,6 +28,7 @@ class ModelSpec:
     provider: str
     model: str
     max_context_tokens: int
+    max_output_tokens: int = 4096
     supports_streaming: bool = True
     supports_tools: bool = True
     supports_vision: bool = False
@@ -151,6 +152,7 @@ class ProviderManager:
                     provider=str(model_data["provider"]),
                     model=str(model_data["model"]),
                     max_context_tokens=int(model_data.get("max_context_tokens", 128000)),
+                    max_output_tokens=int(model_data.get("max_output_tokens", 4096)),
                     supports_streaming=bool(model_data.get("supports_streaming", True)),
                     supports_tools=bool(model_data.get("supports_tools", True)),
                     supports_vision=bool(model_data.get("supports_vision", False)),

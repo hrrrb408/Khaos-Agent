@@ -91,7 +91,7 @@ class AgentService:
         await mode_manager.load()
         if mode:
             await mode_manager.switch(ModeManager.parse(mode))
-        router = load_router_from_config(self.config_path)
+        router = load_router_from_config(self.config_path, project_root=self.project_root)
         permission_engine = PermissionEngine(self.db)
         await permission_engine.load_rules()
         memory_store = MemoryStore(self.db)
@@ -217,9 +217,27 @@ async def serve_json_lines(
             method = request.get("method")
             payload = request.get("payload", {})
             if method == "AgentService.Chat":
-                async for event in agent.chat(ChatRequest(**payload)):
-                    writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
-                    await writer.drain()
+                try:
+                    async for event in agent.chat(ChatRequest(**payload)):
+                        writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                except Exception as exc:
+                    writer.write(
+                        (
+                            json.dumps(
+                                {
+                                    "event": "error",
+                                    "data": {
+                                        "code": exc.__class__.__name__,
+                                        "message": str(exc),
+                                        "recoverable": False,
+                                    },
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                    )
             elif method == "AgentService.SwitchMode":
                 response = await agent.switch_mode(payload.get("session_id", ""), payload["target_mode"])
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
@@ -250,11 +268,17 @@ async def serve_json_lines(
         await server.serve_forever()
 
 
-def load_router_from_config(config_path: Path) -> ModelRouter:
-    """Load model router from config.yaml, falling back to mock when absent."""
-    if not config_path.exists():
-        return create_default_router()
-    return create_default_router(str(config_path), honor_no_config=False)
+def load_router_from_config(config_path: Path, project_root: Path | None = None) -> ModelRouter:
+    """Load model router, merging user config for the project template path."""
+    expanded_config = config_path.expanduser()
+    if not expanded_config.exists():
+        return create_default_router(str(expanded_config), honor_no_config=False)
+    root = project_root or Path.cwd()
+    project_config = (root / "config.yaml").resolve()
+    resolved_config = expanded_config.resolve()
+    if resolved_config == project_config:
+        return create_default_router(honor_no_config=False)
+    return create_default_router(str(expanded_config), honor_no_config=False)
 
 
 def _message_to_event(message) -> dict:

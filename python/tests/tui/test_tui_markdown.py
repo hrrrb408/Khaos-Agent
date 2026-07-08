@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from io import StringIO
+from pathlib import Path
 
 from rich.console import Console
 from rich.markdown import Markdown
 
 from khaos.agent.core import Message
+from khaos.tui.brand import brand_art
 from khaos.tui.chat_panel import ChatPanel
 from khaos.tui.markdown import RenderedLine, markdown_to_rich, render_message, to_rich
 
@@ -106,6 +108,21 @@ def test_renders_error_event():
     assert "timed out" in line.text
 
 
+def test_renders_error_event_with_empty_message():
+    msg = Message(
+        role="system",
+        content="",
+        event="error",
+        metadata={"code": "INTERNAL_ERROR", "message": "", "detail": {"type": "AssertionError"}},
+    )
+
+    line = render_message(msg)[0]
+
+    assert line.style == "error"
+    assert "INTERNAL_ERROR" in line.text
+    assert "AssertionError" in line.text
+
+
 def test_renders_done_event():
     msg = Message(role="system", content="done", token_count=42, stop_reason="end_turn")
 
@@ -170,20 +187,64 @@ def test_markdown_to_rich_renders_fenced_code_blocks():
 def test_chat_panel_buffers_streamed_assistant_markdown_until_done(monkeypatch):
     panel = ChatPanel()
     writes = []
-    monkeypatch.setattr(panel, "write", lambda renderable: writes.append(renderable))
+    monkeypatch.setattr(ChatPanel.__mro__[1], "write", lambda _self, renderable: writes.append(renderable))
+    monkeypatch.setattr(ChatPanel.__mro__[1], "clear", lambda _self: writes.append("CLEAR"))
 
     panel.append_message(Message(role="assistant", content="**自主"))
     panel.append_message(Message(role="assistant", content="编码**\n- 🚀 实现"))
 
-    assert writes == []
+    assert "CLEAR" in writes
+    assert _render_to_text(panel._entries[0]).strip() == "● Khaos\n**自主编码**\n- 🚀 实现"
 
     panel.append_message(Message(role="system", content="done", event="done", stop_reason="end_turn"))
 
-    assert isinstance(writes[0], Markdown)
-    output = _render_to_text(writes[0])
+    output = _render_to_text(panel._entries[0])
+    assert "Khaos" in output
     assert "**" not in output
     assert "自主编码" in output
     assert "🚀 实现" in output
+
+
+def test_chat_panel_redraw_preserves_user_echo_when_stream_updates(monkeypatch):
+    panel = ChatPanel()
+    writes = []
+    monkeypatch.setattr(ChatPanel.__mro__[1], "write", lambda _self, renderable: writes.append(renderable))
+    monkeypatch.setattr(ChatPanel.__mro__[1], "clear", lambda _self: writes.append("CLEAR"))
+
+    panel.append_user_echo("你好 [literal]")
+    panel.append_message(Message(role="assistant", content="**Kha"))
+    panel.append_message(Message(role="assistant", content="os**"))
+
+    assert len(panel._entries) == 2
+    assert "›" in _render_to_text(panel._entries[0])
+    assert "[literal]" in _render_to_text(panel._entries[0])
+    assert _render_to_text(panel._entries[1]).strip() == "● Khaos\n**Khaos**"
+
+
+def test_chat_panel_welcome_dashboard_contains_runtime_context(monkeypatch):
+    panel = ChatPanel()
+    writes = []
+    monkeypatch.setattr(ChatPanel.__mro__[1], "write", lambda _self, renderable: writes.append(renderable))
+
+    panel.append_welcome_dashboard(
+        mode="office",
+        model="qwen/qwen3.5-122b-a10b",
+        session_id="abcdef123456",
+        project_root=Path("/tmp/khaos"),
+    )
+
+    output = _render_to_text(panel._entries[0])
+    assert "Khaos Agent" in output
+    assert "office" in output
+    assert "qwen/qwen3.5-122b-a10b" in output
+    assert "/tmp/khaos" in output
+
+
+def test_brand_art_renders_image_mark_without_caption():
+    output = _render_to_text(brand_art())
+
+    assert len(output.strip()) > 100
+    assert "FEIYUAN" not in output
 
 
 def _render_to_text(renderable) -> str:

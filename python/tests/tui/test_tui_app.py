@@ -54,3 +54,83 @@ def test_app_help_text_advertises_all_commands():
 
     for cmd in ["/mode", "/skills", "/memory", "/tools", "/model", "/session", "/help", "/clear", "/quit"]:
         assert cmd in HELP_TEXT
+
+
+@pytest.mark.asyncio
+async def test_app_token_header_accumulates_session_total(tmp_path, monkeypatch):
+    from khaos.tui.app import HeaderBar, KhaosApp
+    from khaos.tui.chat_panel import ChatPanel
+    from khaos.tui.status_bar import StatusBar
+
+    app = KhaosApp(db_path=str(tmp_path / "khaos.db"), project_root=tmp_path)
+    chat = _FakeChat()
+    status = _FakeStatusBar()
+    header = _FakeHeaderBar()
+    app.agent_loop = _FakeAgentLoop([31, 116])
+
+    def query_one(widget_type):
+        if widget_type is ChatPanel:
+            return chat
+        if widget_type is StatusBar:
+            return status
+        if widget_type is HeaderBar:
+            return header
+        raise AssertionError(f"unexpected widget lookup: {widget_type!r}")
+
+    monkeypatch.setattr(app, "query_one", query_one)
+
+    await app._run_turn_impl("hello")
+    await app._run_turn_impl("introduce yourself")
+
+    assert app._total_tokens == 147
+    assert status.tokens == 147
+    assert header.tokens == 147
+    assert [message.token_count for message in chat.messages] == [31, 116]
+
+
+class _FakeAgentLoop:
+    def __init__(self, token_counts: list[int]) -> None:
+        self._token_counts = token_counts
+
+    async def run(self, _user_input: str, _session_id: str):
+        from khaos.agent.core import Message
+
+        token_count = self._token_counts.pop(0)
+        yield Message(role="system", content="done", token_count=token_count)
+
+
+class _FakeChat:
+    def __init__(self) -> None:
+        self.messages = []
+        self.errors = []
+
+    def append_message(self, message) -> None:
+        self.messages.append(message)
+
+    def append_error(self, text: str) -> None:
+        self.errors.append(text)
+
+
+class _FakeStatusBar:
+    def __init__(self) -> None:
+        self.tokens = 0
+
+    def set_mode(self, _mode: str) -> None:
+        pass
+
+    def set_session(self, _session_id: str) -> None:
+        pass
+
+    def set_tokens(self, total: int) -> None:
+        self.tokens = total
+
+    def set_model(self, _model: str) -> None:
+        pass
+
+
+class _FakeHeaderBar:
+    def __init__(self) -> None:
+        self.tokens = 0
+
+    def set_state(self, _mode: str, _model: str, _session_id: str, tokens: int) -> None:
+        self.tokens = tokens

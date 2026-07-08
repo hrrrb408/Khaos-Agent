@@ -1,6 +1,7 @@
 import asyncio
 
 import pytest
+import httpx
 
 from khaos.agent import ErrorCode, ErrorEvent, ErrorHandler, Message
 from khaos.agent.error_handler import ModelContextTooLongError, ModelRateLimitError
@@ -18,9 +19,24 @@ def test_classify_errors():
     handler = ErrorHandler()
 
     assert handler.classify(asyncio.TimeoutError()) is ErrorCode.MODEL_TIMEOUT
+    assert handler.classify(httpx.ConnectError("network down")) is ErrorCode.MODEL_UNAVAILABLE
     assert handler.classify(ModelRateLimitError()) is ErrorCode.MODEL_RATE_LIMITED
     assert handler.classify(ModelContextTooLongError()) is ErrorCode.MODEL_CONTEXT_TOO_LONG
     assert handler.classify(PermissionError()) is ErrorCode.PERMISSION_DENIED
+
+
+async def test_handle_uses_exception_type_when_message_is_empty(tmp_path):
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    handler = ErrorHandler(db=db)
+
+    event = await handler.handle(AssertionError(), "s1")
+
+    assert event.message == "AssertionError"
+    assert event.to_message().metadata["message"] == "AssertionError"
+    await db.close()
 
 
 async def test_handle_audits_error(tmp_path):
@@ -112,4 +128,3 @@ async def test_agent_loop_error_handler_integration(tmp_path):
     assert events[-1].event == "error"
     assert events[-1].metadata["code"] == "MODEL_TIMEOUT"
     await db.close()
-

@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Awaitable, Callable
 
+import httpx
+
 from khaos.agent.core import Message
 
 
@@ -82,10 +84,14 @@ class ErrorHandler:
         """Map an exception to a stable error code."""
         if isinstance(error, asyncio.TimeoutError):
             return ErrorCode.MODEL_TIMEOUT
+        if isinstance(error, httpx.TimeoutException):
+            return ErrorCode.MODEL_TIMEOUT
         if isinstance(error, ModelRateLimitError):
             return ErrorCode.MODEL_RATE_LIMITED
         if isinstance(error, ModelContextTooLongError):
             return ErrorCode.MODEL_CONTEXT_TOO_LONG
+        if isinstance(error, httpx.TransportError):
+            return ErrorCode.MODEL_UNAVAILABLE
         if isinstance(error, TimeoutError):
             return ErrorCode.TOOL_TIMEOUT
         if isinstance(error, PermissionError):
@@ -120,8 +126,9 @@ class ErrorHandler:
     ) -> ErrorEvent:
         """Classify, audit, and return an SSE error event."""
         code = self.classify(error)
-        event = ErrorEvent(code=code, message=str(error), recoverable=code != ErrorCode.INTERNAL_ERROR, detail=detail)
-        await self.audit_error(code, str(error), session_id, detail)
+        message = _format_error_message(error)
+        event = ErrorEvent(code=code, message=message, recoverable=code != ErrorCode.INTERNAL_ERROR, detail=detail)
+        await self.audit_error(code, message, session_id, detail)
         return event
 
     async def retry_rate_limited(self, operation: Callable[[], Awaitable], base_delay: float = 0.01):
@@ -151,3 +158,14 @@ class ErrorHandler:
             raise RuntimeError("compressor is not configured")
         return await self.compressor.compress(messages, threshold)
 
+
+def _format_error_message(error: Exception) -> str:
+    message = str(error).strip()
+    if message:
+        return message
+    cause = getattr(error, "__cause__", None) or getattr(error, "__context__", None)
+    if isinstance(cause, Exception):
+        cause_message = str(cause).strip()
+        if cause_message:
+            return f"{error.__class__.__name__}: {cause_message}"
+    return error.__class__.__name__
