@@ -32,12 +32,19 @@ khaos/
 │   │   ├── agent/           # Agent 核心循环、上下文、压缩
 │   │   ├── modes/           # 模式管理
 │   │   ├── tools/           # 工具注册、调度、实现
+│   │   │   ├── note_tools.py        # Office 增强：笔记工具
+│   │   │   ├── markdown_tools.py    # Office 增强：Markdown 工具
+│   │   │   ├── clipboard_tools.py   # Office 增强：剪贴板工具
+│   │   │   ├── orchestrator_tools.py # Orchestrator 工具
+│   │   │   └── permission_tools.py  # 权限管理工具
 │   │   ├── memory/          # 三层记忆（Phase 3：TTL/冲突/主动提取）
 │   │   ├── skills/          # 技能系统（Phase 3：声明式 SKILL.md + 触发匹配）
 │   │   ├── audit/           # 审计日志（Phase 3：结构化记录 + 查询）
+│   │   ├── cli/             # CLI 入口点
 │   │   ├── tui/             # 全屏 TUI（Phase 4：Textual + Rich，斜杠命令）
 │   │   ├── permissions/     # 权限引擎
-│   │   ├── subagents/       # 子代理（Phase 2）
+│   │   ├── security/        # 安全模块：命令、路径、敏感信息防护
+│   │   ├── subagents/       # 子代理（Runner、Planner、Service）
 │   │   ├── routing/         # 模型路由（Phase 3：MoA；Phase 4：多 provider 架构）
 │   │   ├── rust_bridge.py   # PyO3 桥接（Phase 3：token；Phase 4：file_ops/exec）
 │   │   └── db/              # 数据库模型、迁移
@@ -509,5 +516,35 @@ make sandbox-run      # 启动沙箱容器
 
 ---
 
-*最后更新：2026-07-07*
+## 快速开始
+
+### Docker 部署
+
+```bash
+docker compose up -d
+# Agent: localhost:50051
+# Gateway: localhost:8080
+```
+
+### 本地开发
+
+```bash
+# Python
+pip install -e .
+khaos start --db khaos.db
+
+# Go 网关
+cd go && go run ./cmd/gateway/ --python-agent 127.0.0.1:50051
+
+# 运行测试
+khaos test --all
+```
+
+### 配置
+
+编辑 `config.yaml` 设置 LLM provider、API key 等。
+
+---
+
+*最后更新：2026-07-08*
 *维护者：瑞邦 + Hermes Agent*

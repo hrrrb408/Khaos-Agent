@@ -1,0 +1,39 @@
+version: "3.8"
+
+services:
+  khaos-agent:
+    build:
+      context: .
+      target: python-agent
+    container_name: khaos-agent
+    ports:
+      - "50051:50051"
+    volumes:
+      - khaos-data:/app/data
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - KHAOS_MODE=office
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('localhost',50051),timeout=2); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  khaos-gateway:
+    build:
+      context: .
+      target: gateway
+    container_name: khaos-gateway
+    ports:
+      - "8080:8080"
+    depends_on:
+      khaos-agent:
+        condition: service_healthy
+    environment:
+      - KHAOS_PYTHON_AGENT=khaos-agent:50051
+      - KHAOS_API_KEY=${KHAOS_API_KEY:-}
+    restart: unless-stopped
+
+volumes:
+  khaos-data:

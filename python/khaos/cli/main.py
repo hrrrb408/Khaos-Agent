@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import subprocess
 import sys
 import uuid
 from pathlib import Path
@@ -162,6 +163,179 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def build_command_parser() -> argparse.ArgumentParser:
+    """Create the product CLI parser with subcommands."""
+    parser = argparse.ArgumentParser(prog="khaos", description="Khaos AI Agent Platform")
+    subparsers = parser.add_subparsers(dest="command")
+
+    start_parser = subparsers.add_parser("start", help="Start Khaos agent server + gateway")
+    start_parser.add_argument("--host", default="127.0.0.1")
+    start_parser.add_argument("--port", type=int, default=50051)
+    start_parser.add_argument("--db", default="khaos.db")
+    start_parser.add_argument("--config", default="config.yaml")
+    start_parser.add_argument("--gateway", action="store_true", help="Also start Go gateway")
+
+    chat_parser = subparsers.add_parser("chat", help="Interactive chat session")
+    chat_parser.add_argument("--mode", default="office", choices=["office", "coding"])
+    chat_parser.add_argument("--db", default="khaos.db")
+    chat_parser.add_argument("--config", default="config.yaml")
+
+    test_parser = subparsers.add_parser("test", help="Run tests", description="Run tests")
+    test_parser.add_argument("--all", action="store_true", help="Run all tests (Python + Go)")
+    test_parser.add_argument("--go", action="store_true", help="Run Go tests only")
+    test_parser.add_argument("--python", action="store_true", help="Run Python tests only")
+    test_parser.add_argument("--verbose", "-v", action="store_true")
+
+    config_parser = subparsers.add_parser("config", help="Configuration management")
+    config_parser.add_argument("--path", default="config.yaml")
+    config_group = config_parser.add_mutually_exclusive_group()
+    config_group.add_argument("--get", type=str, help="Get a config value")
+    config_group.add_argument("--set", type=str, help="Set a config value (KEY=VALUE)")
+
+    subparsers.add_parser("version", help="Show version")
+    return parser
+
+
+def cmd_start(args: argparse.Namespace) -> None:
+    """Start the Python JSON-line agent server."""
+    try:
+        import uvloop
+
+        uvloop.install()
+    except ImportError:
+        pass
+
+    gateway_process: subprocess.Popen | None = None
+    if args.gateway:
+        gateway_cmd = ["go", "run", "./go/cmd/gateway"]
+        gateway_process = subprocess.Popen(gateway_cmd, cwd=str(_project_root()))
+        print("Started Go gateway with: go run ./go/cmd/gateway")
+
+    print(f"Starting Khaos agent on {args.host}:{args.port}")
+    print(f"Database: {args.db}")
+    print(f"Config: {args.config}")
+    from khaos.grpc_server import serve_json_lines
+
+    try:
+        asyncio.run(
+            serve_json_lines(
+                args.host,
+                args.port,
+                args.db,
+                project_root=Path.cwd(),
+                config_path=Path(args.config),
+            )
+        )
+    finally:
+        if gateway_process is not None:
+            gateway_process.terminate()
+
+
+def cmd_chat(args: argparse.Namespace) -> None:
+    """Print chat-mode guidance for the product CLI."""
+    print(f"Khaos Chat - mode: {args.mode}")
+    print("Type 'exit' to quit, '/mode' to switch mode")
+    print()
+    print("Interactive chat requires a configured LLM provider.")
+    print("Set up your API key in config.yaml first.")
+    print("Then run: khaos start --config config.yaml")
+
+
+def cmd_test(args: argparse.Namespace) -> None:
+    """Run selected test suites."""
+    project_root = _project_root()
+    results: list[tuple[str, bool]] = []
+
+    if args.all or args.python or not args.go:
+        print("Running Python tests...")
+        cmd = [
+            sys.executable,
+            "-m",
+            "pytest",
+            "python/tests/",
+            "-x",
+            "--ignore=python/tests/tui",
+        ]
+        if args.verbose:
+            cmd.append("-v")
+        result = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+        print(result.stdout[-500:] if len(result.stdout) > 500 else result.stdout)
+        if result.stderr:
+            print(result.stderr[-200:])
+        results.append(("Python", result.returncode == 0))
+
+    if args.all or args.go:
+        print("\nRunning Go tests...")
+        result = subprocess.run(
+            ["go", "test", "./go/...", "-v"],
+            cwd=str(project_root),
+            capture_output=True,
+            text=True,
+        )
+        print(result.stdout[-500:] if len(result.stdout) > 500 else result.stdout)
+        if result.stderr:
+            print(result.stderr[-200:])
+        results.append(("Go", result.returncode == 0))
+
+    if not results:
+        print("No tests selected. Use --python, --go, or --all")
+        return
+
+    print("\n" + "=" * 40)
+    for name, passed in results:
+        status = "PASSED" if passed else "FAILED"
+        print(f"  {name}: {status}")
+    print("=" * 40)
+    if not all(passed for _, passed in results):
+        raise SystemExit(1)
+
+
+def cmd_config(args: argparse.Namespace) -> None:
+    """Read or update a YAML configuration file."""
+    config_path = Path(args.path)
+    if not config_path.exists():
+        print(f"Config file not found: {config_path}")
+        print("Creating default config...")
+        config_path.write_text(
+            yaml.safe_dump({"model": "default", "port": 50051}, sort_keys=False),
+            encoding="utf-8",
+        )
+        return
+
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+
+    if args.get:
+        value = config
+        for key in args.get.split("."):
+            if isinstance(value, dict):
+                value = value.get(key)
+            else:
+                value = None
+                break
+        if value is not None:
+            print(f"{args.get} = {value}")
+        else:
+            print(f"Key not found: {args.get}")
+    elif args.set:
+        key, value = args.set.split("=", 1)
+        config[key] = value
+        config_path.write_text(yaml.safe_dump(config, sort_keys=False), encoding="utf-8")
+        print(f"Set {key} = {value}")
+    else:
+        print(yaml.safe_dump(config, allow_unicode=True, sort_keys=False), end="")
+
+
+def cmd_version() -> None:
+    """Show the product version."""
+    print("Khaos Agent Platform v0.1.0")
+    print("Python + Go + Rust")
+
+
+def _project_root() -> Path:
+    """Return the repository root from the installed source layout."""
+    return Path(__file__).resolve().parents[3]
+
+
 def handle_config_command(argv: list[str]) -> int:
     """Handle `khaos config` management commands."""
     if not argv:
@@ -235,15 +409,31 @@ def main() -> None:
     """CLI process entrypoint.
 
     Resolution order:
-      1. ``--message`` or piped stdin -> single-shot SSE output (scriptable).
-      2. Interactive TTY, no ``--no-tui``, and textual installed -> full TUI.
-      3. Otherwise -> the line-oriented REPL (``run_repl``).
+      1. Product subcommands: start/chat/test/config/version.
+      2. Legacy flags such as ``--message`` for scriptable SSE output.
     """
     argv = sys.argv[1:]
-    if argv and argv[0] == "config":
-        raise SystemExit(handle_config_command(argv[1:]))
-    if argv and argv[0] == "chat":
-        argv = argv[1:]
+    command_names = {"start", "chat", "test", "config", "version"}
+    if not argv:
+        parser = build_command_parser()
+        parser.print_help()
+        return
+    if argv[0] in command_names:
+        if argv[0] == "config" and len(argv) > 1 and argv[1] in {"setup", "set", "reset"}:
+            raise SystemExit(handle_config_command(argv[1:]))
+        parser = build_command_parser()
+        args = parser.parse_args(argv)
+        if args.command == "start":
+            cmd_start(args)
+        elif args.command == "chat":
+            cmd_chat(args)
+        elif args.command == "test":
+            cmd_test(args)
+        elif args.command == "config":
+            cmd_config(args)
+        elif args.command == "version":
+            cmd_version()
+        return
 
     parser = build_parser()
     args = parser.parse_args(argv)
