@@ -489,37 +489,213 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             parallel=False,
         )
     )
+    # ── Phase 6 browser tools (Playwright-backed, mock fallback) ──
+    # read-permission tools
     for name, description, parameters in [
         (
+            "browser_launch",
+            "Launch a browser instance (Chromium/Firefox/WebKit). Must be called before other browser tools.",
+            {
+                "type": "object",
+                "properties": {
+                    "headless": {
+                        "type": "boolean",
+                        "description": "Run in headless mode (default true)",
+                        "default": True,
+                    },
+                    "browser_type": {
+                        "type": "string",
+                        "enum": ["chromium", "firefox", "webkit"],
+                        "description": "Browser engine to use",
+                        "default": "chromium",
+                    },
+                },
+            },
+        ),
+        (
+            "browser_close",
+            "Close the browser instance and release resources.",
+            {"type": "object", "properties": {}},
+        ),
+        (
             "browser_navigate",
-            "Navigate browser to URL.",
-            {"type": "object", "properties": {"url": {"type": "string"}}, "required": ["url"]},
+            "Navigate to a URL and wait for the page to load.",
+            {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "URL to navigate to"}},
+                "required": ["url"],
+            },
         ),
         (
             "browser_click",
-            "Click an element.",
-            {"type": "object", "properties": {"selector": {"type": "string"}}, "required": ["selector"]},
-        ),
-        (
-            "browser_type",
-            "Type text into an element.",
+            "Click an element by CSS selector, text=, or XPath.",
             {
                 "type": "object",
-                "properties": {"selector": {"type": "string"}, "text": {"type": "string"}},
-                "required": ["selector", "text"],
+                "properties": {
+                    "selector": {
+                        "type": "string",
+                        "description": "CSS selector, text=Label, or xpath=//expression",
+                    }
+                },
+                "required": ["selector"],
             },
         ),
-        ("browser_snapshot", "Read browser snapshot.", {"type": "object", "properties": {}}),
-        ("browser_vision", "Read visual browser summary.", {"type": "object", "properties": {}}),
+        (
+            "browser_snapshot",
+            "Get the current page DOM content (HTML).",
+            {"type": "object", "properties": {}},
+        ),
+        (
+            "browser_screenshot",
+            "Take a screenshot of the current page.",
+            {
+                "type": "object",
+                "properties": {
+                    "save_path": {
+                        "type": "string",
+                        "description": "File path to save screenshot (optional, returns base64 if empty)",
+                    }
+                },
+            },
+        ),
+        (
+            "browser_scroll",
+            "Scroll the page up or down.",
+            {
+                "type": "object",
+                "properties": {
+                    "direction": {"type": "string", "enum": ["up", "down"]},
+                    "amount": {
+                        "type": "integer",
+                        "description": "Scroll amount multiplier (default 3)",
+                        "default": 3,
+                    },
+                },
+                "required": ["direction"],
+            },
+        ),
+        (
+            "browser_vision",
+            "Get a text description of the current page state (URL, title).",
+            {"type": "object", "properties": {}},
+        ),
     ]:
         registry.register(
             ToolDefinition(
                 name=name,
                 description=description,
                 parameters=parameters,
-                modes=["office"],
-                permission_level="read" if name in {"browser_snapshot", "browser_vision"} else "network",
+                modes=["office", "coding"],
+                permission_level="read",
                 parallel=False,
+            )
+        )
+    # write-permission browser tools
+    for name, description, parameters in [
+        (
+            "browser_type",
+            "Type text into an input field (clears existing text first).",
+            {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"},
+                    "text": {"type": "string"},
+                    "press_enter": {
+                        "type": "boolean",
+                        "description": "Press Enter after typing",
+                        "default": False,
+                    },
+                },
+                "required": ["selector", "text"],
+            },
+        ),
+        (
+            "browser_evaluate",
+            "Execute JavaScript in the browser page context.",
+            {
+                "type": "object",
+                "properties": {
+                    "expression": {
+                        "type": "string",
+                        "description": "JavaScript expression to evaluate",
+                    }
+                },
+                "required": ["expression"],
+            },
+        ),
+        (
+            "browser_file_upload",
+            "Upload a file to a file input element.",
+            {
+                "type": "object",
+                "properties": {
+                    "selector": {"type": "string"},
+                    "file_path": {
+                        "type": "string",
+                        "description": "Absolute path to file",
+                    },
+                },
+                "required": ["selector", "file_path"],
+            },
+        ),
+    ]:
+        registry.register(
+            ToolDefinition(
+                name=name,
+                description=description,
+                parameters=parameters,
+                modes=["office", "coding"],
+                permission_level="write",
+                parallel=False,
+            )
+        )
+    # ── Phase 6 web content tools (HTML→Markdown, tables, metadata) ──
+    for name, description, parameters in [
+        (
+            "web_fetch",
+            "Fetch a webpage and extract its content as clean Markdown. Strips ads, navigation, scripts, and formatting noise.",
+            {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL to fetch"},
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Request timeout in seconds (default 30)",
+                        "default": 30,
+                    },
+                },
+                "required": ["url"],
+            },
+        ),
+        (
+            "web_extract_tables",
+            "Extract structured table data from a webpage.",
+            {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "URL containing tables"}
+                },
+                "required": ["url"],
+            },
+        ),
+        (
+            "web_metadata",
+            "Get webpage metadata (title, description, author) without downloading full content.",
+            {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "URL to inspect"}},
+                "required": ["url"],
+            },
+        ),
+    ]:
+        registry.register(
+            ToolDefinition(
+                name=name,
+                description=description,
+                parameters=parameters,
+                modes=["office", "coding"],
+                permission_level="read",
+                parallel=True,
             )
         )
     registry.register(
@@ -575,6 +751,7 @@ def create_runtime_registry() -> ToolRegistry:
         terminal_tools,
         test_tools,
         todo_tools,
+        web_tools,
     )
 
     registry = create_builtin_registry()
@@ -595,11 +772,22 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("git_smart_commit").handler = git_tools.git_smart_commit
     registry.get("git_undo").handler = git_tools.git_undo
     registry.get("test_run").handler = test_tools.test_run
+    # Phase 6 browser tools — all backed by browser_tools (Playwright or mock)
+    registry.get("browser_launch").handler = browser_tools.browser_launch
+    registry.get("browser_close").handler = browser_tools.browser_close
     registry.get("browser_navigate").handler = browser_tools.browser_navigate
     registry.get("browser_click").handler = browser_tools.browser_click
     registry.get("browser_type").handler = browser_tools.browser_type
     registry.get("browser_snapshot").handler = browser_tools.browser_snapshot
+    registry.get("browser_screenshot").handler = browser_tools.browser_screenshot
+    registry.get("browser_scroll").handler = browser_tools.browser_scroll
     registry.get("browser_vision").handler = browser_tools.browser_vision
+    registry.get("browser_evaluate").handler = browser_tools.browser_evaluate
+    registry.get("browser_file_upload").handler = browser_tools.browser_file_upload
+    # Phase 6 web content tools
+    registry.get("web_fetch").handler = web_tools.web_fetch
+    registry.get("web_extract_tables").handler = web_tools.web_extract_tables
+    registry.get("web_metadata").handler = web_tools.web_metadata
     registry.get("code_search").handler = code_search_tools.code_search
     registry.get("code_symbols").handler = code_search_tools.code_symbols
     registry.get("todo_write").handler = todo_tools.todo_write
