@@ -56,6 +56,20 @@ def test_app_help_text_advertises_all_commands():
         assert cmd in HELP_TEXT
 
 
+def test_permission_dialog_friendly_target_prefers_arguments():
+    from khaos.tui.permission_dialog import _friendly_target
+
+    target = _friendly_target(
+        {
+            "name": "list_directory",
+            "arguments": {"path": "~/Desktop"},
+            "target": 'list_directory:{"path": "~/Desktop"}',
+        }
+    )
+
+    assert target == "~/Desktop"
+
+
 @pytest.mark.asyncio
 async def test_app_token_header_accumulates_session_total(tmp_path, monkeypatch):
     from khaos.tui.app import HeaderBar, KhaosApp
@@ -86,6 +100,36 @@ async def test_app_token_header_accumulates_session_total(tmp_path, monkeypatch)
     assert status.tokens == 147
     assert header.tokens == 147
     assert [message.token_count for message in chat.messages] == [31, 116]
+
+
+@pytest.mark.asyncio
+async def test_permission_confirm_uses_direct_push_on_app_thread(tmp_path, monkeypatch):
+    from khaos.tui.app import KhaosApp
+
+    app = KhaosApp(db_path=str(tmp_path / "khaos.db"), project_root=tmp_path)
+    pushed = []
+
+    def push_screen(screen, callback):
+        pushed.append(screen)
+        callback(True)
+
+    def call_from_thread(_callback):
+        raise AssertionError("call_from_thread must not run on the app thread")
+
+    monkeypatch.setattr(app, "push_screen", push_screen)
+    monkeypatch.setattr(app, "call_from_thread", call_from_thread)
+
+    result = await app._confirm_callback(
+        {
+            "id": "call-1",
+            "name": "list_directory",
+            "target": ".",
+            "level": "read",
+        }
+    )
+
+    assert result == {"approved": True, "remember": False}
+    assert pushed
 
 
 class _FakeAgentLoop:

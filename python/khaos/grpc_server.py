@@ -218,7 +218,29 @@ async def serve_json_lines(
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             line = await reader.readline()
-            request = json.loads(line.decode("utf-8"))
+            if not line:
+                return
+            try:
+                request = _parse_json_line(line)
+            except ValueError as exc:
+                writer.write(
+                    (
+                        json.dumps(
+                            {
+                                "event": "error",
+                                "data": {
+                                    "code": "INVALID_JSON",
+                                    "message": str(exc),
+                                    "recoverable": True,
+                                },
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    ).encode("utf-8")
+                )
+                await writer.drain()
+                return
             method = request.get("method")
             payload = request.get("payload", {})
             if method == "AgentService.Chat":
@@ -280,6 +302,24 @@ async def serve_json_lines(
     server = await asyncio.start_server(handle, host, port)
     async with server:
         await server.serve_forever()
+
+
+def _parse_json_line(line: bytes) -> dict:
+    """Decode one JSON-line request into a dict.
+
+    Empty TCP probes are handled before this function. Malformed payloads get a
+    structured error response instead of bubbling into asyncio's
+    client_connected_cb exception logger.
+    """
+    try:
+        request = json.loads(line.decode("utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ValueError("request must be UTF-8 JSON") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError("request must be a JSON object line") from exc
+    if not isinstance(request, dict):
+        raise ValueError("request must be a JSON object")
+    return request
 
 
 async def _build_subagent_service(

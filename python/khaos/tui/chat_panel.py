@@ -47,6 +47,8 @@ class ChatPanel(RichLog):
         next non-text event boundary. This preserves live output without
         parsing partial Markdown such as split ``**bold**`` or fenced code.
         """
+        if _is_hidden_internal_event(message):
+            return
         if message.event is None and message.role == "assistant" and message.content:
             self._append_assistant_chunk(message.content)
             return
@@ -224,6 +226,15 @@ def _prompt_line(text: str) -> Text:
         ("\n› ", "bold #f59e0b"),
         (text, "bold white reverse"),
     )
+
+
+def _is_hidden_internal_event(message: Message) -> bool:
+    """Hide successful internal tool plumbing from the transcript."""
+    if message.event in {"tool_call", "permission_request"}:
+        return True
+    if message.event == "tool_result":
+        return bool((message.metadata or {}).get("success", False))
+    return False
 
 
 class _WelcomeDashboard:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import uuid
 from pathlib import Path
 
@@ -438,7 +439,10 @@ class KhaosApp(App):
         def _show() -> None:
             self.push_screen(PermissionDialog(request), _on_result)
 
-        self.call_from_thread(_show)
+        if threading.get_ident() == getattr(self, "_thread_id", None):
+            _show()
+        else:
+            self.call_from_thread(_show)
         approved = await future
         return {"approved": approved, "remember": False}
 

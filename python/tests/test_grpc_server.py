@@ -5,6 +5,7 @@ from khaos.grpc_server import (
     AgentService,
     ChatRequest,
     ConfirmRequest,
+    _parse_json_line,
     load_router_from_config,
     MemoryService,
     serve_json_lines,
@@ -104,6 +105,23 @@ async def test_json_line_server_chat(tmp_path):
         pytest.skip("sandbox does not allow binding TCP sockets")
     except asyncio.CancelledError:
         pass
+
+
+def test_parse_json_line_accepts_object_request():
+    request = _parse_json_line(b'{"method":"AgentService.Chat","payload":{}}\n')
+
+    assert request["method"] == "AgentService.Chat"
+    assert request["payload"] == {}
+
+
+def test_parse_json_line_rejects_malformed_payload():
+    with pytest.raises(ValueError, match="JSON object line"):
+        _parse_json_line(b"\n")
+
+
+def test_parse_json_line_rejects_non_object_payload():
+    with pytest.raises(ValueError, match="JSON object"):
+        _parse_json_line(b"[]\n")
 
 
 async def test_load_router_from_nvidia_config(tmp_path, monkeypatch):

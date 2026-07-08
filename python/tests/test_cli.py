@@ -6,6 +6,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from khaos.cli.main import build_command_parser
+
 
 def run_cli(*args: str) -> subprocess.CompletedProcess[str]:
     """Run the package CLI in a subprocess."""
@@ -39,3 +41,13 @@ def test_test_help():
 
     assert result.returncode == 0
     assert "Run tests" in result.stdout
+
+
+def test_chat_parser_exposes_interactive_options():
+    parser = build_command_parser()
+    args = parser.parse_args(["chat", "--mode", "coding", "--no-tui", "--yes"])
+
+    assert args.command == "chat"
+    assert args.mode == "coding"
+    assert args.no_tui is True
+    assert args.yes is True

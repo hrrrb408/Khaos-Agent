@@ -221,6 +221,58 @@ def test_chat_panel_redraw_preserves_user_echo_when_stream_updates(monkeypatch):
     assert _render_to_text(panel._entries[1]).strip() == "● Khaos\n**Khaos**"
 
 
+def test_chat_panel_hides_successful_internal_tool_events(monkeypatch):
+    panel = ChatPanel()
+    writes = []
+    monkeypatch.setattr(ChatPanel.__mro__[1], "write", lambda _self, renderable: writes.append(renderable))
+
+    panel.append_message(
+        Message(
+            role="assistant",
+            content="",
+            event="tool_call",
+            metadata={"name": "list_directory", "arguments": {"path": "~/Desktop"}},
+        )
+    )
+    panel.append_message(
+        Message(
+            role="system",
+            content="permission_request",
+            event="permission_request",
+            metadata={"name": "list_directory", "target": "~/Desktop", "level": "read"},
+        )
+    )
+    panel.append_message(
+        Message(
+            role="tool",
+            content="{}",
+            event="tool_result",
+            metadata={"name": "list_directory", "success": True, "output": {"ok": True}},
+        )
+    )
+
+    assert panel._entries == []
+    assert writes == []
+
+
+def test_chat_panel_still_shows_failed_tool_results(monkeypatch):
+    panel = ChatPanel()
+    writes = []
+    monkeypatch.setattr(ChatPanel.__mro__[1], "write", lambda _self, renderable: writes.append(renderable))
+
+    panel.append_message(
+        Message(
+            role="tool",
+            content="{}",
+            event="tool_result",
+            metadata={"name": "terminal", "success": False, "error": "boom", "duration_ms": 4},
+        )
+    )
+
+    assert len(panel._entries) == 1
+    assert "boom" in _render_to_text(panel._entries[0])
+
+
 def test_chat_panel_welcome_dashboard_contains_runtime_context(monkeypatch):
     panel = ChatPanel()
     writes = []

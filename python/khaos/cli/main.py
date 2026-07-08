@@ -179,6 +179,10 @@ def build_command_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument("--mode", default="office", choices=["office", "coding"])
     chat_parser.add_argument("--db", default="khaos.db")
     chat_parser.add_argument("--config", default="config.yaml")
+    chat_parser.add_argument("--session-id", help="Existing or new session id")
+    chat_parser.add_argument("--no-tui", action="store_true", help="Use the line-oriented REPL")
+    chat_parser.add_argument("--yes", action="store_true", help="Approve permission prompts")
+    chat_parser.add_argument("--remember", action="store_true", help="Remember approved permissions")
 
     test_parser = subparsers.add_parser("test", help="Run tests", description="Run tests")
     test_parser.add_argument("--all", action="store_true", help="Run all tests (Python + Go)")
@@ -232,13 +236,8 @@ def cmd_start(args: argparse.Namespace) -> None:
 
 
 def cmd_chat(args: argparse.Namespace) -> None:
-    """Print chat-mode guidance for the product CLI."""
-    print(f"Khaos Chat - mode: {args.mode}")
-    print("Type 'exit' to quit, '/mode' to switch mode")
-    print()
-    print("Interactive chat requires a configured LLM provider.")
-    print("Set up your API key in config.yaml first.")
-    print("Then run: khaos start --config config.yaml")
+    """Launch the interactive Khaos interface."""
+    run_interactive(args)
 
 
 def cmd_test(args: argparse.Namespace) -> None:
@@ -405,6 +404,16 @@ def _tui_available() -> bool:
         return False
 
 
+def run_interactive(args: argparse.Namespace) -> None:
+    """Launch the full-screen TUI when available, otherwise the line REPL."""
+    if not getattr(args, "no_tui", False) and _tui_available():
+        from khaos.tui.app import run_tui
+
+        run_tui(db_path=args.db, project_root=Path.cwd(), mode=args.mode or "")
+        return
+    raise SystemExit(asyncio.run(run_repl(args)))
+
+
 def main() -> None:
     """CLI process entrypoint.
 
@@ -443,12 +452,7 @@ def main() -> None:
         args.message = sys.stdin.read().strip()
         if args.message:
             raise SystemExit(asyncio.run(run_once(args)))
-    if not args.no_tui and _tui_available():
-        from khaos.tui.app import run_tui
-
-        run_tui(db_path=args.db, project_root=Path.cwd(), mode=args.mode or "")
-        return
-    raise SystemExit(asyncio.run(run_repl(args)))
+    run_interactive(args)
 
 
 if __name__ == "__main__":

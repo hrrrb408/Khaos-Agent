@@ -19,10 +19,10 @@ class PermissionDialog(ModalScreen[bool]):
         align: center middle;
     }
     PermissionDialog > Vertical {
-        width: 72;
+        width: 52;
         height: auto;
         padding: 1 2;
-        border: thick $warning;
+        border: round $warning;
         background: $surface;
     }
     PermissionDialog Static {
@@ -45,16 +45,11 @@ class PermissionDialog(ModalScreen[bool]):
 
     def compose(self) -> ComposeResult:  # type: ignore[override]
         name = self.request.get("name", "tool")
-        target = self.request.get("target", "")
-        level = self.request.get("level", "")
-        reason = self.request.get("reason", "")
+        target = _friendly_target(self.request)
         with Vertical():
             yield Static(
-                f"⛔ Permission requested\n\n"
-                f"tool: [b]{name}[/]\n"
-                f"target: [b]{target}[/]\n"
-                f"level: [b]{level}[/]"
-                + (f"\nreason: {reason}" if reason else ""),
+                f"[b]Allow {name}?[/]\n"
+                + (f"[dim]{target}[/]" if target else "[dim]This action needs permission.[/]"),
                 markup=True,
             )
             with Horizontal():
@@ -72,3 +67,17 @@ class PermissionDialog(ModalScreen[bool]):
 
     def action_deny(self) -> None:
         self.dismiss(False)
+
+
+def _friendly_target(request: dict) -> str:
+    """Return a concise user-facing target string for permission prompts."""
+    arguments = request.get("arguments")
+    if isinstance(arguments, dict):
+        for key in ("path", "root", "url", "command", "src", "dst"):
+            value = arguments.get(key)
+            if value:
+                return str(value)
+    target = str(request.get("target", ""))
+    if ":" in target and "{" in target:
+        return target.split(":", 1)[0]
+    return target
