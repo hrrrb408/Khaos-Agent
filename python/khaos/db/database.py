@@ -458,6 +458,185 @@ class Database:
         )
         return [dict(row) for row in await cursor.fetchall()]
 
+    # ------------------------------------------------------------------
+    # Phase 6: session bookmarks + session summary / changed files
+    # ------------------------------------------------------------------
+
+    async def save_bookmark(
+        self,
+        session_id: str,
+        name: str,
+        description: str = "",
+        mode: str = "office",
+        project_root: str | None = None,
+        summary: str = "",
+    ) -> None:
+        """保存一个会话书签。
+
+        同一 (session_id, name) 已存在时整体覆盖更新（upsert）。
+        """
+        conn = await self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO session_bookmarks
+                (session_id, name, description, mode, project_root, summary)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(session_id, name) DO UPDATE SET
+                description  = excluded.description,
+                mode         = excluded.mode,
+                project_root = excluded.project_root,
+                summary      = excluded.summary
+            """,
+            (session_id, name, description, mode, project_root, summary),
+        )
+        await conn.commit()
+
+    async def load_bookmark(self, session_id: str, name: str) -> dict[str, Any] | None:
+        """加载指定书签。不存在时返回 None。"""
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT id, session_id, name, description, mode, project_root,
+                   summary, created_at
+            FROM session_bookmarks
+            WHERE session_id = ? AND name = ?
+            """,
+            (session_id, name),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def list_bookmarks(self, session_id: str | None = None) -> list[dict[str, Any]]:
+        """列出书签，可按 session 过滤。按创建时间倒序返回。"""
+        conn = await self._require_conn()
+        if session_id is None:
+            cursor = await conn.execute(
+                """
+                SELECT id, session_id, name, description, mode, project_root,
+                       summary, created_at
+                FROM session_bookmarks
+                ORDER BY created_at DESC, id DESC
+                """
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT id, session_id, name, description, mode, project_root,
+                       summary, created_at
+                FROM session_bookmarks
+                WHERE session_id = ?
+                ORDER BY created_at DESC, id DESC
+                """,
+                (session_id,),
+            )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def delete_bookmark(self, session_id: str, name: str) -> None:
+        """删除指定书签。不存在的书签静默忽略。"""
+        conn = await self._require_conn()
+        await conn.execute(
+            "DELETE FROM session_bookmarks WHERE session_id = ? AND name = ?",
+            (session_id, name),
+        )
+        await conn.commit()
+
+    async def _ensure_sessions_metadata_column(self, column: str) -> None:
+        """幂等地为 sessions 表增加一个 TEXT 列（如 summary / changed_files）。
+
+        使用 PRAGMA 探测列是否已存在，避免 ALTER TABLE 报错。metadata JSON
+        字段在 schema.sql 中已存在，这里仅在需要独立列时按需扩展。
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(sessions)")
+        existing = {str(row["name"]) for row in await cursor.fetchall()}
+        if column not in existing:
+            await conn.execute(f"ALTER TABLE sessions ADD COLUMN {column} TEXT")
+            await conn.commit()
+
+    async def save_session_summary(self, session_id: str, summary: str) -> None:
+        """保存会话摘要到 sessions 表的 summary 列。
+
+        summary 列不存在则 ALTER TABLE 添加（幂等迁移）。同时合并写入
+        metadata JSON 的 summary 字段，保持向后兼容。
+        """
+        conn = await self._require_conn()
+        await self._ensure_sessions_metadata_column("summary")
+        await conn.execute(
+            "UPDATE sessions SET summary = ?, updated_at = datetime('now') WHERE id = ?",
+            (summary, session_id),
+        )
+        # 同步到 metadata JSON，便于旧读取路径访问
+        await self._merge_session_metadata(session_id, {"summary": summary})
+        await conn.commit()
+
+    async def get_session_summary(self, session_id: str) -> str | None:
+        """读取会话摘要。优先读 summary 列，回退到 metadata JSON。"""
+        conn = await self._require_conn()
+        # summary 列可能不存在（旧库未迁移），用 try 探测。
+        try:
+            cursor = await conn.execute(
+                "SELECT summary FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            if row is not None and row["summary"] is not None:
+                return str(row["summary"])
+        except sqlite3.OperationalError:
+            # 列尚未添加 — 回退到 metadata
+            pass
+        meta = await self._read_session_metadata(session_id)
+        value = meta.get("summary")
+        return str(value) if value is not None else None
+
+    async def save_session_changes(self, session_id: str, files: list[str]) -> None:
+        """保存会话期间修改的文件列表到 sessions metadata。
+
+        与 summary 共存于一个 JSON metadata 字段中，结构：
+        ``{"summary": "...", "changed_files": ["path1", "path2"]}``
+        """
+        conn = await self._require_conn()
+        await self._merge_session_metadata(session_id, {"changed_files": list(files)})
+        await conn.commit()
+
+    async def get_session_changes(self, session_id: str) -> list[str]:
+        """读取会话修改的文件列表。"""
+        meta = await self._read_session_metadata(session_id)
+        raw = meta.get("changed_files")
+        if not isinstance(raw, list):
+            return []
+        return [str(item) for item in raw]
+
+    async def _read_session_metadata(self, session_id: str) -> dict[str, Any]:
+        """读取 sessions.metadata 的 JSON 字典，缺失/损坏时返回空字典。"""
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT metadata FROM sessions WHERE id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return {}
+        raw = row["metadata"]
+        if not raw:
+            return {}
+        try:
+            data = json.loads(str(raw))
+        except (TypeError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    async def _merge_session_metadata(
+        self, session_id: str, updates: dict[str, Any]
+    ) -> None:
+        """合并写入 sessions.metadata JSON（浅合并）。"""
+        conn = await self._require_conn()
+        current = await self._read_session_metadata(session_id)
+        current.update(updates)
+        await conn.execute(
+            "UPDATE sessions SET metadata = ?, updated_at = datetime('now') WHERE id = ?",
+            (json.dumps(current, ensure_ascii=False), session_id),
+        )
+
     async def _require_conn(self):
         if self._conn is None:
             await self.connect()

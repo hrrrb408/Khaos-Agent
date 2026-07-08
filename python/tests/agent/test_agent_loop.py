@@ -256,3 +256,125 @@ async def test_agent_loop_injects_memory_into_system_prompt(tmp_path):
 
     assert "L0 全局记忆" in router.seen_messages[0].content
     await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 6: project context loader (KHAOS.md / AGENTS.md) injection
+# ---------------------------------------------------------------------------
+
+
+class _RecordingRouter:
+    def __init__(self):
+        self.seen_messages = []
+
+    async def call(self, function, messages):
+        self.seen_messages = messages
+        yield Message(role="assistant", content="ok")
+        yield Message(role="assistant", content="", stop_reason="end_turn")
+
+
+async def test_agent_loop_injects_project_context_into_system_prompt(tmp_path):
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    # Project instructions file at the project root.
+    (tmp_path / "KHAOS.md").write_text("# Project Rules\nf-strings only", encoding="utf-8")
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    mode_manager = ModeManager(db, project_root=tmp_path)
+    router = _RecordingRouter()
+
+    from khaos.project_context import ProjectContextLoader
+
+    loader = ProjectContextLoader(tmp_path)
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        router,
+        db,
+        project_context_loader=loader,
+    )
+
+    [message async for message in loop.run("hello", "s1")]
+
+    system_prompt = router.seen_messages[0].content
+    assert "# Project Instructions" in system_prompt
+    assert "# Project Rules" in system_prompt
+    assert "f-strings only" in system_prompt
+    await db.close()
+
+
+async def test_agent_loop_without_project_context_loader_does_not_inject(tmp_path):
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    # Even though KHAOS.md exists, without a loader it must NOT be injected.
+    (tmp_path / "KHAOS.md").write_text("SHOULD_NOT_APPEAR", encoding="utf-8")
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    mode_manager = ModeManager(db, project_root=tmp_path)
+    router = _RecordingRouter()
+    loop = AgentLoop(AgentConfig(), mode_manager, router, db)  # no loader
+
+    [message async for message in loop.run("hello", "s1")]
+
+    system_prompt = router.seen_messages[0].content
+    assert "# Project Instructions" not in system_prompt
+    assert "SHOULD_NOT_APPEAR" not in system_prompt
+    await db.close()
+
+
+async def test_agent_loop_injection_order_project_before_memory_before_skill(tmp_path):
+    """Project context > memory > skill in the system prompt."""
+
+    class FakeMemoryManager:
+        async def inject(self, session_id):
+            return "MEMORY_BLOCK"
+
+    class FakeSkillManager:
+        def match(self, mode, user_input):
+            return ["skill-x"]
+
+        def format_for_prompt(self, matched):
+            return "SKILL_BLOCK"
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("BASE_PROMPT", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    (tmp_path / "KHAOS.md").write_text("PROJECT_BLOCK", encoding="utf-8")
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    mode_manager = ModeManager(db, project_root=tmp_path)
+    router = _RecordingRouter()
+
+    from khaos.project_context import ProjectContextLoader
+
+    loader = ProjectContextLoader(tmp_path)
+    loop = AgentLoop(
+        AgentConfig(),
+        mode_manager,
+        router,
+        db,
+        memory_manager=FakeMemoryManager(),
+        skill_manager=FakeSkillManager(),
+        project_context_loader=loader,
+    )
+
+    [message async for message in loop.run("hello", "s1")]
+
+    system_prompt = router.seen_messages[0].content
+    assert "BASE_PROMPT" in system_prompt
+    # All three blocks present and in the correct order.
+    assert system_prompt.index("PROJECT_BLOCK") < system_prompt.index("MEMORY_BLOCK")
+    assert system_prompt.index("MEMORY_BLOCK") < system_prompt.index("SKILL_BLOCK")
+    await db.close()
+

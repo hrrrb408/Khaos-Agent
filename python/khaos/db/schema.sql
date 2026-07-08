@@ -111,3 +111,16 @@ CREATE TABLE IF NOT EXISTS subagent_tasks (
     finished_at       TEXT
 );
 
+-- Phase 6: Session bookmarks for task persistence across sessions
+CREATE TABLE IF NOT EXISTS session_bookmarks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT NOT NULL,
+    name        TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    mode        TEXT NOT NULL DEFAULT 'office',
+    project_root TEXT,
+    summary     TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(session_id, name)
+);
+

@@ -8,7 +8,12 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AsyncIterator, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Optional
+
+if TYPE_CHECKING:
+    from khaos.coding.cost_tracker import CostTracker
+    from khaos.coding.fingerprint import FileFingerprintCache
+    from khaos.project_context import ProjectContextLoader
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +82,9 @@ class AgentLoop:
         skill_manager=None,
         project_root=None,
         coding_context_builder=None,
+        project_context_loader: "Optional[ProjectContextLoader]" = None,
+        file_fingerprint_cache: "Optional[FileFingerprintCache]" = None,
+        cost_tracker: "Optional[CostTracker]" = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -93,6 +101,13 @@ class AgentLoop:
         # left as-is (not resolved) so callers can pass relative paths.
         self.project_root = project_root
         self.coding_context_builder = coding_context_builder
+        # Phase 6: 项目约定文件加载器（KHAOS.md / AGENTS.md）。注入优先级
+        # 高于 memory / skill，因为它们是项目级硬规则。
+        self.project_context_loader = project_context_loader
+        # Phase 6.3: 文件指纹缓存——跳过未修改文件，节省 token。
+        self.file_fingerprint_cache = file_fingerprint_cache
+        # Phase 6.3: 会话级 token / 费用追踪。
+        self.cost_tracker = cost_tracker
 
     async def run(self, user_input: str, session_id: str) -> AsyncIterator[Message]:
         """
@@ -126,6 +141,14 @@ class AgentLoop:
                             self.config.compression_threshold,
                         )
                         messages = result.messages
+                # Phase 6.3: 记录本轮的输入 token（整个上下文）。
+                if self.cost_tracker is not None:
+                    input_tokens = sum(
+                        message.token_count
+                        or self.token_engine.count_tokens(message.content)
+                        for message in messages
+                    )
+                    self.cost_tracker.add_input_tokens(input_tokens)
                 while True:
                     assistant_content = ""
                     tool_calls: list[dict] = []
@@ -140,6 +163,8 @@ class AgentLoop:
                             chunk.created_at = time.time()
                             assistant_content += chunk.content
                             total_tokens += chunk.token_count
+                            if self.cost_tracker is not None:
+                                self.cost_tracker.add_output_tokens(chunk.token_count)
                             yield chunk
                         if chunk.tool_calls:
                             tool_calls.extend(chunk.tool_calls)
@@ -184,6 +209,9 @@ class AgentLoop:
                 messages.append(assistant_msg)
                 await self.db.insert_message(session_id, assistant_msg)
                 turn_count += 1
+                # Phase 6.3: 结束本轮 token / 费用统计（无论是否继续工具循环）。
+                if self.cost_tracker is not None:
+                    self.cost_tracker.finish_turn()
 
                 if stop_reason != StopReason.TOOL_USE.value:
                     break
@@ -247,6 +275,8 @@ class AgentLoop:
                         )
                         messages.append(tool_msg)
                         await self.db.insert_message(session_id, tool_msg)
+                        if self.cost_tracker is not None:
+                            self.cost_tracker.add_tool_tokens(tool_msg.token_count)
                         yield tool_msg
 
             else:
@@ -259,6 +289,17 @@ class AgentLoop:
                 stop_reason=stop_reason,
                 created_at=time.time(),
             )
+            # Phase 6.3: 在结束前 yield 费用摘要（若有 tracker 且有消耗）。
+            if self.cost_tracker is not None:
+                summary = self.cost_tracker.format_summary()
+                if summary:
+                    yield Message(
+                        role="system",
+                        content=summary,
+                        event="cost_summary",
+                        metadata={"cost_report": self.cost_tracker.get_report().__dict__},
+                        created_at=time.time(),
+                    )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -305,7 +346,14 @@ class AgentLoop:
         return messages
 
     async def _build_system_prompt(self, session_id: str, user_input: str = "") -> str:
+        # 注入顺序：项目约定文件 > memory > skill > 项目结构（见 AGENTS.md Phase 6）
         prompt = await self.mode_manager.load_system_prompt()
+
+        if self.project_context_loader is not None:
+            project_ctx = self.project_context_loader.load()
+            if project_ctx:
+                prompt = f"{prompt}\n\n# Project Instructions\n\n{project_ctx}"
+
         if self.memory_manager is not None:
             memory_text = await self.memory_manager.inject(session_id)
             if memory_text:
@@ -366,6 +414,11 @@ class AgentLoop:
         Aggregates the file contents collected by the coding context builder
         into one fenced block per file. Returns None outside coding mode or
         when no relevant files are found.
+
+        When a ``file_fingerprint_cache`` is configured, only files whose
+        content changed since the last injection are actually included; the
+        rest are skipped to save tokens. Each header is annotated with its
+        status: ``(changed)`` or ``(cached)``.
         """
         if not self._is_coding_mode():
             return None
@@ -387,14 +440,29 @@ class AgentLoop:
         if not context_files:
             return None
 
-        blocks: list[str] = ["# Relevant Files\n"]
         try:
             root_for_rel = Path(self.project_root).expanduser().resolve()
         except (OSError, ValueError):
             root_for_rel = None
+
+        cache = self.file_fingerprint_cache
+        blocks: list[str] = ["# Relevant Files\n"]
+        skipped = 0
         for entry in context_files:
             path = entry["path"]
             content = entry["content"]
+            path_key = str(path)
+
+            # Fingerprint filter: skip unchanged files, inject only changed ones.
+            if cache is not None:
+                if not cache.is_changed(path_key, content):
+                    skipped += 1
+                    continue
+                cache.update(path_key, content)
+                status = "changed"
+            else:
+                status = "changed"  # no cache → treat everything as fresh
+
             if root_for_rel is not None:
                 try:
                     display = str(Path(path).relative_to(root_for_rel))
@@ -403,7 +471,21 @@ class AgentLoop:
             else:
                 display = str(path)
             language = self._language_for_path(str(path))
-            blocks.append(f"## {display}\n```{language}\n{content}\n```\n")
+            blocks.append(
+                f"## {display} ({status})\n```{language}\n{content}\n```\n"
+            )
+
+        if skipped > 0:
+            logger.info(
+                "fingerprint cache skipped %d unchanged files (of %d)",
+                skipped,
+                len(context_files),
+            )
+
+        # If a cache is configured and every candidate was unchanged, there is
+        # nothing to inject this turn.
+        if cache is not None and len(blocks) == 1:
+            return None
 
         text = "\n".join(blocks)
         return Message(
