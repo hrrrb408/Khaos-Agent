@@ -1,8 +1,17 @@
 import asyncio
+import json
 
 import pytest
 
-from khaos.tools.git_tools import git_branch, git_commit, git_diff, git_log
+from khaos.tools.git_tools import (
+    git_branch,
+    git_commit,
+    git_diff,
+    git_log,
+    git_smart_commit,
+    git_status,
+    git_undo,
+)
 from khaos.tools.registry import create_runtime_registry
 
 
@@ -66,4 +75,139 @@ def test_runtime_registry_binds_git_tools():
 
     assert registry.get("git_diff").handler is not None
     assert registry.get("git_commit").permission_level == "write"
+
+
+# ---------------------------------------------------------------------------
+# git_status
+# ---------------------------------------------------------------------------
+
+
+async def test_git_status_clean_repo(tmp_path):
+    repo = await _repo(tmp_path)
+
+    result = json.loads(await git_status(str(repo)))
+
+    assert result["branch"] in {"main", "master"}
+    assert result["is_clean"] is True
+    assert result["modified"] == []
+    assert result["untracked"] == []
+    assert result["staged"] == []
+
+
+async def test_git_status_classifies_changes(tmp_path):
+    repo = await _repo(tmp_path)
+    (repo / "a.txt").write_text("changed\n", encoding="utf-8")  # modified
+    (repo / "new.txt").write_text("n\n", encoding="utf-8")  # untracked
+    (repo / "b.txt").write_text("b\n", encoding="utf-8")  # untracked
+    await _git(repo, "add", "b.txt")  # now staged/new
+
+    result = json.loads(await git_status(str(repo)))
+
+    assert result["is_clean"] is False
+    assert "a.txt" in result["modified"]
+    assert "new.txt" in result["untracked"]
+    assert "b.txt" in result["added"]
+    assert "b.txt" in result["staged"]
+
+
+# ---------------------------------------------------------------------------
+# git_smart_commit
+# ---------------------------------------------------------------------------
+
+
+async def test_git_smart_commit_nothing_to_commit(tmp_path):
+    repo = await _repo(tmp_path)
+
+    result = json.loads(await git_smart_commit(str(repo)))
+
+    assert result == {"message": "Nothing to commit."}
+
+
+async def test_git_smart_commit_auto_message_for_new_file(tmp_path):
+    repo = await _repo(tmp_path)
+    (repo / "feature.py").write_text("print('hi')\n", encoding="utf-8")
+
+    result = json.loads(await git_smart_commit(str(repo)))
+
+    assert result["files_changed"] == 1
+    assert result["message"].startswith("feat")
+    assert "feature.py" in result["message"]
+    assert result["branch"] in {"main", "master"}
+    # git's default short hash is 7-12 hex chars depending on repo size.
+    assert len(result["commit"]) >= 7
+    assert all(c in "0123456789abcdef" for c in result["commit"])
+    # Confirm the commit actually landed.
+    log = await git_log(str(repo), limit=1)
+    assert result["commit"] in log["stdout"]
+
+
+async def test_git_smart_commit_custom_message(tmp_path):
+    repo = await _repo(tmp_path)
+    (repo / "fix.txt").write_text("fix\n", encoding="utf-8")
+
+    result = json.loads(
+        await git_smart_commit(str(repo), message="fix: custom msg")
+    )
+
+    assert result["message"] == "fix: custom msg"
+    assert result["files_changed"] == 1
+
+
+async def test_git_smart_commit_test_file_type(tmp_path):
+    repo = await _repo(tmp_path)
+    # Only test files are touched → commit type should be "test".
+    (repo / "test_things.py").write_text("# tests\n", encoding="utf-8")
+    (repo / "test_more.py").write_text("# more\n", encoding="utf-8")
+
+    result = json.loads(await git_smart_commit(str(repo)))
+
+    assert result["message"].startswith("test")
+
+
+# ---------------------------------------------------------------------------
+# git_undo
+# ---------------------------------------------------------------------------
+
+
+async def test_git_undo_restores_changes_staged(tmp_path):
+    repo = await _repo(tmp_path)
+    (repo / "c.txt").write_text("c\n", encoding="utf-8")
+    await git_smart_commit(str(repo), message="feat: add c")
+
+    result = json.loads(await git_undo(str(repo)))
+
+    assert "Undone commit" in result["message"]
+    assert "c.txt" in result["files"]
+    # The file content survives the soft reset.
+    assert (repo / "c.txt").read_text(encoding="utf-8") == "c\n"
+    # And it should be staged again after undo.
+    status = json.loads(await git_status(str(repo)))
+    assert "c.txt" in status["staged"]
+
+
+async def test_git_undo_without_commits_returns_error(tmp_path):
+    await _git(tmp_path, "init")
+
+    result = json.loads(await git_undo(str(tmp_path)))
+
+    assert "error" in result
+
+
+# ---------------------------------------------------------------------------
+# registry wiring for new tools
+# ---------------------------------------------------------------------------
+
+
+def test_runtime_registry_binds_new_git_and_test_tools():
+    registry = create_runtime_registry()
+
+    assert registry.get("git_status").handler is not None
+    assert registry.get("git_smart_commit").handler is not None
+    assert registry.get("git_undo").handler is not None
+    assert registry.get("test_run").handler is not None
+    assert registry.get("git_status").permission_level == "read"
+    assert registry.get("git_smart_commit").permission_level == "write"
+    assert registry.get("git_undo").permission_level == "write"
+    assert registry.get("test_run").permission_level == "write"
+
 

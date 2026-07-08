@@ -41,11 +41,19 @@ MODE_CONFIGS = {
             "read_file",
             "write_file",
             "patch",
+            "multi_edit",
             "search_files",
             "terminal",
             "process",
             "sandbox_exec",
             "sandbox_build",
+            "todo_read",
+            "todo_write",
+            "todo_update",
+            "test_run",
+            "git_status",
+            "git_smart_commit",
+            "git_undo",
         ],
         preferred_model_function="coding",
         interaction_style="autonomous",
@@ -110,4 +118,3 @@ class ModeManager:
         if normalized in {"coding", "code", "编码"}:
             return Mode.CODING
         raise ValueError(f"unknown mode: {value}")
-

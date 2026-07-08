@@ -32,6 +32,8 @@ class AgentConfig:
     max_budget_tokens: int = 500000
     stream_timeout: int = 120
     compression_threshold: int = 128000
+    # Token budget for the injected project-structure tree (coding mode only).
+    project_structure_token_budget: int = 2000
 
 
 @dataclass
@@ -73,6 +75,8 @@ class AgentLoop:
         error_handler=None,
         token_engine: SimpleTokenEngine | None = None,
         skill_manager=None,
+        project_root=None,
+        coding_context_builder=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -85,6 +89,10 @@ class AgentLoop:
         self.error_handler = error_handler
         self.token_engine = token_engine or SimpleTokenEngine()
         self.skill_manager = skill_manager
+        # Coding-mode context building. ``project_root`` may be a str or Path;
+        # left as-is (not resolved) so callers can pass relative paths.
+        self.project_root = project_root
+        self.coding_context_builder = coding_context_builder
 
     async def run(self, user_input: str, session_id: str) -> AsyncIterator[Message]:
         """
@@ -110,6 +118,7 @@ class AgentLoop:
             turn_count = 0
 
             while turn_count < self.config.max_turns:
+                empty_response_retries = 0
                 if await self._check_compression(messages):
                     if self.compressor is not None:
                         result = await self.compressor.compress(
@@ -117,33 +126,52 @@ class AgentLoop:
                             self.config.compression_threshold,
                         )
                         messages = result.messages
-                assistant_content = ""
-                tool_calls: list[dict] = []
-                stop_reason = StopReason.END_TURN.value
+                while True:
+                    assistant_content = ""
+                    tool_calls: list[dict] = []
+                    stop_reason = StopReason.END_TURN.value
 
-                async for chunk in self.router.call(
-                    self.mode_manager.mode_config.preferred_model_function,
-                    messages,
-                ):
-                    if chunk.content:
-                        chunk.token_count = self.token_engine.count_tokens(chunk.content)
-                        chunk.created_at = time.time()
-                        assistant_content += chunk.content
-                        total_tokens += chunk.token_count
-                        yield chunk
-                    if chunk.tool_calls:
-                        tool_calls.extend(chunk.tool_calls)
-                        for tool_call in chunk.tool_calls:
-                            yield Message(
-                                role="assistant",
-                                content="",
-                                tool_calls=[tool_call],
-                                event="tool_call",
-                                metadata=tool_call,
-                                created_at=time.time(),
-                            )
-                    if chunk.stop_reason:
-                        stop_reason = chunk.stop_reason
+                    async for chunk in self.router.call(
+                        self.mode_manager.mode_config.preferred_model_function,
+                        messages,
+                    ):
+                        if chunk.content:
+                            chunk.token_count = self.token_engine.count_tokens(chunk.content)
+                            chunk.created_at = time.time()
+                            assistant_content += chunk.content
+                            total_tokens += chunk.token_count
+                            yield chunk
+                        if chunk.tool_calls:
+                            tool_calls.extend(chunk.tool_calls)
+                            for tool_call in chunk.tool_calls:
+                                yield Message(
+                                    role="assistant",
+                                    content="",
+                                    tool_calls=[tool_call],
+                                    event="tool_call",
+                                    metadata=tool_call,
+                                    created_at=time.time(),
+                                )
+                        if chunk.stop_reason:
+                            stop_reason = chunk.stop_reason
+
+                    if assistant_content.strip() or tool_calls or stop_reason == StopReason.TOOL_USE.value:
+                        break
+                    if empty_response_retries >= 1:
+                        yield Message(
+                            role="system",
+                            content="model returned an empty response",
+                            stop_reason="error",
+                            event="error",
+                            metadata={
+                                "code": "EMPTY_MODEL_RESPONSE",
+                                "message": "Model returned no text or tool calls.",
+                            },
+                            created_at=time.time(),
+                        )
+                        return
+                    empty_response_retries += 1
+                    logger.warning("empty model response, retrying once: session=%s", session_id)
 
                 assistant_msg = Message(
                     role="assistant",
@@ -248,7 +276,19 @@ class AgentLoop:
                 )
 
     async def _build_context(self, session_id: str, user_input: str = "") -> list[Message]:
-        """Build the P0-A context from mode prompt and persisted messages."""
+        """Build the P0-A context from mode prompt and persisted messages.
+
+        In coding mode (when ``project_root`` is set) this also injects:
+
+        1. The project structure tree into the *system* prompt (see
+           :meth:`_build_system_prompt`) — kept small (≤ token budget).
+        2. The contents of files relevant to ``user_input`` as an extra
+           ``# Relevant Files`` system message appended *after* the persisted
+           history, so the model sees them just before the current turn.
+
+        Neither injection happens in office mode or when ``project_root`` is
+        unset, so non-coding behaviour is unchanged.
+        """
         messages = [
             Message(
                 role="system",
@@ -257,6 +297,11 @@ class AgentLoop:
             )
         ]
         messages.extend(await self.db.list_messages(session_id))
+
+        relevant = self._build_relevant_files_message(user_input)
+        if relevant is not None:
+            messages.append(relevant)
+
         return messages
 
     async def _build_system_prompt(self, session_id: str, user_input: str = "") -> str:
@@ -271,7 +316,142 @@ class AgentLoop:
             skill_text = self.skill_manager.format_for_prompt(matched)
             if skill_text:
                 prompt = f"{prompt}\n\n{skill_text}"
+
+        structure = self._build_project_structure()
+        if structure:
+            prompt = f"{prompt}\n\n{structure}"
+
         return prompt
+
+    def _is_coding_mode(self) -> bool:
+        """Return True when the active mode is coding and a project root is set."""
+        if self.project_root is None:
+            return False
+        try:
+            return self.mode_manager.current_mode.value == "coding"
+        except AttributeError:
+            return False
+
+    def _build_project_structure(self) -> str:
+        """Return a ``# Project Structure`` block for the system prompt.
+
+        Only populated in coding mode. The tree is trimmed to the configured
+        token budget so it never dominates the system prompt.
+        """
+        if not self._is_coding_mode():
+            return ""
+        builder = self.coding_context_builder
+        if builder is None:
+            return ""
+        try:
+            from pathlib import Path
+
+            root = Path(self.project_root).expanduser().resolve()
+            index = builder.indexer.scan(root)
+        except (OSError, FileNotFoundError, NotADirectoryError) as exc:
+            logger.warning("coding project structure scan failed: %s", exc)
+            return ""
+        except Exception as exc:  # noqa: BLE001 — scan must never break the loop
+            logger.warning("coding project structure scan errored: %s", exc)
+            return ""
+
+        tree = str(index.get("tree", ""))
+        budget = getattr(self.config, "project_structure_token_budget", 2000)
+        trimmed = self._trim_to_budget(tree, budget)
+        return f"# Project Structure\n\n{trimmed}"
+
+    def _build_relevant_files_message(self, user_input: str):
+        """Return a ``# Relevant Files`` system Message, or None.
+
+        Aggregates the file contents collected by the coding context builder
+        into one fenced block per file. Returns None outside coding mode or
+        when no relevant files are found.
+        """
+        if not self._is_coding_mode():
+            return None
+        builder = self.coding_context_builder
+        if builder is None:
+            return None
+        try:
+            from pathlib import Path
+
+            root = Path(self.project_root).expanduser().resolve()
+            context_files = builder.build(user_input, root, target_files=None)
+        except (OSError, FileNotFoundError, NotADirectoryError) as exc:
+            logger.warning("coding relevant-files build failed: %s", exc)
+            return None
+        except Exception as exc:  # noqa: BLE001 — context build must not break the loop
+            logger.warning("coding relevant-files build errored: %s", exc)
+            return None
+
+        if not context_files:
+            return None
+
+        blocks: list[str] = ["# Relevant Files\n"]
+        try:
+            root_for_rel = Path(self.project_root).expanduser().resolve()
+        except (OSError, ValueError):
+            root_for_rel = None
+        for entry in context_files:
+            path = entry["path"]
+            content = entry["content"]
+            if root_for_rel is not None:
+                try:
+                    display = str(Path(path).relative_to(root_for_rel))
+                except ValueError:
+                    display = str(path)
+            else:
+                display = str(path)
+            language = self._language_for_path(str(path))
+            blocks.append(f"## {display}\n```{language}\n{content}\n```\n")
+
+        text = "\n".join(blocks)
+        return Message(
+            role="system",
+            content=text,
+            token_count=self.token_engine.count_tokens(text),
+        )
+
+    def _trim_to_budget(self, text: str, budget: int) -> str:
+        """Trim ``text`` to approximately ``budget`` tokens, on line boundaries."""
+        if not text or budget <= 0:
+            return ""
+        if self.token_engine.count_tokens(text) <= budget:
+            return text
+        lines = text.splitlines()
+        kept: list[str] = []
+        used = 0
+        for line in lines:
+            line_tokens = self.token_engine.count_tokens(line)
+            if used + line_tokens > budget:
+                break
+            kept.append(line)
+            used += line_tokens
+        if not kept:
+            kept = lines[:1]
+        kept.append(f"... (trimmed, {len(lines) - len(kept)} more lines)")
+        return "\n".join(kept)
+
+    @staticmethod
+    def _language_for_path(path: str) -> str:
+        """Map a file extension to a fenced-code language hint."""
+        suffix = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+        mapping = {
+            "py": "python",
+            "go": "go",
+            "rs": "rust",
+            "js": "javascript",
+            "jsx": "jsx",
+            "ts": "typescript",
+            "tsx": "tsx",
+            "md": "markdown",
+            "toml": "toml",
+            "yaml": "yaml",
+            "yml": "yaml",
+            "json": "json",
+            "txt": "text",
+        }
+        return mapping.get(suffix, "")
 
     async def _check_compression(self, messages: list[Message]) -> bool:
         total_tokens = sum(

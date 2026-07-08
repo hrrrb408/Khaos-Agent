@@ -10,6 +10,8 @@ from pathlib import Path
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.widgets import Static
+from rich.text import Text
 
 from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
@@ -45,9 +47,18 @@ class KhaosApp(App):
     CSS = """
     Screen {
         layout: vertical;
+        background: #0d0d0d;
+        color: #e0e0e0;
+    }
+    #header {
+        height: 1;
+        padding: 0 2;
+        background: #15110a;
+        color: #e0e0e0;
     }
     #chat {
         height: 1fr;
+        margin: 0 2;
     }
     """
 
@@ -83,28 +94,74 @@ class KhaosApp(App):
     # --- layout ------------------------------------------------------------
 
     def compose(self) -> ComposeResult:  # type: ignore[override]
+        yield HeaderBar()
         yield ChatPanel()
         yield InputPanel()
         yield StatusBar()
 
     async def on_mount(self) -> None:  # type: ignore[override]
         configured = await self._bootstrap()
+        self._sync_status()
         chat = self.query_one(ChatPanel)
         if not configured:
-            chat.append_text(
-                f"Khaos ready. session [b]{self.session_id}[/], mode "
-                f"[b]{self._mode_label()}[/].",
-                markdown=False,
+            chat.append_welcome_dashboard(
+                mode=self._mode_label(),
+                model="setup",
+                session_id=self.session_id,
+                project_root=self.project_root,
+                viewport_width=self.size.width,
             )
             self._begin_setup_flow()
-            self._sync_status()
             return
-        chat.append_text(
-            f"Khaos ready. session [b]{self.session_id}[/], mode "
-            f"[b]{self._mode_label()}[/]. Type /help for commands.",
-            markdown=False,
+        chat.append_welcome_dashboard(
+            mode=self._mode_label(),
+            model=self._current_model_label(),
+            session_id=self.session_id,
+            project_root=self.project_root,
+            viewport_width=self.size.width,
         )
-        self._sync_status()
+        if self.mode_manager is not None and self.mode_manager.current_mode.value == "coding":
+            self._show_project_overview()
+
+    def _show_project_overview(self) -> None:
+        """Scan the project once and append a compact overview line.
+
+        Only runs in coding mode. Failures (non-git dir, missing files) are
+        logged and silently skipped — the overview is a nicety, not a gate.
+        """
+        try:
+            from khaos.coding import RepoIndexer
+        except ImportError:
+            return
+        try:
+            index = RepoIndexer().scan(self.project_root)
+        except (OSError, FileNotFoundError, NotADirectoryError) as exc:
+            logger.debug("project overview skipped: %s", exc)
+            return
+        except Exception as exc:  # noqa: BLE001 — overview must never break boot
+            logger.debug("project overview errored: %s", exc)
+            return
+
+        name = self.project_root.name
+        files = index.get("total_files", 0)
+        dirs = index.get("total_dirs", 0)
+        entries = [
+            f"Entry: {', '.join(p.name for p in index.get('entry_files', []))}"
+        ] if index.get("entry_files") else []
+        tests = [
+            f"Tests: {', '.join(p.name + '/' for p in index.get('test_dirs', []))}"
+        ] if index.get("test_dirs") else []
+        configs = [
+            f"Config: {', '.join(p.name for p in index.get('config_files', []))}"
+        ] if index.get("config_files") else []
+
+        summary = "  ".join(
+            [f"📁 Project: {name} ({files} files, {dirs} dirs)", *entries, *tests, *configs]
+        )
+        try:
+            self.query_one(ChatPanel).append_text(summary, markdown=False)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("project overview render failed: %s", exc)
 
     async def _bootstrap(self) -> bool:
         self.db = Database(self.db_path)
@@ -137,6 +194,7 @@ class KhaosApp(App):
         skills_dir = self.project_root / "skills"
         if skills_dir.is_dir():
             self.skill_manager.load_from_dir(skills_dir)
+        coding_builder = self._build_coding_context_builder()
         self.agent_loop = AgentLoop(
             AgentConfig(),
             self.mode_manager,
@@ -148,7 +206,18 @@ class KhaosApp(App):
             memory_manager=self.memory_manager,
             error_handler=ErrorHandler(db=self.db, router=self.router, compressor=compressor),
             skill_manager=self.skill_manager if len(self.skill_manager.registry) > 0 else None,
+            project_root=self.project_root,
+            coding_context_builder=coding_builder,
         )
+
+    def _build_coding_context_builder(self):
+        """Construct a CodingContextBuilder, or None if coding pkg is absent."""
+        try:
+            from khaos.coding import CodingContextBuilder
+        except ImportError:
+            logger.debug("coding module unavailable; skipping context builder")
+            return None
+        return CodingContextBuilder()
 
     # --- input handling ----------------------------------------------------
 
@@ -186,27 +255,92 @@ class KhaosApp(App):
 
     @work(exclusive=True)
     async def _run_turn(self, user_input: str) -> None:
+        """Run one agent turn in a Textual worker."""
+        await self._run_turn_impl(user_input)
+
+    async def _run_turn_impl(self, user_input: str) -> None:
         """Stream one agent turn into the chat panel."""
         if self.agent_loop is None:
             return
         chat = self.query_one(ChatPanel)
+        turn_tokens = 0
         try:
             async for message in self.agent_loop.run(user_input, self.session_id):
                 self._render_message(message)
-                self._total_tokens = max(self._total_tokens, message.token_count)
+                if _is_done_message(message):
+                    turn_tokens = message.token_count
         except Exception as exc:  # noqa: BLE001 — surface any error to the user
             logger.exception("agent turn failed")
             chat.append_error(f"turn failed: {exc}")
+        if turn_tokens > 0:
+            self._total_tokens += turn_tokens
         self._sync_status()
 
     def _render_message(self, message: Message) -> None:
         chat = self.query_one(ChatPanel)
         chat.append_message(message)
+        # After a successful write-class tool call, surface a live git diff so
+        # the user immediately sees what changed — purely cosmetic, never sent
+        # back to the model.
+        if self._is_write_tool_result(message):
+            self._maybe_show_diff(message)
+
+    # Tools whose success should trigger an automatic diff preview.
+    _DIFF_TRIGGER_TOOLS = frozenset({"write_file", "patch", "multi_edit"})
+
+    def _is_write_tool_result(self, message: Message) -> bool:
+        if message.event != "tool_result":
+            return False
+        meta = message.metadata or {}
+        return meta.get("success") is True and meta.get("name") in self._DIFF_TRIGGER_TOOLS
+
+    def _maybe_show_diff(self, message: Message) -> None:
+        """Run ``git diff`` in the project root and render it if non-empty."""
+        try:
+            import subprocess
+
+            result = subprocess.run(
+                ["git", "diff", "--color=never"],
+                cwd=str(self.project_root),
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            logger.debug("diff preview skipped: %s", exc)
+            return
+        if result.returncode != 0:
+            logger.debug("diff preview skipped (rc=%d): %s", result.returncode, result.stderr.strip())
+            return
+        diff_text = result.stdout.strip()
+        meta = message.metadata or {}
+        file_path = self._extract_changed_path(meta) or "working tree"
+        try:
+            self.query_one(ChatPanel).append_diff(file_path, diff_text)
+        except Exception as exc:  # noqa: BLE001 — never let the preview crash the turn
+            logger.debug("diff render failed: %s", exc)
+
+    @staticmethod
+    def _extract_changed_path(meta: dict) -> str:
+        """Best-effort path extraction from a write-class tool result."""
+        output = meta.get("output")
+        if isinstance(output, dict):
+            for key in ("path", "file", "file_path"):
+                value = output.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        if isinstance(output, str) and output:
+            return output.splitlines()[0][:120]
+        arguments = meta.get("arguments")
+        if isinstance(arguments, dict):
+            for key in ("path", "file", "file_path"):
+                value = arguments.get(key)
+                if isinstance(value, str) and value:
+                    return value
+        return ""
 
     def _echo_user(self, text: str) -> None:
-        from rich.text import Text
-        t = Text.assemble(("you:", "cyan"), " ", text)
-        self.query_one(ChatPanel).write(t)
+        self.query_one(ChatPanel).append_user_echo(text)
 
     # --- first-run setup ---------------------------------------------------
 
@@ -327,6 +461,7 @@ class KhaosApp(App):
 
     def _new_session(self, _unused: str = "") -> str:
         self.session_id = str(uuid.uuid4())
+        self._total_tokens = 0
         if self.db is not None and self.mode_manager is not None:
             asyncio.ensure_future(
                 self.db.create_session(self.session_id, self.mode_manager.current_mode.value)
@@ -346,15 +481,66 @@ class KhaosApp(App):
         bar.set_tokens(self._total_tokens)
         if self.router is None:
             bar.set_model("setup")
+            self.query_one(HeaderBar).set_state(
+                self._mode_label(),
+                "setup",
+                self.session_id,
+                self._total_tokens,
+            )
             return
         try:
-            model = next(iter(self.router.provider_manager._models.keys()), "mock")
+            model = self._current_model_label()
             bar.set_model(model)
         except Exception:
             bar.set_model("mock")
+            model = "mock"
+        self.query_one(HeaderBar).set_state(
+            self._mode_label(),
+            model,
+            self.session_id,
+            self._total_tokens,
+        )
 
     def action_clear_chat(self) -> None:
         self.query_one(ChatPanel).clear()
+
+    def _current_model_label(self) -> str:
+        if self.router is None:
+            return "setup"
+        return next(iter(self.router.provider_manager._models.keys()), "mock")
+
+
+class HeaderBar(Static):
+    """Compact product header for the TUI."""
+
+    def __init__(self) -> None:
+        super().__init__("", id="header")
+
+    def set_state(self, mode: str, model: str, session_id: str, tokens: int) -> None:
+        self.update(
+            Text.assemble(
+                (" Khaos", "bold #f59e0b"),
+                ("  "),
+                (mode.upper(), "bold #f59e0b"),
+                ("  ·  ", "dim"),
+                (_compact(model, 40), "white"),
+                ("  ·  ", "dim"),
+                (session_id[:8], "#9ca3af"),
+                ("  ·  ", "dim"),
+                (str(tokens), "#9ca3af"),
+                (" tok", "dim"),
+            )
+        )
+
+
+def _compact(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+def _is_done_message(message: Message) -> bool:
+    return message.event == "done" or (message.role == "system" and message.content == "done")
 
 
 def run_tui(

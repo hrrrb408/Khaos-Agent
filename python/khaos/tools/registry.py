@@ -64,24 +64,36 @@ class ToolRegistry:
     def validate_call(self, name: str, params: dict) -> bool:
         """Validate a small useful subset of JSON Schema."""
         schema = self.get(name).parameters
-        if schema.get("type") == "object" and not isinstance(params, dict):
+        return self._validate_schema_value(schema, params)
+
+    def _validate_schema_value(self, schema: dict, value: Any) -> bool:
+        expected = schema.get("type")
+        if "enum" in schema and value not in schema["enum"]:
             return False
-        for required in schema.get("required", []):
-            if required not in params:
+        if expected == "string":
+            return isinstance(value, str)
+        if expected == "integer":
+            return isinstance(value, int)
+        if expected == "boolean":
+            return isinstance(value, bool)
+        if expected == "object":
+            if not isinstance(value, dict):
                 return False
-        properties = schema.get("properties", {})
-        for key, value in params.items():
-            if key not in properties:
-                continue
-            expected = properties[key].get("type")
-            if expected == "string" and not isinstance(value, str):
+            for required in schema.get("required", []):
+                if required not in value:
+                    return False
+            properties = schema.get("properties", {})
+            return all(
+                key not in properties or self._validate_schema_value(properties[key], item)
+                for key, item in value.items()
+            )
+        if expected == "array":
+            if not isinstance(value, list):
                 return False
-            if expected == "integer" and not isinstance(value, int):
-                return False
-            if expected == "boolean" and not isinstance(value, bool):
-                return False
-            if expected == "object" and not isinstance(value, dict):
-                return False
+            item_schema = schema.get("items")
+            if item_schema is None:
+                return True
+            return all(self._validate_schema_value(item_schema, item) for item in value)
         return True
 
 
@@ -116,6 +128,37 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                     "content": {"type": "string"},
                 },
                 "required": ["path", "content"],
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="multi_edit",
+            description=(
+                "Apply multiple search-and-replace edits to a single file in one call. "
+                "If any edit fails to match, no changes are written."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "edits": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string"},
+                                "new_text": {"type": "string"},
+                            },
+                            "required": ["old_text", "new_text"],
+                        },
+                        "description": "List of edits to apply",
+                    },
+                },
+                "required": ["path", "edits"],
             },
             modes=["coding"],
             permission_level="write",
@@ -293,6 +336,159 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             parallel=True,
         )
     )
+    registry.register(
+        ToolDefinition(
+            name="test_run",
+            description=(
+                "Run test commands and parse results. Returns structured "
+                "output with pass/fail counts and failed test details."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "string",
+                        "description": "Test command to run",
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory",
+                    },
+                },
+                "required": ["command", "cwd"],
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="git_status",
+            description="Get current git status (branch, modified/added/deleted/untracked files).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory",
+                    },
+                },
+                "required": ["cwd"],
+            },
+            modes=["coding", "office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="git_smart_commit",
+            description=(
+                "Stage all changes and commit with an auto-generated or custom "
+                "conventional commit message."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Optional commit message. Auto-generated if empty.",
+                    },
+                },
+                "required": ["cwd"],
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="git_undo",
+            description="Undo the last commit, keeping file changes staged (soft reset).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory",
+                    },
+                },
+                "required": ["cwd"],
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="todo_write",
+            description="Write or append to a todo list. Use this to track your plan and progress.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "append": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, append to existing todos; if false, replace entire list"
+                        ),
+                    },
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string"},
+                                "id": {"type": "string"},
+                                "status": {"type": "string"},
+                            },
+                            "required": ["content"],
+                        },
+                    },
+                },
+                "required": ["append", "todos"],
+            },
+            modes=["coding"],
+            permission_level="read",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="todo_read",
+            description="Read the current todo list.",
+            parameters={"type": "object", "properties": {}},
+            modes=["coding"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="todo_update",
+            description="Update a todo item's status (pending/in_progress/completed).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "todo_id": {"type": "string"},
+                    "status": {
+                        "type": "string",
+                        "enum": ["pending", "in_progress", "completed"],
+                    },
+                },
+                "required": ["todo_id", "status"],
+            },
+            modes=["coding"],
+            permission_level="read",
+            parallel=False,
+        )
+    )
     for name, description, parameters in [
         (
             "browser_navigate",
@@ -377,12 +573,15 @@ def create_runtime_registry() -> ToolRegistry:
         git_tools,
         sandbox_tools,
         terminal_tools,
+        test_tools,
+        todo_tools,
     )
 
     registry = create_builtin_registry()
     registry.get("read_file").handler = file_tools.read_file
     registry.get("write_file").handler = file_tools.write_file
     registry.get("patch").handler = file_tools.patch
+    registry.get("multi_edit").handler = file_tools.multi_edit
     registry.get("search_files").handler = file_tools.search_files
     registry.get("terminal").handler = terminal_tools.terminal
     registry.get("process").handler = terminal_tools.process
@@ -392,6 +591,10 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("git_commit").handler = git_tools.git_commit
     registry.get("git_branch").handler = git_tools.git_branch
     registry.get("git_log").handler = git_tools.git_log
+    registry.get("git_status").handler = git_tools.git_status
+    registry.get("git_smart_commit").handler = git_tools.git_smart_commit
+    registry.get("git_undo").handler = git_tools.git_undo
+    registry.get("test_run").handler = test_tools.test_run
     registry.get("browser_navigate").handler = browser_tools.browser_navigate
     registry.get("browser_click").handler = browser_tools.browser_click
     registry.get("browser_type").handler = browser_tools.browser_type
@@ -399,4 +602,7 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("browser_vision").handler = browser_tools.browser_vision
     registry.get("code_search").handler = code_search_tools.code_search
     registry.get("code_symbols").handler = code_search_tools.code_symbols
+    registry.get("todo_write").handler = todo_tools.todo_write
+    registry.get("todo_read").handler = todo_tools.todo_read
+    registry.get("todo_update").handler = todo_tools.todo_update
     return registry
