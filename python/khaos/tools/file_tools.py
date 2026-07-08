@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from khaos.security.path_guard import PathGuard
+
 
 TREE_EXCLUDE_DIRS = {
     ".git",
@@ -28,6 +30,15 @@ TREE_EXCLUDE_DIRS = {
     "build",
 }
 
+_SECURITY_ENABLED = True
+_PATH_GUARD = PathGuard()
+
+
+def enable_security(enabled: bool = True) -> None:
+    """启用/禁用安全检查（测试用）。"""
+    global _SECURITY_ENABLED
+    _SECURITY_ENABLED = enabled
+
 
 async def read_file(path: str, offset: int = 1, limit: int = 500) -> dict[str, Any]:
     """Read a file page with one-based line numbers."""
@@ -35,6 +46,15 @@ async def read_file(path: str, offset: int = 1, limit: int = 500) -> dict[str, A
 
 
 def _read_file_sync(path: str, offset: int, limit: int) -> dict[str, Any]:
+    if _SECURITY_ENABLED:
+        check = _PATH_GUARD.check_read(path)
+        if not check.safe:
+            return {
+                "ok": False,
+                "path": check.normalized_path,
+                "error": f"File read blocked: {check.reason}",
+                "risk_level": check.risk_level,
+            }
     file_path = Path(path).expanduser().resolve()
     if offset < 1:
         raise ValueError("offset must be >= 1")
@@ -59,6 +79,15 @@ async def write_file(path: str, content: str) -> dict[str, Any]:
 
 
 def _write_file_sync(path: str, content: str) -> dict[str, Any]:
+    if _SECURITY_ENABLED:
+        check = _PATH_GUARD.check_write(path)
+        if not check.safe:
+            return {
+                "ok": False,
+                "path": check.normalized_path,
+                "error": f"File write blocked: {check.reason}",
+                "risk_level": check.risk_level,
+            }
     file_path = Path(path).expanduser().resolve()
     file_path.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(file_path, content)

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
+from khaos.security.middleware import SecurityMiddleware
 from khaos.tools.registry import ToolRegistry
 
 
@@ -77,10 +78,12 @@ class ToolScheduler:
         permission_engine,
         budget: ToolBudget | None = None,
         use_rust_executor: bool = False,
+        security_middleware: SecurityMiddleware | None = None,
     ):
         self.registry = registry
         self.permission_engine = permission_engine
         self.budget = budget or ToolBudget()
+        self.security_middleware = security_middleware or SecurityMiddleware()
         # When True and the Rust bridge is importable, read-only file reads in
         # the parallel group are offloaded to the Rust executor for the bulk
         # I/O; the result still flows through the normal Python handler so
@@ -228,17 +231,49 @@ class ToolScheduler:
                 error="Tool has no handler",
             )
         try:
+            security = await self.security_middleware.pre_check(
+                tool.name,
+                call.get("arguments", {}),
+            )
+            if not security.allowed:
+                target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+                await self.permission_engine.audit(
+                    tool.name,
+                    target,
+                    "denied",
+                    {
+                        "tool_call_id": call["id"],
+                        "reason": security.reason,
+                        "risk_level": security.risk_level,
+                        "check_type": security.check_type,
+                    },
+                    session_id,
+                )
+                return ToolResult(
+                    tool_call_id=call["id"],
+                    name=tool.name,
+                    success=False,
+                    error=f"Security check blocked: {security.reason}",
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
             output = await asyncio.wait_for(
                 tool.handler(**call.get("arguments", {})),
                 timeout=tool.timeout,
             )
             self.budget.record(len(str(output)))
             target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            secret_scan = await self.security_middleware.post_check(tool.name, output)
+            detail: dict[str, Any] = {"tool_call_id": call["id"]}
+            if secret_scan.has_secrets:
+                detail["secrets_detected"] = True
+                detail["secret_categories"] = [
+                    secret.category for secret in secret_scan.secrets
+                ]
             await self.permission_engine.audit(
                 tool.name,
                 target,
                 "success",
-                {"tool_call_id": call["id"]},
+                detail,
                 session_id,
             )
             return ToolResult(
@@ -295,4 +330,3 @@ class ToolScheduler:
             "name": str(call["name"]),
             "arguments": dict(call.get("arguments") or {}),
         }
-

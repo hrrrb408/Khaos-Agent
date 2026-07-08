@@ -13,6 +13,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import re
 from dataclasses import dataclass, field
@@ -20,6 +21,7 @@ from typing import Any
 from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger(__name__)
+_SECURITY_ENABLED = True
 
 # httpx is optional at runtime (urllib fallback keeps zero-dependency envs working).
 try:  # pragma: no cover - import success depends on the environment
@@ -394,7 +396,35 @@ def extract_tables(html: str) -> list[dict[str, Any]]:
 
 def _is_valid_url(url: str) -> bool:
     parsed = urlparse(url)
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and _is_safe_url(parsed)
+
+
+def enable_security(enabled: bool = True) -> None:
+    """启用/禁用 URL 安全检查（测试用）。"""
+    global _SECURITY_ENABLED
+    _SECURITY_ENABLED = enabled
+
+
+def _is_safe_url(parsed) -> bool:
+    if not _SECURITY_ENABLED:
+        return True
+    hostname = (parsed.hostname or "").strip().lower().rstrip(".")
+    if not hostname:
+        return False
+    if hostname == "localhost" or hostname.endswith(".localhost"):
+        return False
+    try:
+        ip = ipaddress.ip_address(hostname.strip("[]"))
+    except ValueError:
+        return True
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    )
 
 
 class _HTTPError(Exception):

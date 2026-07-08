@@ -1095,6 +1095,98 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             parallel=True,
         )
     )
+    registry.register(
+        ToolDefinition(
+            name="list_permission_rules",
+            description="List all permission rules (patterns, approval modes, scopes).",
+            parameters={"type": "object", "properties": {}},
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="grant_permission",
+            description="Grant a permission rule to auto-approve or deny a tool pattern.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Glob pattern (e.g. /home/user/**)",
+                    },
+                    "permission_level": {
+                        "type": "string",
+                        "enum": ["read", "write"],
+                        "description": "Permission level",
+                    },
+                    "approval": {
+                        "type": "string",
+                        "enum": ["auto-approve", "ask-every", "deny"],
+                        "default": "auto-approve",
+                    },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["office", "coding", "all"],
+                        "default": "all",
+                    },
+                },
+                "required": ["pattern", "permission_level"],
+            },
+            modes=["office"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="revoke_permission",
+            description="Revoke a permission rule by its ID.",
+            parameters={
+                "type": "object",
+                "properties": {"rule_id": {"type": "integer"}},
+                "required": ["rule_id"],
+            },
+            modes=["office"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="query_audit_logs",
+            description="Query audit logs (permission decisions, tool executions).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "Filter by tool/action name",
+                    },
+                    "result": {
+                        "type": "string",
+                        "enum": ["approved", "denied", "error", "success"],
+                        "description": "Filter by result type",
+                    },
+                    "limit": {"type": "integer", "default": 50},
+                },
+            },
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="security_status",
+            description="Get security status overview (rule count, recent denials).",
+            parameters={"type": "object", "properties": {}},
+            modes=["office"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
 
 
 def create_builtin_registry() -> ToolRegistry:
@@ -1114,6 +1206,7 @@ def create_runtime_registry() -> ToolRegistry:
         git_tools,
         markdown_tools,
         note_tools,
+        permission_tools,
         sandbox_tools,
         terminal_tools,
         test_tools,
@@ -1183,4 +1276,9 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("collect_results").handler = orchestrator_tools.collect_results
     registry.get("execute_plan").handler = orchestrator_tools.execute_plan
     registry.get("subagent_status").handler = orchestrator_tools.subagent_status
+    registry.get("list_permission_rules").handler = permission_tools.list_permission_rules
+    registry.get("grant_permission").handler = permission_tools.grant_permission
+    registry.get("revoke_permission").handler = permission_tools.revoke_permission
+    registry.get("query_audit_logs").handler = permission_tools.query_audit_logs
+    registry.get("security_status").handler = permission_tools.security_status
     return registry

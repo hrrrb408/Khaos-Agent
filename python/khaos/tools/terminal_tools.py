@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from khaos.permissions.engine import split_command_segments
+from khaos.security.command_guard import CommandGuard
 
 
 READ_ONLY_COMMANDS = {
@@ -68,6 +69,14 @@ class ManagedProcess:
 
 
 _PROCESSES: dict[str, ManagedProcess] = {}
+_SECURITY_ENABLED = True
+_COMMAND_GUARD = CommandGuard()
+
+
+def enable_security(enabled: bool = True) -> None:
+    """启用/禁用安全检查（测试用）。"""
+    global _SECURITY_ENABLED
+    _SECURITY_ENABLED = enabled
 
 
 async def terminal(
@@ -77,9 +86,20 @@ async def terminal(
     timeout: int = 30,
 ) -> dict[str, Any]:
     """Run a terminal command in the foreground or background."""
+    command_check = check_command_safety(command)
+    if not command_check["safe"]:
+        return {
+            "ok": False,
+            "error": f"Command blocked: {command_check['reason']}",
+            "risk_level": command_check["risk_level"],
+        }
     safety = evaluate_command_safety(command)
     if safety["blocked"]:
-        raise PermissionError(f"blocked dangerous command: {safety['reason']}")
+        return {
+            "ok": False,
+            "error": f"Command blocked: {safety['reason']}",
+            "risk_level": "dangerous",
+        }
     workdir = str(Path(cwd).expanduser().resolve())
     if background:
         proc = await asyncio.create_subprocess_shell(
@@ -118,6 +138,19 @@ async def terminal(
         "stdout": stdout.decode("utf-8", errors="replace"),
         "stderr": stderr.decode("utf-8", errors="replace"),
         "safety": safety,
+    }
+
+
+def check_command_safety(command: str) -> dict[str, Any]:
+    """检查命令安全性。在 terminal() 执行前调用。"""
+    if not _SECURITY_ENABLED:
+        return {"safe": True, "risk_level": "safe", "reason": "security disabled"}
+    result = _COMMAND_GUARD.check(command)
+    return {
+        "safe": result.safe,
+        "risk_level": result.risk_level,
+        "reason": result.reason,
+        "matched_pattern": result.matched_pattern,
     }
 
 

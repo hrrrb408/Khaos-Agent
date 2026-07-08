@@ -414,6 +414,18 @@ class TestWebFetch:
         assert result["ok"] is False
         assert "Invalid URL" in result["error"]
 
+    async def test_blocks_localhost_url(self):
+        result = await web_fetch("http://localhost:8080")
+
+        assert result["ok"] is False
+        assert "Invalid URL" in result["error"]
+
+    async def test_blocks_private_ip_url(self):
+        result = await web_fetch("http://192.168.1.10")
+
+        assert result["ok"] is False
+        assert "Invalid URL" in result["error"]
+
 
 class TestWebExtractTables:
     async def test_extracts_tables_from_url(self, mock_httpx_client):
