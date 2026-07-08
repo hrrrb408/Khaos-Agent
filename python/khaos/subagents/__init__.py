@@ -2,11 +2,13 @@
 
 from khaos.subagents.planner import SubTaskPlan, TaskPlanner
 from khaos.subagents.runner import SubAgentRunner
+from khaos.subagents.service import SubAgentService
 from khaos.subagents.spawner import SubAgentConfig, SubAgentSpawner, SubAgentTask
 
 __all__ = [
     "SubAgentConfig",
     "SubAgentRunner",
+    "SubAgentService",
     "SubAgentSpawner",
     "SubAgentTask",
     "SubTaskPlan",

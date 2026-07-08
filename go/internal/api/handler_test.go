@@ -37,6 +37,23 @@ func (m *mockAgent) SwitchMode(ctx context.Context, sessionID string, targetMode
 	return targetMode, nil
 }
 
+type mockSubagentClient struct {
+	goal string
+}
+
+func (m *mockSubagentClient) Spawn(ctx context.Context, goal string, taskContext string, tools []string, timeout int) (map[string]any, error) {
+	m.goal = goal
+	return map[string]any{"id": "sub-1", "status": "running", "goal": goal}, nil
+}
+
+func (m *mockSubagentClient) CollectResults(ctx context.Context) (map[string]any, error) {
+	return map[string]any{"results": []any{}}, nil
+}
+
+func (m *mockSubagentClient) Status(ctx context.Context) (map[string]any, error) {
+	return map[string]any{"active": 0}, nil
+}
+
 func newTestHandler(apiKey string) (http.Handler, *mockAgent) {
 	agent := &mockAgent{}
 	handler := NewHandler(agent, NewMemoryMap(), NewMapConfig(map[string]any{"mode": "office"}), apiKey, rate.NewTokenBucket(1000, 100))
@@ -200,5 +217,69 @@ func TestAuditEndpointDefaultsLimit(t *testing.T) {
 
 	if audit.limit != 100 {
 		t.Fatalf("default limit should be 100, got %d", audit.limit)
+	}
+}
+
+func TestMetricsEndpoint(t *testing.T) {
+	handler, _ := newTestHandler("")
+	rec := serve(handler, http.MethodGet, "/api/metrics", "", "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if _, ok := payload["total_requests"]; !ok {
+		t.Fatalf("missing total_requests: %v", payload)
+	}
+	if _, ok := payload["requests_by_route"]; !ok {
+		t.Fatalf("missing requests_by_route: %v", payload)
+	}
+}
+
+func TestSubagentSpawn(t *testing.T) {
+	subagents := &mockSubagentClient{}
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1000, 100)).WithSubagents(subagents)
+
+	rec := serve(handler.Routes(), http.MethodPost, "/api/subagents/spawn", `{"goal":"inspect","context":"ctx","tools":["read_file"],"timeout":300}`, "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if subagents.goal != "inspect" {
+		t.Fatalf("goal not forwarded: %q", subagents.goal)
+	}
+}
+
+func TestSubagentStatusNotConfigured(t *testing.T) {
+	handler, _ := newTestHandler("")
+	rec := serve(handler, http.MethodGet, "/api/subagents/status", "", "")
+
+	if rec.Code != http.StatusNotImplemented {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestNDJSONStream(t *testing.T) {
+	handler, _ := newTestHandler("")
+	rec := serve(handler, http.MethodPost, "/api/chat/s1/stream", `{"message":"hello","mode":"office"}`, "")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if contentType := rec.Header().Get("Content-Type"); contentType != "application/x-ndjson" {
+		t.Fatalf("content type=%q", contentType)
+	}
+	lines := strings.Split(strings.TrimSpace(rec.Body.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("expected 2 ndjson lines, got %d: %q", len(lines), rec.Body.String())
+	}
+	for _, line := range lines {
+		var event ChatEvent
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("invalid ndjson line %q: %v", line, err)
+		}
 	}
 }

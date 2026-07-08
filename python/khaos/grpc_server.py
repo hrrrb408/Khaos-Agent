@@ -33,6 +33,7 @@ from khaos.rust_bridge import get_token_engine
 from khaos.routing.router import create_default_router
 from khaos.routing import ModelRouter
 from khaos.skills import SkillManager
+from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
 from khaos.tools import create_runtime_registry
 from khaos.tools.scheduler import ToolScheduler
 
@@ -201,6 +202,7 @@ async def serve_json_lines(
     db_path: str,
     project_root: Path | None = None,
     config_path: Path | None = None,
+    enable_subagents: bool = False,
 ) -> None:
     """Serve JSON-line RPC requests over TCP."""
     db = Database(db_path)
@@ -209,6 +211,9 @@ async def serve_json_lines(
     agent = AgentService(db, project_root=project_root, config_path=config_path)
     memory = MemoryService(MemoryStore(db))
     audit_service = AuditService(AuditLogger(db))
+    subagent_service: SubAgentService | None = None
+    if enable_subagents:
+        subagent_service = await _build_subagent_service(db, project_root, config_path)
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -256,6 +261,15 @@ async def serve_json_lines(
             elif method == "AuditService.Query":
                 response = await audit_service.query(**payload)
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "SubAgentService.Spawn":
+                response = await _handle_optional_subagent(subagent_service, "spawn", payload)
+                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "SubAgentService.Collect":
+                response = await _handle_optional_subagent(subagent_service, "collect", payload)
+                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "SubAgentService.Status":
+                response = await _handle_optional_subagent(subagent_service, "status", payload)
+                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             else:
                 writer.write(json.dumps({"error": "unknown method"}).encode("utf-8") + b"\n")
             await writer.drain()
@@ -266,6 +280,63 @@ async def serve_json_lines(
     server = await asyncio.start_server(handle, host, port)
     async with server:
         await server.serve_forever()
+
+
+async def _build_subagent_service(
+    db: Database,
+    project_root: Path | None,
+    config_path: Path | None,
+) -> SubAgentService:
+    root = project_root or Path.cwd()
+    resolved_config = config_path or root / "config.yaml"
+    mode_manager = ModeManager(db, project_root=root)
+    await mode_manager.load()
+    router = load_router_from_config(resolved_config, project_root=root)
+    permission_engine = PermissionEngine(db)
+    await permission_engine.load_rules()
+    memory_store = MemoryStore(db)
+    memory_manager = MemoryManager(
+        memory_store,
+        budget=MemoryBudget(),
+        mode_getter=lambda: mode_manager.current_mode,
+        intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
+    )
+    skill_manager = SkillManager()
+    skills_dir = root / "skills"
+    if skills_dir.is_dir():
+        skill_manager.load_from_dir(skills_dir)
+    runner = SubAgentRunner(
+        router=router,
+        db=db,
+        mode_manager=mode_manager,
+        tool_scheduler=ToolScheduler(create_runtime_registry(), permission_engine),
+        memory_manager=memory_manager,
+        skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
+        token_engine=get_token_engine(),
+    )
+    spawner = SubAgentSpawner(
+        SubAgentConfig(max_concurrent=3, max_spawn_depth=1, allow_nesting=False),
+        db,
+        runner=runner.run,
+        registry=create_runtime_registry(),
+    )
+    return SubAgentService(spawner, runner)
+
+
+async def _handle_optional_subagent(
+    subagent_service: SubAgentService | None,
+    action: str,
+    payload: dict,
+) -> dict:
+    if subagent_service is None:
+        return {"ok": False, "error": "subagents not enabled"}
+    if action == "spawn":
+        return await subagent_service.handle_spawn(payload)
+    if action == "collect":
+        return await subagent_service.handle_collect(payload)
+    if action == "status":
+        return await subagent_service.handle_status(payload)
+    return {"ok": False, "error": "unknown subagent action"}
 
 
 def load_router_from_config(config_path: Path, project_root: Path | None = None) -> ModelRouter:
@@ -307,6 +378,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=50051)
     parser.add_argument("--db", default="khaos.db")
     parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--subagents", action="store_true")
     args = parser.parse_args()
     asyncio.run(
         serve_json_lines(
@@ -315,6 +387,7 @@ def main() -> None:
             args.db,
             project_root=Path.cwd(),
             config_path=Path(args.config),
+            enable_subagents=args.subagents,
         )
     )
 

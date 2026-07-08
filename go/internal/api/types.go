@@ -22,6 +22,13 @@ type AgentClient interface {
 	SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error)
 }
 
+// SubagentClient forwards subagent lifecycle calls to the Python service.
+type SubagentClient interface {
+	Spawn(ctx context.Context, goal string, context string, tools []string, timeout int) (map[string]any, error)
+	CollectResults(ctx context.Context) (map[string]any, error)
+	Status(ctx context.Context) (map[string]any, error)
+}
+
 // Memory represents one memory record.
 type Memory struct {
 	ID         int64  `json:"id"`

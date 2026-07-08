@@ -11,6 +11,7 @@ import (
 	"khaos/go/internal/api"
 	"khaos/go/internal/platform"
 	"khaos/go/internal/rate"
+	"khaos/go/internal/ws"
 )
 
 type mockAgentClient struct{}
@@ -40,10 +41,15 @@ func main() {
 		defaultPythonAgent = "127.0.0.1:50051"
 	}
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
+	wsAddr := flag.String("ws-addr", "", "WebSocket listen address, defaults to --addr")
 	apiKey := flag.String("api-key", defaultAPIKey, "X-Khaos-Key value")
 	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService JSON-line address")
 	mockAgent := flag.Bool("mock-agent", false, "use in-process mock agent")
+	enableSubagents := flag.Bool("subagents", false, "enable subagent proxy")
 	flag.Parse()
+	if *wsAddr == "" {
+		*wsAddr = *addr
+	}
 	var agent api.AgentClient = platform.PythonClient{Address: *pythonAddr}
 	if *mockAgent {
 		agent = mockAgentClient{}
@@ -59,8 +65,32 @@ func main() {
 	// When talking to a real Python agent, also forward audit queries. The mock
 	// agent path leaves audit unconfigured (GET /api/audit returns []).
 	if !*mockAgent {
-		handler = handler.WithAudit(platform.PythonClient{Address: *pythonAddr})
+		client := platform.PythonClient{Address: *pythonAddr}
+		handler = handler.WithAudit(client)
+		if *enableSubagents {
+			handler = handler.WithSubagents(client)
+		}
 	}
+	wsHub := ws.NewHub()
+	go wsHub.Run()
+	wsRoute := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ws.HandleWebSocket(wsHub, agent, w, r)
+	})
+	root := http.NewServeMux()
+	root.Handle("/api/ws/", wsRoute)
+	root.Handle("/", handler.Routes())
+
 	log.Printf("Khaos gateway listening on %s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, handler.Routes()))
+	log.Printf("WebSocket available at ws://%s/api/ws/{session}", *wsAddr)
+	if *enableSubagents {
+		log.Printf("Subagent proxy enabled (Python agent: %s)", *pythonAddr)
+	}
+	if *wsAddr != *addr {
+		wsMux := http.NewServeMux()
+		wsMux.Handle("/api/ws/", wsRoute)
+		go func() {
+			log.Fatal(http.ListenAndServe(*wsAddr, wsMux))
+		}()
+	}
+	log.Fatal(http.ListenAndServe(*addr, root))
 }

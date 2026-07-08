@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"khaos/go/internal/auth"
+	"khaos/go/internal/metrics"
 	"khaos/go/internal/rate"
 )
 
@@ -20,8 +22,10 @@ type Handler struct {
 	agent     AgentClient
 	memory    MemoryClient
 	audit     AuditClient
+	subagents SubagentClient
 	config    ConfigStore
 	limiter   *rate.TokenBucket
+	metrics   *metrics.Collector
 	apiKey    string
 	startedAt time.Time
 	mu        sync.Mutex
@@ -43,6 +47,7 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 		memory:    memory,
 		config:    config,
 		limiter:   limiter,
+		metrics:   metrics.NewCollector(),
 		apiKey:    apiKey,
 		startedAt: time.Now(),
 		streams:   map[string]<-chan ChatEvent{},
@@ -55,13 +60,24 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 	}
 }
 
+// WithSubagents attaches a subagent client so subagent endpoints are served.
+func (h *Handler) WithSubagents(subagents SubagentClient) *Handler {
+	h.subagents = subagents
+	return h
+}
+
 // Routes returns all REST routes with auth and rate limiting middleware.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/chat", h.handleChat)
 	mux.HandleFunc("GET /api/chat/{id}/stream", h.handleChatStream)
+	mux.HandleFunc("POST /api/chat/{id}/stream", h.handleChatNDJSONStream)
 	mux.HandleFunc("POST /api/chat/{id}/confirm", h.handleConfirm)
 	mux.HandleFunc("POST /api/mode", h.handleMode)
+	mux.HandleFunc("POST /api/subagents/spawn", h.handleSubagentSpawn)
+	mux.HandleFunc("POST /api/subagents/collect", h.handleSubagentCollect)
+	mux.HandleFunc("GET /api/subagents/status", h.handleSubagentStatus)
+	mux.HandleFunc("GET /api/metrics", h.handleMetrics)
 	mux.HandleFunc("GET /api/memory", h.handleMemoryGet)
 	mux.HandleFunc("POST /api/memory", h.handleMemorySet)
 	mux.HandleFunc("DELETE /api/memory/{id}", h.handleMemoryDelete)
@@ -72,7 +88,7 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("PUT /api/config", h.handleConfigSet)
 	mux.HandleFunc("GET /api/audit", h.handleAudit)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
-	return h.cors(auth.Middleware(h.apiKey, h.rateLimit(mux)))
+	return h.cors(auth.Middleware(h.apiKey, h.rateLimit(h.requestLog(h.metricsMiddleware(mux)))))
 }
 
 func (h *Handler) cors(next http.Handler) http.Handler {
@@ -96,6 +112,55 @@ func (h *Handler) rateLimit(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (h *Handler) requestLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		next.ServeHTTP(recorder, r)
+		durationMs := float64(time.Since(start).Microseconds()) / 1000.0
+		log.Printf("%s %s %d %.1fms", r.Method, r.URL.Path, recorder.status, durationMs)
+	})
+}
+
+func (h *Handler) metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if h.metrics == nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		start := time.Now()
+		h.metrics.IncrActive()
+		defer h.metrics.DecrActive()
+		next.ServeHTTP(recorder, r)
+		var reqErr error
+		if recorder.status >= http.StatusBadRequest {
+			reqErr = fmt.Errorf("status %d", recorder.status)
+		}
+		route := r.Pattern
+		if route == "" {
+			route = r.URL.Path
+		}
+		h.metrics.RecordRequest(route, r.Method, time.Since(start), reqErr)
+	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (r *statusRecorder) WriteHeader(status int) {
+	r.status = status
+	r.ResponseWriter.WriteHeader(status)
+}
+
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
@@ -144,6 +209,42 @@ func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("id")
+	if sessionID == "" || sessionID == "new" {
+		sessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
+	}
+	var req ChatRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if req.Message == "" {
+		writeError(w, http.StatusBadRequest, "message is required")
+		return
+	}
+	req.SessionID = sessionID
+	stream, err := h.agent.Chat(r.Context(), req)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Transfer-Encoding", "chunked")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.WriteHeader(http.StatusOK)
+	flusher, _ := w.(http.Flusher)
+	encoder := json.NewEncoder(w)
+	for event := range stream {
+		if err := encoder.Encode(event); err != nil {
+			return
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+}
+
 func (h *Handler) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		ToolCallID string `json:"tool_call_id"`
@@ -176,6 +277,55 @@ func (h *Handler) handleMode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"current_mode": mode})
+}
+
+func (h *Handler) handleSubagentSpawn(w http.ResponseWriter, r *http.Request) {
+	if h.subagents == nil {
+		writeError(w, http.StatusNotImplemented, "subagents not configured")
+		return
+	}
+	var body struct {
+		Goal    string   `json:"goal"`
+		Context string   `json:"context"`
+		Tools   []string `json:"tools"`
+		Timeout int      `json:"timeout"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	result, err := h.subagents.Spawn(r.Context(), body.Goal, body.Context, body.Tools, body.Timeout)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleSubagentCollect(w http.ResponseWriter, r *http.Request) {
+	if h.subagents == nil {
+		writeError(w, http.StatusNotImplemented, "subagents not configured")
+		return
+	}
+	result, err := h.subagents.CollectResults(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleSubagentStatus(w http.ResponseWriter, r *http.Request) {
+	if h.subagents == nil {
+		writeError(w, http.StatusNotImplemented, "subagents not configured")
+		return
+	}
+	result, err := h.subagents.Status(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) handleMemoryGet(w http.ResponseWriter, r *http.Request) {
@@ -312,6 +462,10 @@ func (h *Handler) handleAudit(w http.ResponseWriter, r *http.Request) {
 		entries = []AuditEntry{}
 	}
 	writeJSON(w, http.StatusOK, entries)
+}
+
+func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, h.metrics.Snapshot())
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {

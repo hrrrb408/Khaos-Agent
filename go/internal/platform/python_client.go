@@ -11,8 +11,9 @@ import (
 
 // Compile-time assertions that PythonClient satisfies the gateway interfaces.
 var (
-	_ api.AgentClient = PythonClient{}
-	_ api.AuditClient = PythonClient{}
+	_ api.AgentClient    = PythonClient{}
+	_ api.AuditClient    = PythonClient{}
+	_ api.SubagentClient = PythonClient{}
 )
 
 // PythonClient talks to the Python AgentService JSON-line endpoint.
@@ -121,4 +122,43 @@ func (c PythonClient) Query(ctx context.Context, action, result, since, until st
 		return nil, err
 	}
 	return entries, nil
+}
+
+// Spawn starts a subagent task through Python.
+func (c PythonClient) Spawn(ctx context.Context, goal string, taskContext string, tools []string, timeout int) (map[string]any, error) {
+	return c.callMap(ctx, "SubAgentService.Spawn", map[string]any{
+		"goal":    goal,
+		"context": taskContext,
+		"tools":   tools,
+		"timeout": timeout,
+	})
+}
+
+// CollectResults collects completed subagent results through Python.
+func (c PythonClient) CollectResults(ctx context.Context) (map[string]any, error) {
+	return c.callMap(ctx, "SubAgentService.Collect", map[string]any{})
+}
+
+// Status returns subagent service status through Python.
+func (c PythonClient) Status(ctx context.Context) (map[string]any, error) {
+	return c.callMap(ctx, "SubAgentService.Status", map[string]any{})
+}
+
+func (c PythonClient) callMap(ctx context.Context, method string, payload map[string]any) (map[string]any, error) {
+	conn, err := net.Dial("tcp", c.Address)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(map[string]any{
+		"method":  method,
+		"payload": payload,
+	}); err != nil {
+		return nil, err
+	}
+	var response map[string]any
+	if err := json.NewDecoder(conn).Decode(&response); err != nil {
+		return nil, err
+	}
+	return response, nil
 }
