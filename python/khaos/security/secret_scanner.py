@@ -30,6 +30,16 @@ SECRET_PATTERNS = [
         re.compile(r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}"),
         "JWT Token",
     ),
+    # Common credential-bearing environment variable names with an assigned
+    # value. Catches accidental dumps like "OPENAI_API_KEY=sk-...".
+    (
+        re.compile(
+            r"(?i)(?:OPENAI_API_KEY|ANTHROPIC_API_KEY|AWS_SECRET_ACCESS_KEY"
+            r"|GITHUB_TOKEN|GOOGLE_API_KEY|DEEPSEEK_API_KEY|NVIDIA_API_KEY)"
+            r"\s*[=:]\s*['\"]?(\S{10,})['\"]?"
+        ),
+        "API Key in env var",
+    ),
 ]
 
 MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024

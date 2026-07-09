@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import signal
 import uuid
@@ -72,6 +73,47 @@ _PROCESSES: dict[str, ManagedProcess] = {}
 _SECURITY_ENABLED = True
 _COMMAND_GUARD = CommandGuard()
 
+# Environment-variable prefixes that are safe to pass through to spawned
+# subprocesses. Everything else (API keys, tokens, etc.) is stripped so a
+# command run via the terminal tool cannot exfiltrate credentials from Khaos's
+# own environment. This only affects subprocesses spawned by ``terminal()`` —
+# Khaos itself still sees its full environment.
+SAFE_ENV_PREFIXES = (
+    "PATH",
+    "HOME",
+    "USER",
+    "LANG",
+    "LC_",  # locale variants (LC_ALL, LC_CTYPE, …)
+    "TERM",
+    "SHELL",
+    "PYTHONPATH",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "PWD",
+    "OLDPWD",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+)
+
+# Explicit allowlist of non-prefixed vars that are safe to forward.
+SAFE_ENV_EXACT = frozenset({"CI", "GITHUB_ACTIONS", "DOCKER_CONTAINER"})
+
+
+def _build_safe_env() -> dict[str, str]:
+    """构建安全的环境变量字典，移除可能包含密钥的变量。
+
+    Only variables whose name starts with a :data:`SAFE_ENV_PREFIXES` entry or
+    appears in :data:`SAFE_ENV_EXACT` are forwarded to the subprocess. This
+    prevents a model-run command from reading ``OPENAI_API_KEY`` and similar
+    credentials out of Khaos's own environment.
+    """
+    env: dict[str, str] = {}
+    for key, value in os.environ.items():
+        if key in SAFE_ENV_EXACT or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES):
+            env[key] = value
+    return env
+
 
 def enable_security(enabled: bool = True) -> None:
     """启用/禁用安全检查（测试用）。"""
@@ -107,6 +149,7 @@ async def terminal(
             cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_build_safe_env(),
         )
         process_id = str(uuid.uuid4())
         managed = ManagedProcess(process_id, command, proc)
@@ -125,6 +168,7 @@ async def terminal(
         cwd=workdir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=_build_safe_env(),
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)

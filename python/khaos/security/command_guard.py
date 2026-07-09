@@ -57,6 +57,8 @@ BLOCKED_COMMANDS = frozenset(
         "groupdel",
         "insmod",
         "modprobe",
+        "env",
+        "printenv",
     }
 )
 
@@ -81,7 +83,8 @@ ALLOWED_SUDO_PREFIXES = frozenset(
 RISKY_PATTERNS = re.compile(
     r"(?:rm\s+-|DROP\s+TABLE|DROP\s+DATABASE|DELETE\s+FROM|TRUNCATE\s+TABLE"
     r"|git\s+push\s+--force|git\s+reset\s+--hard|DROP\s+SCHEMA"
-    r"|ALTER\s+TABLE.*DROP|INSERT\s+INTO.*SELECT)",
+    r"|ALTER\s+TABLE.*DROP|INSERT\s+INTO.*SELECT"
+    r"|os\.environ|getenv|ENV\[)",
     re.IGNORECASE,
 )
 
