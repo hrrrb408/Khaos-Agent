@@ -107,10 +107,15 @@ class CommandGuard:
         block_dangerous: bool = True,
         confirm_risky: bool = True,
         allowed_commands: frozenset[str] | None = None,
+        extra_blocked: frozenset[str] | None = None,
     ):
         self.block_dangerous = block_dangerous
         self.confirm_risky = confirm_risky
         self._allowed_commands = allowed_commands
+        # Instance-level extension of the module BLOCKED_COMMANDS set. Kept on
+        # the instance (not merged into the global) so one configured guard
+        # never leaks its policy into another — important for test isolation.
+        self._extra_blocked = extra_blocked or frozenset()
 
     def check(self, command: str) -> CommandCheckResult:
         """检查命令是否安全。"""
@@ -126,7 +131,7 @@ class CommandGuard:
                 matched_pattern=_base_command(stripped),
             )
 
-        blocked = _blocked_command_match(stripped)
+        blocked = _blocked_command_match(stripped, self._extra_blocked)
         if blocked is not None:
             return CommandCheckResult(
                 safe=False,
@@ -165,7 +170,7 @@ class CommandGuard:
         for segment in _split_shell_segments(command):
             if not segment.strip():
                 continue
-            blocked = _blocked_command_match(segment)
+            blocked = _blocked_command_match(segment, self._extra_blocked)
             if blocked is not None:
                 return CommandCheckResult(
                     safe=False,
@@ -190,7 +195,9 @@ class CommandGuard:
         return bool(base and base in self._allowed_commands)
 
 
-def _blocked_command_match(command: str) -> str | None:
+def _blocked_command_match(
+    command: str, extra_blocked: frozenset[str] | None = None
+) -> str | None:
     base = _base_command(command)
     if not base:
         return None
@@ -203,7 +210,13 @@ def _blocked_command_match(command: str) -> str | None:
         return "su"
     if base == "at":
         return "at"
-    for pattern in BLOCKED_COMMANDS:
+    # Merge the module-level set with the caller's instance-level extras.
+    # Reading both (rather than mutating the global) keeps one guard's policy
+    # from leaking into another.
+    blocked_set = BLOCKED_COMMANDS
+    if extra_blocked:
+        blocked_set = blocked_set | extra_blocked
+    for pattern in blocked_set:
         normalized = pattern.strip()
         if normalized.endswith("."):
             if base.startswith(normalized):

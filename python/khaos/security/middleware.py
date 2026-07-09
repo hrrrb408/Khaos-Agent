@@ -78,7 +78,7 @@ class SecurityMiddleware:
             self._apply_policy(policy)
 
     def _apply_policy(self, policy: "SandboxPolicy") -> None:
-        """Merge policy lists into the existing guards (additive)."""
+        """Merge policy lists into the existing guards (additive, instance-level)."""
         # Extend PathGuard's protected set with policy-denied paths.
         if policy.denied_paths:
             extra = frozenset(
@@ -90,12 +90,15 @@ class SecurityMiddleware:
                 existing = getattr(self.path_guard, "_protected", frozenset())
                 self.path_guard._protected = existing | extra
         # Extend CommandGuard's blocked commands with policy-blocked ones.
+        # Done instance-level (extra_blocked) — never mutates the module
+        # global, so one middleware's policy can't leak into another guard.
         if policy.commands_blocked:
-            from khaos.security import command_guard as cg
-
-            existing_blocked = getattr(cg, "BLOCKED_COMMANDS", frozenset())
-            merged = existing_blocked | frozenset(policy.commands_blocked)
-            cg.BLOCKED_COMMANDS = merged
+            self.command_guard = CommandGuard(
+                block_dangerous=self.command_guard.block_dangerous,
+                confirm_risky=self.command_guard.confirm_risky,
+                allowed_commands=self.command_guard._allowed_commands,
+                extra_blocked=frozenset(policy.commands_blocked),
+            )
 
     async def pre_check(self, tool_name: str, arguments: dict) -> SecurityCheckResult:
         """工具执行前的安全检查。
