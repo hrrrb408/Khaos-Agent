@@ -18,6 +18,8 @@ from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.error_handler import ErrorHandler
 from khaos.audit import AuditLogger
+from khaos.coding.task_manager import TaskManager
+from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.db import Database
 from khaos.memory import (
     Memory,
@@ -61,6 +63,9 @@ class AgentService:
         self.project_root = project_root or Path.cwd()
         self.config_path = config_path or self.project_root / "config.yaml"
         self.pending_confirmations: dict[str, dict] = {}
+        # Shared coding-task tracker so the TUI / TaskService can observe
+        # long-running coding turns alongside the AgentLoop.
+        self.task_manager = TaskManager()
 
     async def chat(self, request: ChatRequest) -> AsyncIterator[dict]:
         """Stream chat events."""
@@ -112,6 +117,10 @@ class AgentService:
         skills_dir = self.project_root / "skills"
         if skills_dir.is_dir():
             skill_manager.load_from_dir(skills_dir)
+        # Verify-fix loop: only active in coding mode, where test failures
+        # should trigger automatic diagnose→fix→re-run cycles.
+        is_coding = mode_manager.current_mode.value == "coding"
+        verify_fix_loop = VerifyFixLoop() if is_coding else None
         loop = AgentLoop(
             AgentConfig(),
             mode_manager,
@@ -124,6 +133,8 @@ class AgentService:
             error_handler=ErrorHandler(db=self.db, router=router, compressor=compressor),
             token_engine=token_engine,
             skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
+            verify_fix_loop=verify_fix_loop,
+            task_manager=self.task_manager if is_coding else None,
         )
         return mode_manager, loop
 
@@ -196,6 +207,26 @@ class AuditService:
         return [entry.to_dict() for entry in entries]
 
 
+class TaskService:
+    """Coding-task RPC service backed by a shared :class:`TaskManager`."""
+
+    def __init__(self, task_manager: TaskManager):
+        self.task_manager = task_manager
+
+    async def list(self, active_only: bool = False) -> list[dict]:
+        """List tasks — active ones by default, all when ``active_only`` is set."""
+        if active_only:
+            return await self.task_manager.list_active()
+        return await self.task_manager.list_all()
+
+    async def get(self, task_id: str) -> dict:
+        """Return one task's state, or ``{"error": "not found"}``."""
+        task = await self.task_manager.get(task_id)
+        if task is None:
+            return {"error": "task not found", "task_id": task_id}
+        return task.to_dict()
+
+
 async def serve_json_lines(
     host: str,
     port: int,
@@ -211,6 +242,7 @@ async def serve_json_lines(
     agent = AgentService(db, project_root=project_root, config_path=config_path)
     memory = MemoryService(MemoryStore(db))
     audit_service = AuditService(AuditLogger(db))
+    task_service = TaskService(agent.task_manager)
     subagent_service: SubAgentService | None = None
     if enable_subagents:
         subagent_service = await _build_subagent_service(db, project_root, config_path)
@@ -282,6 +314,12 @@ async def serve_json_lines(
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             elif method == "AuditService.Query":
                 response = await audit_service.query(**payload)
+                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "TaskService.List":
+                response = await task_service.list(**payload)
+                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "TaskService.Get":
+                response = await task_service.get(**payload)
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             elif method == "SubAgentService.Spawn":
                 response = await _handle_optional_subagent(subagent_service, "spawn", payload)

@@ -31,6 +31,8 @@ class TuiContext:
     router: Any = None
     db: Any = None
     skill_manager: SkillManager | None = None
+    # Optional shared coding-task tracker for the /tasks and /task commands.
+    task_manager: Any = None
     session_id: str = ""
     # Callbacks the app wires up for state-changing commands.
     on_clear: Callable[[], None] | None = None
@@ -66,6 +68,8 @@ Khaos TUI — slash commands:
   /memory search <query>    Full-text search memories
   /tools [mode]             List available tools (optionally per mode)
   /model <name>             Show or set the active model (set is advisory)
+  /tasks                    List active coding tasks (all tasks with -a)
+  /task <id>                Show details for one coding task
   /session new              Start a new session
   /session list             List known sessions
   /help                     Show this help
@@ -119,6 +123,10 @@ async def handle_command(line: str, ctx: TuiContext) -> CommandResult:
         return _cmd_tools(args, ctx)
     if cmd == "/model":
         return _cmd_model(args, ctx)
+    if cmd == "/tasks":
+        return await _cmd_tasks(args, ctx)
+    if cmd == "/task":
+        return await _cmd_task(args, ctx)
     if cmd == "/session":
         return _cmd_session(args, ctx)
 
@@ -234,6 +242,61 @@ def _cmd_session(args: list[str], ctx: TuiContext) -> CommandResult:
             f"current session: {ctx.session_id or '(none)'}",
         )
     return CommandResult(handled=True, message="usage: /session [new|list]")
+
+
+async def _cmd_tasks(args: list[str], ctx: TuiContext) -> CommandResult:
+    if ctx.task_manager is None:
+        return CommandResult(handled=True, message="task manager not configured")
+    # ``-a`` / ``--all`` lists every task; default lists active ones only.
+    active_only = not (args and args[0] in {"-a", "--all"})
+    tasks = await ctx.task_manager.list_active() if active_only else await ctx.task_manager.list_all()
+    if not tasks:
+        scope = "active" if active_only else ""
+        return CommandResult(
+            handled=True, message=f"no {scope} coding tasks.".strip()
+        )
+    label = "active tasks" if active_only else "all tasks"
+    lines = [f"{label}:"]
+    for task in tasks:
+        lines.append(
+            f"  [{task['status']}] {task['id']}  "
+            f"{task['goal'][:60]}  (fixes={task['fix_attempts']})"
+        )
+    return CommandResult(handled=True, message="\n".join(lines))
+
+
+async def _cmd_task(args: list[str], ctx: TuiContext) -> CommandResult:
+    if ctx.task_manager is None:
+        return CommandResult(handled=True, message="task manager not configured")
+    if not args:
+        return CommandResult(handled=True, message="usage: /task <id>")
+    task = await ctx.task_manager.get(args[0])
+    if task is None:
+        return CommandResult(handled=True, message=f"task {args[0]!r} not found")
+    data = task.to_dict() if hasattr(task, "to_dict") else task
+    lines = [
+        f"task {data['id']}: {data['goal']}",
+        f"  status:       {data['status']}",
+        f"  fix_attempts: {data['fix_attempts']}",
+        f"  created_at:   {data['created_at']}",
+        f"  updated_at:   {data['updated_at']}",
+    ]
+    if data["error"]:
+        lines.append(f"  error:        {data['error']}")
+    if data["files_modified"]:
+        lines.append("  modified:")
+        for path in data["files_modified"]:
+            lines.append(f"    - {path}")
+    if data["files_viewed"]:
+        lines.append("  viewed:")
+        for path in data["files_viewed"]:
+            lines.append(f"    - {path}")
+    if data["test_results"]:
+        lines.append("  recent tests:")
+        for result in data["test_results"]:
+            ok = result.get("success")
+            lines.append(f"    - success={ok}")
+    return CommandResult(handled=True, message="\n".join(lines))
 
 
 def _current_mode_value(ctx: TuiContext) -> str:

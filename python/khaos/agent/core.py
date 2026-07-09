@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, AsyncIterator, Optional
 if TYPE_CHECKING:
     from khaos.coding.cost_tracker import CostTracker
     from khaos.coding.fingerprint import FileFingerprintCache
+    from khaos.coding.task_manager import TaskManager
+    from khaos.coding.verify_fix import VerifyFixLoop
     from khaos.project_context import ProjectContextLoader
 
 logger = logging.getLogger(__name__)
@@ -85,6 +87,9 @@ class AgentLoop:
         project_context_loader: "Optional[ProjectContextLoader]" = None,
         file_fingerprint_cache: "Optional[FileFingerprintCache]" = None,
         cost_tracker: "Optional[CostTracker]" = None,
+        verify_fix_loop: "Optional[VerifyFixLoop]" = None,
+        task_manager: "Optional[TaskManager]" = None,
+        task_id: str | None = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -108,15 +113,32 @@ class AgentLoop:
         self.file_fingerprint_cache = file_fingerprint_cache
         # Phase 6.3: 会话级 token / 费用追踪。
         self.cost_tracker = cost_tracker
+        # Verify-fix loop: when a test_run result contains failures, inject a
+        # guidance message so the model diagnoses, fixes, and re-runs. Only
+        # active in coding mode (office mode leaves this as None).
+        self.verify_fix_loop = verify_fix_loop
+        # Long-task tracking: record files viewed/modified and test outcomes.
+        self.task_manager = task_manager
+        self.task_id = task_id
 
-    async def run(self, user_input: str, session_id: str) -> AsyncIterator[Message]:
+    async def run(
+        self,
+        user_input: str,
+        session_id: str,
+        task_id: str | None = None,
+    ) -> AsyncIterator[Message]:
         """
         Stream one user turn through the model router.
 
         P0-A intentionally skips real tools, permissions, memory injection, and
         compression. It persists the user message immediately and persists the
         aggregated assistant message after streaming completes.
+
+        ``task_id`` optionally links this turn to a tracked coding task so file
+        reads/writes and test results are recorded for observability.
         """
+        # A task_id passed to run() overrides the instance default for this turn.
+        active_task_id = task_id or self.task_id
         total_tokens = 0
         try:
             messages = await self._build_context(session_id, user_input)
@@ -280,6 +302,51 @@ class AgentLoop:
                         await self.db.insert_message(session_id, tool_msg)
                         if self.cost_tracker is not None:
                             self.cost_tracker.add_tool_tokens(tool_msg.token_count)
+                        # Long-task observability: record what this turn touched.
+                        await self._record_task_activity(result, active_task_id)
+                        # Verify-fix loop: when a test_run result contains
+                        # failures, inject a guidance message so the model
+                        # diagnoses, fixes, and re-runs the tests.
+                        if self.verify_fix_loop is not None:
+                            result_dict = {
+                                "name": result.name,
+                                "success": result.success,
+                                "output": result.output,
+                                "error": result.error,
+                            }
+                            if self.verify_fix_loop.should_enter_loop(result_dict):
+                                failure_context = (
+                                    self.verify_fix_loop.build_failure_context(
+                                        result_dict
+                                    )
+                                )
+                                if failure_context:
+                                    fix_msg = Message(
+                                        role="system",
+                                        content=failure_context,
+                                        token_count=self.token_engine.count_tokens(
+                                            failure_context
+                                        ),
+                                        event="verify_fix",
+                                        created_at=time.time(),
+                                    )
+                                    messages.append(fix_msg)
+                                    await self.db.insert_message(session_id, fix_msg)
+                                    if self.task_manager is not None and active_task_id:
+                                        await self.task_manager.update_status(
+                                            active_task_id,
+                                            "fixing",
+                                            fix_attempts=self.verify_fix_loop.attempt_count,
+                                        )
+                                    yield fix_msg
+                                    if self.verify_fix_loop.is_loop_exhausted():
+                                        report = self.verify_fix_loop.get_final_report()
+                                        yield Message(
+                                            role="system",
+                                            content=report,
+                                            event="verify_fix_report",
+                                            created_at=time.time(),
+                                        )
                         yield tool_msg
 
             else:
@@ -560,6 +627,31 @@ class AgentLoop:
             "txt": "text",
         }
         return mapping.get(suffix, "")
+
+    async def _record_task_activity(self, result, task_id: str | None) -> None:
+        """Record a tool result against the tracked coding task, if any.
+
+        Maps tool names to task fields: ``read_file``/``list_directory`` →
+        viewed, ``write_file``/``patch``/``multi_edit`` → modified,
+        ``test_run`` → a test result entry. Failures are non-fatal — task
+        tracking is observability only and must never break the loop.
+        """
+        if self.task_manager is None or not task_id:
+            return
+        try:
+            name = result.name
+            args: dict = {}
+            output = result.output
+            if name in {"read_file", "list_directory"}:
+                await self.task_manager.track_file_viewed(task_id, str(output)[:200])
+            elif name in {"write_file", "patch", "multi_edit"}:
+                await self.task_manager.track_file_modified(task_id, str(output)[:200])
+            elif name == "test_run":
+                await self.task_manager.add_test_result(
+                    task_id, {"success": result.success, "output": output}
+                )
+        except Exception as exc:  # noqa: BLE001 — observability must not break the loop
+            logger.warning("task tracking failed: %s", exc)
 
     async def _check_compression(self, messages: list[Message]) -> bool:
         total_tokens = sum(
