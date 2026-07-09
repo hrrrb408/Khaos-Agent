@@ -1,0 +1,47 @@
+# Khaos 安全策略
+# 此文件控制 Agent 的权限边界。修改后重启生效。
+
+sandbox:
+  # workspace-write: 只能写工作目录
+  # read-only: 只读
+  # full-access: 可写任何非保护路径
+  # yolo: 无限制（仅本地开发用）
+  mode: workspace-write
+
+  # 网络访问（默认关闭）
+  network: false
+  allowed_domains: []
+  blocked_domains: []
+
+  # 文件系统路径
+  allowed_paths:
+    - "."
+  denied_paths:
+    - "~/.ssh"
+    - "~/.aws"
+    - "~/.gnupg"
+    - "~/.config/gcloud"
+    - "/etc/shadow"
+    - "/etc/passwd"
+
+commands:
+  allow: []
+  require_approval:
+    - git push
+    - rm
+    - curl
+    - wget
+    - docker
+    - npm publish
+    - pip install
+    - cargo publish
+  block: []
+
+secrets:
+  scan_on_output: true
+  scan_before_tool_result: true
+  block_env_dump: true
+
+audit:
+  enabled: true
+  # log_path: null  # null 表示写入 SQLite
