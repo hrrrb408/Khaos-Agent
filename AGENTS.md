@@ -40,6 +40,11 @@ khaos/
 │   │   ├── memory/          # 三层记忆（Phase 3：TTL/冲突/主动提取）
 │   │   ├── skills/          # 技能系统（Phase 3：声明式 SKILL.md + 触发匹配）
 │   │   ├── audit/           # 审计日志（Phase 3：结构化记录 + 查询）
+│   │   ├── coding/          # Coding 模式增强（Claude Code 对齐）
+│   │   │   ├── context.py          # CodingContextBuilder（调用图/依赖评分）
+│   │   │   ├── parser.py           # AST 符号/调用图/依赖图
+│   │   │   ├── verify_fix.py       # 自动 verify-fix 循环策略层
+│   │   │   └── task_manager.py     # 长任务后台状态管理
 │   │   ├── cli/             # CLI 入口点
 │   │   ├── tui/             # 全屏 TUI（Phase 4：Textual + Rich，斜杠命令）
 │   │   ├── permissions/     # 权限引擎
@@ -96,6 +101,7 @@ khaos/
 | 模型路由 | LLD §1.7 | — |
 | MoA (Phase 3) | — (routing/moa.py) | — |
 | 多 Provider (Phase 4) | — (routing/providers/) | — |
+| Coding 增强 | — (coding/) | — |
 | Go API 网关 | LLD §2 | audit_log |
 | Rust FFI (Phase 3) | LLD §3 | — |
 | 数据库 DDL | LLD §4 | 全部 |
@@ -209,6 +215,8 @@ async def run(self, ...):
 - 使用 `pytest`，不用 `unittest`
 - fixture 放在 `conftest.py`
 - Mock 外部依赖（模型 API、Docker、文件系统）
+- Coding 模式新增模块必须在 `python/tests/coding/` 下有对应测试。
+- VerifyFixLoop 是核心策略层，其测试覆盖率应达到 100%。
 
 ```python
 # tests/conftest.py
@@ -546,5 +554,5 @@ khaos test --all
 
 ---
 
-*最后更新：2026-07-08*
+*最后更新：2026-07-09*
 *维护者：瑞邦 + Hermes Agent*
