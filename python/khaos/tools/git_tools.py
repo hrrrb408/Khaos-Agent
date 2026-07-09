@@ -183,6 +183,183 @@ async def git_undo(cwd: str = ".") -> str:
     )
 
 
+async def git_create_branch(
+    cwd: str = ".", branch_name: str = "", from_base: str = "main"
+) -> str:
+    """Create a new branch from ``from_base`` and switch to it.
+
+    Args:
+        cwd: Repository working directory.
+        branch_name: Target branch name (e.g. ``fix/login-bug``). Required.
+        from_base: Base branch to branch off (default ``main``).
+
+    Returns JSON describing the result:
+
+    * ``{"branch", "base", "created": true}`` on success.
+    * ``{"branch", "base", "created": false, "error": ...}`` if the branch
+      already exists or the base is missing.
+    """
+    if not branch_name or not branch_name.strip():
+        return json.dumps(
+            {"error": "branch_name must not be empty"}, ensure_ascii=False
+        )
+
+    # Fetch the base so we branch off its latest tip. Missing base is reported
+    # explicitly rather than crashing mid-checkout.
+    base = from_base or "main"
+    base_lookup = await _git(["git", "rev-parse", "--verify", base], cwd)
+    if base_lookup["returncode"] != 0:
+        return json.dumps(
+            {
+                "branch": branch_name,
+                "base": base,
+                "created": False,
+                "error": f"base branch {base!r} not found",
+            },
+            ensure_ascii=False,
+        )
+
+    checkout = await _git(["git", "checkout", "-b", branch_name, base], cwd)
+    if checkout["returncode"] != 0:
+        message = checkout["stderr"].strip() or checkout["stdout"].strip()
+        created = "already exists" not in message
+        logger.info("git_create_branch: %s from %s — %s", branch_name, base, message)
+        return json.dumps(
+            {
+                "branch": branch_name,
+                "base": base,
+                "created": created,
+                "error": message,
+            },
+            ensure_ascii=False,
+        )
+
+    logger.info("git_create_branch: created %s from %s", branch_name, base)
+    return json.dumps(
+        {"branch": branch_name, "base": base, "created": True},
+        ensure_ascii=False,
+    )
+
+
+async def git_push(
+    cwd: str = ".", remote: str = "origin", branch: str = ""
+) -> str:
+    """Push the current (or named) branch to ``remote``.
+
+    Args:
+        cwd: Repository working directory.
+        remote: Remote name (default ``origin``).
+        branch: Branch to push. Empty pushes the current branch.
+
+    Returns JSON ``{"remote", "branch", "pushed": bool, ...}``.
+    """
+    remote = remote or "origin"
+    if not branch:
+        branch_result = await _git(["git", "branch", "--show-current"], cwd)
+        branch = branch_result["stdout"].strip() or "HEAD"
+
+    # ``-u`` sets up tracking so future ``git push`` needs no args.
+    push = await _git(
+        ["git", "push", "-u", remote, branch], cwd
+    )
+    pushed = push["returncode"] == 0
+    payload: dict[str, Any] = {
+        "remote": remote,
+        "branch": branch,
+        "pushed": pushed,
+    }
+    if not pushed:
+        payload["error"] = (push["stderr"].strip() or push["stdout"].strip())[
+            :500
+        ]
+    logger.info(
+        "git_push: %s/%s pushed=%s", remote, branch, pushed
+    )
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def git_pr_body(cwd: str = ".") -> str:
+    """Generate a PR description draft from the current branch's commits.
+
+    Compares the current branch against ``main`` and assembles:
+
+    * ``title`` — derived from the most significant conventional-commit subject.
+    * ``body`` — a bulleted summary of every commit on this branch.
+    * ``files`` — the list of changed files (``git diff --name-only``).
+
+    Returns JSON ``{"title", "body", "files"}``. When the branch has no
+    commits ahead of main, ``title`` is empty and ``body`` notes that.
+    """
+    base = "main"
+    # Commits on this branch not on main.
+    log = await _git(
+        ["git", "log", f"{base}..HEAD", "--pretty=%H%x09%s%x09%an"],
+        cwd,
+    )
+    if log["returncode"] != 0:
+        # Base branch may not exist yet; fall back to all reachable commits.
+        log = await _git(
+            ["git", "log", "--pretty=%H%x09%s%x09%an", "--max-count=20"], cwd
+        )
+
+    commit_lines = [
+        line for line in log["stdout"].splitlines() if line.strip()
+    ]
+    if not commit_lines:
+        return json.dumps(
+            {
+                "title": "",
+                "body": "No commits ahead of base branch.",
+                "files": [],
+            },
+            ensure_ascii=False,
+        )
+
+    commits = [_parse_commit_line(line) for line in commit_lines]
+    title = _pick_pr_title(commits)
+    body_lines: list[str] = ["## Summary", ""]
+    for commit in commits:
+        body_lines.append(f"- {commit['subject']}")
+    body_lines.append("")
+    body = "\n".join(body_lines)
+
+    diff = await _git(["git", "diff", f"{base}...HEAD", "--name-only"], cwd)
+    if diff["returncode"] != 0:
+        diff = await _git(["git", "diff", "--name-only", "HEAD"], cwd)
+    files = [line for line in diff["stdout"].splitlines() if line.strip()]
+
+    logger.info(
+        "git_pr_body: %d commits, %d files", len(commits), len(files)
+    )
+    return json.dumps(
+        {"title": title, "body": body, "files": files},
+        ensure_ascii=False,
+    )
+
+
+def _parse_commit_line(line: str) -> dict[str, str]:
+    """Split a ``%H\\t%s\\t%an`` log line into hash/subject/author."""
+    parts = line.split("\t")
+    revision = parts[0] if parts else ""
+    subject = parts[1] if len(parts) > 1 else ""
+    author = parts[2] if len(parts) > 2 else ""
+    return {"revision": revision, "subject": subject, "author": author}
+
+
+def _pick_pr_title(commits: list[dict[str, str]]) -> str:
+    """Choose a PR title from the branch's commits.
+
+    ``commits`` is ordered newest-first (``git log`` default). Prefers the
+    first conventional-commit subject (``type(scope): desc``) — i.e. the most
+    recent structured commit, which is typically the most relevant headline
+    for a reviewer; falls back to the newest commit's subject.
+    """
+    for commit in commits:
+        if re.match(r"^\w+(\([\w-]+\))?:\s", commit["subject"]):
+            return commit["subject"]
+    return commits[0]["subject"] if commits else ""
+
+
 def _parse_name_status(line: str) -> dict[str, str]:
     """Parse a ``git diff --name-status`` line into status + path."""
     parts = line.split("\t")

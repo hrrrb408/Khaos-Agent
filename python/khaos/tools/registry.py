@@ -711,6 +711,84 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     )
     registry.register(
         ToolDefinition(
+            name="git_create_branch",
+            description="Create and switch to a new branch off a base branch (default: main).",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory",
+                    },
+                    "branch_name": {
+                        "type": "string",
+                        "description": "Branch name (e.g. fix/login-bug, feat/add-auth)",
+                    },
+                    "from_base": {
+                        "type": "string",
+                        "description": "Base branch to branch off (default: main)",
+                        "default": "main",
+                    },
+                },
+                "required": ["cwd", "branch_name"],
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="git_push",
+            description="Push the current (or named) branch to a remote, setting up tracking.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory",
+                    },
+                    "remote": {
+                        "type": "string",
+                        "description": "Remote name (default: origin)",
+                        "default": "origin",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch to push (empty = current branch)",
+                    },
+                },
+                "required": ["cwd"],
+            },
+            modes=["coding"],
+            permission_level="write",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="git_pr_body",
+            description=(
+                "Generate a PR description draft (title, body, changed files) "
+                "from the current branch's commits relative to main."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory",
+                    },
+                },
+                "required": ["cwd"],
+            },
+            modes=["coding"],
+            permission_level="read",
+            parallel=True,
+        )
+    )
+    registry.register(
+        ToolDefinition(
             name="todo_write",
             description="Write or append to a todo list. Use this to track your plan and progress.",
             parameters={
@@ -1247,6 +1325,9 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("git_status").handler = git_tools.git_status
     registry.get("git_smart_commit").handler = git_tools.git_smart_commit
     registry.get("git_undo").handler = git_tools.git_undo
+    registry.get("git_create_branch").handler = git_tools.git_create_branch
+    registry.get("git_push").handler = git_tools.git_push
+    registry.get("git_pr_body").handler = git_tools.git_pr_body
     registry.get("test_run").handler = test_tools.test_run
     # Phase 6 browser tools — all backed by browser_tools (Playwright or mock)
     registry.get("browser_launch").handler = browser_tools.browser_launch
