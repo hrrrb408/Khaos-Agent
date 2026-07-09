@@ -147,13 +147,22 @@ class PermissionEngine:
         result: str,
         detail: dict | None = None,
         session_id: str | None = None,
+        risk_level: str = "safe",
     ) -> None:
-        """Write a tool permission/execution audit log."""
+        """Write a tool permission/execution audit log.
+
+        ``risk_level`` (new, optional) tags the severity of the audited
+        decision (e.g. ``"safe"``, ``"risky"``, ``"blocked"``). Existing
+        callers that omit it keep the historical ``"safe"`` default.
+        """
+        enriched = dict(detail or {})
+        if risk_level and "risk_level" not in enriched:
+            enriched["risk_level"] = risk_level
         await self.db.insert_audit_log(
             action=tool_name,
             target=target,
             result=result,
-            detail=json.dumps(detail or {}, ensure_ascii=False),
+            detail=json.dumps(enriched, ensure_ascii=False),
             session_id=session_id,
         )
 

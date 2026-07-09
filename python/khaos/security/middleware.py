@@ -2,17 +2,29 @@
 
 Orchestrates CommandGuard, PathGuard, SecretScanner into a unified
 pre-execution / post-execution pipeline that ToolScheduler calls.
+
+When a :class:`SandboxPolicy` is supplied, its lists are merged into the
+existing guards so behaviour stays backward-compatible: policy-denied paths
+extend PathGuard's protected set, policy-blocked commands extend
+CommandGuard's blocked set, and ``secrets_scan_on_output`` gates the
+post-execution secret scan.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from khaos.security.command_guard import CommandGuard
 from khaos.security.path_guard import PathGuard
 from khaos.security.secret_scanner import ScanResult, SecretScanner
+
+if TYPE_CHECKING:
+    from khaos.audit.logger import AuditLogger
+    from khaos.security.network_guard import NetworkGuard
+    from khaos.security.policy import SandboxPolicy
+    from khaos.security.sandbox import Sandbox
 
 logger = logging.getLogger(__name__)
 
@@ -42,16 +54,100 @@ class SecurityMiddleware:
         path_guard: PathGuard | None = None,
         secret_scanner: SecretScanner | None = None,
         enabled: bool = True,
+        policy: "SandboxPolicy | None" = None,
+        sandbox: "Sandbox | None" = None,
+        network_guard: "NetworkGuard | None" = None,
+        audit_logger: "AuditLogger | None" = None,
     ):
         self.command_guard = command_guard or CommandGuard()
         self.path_guard = path_guard or PathGuard()
         self.secret_scanner = secret_scanner or SecretScanner()
         self.enabled = enabled
+        self.policy = policy
+        self.sandbox = sandbox
+        self.network_guard = network_guard
+        self.audit_logger = audit_logger
+        # secrets_scan_on_output: when a policy is present, defer to it so a
+        # user can disable output scanning in trusted setups.
+        self._scan_on_output = (
+            policy.secrets_scan_on_output if policy is not None else True
+        )
+        # Merge policy lists into the existing guards so the detection layer
+        # also enforces the policy's extra denials (defense in depth).
+        if policy is not None:
+            self._apply_policy(policy)
+
+    def _apply_policy(self, policy: "SandboxPolicy") -> None:
+        """Merge policy lists into the existing guards (additive)."""
+        # Extend PathGuard's protected set with policy-denied paths.
+        if policy.denied_paths:
+            extra = frozenset(
+                str(path)
+                for path in policy.denied_paths
+                if path and path != "."
+            )
+            if extra:
+                existing = getattr(self.path_guard, "_protected", frozenset())
+                self.path_guard._protected = existing | extra
+        # Extend CommandGuard's blocked commands with policy-blocked ones.
+        if policy.commands_blocked:
+            from khaos.security import command_guard as cg
+
+            existing_blocked = getattr(cg, "BLOCKED_COMMANDS", frozenset())
+            merged = existing_blocked | frozenset(policy.commands_blocked)
+            cg.BLOCKED_COMMANDS = merged
 
     async def pre_check(self, tool_name: str, arguments: dict) -> SecurityCheckResult:
-        """工具执行前的安全检查。"""
+        """工具执行前的安全检查。
+
+        检查顺序（优先级从高到低）：
+        sandbox capability → network → command → path write → path read。
+
+        当任何检查拦截时，若有 ``audit_logger``，自动记录一条安全事件。
+        """
+        result = self._run_checks(tool_name, arguments)
+        # Record security events for blocks, so denials are queryable/exportable.
+        if not result.allowed and self.audit_logger is not None:
+            try:
+                await self.audit_logger.log_security_event(
+                    event_type=result.check_type or "blocked",
+                    tool_name=tool_name,
+                    reason=result.reason,
+                    detail={
+                        "risk_level": result.risk_level,
+                        "arguments_keys": list(arguments.keys()),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 — audit must never block enforcement
+                logger.warning("security event audit failed: %s", exc)
+        return result
+
+    def _run_checks(self, tool_name: str, arguments: dict) -> SecurityCheckResult:
+        """Run the actual check pipeline (no side effects)."""
         if not self.enabled:
             return SecurityCheckResult(allowed=True, risk_level="safe")
+
+        # 沙箱 capability 检查（优先级最高）
+        if self.sandbox is not None:
+            sandbox_result = self.sandbox.check_tool(tool_name)
+            if not sandbox_result.allowed:
+                return SecurityCheckResult(
+                    allowed=False,
+                    risk_level="blocked",
+                    reason=sandbox_result.reason,
+                    check_type="sandbox",
+                )
+
+        # 网络访问检查
+        if self.network_guard is not None:
+            net_result = self.network_guard.check_tool(tool_name, arguments)
+            if not net_result.allowed:
+                return SecurityCheckResult(
+                    allowed=False,
+                    risk_level="blocked",
+                    reason=net_result.reason,
+                    check_type="network",
+                )
 
         if tool_name in COMMAND_TOOLS:
             command = str(arguments.get("command", ""))
@@ -99,7 +195,7 @@ class SecurityMiddleware:
 
     async def post_check(self, tool_name: str, output: Any) -> ScanResult:
         """工具执行后的敏感信息扫描。"""
-        if not self.enabled or self.secret_scanner is None:
+        if not self.enabled or not self._scan_on_output or self.secret_scanner is None:
             return ScanResult(has_secrets=False)
 
         text = ""

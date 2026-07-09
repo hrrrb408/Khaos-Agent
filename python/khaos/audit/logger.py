@@ -129,6 +129,29 @@ class AuditLogger:
             session_id=session_id,
         )
 
+    async def log_security_event(
+        self,
+        event_type: str,
+        tool_name: str,
+        reason: str,
+        detail: dict[str, Any] | None = None,
+        session_id: str | None = None,
+    ) -> int:
+        """记录安全事件到审计日志。
+
+        ``event_type`` 是分类标签，例如 ``"command_blocked"`` /
+        ``"path_denied"`` / ``"network_blocked"`` / ``"sandbox_violation"``。
+        事件以 ``action="security:<event_type>"``、``result="blocked"`` 写入，
+        因此一次 ``query(result="blocked")`` 就能覆盖所有安全拦截。
+        """
+        return await self.log(
+            action=f"security:{event_type}",
+            target=f"{tool_name}:{reason}",
+            result=RESULT_DENIED,
+            detail=detail,
+            session_id=session_id,
+        )
+
     async def query(
         self,
         action: str | None = None,

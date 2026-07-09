@@ -34,6 +34,8 @@ from khaos.permissions import PermissionEngine
 from khaos.rust_bridge import get_token_engine
 from khaos.routing.router import create_default_router
 from khaos.routing import ModelRouter
+from khaos.security.middleware import SecurityMiddleware
+from khaos.security.policy import load_policy
 from khaos.skills import SkillManager
 from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
 from khaos.tools import create_runtime_registry
@@ -66,6 +68,9 @@ class AgentService:
         # Shared coding-task tracker so the TUI / TaskService can observe
         # long-running coding turns alongside the AgentLoop.
         self.task_manager = TaskManager()
+        # Security policy loaded once (not per chat call) and cached; rebuild
+        # the middleware stack from it for every runtime.
+        self._policy = load_policy(project_root / "khaos_policy.yaml")
 
     async def chat(self, request: ChatRequest) -> AsyncIterator[dict]:
         """Stream chat events."""
@@ -121,12 +126,20 @@ class AgentService:
         # should trigger automatic diagnose→fix→re-run cycles.
         is_coding = mode_manager.current_mode.value == "coding"
         verify_fix_loop = VerifyFixLoop() if is_coding else None
+        # Build the security stack from the policy file: Sandbox + NetworkGuard
+        # + policy-extended guards + audit logger, all wired into the
+        # middleware that ToolScheduler calls before every tool.
+        security_middleware = self._build_security_middleware()
         loop = AgentLoop(
             AgentConfig(),
             mode_manager,
             router,
             self.db,
-            tool_scheduler=ToolScheduler(create_runtime_registry(), permission_engine),
+            tool_scheduler=ToolScheduler(
+                create_runtime_registry(),
+                permission_engine,
+                security_middleware=security_middleware,
+            ),
             confirm_callback=self._wait_for_confirmation,
             context_compressor=compressor,
             memory_manager=memory_manager,
@@ -145,6 +158,46 @@ class AgentService:
                 return self.pending_confirmations.pop(tool_call_id)
             await asyncio.sleep(0.1)
         return {"approved": False, "remember": False}
+
+    def _build_security_middleware(self) -> SecurityMiddleware:
+        """Build the full security stack from the policy file.
+
+        Wiring chain (see 批次 5 of the Codex-alignment doc):
+        policy → Sandbox(mode) + NetworkGuard(network_*) + policy-extended
+        guards + audit_logger → SecurityMiddleware → ToolScheduler.pre_check.
+
+        Components are optional and imported lazily so the server starts even
+        before all batches are present; a missing class simply means that
+        layer is not enforced yet.
+        """
+        policy = self._policy
+        sandbox = None
+        network_guard = None
+        # Sandbox: capability constraint layer.
+        try:
+            from khaos.security.sandbox import Sandbox
+
+            sandbox = Sandbox.from_policy_mode(policy.mode, self.project_root)
+        except ImportError:
+            pass
+        # NetworkGuard: network access control.
+        try:
+            from khaos.security.network_guard import NetworkGuard
+
+            network_guard = NetworkGuard(
+                network_enabled=policy.network_enabled,
+                allowed_domains=policy.network_allowed_domains,
+                blocked_domains=policy.network_blocked_domains,
+            )
+        except ImportError:
+            pass
+        audit_logger = AuditLogger(self.db) if policy.audit_enabled else None
+        return SecurityMiddleware(
+            policy=policy,
+            sandbox=sandbox,
+            network_guard=network_guard,
+            audit_logger=audit_logger,
+        )
 
 
 class MemoryService:
