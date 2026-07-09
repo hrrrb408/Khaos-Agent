@@ -10,7 +10,7 @@ from typing import Any
 
 from khaos.agent.core import SimpleTokenEngine
 from khaos.coding.indexer import CONFIG_FILE_NAMES, RepoIndexer
-from khaos.coding.parser import CodeParser
+from khaos.coding.parser import CodeParser, build_dependency_graph
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +36,9 @@ IMPORT_MATCH_SCORE = 25
 TEST_SCORE = 15
 CONFIG_SCORE = 10
 DEFAULT_SCORE = 1
+# Files that import, or are imported by, a target file. Boosted because a
+# change to a target can ripple through its dependency neighbourhood.
+DEPENDENCY_MATCH_SCORE = 30
 
 
 @dataclass
@@ -46,6 +49,10 @@ class CodingContextBuilder:
     token_engine: SimpleTokenEngine = field(default_factory=SimpleTokenEngine)
     indexer: RepoIndexer = field(default_factory=RepoIndexer)
     parser: CodeParser = field(default_factory=CodeParser)
+    # Cached dependency graph keyed by ``project_root``. Rebuilt only when the
+    # root changes, so repeated ``build()`` calls reuse the same analysis.
+    _dependency_graph: dict[Path, set[Path]] | None = field(default=None, repr=False)
+    _dependency_graph_root: Path | None = field(default=None, repr=False)
 
     def build(
         self,
@@ -64,6 +71,7 @@ class CodingContextBuilder:
             for path in files
             if path.suffix == ".py"
         }
+        dependency_graph = self._get_dependency_graph(root, files)
 
         scored_files: list[tuple[int, int, Path, str]] = []
         for path in files:
@@ -73,6 +81,7 @@ class CodingContextBuilder:
                 keywords,
                 target_set,
                 imports_by_file,
+                dependency_graph,
             )
             if score <= 0:
                 continue
@@ -142,6 +151,7 @@ class CodingContextBuilder:
         keywords: set[str],
         target_set: set[Path],
         imports_by_file: dict[Path, list[str]],
+        dependency_graph: dict[Path, set[Path]] | None = None,
     ) -> tuple[int, str]:
         reasons: list[str] = []
         score = 0
@@ -160,6 +170,16 @@ class CodingContextBuilder:
             score += IMPORT_MATCH_SCORE * len(imported_targets)
             reasons.append(f"imports:{','.join(imported_targets)}")
 
+        # Dependency-graph boost: files that import a target (callers, who may
+        # break when the target's interface changes) or are imported by a
+        # target (dependencies, whose behaviour the target relies on) are both
+        # relevant to a change in the target.
+        if dependency_graph and target_set:
+            dep_reason = self._dependency_match_reason(path, dependency_graph, target_set)
+            if dep_reason:
+                score += DEPENDENCY_MATCH_SCORE
+                reasons.append(dep_reason)
+
         if self._is_test_file(path):
             score += TEST_SCORE
             reasons.append("test")
@@ -177,6 +197,41 @@ class CodingContextBuilder:
             reasons.append("default")
 
         return score, ";".join(reasons)
+
+    def _get_dependency_graph(
+        self, root: Path, files: list[Path]
+    ) -> dict[Path, set[Path]]:
+        """Return the cached dependency graph, rebuilding it if the root moved.
+
+        The graph is computed once per project root and reused across
+        ``build()`` calls; only a root change triggers a rebuild.
+        """
+        if self._dependency_graph is None or self._dependency_graph_root != root:
+            self._dependency_graph = build_dependency_graph(root, files)
+            self._dependency_graph_root = root
+            logger.debug(
+                "rebuilt dependency graph: %d files under %s",
+                len(self._dependency_graph),
+                root,
+            )
+        return self._dependency_graph
+
+    @staticmethod
+    def _dependency_match_reason(
+        path: Path,
+        dependency_graph: dict[Path, set[Path]],
+        target_set: set[Path],
+    ) -> str:
+        """Return a relevance tag if ``path`` is in a target's dependency hood."""
+        imports = dependency_graph.get(path, set())
+        # path imports a target → caller side.
+        if imports & target_set:
+            return "imports_target"
+        # a target imports path → dependency side.
+        for target in target_set:
+            if path in dependency_graph.get(target, set()):
+                return "imported_by_target"
+        return ""
 
     def _matching_import_targets(
         self,
