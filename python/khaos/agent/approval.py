@@ -33,6 +33,7 @@ class ApprovalBroker:
             if future is None:
                 decision = self._decisions.pop(tool_call_id, None)
                 if decision is not None:
+                    self._bindings.pop(tool_call_id, None)
                     return {"approved": decision.approved, "remember": decision.remember}
                 future = asyncio.get_running_loop().create_future()
                 self._pending[tool_call_id] = future

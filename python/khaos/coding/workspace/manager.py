@@ -79,6 +79,10 @@ class WorkspaceManager:
             workspace.state = target
             return WorkspaceTransition.UPDATED
 
+    def get(self, workspace_id: str) -> TaskWorkspace | None:
+        """Return a workspace without allowing callers to mutate its registry."""
+        return self._workspaces.get(workspace_id)
+
     async def build_changeset(self, workspace_id: str) -> ChangeSet:
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:

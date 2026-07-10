@@ -29,6 +29,9 @@ class ExecutionRequest:
     allowed_environment_keys: frozenset[str] = frozenset({"PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"})
     network_policy: NetworkPolicy = NetworkPolicy.NONE
     budget: ResourceBudget = field(default_factory=ResourceBudget)
+    task_id: str | None = None
+    workspace_id: str | None = None
+    access_mode: str = "read-only"
 
 
 @dataclass(frozen=True)
