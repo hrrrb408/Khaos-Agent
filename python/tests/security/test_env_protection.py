@@ -47,23 +47,24 @@ def test_env_in_pipeline_blocked() -> None:
 
 
 # ---------------------------------------------------------------------------
-# CommandGuard: python getenv / os.environ flagged as risky
+# CommandGuard: inline Python is blocked
 # ---------------------------------------------------------------------------
 
 
 def test_python_getenv_detected() -> None:
-    """Python code reading os.environ is flagged as risky (needs approval)."""
+    """Inline Python is blocked before it can read process secrets."""
     result = CommandGuard().check('python -c "import os; print(os.environ)"')
 
-    assert result.risk_level == "risky"
-    assert result.safe is True  # risky ≠ blocked; it requires confirmation
+    assert result.risk_level == "blocked"
+    assert result.safe is False
 
 
 def test_python_getenv_call_detected() -> None:
-    """``getenv`` calls are also flagged."""
+    """``getenv`` cannot be reached through inline Python."""
     result = CommandGuard().check('python -c "import os; os.getenv(\'KEY\')"')
 
-    assert result.risk_level == "risky"
+    assert result.risk_level == "blocked"
+    assert result.safe is False
 
 
 # ---------------------------------------------------------------------------

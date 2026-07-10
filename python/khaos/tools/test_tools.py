@@ -16,6 +16,8 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from khaos.tools.terminal_tools import _build_safe_env, _isolated_command
+
 logger = logging.getLogger(__name__)
 
 # Hard cap for any single test invocation.
@@ -46,11 +48,15 @@ async def test_run(command: str, cwd: str) -> str:
         )
 
     try:
+        isolated = _isolated_command(shlex.join(parts), workdir)
+        if isolated is None:
+            return json.dumps({"success": False, "error": "OS sandbox unavailable"})
         process = await asyncio.create_subprocess_exec(
-            *parts,
+            *isolated,
             cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            env=_build_safe_env(),
         )
     except FileNotFoundError as exc:
         logger.warning("test command not found: %s", parts[0] if parts else "")
@@ -92,6 +98,19 @@ async def test_run(command: str, cwd: str) -> str:
 
     output = stdout_data.decode("utf-8", errors="replace")
     exit_code = int(process.returncode or 0)
+    if exit_code == 127:
+        return json.dumps(
+            {
+                "success": False,
+                "passed": 0,
+                "failed": 0,
+                "errors": 0,
+                "exit_code": exit_code,
+                "failed_cases": [],
+                "summary": output.strip() or "command not found",
+            },
+            ensure_ascii=False,
+        )
     result = _parse_result(command, output, exit_code)
     logger.info(
         "test_run parsed: passed=%d failed=%d errors=%d exit=%d",

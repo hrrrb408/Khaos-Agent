@@ -121,3 +121,11 @@ def test_extra_blocked_combines_with_global():
     # Built-in block (sudo) still works alongside the extra (mymockcmd).
     assert guard.check("sudo su").safe is False
     assert guard.check("mymockcmd --flag").safe is False
+
+
+def test_blocks_arbitrary_python_entrypoints():
+    guard = CommandGuard()
+    assert not guard.check("python").safe
+    assert not guard.check("python -c 'print(1)'").safe
+    assert not guard.check("python -m http.server").safe
+    assert guard.check("python -m pytest -q").safe

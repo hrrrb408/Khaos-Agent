@@ -6,6 +6,8 @@ import asyncio
 import os
 import shlex
 import signal
+import shutil
+import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -143,9 +145,12 @@ async def terminal(
             "risk_level": "dangerous",
         }
     workdir = str(Path(cwd).expanduser().resolve())
+    executable = _isolated_command(command, workdir)
+    if executable is None:
+        return {"ok": False, "error": "OS sandbox unavailable", "risk_level": "blocked"}
     if background:
-        proc = await asyncio.create_subprocess_shell(
-            command,
+        proc = await asyncio.create_subprocess_exec(
+            *executable,
             cwd=workdir,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -163,8 +168,8 @@ async def terminal(
             "safety": safety,
         }
 
-    proc = await asyncio.create_subprocess_shell(
-        command,
+    proc = await asyncio.create_subprocess_exec(
+        *executable,
         cwd=workdir,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -183,6 +188,22 @@ async def terminal(
         "stderr": stderr.decode("utf-8", errors="replace"),
         "safety": safety,
     }
+
+
+def _isolated_command(command: str, workdir: str) -> list[str] | None:
+    """Wrap a shell command in the host OS sandbox."""
+    if os.environ.get("CODEX_SANDBOX"):
+        # The parent process is already constrained by an OS sandbox; nested
+        # sandbox-exec is rejected by macOS with EPERM, but child processes
+        # inherit the existing profile.
+        return ["/bin/sh", "-lc", command]
+    if sys.platform == "darwin" and shutil.which("sandbox-exec"):
+        escaped = workdir.replace('"', '\\"')
+        profile = f'(version 1)(deny default)(allow process*)(allow sysctl-read)(allow file-read*)(allow file-write* (subpath "{escaped}"))(allow file-write* (subpath "/tmp"))(allow network-outbound)'
+        return ["sandbox-exec", "-p", profile, "/bin/sh", "-lc", command]
+    if sys.platform.startswith("linux") and shutil.which("bwrap"):
+        return ["bwrap", "--ro-bind", "/", "/", "--bind", workdir, workdir, "--tmpfs", "/tmp", "--unshare-all", "--share-net", "/bin/sh", "-lc", command]
+    return None
 
 
 def check_command_safety(command: str) -> dict[str, Any]:

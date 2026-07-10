@@ -123,6 +123,10 @@ class CommandGuard:
         if not stripped:
             return CommandCheckResult(safe=True, risk_level="safe", reason="empty command")
 
+        python_entry = _unsafe_python_entry(stripped)
+        if python_entry:
+            return CommandCheckResult(False, "blocked", python_entry, "python")
+
         if self._allowed_commands is not None and not self._is_base_command_allowed(stripped):
             return CommandCheckResult(
                 safe=False,
@@ -231,6 +235,20 @@ def _base_command(command: str) -> str:
     if not parts:
         return ""
     return Path(parts[0]).name
+
+
+def _unsafe_python_entry(command: str) -> str:
+    """Reject interactive and inline Python while permitting script/test execution."""
+    parts = _split_words(command)
+    if not parts or Path(parts[0]).name not in {"python", "python3", "python3.11"}:
+        return ""
+    if len(parts) == 1:
+        return "interactive Python is not allowed"
+    if parts[1] in {"-c", "-", "-i"}:
+        return "inline or interactive Python is not allowed"
+    if parts[1] == "-m" and (len(parts) < 3 or parts[2] not in {"pytest", "unittest", "compileall", "py_compile"}):
+        return "only test and compile Python modules are allowed"
+    return ""
 
 
 def _split_words(command: str) -> list[str]:

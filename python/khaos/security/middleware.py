@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-COMMAND_TOOLS = frozenset({"terminal", "process"})
+COMMAND_TOOLS = frozenset({"terminal", "process", "test_run"})
 READ_PATH_TOOLS = frozenset({"read_file", "search_files", "file_info", "list_directory", "tree_view"})
 WRITE_PATH_TOOLS = frozenset({"write_file", "patch", "multi_edit", "copy_file", "move_file"})
 WRITE_PATH_PARAMS = frozenset({"path", "file_path", "src", "dst"})
