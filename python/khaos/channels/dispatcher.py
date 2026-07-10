@@ -161,6 +161,8 @@ class MessageDispatcher:
                 target=message.target,
                 metadata=message.metadata,
                 media_paths=message.media_paths,
+                reply_to_id=message.reply_to_id,
+                parse_mode=message.parse_mode,
             )
             results.extend(await self.dispatch(message_copy))
         return results
