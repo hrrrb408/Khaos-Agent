@@ -81,6 +81,13 @@ class NetworkGuard:
         if self.network_enabled:
             return NetworkCheckResult(allowed=True)
 
+        if tool_name.startswith("github_"):
+            return NetworkCheckResult(
+                allowed=False,
+                reason="GitHub network access disabled by policy",
+                domain="github.com",
+            )
+
         if tool_name == "terminal":
             return self._check_terminal_command(arguments.get("command", ""))
 

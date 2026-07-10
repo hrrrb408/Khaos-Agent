@@ -186,16 +186,17 @@ HISTORY_TOOL_SPECS = [
 def register_builtin_tools(registry: ToolRegistry) -> None:
     """Register the Phase 1 built-in tool declarations."""
     from khaos.tools.channel_tools import CHANNEL_TOOLS
+    from khaos.tools.github_tools import GITHUB_TOOL_SPECS
 
-    for spec in CHANNEL_TOOLS:
+    for spec in [*CHANNEL_TOOLS, *GITHUB_TOOL_SPECS]:
         registry.register(
             ToolDefinition(
                 name=spec["name"],
                 description=spec["description"],
                 parameters=spec["parameters"],
                 modes=["all"],
-                permission_level="write" if spec["name"] in {"channel_enable", "channel_disable"} else "read",
-                parallel=spec["name"] in {"channel_list", "channel_health"},
+                permission_level="write" if spec["name"] in {"channel_enable", "channel_disable", "github_create_pr", "github_comment_issue", "github_request_review"} else "read",
+                parallel=spec["name"] in {"channel_list", "channel_health", "github_read_issue"},
             )
         )
     registry.register(
@@ -1406,6 +1407,7 @@ def create_runtime_registry() -> ToolRegistry:
         cron_tools,
         file_tools,
         git_tools,
+        github_tools,
         history_tools,
         markdown_tools,
         note_tools,
@@ -1422,6 +1424,10 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("channel_health").handler = channel_tools.channel_health
     registry.get("channel_enable").handler = channel_tools.channel_enable
     registry.get("channel_disable").handler = channel_tools.channel_disable
+    registry.get("github_create_pr").handler = github_tools.github_create_pr
+    registry.get("github_read_issue").handler = github_tools.github_read_issue
+    registry.get("github_comment_issue").handler = github_tools.github_comment_issue
+    registry.get("github_request_review").handler = github_tools.github_request_review
     registry.get("read_file").handler = file_tools.read_file
     registry.get("write_file").handler = file_tools.write_file
     registry.get("patch").handler = file_tools.patch
