@@ -72,6 +72,10 @@ async def test_scheduler_executes_parallel_and_serial(tmp_path):
 
     assert [result.success for result in results] == [True, True]
     assert [result.output for result in results] == ["a", "b"]
+    assert [result.arguments for result in results] == [
+        {"value": "a"},
+        {"value": "b"},
+    ]
     await db.close()
 
 
@@ -190,4 +194,3 @@ async def test_scheduler_timeout_returns_failure(tmp_path):
 
     assert not results[0].success
     await db.close()
-

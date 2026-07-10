@@ -26,6 +26,7 @@ class ToolResult:
     output: Any = ""
     error: str = ""
     duration_ms: int = 0
+    arguments: dict[str, Any] | None = None
 
 
 @dataclass
@@ -128,6 +129,7 @@ class ToolScheduler:
                         name=tool.name,
                         success=False,
                         error="Invalid tool arguments",
+                        arguments=normalized["arguments"],
                     ),
                 )
                 continue
@@ -153,6 +155,7 @@ class ToolScheduler:
                         name=tool.name,
                         success=False,
                         error=f"Permission denied: {decision.reason}",
+                        arguments=normalized["arguments"],
                     ),
                 )
                 continue
@@ -183,6 +186,7 @@ class ToolScheduler:
                             name=tool.name,
                             success=False,
                             error="User denied permission",
+                            arguments=normalized["arguments"],
                         ),
                     )
                     continue
@@ -212,6 +216,7 @@ class ToolScheduler:
                         name=call["name"],
                         success=False,
                         error="Tool budget exhausted",
+                        arguments=call["arguments"],
                     ),
                 )
                 break
@@ -229,6 +234,7 @@ class ToolScheduler:
                 name=call["name"],
                 success=False,
                 error="Tool has no handler",
+                arguments=call["arguments"],
             )
         try:
             security = await self.security_middleware.pre_check(
@@ -255,6 +261,7 @@ class ToolScheduler:
                     success=False,
                     error=f"Security check blocked: {security.reason}",
                     duration_ms=int((time.monotonic() - start) * 1000),
+                    arguments=call["arguments"],
                 )
             output = await asyncio.wait_for(
                 tool.handler(**call.get("arguments", {})),
@@ -282,6 +289,7 @@ class ToolScheduler:
                 success=True,
                 output=output,
                 duration_ms=int((time.monotonic() - start) * 1000),
+                arguments=call["arguments"],
             )
         except Exception as exc:
             target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
@@ -298,6 +306,7 @@ class ToolScheduler:
                 success=False,
                 error=str(exc),
                 duration_ms=int((time.monotonic() - start) * 1000),
+                arguments=call["arguments"],
             )
 
     async def _confirm(
