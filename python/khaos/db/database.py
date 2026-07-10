@@ -637,8 +637,254 @@ class Database:
             (json.dumps(current, ensure_ascii=False), session_id),
         )
 
+    # ------------------------------------------------------------------
+    # Hermes batch 1: scheduled (cron) tasks
+    # ------------------------------------------------------------------
+
+    async def insert_scheduled_task(
+        self,
+        name: str,
+        prompt: str,
+        status: str,
+        schedule,
+        deliver_to: str = "local",
+        meta: dict | None = None,
+    ) -> str:
+        """Persist a new scheduled task and return its id."""
+        import uuid
+
+        conn = await self._require_conn()
+        task_id = uuid.uuid4().hex[:12]
+        schedule_json = json.dumps(_schedule_to_dict(schedule), ensure_ascii=False)
+        meta_json = json.dumps(meta or {}, ensure_ascii=False)
+        await conn.execute(
+            """
+            INSERT INTO scheduled_tasks
+                (id, name, prompt, status, schedule_config, deliver_to, meta)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (task_id, name, prompt, status, schedule_json, deliver_to, meta_json),
+        )
+        await conn.commit()
+        return task_id
+
+    async def update_scheduled_task_status(self, task_id: str, status: str) -> None:
+        conn = await self._require_conn()
+        await conn.execute(
+            "UPDATE scheduled_tasks SET status = ? WHERE id = ?",
+            (status, task_id),
+        )
+        await conn.commit()
+
+    async def update_scheduled_task(
+        self,
+        task_id: str,
+        status: str | None = None,
+        last_run: str | None = None,
+        next_run: str | None = None,
+        run_count: int | None = None,
+        last_result: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        conn = await self._require_conn()
+        clauses: list[str] = []
+        params: list[Any] = []
+        for col, val in [
+            ("status", status),
+            ("last_run", last_run),
+            ("next_run", next_run),
+            ("run_count", run_count),
+            ("last_result", last_result),
+            ("error", error),
+        ]:
+            if val is not None:
+                clauses.append(f"{col} = ?")
+                params.append(val)
+        if not clauses:
+            return
+        params.append(task_id)
+        await conn.execute(
+            f"UPDATE scheduled_tasks SET {', '.join(clauses)} WHERE id = ?",
+            tuple(params),
+        )
+        await conn.commit()
+
+    async def list_scheduled_tasks(self) -> list[dict[str, Any]]:
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
+                   created_at, last_run, next_run, run_count, last_result, error
+            FROM scheduled_tasks
+            ORDER BY created_at
+            """
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    # ------------------------------------------------------------------
+    # Hermes batch 2: session history FTS5 search
+    # ------------------------------------------------------------------
+
+    async def insert_message_fts(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        token_count: int = 0,
+        rowid: int | None = None,
+    ) -> None:
+        """Index a message into messages_fts.
+
+        ``rowid`` should be the messages.id so the FTS row mirrors the base
+        row — this lets search results link back to the exact message. When
+        omitted, FTS auto-assigns a rowid (still searchable, just not joined).
+        """
+        conn = await self._require_conn()
+        from datetime import datetime as _dt
+
+        created = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        if rowid is not None:
+            await conn.execute(
+                "INSERT INTO messages_fts (rowid, session_id, role, content, created_at) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (rowid, session_id, role, content, created),
+            )
+        else:
+            await conn.execute(
+                "INSERT INTO messages_fts (session_id, role, content, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (session_id, role, content, created),
+            )
+        await conn.commit()
+
+    async def search_sessions(
+        self, query: str, limit: int = 10, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """FTS5 BM25 search across all session messages.
+
+        Returns rows with id, session_id, role, created_at, rank, and a
+        snippet() with the matched term highlighted.
+        """
+        conn = await self._require_conn()
+        # snippet: highlight matches with [ ... ]; bm25() rank (lower = better).
+        cursor = await conn.execute(
+            """
+            SELECT rowid AS id, session_id, role, created_at,
+                   rank,
+                   snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
+            FROM messages_fts
+            WHERE messages_fts MATCH ?
+            ORDER BY rank
+            LIMIT ? OFFSET ?
+            """,
+            (query, limit, offset),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_session_messages(
+        self, session_id: str, limit: int = 50, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """Return messages for a session, newest-aware pagination."""
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT id, session_id, role, content, token_count, created_at
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            (session_id, limit, offset),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_message_window(
+        self, session_id: str, message_id: int, window: int = 5
+    ) -> list[dict[str, Any]]:
+        """Return up to ``window`` messages before and after ``message_id``."""
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT id, session_id, role, content, token_count, created_at
+            FROM messages
+            WHERE session_id = ?
+            ORDER BY ABS(id - ?), id
+            LIMIT ?
+            """,
+            (session_id, message_id, window * 2 + 1),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        # Re-sort chronologically after the ABS-based proximity selection.
+        rows.sort(key=lambda r: r["id"])
+        return rows
+
+    async def count_session_messages(self, session_id: str) -> int:
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+            (session_id,),
+        )
+        row = await cursor.fetchone()
+        return int(row["n"]) if row else 0
+
+    async def count_messages_before_after(
+        self, session_id: str, message_id: int
+    ) -> tuple[int, int]:
+        """Return (count_before, count_after) relative to ``message_id``."""
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT "
+            "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
+            "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
+            "FROM messages WHERE session_id = ?",
+            (message_id, message_id, session_id),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            return (0, 0)
+        return (int(row["before_n"] or 0), int(row["after_n"] or 0))
+
+    async def list_sessions(
+        self, limit: int = 20, offset: int = 0
+    ) -> list[dict[str, Any]]:
+        """List sessions newest-first, with a message-count + last-message preview."""
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT s.id, s.mode, s.created_at,
+                   (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
+                   (SELECT content FROM messages m WHERE m.session_id = s.id
+                    ORDER BY m.id DESC LIMIT 1) AS preview
+            FROM sessions s
+            WHERE s.status = 'active'
+            ORDER BY s.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            (limit, offset),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
     async def _require_conn(self):
         if self._conn is None:
             await self.connect()
         assert self._conn is not None
         return self._conn
+
+
+def _schedule_to_dict(schedule) -> dict[str, Any]:
+    """Serialize a ScheduleConfig (dataclass) to a JSON-safe dict."""
+    if schedule is None:
+        return {}
+    if hasattr(schedule, "__dict__"):
+        return {k: v for k, v in vars(schedule).items()}
+    if isinstance(schedule, dict):
+        return schedule
+    return {}
