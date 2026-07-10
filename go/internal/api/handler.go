@@ -24,6 +24,7 @@ type Handler struct {
 	memory    MemoryClient
 	audit     AuditClient
 	subagents SubagentClient
+	tasks     TaskClient
 	config    ConfigStore
 	limiter   *rate.TokenBucket
 	metrics   *metrics.Collector
@@ -34,6 +35,9 @@ type Handler struct {
 	sessions  map[string]ChatRequest
 	tools     []map[string]any
 }
+
+// WithTasks attaches the persistent coding task service.
+func (h *Handler) WithTasks(tasks TaskClient) *Handler { h.tasks = tasks; return h }
 
 // WithAudit attaches an audit client so GET /api/audit is served.
 func (h *Handler) WithAudit(audit AuditClient) *Handler {
@@ -94,6 +98,14 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/channels/health", h.handleChannelsList)
 	mux.HandleFunc("POST /api/channels/{id}/enable", h.handleChannelEnable)
 	mux.HandleFunc("POST /api/channels/{id}/disable", h.handleChannelDisable)
+	mux.HandleFunc("POST /v1/tasks", h.handleCreateTask)
+	mux.HandleFunc("GET /v1/tasks", h.handleListTasks)
+	mux.HandleFunc("GET /v1/tasks/{id}", h.handleGetTask)
+	mux.HandleFunc("POST /v1/tasks/{id}/cancel", h.handleCancelTask)
+	mux.HandleFunc("POST /v1/tasks/{id}/approve", h.handleApproveTask)
+	mux.HandleFunc("POST /v1/tasks/{id}/reject", h.handleRejectTask)
+	mux.HandleFunc("GET /v1/tasks/{id}/events", h.handleTaskEvents)
+	mux.HandleFunc("GET /v1/tasks/{id}/artifacts", h.handleTaskArtifacts)
 	common := h.rateLimit(h.requestLog(h.metricsMiddleware(mux)))
 	secured := auth.Middleware(h.apiKey, common)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -105,6 +117,123 @@ func (h *Handler) Routes() http.Handler {
 		secured.ServeHTTP(w, r)
 	})
 	return h.cors(root)
+}
+
+func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	var request struct {
+		Goal string `json:"goal"`
+	}
+	if json.NewDecoder(r.Body).Decode(&request) != nil || strings.TrimSpace(request.Goal) == "" {
+		writeError(w, http.StatusBadRequest, "goal is required")
+		return
+	}
+	result, err := h.tasks.CreateTask(r.Context(), request.Goal)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusCreated, result)
+}
+
+func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	result, err := h.tasks.ListTasks(r.Context(), r.URL.Query().Get("active") == "true")
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleGetTask(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	result, err := h.tasks.GetTask(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
+}
+
+func (h *Handler) handleCancelTask(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	h.changeTask(w, r, "cancelled", h.tasks.CancelTask)
+}
+func (h *Handler) handleApproveTask(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	h.changeTask(w, r, "approved", h.tasks.ApproveTask)
+}
+func (h *Handler) handleRejectTask(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	h.changeTask(w, r, "rejected", h.tasks.RejectTask)
+}
+func (h *Handler) changeTask(w http.ResponseWriter, r *http.Request, status string, action func(context.Context, string) error) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	id := r.PathValue("id")
+	if err := action(r.Context(), id); err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status, "task_id": id})
+}
+
+func (h *Handler) handleTaskEvents(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	events, err := h.tasks.TaskEvents(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, http.StatusInternalServerError, "streaming not supported")
+		return
+	}
+	for event := range events {
+		data, _ := json.Marshal(event)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+}
+
+func (h *Handler) handleTaskArtifacts(w http.ResponseWriter, r *http.Request) {
+	if h.tasks == nil {
+		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	result, err := h.tasks.TaskArtifacts(r.Context(), r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) channelClient(w http.ResponseWriter) (ChannelClient, bool) {

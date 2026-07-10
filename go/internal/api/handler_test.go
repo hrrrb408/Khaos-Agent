@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -45,6 +46,34 @@ type mockChannelAgent struct {
 	mockAgent
 	webhook WebhookRequest
 	enabled bool
+}
+
+type mockTaskClient struct{ activeOnly bool }
+
+func (m *mockTaskClient) CreateTask(_ context.Context, goal string) (map[string]any, error) {
+	return map[string]any{"id": "t1", "goal": goal}, nil
+}
+func (m *mockTaskClient) ListTasks(_ context.Context, active bool) ([]map[string]any, error) {
+	m.activeOnly = active
+	return []map[string]any{{"id": "t1"}}, nil
+}
+func (m *mockTaskClient) GetTask(_ context.Context, id string) (map[string]any, error) {
+	if id == "missing" {
+		return nil, errors.New("not found")
+	}
+	return map[string]any{"id": id}, nil
+}
+func (m *mockTaskClient) CancelTask(_ context.Context, id string) error  { return nil }
+func (m *mockTaskClient) ApproveTask(_ context.Context, id string) error { return nil }
+func (m *mockTaskClient) RejectTask(_ context.Context, id string) error  { return nil }
+func (m *mockTaskClient) TaskEvents(_ context.Context, id string) (<-chan map[string]any, error) {
+	ch := make(chan map[string]any, 1)
+	ch <- map[string]any{"event_id": "e1", "task_id": id, "sequence": 1, "type": "task.running", "timestamp": "now", "payload": map[string]any{}}
+	close(ch)
+	return ch, nil
+}
+func (m *mockTaskClient) TaskArtifacts(_ context.Context, id string) ([]map[string]any, error) {
+	return []map[string]any{{"type": "file"}}, nil
 }
 
 func (m *mockChannelAgent) HandleWebhook(_ context.Context, request WebhookRequest) (WebhookResponse, error) {
@@ -181,6 +210,30 @@ func TestWebhookAndChannelEndpoints(t *testing.T) {
 	}
 	if rec := serve(handler, http.MethodPost, "/api/channels/tg/enable", "", "gateway-key"); rec.Code != http.StatusOK || !agent.enabled {
 		t.Fatalf("enable status=%d enabled=%v", rec.Code, agent.enabled)
+	}
+}
+
+func TestTaskRESTAndEvents(t *testing.T) {
+	tasks := &mockTaskClient{}
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), "", rate.NewTokenBucket(100, 10)).WithTasks(tasks).Routes()
+	if rec := serve(handler, http.MethodPost, "/v1/tasks", `{"goal":"ship"}`, ""); rec.Code != http.StatusCreated {
+		t.Fatalf("create=%d %s", rec.Code, rec.Body.String())
+	}
+	if rec := serve(handler, http.MethodPost, "/v1/tasks", `{"goal":""}`, ""); rec.Code != http.StatusBadRequest {
+		t.Fatalf("empty=%d", rec.Code)
+	}
+	if rec := serve(handler, http.MethodGet, "/v1/tasks?active=true", "", ""); rec.Code != http.StatusOK || !tasks.activeOnly {
+		t.Fatalf("list=%d active=%v", rec.Code, tasks.activeOnly)
+	}
+	if rec := serve(handler, http.MethodGet, "/v1/tasks/t1", "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("get=%d", rec.Code)
+	}
+	if rec := serve(handler, http.MethodPost, "/v1/tasks/t1/cancel", "", ""); rec.Code != http.StatusOK {
+		t.Fatalf("cancel=%d", rec.Code)
+	}
+	rec := serve(handler, http.MethodGet, "/v1/tasks/t1/events", "", "")
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"event_id":"e1"`) {
+		t.Fatalf("events=%d %s", rec.Code, rec.Body.String())
 	}
 }
 

@@ -67,6 +67,7 @@ func main() {
 	if !*mockAgent {
 		client := platform.PythonClient{Address: *pythonAddr}
 		handler = handler.WithAudit(client)
+		handler = handler.WithTasks(client)
 		if *enableSubagents {
 			handler = handler.WithSubagents(client)
 		}

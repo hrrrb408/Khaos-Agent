@@ -56,6 +56,18 @@ type ChannelClient interface {
 	SetChannelEnabled(ctx context.Context, channelID string, enabled bool) error
 }
 
+// TaskClient manages persistent coding tasks and their event streams.
+type TaskClient interface {
+	CreateTask(ctx context.Context, goal string) (map[string]any, error)
+	ListTasks(ctx context.Context, activeOnly bool) ([]map[string]any, error)
+	GetTask(ctx context.Context, id string) (map[string]any, error)
+	CancelTask(ctx context.Context, id string) error
+	ApproveTask(ctx context.Context, id string) error
+	RejectTask(ctx context.Context, id string) error
+	TaskEvents(ctx context.Context, id string) (<-chan map[string]any, error)
+	TaskArtifacts(ctx context.Context, id string) ([]map[string]any, error)
+}
+
 // SubagentClient forwards subagent lifecycle calls to the Python service.
 type SubagentClient interface {
 	Spawn(ctx context.Context, goal string, context string, tools []string, timeout int) (map[string]any, error)

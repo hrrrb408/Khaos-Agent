@@ -16,7 +16,69 @@ var (
 	_ api.AuditClient    = PythonClient{}
 	_ api.SubagentClient = PythonClient{}
 	_ api.ChannelClient  = PythonClient{}
+	_ api.TaskClient     = PythonClient{}
 )
+
+// CreateTask creates a persistent coding task.
+func (c PythonClient) CreateTask(ctx context.Context, goal string) (map[string]any, error) {
+	return c.callMap(ctx, "TaskService.Create", map[string]any{"goal": goal})
+}
+func (c PythonClient) ListTasks(ctx context.Context, activeOnly bool) ([]map[string]any, error) {
+	return c.callList(ctx, "TaskService.List", map[string]any{"active_only": activeOnly})
+}
+func (c PythonClient) GetTask(ctx context.Context, id string) (map[string]any, error) {
+	return c.callMap(ctx, "TaskService.Get", map[string]any{"task_id": id})
+}
+func (c PythonClient) CancelTask(ctx context.Context, id string) error {
+	return c.taskAction(ctx, "TaskService.Cancel", id)
+}
+func (c PythonClient) ApproveTask(ctx context.Context, id string) error {
+	return c.taskAction(ctx, "TaskService.Approve", id)
+}
+func (c PythonClient) RejectTask(ctx context.Context, id string) error {
+	return c.taskAction(ctx, "TaskService.Reject", id)
+}
+func (c PythonClient) TaskArtifacts(ctx context.Context, id string) ([]map[string]any, error) {
+	return c.callList(ctx, "TaskService.Artifacts", map[string]any{"task_id": id})
+}
+func (c PythonClient) taskAction(ctx context.Context, method, id string) error {
+	response, err := c.callMap(ctx, method, map[string]any{"task_id": id})
+	if err != nil {
+		return err
+	}
+	if ok, _ := response["ok"].(bool); !ok {
+		return fmt.Errorf("task action failed: %s", id)
+	}
+	return nil
+}
+
+func (c PythonClient) TaskEvents(ctx context.Context, id string) (<-chan map[string]any, error) {
+	conn, err := net.Dial("tcp", c.Address)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.NewEncoder(conn).Encode(map[string]any{"method": "TaskService.Events", "payload": map[string]any{"task_id": id}}); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	ch := make(chan map[string]any)
+	go func() {
+		defer close(ch)
+		defer conn.Close()
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			var event map[string]any
+			if json.Unmarshal(scanner.Bytes(), &event) == nil {
+				select {
+				case ch <- event:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return ch, nil
+}
 
 // PythonClient talks to the Python AgentService JSON-line endpoint.
 type PythonClient struct {
@@ -207,6 +269,22 @@ func (c PythonClient) callMap(ctx context.Context, method string, payload map[st
 		return nil, err
 	}
 	var response map[string]any
+	if err := json.NewDecoder(conn).Decode(&response); err != nil {
+		return nil, err
+	}
+	return response, nil
+}
+
+func (c PythonClient) callList(ctx context.Context, method string, payload map[string]any) ([]map[string]any, error) {
+	conn, err := net.Dial("tcp", c.Address)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	if err := json.NewEncoder(conn).Encode(map[string]any{"method": method, "payload": payload}); err != nil {
+		return nil, err
+	}
+	var response []map[string]any
 	if err := json.NewDecoder(conn).Decode(&response); err != nil {
 		return nil, err
 	}
