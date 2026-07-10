@@ -1,6 +1,9 @@
 package api
 
-import "context"
+import (
+	"context"
+	"encoding/json"
+)
 
 // ChatRequest is the REST request body for POST /api/chat.
 type ChatRequest struct {
@@ -20,6 +23,37 @@ type AgentClient interface {
 	Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
 	ConfirmPermission(ctx context.Context, sessionID string, toolCallID string, approved bool, remember bool) error
 	SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error)
+}
+
+// WebhookRequest preserves an external platform's original webhook data.
+type WebhookRequest struct {
+	Platform  string            `json:"platform"`
+	ChannelID string            `json:"channel_id"`
+	Headers   map[string]string `json:"headers"`
+	Body      json.RawMessage   `json:"body"`
+}
+
+// WebhookResponse is returned after an inbound webhook is processed.
+type WebhookResponse struct {
+	Status    string `json:"status"`
+	MessageID string `json:"message_id,omitempty"`
+	Error     string `json:"error,omitempty"`
+}
+
+// ChannelInfo reports one registered channel's state.
+type ChannelInfo struct {
+	ID      string `json:"id"`
+	Type    string `json:"type"`
+	Enabled bool   `json:"enabled"`
+	Healthy bool   `json:"healthy"`
+	Status  string `json:"status"`
+}
+
+// ChannelClient is the optional channel-management RPC surface.
+type ChannelClient interface {
+	HandleWebhook(ctx context.Context, request WebhookRequest) (WebhookResponse, error)
+	ListChannels(ctx context.Context) ([]ChannelInfo, error)
+	SetChannelEnabled(ctx context.Context, channelID string, enabled bool) error
 }
 
 // SubagentClient forwards subagent lifecycle calls to the Python service.

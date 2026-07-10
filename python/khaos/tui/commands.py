@@ -37,6 +37,7 @@ class TuiContext:
     cron_engine: Any = None
     # Optional session history search for the /history command.
     session_search: Any = None
+    channel_registry: Any = None
     session_id: str = ""
     # Callbacks the app wires up for state-changing commands.
     on_clear: Callable[[], None] | None = None
@@ -82,6 +83,9 @@ Khaos TUI — slash commands:
   /history search <query>   Search past sessions
   /history browse          List recent sessions
   /history read <id>       Read a full session
+  /channels                List registered channels
+  /channels enable <id>    Enable a channel
+  /channels disable <id>   Disable a channel
   /session new              Start a new session
   /session list             List known sessions
   /help                     Show this help
@@ -143,10 +147,29 @@ async def handle_command(line: str, ctx: TuiContext) -> CommandResult:
         return await _cmd_cron(args, ctx)
     if cmd == "/history":
         return await _cmd_history(args, ctx)
+    if cmd == "/channels":
+        return _cmd_channels(args, ctx)
     if cmd == "/session":
         return _cmd_session(args, ctx)
 
     return CommandResult(handled=True, message=f"unknown command: {cmd}\n\n{HELP_TEXT}")
+
+
+def _cmd_channels(args: list[str], ctx: TuiContext) -> CommandResult:
+    if ctx.channel_registry is None:
+        return CommandResult(handled=True, message="channel registry not configured")
+    if not args or args[0] == "list":
+        channels = ctx.channel_registry.list_all()
+        if not channels:
+            return CommandResult(handled=True, message="no channels registered.")
+        lines = ["channels:"]
+        for channel in channels:
+            lines.append(f"  {channel.id} [{channel.channel_type.value}] {channel.health.status.value}")
+        return CommandResult(handled=True, message="\n".join(lines))
+    if len(args) == 2 and args[0] in {"enable", "disable"}:
+        ok = getattr(ctx.channel_registry, args[0])(args[1])
+        return CommandResult(handled=True, message=f"{args[1]}: {args[0]}d" if ok else f"channel not found: {args[1]}")
+    return CommandResult(handled=True, message="usage: /channels [list|enable <id>|disable <id>]")
 
 
 async def _cmd_mode(args: list[str], ctx: TuiContext) -> CommandResult:

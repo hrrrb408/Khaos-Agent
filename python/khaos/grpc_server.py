@@ -20,6 +20,7 @@ from khaos.agent.error_handler import ErrorHandler
 from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
+from khaos.channels import ChannelRegistry, ChannelType, PlatformMessage, WebhookHandler
 from khaos.db import Database
 from khaos.memory import (
     Memory,
@@ -39,6 +40,7 @@ from khaos.security.policy import load_policy
 from khaos.skills import SkillManager
 from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
 from khaos.tools import create_runtime_registry
+from khaos.tools.channel_tools import set_channel_registry
 from khaos.tools.scheduler import ToolScheduler
 
 
@@ -68,6 +70,8 @@ class AgentService:
         # Shared coding-task tracker so the TUI / TaskService can observe
         # long-running coding turns alongside the AgentLoop.
         self.task_manager = TaskManager()
+        self.channel_registry = ChannelRegistry()
+        set_channel_registry(self.channel_registry)
         # Security policy loaded once (not per chat call) and cached; rebuild
         # the middleware stack from it for every runtime.
         self._policy = load_policy(project_root / "khaos_policy.yaml")
@@ -95,6 +99,43 @@ class AgentService:
             "remember": request.remember,
         }
         return {"ok": True}
+
+    async def handle_webhook(
+        self,
+        platform: str,
+        channel_id: str,
+        headers: dict[str, str],
+        body: str,
+    ) -> dict[str, str]:
+        """Validate and process one inbound platform webhook."""
+        channel = self.channel_registry.get(channel_id)
+        if channel is None or not channel.is_enabled:
+            return {"status": "channel_not_found_or_disabled"}
+        try:
+            channel_type = ChannelType.WEBHOOK_IN if platform == "generic" else ChannelType(platform)
+        except ValueError:
+            return {"status": "unsupported_platform"}
+        if channel.channel_type != channel_type:
+            return {"status": "channel_type_mismatch"}
+        handler = WebhookHandler(
+            channel_type,
+            secret=channel.config.secret,
+            on_message=lambda message: self._on_webhook_message(channel_id, message),
+        )
+        return await handler.handle(headers, body.encode("utf-8"))
+
+    async def _on_webhook_message(self, channel_id: str, message: PlatformMessage) -> None:
+        session_id = f"{message.channel.value}:{message.target or message.sender.id}"
+        async for _event in self.chat(ChatRequest(session_id, message.to_agent_input())):
+            pass
+        self.channel_registry.record_success(channel_id, received=True)
+
+    def list_channels(self) -> dict[str, object]:
+        return {"channels": self.channel_registry.get_health_report()}
+
+    def set_channel_enabled(self, channel_id: str, enabled: bool) -> dict[str, object]:
+        changed = self.channel_registry.enable(channel_id) if enabled else self.channel_registry.disable(channel_id)
+        return {"ok": changed, "channel_id": channel_id}
 
     async def _build_runtime(self, session_id: str, mode: str) -> tuple[ModeManager, AgentLoop]:
         await self.db.create_session(session_id, mode or "office")
@@ -355,6 +396,14 @@ async def serve_json_lines(
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             elif method == "AgentService.ConfirmPermission":
                 response = await agent.confirm_permission(ConfirmRequest(**payload))
+                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "AgentService.HandleWebhook":
+                response = await agent.handle_webhook(**payload)
+                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method in {"ChannelService.List", "ChannelService.Health"}:
+                writer.write((json.dumps(agent.list_channels(), ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method in {"ChannelService.Enable", "ChannelService.Disable"}:
+                response = agent.set_channel_enabled(payload["channel_id"], method.endswith("Enable"))
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
             elif method == "MemoryService.SetMemory":
                 response = await memory.set_memory(**payload)

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net"
 
 	"khaos/go/internal/api"
@@ -14,11 +15,60 @@ var (
 	_ api.AgentClient    = PythonClient{}
 	_ api.AuditClient    = PythonClient{}
 	_ api.SubagentClient = PythonClient{}
+	_ api.ChannelClient  = PythonClient{}
 )
 
 // PythonClient talks to the Python AgentService JSON-line endpoint.
 type PythonClient struct {
 	Address string
+}
+
+// HandleWebhook forwards an inbound webhook to Python without interpreting it.
+func (c PythonClient) HandleWebhook(ctx context.Context, request api.WebhookRequest) (api.WebhookResponse, error) {
+	response, err := c.callMap(ctx, "AgentService.HandleWebhook", map[string]any{
+		"platform": request.Platform, "channel_id": request.ChannelID,
+		"headers": request.Headers, "body": string(request.Body),
+	})
+	if err != nil {
+		return api.WebhookResponse{}, err
+	}
+	return api.WebhookResponse{Status: stringValue(response["status"]), MessageID: stringValue(response["message_id"]), Error: stringValue(response["error"])}, nil
+}
+
+// ListChannels returns all registered channels.
+func (c PythonClient) ListChannels(ctx context.Context) ([]api.ChannelInfo, error) {
+	response, err := c.callMap(ctx, "ChannelService.List", map[string]any{})
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(response["channels"])
+	if err != nil {
+		return nil, err
+	}
+	var channels []api.ChannelInfo
+	err = json.Unmarshal(raw, &channels)
+	return channels, err
+}
+
+// SetChannelEnabled changes one registered channel's enabled state.
+func (c PythonClient) SetChannelEnabled(ctx context.Context, channelID string, enabled bool) error {
+	method := "ChannelService.Disable"
+	if enabled {
+		method = "ChannelService.Enable"
+	}
+	response, err := c.callMap(ctx, method, map[string]any{"channel_id": channelID})
+	if err != nil {
+		return err
+	}
+	if ok, _ := response["ok"].(bool); !ok {
+		return fmt.Errorf("channel not found: %s", channelID)
+	}
+	return nil
+}
+
+func stringValue(value any) string {
+	text, _ := value.(string)
+	return text
 }
 
 // Chat starts a chat RPC and streams events.

@@ -41,6 +41,26 @@ type mockSubagentClient struct {
 	goal string
 }
 
+type mockChannelAgent struct {
+	mockAgent
+	webhook WebhookRequest
+	enabled bool
+}
+
+func (m *mockChannelAgent) HandleWebhook(_ context.Context, request WebhookRequest) (WebhookResponse, error) {
+	m.webhook = request
+	return WebhookResponse{Status: "ok", MessageID: "m1"}, nil
+}
+
+func (m *mockChannelAgent) ListChannels(_ context.Context) ([]ChannelInfo, error) {
+	return []ChannelInfo{{ID: "tg", Type: "telegram", Enabled: true, Healthy: true, Status: "enabled"}}, nil
+}
+
+func (m *mockChannelAgent) SetChannelEnabled(_ context.Context, _ string, enabled bool) error {
+	m.enabled = enabled
+	return nil
+}
+
 func (m *mockSubagentClient) Spawn(ctx context.Context, goal string, taskContext string, tools []string, timeout int) (map[string]any, error) {
 	m.goal = goal
 	return map[string]any{"id": "sub-1", "status": "running", "goal": goal}, nil
@@ -146,6 +166,21 @@ func TestRateLimit(t *testing.T) {
 	}
 	if rec := serve(handler, http.MethodGet, "/api/health", "", ""); rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status=%d", rec.Code)
+	}
+}
+
+func TestWebhookAndChannelEndpoints(t *testing.T) {
+	agent := &mockChannelAgent{}
+	handler := NewHandler(agent, NewMemoryMap(), NewMapConfig(nil), "gateway-key", rate.NewTokenBucket(100, 10)).Routes()
+	rec := serve(handler, http.MethodPost, "/api/webhook/telegram?channel_id=tg", `{"message":{"message_id":1}}`, "")
+	if rec.Code != http.StatusOK || agent.webhook.ChannelID != "tg" || agent.webhook.Platform != "telegram" {
+		t.Fatalf("webhook status=%d request=%+v", rec.Code, agent.webhook)
+	}
+	if rec := serve(handler, http.MethodGet, "/api/channels", "", "gateway-key"); rec.Code != http.StatusOK {
+		t.Fatalf("list status=%d", rec.Code)
+	}
+	if rec := serve(handler, http.MethodPost, "/api/channels/tg/enable", "", "gateway-key"); rec.Code != http.StatusOK || !agent.enabled {
+		t.Fatalf("enable status=%d enabled=%v", rec.Code, agent.enabled)
 	}
 }
 

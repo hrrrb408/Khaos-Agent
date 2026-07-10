@@ -48,6 +48,9 @@ khaos/
 │   │   ├── scheduler/       # 定时任务调度（Hermes：CronEngine）
 │   │   ├── session/         # 会话历史 FTS5 搜索 + 窗口滚动（Hermes）
 │   │   ├── channels/        # 多平台消息通道抽象（Hermes：WebSocket/LogFile/Memory）
+│   │   │   ├── webhook.py          # 入站 Webhook 签名验证与平台解析
+│   │   │   ├── registry.py         # 通道注册、状态与健康检查
+│   │   │   └── adapter.py          # Telegram/Discord/Slack/WeChat 适配器
 │   │   ├── cli/             # CLI 入口点
 │   │   ├── tui/             # 全屏 TUI（Phase 4：Textual + Rich，斜杠命令）
 │   │   ├── permissions/     # 权限引擎
@@ -108,6 +111,7 @@ khaos/
 | 定时任务 (Hermes) | — (scheduler/) | scheduled_tasks |
 | 会话历史搜索 (Hermes) | — (session/) | messages_fts |
 | 多平台通道 (Hermes) | — (channels/) | — |
+| Webhook 与 Bot 通道 | — (channels/webhook.py, registry.py, adapter.py) | — |
 | 技能自动生成 (Hermes) | — (skills/generator.py) | — |
 | Go API 网关 | LLD §2 | audit_log |
 | Rust FFI (Phase 3) | LLD §3 | — |

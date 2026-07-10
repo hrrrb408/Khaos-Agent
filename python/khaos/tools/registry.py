@@ -185,6 +185,19 @@ HISTORY_TOOL_SPECS = [
 
 def register_builtin_tools(registry: ToolRegistry) -> None:
     """Register the Phase 1 built-in tool declarations."""
+    from khaos.tools.channel_tools import CHANNEL_TOOLS
+
+    for spec in CHANNEL_TOOLS:
+        registry.register(
+            ToolDefinition(
+                name=spec["name"],
+                description=spec["description"],
+                parameters=spec["parameters"],
+                modes=["all"],
+                permission_level="write" if spec["name"] in {"channel_enable", "channel_disable"} else "read",
+                parallel=spec["name"] in {"channel_list", "channel_health"},
+            )
+        )
     registry.register(
         ToolDefinition(
             name="read_file",
@@ -1387,6 +1400,7 @@ def create_runtime_registry() -> ToolRegistry:
     """Create a built-in registry with concrete P0-B tool handlers."""
     from khaos.tools import (
         browser_tools,
+        channel_tools,
         clipboard_tools,
         code_search_tools,
         cron_tools,
@@ -1404,6 +1418,10 @@ def create_runtime_registry() -> ToolRegistry:
     )
 
     registry = create_builtin_registry()
+    registry.get("channel_list").handler = channel_tools.channel_list
+    registry.get("channel_health").handler = channel_tools.channel_health
+    registry.get("channel_enable").handler = channel_tools.channel_enable
+    registry.get("channel_disable").handler = channel_tools.channel_disable
     registry.get("read_file").handler = file_tools.read_file
     registry.get("write_file").handler = file_tools.write_file
     registry.get("patch").handler = file_tools.patch

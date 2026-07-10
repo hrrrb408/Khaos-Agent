@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strconv"
@@ -88,7 +89,91 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("PUT /api/config", h.handleConfigSet)
 	mux.HandleFunc("GET /api/audit", h.handleAudit)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
-	return h.cors(auth.Middleware(h.apiKey, h.rateLimit(h.requestLog(h.metricsMiddleware(mux)))))
+	mux.HandleFunc("POST /api/webhook/{platform}", h.handleWebhook)
+	mux.HandleFunc("GET /api/channels", h.handleChannelsList)
+	mux.HandleFunc("GET /api/channels/health", h.handleChannelsList)
+	mux.HandleFunc("POST /api/channels/{id}/enable", h.handleChannelEnable)
+	mux.HandleFunc("POST /api/channels/{id}/disable", h.handleChannelDisable)
+	common := h.rateLimit(h.requestLog(h.metricsMiddleware(mux)))
+	secured := auth.Middleware(h.apiKey, common)
+	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Platform webhooks authenticate with their platform signature in Python.
+		if strings.HasPrefix(r.URL.Path, "/api/webhook/") {
+			common.ServeHTTP(w, r)
+			return
+		}
+		secured.ServeHTTP(w, r)
+	})
+	return h.cors(root)
+}
+
+func (h *Handler) channelClient(w http.ResponseWriter) (ChannelClient, bool) {
+	client, ok := h.agent.(ChannelClient)
+	if !ok {
+		writeError(w, http.StatusNotImplemented, "channel service not configured")
+	}
+	return client, ok
+}
+
+func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.channelClient(w)
+	if !ok {
+		return
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid webhook body")
+		return
+	}
+	headers := make(map[string]string, len(r.Header))
+	for key, values := range r.Header {
+		if len(values) > 0 {
+			headers[strings.ToLower(key)] = values[0]
+		}
+	}
+	response, err := client.HandleWebhook(r.Context(), WebhookRequest{Platform: r.PathValue("platform"), ChannelID: r.URL.Query().Get("channel_id"), Headers: headers, Body: json.RawMessage(body)})
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	status := http.StatusOK
+	if response.Status != "ok" {
+		status = http.StatusBadRequest
+	}
+	writeJSON(w, status, response)
+}
+
+func (h *Handler) handleChannelsList(w http.ResponseWriter, r *http.Request) {
+	client, ok := h.channelClient(w)
+	if !ok {
+		return
+	}
+	channels, err := client.ListChannels(r.Context())
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"channels": channels})
+}
+
+func (h *Handler) handleChannelEnable(w http.ResponseWriter, r *http.Request) {
+	h.setChannelEnabled(w, r, true)
+}
+
+func (h *Handler) handleChannelDisable(w http.ResponseWriter, r *http.Request) {
+	h.setChannelEnabled(w, r, false)
+}
+
+func (h *Handler) setChannelEnabled(w http.ResponseWriter, r *http.Request, enabled bool) {
+	client, ok := h.channelClient(w)
+	if !ok {
+		return
+	}
+	if err := client.SetChannelEnabled(r.Context(), r.PathValue("id"), enabled); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (h *Handler) cors(next http.Handler) http.Handler {
@@ -139,11 +224,7 @@ func (h *Handler) metricsMiddleware(next http.Handler) http.Handler {
 		if recorder.status >= http.StatusBadRequest {
 			reqErr = fmt.Errorf("status %d", recorder.status)
 		}
-		route := r.Pattern
-		if route == "" {
-			route = r.URL.Path
-		}
-		h.metrics.RecordRequest(route, r.Method, time.Since(start), reqErr)
+		h.metrics.RecordRequest(r.URL.Path, r.Method, time.Since(start), reqErr)
 	})
 }
 
