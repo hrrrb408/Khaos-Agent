@@ -19,6 +19,8 @@ class SandboxConfig:
     cpus: float = 1.0
     memory: str = "512m"
     timeout: int = 30
+    pids_limit: int = 256
+    tmp_mb: int = 256
 
 
 class DockerSandboxClient:
@@ -31,6 +33,15 @@ class DockerSandboxClient:
             "docker",
             "create",
             "--rm",
+            "--read-only",
+            "--tmpfs",
+            f"/tmp:rw,noexec,nosuid,nodev,size={config.tmp_mb}m",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+            "--pids-limit",
+            str(config.pids_limit),
             "--network",
             "none" if not config.network else "bridge",
             "--cpus",
@@ -164,4 +175,3 @@ async def _run_exec(args: list[str], timeout: int) -> dict[str, Any]:
 def _validate_command(command: str) -> None:
     if not shlex.split(command):
         raise ValueError("command must not be empty")
-
