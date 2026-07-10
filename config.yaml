@@ -80,6 +80,31 @@ security:
   block_dangerous_commands: true
   confirm_risky_commands: true
 
+# Coding runtime alignment defaults. Optional adapters degrade safely when
+# Tree-sitter/LSP or a stronger execution backend is unavailable.
+coding:
+  intelligence:
+    enabled: true
+    languages: [python, javascript, typescript, go, rust]
+    incremental: true
+    tree_sitter: {enabled: auto}
+    lsp: {enabled: auto, request_timeout_seconds: 10, restart_limit: 1}
+  workspace:
+    mode: worktree
+    require_clean_base: true
+    default_output: commit-in-worktree
+  verification:
+    enabled: true
+    max_fix_attempts: 3
+    run_affected_first: true
+    run_full_before_delivery: true
+
+execution:
+  backend: auto
+  network_policy: none
+  writable_roots: workspace
+  environment_allowlist: [PATH, HOME, LANG, LC_ALL, TMPDIR]
+
 mode:
   default: "office"
 
