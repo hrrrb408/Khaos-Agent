@@ -107,7 +107,7 @@ khaos/
 | 模型路由 | LLD §1.7 | — |
 | MoA (Phase 3) | — (routing/moa.py) | — |
 | 多 Provider (Phase 4) | — (routing/providers/) | — |
-| Coding 增强 | — (coding/) | — |
+| Coding 增强 | — (coding/) | coding_tasks |
 | 定时任务 (Hermes) | — (scheduler/) | scheduled_tasks |
 | 会话历史搜索 (Hermes) | — (session/) | messages_fts |
 | 多平台通道 (Hermes) | — (channels/) | — |
