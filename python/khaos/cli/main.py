@@ -48,30 +48,9 @@ async def run_once(args: argparse.Namespace) -> int:
     session_id = args.session_id or str(uuid.uuid4())
     await db.create_session(session_id, mode_manager.current_mode.value)
 
-    router = create_default_router()
-    permission_engine = PermissionEngine(db)
-    await permission_engine.load_rules()
-    memory_store = MemoryStore(db)
-    memory_manager = MemoryManager(
-        memory_store,
-        budget=MemoryBudget(),
-        mode_getter=lambda: mode_manager.current_mode,
-        intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
-    )
-    scheduler = ToolScheduler(create_runtime_registry(), permission_engine)
-    compressor = ContextCompressor(router, memory_manager=memory_manager)
-    error_handler = ErrorHandler(db=db, router=router, compressor=compressor)
-    loop = AgentLoop(
-        AgentConfig(),
-        mode_manager,
-        router,
-        db,
-        tool_scheduler=scheduler,
-        confirm_callback=_confirm_from_args(args),
-        context_compressor=compressor,
-        memory_manager=memory_manager,
-        error_handler=error_handler,
-    )
+    from khaos.runtime import RuntimeConfig, build_runtime
+    runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args)))
+    loop = runtime.loop
 
     print(f"session_id: {session_id}", flush=True)
     async for message in loop.run(args.message, session_id):
@@ -91,37 +70,10 @@ async def run_repl(args: argparse.Namespace) -> int:
     await mode_manager.load()
     session_id = args.session_id or str(uuid.uuid4())
     await db.create_session(session_id, mode_manager.current_mode.value)
-    router = create_default_router()
-    permission_engine = PermissionEngine(db)
-    await permission_engine.load_rules()
-    memory_store = MemoryStore(db)
-    memory_manager = MemoryManager(
-        memory_store,
-        budget=MemoryBudget(),
-        mode_getter=lambda: mode_manager.current_mode,
-        intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
-    )
-    scheduler = ToolScheduler(create_runtime_registry(), permission_engine)
-    compressor = ContextCompressor(router, memory_manager=memory_manager)
-    error_handler = ErrorHandler(db=db, router=router, compressor=compressor)
-    skill_manager = SkillManager()
-    skills_dir = Path.cwd() / "skills"
-    if skills_dir.is_dir():
-        loaded = skill_manager.load_from_dir(skills_dir)
-        if loaded:
-            print(f"loaded {len(loaded)} skill(s) from {skills_dir}")
-    loop = AgentLoop(
-        AgentConfig(),
-        mode_manager,
-        router,
-        db,
-        tool_scheduler=scheduler,
-        confirm_callback=_interactive_confirm(args),
-        context_compressor=compressor,
-        memory_manager=memory_manager,
-        error_handler=error_handler,
-        skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
-    )
+    from khaos.runtime import RuntimeConfig, build_runtime
+    runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args)))
+    loop = runtime.loop
+    skill_manager = runtime.skill_manager
 
     print(f"session_id: {session_id}")
     print(f"mode: {mode_manager.current_mode.value}")

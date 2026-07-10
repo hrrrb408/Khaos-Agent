@@ -75,17 +75,15 @@ class SubAgentRunner:
         # 保证子代理 session 已持久化（与 spawn() 的 create_session 对齐）。
         await self.db.create_session(session_id)
 
-        loop = AgentLoop(
-            config=config,
-            mode_manager=self.mode_manager,
-            router=self.router,
-            db=self.db,
+        from khaos.runtime import RuntimeConfig, build_runtime
+        runtime = await build_runtime(RuntimeConfig(
+            db=self.db, mode_manager=self.mode_manager, router=self.router,
             tool_scheduler=self.tool_scheduler,
             memory_manager=self.memory_manager if self.inherit_memory else None,
-            skill_manager=self.skill_manager,
-            token_engine=self.token_engine,
+            skill_manager=self.skill_manager, agent_config=config,
             coding_context_builder=self.coding_context_builder,
-        )
+        ))
+        loop = runtime.loop
 
         logger.info(
             "SubAgentRunner starting: task=%s session=%s goal=%r",

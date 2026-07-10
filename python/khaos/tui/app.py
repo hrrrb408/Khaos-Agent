@@ -181,35 +181,16 @@ class KhaosApp(App):
     async def _bootstrap_agent_runtime(self) -> None:
         if self.db is None or self.mode_manager is None:
             return
-        self.router = create_default_router()
-        permission_engine = PermissionEngine(self.db)
-        await permission_engine.load_rules()
-        memory_store = MemoryStore(self.db)
-        self.memory_manager = MemoryManager(
-            memory_store,
-            budget=MemoryBudget(),
-            mode_getter=lambda: self.mode_manager.current_mode,
-            intent_getter=lambda: getattr(self.mode_manager, "_intent_buffer", ""),
-        )
-        compressor = ContextCompressor(self.router, memory_manager=self.memory_manager)
-        skills_dir = self.project_root / "skills"
-        if skills_dir.is_dir():
-            self.skill_manager.load_from_dir(skills_dir)
-        coding_builder = self._build_coding_context_builder()
-        self.agent_loop = AgentLoop(
-            AgentConfig(),
-            self.mode_manager,
-            self.router,
-            self.db,
-            tool_scheduler=ToolScheduler(create_runtime_registry(), permission_engine),
+        from khaos.runtime import RuntimeConfig, build_runtime
+        runtime = await build_runtime(RuntimeConfig(
+            db=self.db, project_root=self.project_root, mode_manager=self.mode_manager,
             confirm_callback=self._confirm_callback,
-            context_compressor=compressor,
-            memory_manager=self.memory_manager,
-            error_handler=ErrorHandler(db=self.db, router=self.router, compressor=compressor),
-            skill_manager=self.skill_manager if len(self.skill_manager.registry) > 0 else None,
-            project_root=self.project_root,
-            coding_context_builder=coding_builder,
-        )
+            coding_context_builder=self._build_coding_context_builder(),
+            skill_manager=self.skill_manager,
+        ))
+        self.router = runtime.loop.router
+        self.agent_loop = runtime.loop
+        self.memory_manager = runtime.memory_manager
 
     def _build_coding_context_builder(self):
         """Construct a CodingContextBuilder, or None if coding pkg is absent."""

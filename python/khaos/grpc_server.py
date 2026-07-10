@@ -162,59 +162,15 @@ class AgentService:
 
     async def _build_runtime(self, session_id: str, mode: str) -> tuple[ModeManager, AgentLoop]:
         await self.db.create_session(session_id, mode or "office")
-        mode_manager = ModeManager(self.db, project_root=self.project_root)
-        await mode_manager.load()
-        if mode:
-            await mode_manager.switch(ModeManager.parse(mode))
-        router = load_router_from_config(self.config_path, project_root=self.project_root)
-        permission_engine = PermissionEngine(self.db)
-        await permission_engine.load_rules()
-        memory_store = MemoryStore(self.db)
-        memory_manager = MemoryManager(
-            memory_store,
-            budget=MemoryBudget(),
-            mode_getter=lambda: mode_manager.current_mode,
-            intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
-        )
-        compressor = ContextCompressor(router, memory_manager=memory_manager)
-        # Prefer the Rust tokenizer for accurate counts; transparently fall back
-        # to the pure-Python SimpleTokenEngine when the extension is not built.
-        token_engine = get_token_engine()
-        # Load any on-disk skills (skills/ at the project root). Empty registry
-        # means no skill_manager is wired, preserving prior behavior.
-        skill_manager = SkillManager()
-        skills_dir = self.project_root / "skills"
-        if skills_dir.is_dir():
-            skill_manager.load_from_dir(skills_dir)
-        # Verify-fix loop: only active in coding mode, where test failures
-        # should trigger automatic diagnose→fix→re-run cycles.
-        is_coding = mode_manager.current_mode.value == "coding"
-        verify_fix_loop = VerifyFixLoop() if is_coding else None
-        # Build the security stack from the policy file: Sandbox + NetworkGuard
-        # + policy-extended guards + audit logger, all wired into the
-        # middleware that ToolScheduler calls before every tool.
-        security_middleware = self._build_security_middleware()
-        loop = AgentLoop(
-            AgentConfig(),
-            mode_manager,
-            router,
-            self.db,
-            tool_scheduler=ToolScheduler(
-                create_runtime_registry(),
-                permission_engine,
-                security_middleware=security_middleware,
-            ),
-            confirm_callback=self._wait_for_confirmation,
-            context_compressor=compressor,
-            memory_manager=memory_manager,
-            error_handler=ErrorHandler(db=self.db, router=router, compressor=compressor),
-            token_engine=token_engine,
-            skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
-            verify_fix_loop=verify_fix_loop,
-            task_manager=self.task_manager if is_coding else None,
-            skill_generator=SkillGenerator() if is_coding else None,
-        )
-        return mode_manager, loop
+        from khaos.runtime import RuntimeConfig, build_runtime
+
+        result = await build_runtime(RuntimeConfig(
+            project_root=self.project_root, config_path=self.config_path,
+            mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
+            db=self.db, audit_logger=AuditLogger(self.db) if self._policy.audit_enabled else None,
+            task_manager=self.task_manager,
+        ))
+        return result.mode_manager, result.loop
 
     async def _wait_for_confirmation(self, request: dict) -> dict:
         tool_call_id = request["id"]
@@ -344,6 +300,28 @@ class TaskService:
             return {"error": "task not found", "task_id": task_id}
         return task.to_dict()
 
+    async def create(self, goal: str) -> dict:
+        return (await self.task_manager.create(goal)).to_dict()
+
+    async def cancel(self, task_id: str) -> dict:
+        return {"ok": await self.task_manager.cancel(task_id), "task_id": task_id}
+
+    async def approve(self, task_id: str) -> dict:
+        task = await self.task_manager.get(task_id)
+        if task is None:
+            return {"ok": False, "error": "task not found"}
+        await self.task_manager.update_status(task_id, "running")
+        return {"ok": True, "task_id": task_id}
+
+    async def reject(self, task_id: str) -> dict:
+        return await self.cancel(task_id)
+
+    async def artifacts(self, task_id: str) -> list[dict]:
+        task = await self.task_manager.get(task_id)
+        if task is None:
+            return []
+        return ([{"type": "file", "path": path} for path in task.files_modified] + [{"type": "test_result", "data": result} for result in task.test_results])
+
 
 async def serve_json_lines(
     host: str,
@@ -448,6 +426,17 @@ async def serve_json_lines(
             elif method == "TaskService.Get":
                 response = await task_service.get(**payload)
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "TaskService.Create":
+                writer.write((json.dumps(await task_service.create(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method in {"TaskService.Cancel", "TaskService.Approve", "TaskService.Reject"}:
+                action = method.rsplit(".", 1)[-1].lower()
+                writer.write((json.dumps(await getattr(task_service, action)(payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "TaskService.Artifacts":
+                writer.write((json.dumps(await task_service.artifacts(payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
+            elif method == "TaskService.Events":
+                async for event in task_service.task_manager.subscribe(payload["task_id"]):
+                    writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                    await writer.drain()
             elif method == "SubAgentService.Spawn":
                 response = await _handle_optional_subagent(subagent_service, "spawn", payload)
                 writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
