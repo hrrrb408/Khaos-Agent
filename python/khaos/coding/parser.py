@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -176,6 +177,9 @@ def build_call_graph(
 
     for file_path in file_paths:
         path = file_path.expanduser().resolve()
+        if path.suffix in {".go", ".rs"}:
+            _build_regex_call_graph(path, graph)
+            continue
         if path.suffix != ".py":
             continue
         try:
@@ -201,6 +205,25 @@ def build_call_graph(
 
     _ = root  # kept for logging parity with the dependency graph builder
     return graph
+
+
+def _build_regex_call_graph(path: Path, graph: dict[str, set[str]]) -> None:
+    """Extract useful Go/Rust call edges without external parser dependencies."""
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return
+    if path.suffix == ".go":
+        definitions = re.finditer(r"(?m)^\s*func\s*(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\([^)]*\)\s*(?:\([^)]*\)|[^\s{]+)?\s*\{", source)
+    else:
+        definitions = re.finditer(r"(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*(?:<[^>]*>)?\s*\([^)]*\)[^{]*\{", source)
+    matches = list(definitions)
+    for index, match in enumerate(matches):
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(source)
+        body = source[match.end():end]
+        calls = set(re.findall(r"\b([A-Za-z_]\w*(?:(?:\.|::)[A-Za-z_]\w*)*)\s*[!(]", body))
+        calls -= {"if", "for", "while", "switch", "match", "return", "go", "defer"}
+        graph.setdefault(match.group(1), set()).update(calls)
 
 
 def _register_function_calls(
@@ -299,8 +322,10 @@ def build_dependency_graph(
 
     for file_path in file_paths:
         path = file_path.expanduser().resolve()
+        if path.suffix in {".go", ".rs"}:
+            graph[path] = _regex_dependencies(root, path)
+            continue
         if path.suffix != ".py":
-            # Non-Python files: still keyed (empty) so callers see the node.
             graph[path] = set()
             continue
         graph.setdefault(path, set())
@@ -329,6 +354,29 @@ def build_dependency_graph(
                     graph[path].add(target)
 
     return graph
+
+
+def _regex_dependencies(root: Path, path: Path) -> set[Path]:
+    try:
+        source = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    targets: set[Path] = set()
+    if path.suffix == ".go":
+        imports = re.findall(r'(?m)(?:^\s*import\s+|^\s*)"([^"]+)"', source)
+        for imported in imports:
+            suffix = Path(imported)
+            for candidate in (root / suffix, root / "go" / suffix, path.parent / suffix.name):
+                if candidate.is_dir():
+                    targets.update(item.resolve() for item in candidate.glob("*.go") if item.resolve() != path)
+    else:
+        modules = re.findall(r"(?m)^\s*(?:pub\s+)?mod\s+([A-Za-z_]\w*)\s*;", source)
+        modules += re.findall(r"(?m)^\s*use\s+(?:crate|self|super)::([A-Za-z_]\w*)", source)
+        for module in modules:
+            for candidate in (path.parent / f"{module}.rs", path.parent / module / "mod.rs"):
+                if candidate.is_file() and candidate.resolve() != path:
+                    targets.add(candidate.resolve())
+    return targets
 
 
 def _resolve_import(

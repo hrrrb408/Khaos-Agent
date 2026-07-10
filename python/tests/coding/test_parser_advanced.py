@@ -93,6 +93,32 @@ def test_call_graph_empty_for_go(tmp_path: Path) -> None:
     assert graph == {}
 
 
+def test_call_graph_supports_go_and_rust(tmp_path: Path) -> None:
+    go_file = tmp_path / "main.go"
+    go_file.write_text("package main\nfunc run() { helper() }\n", encoding="utf-8")
+    rust_file = tmp_path / "lib.rs"
+    rust_file.write_text("pub fn start() { worker::run(); }\n", encoding="utf-8")
+    graph = build_call_graph(tmp_path, [go_file, rust_file])
+    assert "helper" in graph["run"]
+    assert "worker::run" in graph["start"]
+
+
+def test_dependency_graph_supports_go_and_rust(tmp_path: Path) -> None:
+    pkg = tmp_path / "localpkg"
+    pkg.mkdir()
+    dep = pkg / "dep.go"
+    dep.write_text("package localpkg", encoding="utf-8")
+    main = tmp_path / "main.go"
+    main.write_text('package main\nimport "localpkg"\n', encoding="utf-8")
+    module = tmp_path / "worker.rs"
+    module.write_text("pub fn run() {}", encoding="utf-8")
+    lib = tmp_path / "lib.rs"
+    lib.write_text("mod worker;", encoding="utf-8")
+    graph = build_dependency_graph(tmp_path, [main, dep, lib, module])
+    assert dep.resolve() in graph[main.resolve()]
+    assert module.resolve() in graph[lib.resolve()]
+
+
 # ---------------------------------------------------------------------------
 # Dependency graph
 # ---------------------------------------------------------------------------
