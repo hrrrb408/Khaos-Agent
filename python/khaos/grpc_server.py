@@ -35,12 +35,14 @@ from khaos.permissions import PermissionEngine
 from khaos.rust_bridge import get_token_engine
 from khaos.routing.router import create_default_router
 from khaos.routing import ModelRouter
+from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.policy import load_policy
 from khaos.skills import SkillManager
 from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
 from khaos.tools import create_runtime_registry
 from khaos.tools.channel_tools import set_channel_registry
+from khaos.tools.cron_tools import set_cron_engine
 from khaos.tools.scheduler import ToolScheduler
 
 
@@ -70,11 +72,31 @@ class AgentService:
         # Shared coding-task tracker so the TUI / TaskService can observe
         # long-running coding turns alongside the AgentLoop.
         self.task_manager = TaskManager()
+        self.cron_engine = CronEngine(db=db, executor=self._execute_scheduled_prompt)
+        set_cron_engine(self.cron_engine)
         self.channel_registry = ChannelRegistry()
         set_channel_registry(self.channel_registry)
         # Security policy loaded once (not per chat call) and cached; rebuild
         # the middleware stack from it for every runtime.
         self._policy = load_policy(project_root / "khaos_policy.yaml")
+
+    async def start(self) -> None:
+        """Start process-scoped background services."""
+        await self.cron_engine.start()
+
+    async def shutdown(self) -> None:
+        """Stop process-scoped background services."""
+        await self.cron_engine.stop()
+
+    async def _execute_scheduled_prompt(self, task_id: str, prompt: str) -> str:
+        """Run a scheduled prompt through the normal office-mode agent path."""
+        contents: list[str] = []
+        async for event in self.chat(ChatRequest(f"cron:{task_id}", prompt, "office")):
+            if event.get("event") == "message":
+                content = event.get("data", {}).get("content")
+                if content:
+                    contents.append(str(content))
+        return "\n".join(contents)
 
     async def chat(self, request: ChatRequest) -> AsyncIterator[dict]:
         """Stream chat events."""
@@ -334,6 +356,7 @@ async def serve_json_lines(
     await db.connect()
     await db.run_migrations()
     agent = AgentService(db, project_root=project_root, config_path=config_path)
+    await agent.start()
     memory = MemoryService(MemoryStore(db))
     audit_service = AuditService(AuditLogger(db))
     task_service = TaskService(agent.task_manager)
@@ -439,9 +462,13 @@ async def serve_json_lines(
             writer.close()
             await writer.wait_closed()
 
-    server = await asyncio.start_server(handle, host, port)
-    async with server:
-        await server.serve_forever()
+    try:
+        server = await asyncio.start_server(handle, host, port)
+        async with server:
+            await server.serve_forever()
+    finally:
+        await agent.shutdown()
+        await db.close()
 
 
 def _parse_json_line(line: bytes) -> dict:

@@ -46,6 +46,22 @@ async def test_agent_service_switch_and_confirm(tmp_path):
     await db.close()
 
 
+async def test_agent_service_starts_and_stops_cron_engine(tmp_path):
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+
+    await service.start()
+    assert service.cron_engine._running is True
+    await service.shutdown()
+    assert service.cron_engine._running is False
+    await db.close()
+
+
 async def test_agent_service_permission_waits_for_confirm(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
