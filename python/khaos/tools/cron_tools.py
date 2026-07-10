@@ -1,4 +1,11 @@
-"""Tools for scheduled task management."""
+"""Tools for scheduled task management.
+
+The handlers delegate to a process-wide :class:`CronEngine` instance injected
+via :func:`set_cron_engine` (called once at startup, mirroring how
+``terminal_tools`` holds a module-level guard). Until an engine is injected the
+handlers report "not available" rather than pretending success — a tool that
+claims to create a task but creates nothing is worse than an honest failure.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +13,17 @@ import logging
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Module-level holder for the live CronEngine. Injected at startup by the
+# server bootstrap (grpc_server / CLI). Same pattern as terminal_tools.
+_cron_engine: Any = None
+
+
+def set_cron_engine(engine: Any) -> None:
+    """Inject the process-wide CronEngine instance (called at startup)."""
+    global _cron_engine
+    _cron_engine = engine
+    logger.info("cron engine injected into cron_tools")
 
 
 async def cron_create(name: str, prompt: str, schedule: str, **kwargs: Any) -> dict:
@@ -18,45 +36,69 @@ async def cron_create(name: str, prompt: str, schedule: str, **kwargs: Any) -> d
         repeat: Optional max repeat count
         deliver_to: Where to send results (local / session:<id> / all)
     """
-    from khaos.scheduler.models import ScheduleConfig
-
     config = _parse_schedule(schedule)
     if kwargs.get("repeat"):
         config.repeat = int(kwargs["repeat"])
-    if kwargs.get("deliver_to"):
-        deliver = kwargs["deliver_to"]
-    else:
-        deliver = "local"
+    deliver = kwargs.get("deliver_to") or "local"
 
-    # cron_engine 由 tool scheduler 注入
-    # 实际调用在 handler 中完成
-
+    if _cron_engine is None:
+        return {
+            "status": "unavailable",
+            "error": "cron engine not configured",
+            "name": name,
+        }
+    task = await _cron_engine.create(name, prompt, config, deliver_to=deliver)
     return {
         "status": "created",
+        "task_id": task.id,
         "name": name,
         "schedule": schedule,
         "deliver_to": deliver,
+        "next_run": task.next_run.isoformat() if task.next_run else None,
     }
 
 
 async def cron_list(**kwargs: Any) -> dict:
     """List all scheduled tasks."""
-    return {"tasks": []}
+    if _cron_engine is None:
+        return {"status": "unavailable", "error": "cron engine not configured", "tasks": []}
+    tasks = await _cron_engine.list_tasks()
+    return {
+        "tasks": [
+            {
+                "id": t.id,
+                "name": t.name,
+                "status": t.status.value,
+                "next_run": t.next_run.isoformat() if t.next_run else None,
+                "run_count": t.run_count,
+            }
+            for t in tasks
+        ]
+    }
 
 
 async def cron_remove(task_id: str, **kwargs: Any) -> dict:
     """Remove a scheduled task."""
-    return {"status": "removed", "task_id": task_id}
+    if _cron_engine is None:
+        return {"status": "unavailable", "error": "cron engine not configured"}
+    ok = await _cron_engine.remove(task_id)
+    return {"status": "removed" if ok else "not_found", "task_id": task_id}
 
 
 async def cron_pause(task_id: str, **kwargs: Any) -> dict:
     """Pause a scheduled task."""
-    return {"status": "paused", "task_id": task_id}
+    if _cron_engine is None:
+        return {"status": "unavailable", "error": "cron engine not configured"}
+    ok = await _cron_engine.pause(task_id)
+    return {"status": "paused" if ok else "not_found", "task_id": task_id}
 
 
 async def cron_resume(task_id: str, **kwargs: Any) -> dict:
     """Resume a paused scheduled task."""
-    return {"status": "resumed", "task_id": task_id}
+    if _cron_engine is None:
+        return {"status": "unavailable", "error": "cron engine not configured"}
+    ok = await _cron_engine.resume(task_id)
+    return {"status": "resumed" if ok else "not_found", "task_id": task_id}
 
 
 def _parse_schedule(schedule: str) -> "ScheduleConfig":

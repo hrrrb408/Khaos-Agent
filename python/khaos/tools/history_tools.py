@@ -1,4 +1,10 @@
-"""Tools for session history search."""
+"""Tools for session history search.
+
+Handlers delegate to a :class:`SessionSearch` instance injected via
+:func:`set_session_search` at startup. Without an injected instance the
+handlers report "not available" instead of returning empty results that look
+like successful (but data-free) searches.
+"""
 
 from __future__ import annotations
 
@@ -7,20 +13,66 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+# Module-level holder for the live SessionSearch instance.
+_session_search: Any = None
+
+
+def set_session_search(search: Any) -> None:
+    """Inject the process-wide SessionSearch instance (called at startup)."""
+    global _session_search
+    _session_search = search
+    logger.info("session search injected into history_tools")
+
 
 async def history_search(query: str, limit: int = 10, **kwargs: Any) -> dict:
     """Search past session history using full-text search."""
-    return {"results": [], "query": query, "limit": limit}
+    if _session_search is None:
+        return {"status": "unavailable", "error": "session search not configured", "results": []}
+    results = await _session_search.search(query, limit=limit)
+    return {
+        "query": query,
+        "results": [
+            {
+                "session_id": r.session_id,
+                "snippet": r.snippet,
+                "role": r.role,
+                "created_at": r.created_at,
+            }
+            for r in results
+        ],
+    }
 
 
 async def history_browse(limit: int = 20, **kwargs: Any) -> dict:
     """Browse recent sessions by date."""
-    return {"sessions": [], "limit": limit}
+    if _session_search is None:
+        return {"status": "unavailable", "error": "session search not configured", "sessions": []}
+    summaries = await _session_search.browse(limit=limit)
+    return {
+        "sessions": [
+            {
+                "session_id": s.session_id,
+                "title": s.title,
+                "message_count": s.message_count,
+                "created_at": s.created_at,
+            }
+            for s in summaries
+        ]
+    }
 
 
 async def history_read(session_id: str, **kwargs: Any) -> dict:
     """Read messages from a specific session."""
-    return {"session_id": session_id, "messages": []}
+    if _session_search is None:
+        return {"status": "unavailable", "error": "session search not configured"}
+    messages = await _session_search.read_session(session_id)
+    return {
+        "session_id": session_id,
+        "messages": [
+            {"role": m.get("role"), "content": m.get("content"), "created_at": m.get("created_at")}
+            for m in messages
+        ],
+    }
 
 
 HISTORY_TOOLS = [
