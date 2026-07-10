@@ -49,15 +49,16 @@ async def run_once(args: argparse.Namespace) -> int:
     await db.create_session(session_id, mode_manager.current_mode.value)
 
     from khaos.runtime import RuntimeConfig, build_runtime
-    runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args)))
-    loop = runtime.loop
-
-    print(f"session_id: {session_id}", flush=True)
-    async for message in loop.run(args.message, session_id):
-        print(encode_sse(message), end="", flush=True)
-
-    await runtime.aclose()
-    await db.close()
+    runtime = None
+    try:
+        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args)))
+        print(f"session_id: {session_id}", flush=True)
+        async for message in runtime.loop.run(args.message, session_id):
+            print(encode_sse(message), end="", flush=True)
+    finally:
+        if runtime is not None:
+            await runtime.aclose()
+        await db.close()
     return 0
 
 
@@ -72,13 +73,13 @@ async def run_repl(args: argparse.Namespace) -> int:
     session_id = args.session_id or str(uuid.uuid4())
     await db.create_session(session_id, mode_manager.current_mode.value)
     from khaos.runtime import RuntimeConfig, build_runtime
-    runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args)))
-    loop = runtime.loop
-    skill_manager = runtime.skill_manager
-
-    print(f"session_id: {session_id}")
-    print(f"mode: {mode_manager.current_mode.value}")
+    runtime = None
     try:
+        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args)))
+        loop = runtime.loop
+        skill_manager = runtime.skill_manager
+        print(f"session_id: {session_id}")
+        print(f"mode: {mode_manager.current_mode.value}")
         while True:
             user_input = input("> ").strip()
             if user_input in {"/quit", "/exit"}:
@@ -99,7 +100,8 @@ async def run_repl(args: argparse.Namespace) -> int:
             async for message in loop.run(user_input, session_id):
                 print(encode_sse(message), end="", flush=True)
     finally:
-        await runtime.aclose()
+        if runtime is not None:
+            await runtime.aclose()
         await db.close()
     return 0
 

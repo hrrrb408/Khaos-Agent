@@ -196,16 +196,12 @@ class KhaosApp(App):
         self.task_manager = runtime.task_manager
         self._runtime = runtime
 
-    def on_unmount(self) -> None:  # type: ignore[override]
-        """Release TUI runtime resources without owning-loop double closes."""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
+    async def on_unmount(self) -> None:  # type: ignore[override]
+        """Await TUI runtime and database cleanup before the loop exits."""
         if self._runtime is not None:
-            loop.create_task(self._runtime.aclose())
+            await self._runtime.aclose()
         if self.db is not None:
-            loop.create_task(self.db.close())
+            await self.db.close()
 
     def _build_coding_context_builder(self):
         """Construct a CodingContextBuilder, or None if coding pkg is absent."""

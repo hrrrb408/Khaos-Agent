@@ -60,9 +60,13 @@ class RuntimeResult:
     memory_manager: MemoryManager
     skill_manager: SkillManager
     new_verify_fix_loop: Callable[[], VerifyFixLoop] | None
+    _closed: bool = False
 
     async def aclose(self) -> None:
         """Release runtime-owned resources; database ownership stays with caller."""
+        if self._closed:
+            return
+        self._closed = True
         if self.memory_manager is not None:
             close = getattr(self.memory_manager, "aclose", None)
             if close is not None:
