@@ -74,6 +74,9 @@ class CodingTask:
     fix_attempts: int = 0
     error: str | None = None
     metadata: dict = field(default_factory=dict)
+    # Hermes batch 3: tool-call trace for skill generation.
+    # Each entry: {tool_name, arguments, success}.
+    trace: list[dict] = field(default_factory=list)
 
     def touch(self) -> None:
         """Stamp ``updated_at`` to now."""

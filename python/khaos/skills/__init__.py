@@ -5,6 +5,7 @@ that augments the agent's system prompt when its declared triggers match the
 current scene. See ``skill.py`` for the on-disk format.
 """
 
+from khaos.skills.generator import SkillCandidate, SkillGenerator, TaskTrace, ToolTrace
 from khaos.skills.loader import SkillLoader
 from khaos.skills.manager import SkillManager
 from khaos.skills.registry import SkillRegistry
@@ -16,4 +17,8 @@ __all__ = [
     "SkillRegistry",
     "SkillManager",
     "SkillLoader",
+    "SkillGenerator",
+    "SkillCandidate",
+    "TaskTrace",
+    "ToolTrace",
 ]
