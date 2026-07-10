@@ -153,6 +153,13 @@ class VerifyFixLoop:
         """True when the fix budget has been spent."""
         return self._attempt_count >= self.max_fix_attempts
 
+    def should_stop_no_progress(self) -> bool:
+        """Stop after two identical failure signatures without a useful diff."""
+        if len(self._history) < 2:
+            return False
+        previous, current = self._history[-2:]
+        return (previous.failed, previous.errors, previous.failed_cases) == (current.failed, current.errors, current.failed_cases)
+
     def get_final_report(self) -> str:
         """Summarise the loop: attempts made and which tests finally passed."""
         if not self._history:

@@ -169,3 +169,11 @@ def test_negative_max_attempts_raises() -> None:
 
     with pytest.raises(ValueError):
         VerifyFixLoop(max_fix_attempts=-1)
+
+
+def test_no_progress_signal_after_repeated_failures() -> None:
+    loop = VerifyFixLoop(max_fix_attempts=3)
+    failed = _failed_test_result()
+    loop.build_failure_context(failed)
+    loop.build_failure_context(failed)
+    assert loop.should_stop_no_progress() is True
