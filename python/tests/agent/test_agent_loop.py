@@ -5,7 +5,35 @@ from khaos.modes import Mode, ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
 from khaos.tools import create_runtime_registry
-from khaos.tools.scheduler import ToolScheduler
+from khaos.tools.scheduler import ToolResult, ToolScheduler
+
+
+async def test_task_activity_uses_original_tool_arguments():
+    class RecordingTaskManager:
+        def __init__(self):
+            self.viewed = []
+            self.modified = []
+
+        async def track_file_viewed(self, task_id, path):
+            self.viewed.append((task_id, path))
+
+        async def track_file_modified(self, task_id, path):
+            self.modified.append((task_id, path))
+
+    loop = AgentLoop.__new__(AgentLoop)
+    loop.task_manager = RecordingTaskManager()
+
+    await loop._record_task_activity(
+        ToolResult("r1", "read_file", True, output="formatted output", arguments={"path": "src/a.py"}),
+        "task-1",
+    )
+    await loop._record_task_activity(
+        ToolResult("w1", "write_file", True, output="ok", arguments={"path": "src/b.py"}),
+        "task-1",
+    )
+
+    assert loop.task_manager.viewed == [("task-1", "src/a.py")]
+    assert loop.task_manager.modified == [("task-1", "src/b.py")]
 
 
 async def test_agent_loop_streams_and_persists_messages(tmp_path):

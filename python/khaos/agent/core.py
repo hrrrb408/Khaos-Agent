@@ -295,6 +295,7 @@ class AgentLoop:
                                 "output": result.output,
                                 "error": result.error,
                                 "duration_ms": result.duration_ms,
+                                "arguments": result.arguments or {},
                             },
                             created_at=time.time(),
                         )
@@ -640,12 +641,16 @@ class AgentLoop:
             return
         try:
             name = result.name
-            args: dict = {}
+            args = result.arguments or {}
             output = result.output
             if name in {"read_file", "list_directory"}:
-                await self.task_manager.track_file_viewed(task_id, str(output)[:200])
+                path = args.get("path") or args.get("cwd")
+                if path:
+                    await self.task_manager.track_file_viewed(task_id, str(path))
             elif name in {"write_file", "patch", "multi_edit"}:
-                await self.task_manager.track_file_modified(task_id, str(output)[:200])
+                path = args.get("path")
+                if path:
+                    await self.task_manager.track_file_modified(task_id, str(path))
             elif name == "test_run":
                 await self.task_manager.add_test_result(
                     task_id, {"success": result.success, "output": output}
