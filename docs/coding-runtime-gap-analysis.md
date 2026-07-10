@@ -15,15 +15,15 @@
 
 | 组件 | 组件代码 | 运行时接入 | 安全保证 | 备注 |
 |---|---|---|---|---|
-| WorkspaceManager | implemented | experimental | experimental | 已可创建 Worktree，但尚未接入 AgentLoop 全链路 |
+| WorkspaceManager | implemented | integrated | experimental | AgentLoop 在 Git 仓库中创建并注入 Task Workspace |
 | ChangeSet | implemented | experimental | experimental | 已有内容 hash，尚未完成 patch artifact 与 apply 链 |
 | ApprovalBroker | implemented | integrated | experimental | 工具审批已接入；ChangeSet 应用绑定仍待 M2 |
-| HostExecutionBackend | implemented | experimental | experimental | 当前为 host argv 执行，尚非 macOS/Linux 强制沙箱 |
+| HostExecutionBackend | implemented | integrated | experimental | 已由 ExecutionService 使用，尚非 macOS/Linux 强制沙箱 |
 | Docker sandbox 参数 | implemented | experimental | experimental | 参数已强化，但尚未限定为活动 TaskWorkspace |
 | terminal | implemented | experimental | experimental | 仍有旧兼容入口，尚未统一进入 ExecutionService |
 | test_run | implemented | experimental | experimental | 尚未完整委托 VerificationPipeline/ExecutionService |
 | sandbox_exec | implemented | experimental | experimental | 旧 Docker 入口仍存在 |
-| VerificationPipeline | implemented | integrated | experimental | 基础步骤执行已接入 Host backend |
+| VerificationPipeline | implemented | integrated | experimental | 基础步骤执行已统一进入 ExecutionService |
 | LanguageRegistry/索引/LSP | implemented | experimental | experimental | M2 阶段冻结后续增强，不宣称完整能力 |
 
 ## 明确不作出的保证
@@ -35,4 +35,4 @@
 
 ## M2 目标
 
-M2 只处理真实执行链、Workspace Boundary、ExecutionService、ChangeSet 审批应用和安全生命周期测试。完成条件以端到端证据为准；组件存在但未接入的能力仍保持 `experimental`。
+M2 当前进度：Workspace 接线、真实路径 Boundary、ExecutionService 和 patch artifact 已完成；ChangeSet apply 审批、macOS/Linux 强制沙箱、Docker Workspace 强校验和完整生命周期 E2E 仍为 `experimental`，不得宣传为 `enforced`。
