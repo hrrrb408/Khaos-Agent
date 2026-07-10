@@ -765,6 +765,27 @@ class Database:
             )
         await conn.commit()
 
+    async def upsert_coding_task(self, task: dict[str, Any]) -> None:
+        """Persist the complete JSON-safe state of one coding task."""
+        conn = await self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO coding_tasks (id, goal, status, state_json, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET goal=excluded.goal,
+                status=excluded.status, state_json=excluded.state_json,
+                updated_at=excluded.updated_at
+            """,
+            (task["id"], task["goal"], task["status"], json.dumps(task), task["created_at"], task["updated_at"]),
+        )
+        await conn.commit()
+
+    async def list_coding_tasks(self) -> list[dict[str, Any]]:
+        """Load persisted coding-task state in creation order."""
+        conn = await self._require_conn()
+        cursor = await conn.execute("SELECT state_json FROM coding_tasks ORDER BY created_at")
+        return [json.loads(str(row["state_json"])) for row in await cursor.fetchall()]
+
     async def search_sessions(
         self, query: str, limit: int = 10, offset: int = 0
     ) -> list[dict[str, Any]]:

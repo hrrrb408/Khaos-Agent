@@ -143,6 +143,17 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status ON scheduled_tasks(status, next_run);
 
+CREATE TABLE IF NOT EXISTS coding_tasks (
+    id             TEXT PRIMARY KEY,
+    goal           TEXT NOT NULL,
+    status         TEXT NOT NULL,
+    state_json     TEXT NOT NULL DEFAULT '{}',
+    created_at     TEXT NOT NULL,
+    updated_at     TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updated_at);
+
 -- Hermes batch 2: session history FTS5 search over messages.
 -- Separate FTS5 table (rowid mirrors messages.id) populated manually by
 -- insert_message_fts(). A standalone table avoids external-content trigger
@@ -154,4 +165,3 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     created_at,
     tokenize='unicode61'
 );
-

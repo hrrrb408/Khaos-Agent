@@ -218,6 +218,26 @@ async def test_cancel_marks_cancelled() -> None:
 
 
 @pytest.mark.asyncio
+async def test_task_manager_persists_and_recovers_interrupted_task(tmp_path) -> None:
+    from khaos.db import Database
+
+    db = Database(tmp_path / "tasks.db")
+    await db.connect()
+    await db.run_migrations()
+    manager = TaskManager(db=db)
+    task = await manager.create("long work")
+    await manager.update_status(task.id, TaskStatus.RUNNING)
+    await manager.record_trace(task.id, {"tool_name": "read_file", "arguments": {}, "success": True})
+    restored = TaskManager(db=db)
+    await restored.load()
+    loaded = await restored.get(task.id)
+    assert loaded.status == TaskStatus.BLOCKED
+    assert loaded.error == "interrupted by process restart"
+    assert loaded.trace[0]["tool_name"] == "read_file"
+    await db.close()
+
+
+@pytest.mark.asyncio
 async def test_cancel_unknown_returns_false() -> None:
     manager = TaskManager()
     assert await manager.cancel("ghost") is False

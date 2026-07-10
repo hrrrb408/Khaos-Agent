@@ -82,9 +82,9 @@ class CodingTask:
         """Stamp ``updated_at`` to now."""
         self.updated_at = datetime.now()
 
-    def to_dict(self) -> dict[str, Any]:
+    def to_dict(self, include_internal: bool = False) -> dict[str, Any]:
         """Serialize to a JSON-safe dict for the TUI / RPC layer."""
-        return {
+        data = {
             "id": self.id,
             "goal": self.goal,
             "status": self.status.value,
@@ -96,6 +96,10 @@ class CodingTask:
             "fix_attempts": self.fix_attempts,
             "error": self.error,
         }
+        if include_internal:
+            data["metadata"] = self.metadata
+            data["trace"] = self.trace
+        return data
 
 
 class TaskManager:
@@ -105,10 +109,35 @@ class TaskManager:
     and the TUI / JSON-line server (reading state) can share one instance.
     """
 
-    def __init__(self, max_active: int = 5) -> None:
+    def __init__(self, max_active: int = 5, db: Any = None) -> None:
         self._tasks: dict[str, CodingTask] = {}
         self._max_active = max_active
         self._lock = asyncio.Lock()
+        self._db = db
+
+    async def load(self) -> None:
+        """Restore tasks and mark interrupted in-flight work as blocked."""
+        if self._db is None:
+            return
+        for data in await self._db.list_coding_tasks():
+            task = CodingTask(
+                id=data["id"], goal=data.get("goal", ""),
+                status=TaskStatus.parse(data.get("status", "pending")),
+                created_at=datetime.fromisoformat(data["created_at"]),
+                updated_at=datetime.fromisoformat(data["updated_at"]),
+                files_modified=list(data.get("files_modified", [])),
+                files_viewed=list(data.get("files_viewed", [])),
+                test_results=list(data.get("test_results", [])),
+                fix_attempts=int(data.get("fix_attempts", 0)),
+                error=data.get("error"), metadata=dict(data.get("metadata", {})),
+                trace=list(data.get("trace", [])),
+            )
+            if task.status in ACTIVE_STATUSES:
+                task.status = TaskStatus.BLOCKED
+                task.error = "interrupted by process restart"
+                task.touch()
+            self._tasks[task.id] = task
+            await self._persist(task)
 
     async def create(self, goal: str) -> CodingTask:
         """Create a new task. Raises if the active-task limit is reached."""
@@ -120,6 +149,7 @@ class TaskManager:
                 )
             task = CodingTask(goal=goal)
             self._tasks[task.id] = task
+            await self._persist(task)
             logger.info("created coding task %s: %s", task.id, goal[:80])
             return task
 
@@ -149,6 +179,7 @@ class TaskManager:
                 else:
                     task.metadata[key] = value
             task.touch()
+            await self._persist(task)
 
     async def add_test_result(self, task_id: str, result: dict) -> None:
         """Record one test-run outcome against a task."""
@@ -162,6 +193,7 @@ class TaskManager:
             if len(task.test_results) > TEST_RESULT_HISTORY:
                 task.test_results = task.test_results[-TEST_RESULT_HISTORY:]
             task.touch()
+            await self._persist(task)
 
     async def track_file_modified(self, task_id: str, path: str) -> None:
         """Record a file this task modified (deduplicated)."""
@@ -172,6 +204,7 @@ class TaskManager:
             if path not in task.files_modified:
                 task.files_modified.append(path)
             task.touch()
+            await self._persist(task)
 
     async def track_file_viewed(self, task_id: str, path: str) -> None:
         """Record a file this task read (deduplicated)."""
@@ -182,6 +215,7 @@ class TaskManager:
             if path not in task.files_viewed:
                 task.files_viewed.append(path)
             task.touch()
+            await self._persist(task)
 
     async def list_active(self) -> list[dict]:
         """Return all in-flight tasks (not completed/cancelled/failed)."""
@@ -205,7 +239,21 @@ class TaskManager:
                 return False
             task.status = TaskStatus.CANCELLED
             task.touch()
+            await self._persist(task)
             return True
+
+    async def record_trace(self, task_id: str, entry: dict[str, Any]) -> None:
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            task.trace.append(entry)
+            task.touch()
+            await self._persist(task)
+
+    async def _persist(self, task: CodingTask) -> None:
+        if self._db is not None:
+            await self._db.upsert_coding_task(task.to_dict(include_internal=True))
 
     def _active_count(self) -> int:
         """Count in-flight tasks (callers hold ``self._lock``)."""
