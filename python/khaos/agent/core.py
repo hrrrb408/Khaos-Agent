@@ -277,7 +277,15 @@ class AgentLoop:
                     if event.permission_request is not None:
                         request = event.permission_request
                         if self.task_manager is not None and active_task_id:
-                            await self.task_manager.update_status(active_task_id, "blocked")
+                            await self.task_manager.update_status(
+                                active_task_id,
+                                "blocked",
+                                pending_approval={
+                                    "tool_call_id": request.tool_call_id,
+                                    "tool_name": request.name,
+                                    "target": request.target,
+                                },
+                            )
                         yield Message(
                             role="system",
                             content="permission_request",

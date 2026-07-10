@@ -209,6 +209,32 @@ class TaskManager:
             await self._persist(task)
             return TransitionResult.UPDATED
 
+    async def transition(self, task_id: str, *, expected: set[TaskStatus], target: TaskStatus, **updates: Any) -> TransitionResult:
+        """Atomically transition only when current state is expected."""
+        async with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return TransitionResult.NOT_FOUND
+            if task.status not in expected:
+                return TransitionResult.INVALID_TRANSITION
+            task.status = target
+            for key, value in updates.items():
+                if hasattr(task, key):
+                    setattr(task, key, value)
+                else:
+                    task.metadata[key] = value
+            task.touch()
+            await self._persist(task)
+            return TransitionResult.UPDATED
+
+    async def find_by_pending_tool(self, tool_call_id: str) -> CodingTask | None:
+        async with self._lock:
+            for task in self._tasks.values():
+                pending = task.metadata.get("pending_approval")
+                if isinstance(pending, dict) and pending.get("tool_call_id") == tool_call_id:
+                    return task
+        return None
+
     async def add_test_result(self, task_id: str, result: dict) -> None:
         """Record one test-run outcome against a task."""
         async with self._lock:

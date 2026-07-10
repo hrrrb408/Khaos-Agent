@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import AsyncIterator
 
 from khaos.agent import AgentConfig, AgentLoop
+from khaos.agent.approval import ApprovalBroker
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.error_handler import ErrorHandler
 from khaos.audit import AuditLogger
@@ -69,6 +70,7 @@ class AgentService:
         self.project_root = project_root or Path.cwd()
         self.config_path = config_path or self.project_root / "config.yaml"
         self.pending_confirmations: dict[str, dict] = {}
+        self.approval_broker = ApprovalBroker()
         # Shared coding-task tracker so the TUI / TaskService can observe
         # long-running coding turns alongside the AgentLoop.
         self.task_manager = TaskManager(db=db)
@@ -117,11 +119,7 @@ class AgentService:
         return {"current_mode": mode.value}
 
     async def confirm_permission(self, request: ConfirmRequest) -> dict:
-        self.pending_confirmations[request.tool_call_id] = {
-            "approved": request.approved,
-            "remember": request.remember,
-        }
-        return {"ok": True}
+        return {"ok": await self.approval_broker.resolve(request.tool_call_id, request.approved, request.remember)}
 
     async def handle_webhook(
         self,
@@ -173,12 +171,7 @@ class AgentService:
         return result.mode_manager, result.loop
 
     async def _wait_for_confirmation(self, request: dict) -> dict:
-        tool_call_id = request["id"]
-        for _ in range(1200):
-            if tool_call_id in self.pending_confirmations:
-                return self.pending_confirmations.pop(tool_call_id)
-            await asyncio.sleep(0.1)
-        return {"approved": False, "remember": False}
+        return await self.approval_broker.wait(request["id"], timeout=120.0)
 
     def _build_security_middleware(self) -> SecurityMiddleware:
         """Build the full security stack from the policy file.
@@ -284,8 +277,9 @@ class AuditService:
 class TaskService:
     """Coding-task RPC service backed by a shared :class:`TaskManager`."""
 
-    def __init__(self, task_manager: TaskManager):
+    def __init__(self, task_manager: TaskManager, approval_broker: ApprovalBroker | None = None):
         self.task_manager = task_manager
+        self.approval_broker = approval_broker
 
     async def list(self, active_only: bool = False) -> list[dict]:
         """List tasks — active ones by default, all when ``active_only`` is set."""
@@ -321,8 +315,12 @@ class TaskService:
             return {"ok": False, "error": "task not found", "task_id": task_id}
         if task.status != TaskStatus.BLOCKED:
             return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
-        result = await self.task_manager.update_status(task_id, TaskStatus.RUNNING)
-        return {"ok": result == TransitionResult.UPDATED, "task_id": task_id}
+        pending = task.metadata.get("pending_approval") or {}
+        result = await self.task_manager.transition(task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.RUNNING, pending_approval=None)
+        if result != TransitionResult.UPDATED:
+            return {"ok": False, "error": "task is no longer blocked", "task_id": task_id}
+        resolved = await self.approval_broker.resolve(pending.get("tool_call_id", ""), True) if self.approval_broker else True
+        return {"ok": resolved, "task_id": task_id}
 
     async def reject(self, task_id: str) -> dict:
         from khaos.coding.task_manager import TaskStatus, TransitionResult
@@ -332,8 +330,12 @@ class TaskService:
             return {"ok": False, "error": "task not found", "task_id": task_id}
         if task.status != TaskStatus.BLOCKED:
             return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
-        result = await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="rejected by user")
-        return {"ok": result == TransitionResult.UPDATED, "task_id": task_id}
+        pending = task.metadata.get("pending_approval") or {}
+        result = await self.task_manager.transition(task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.FAILED, error="rejected by user", pending_approval=None)
+        if result != TransitionResult.UPDATED:
+            return {"ok": False, "error": "task is no longer blocked", "task_id": task_id}
+        resolved = await self.approval_broker.resolve(pending.get("tool_call_id", ""), False) if self.approval_broker else True
+        return {"ok": resolved, "task_id": task_id}
 
     async def artifacts(self, task_id: str) -> list[dict]:
         task = await self.task_manager.get(task_id)
@@ -358,7 +360,7 @@ async def serve_json_lines(
     await agent.start()
     memory = MemoryService(MemoryStore(db))
     audit_service = AuditService(AuditLogger(db))
-    task_service = TaskService(agent.task_manager)
+    task_service = TaskService(agent.task_manager, agent.approval_broker)
     subagent_service: SubAgentService | None = None
     if enable_subagents:
         subagent_service = await _build_subagent_service(db, project_root, config_path)
