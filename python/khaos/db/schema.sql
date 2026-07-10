@@ -124,3 +124,34 @@ CREATE TABLE IF NOT EXISTS session_bookmarks (
     UNIQUE(session_id, name)
 );
 
+-- Hermes batch 1: scheduled (cron) tasks
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    id              TEXT PRIMARY KEY,
+    name            TEXT NOT NULL,
+    prompt          TEXT NOT NULL,
+    status          TEXT NOT NULL DEFAULT 'pending',
+    schedule_config TEXT NOT NULL DEFAULT '{}',
+    deliver_to      TEXT NOT NULL DEFAULT 'local',
+    meta            TEXT NOT NULL DEFAULT '{}',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    last_run        TEXT,
+    next_run        TEXT,
+    run_count       INTEGER NOT NULL DEFAULT 0,
+    last_result     TEXT,
+    error           TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status ON scheduled_tasks(status, next_run);
+
+-- Hermes batch 2: session history FTS5 search over messages.
+-- Separate FTS5 table (rowid mirrors messages.id) populated manually by
+-- insert_message_fts(). A standalone table avoids external-content trigger
+-- complexity while still giving BM25 ranking + snippet() over message text.
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    session_id,
+    role,
+    content,
+    created_at,
+    tokenize='unicode61'
+);
+
