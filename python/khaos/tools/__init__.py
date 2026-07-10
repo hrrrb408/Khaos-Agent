@@ -3,6 +3,8 @@
 from khaos.tools.registry import (
     ToolDefinition,
     ToolRegistry,
+    ToolCapability,
+    ToolInvocationBroker,
     create_builtin_registry,
     create_runtime_registry,
 )
@@ -10,7 +12,8 @@ from khaos.tools.registry import (
 __all__ = [
     "ToolDefinition",
     "ToolRegistry",
+    "ToolCapability",
+    "ToolInvocationBroker",
     "create_builtin_registry",
     "create_runtime_registry",
 ]
-

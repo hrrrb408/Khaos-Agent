@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from khaos.exceptions import ToolNotFoundError
+from dataclasses import field
+
+
+@dataclass(frozen=True)
+class ToolCapability:
+    name: str
+    modes: frozenset[str]
+    scopes: frozenset[str]
 
 
 @dataclass
@@ -20,6 +28,7 @@ class ToolDefinition:
     parallel: bool
     timeout: int = 60
     handler: Callable[..., Awaitable[Any]] | None = None
+    capabilities: tuple[ToolCapability, ...] = ()
 
 
 class ToolRegistry:
@@ -32,6 +41,9 @@ class ToolRegistry:
         """Register a tool definition."""
         if definition.name in self._tools:
             raise ValueError(f"tool already registered: {definition.name}")
+        if not definition.capabilities:
+            capability = _infer_capability(definition)
+            definition.capabilities = (capability,) if capability is not None else ()
         self._tools[definition.name] = definition
 
     def get(self, name: str) -> ToolDefinition:
@@ -66,6 +78,57 @@ class ToolRegistry:
         schema = self.get(name).parameters
         return self._validate_schema_value(schema, params)
 
+    def capabilities_for(self, name: str) -> tuple[ToolCapability, ...]:
+        return self.get(name).capabilities
+
+    def _validate_schema_value(self, schema: dict, value: Any) -> bool:
+        expected = schema.get("type")
+        if "enum" in schema and value not in schema["enum"]:
+            return False
+        if expected == "string":
+            return isinstance(value, str)
+        if expected == "integer":
+            return isinstance(value, int)
+        if expected == "boolean":
+            return isinstance(value, bool)
+        if expected == "object":
+            if not isinstance(value, dict):
+                return False
+            if any(required not in value for required in schema.get("required", [])):
+                return False
+            properties = schema.get("properties", {})
+            return all(key not in properties or self._validate_schema_value(properties[key], item) for key, item in value.items())
+        if expected == "array":
+            items = schema.get("items")
+            return isinstance(value, list) and (items is None or all(self._validate_schema_value(items, item) for item in value))
+        return True
+
+
+class ToolInvocationBroker:
+    """Uniform capability gate before any public tool handler is invoked."""
+
+    def __init__(self, registry: ToolRegistry) -> None:
+        self.registry = registry
+
+    async def invoke(self, name: str, *, mode: str, context: dict[str, Any], **params: Any) -> Any:
+        definition = self.registry.get(name)
+        capabilities = definition.capabilities
+        if not capabilities and (definition.permission_level != "read" or name in {"terminal", "test_run", "sandbox_exec"}):
+            raise PermissionError(f"tool {name} has no declared capability")
+        for capability in capabilities:
+            if mode not in capability.modes and "all" not in capability.modes:
+                raise PermissionError(f"tool {name} is unavailable in mode {mode}")
+            if capability.name == "process.execute":
+                service = context.get("execution_service")
+                if service is None:
+                    raise PermissionError("process.execute requires ExecutionService")
+            if capability.name == "filesystem.write":
+                if context.get("workspace_id") is None or context.get("task_id") is None:
+                    raise PermissionError("filesystem.write requires active TaskWorkspace")
+        if definition.handler is None:
+            raise ToolNotFoundError(f"tool handler not configured: {name}")
+        return await definition.handler(**params)
+
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:
         expected = schema.get("type")
         if "enum" in schema and value not in schema["enum"]:
@@ -95,6 +158,21 @@ class ToolRegistry:
                 return True
             return all(self._validate_schema_value(item_schema, item) for item in value)
         return True
+
+
+def _infer_capability(definition: ToolDefinition) -> ToolCapability | None:
+    name = definition.name
+    if name in {"terminal", "test_run", "sandbox_exec"} or name in {"process"}:
+        return ToolCapability("process.execute", frozenset(definition.modes), frozenset({"task-workspace"}))
+    if name in {"write_file", "multi_edit", "file_patch", "mkdir", "delete_file"}:
+        return ToolCapability("filesystem.write", frozenset(definition.modes), frozenset({"task-workspace"}))
+    if name.startswith("git_"):
+        return ToolCapability("vcs.write" if definition.permission_level == "write" else "vcs.read", frozenset(definition.modes), frozenset({"task-workspace"}))
+    if name.startswith("github_"):
+        return ToolCapability("network.access", frozenset(definition.modes), frozenset({"user-selected"}))
+    if definition.permission_level == "read":
+        return ToolCapability("filesystem.read", frozenset(definition.modes), frozenset({"task-workspace", "app-data", "user-selected"}))
+    return None
 
 
 # Hermes batch 5: declarative specs for cron + history tools. Defined here
