@@ -29,6 +29,25 @@ class UnsupportedBackend:
         return None
 
 
+class BackendSelector:
+    """Select a platform backend; writable execution never falls back to host."""
+
+    def select(self, *, writable: bool):
+        if sys.platform == "darwin":
+            backend = MacOSSandboxBackend()
+            if shutil.which("sandbox-exec"):
+                return backend
+        elif sys.platform.startswith("linux"):
+            backend = LinuxBubblewrapBackend()
+            if shutil.which("bwrap"):
+                return backend
+        if writable:
+            return UnsupportedBackend()
+        from khaos.coding.execution.host import HostExecutionBackend
+
+        return HostExecutionBackend()
+
+
 class MacOSSandboxBackend:
     name = "macos-sandbox-exec"
 
@@ -40,6 +59,15 @@ class MacOSSandboxBackend:
         escaped = str(worktree.resolve()).replace("\\", "\\\\").replace('"', '\\"')
         return f'(version 1)(deny default)(allow process*)(allow file-read*)(allow file-write* (subpath "{escaped}"))(allow file-write* (subpath "/tmp"))(deny network*)'
 
+    async def execute(self, request):
+        from khaos.coding.execution.host import HostExecutionBackend
+        from dataclasses import replace
+        worktree = request.writable_roots[0] if request.writable_roots else request.cwd
+        return await HostExecutionBackend().execute(replace(request, argv=("sandbox-exec", "-p", self.profile(worktree), *request.argv)))
+
+    async def terminate(self, execution_id: str) -> None:
+        return None
+
 
 class LinuxBubblewrapBackend:
     name = "linux-bwrap"
@@ -50,3 +78,12 @@ class LinuxBubblewrapBackend:
 
     def argv_prefix(self, worktree: Path) -> tuple[str, ...]:
         return ("bwrap", "--ro-bind", "/", "/", "--bind", str(worktree.resolve()), str(worktree.resolve()), "--tmpfs", "/tmp", "--unshare-net", "--unshare-pid")
+
+    async def execute(self, request):
+        from khaos.coding.execution.host import HostExecutionBackend
+        from dataclasses import replace
+        worktree = request.writable_roots[0] if request.writable_roots else request.cwd
+        return await HostExecutionBackend().execute(replace(request, argv=(*self.argv_prefix(worktree), *request.argv)))
+
+    async def terminate(self, execution_id: str) -> None:
+        return None

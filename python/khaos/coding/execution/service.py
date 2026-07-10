@@ -11,8 +11,11 @@ class ExecutionService:
         self.backend = backend
         self.workspace_manager = workspace_manager
         self._active: dict[str, tuple[str, str]] = {}
+        self._closed = False
 
     async def execute(self, request: ExecutionRequest) -> ExecutionResult:
+        if self._closed:
+            raise RuntimeError("execution service is shut down")
         if request.access_mode == "workspace-write":
             if self.workspace_manager is None or not request.task_id or not request.workspace_id:
                 raise PermissionError("workspace-write requires an active TaskWorkspace")
@@ -36,5 +39,8 @@ class ExecutionService:
         self._active.pop(execution_id, None)
 
     async def shutdown(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
         for execution_id in tuple(self._active):
             await self.terminate(execution_id)

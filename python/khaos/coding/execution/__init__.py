@@ -3,6 +3,6 @@
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.models import ExecutionRequest, ExecutionResult, NetworkPolicy, ResourceBudget
 from khaos.coding.execution.service import ExecutionService
-from khaos.coding.execution.platform import LinuxBubblewrapBackend, MacOSSandboxBackend, UnsupportedBackend
+from khaos.coding.execution.platform import BackendSelector, LinuxBubblewrapBackend, MacOSSandboxBackend, UnsupportedBackend
 
-__all__ = ["ExecutionRequest", "ExecutionResult", "ExecutionService", "HostExecutionBackend", "LinuxBubblewrapBackend", "MacOSSandboxBackend", "NetworkPolicy", "ResourceBudget", "UnsupportedBackend"]
+__all__ = ["BackendSelector", "ExecutionRequest", "ExecutionResult", "ExecutionService", "HostExecutionBackend", "LinuxBubblewrapBackend", "MacOSSandboxBackend", "NetworkPolicy", "ResourceBudget", "UnsupportedBackend"]

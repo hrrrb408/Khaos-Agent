@@ -15,6 +15,7 @@ from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
+from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
@@ -50,6 +51,7 @@ class RuntimeConfig:
     skill_manager: SkillManager | None = None
     tool_scheduler: ToolScheduler | None = None
     workspace_manager: WorkspaceManager | None = None
+    execution_service: ExecutionService | None = None
 
 
 @dataclass
@@ -63,6 +65,7 @@ class RuntimeResult:
     skill_manager: SkillManager
     new_verify_fix_loop: Callable[[], VerifyFixLoop] | None
     _closed: bool = False
+    execution_service: ExecutionService | None = None
 
     async def aclose(self) -> None:
         """Release runtime-owned resources; database ownership stays with caller."""
@@ -76,6 +79,11 @@ class RuntimeResult:
                     await close()
                 except Exception:
                     logger.debug("memory manager close failed", exc_info=True)
+        if self.execution_service is not None:
+            try:
+                await self.execution_service.shutdown()
+            except Exception:
+                logger.debug("execution service close failed", exc_info=True)
 
 
 async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
@@ -112,6 +120,8 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     if task_manager is None:
         task_manager = TaskManager(db=cfg.db)
         await task_manager.load()
+    workspace_manager = cfg.workspace_manager or WorkspaceManager()
+    execution_service = cfg.execution_service or ExecutionService(BackendSelector().select(writable=False), workspace_manager)
     policy = load_policy(root / "khaos_policy.yaml")
     sandbox = cfg.sandbox or Sandbox.from_policy_mode(policy.mode, root)
     network_guard = cfg.network_guard or NetworkGuard(
@@ -140,6 +150,6 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         task_manager=task_manager,
         skill_generator=skill_generator, project_root=root,
         coding_context_builder=cfg.coding_context_builder,
-        workspace_manager=cfg.workspace_manager or WorkspaceManager(),
+        workspace_manager=workspace_manager,
     )
-    return RuntimeResult(loop, mode_manager, task_manager, skill_generator, scheduler, memory_manager, skill_manager, verify_factory)
+    return RuntimeResult(loop, mode_manager, task_manager, skill_generator, scheduler, memory_manager, skill_manager, verify_factory, execution_service)
