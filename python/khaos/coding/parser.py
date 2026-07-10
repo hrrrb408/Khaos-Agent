@@ -28,6 +28,9 @@ class CodeParser:
             logger.warning("Unable to parse symbols: path=%s error=%s", path, exc)
             return []
 
+        return self._symbols_from_module(module)
+
+    def _symbols_from_module(self, module: ast.Module) -> list[dict[str, Any]]:
         symbols: list[dict[str, Any]] = []
         for node in ast.walk(module):
             if isinstance(node, ast.ClassDef):
@@ -49,6 +52,20 @@ class CodeParser:
 
         symbols.sort(key=lambda item: int(item["line"]))
         return symbols
+
+    def parse_symbols_from_source(self, source: str) -> list[dict[str, Any]]:
+        module = ast.parse(source)
+        return self._symbols_from_module(module)
+
+    def parse_imports_from_source(self, source: str) -> list[str]:
+        module = ast.parse(source)
+        imports: list[str] = []
+        for node in ast.walk(module):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imports.append("." * node.level + (node.module or ""))
+        return sorted(set(imports))
 
     def parse_imports(self, file_path: Path) -> list[str]:
         """Extract import statements from a Python file."""
