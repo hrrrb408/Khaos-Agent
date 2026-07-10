@@ -33,6 +33,10 @@ class TuiContext:
     skill_manager: SkillManager | None = None
     # Optional shared coding-task tracker for the /tasks and /task commands.
     task_manager: Any = None
+    # Optional cron engine for the /cron command.
+    cron_engine: Any = None
+    # Optional session history search for the /history command.
+    session_search: Any = None
     session_id: str = ""
     # Callbacks the app wires up for state-changing commands.
     on_clear: Callable[[], None] | None = None
@@ -70,6 +74,14 @@ Khaos TUI — slash commands:
   /model <name>             Show or set the active model (set is advisory)
   /tasks                    List active coding tasks (all tasks with -a)
   /task <id>                Show details for one coding task
+  /cron list                List scheduled tasks
+  /cron create <n> <sched> <prompt>  Create a scheduled task
+  /cron pause <id>          Pause a scheduled task
+  /cron resume <id>         Resume a scheduled task
+  /cron remove <id>         Remove a scheduled task
+  /history search <query>   Search past sessions
+  /history browse          List recent sessions
+  /history read <id>       Read a full session
   /session new              Start a new session
   /session list             List known sessions
   /help                     Show this help
@@ -127,6 +139,10 @@ async def handle_command(line: str, ctx: TuiContext) -> CommandResult:
         return await _cmd_tasks(args, ctx)
     if cmd == "/task":
         return await _cmd_task(args, ctx)
+    if cmd == "/cron":
+        return await _cmd_cron(args, ctx)
+    if cmd == "/history":
+        return await _cmd_history(args, ctx)
     if cmd == "/session":
         return _cmd_session(args, ctx)
 
@@ -221,6 +237,96 @@ def _cmd_model(args: list[str], ctx: TuiContext) -> CommandResult:
             f"model switching is config-driven; add {args[0]!r} to config.yaml "
             "under models.router or models.default_model."
         ),
+    )
+
+
+async def _cmd_history(args: list[str], ctx: TuiContext) -> CommandResult:
+    if ctx.session_search is None:
+        return CommandResult(handled=True, message="session search not configured")
+    if not args:
+        return CommandResult(
+            handled=True, message="usage: /history [search <query>|browse|read <id>]"
+        )
+    sub = args[0]
+    if sub == "search":
+        query = " ".join(args[1:])
+        if not query:
+            return CommandResult(handled=True, message="usage: /history search <query>")
+        results = await ctx.session_search.search(query)
+        if not results:
+            return CommandResult(handled=True, message=f"no matches for {query!r}.")
+        lines = [f"search results for {query!r}:"]
+        for r in results:
+            lines.append(f"  [{r.role}] {r.session_id}  {r.snippet}")
+        return CommandResult(handled=True, message="\n".join(lines))
+    if sub == "browse":
+        summaries = await ctx.session_search.browse()
+        if not summaries:
+            return CommandResult(handled=True, message="no sessions found.")
+        lines = ["recent sessions:"]
+        for s in summaries:
+            lines.append(f"  {s.session_id}  ({s.message_count} msgs)  {s.title[:50]}")
+        return CommandResult(handled=True, message="\n".join(lines))
+    if sub == "read":
+        if len(args) < 2:
+            return CommandResult(handled=True, message="usage: /history read <session_id>")
+        sid = args[1]
+        messages = await ctx.session_search.read_session(sid)
+        if not messages:
+            return CommandResult(handled=True, message=f"session {sid!r} is empty or unknown.")
+        lines = [f"session {sid} ({len(messages)} messages):"]
+        for m in messages:
+            lines.append(f"  [{m.get('role', '?')}] {str(m.get('content', ''))[:80]}")
+        return CommandResult(handled=True, message="\n".join(lines))
+    return CommandResult(
+        handled=True, message=f"unknown /history subcommand: {sub}"
+    )
+
+
+async def _cmd_cron(args: list[str], ctx: TuiContext) -> CommandResult:
+    if ctx.cron_engine is None:
+        return CommandResult(handled=True, message="cron engine not configured")
+    if not args:
+        return CommandResult(
+            handled=True, message="usage: /cron [list|create|pause|resume|remove]"
+        )
+    sub = args[0]
+    if sub == "list":
+        tasks = await ctx.cron_engine.list_tasks()
+        if not tasks:
+            return CommandResult(handled=True, message="no scheduled tasks.")
+        lines = ["scheduled tasks:"]
+        for t in tasks:
+            nxt = t.next_run.isoformat() if t.next_run else "-"
+            lines.append(f"  [{t.status.value}] {t.id}  {t.name}  next={nxt}  runs={t.run_count}")
+        return CommandResult(handled=True, message="\n".join(lines))
+    if sub == "create":
+        # /cron create <name> <schedule> <prompt...>
+        if len(args) < 4:
+            return CommandResult(
+                handled=True,
+                message="usage: /cron create <name> <schedule> <prompt>",
+            )
+        name, schedule_expr, prompt = args[1], args[2], " ".join(args[3:])
+        from khaos.tools.cron_tools import _parse_schedule
+
+        config = _parse_schedule(schedule_expr)
+        task = await ctx.cron_engine.create(name, prompt, config)
+        return CommandResult(
+            handled=True,
+            message=f"created task {task.id} ({name}), next_run={task.next_run.isoformat() if task.next_run else '-'}",
+        )
+    if sub in {"pause", "resume", "remove"}:
+        if len(args) < 2:
+            return CommandResult(handled=True, message=f"usage: /cron {sub} <id>")
+        task_id = args[1]
+        method = {"pause": ctx.cron_engine.pause, "resume": ctx.cron_engine.resume, "remove": ctx.cron_engine.remove}[sub]
+        ok = await method(task_id)
+        if not ok:
+            return CommandResult(handled=True, message=f"task {task_id!r} not found")
+        return CommandResult(handled=True, message=f"{sub}d task {task_id}")
+    return CommandResult(
+        handled=True, message=f"unknown /cron subcommand: {sub}\nusage: /cron [list|create|pause|resume|remove]"
     )
 
 

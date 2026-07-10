@@ -45,6 +45,9 @@ khaos/
 │   │   │   ├── parser.py           # AST 符号/调用图/依赖图
 │   │   │   ├── verify_fix.py       # 自动 verify-fix 循环策略层
 │   │   │   └── task_manager.py     # 长任务后台状态管理
+│   │   ├── scheduler/       # 定时任务调度（Hermes：CronEngine）
+│   │   ├── session/         # 会话历史 FTS5 搜索 + 窗口滚动（Hermes）
+│   │   ├── channels/        # 多平台消息通道抽象（Hermes：WebSocket/LogFile/Memory）
 │   │   ├── cli/             # CLI 入口点
 │   │   ├── tui/             # 全屏 TUI（Phase 4：Textual + Rich，斜杠命令）
 │   │   ├── permissions/     # 权限引擎
@@ -102,6 +105,10 @@ khaos/
 | MoA (Phase 3) | — (routing/moa.py) | — |
 | 多 Provider (Phase 4) | — (routing/providers/) | — |
 | Coding 增强 | — (coding/) | — |
+| 定时任务 (Hermes) | — (scheduler/) | scheduled_tasks |
+| 会话历史搜索 (Hermes) | — (session/) | messages_fts |
+| 多平台通道 (Hermes) | — (channels/) | — |
+| 技能自动生成 (Hermes) | — (skills/generator.py) | — |
 | Go API 网关 | LLD §2 | audit_log |
 | Rust FFI (Phase 3) | LLD §3 | — |
 | 数据库 DDL | LLD §4 | 全部 |

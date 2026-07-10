@@ -97,6 +97,92 @@ class ToolRegistry:
         return True
 
 
+# Hermes batch 5: declarative specs for cron + history tools. Defined here
+# (not imported from the tool modules) to avoid a circular import at module
+# load time — the tool modules are wired lazily in create_runtime_registry().
+CRON_TOOL_SPECS = [
+    {
+        "name": "cron_create",
+        "description": "Create a new scheduled task. Schedule formats: cron '0 9' (daily 9am), interval '30m'/'2h', ISO timestamp (one-shot).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "Task name"},
+                "prompt": {"type": "string", "description": "Prompt to execute when triggered"},
+                "schedule": {"type": "string", "description": "Schedule expression"},
+                "repeat": {"type": "integer", "description": "Max repeat count (optional)"},
+                "deliver_to": {"type": "string", "description": "Where to send results"},
+            },
+            "required": ["name", "prompt", "schedule"],
+        },
+    },
+    {
+        "name": "cron_list",
+        "description": "List all scheduled tasks.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "cron_remove",
+        "description": "Remove a scheduled task.",
+        "parameters": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string", "description": "Task ID to remove"}},
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "cron_pause",
+        "description": "Pause a scheduled task.",
+        "parameters": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string", "description": "Task ID"}},
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "cron_resume",
+        "description": "Resume a paused scheduled task.",
+        "parameters": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string", "description": "Task ID"}},
+            "required": ["task_id"],
+        },
+    },
+]
+
+HISTORY_TOOL_SPECS = [
+    {
+        "name": "history_search",
+        "description": "Search past session history. Supports AND/OR/NOT operators and quoted phrases.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "limit": {"type": "integer", "description": "Max results (default 10)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "history_browse",
+        "description": "Browse recent sessions by date.",
+        "parameters": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "Max sessions (default 20)"}},
+        },
+    },
+    {
+        "name": "history_read",
+        "description": "Read messages from a specific past session.",
+        "parameters": {
+            "type": "object",
+            "properties": {"session_id": {"type": "string", "description": "Session ID to read"}},
+            "required": ["session_id"],
+        },
+    },
+]
+
+
 def register_builtin_tools(registry: ToolRegistry) -> None:
     """Register the Phase 1 built-in tool declarations."""
     registry.register(
@@ -1265,6 +1351,29 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             parallel=True,
         )
     )
+    # Hermes batch 5: cron + history tools (available in all modes).
+    for spec in CRON_TOOL_SPECS:
+        registry.register(
+            ToolDefinition(
+                name=spec["name"],
+                description=spec["description"],
+                parameters=spec["parameters"],
+                modes=["all"],
+                permission_level="write",
+                parallel=False,
+            )
+        )
+    for spec in HISTORY_TOOL_SPECS:
+        registry.register(
+            ToolDefinition(
+                name=spec["name"],
+                description=spec["description"],
+                parameters=spec["parameters"],
+                modes=["all"],
+                permission_level="read",
+                parallel=True,
+            )
+        )
 
 
 def create_builtin_registry() -> ToolRegistry:
@@ -1280,8 +1389,10 @@ def create_runtime_registry() -> ToolRegistry:
         browser_tools,
         clipboard_tools,
         code_search_tools,
+        cron_tools,
         file_tools,
         git_tools,
+        history_tools,
         markdown_tools,
         note_tools,
         permission_tools,
@@ -1362,4 +1473,13 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("revoke_permission").handler = permission_tools.revoke_permission
     registry.get("query_audit_logs").handler = permission_tools.query_audit_logs
     registry.get("security_status").handler = permission_tools.security_status
+    # Hermes batch 5: cron + history tool handlers.
+    registry.get("cron_create").handler = cron_tools.cron_create
+    registry.get("cron_list").handler = cron_tools.cron_list
+    registry.get("cron_remove").handler = cron_tools.cron_remove
+    registry.get("cron_pause").handler = cron_tools.cron_pause
+    registry.get("cron_resume").handler = cron_tools.cron_resume
+    registry.get("history_search").handler = history_tools.history_search
+    registry.get("history_browse").handler = history_tools.history_browse
+    registry.get("history_read").handler = history_tools.history_read
     return registry
