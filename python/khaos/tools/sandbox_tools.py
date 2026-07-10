@@ -175,3 +175,14 @@ async def _run_exec(args: list[str], timeout: int) -> dict[str, Any]:
 def _validate_command(command: str) -> None:
     if not shlex.split(command):
         raise ValueError("command must not be empty")
+
+
+def validate_task_workspace(workspace_path: str | Path, repository_root: str | Path) -> Path:
+    """Reject Docker mounts that are not an active task Worktree path."""
+    workspace = Path(workspace_path).expanduser().resolve()
+    repository = Path(repository_root).expanduser().resolve()
+    if workspace == repository or repository in workspace.parents:
+        raise PermissionError("Docker sandbox cannot mount the main repository")
+    if not (workspace / ".git").exists() and not (workspace / ".git").is_file():
+        raise PermissionError("Docker sandbox requires an active Git Worktree")
+    return workspace

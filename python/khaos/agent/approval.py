@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 
 
@@ -18,13 +19,13 @@ class ApprovalBroker:
     def __init__(self) -> None:
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._decisions: dict[str, ApprovalDecision] = {}
-        self._bindings: dict[str, str] = {}
+        self._bindings: dict[str, tuple[str, float | None]] = {}
         self._lock = asyncio.Lock()
 
-    async def bind(self, tool_call_id: str, approval_key: str) -> None:
+    async def bind(self, tool_call_id: str, approval_key: str, expiry: float | None = None) -> None:
         """Bind a pending approval to an immutable ChangeSet operation."""
         async with self._lock:
-            self._bindings[tool_call_id] = approval_key
+            self._bindings[tool_call_id] = (approval_key, expiry)
 
     async def wait(self, tool_call_id: str, timeout: float | None = None) -> dict:
         async with self._lock:
@@ -52,8 +53,8 @@ class ApprovalBroker:
         approval_key: str | None = None,
     ) -> bool:
         async with self._lock:
-            expected_key = self._bindings.get(tool_call_id)
-            if expected_key is not None and expected_key != approval_key:
+            binding = self._bindings.get(tool_call_id)
+            if binding is not None and (binding[0] != approval_key or binding[1] is not None and time.time() >= binding[1]):
                 return False
             future = self._pending.get(tool_call_id)
             if future is None:

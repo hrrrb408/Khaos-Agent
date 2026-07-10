@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 from khaos.agent.approval import ApprovalBroker
 from khaos.coding.task_manager import TaskManager, TaskStatus
@@ -27,3 +28,9 @@ async def test_approval_broker_rejects_stale_changeset_binding():
     assert await broker.resolve("call-2", True, approval_key="changeset:old:apply") is False
     assert await broker.resolve("call-2", True, approval_key="changeset:new:apply") is True
     assert await broker.wait("call-2", timeout=0.1) == {"approved": True, "remember": False}
+
+
+async def test_approval_broker_rejects_expired_binding():
+    broker = ApprovalBroker()
+    await broker.bind("call-3", "key", expiry=time.time() - 1)
+    assert await broker.resolve("call-3", True, approval_key="key") is False
