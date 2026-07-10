@@ -163,7 +163,24 @@ def _parse_wechat(raw: dict[str, Any] | str) -> PlatformMessage:
         }
     else:
         data = raw
-    return PlatformMessage(id=str(data.get("MsgId", data.get("MsgID", ""))), channel=ChannelType.WECHAT, text=data.get("Content", data.get("content", data.get("text", ""))), sender=Sender(id=str(data.get("FromUserName", "")), platform_id=str(data.get("FromUserName", ""))), target=str(data.get("ToUserName", "")), raw_payload=data)
+    msg_type = str(data.get("MsgType", "text")).lower()
+    text = str(data.get("Content", data.get("content", data.get("text", ""))))
+    message = PlatformMessage(id=str(data.get("MsgId", data.get("MsgID", ""))), channel=ChannelType.WECHAT, text=text, sender=Sender(id=str(data.get("FromUserName", "")), platform_id=str(data.get("FromUserName", ""))), target=str(data.get("ToUserName", "")), raw_payload=data, metadata={"msg_type": msg_type})
+    if msg_type in {"image", "voice", "video"}:
+        content_type = {"image": ContentType.IMAGE, "voice": ContentType.AUDIO, "video": ContentType.VIDEO}[msg_type]
+        message.content_type = content_type
+        message.attachments.append(MediaAttachment(url=str(data.get("PicUrl", data.get("MediaId", ""))), mime_type=str(data.get("Format", "")), thumbnail_url=str(data.get("ThumbMediaId", ""))))
+    elif msg_type == "location":
+        message.text = str(data.get("Label", ""))
+        message.metadata.update({"latitude": data.get("Location_X"), "longitude": data.get("Location_Y"), "scale": data.get("Scale")})
+    elif msg_type == "link":
+        message.text = str(data.get("Title", ""))
+        message.attachments.append(MediaAttachment(url=str(data.get("Url", "")), caption=str(data.get("Description", ""))))
+        message.content_type = ContentType.MIXED
+    elif msg_type == "event":
+        message.text = str(data.get("Event", ""))
+        message.metadata.update({"event": data.get("Event"), "event_key": data.get("EventKey")})
+    return message
 
 
 def _parse_generic_webhook(raw: dict[str, Any]) -> PlatformMessage:

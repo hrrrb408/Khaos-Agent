@@ -66,6 +66,20 @@ async def test_wechat_xml_and_bad_signature():
 
 
 @pytest.mark.asyncio
+async def test_wechat_image_and_location_types():
+    messages = []
+    image = b"<xml><MsgType>image</MsgType><MsgId>9</MsgId><PicUrl>https://img</PicUrl></xml>"
+    location = b"<xml><MsgType>location</MsgType><Label>Shanghai</Label><Location_X>31.2</Location_X><Location_Y>121.5</Location_Y></xml>"
+    handler = WebhookHandler(ChannelType.WECHAT, on_message=messages.append)
+    await handler.handle({}, image)
+    await handler.handle({}, location)
+    assert messages[0].content_type == ContentType.IMAGE
+    assert messages[0].attachments[0].url == "https://img"
+    assert messages[1].text == "Shanghai"
+    assert messages[1].metadata["latitude"] == "31.2"
+
+
+@pytest.mark.asyncio
 async def test_generic_and_parse_error():
     messages = []
     handler = WebhookHandler(ChannelType.WEBHOOK_IN, on_message=messages.append)
