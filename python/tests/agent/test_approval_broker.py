@@ -19,3 +19,11 @@ async def test_task_approval_resolves_waiting_tool_decision():
     assert response["ok"] is True
     assert decision == {"approved": True, "remember": False}
     assert (await manager.get(task.id)).status == TaskStatus.RUNNING
+
+
+async def test_approval_broker_rejects_stale_changeset_binding():
+    broker = ApprovalBroker()
+    await broker.bind("call-2", "changeset:new:apply")
+    assert await broker.resolve("call-2", True, approval_key="changeset:old:apply") is False
+    assert await broker.resolve("call-2", True, approval_key="changeset:new:apply") is True
+    assert await broker.wait("call-2", timeout=0.1) == {"approved": True, "remember": False}

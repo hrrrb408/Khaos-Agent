@@ -18,7 +18,13 @@ class ApprovalBroker:
     def __init__(self) -> None:
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._decisions: dict[str, ApprovalDecision] = {}
+        self._bindings: dict[str, str] = {}
         self._lock = asyncio.Lock()
+
+    async def bind(self, tool_call_id: str, approval_key: str) -> None:
+        """Bind a pending approval to an immutable ChangeSet operation."""
+        async with self._lock:
+            self._bindings[tool_call_id] = approval_key
 
     async def wait(self, tool_call_id: str, timeout: float | None = None) -> dict:
         async with self._lock:
@@ -38,8 +44,17 @@ class ApprovalBroker:
             async with self._lock:
                 self._pending.pop(tool_call_id, None)
 
-    async def resolve(self, tool_call_id: str, approved: bool, remember: bool = False) -> bool:
+    async def resolve(
+        self,
+        tool_call_id: str,
+        approved: bool,
+        remember: bool = False,
+        approval_key: str | None = None,
+    ) -> bool:
         async with self._lock:
+            expected_key = self._bindings.get(tool_call_id)
+            if expected_key is not None and expected_key != approval_key:
+                return False
             future = self._pending.get(tool_call_id)
             if future is None:
                 self._decisions[tool_call_id] = ApprovalDecision(approved, remember)
@@ -47,4 +62,5 @@ class ApprovalBroker:
             if future.done():
                 return False
             future.set_result(ApprovalDecision(approved, remember))
+            self._bindings.pop(tool_call_id, None)
             return True
