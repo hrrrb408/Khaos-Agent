@@ -38,7 +38,7 @@ from khaos.routing import ModelRouter
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.policy import load_policy
-from khaos.skills import SkillManager
+from khaos.skills import SkillGenerator, SkillManager
 from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
 from khaos.tools import create_runtime_registry
 from khaos.tools.channel_tools import set_channel_registry
@@ -71,7 +71,7 @@ class AgentService:
         self.pending_confirmations: dict[str, dict] = {}
         # Shared coding-task tracker so the TUI / TaskService can observe
         # long-running coding turns alongside the AgentLoop.
-        self.task_manager = TaskManager()
+        self.task_manager = TaskManager(db=db)
         self.cron_engine = CronEngine(db=db, executor=self._execute_scheduled_prompt)
         set_cron_engine(self.cron_engine)
         self.channel_registry = ChannelRegistry()
@@ -82,6 +82,7 @@ class AgentService:
 
     async def start(self) -> None:
         """Start process-scoped background services."""
+        await self.task_manager.load()
         await self.cron_engine.start()
 
     async def shutdown(self) -> None:
@@ -211,6 +212,7 @@ class AgentService:
             skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
             verify_fix_loop=verify_fix_loop,
             task_manager=self.task_manager if is_coding else None,
+            skill_generator=SkillGenerator() if is_coding else None,
         )
         return mode_manager, loop
 

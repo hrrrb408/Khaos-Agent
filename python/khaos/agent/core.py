@@ -90,6 +90,7 @@ class AgentLoop:
         verify_fix_loop: "Optional[VerifyFixLoop]" = None,
         task_manager: "Optional[TaskManager]" = None,
         task_id: str | None = None,
+        skill_generator=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -120,6 +121,7 @@ class AgentLoop:
         # Long-task tracking: record files viewed/modified and test outcomes.
         self.task_manager = task_manager
         self.task_id = task_id
+        self.skill_generator = skill_generator
 
     async def run(
         self,
@@ -148,7 +150,7 @@ class AgentLoop:
                 token_count=self.token_engine.count_tokens(user_input),
                 created_at=time.time(),
             )
-            await self.db.insert_message(session_id, user_msg)
+            await self._persist_message(session_id, user_msg)
             messages.append(user_msg)
             total_tokens += user_msg.token_count
 
@@ -232,7 +234,7 @@ class AgentLoop:
                     stop_reason=stop_reason,
                 )
                 messages.append(assistant_msg)
-                await self.db.insert_message(session_id, assistant_msg)
+                await self._persist_message(session_id, assistant_msg)
                 turn_count += 1
                 # Phase 6.3: 结束本轮 token / 费用统计（无论是否继续工具循环）。
                 if self.cost_tracker is not None:
@@ -300,11 +302,16 @@ class AgentLoop:
                             created_at=time.time(),
                         )
                         messages.append(tool_msg)
-                        await self.db.insert_message(session_id, tool_msg)
+                        await self._persist_message(session_id, tool_msg)
                         if self.cost_tracker is not None:
                             self.cost_tracker.add_tool_tokens(tool_msg.token_count)
                         # Long-task observability: record what this turn touched.
                         await self._record_task_activity(result, active_task_id)
+                        if self.task_manager is not None and active_task_id:
+                            await self.task_manager.record_trace(
+                                active_task_id,
+                                {"tool_name": result.name, "arguments": result.arguments or {}, "success": result.success, "result_summary": str(result.output or result.error)[:500], "timestamp": time.time()},
+                            )
                         # Verify-fix loop: when a test_run result contains
                         # failures, inject a guidance message so the model
                         # diagnoses, fixes, and re-runs the tests.
@@ -332,7 +339,7 @@ class AgentLoop:
                                         created_at=time.time(),
                                     )
                                     messages.append(fix_msg)
-                                    await self.db.insert_message(session_id, fix_msg)
+                                    await self._persist_message(session_id, fix_msg)
                                     if self.task_manager is not None and active_task_id:
                                         await self.task_manager.update_status(
                                             active_task_id,
@@ -352,6 +359,10 @@ class AgentLoop:
 
             else:
                 stop_reason = StopReason.MAX_TURNS.value
+
+            if self.task_manager is not None and active_task_id:
+                await self.task_manager.update_status(active_task_id, "completed")
+                await self._analyze_task_skill(active_task_id)
 
             yield Message(
                 role="system",
@@ -387,6 +398,35 @@ class AgentLoop:
                     metadata={"code": "INTERNAL_ERROR", "message": str(exc)},
                 )
 
+    async def _persist_message(self, session_id: str, message: Message) -> None:
+        """Persist and index a message as one logical core-loop operation."""
+        rowid = await self.db.insert_message(session_id, message)
+        await self.db.insert_message_fts(
+            session_id, message.role, message.content, message.token_count, rowid=rowid
+        )
+
+    async def _analyze_task_skill(self, task_id: str) -> None:
+        if self.skill_generator is None or self.task_manager is None:
+            return
+        from khaos.skills import TaskTrace, ToolTrace
+
+        task = await self.task_manager.get(task_id)
+        if task is None:
+            return
+        trace = TaskTrace(
+            task_id=task.id,
+            goal=task.goal,
+            tools_called=[ToolTrace(**entry) for entry in task.trace],
+            files_modified=task.files_modified,
+            test_results=task.test_results,
+            status=task.status.value,
+        )
+        candidates = self.skill_generator.analyze(trace)
+        await self.task_manager.update_status(
+            task_id,
+            task.status,
+            skill_candidates=[candidate.__dict__ for candidate in candidates],
+        )
     async def _build_context(self, session_id: str, user_input: str = "") -> list[Message]:
         """Build the P0-A context from mode prompt and persisted messages.
 
