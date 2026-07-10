@@ -61,6 +61,16 @@ class RuntimeResult:
     skill_manager: SkillManager
     new_verify_fix_loop: Callable[[], VerifyFixLoop] | None
 
+    async def aclose(self) -> None:
+        """Release runtime-owned resources; database ownership stays with caller."""
+        if self.memory_manager is not None:
+            close = getattr(self.memory_manager, "aclose", None)
+            if close is not None:
+                try:
+                    await close()
+                except Exception:
+                    logger.debug("memory manager close failed", exc_info=True)
+
 
 async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     """Build and initialize a complete runtime; this is the sole loop factory."""
@@ -92,9 +102,8 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     skills_dir = root / "skills"
     if len(skill_manager.registry) == 0 and skills_dir.is_dir():
         skill_manager.load_from_dir(skills_dir)
-    is_coding = mode_manager.current_mode.value == "coding"
     task_manager = cfg.task_manager
-    if task_manager is None and is_coding:
+    if task_manager is None:
         task_manager = TaskManager(db=cfg.db)
         await task_manager.load()
     policy = load_policy(root / "khaos_policy.yaml")
@@ -112,8 +121,8 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         ),
     )
     compressor = ContextCompressor(router, memory_manager=memory_manager)
-    verify_factory = VerifyFixLoop if is_coding else None
-    skill_generator = SkillGenerator() if is_coding else None
+    verify_factory = VerifyFixLoop
+    skill_generator = SkillGenerator()
     loop = AgentLoop(
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
         tool_scheduler=scheduler, confirm_callback=cfg.confirm_callback,
@@ -122,7 +131,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         token_engine=get_token_engine(),
         skill_manager=skill_manager if len(skill_manager.registry) else None,
         verify_fix_factory=verify_factory,
-        task_manager=task_manager if is_coding else None,
+        task_manager=task_manager,
         skill_generator=skill_generator, project_root=root,
         coding_context_builder=cfg.coding_context_builder,
     )

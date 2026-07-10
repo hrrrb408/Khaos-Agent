@@ -56,6 +56,7 @@ async def run_once(args: argparse.Namespace) -> int:
     async for message in loop.run(args.message, session_id):
         print(encode_sse(message), end="", flush=True)
 
+    await runtime.aclose()
     await db.close()
     return 0
 
@@ -98,6 +99,7 @@ async def run_repl(args: argparse.Namespace) -> int:
             async for message in loop.run(user_input, session_id):
                 print(encode_sse(message), end="", flush=True)
     finally:
+        await runtime.aclose()
         await db.close()
     return 0
 

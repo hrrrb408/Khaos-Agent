@@ -84,6 +84,8 @@ class KhaosApp(App):
         self.mode_manager: ModeManager | None = None
         self.router = None
         self.memory_manager: MemoryManager | None = None
+        self.task_manager = None
+        self._runtime = None
         self.skill_manager = SkillManager()
         self.agent_loop: AgentLoop | None = None
         self.session_id = str(uuid.uuid4())
@@ -191,6 +193,19 @@ class KhaosApp(App):
         self.router = runtime.loop.router
         self.agent_loop = runtime.loop
         self.memory_manager = runtime.memory_manager
+        self.task_manager = runtime.task_manager
+        self._runtime = runtime
+
+    def on_unmount(self) -> None:  # type: ignore[override]
+        """Release TUI runtime resources without owning-loop double closes."""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if self._runtime is not None:
+            loop.create_task(self._runtime.aclose())
+        if self.db is not None:
+            loop.create_task(self.db.close())
 
     def _build_coding_context_builder(self):
         """Construct a CodingContextBuilder, or None if coding pkg is absent."""
@@ -438,6 +453,7 @@ class KhaosApp(App):
             router=self.router,
             db=self.db,
             skill_manager=self.skill_manager,
+            task_manager=self.task_manager,
             session_id=self.session_id,
             on_clear=lambda: self.query_one(ChatPanel).clear(),
             on_quit=self.exit,

@@ -9,6 +9,7 @@ from khaos.grpc_server import (
     load_router_from_config,
     MemoryService,
     serve_json_lines,
+    TaskService,
 )
 from khaos.memory import MemoryStore
 
@@ -60,6 +61,22 @@ async def test_agent_service_starts_and_stops_cron_engine(tmp_path):
     await service.shutdown()
     assert service.cron_engine._running is False
     await db.close()
+
+
+async def test_task_service_only_approves_or_rejects_blocked_tasks():
+    from khaos.coding.task_manager import TaskManager
+
+    manager = TaskManager()
+    service = TaskService(manager)
+    task = await manager.create("approval")
+    not_blocked = await service.approve(task.id)
+    await manager.update_status(task.id, "blocked")
+    approved = await service.approve(task.id)
+    await manager.update_status(task.id, "blocked")
+    rejected = await service.reject(task.id)
+    assert not not_blocked["ok"]
+    assert approved["ok"]
+    assert rejected["ok"]
 
 
 async def test_agent_service_permission_waits_for_confirm(tmp_path):

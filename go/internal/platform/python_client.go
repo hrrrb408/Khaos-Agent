@@ -29,27 +29,31 @@ func (c PythonClient) ListTasks(ctx context.Context, activeOnly bool) ([]map[str
 func (c PythonClient) GetTask(ctx context.Context, id string) (map[string]any, error) {
 	return c.callMap(ctx, "TaskService.Get", map[string]any{"task_id": id})
 }
-func (c PythonClient) CancelTask(ctx context.Context, id string) error {
+func (c PythonClient) CancelTask(ctx context.Context, id string) (api.TransitionResult, error) {
 	return c.taskAction(ctx, "TaskService.Cancel", id)
 }
-func (c PythonClient) ApproveTask(ctx context.Context, id string) error {
+func (c PythonClient) ApproveTask(ctx context.Context, id string) (api.TransitionResult, error) {
 	return c.taskAction(ctx, "TaskService.Approve", id)
 }
-func (c PythonClient) RejectTask(ctx context.Context, id string) error {
+func (c PythonClient) RejectTask(ctx context.Context, id string) (api.TransitionResult, error) {
 	return c.taskAction(ctx, "TaskService.Reject", id)
 }
 func (c PythonClient) TaskArtifacts(ctx context.Context, id string) ([]map[string]any, error) {
 	return c.callList(ctx, "TaskService.Artifacts", map[string]any{"task_id": id})
 }
-func (c PythonClient) taskAction(ctx context.Context, method, id string) error {
+func (c PythonClient) taskAction(ctx context.Context, method, id string) (api.TransitionResult, error) {
 	response, err := c.callMap(ctx, method, map[string]any{"task_id": id})
 	if err != nil {
-		return err
+		return "", err
 	}
 	if ok, _ := response["ok"].(bool); !ok {
-		return fmt.Errorf("task action failed: %s", id)
+		message := stringValue(response["error"])
+		if message == "task not found" {
+			return api.TransitionNotFound, nil
+		}
+		return api.TransitionInvalid, nil
 	}
-	return nil
+	return api.TransitionUpdated, nil
 }
 
 func (c PythonClient) TaskEvents(ctx context.Context, id string) (<-chan map[string]any, error) {
