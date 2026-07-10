@@ -13,6 +13,7 @@ post-execution secret scan.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -196,14 +197,38 @@ class SecurityMiddleware:
 
         return SecurityCheckResult(allowed=True, risk_level="safe")
 
-    async def post_check(self, tool_name: str, output: Any) -> ScanResult:
-        """工具执行后的敏感信息扫描。"""
+    async def post_check(self, tool_name: str, output: Any) -> tuple[ScanResult, Any]:
+        """Scan and redact tool output before it reaches model context."""
         if not self.enabled or not self._scan_on_output or self.secret_scanner is None:
-            return ScanResult(has_secrets=False)
+            return ScanResult(has_secrets=False), output
 
         text = ""
         if isinstance(output, str):
             text = output
         elif isinstance(output, dict):
             text = str(output)
-        return self.secret_scanner.scan_text(text)
+        result = self.secret_scanner.scan_text(text)
+        if not result.has_secrets:
+            return result, output
+
+        def redact(value: Any) -> Any:
+            if isinstance(value, str):
+                sanitized = value
+                if any(secret.category == "Private Key" for secret in result.secrets):
+                    sanitized = re.sub(
+                        r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----.*?-----END (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+                        "[REDACTED PRIVATE KEY]",
+                        sanitized,
+                        flags=re.DOTALL,
+                    )
+                for secret in result.secrets:
+                    sanitized = sanitized.replace(secret.matched_text, secret.masked)
+                return sanitized
+            if isinstance(value, dict):
+                return {key: redact(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [redact(item) for item in value]
+            return value
+
+        logger.warning("secret detected and redacted in %s output", tool_name)
+        return result, redact(output)

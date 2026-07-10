@@ -269,7 +269,7 @@ class ToolScheduler:
             )
             self.budget.record(len(str(output)))
             target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
-            secret_scan = await self.security_middleware.post_check(tool.name, output)
+            secret_scan, output = await self.security_middleware.post_check(tool.name, output)
             detail: dict[str, Any] = {"tool_call_id": call["id"]}
             if secret_scan.has_secrets:
                 detail["secrets_detected"] = True

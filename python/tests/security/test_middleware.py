@@ -52,20 +52,22 @@ async def test_pre_check_safe_write():
 async def test_post_check_no_secrets():
     middleware = SecurityMiddleware()
 
-    result = await middleware.post_check("terminal", {"stdout": "hello"})
+    result, output = await middleware.post_check("terminal", {"stdout": "hello"})
 
     assert result.has_secrets is False
+    assert output == {"stdout": "hello"}
 
 
 async def test_post_check_with_secrets():
     middleware = SecurityMiddleware()
 
-    result = await middleware.post_check(
+    result, output = await middleware.post_check(
         "terminal",
         {"stdout": "api_key=abcd1234abcd1234abcd1234"},
     )
 
     assert result.has_secrets is True
+    assert "abcd1234abcd1234abcd1234" not in str(output)
     assert result.secrets[0].category == "API Key"
 
 
@@ -73,7 +75,8 @@ async def test_disabled():
     middleware = SecurityMiddleware(enabled=False)
 
     pre = await middleware.pre_check("terminal", {"command": "sudo su"})
-    post = await middleware.post_check("terminal", {"stdout": "api_key=abcd1234abcd1234abcd1234"})
+    post, output = await middleware.post_check("terminal", {"stdout": "api_key=abcd1234abcd1234abcd1234"})
 
     assert pre.allowed is True
     assert post.has_secrets is False
+    assert "abcd1234abcd1234" in str(output)
