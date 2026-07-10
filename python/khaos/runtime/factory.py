@@ -14,6 +14,7 @@ from khaos.agent.error_handler import ErrorHandler
 from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
+from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
@@ -48,6 +49,7 @@ class RuntimeConfig:
     memory_manager: MemoryManager | None = None
     skill_manager: SkillManager | None = None
     tool_scheduler: ToolScheduler | None = None
+    workspace_manager: WorkspaceManager | None = None
 
 
 @dataclass
@@ -138,5 +140,6 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         task_manager=task_manager,
         skill_generator=skill_generator, project_root=root,
         coding_context_builder=cfg.coding_context_builder,
+        workspace_manager=cfg.workspace_manager or WorkspaceManager(),
     )
     return RuntimeResult(loop, mode_manager, task_manager, skill_generator, scheduler, memory_manager, skill_manager, verify_factory)

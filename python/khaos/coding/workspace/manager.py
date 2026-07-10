@@ -86,7 +86,21 @@ class WorkspaceManager:
         patch = await self._git(workspace.worktree_path, "diff", "--binary", workspace.base_sha)
         stat = await self._git(workspace.worktree_path, "diff", "--stat", workspace.base_sha)
         names = await self._git(workspace.worktree_path, "diff", "--name-only", workspace.base_sha)
-        return ChangeSet.create(id=uuid.uuid4().hex[:12], workspace_id=workspace_id, base_sha=workspace.base_sha, head_sha=None, patch=patch, diff_stat=stat, changed_files=tuple(line for line in names.splitlines() if line))
+        changeset = ChangeSet.create(id=uuid.uuid4().hex[:12], workspace_id=workspace_id, base_sha=workspace.base_sha, head_sha=None, patch=patch, diff_stat=stat, changed_files=tuple(line for line in names.splitlines() if line))
+        artifact = workspace.worktree_path.parent / f"{changeset.id}.patch"
+        artifact.write_text(patch, encoding="utf-8")
+        return changeset
+
+    async def commit_in_worktree(self, workspace_id: str, changeset: ChangeSet, message: str) -> str:
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None or changeset.workspace_id != workspace_id:
+            raise WorkspaceError("workspace or changeset not found")
+        current = await self._git(workspace.worktree_path, "diff", "--binary", workspace.base_sha)
+        if current.encode("utf-8") != changeset.patch.encode("utf-8"):
+            raise WorkspaceError("changeset content changed; approval is stale")
+        await self._git(workspace.worktree_path, "add", "--", *changeset.changed_files)
+        await self._git(workspace.worktree_path, "commit", "-m", message)
+        return await self._git(workspace.worktree_path, "rev-parse", "HEAD")
 
     async def cleanup(self, workspace_id: str, *, force: bool = False) -> WorkspaceTransition:
         async with self._lock:

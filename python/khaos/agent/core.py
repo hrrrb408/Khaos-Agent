@@ -8,6 +8,7 @@ import logging
 import time
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, AsyncIterator, Optional
 
 if TYPE_CHECKING:
@@ -92,6 +93,7 @@ class AgentLoop:
         task_manager: "Optional[TaskManager]" = None,
         task_id: str | None = None,
         skill_generator=None,
+        workspace_manager=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -124,6 +126,8 @@ class AgentLoop:
         self.task_manager = task_manager
         self.task_id = task_id
         self.skill_generator = skill_generator
+        self.workspace_manager = workspace_manager
+        self.active_workspace = None
 
     async def run(
         self,
@@ -153,6 +157,17 @@ class AgentLoop:
                 task = await self.task_manager.create(user_input)
                 active_task_id = task.id
                 await self.task_manager.update_status(active_task_id, "running")
+                if self.workspace_manager is not None and self.project_root is not None:
+                    root = Path(self.project_root).expanduser().resolve()
+                    if (root / ".git").exists():
+                        self.active_workspace = await self.workspace_manager.create(root, active_task_id)
+                        await self.task_manager.update_status(
+                            active_task_id,
+                            "running",
+                            workspace_id=self.active_workspace.id,
+                            worktree_path=str(self.active_workspace.worktree_path),
+                            base_sha=self.active_workspace.base_sha,
+                        )
             else:
                 task = await self.task_manager.get(active_task_id)
                 if task is not None and task.status.value == "blocked":
