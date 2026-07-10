@@ -56,14 +56,24 @@ type ChannelClient interface {
 	SetChannelEnabled(ctx context.Context, channelID string, enabled bool) error
 }
 
+// TransitionResult identifies the outcome of a task lifecycle transition.
+type TransitionResult string
+
+const (
+	TransitionUpdated   TransitionResult = "updated"
+	TransitionUnchanged TransitionResult = "unchanged"
+	TransitionNotFound  TransitionResult = "not_found"
+	TransitionInvalid   TransitionResult = "invalid_transition"
+)
+
 // TaskClient manages persistent coding tasks and their event streams.
 type TaskClient interface {
 	CreateTask(ctx context.Context, goal string) (map[string]any, error)
 	ListTasks(ctx context.Context, activeOnly bool) ([]map[string]any, error)
 	GetTask(ctx context.Context, id string) (map[string]any, error)
-	CancelTask(ctx context.Context, id string) error
-	ApproveTask(ctx context.Context, id string) error
-	RejectTask(ctx context.Context, id string) error
+	CancelTask(ctx context.Context, id string) (TransitionResult, error)
+	ApproveTask(ctx context.Context, id string) (TransitionResult, error)
+	RejectTask(ctx context.Context, id string) (TransitionResult, error)
 	TaskEvents(ctx context.Context, id string) (<-chan map[string]any, error)
 	TaskArtifacts(ctx context.Context, id string) ([]map[string]any, error)
 }

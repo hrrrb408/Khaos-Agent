@@ -186,13 +186,26 @@ func (h *Handler) handleRejectTask(w http.ResponseWriter, r *http.Request) {
 	}
 	h.changeTask(w, r, "rejected", h.tasks.RejectTask)
 }
-func (h *Handler) changeTask(w http.ResponseWriter, r *http.Request, status string, action func(context.Context, string) error) {
+func (h *Handler) changeTask(w http.ResponseWriter, r *http.Request, status string, action func(context.Context, string) (TransitionResult, error)) {
 	if h.tasks == nil {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
 	id := r.PathValue("id")
-	if err := action(r.Context(), id); err != nil {
+	result, err := action(r.Context(), id)
+	if err != nil || result == TransitionNotFound || result == TransitionInvalid {
+		if result == TransitionNotFound {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		if result == TransitionInvalid {
+			writeError(w, http.StatusConflict, "invalid task transition")
+			return
+		}
+		if err == nil {
+			writeError(w, http.StatusConflict, "invalid task transition")
+			return
+		}
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}

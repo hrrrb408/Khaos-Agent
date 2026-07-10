@@ -304,17 +304,36 @@ class TaskService:
         return (await self.task_manager.create(goal)).to_dict()
 
     async def cancel(self, task_id: str) -> dict:
-        return {"ok": await self.task_manager.cancel(task_id), "task_id": task_id}
+        from khaos.coding.task_manager import TransitionResult
 
-    async def approve(self, task_id: str) -> dict:
-        task = await self.task_manager.get(task_id)
-        if task is None:
-            return {"ok": False, "error": "task not found"}
-        await self.task_manager.update_status(task_id, "running")
+        result = await self.task_manager.cancel(task_id)
+        if result == TransitionResult.NOT_FOUND:
+            return {"ok": False, "error": "task not found", "task_id": task_id}
+        if result == TransitionResult.INVALID_TRANSITION:
+            return {"ok": False, "error": "task already terminal", "task_id": task_id}
         return {"ok": True, "task_id": task_id}
 
+    async def approve(self, task_id: str) -> dict:
+        from khaos.coding.task_manager import TaskStatus, TransitionResult
+
+        task = await self.task_manager.get(task_id)
+        if task is None:
+            return {"ok": False, "error": "task not found", "task_id": task_id}
+        if task.status != TaskStatus.BLOCKED:
+            return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
+        result = await self.task_manager.update_status(task_id, TaskStatus.RUNNING)
+        return {"ok": result == TransitionResult.UPDATED, "task_id": task_id}
+
     async def reject(self, task_id: str) -> dict:
-        return await self.cancel(task_id)
+        from khaos.coding.task_manager import TaskStatus, TransitionResult
+
+        task = await self.task_manager.get(task_id)
+        if task is None:
+            return {"ok": False, "error": "task not found", "task_id": task_id}
+        if task.status != TaskStatus.BLOCKED:
+            return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
+        result = await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="rejected by user")
+        return {"ok": result == TransitionResult.UPDATED, "task_id": task_id}
 
     async def artifacts(self, task_id: str) -> list[dict]:
         task = await self.task_manager.get(task_id)

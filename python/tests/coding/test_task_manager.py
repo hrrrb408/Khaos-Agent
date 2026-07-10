@@ -11,6 +11,7 @@ from khaos.coding.task_manager import (
     CodingTask,
     TaskManager,
     TaskStatus,
+    TransitionResult,
 )
 
 
@@ -212,7 +213,7 @@ async def test_max_active_frees_up_after_completion() -> None:
 async def test_cancel_marks_cancelled() -> None:
     manager = TaskManager()
     task = await manager.create("doomed")
-    assert await manager.cancel(task.id) is True
+    assert await manager.cancel(task.id) == TransitionResult.UPDATED
     assert (await manager.get(task.id)).status == TaskStatus.CANCELLED
     assert task.id not in {item["id"] for item in await manager.list_active()}
 
@@ -240,7 +241,7 @@ async def test_task_manager_persists_and_recovers_interrupted_task(tmp_path) -> 
 @pytest.mark.asyncio
 async def test_cancel_unknown_returns_false() -> None:
     manager = TaskManager()
-    assert await manager.cancel("ghost") is False
+    assert await manager.cancel("ghost") == TransitionResult.NOT_FOUND
 
 
 def test_task_status_parse_roundtrip() -> None:

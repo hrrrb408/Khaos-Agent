@@ -63,9 +63,15 @@ func (m *mockTaskClient) GetTask(_ context.Context, id string) (map[string]any, 
 	}
 	return map[string]any{"id": id}, nil
 }
-func (m *mockTaskClient) CancelTask(_ context.Context, id string) error  { return nil }
-func (m *mockTaskClient) ApproveTask(_ context.Context, id string) error { return nil }
-func (m *mockTaskClient) RejectTask(_ context.Context, id string) error  { return nil }
+func (m *mockTaskClient) CancelTask(_ context.Context, id string) (TransitionResult, error) {
+	return TransitionUpdated, nil
+}
+func (m *mockTaskClient) ApproveTask(_ context.Context, id string) (TransitionResult, error) {
+	return TransitionUpdated, nil
+}
+func (m *mockTaskClient) RejectTask(_ context.Context, id string) (TransitionResult, error) {
+	return TransitionUpdated, nil
+}
 func (m *mockTaskClient) TaskEvents(_ context.Context, id string) (<-chan map[string]any, error) {
 	ch := make(chan map[string]any, 1)
 	ch <- map[string]any{"event_id": "e1", "task_id": id, "sequence": 1, "type": "task.running", "timestamp": "now", "payload": map[string]any{}}

@@ -60,6 +60,15 @@ ACTIVE_STATUSES = frozenset(
 TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED})
 
 
+class TransitionResult(Enum):
+    """Result of a task lifecycle transition."""
+
+    UPDATED = "updated"
+    UNCHANGED = "unchanged"
+    NOT_FOUND = "not_found"
+    INVALID_TRANSITION = "invalid_transition"
+
+
 @dataclass
 class CodingTask:
     """State record for one coding task."""
@@ -78,6 +87,7 @@ class CodingTask:
     # Hermes batch 3: tool-call trace for skill generation.
     # Each entry: {tool_name, arguments, success}.
     trace: list[dict] = field(default_factory=list)
+    event_sequence: int = 0
 
     def touch(self) -> None:
         """Stamp ``updated_at`` to now."""
@@ -100,6 +110,7 @@ class CodingTask:
         if include_internal:
             data["metadata"] = self.metadata
             data["trace"] = self.trace
+            data["event_sequence"] = self.event_sequence
         return data
 
 
@@ -133,6 +144,7 @@ class TaskManager:
                 fix_attempts=int(data.get("fix_attempts", 0)),
                 error=data.get("error"), metadata=dict(data.get("metadata", {})),
                 trace=list(data.get("trace", [])),
+                event_sequence=int(data.get("event_sequence", 0)),
             )
             if task.status in ACTIVE_STATUSES:
                 task.status = TaskStatus.BLOCKED
@@ -162,7 +174,7 @@ class TaskManager:
 
     async def update_status(
         self, task_id: str, status: TaskStatus | str, **kwargs: Any
-    ) -> None:
+    ) -> TransitionResult:
         """Transition a task's status and merge extra fields.
 
         ``kwargs`` may set any ``CodingTask`` attribute (e.g.
@@ -173,10 +185,20 @@ class TaskManager:
             task = self._tasks.get(task_id)
             if task is None:
                 logger.warning("update_status: unknown task %s", task_id)
-                return
-            if task.status in TERMINAL_STATUSES and resolved not in TERMINAL_STATUSES:
+                return TransitionResult.NOT_FOUND
+            if task.status == resolved:
+                for key, value in kwargs.items():
+                    if hasattr(task, key):
+                        setattr(task, key, value)
+                    else:
+                        task.metadata[key] = value
+                if kwargs:
+                    task.touch()
+                    await self._persist(task)
+                return TransitionResult.UNCHANGED
+            if task.status in TERMINAL_STATUSES:
                 logger.warning("refusing terminal task transition %s -> %s for %s", task.status.value, resolved.value, task_id)
-                return
+                return TransitionResult.INVALID_TRANSITION
             task.status = resolved
             for key, value in kwargs.items():
                 if hasattr(task, key):
@@ -185,6 +207,7 @@ class TaskManager:
                     task.metadata[key] = value
             task.touch()
             await self._persist(task)
+            return TransitionResult.UPDATED
 
     async def add_test_result(self, task_id: str, result: dict) -> None:
         """Record one test-run outcome against a task."""
@@ -236,16 +259,18 @@ class TaskManager:
         async with self._lock:
             return [task.to_dict() for task in self._tasks.values()]
 
-    async def cancel(self, task_id: str) -> bool:
-        """Mark a task cancelled. Returns False if the task is unknown."""
+    async def cancel(self, task_id: str) -> TransitionResult:
+        """Cancel an active task without overwriting a terminal state."""
         async with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
-                return False
+                return TransitionResult.NOT_FOUND
+            if task.status in TERMINAL_STATUSES:
+                return TransitionResult.INVALID_TRANSITION
             task.status = TaskStatus.CANCELLED
             task.touch()
             await self._persist(task)
-            return True
+            return TransitionResult.UPDATED
 
     async def record_trace(self, task_id: str, entry: dict[str, Any]) -> None:
         async with self._lock:
@@ -257,9 +282,10 @@ class TaskManager:
             await self._persist(task)
 
     async def _persist(self, task: CodingTask) -> None:
+        task.event_sequence += 1
         if self._db is not None:
             await self._db.upsert_coding_task(task.to_dict(include_internal=True))
-        event = {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": len(task.trace) + 1, "type": f"task.{task.status.value}", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
+        event = {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": task.event_sequence, "type": f"task.{task.status.value}", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
         for queue in self._subscribers.get(task.id, []):
             queue.put_nowait(event)
 
@@ -271,7 +297,7 @@ class TaskManager:
         queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._subscribers.setdefault(task_id, []).append(queue)
         try:
-            yield {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": 0, "type": "task.snapshot", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
+            yield {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": task.event_sequence, "type": "task.snapshot", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
             while True:
                 yield await queue.get()
         finally:

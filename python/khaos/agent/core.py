@@ -143,8 +143,20 @@ class AgentLoop:
         """
         # A task_id passed to run() overrides the instance default for this turn.
         active_task_id = task_id or self.task_id
-        if self._verify_fix_factory is not None:
+        is_coding = self.mode_manager.current_mode.value == "coding"
+        if is_coding and self._verify_fix_factory is not None:
             self.verify_fix_loop = self._verify_fix_factory()
+        elif not is_coding:
+            self.verify_fix_loop = None
+        if self.task_manager is not None and is_coding:
+            if active_task_id is None:
+                task = await self.task_manager.create(user_input)
+                active_task_id = task.id
+                await self.task_manager.update_status(active_task_id, "running")
+            else:
+                task = await self.task_manager.get(active_task_id)
+                if task is not None and task.status.value == "blocked":
+                    await self.task_manager.update_status(active_task_id, "running")
         total_tokens = 0
         try:
             messages = await self._build_context(session_id, user_input)
@@ -264,6 +276,8 @@ class AgentLoop:
                 ):
                     if event.permission_request is not None:
                         request = event.permission_request
+                        if self.task_manager is not None and active_task_id:
+                            await self.task_manager.update_status(active_task_id, "blocked")
                         yield Message(
                             role="system",
                             content="permission_request",
@@ -311,6 +325,8 @@ class AgentLoop:
                             self.cost_tracker.add_tool_tokens(tool_msg.token_count)
                         # Long-task observability: record what this turn touched.
                         await self._record_task_activity(result, active_task_id)
+                        if result.name == "test_run" and self.task_manager is not None and active_task_id:
+                            await self.task_manager.update_status(active_task_id, "waiting_test")
                         if self.task_manager is not None and active_task_id:
                             await self.task_manager.record_trace(
                                 active_task_id,
