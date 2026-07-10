@@ -3,6 +3,8 @@ import hmac
 import json
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from khaos.channels import ChannelType, ContentType, WebhookHandler
 
@@ -26,6 +28,31 @@ async def test_slack_signature_and_file():
     result = await WebhookHandler(ChannelType.SLACK, secret, messages.append).handle({"X-Slack-Request-Timestamp": timestamp, "X-Slack-Signature": signature}, body)
     assert result["status"] == "ok"
     assert messages[0].attachments[0].file_name == "x.txt"
+
+
+@pytest.mark.asyncio
+async def test_discord_ed25519_signature():
+    private_key = Ed25519PrivateKey.generate()
+    public_key = private_key.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    timestamp = "123"
+    body = b'{"id":"interaction-1","data":{"content":"hello"}}'
+    signature = private_key.sign(timestamp.encode() + body).hex()
+    handler = WebhookHandler(ChannelType.DISCORD, public_key.hex())
+
+    accepted = await handler.handle(
+        {"x-signature-timestamp": timestamp, "x-signature-ed25519": signature},
+        body,
+    )
+    rejected = await handler.handle(
+        {"x-signature-timestamp": timestamp, "x-signature-ed25519": "00" * 64},
+        body,
+    )
+
+    assert accepted["status"] == "ok"
+    assert rejected["status"] == "signature_error"
 
 
 @pytest.mark.asyncio

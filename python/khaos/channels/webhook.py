@@ -7,9 +7,12 @@ import hmac
 import inspect
 import json
 import logging
-import re
+import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
+
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from khaos.channels.models import (
     ChannelType,
@@ -46,7 +49,13 @@ class WebhookHandler:
                 raw = json.loads(body)
             msg = self._parser()(raw)
             msg.channel = self.platform
-        except (json.JSONDecodeError, UnicodeDecodeError, TypeError, ValueError) as exc:
+        except (
+            json.JSONDecodeError,
+            UnicodeDecodeError,
+            TypeError,
+            ValueError,
+            ET.ParseError,
+        ) as exc:
             logger.warning("webhook parse failed for %s: %s", self.platform.value, exc)
             return {"status": "parse_error", "error": str(exc)}
         if self._on_message is not None:
@@ -71,10 +80,14 @@ class WebhookHandler:
         if self.platform == ChannelType.DISCORD:
             timestamp = headers.get("x-signature-timestamp", "")
             signature = headers.get("x-signature-ed25519", "")
-            expected = hmac.new(
-                self.secret.encode(), timestamp.encode() + body, hashlib.sha256
-            ).hexdigest()
-            return bool(timestamp and signature) and hmac.compare_digest(signature, expected)
+            if not timestamp or not signature:
+                return False
+            try:
+                public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.secret))
+                public_key.verify(bytes.fromhex(signature), timestamp.encode() + body)
+            except (ValueError, InvalidSignature):
+                return False
+            return True
         if self.platform == ChannelType.SLACK:
             timestamp = headers.get("x-slack-request-timestamp", "")
             signature = headers.get("x-slack-signature", "")
@@ -142,10 +155,12 @@ def _parse_slack(raw: dict[str, Any]) -> PlatformMessage:
 
 def _parse_wechat(raw: dict[str, Any] | str) -> PlatformMessage:
     if isinstance(raw, str):
-        def value(tag: str) -> str:
-            match = re.search(rf"<{tag}>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</{tag}>", raw, re.DOTALL)
-            return match.group(1) if match else ""
-        data = {key: value(key) for key in ("MsgId", "Content", "FromUserName", "ToUserName")}
+        root = ET.fromstring(raw)
+        data = {
+            element.tag.rsplit("}", 1)[-1]: element.text or ""
+            for element in root.iter()
+            if element is not root
+        }
     else:
         data = raw
     return PlatformMessage(id=str(data.get("MsgId", data.get("MsgID", ""))), channel=ChannelType.WECHAT, text=data.get("Content", data.get("content", data.get("text", ""))), sender=Sender(id=str(data.get("FromUserName", "")), platform_id=str(data.get("FromUserName", ""))), target=str(data.get("ToUserName", "")), raw_payload=data)
