@@ -57,6 +57,7 @@ ACTIVE_STATUSES = frozenset(
         TaskStatus.FIXING,
     }
 )
+TERMINAL_STATUSES = frozenset({TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED})
 
 
 @dataclass
@@ -114,6 +115,7 @@ class TaskManager:
         self._max_active = max_active
         self._lock = asyncio.Lock()
         self._db = db
+        self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
 
     async def load(self) -> None:
         """Restore tasks and mark interrupted in-flight work as blocked."""
@@ -171,6 +173,9 @@ class TaskManager:
             task = self._tasks.get(task_id)
             if task is None:
                 logger.warning("update_status: unknown task %s", task_id)
+                return
+            if task.status in TERMINAL_STATUSES and resolved not in TERMINAL_STATUSES:
+                logger.warning("refusing terminal task transition %s -> %s for %s", task.status.value, resolved.value, task_id)
                 return
             task.status = resolved
             for key, value in kwargs.items():
@@ -254,6 +259,23 @@ class TaskManager:
     async def _persist(self, task: CodingTask) -> None:
         if self._db is not None:
             await self._db.upsert_coding_task(task.to_dict(include_internal=True))
+        event = {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": len(task.trace) + 1, "type": f"task.{task.status.value}", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
+        for queue in self._subscribers.get(task.id, []):
+            queue.put_nowait(event)
+
+    async def subscribe(self, task_id: str):
+        """Yield an initial snapshot and subsequent state-change events."""
+        task = await self.get(task_id)
+        if task is None:
+            raise KeyError(task_id)
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._subscribers.setdefault(task_id, []).append(queue)
+        try:
+            yield {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": 0, "type": "task.snapshot", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
+            while True:
+                yield await queue.get()
+        finally:
+            self._subscribers[task_id].remove(queue)
 
     def _active_count(self) -> int:
         """Count in-flight tasks (callers hold ``self._lock``)."""

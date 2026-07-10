@@ -88,6 +88,7 @@ class AgentLoop:
         file_fingerprint_cache: "Optional[FileFingerprintCache]" = None,
         cost_tracker: "Optional[CostTracker]" = None,
         verify_fix_loop: "Optional[VerifyFixLoop]" = None,
+        verify_fix_factory=None,
         task_manager: "Optional[TaskManager]" = None,
         task_id: str | None = None,
         skill_generator=None,
@@ -118,6 +119,7 @@ class AgentLoop:
         # guidance message so the model diagnoses, fixes, and re-runs. Only
         # active in coding mode (office mode leaves this as None).
         self.verify_fix_loop = verify_fix_loop
+        self._verify_fix_factory = verify_fix_factory
         # Long-task tracking: record files viewed/modified and test outcomes.
         self.task_manager = task_manager
         self.task_id = task_id
@@ -141,6 +143,8 @@ class AgentLoop:
         """
         # A task_id passed to run() overrides the instance default for this turn.
         active_task_id = task_id or self.task_id
+        if self._verify_fix_factory is not None:
+            self.verify_fix_loop = self._verify_fix_factory()
         total_tokens = 0
         try:
             messages = await self._build_context(session_id, user_input)
@@ -361,8 +365,7 @@ class AgentLoop:
                 stop_reason = StopReason.MAX_TURNS.value
 
             if self.task_manager is not None and active_task_id:
-                await self.task_manager.update_status(active_task_id, "completed")
-                await self._analyze_task_skill(active_task_id)
+                await self._finalize_task(active_task_id, stop_reason)
 
             yield Message(
                 role="system",
@@ -383,9 +386,13 @@ class AgentLoop:
                         created_at=time.time(),
                     )
         except asyncio.CancelledError:
+            if self.task_manager is not None and active_task_id:
+                await self.task_manager.update_status(active_task_id, "cancelled", error="task cancelled")
             raise
         except Exception as exc:
             logger.error("Agent loop error: %s", exc, exc_info=True)
+            if self.task_manager is not None and active_task_id:
+                await self.task_manager.update_status(active_task_id, "failed", error=str(exc))
             if self.error_handler is not None:
                 error_event = await self.error_handler.handle(exc, session_id)
                 yield error_event.to_message()
@@ -427,6 +434,18 @@ class AgentLoop:
             task.status,
             skill_candidates=[candidate.__dict__ for candidate in candidates],
         )
+
+    async def _finalize_task(self, task_id: str, stop_reason: str | None) -> None:
+        """Apply terminal task semantics and run successful-task observation."""
+        from khaos.coding.task_manager import TaskStatus
+
+        if stop_reason == StopReason.MAX_TURNS.value:
+            await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="max_turns exhausted without completion")
+        elif self.verify_fix_loop is not None and self.verify_fix_loop.is_loop_exhausted():
+            await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="verify-fix loop exhausted, tests still failing")
+        else:
+            await self.task_manager.update_status(task_id, TaskStatus.COMPLETED)
+        await self._analyze_task_skill(task_id)
     async def _build_context(self, session_id: str, user_input: str = "") -> list[Message]:
         """Build the P0-A context from mode prompt and persisted messages.
 
