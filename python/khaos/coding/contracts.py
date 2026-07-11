@@ -10,6 +10,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Protocol, Sequence
 
+from khaos.coding.intelligence.models import ParseResult, ParseState
+
 
 @dataclass(frozen=True)
 class SourcePosition:
@@ -38,6 +40,19 @@ class LanguageAdapter(Protocol):
     extensions: frozenset[str]
 
     def parse(self, path: Path, content: bytes) -> ParsedFile: ...
+
+
+class IntelligenceAdapter(Protocol):
+    language: str
+    source_name: str
+    supports_incremental: bool
+    version: str
+
+    def availability(self) -> object: ...
+
+    def parse(
+        self, *, file_path: str, content: bytes, previous_state: ParseState | None = None
+    ) -> ParseResult: ...
 
 
 @dataclass(frozen=True)

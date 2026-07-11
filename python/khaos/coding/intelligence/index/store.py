@@ -68,9 +68,9 @@ class IndexStore:
         self._conn.execute("DELETE FROM code_symbols WHERE project_id=? AND path=?", (project_id, str(resolved)))
         self._conn.execute("DELETE FROM code_imports WHERE project_id=? AND path=?", (project_id, str(resolved)))
         self._conn.execute("DELETE FROM code_files WHERE project_id=? AND path=?", (project_id, str(resolved)))
-        self._conn.execute("INSERT INTO code_files VALUES (?, ?, ?, ?, ?, ?, ?)", (project_id, str(resolved), parsed.language, stat.st_size, stat.st_mtime_ns, digest, "legacy-v1"))
+        self._conn.execute("INSERT INTO code_files VALUES (?, ?, ?, ?, ?, ?, ?)", (project_id, str(resolved), parsed.language, stat.st_size, stat.st_mtime_ns, digest, parsed.parser_version))
         self._conn.executemany("INSERT INTO code_symbols VALUES (?, ?, ?, ?, ?, ?, ?)", [(project_id, str(resolved), str(item.get("name", "")), str(item.get("kind", "unknown")), int(item.get("line", 0)), item.get("signature"), "legacy") for item in parsed.symbols])
-        self._conn.executemany("INSERT INTO code_imports VALUES (?, ?, ?)", [(project_id, str(resolved), str(item)) for item in parsed.imports])
+        self._conn.executemany("INSERT INTO code_imports VALUES (?, ?, ?)", [(project_id, str(resolved), item.module) for item in parsed.imports])
         return True
 
     async def remove(self, project_id: str, path: Path) -> None:
