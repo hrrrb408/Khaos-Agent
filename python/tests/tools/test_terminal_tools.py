@@ -1,3 +1,4 @@
+from khaos.coding.execution import ExecutionService, HostExecutionBackend
 from khaos.tools.terminal_tools import (
     check_command_safety,
     enable_security,
@@ -6,6 +7,11 @@ from khaos.tools.terminal_tools import (
     process,
     terminal,
 )
+
+
+def _execution_service() -> ExecutionService:
+    """Minimal ExecutionService for read-only terminal tests (no workspace)."""
+    return ExecutionService(HostExecutionBackend())
 
 
 def test_evaluate_command_safety_read_only_pipeline():
@@ -34,7 +40,9 @@ def test_is_read_only_command():
 
 
 async def test_terminal_foreground_success(tmp_path):
-    result = await terminal("echo hello", cwd=str(tmp_path), timeout=5)
+    result = await terminal(
+        "echo hello", cwd=str(tmp_path), timeout=5, execution_service=_execution_service()
+    )
 
     assert result["returncode"] == 0
     assert result["stdout"] == "hello\n"
@@ -59,7 +67,9 @@ def test_check_command_safety_blocks_when_enabled():
 async def test_terminal_security_disabled_allows_command(tmp_path):
     enable_security(False)
     try:
-        result = await terminal("echo safe", cwd=str(tmp_path), timeout=5)
+        result = await terminal(
+            "echo safe", cwd=str(tmp_path), timeout=5, execution_service=_execution_service()
+        )
     finally:
         enable_security(True)
 
@@ -67,14 +77,22 @@ async def test_terminal_security_disabled_allows_command(tmp_path):
     assert result["stdout"] == "safe\n"
 
 
-async def test_terminal_background_wait_and_log(tmp_path):
-    started = await terminal("echo background", cwd=str(tmp_path), background=True)
+async def test_terminal_without_execution_service_fails_closed(tmp_path):
+    """Coding Agent reachable terminal() must fail closed without ExecutionService."""
+    result = await terminal("echo hello", cwd=str(tmp_path), timeout=5)
 
-    waited = await process("wait", started["id"], timeout=5)
-    logs = await process("log", started["id"])
+    assert result["ok"] is False
+    assert "ExecutionService unavailable" in result["error"]
+    assert result["risk_level"] == "blocked"
 
-    assert waited["returncode"] == 0
-    assert "background" in logs["stdout"]
+
+async def test_terminal_background_without_execution_service_fails_closed(tmp_path):
+    """Background terminal spawn must also fail closed without ExecutionService."""
+    result = await terminal("echo background", cwd=str(tmp_path), background=True)
+
+    assert result["ok"] is False
+    assert "ExecutionService unavailable" in result["error"]
+    assert result["risk_level"] == "blocked"
 
 
 async def test_process_poll_unknown_raises():

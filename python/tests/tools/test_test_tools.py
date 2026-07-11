@@ -1,6 +1,9 @@
 """Tests for the test_run feedback-loop tool and its output parsers."""
 
 import json
+import subprocess
+
+import pytest
 
 from khaos.tools import test_tools
 from khaos.tools.test_tools import (
@@ -11,6 +14,28 @@ from khaos.tools.test_tools import (
     _parse_jest,
     _parse_pytest,
 )
+
+
+async def _workspace_execution(tmp_path):
+    """Set up a git repo + workspace + ExecutionService for workspace-write tests."""
+    from khaos.coding.execution import ExecutionService, HostExecutionBackend
+    from khaos.coding.workspace.manager import WorkspaceManager
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    for cmd in (
+        ["git", "init", "-q"],
+        ["git", "config", "user.email", "t@t.com"],
+        ["git", "config", "user.name", "T"],
+    ):
+        subprocess.run(cmd, cwd=repo, check=True)
+    (repo / "file.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repo, "task")
+    execution = ExecutionService(HostExecutionBackend(), manager)
+    return execution, workspace
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +230,7 @@ def test_format_summary_parts():
 
 
 # ---------------------------------------------------------------------------
-# integration: real subprocess via a known command
+# integration: ExecutionService-backed execution via a known command
 # ---------------------------------------------------------------------------
 
 
@@ -216,13 +241,25 @@ async def test_test_run_empty_command_returns_error(tmp_path):
     assert "empty" in result["error"]
 
 
+async def test_test_run_without_execution_service_fails_closed(tmp_path):
+    """Coding Agent reachable test_run() must fail closed without ExecutionService."""
+    result = json.loads(await test_tools.test_run("echo hello", cwd=str(tmp_path)))
+
+    assert result["success"] is False
+    assert "ExecutionService unavailable" in result["error"]
+
+
 async def test_test_run_executes_real_command(tmp_path):
     # ``python3 -c`` doubles as a deterministic "test" that exits 0 with known
-    # stdout so we exercise the full subprocess path without a real runner.
+    # stdout so we exercise the full ExecutionService path without a real runner.
+    execution, workspace = await _workspace_execution(tmp_path)
     result = json.loads(
         await test_tools.test_run(
             "python3 -c \"print('3 passed in 0.1s')\"",
-            cwd=str(tmp_path),
+            cwd=str(workspace.worktree_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id=workspace.id,
         )
     )
 
@@ -232,9 +269,14 @@ async def test_test_run_executes_real_command(tmp_path):
 
 
 async def test_test_run_unknown_command_reports_failure(tmp_path):
+    execution, workspace = await _workspace_execution(tmp_path)
     result = json.loads(
         await test_tools.test_run(
-            "definitely-not-a-real-binary-xyz", cwd=str(tmp_path)
+            "definitely-not-a-real-binary-xyz",
+            cwd=str(workspace.worktree_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id=workspace.id,
         )
     )
 
@@ -245,10 +287,14 @@ async def test_test_run_unknown_command_reports_failure(tmp_path):
 async def test_test_run_timeout(monkeypatch, tmp_path):
     # Force a tiny timeout so the hung process branch is exercised.
     monkeypatch.setattr(test_tools, "TEST_RUN_TIMEOUT", 0)
+    execution, workspace = await _workspace_execution(tmp_path)
     result = json.loads(
         await test_tools.test_run(
             "python3 -c \"import time; time.sleep(5)\"",
-            cwd=str(tmp_path),
+            cwd=str(workspace.worktree_path),
+            execution_service=execution,
+            task_id="task",
+            workspace_id=workspace.id,
         )
     )
 

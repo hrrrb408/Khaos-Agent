@@ -7,7 +7,6 @@ agent loop can reason about when fixing failing tests.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -16,25 +15,41 @@ import shlex
 from pathlib import Path
 from typing import Any
 
-from khaos.tools.terminal_tools import _build_safe_env, _isolated_command
-
 logger = logging.getLogger(__name__)
 
 # Hard cap for any single test invocation.
 TEST_RUN_TIMEOUT: int = 120
 
 
-async def test_run(command: str, cwd: str) -> str:
+async def test_run(
+    command: str,
+    cwd: str,
+    execution_service=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
+) -> str:
     """Run a test command and return a structured JSON summary.
 
+    Coding Agent reachable handler: fail closed when ExecutionService is
+    missing. Direct subprocess fallback is removed — no OS-sandbox auto-fallback.
+
     The command is split with :mod:`shlex` and executed via
-    :func:`asyncio.create_subprocess_exec` so no shell is spawned. ``stdout``
-    and ``stderr`` are merged, captured, and parsed by the runner-specific
-    parser best matching ``command``.
+    :class:`ExecutionService` so no shell is spawned. ``stdout`` and ``stderr``
+    are merged, captured, and parsed by the runner-specific parser best matching
+    ``command``.
     """
     if not command or not command.strip():
         return json.dumps(
             {"success": False, "error": "command must not be empty"},
+            ensure_ascii=False,
+        )
+
+    if execution_service is None:
+        return json.dumps(
+            {
+                "success": False,
+                "error": "ExecutionService unavailable: Coding mode requires sandboxed execution; direct subprocess fallback is disabled",
+            },
             ensure_ascii=False,
         )
 
@@ -47,16 +62,18 @@ async def test_run(command: str, cwd: str) -> str:
             ensure_ascii=False,
         )
 
+    from khaos.coding.execution import ExecutionRequest, ResourceBudget
+
     try:
-        isolated = _isolated_command(shlex.join(parts), workdir)
-        if isolated is None:
-            return json.dumps({"success": False, "error": "OS sandbox unavailable"})
-        process = await asyncio.create_subprocess_exec(
-            *isolated,
-            cwd=workdir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            env=_build_safe_env(),
+        result = await execution_service.execute(
+            ExecutionRequest(
+                tuple(parts),
+                Path(workdir),
+                budget=ResourceBudget(timeout_seconds=TEST_RUN_TIMEOUT),
+                task_id=task_id,
+                workspace_id=workspace_id,
+                access_mode="workspace-write",
+            )
         )
     except FileNotFoundError as exc:
         logger.warning("test command not found: %s", parts[0] if parts else "")
@@ -73,16 +90,7 @@ async def test_run(command: str, cwd: str) -> str:
             ensure_ascii=False,
         )
 
-    try:
-        stdout_data, _ = await asyncio.wait_for(
-            process.communicate(), timeout=TEST_RUN_TIMEOUT
-        )
-    except asyncio.TimeoutError:
-        try:
-            process.kill()
-        except ProcessLookupError:
-            pass
-        await process.wait()
+    if result.status == "timed-out":
         return json.dumps(
             {
                 "success": False,
@@ -96,8 +104,8 @@ async def test_run(command: str, cwd: str) -> str:
             ensure_ascii=False,
         )
 
-    output = stdout_data.decode("utf-8", errors="replace")
-    exit_code = int(process.returncode or 0)
+    output = f"{result.stdout}{result.stderr}"
+    exit_code = int(result.return_code or 0)
     if exit_code == 127:
         return json.dumps(
             {
@@ -111,15 +119,15 @@ async def test_run(command: str, cwd: str) -> str:
             },
             ensure_ascii=False,
         )
-    result = _parse_result(command, output, exit_code)
+    parsed = _parse_result(command, output, exit_code)
     logger.info(
         "test_run parsed: passed=%d failed=%d errors=%d exit=%d",
-        result["passed"],
-        result["failed"],
-        result["errors"],
+        parsed["passed"],
+        parsed["failed"],
+        parsed["errors"],
         exit_code,
     )
-    return json.dumps(result, ensure_ascii=False)
+    return json.dumps(parsed, ensure_ascii=False)
 
 
 def _parse_result(command: str, output: str, exit_code: int) -> dict[str, Any]:

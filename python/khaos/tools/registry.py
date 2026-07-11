@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from khaos.exceptions import ToolNotFoundError
+from dataclasses import field
+
+
+@dataclass(frozen=True)
+class ToolCapability:
+    name: str
+    modes: frozenset[str]
+    scopes: frozenset[str]
 
 
 @dataclass
@@ -20,18 +28,23 @@ class ToolDefinition:
     parallel: bool
     timeout: int = 60
     handler: Callable[..., Awaitable[Any]] | None = None
+    capabilities: tuple[ToolCapability, ...] = ()
 
 
 class ToolRegistry:
     """Runtime registry for declared tools."""
 
-    def __init__(self):
+    def __init__(self, enforce_capabilities: bool = False):
         self._tools: dict[str, ToolDefinition] = {}
+        self.enforce_capabilities = enforce_capabilities
 
     def register(self, definition: ToolDefinition) -> None:
         """Register a tool definition."""
         if definition.name in self._tools:
             raise ValueError(f"tool already registered: {definition.name}")
+        if self.enforce_capabilities and not definition.capabilities:
+            capability = _infer_capability(definition)
+            definition.capabilities = (capability,) if capability is not None else ()
         self._tools[definition.name] = definition
 
     def get(self, name: str) -> ToolDefinition:
@@ -66,6 +79,83 @@ class ToolRegistry:
         schema = self.get(name).parameters
         return self._validate_schema_value(schema, params)
 
+    def capabilities_for(self, name: str) -> tuple[ToolCapability, ...]:
+        return self.get(name).capabilities
+
+    def _validate_schema_value(self, schema: dict, value: Any) -> bool:
+        expected = schema.get("type")
+        if "enum" in schema and value not in schema["enum"]:
+            return False
+        if expected == "string":
+            return isinstance(value, str)
+        if expected == "integer":
+            return isinstance(value, int)
+        if expected == "boolean":
+            return isinstance(value, bool)
+        if expected == "object":
+            if not isinstance(value, dict):
+                return False
+            if any(required not in value for required in schema.get("required", [])):
+                return False
+            properties = schema.get("properties", {})
+            return all(key not in properties or self._validate_schema_value(properties[key], item) for key, item in value.items())
+        if expected == "array":
+            items = schema.get("items")
+            return isinstance(value, list) and (items is None or all(self._validate_schema_value(items, item) for item in value))
+        return True
+
+
+class ToolInvocationBroker:
+    """Uniform capability gate before any public tool handler is invoked."""
+
+    def __init__(self, registry: ToolRegistry) -> None:
+        self.registry = registry
+
+    async def invoke(self, name: str, *, mode: str, context: dict[str, Any], **params: Any) -> Any:
+        definition = self.registry.get(name)
+        capabilities = definition.capabilities
+        if not capabilities and self.registry.enforce_capabilities:
+            raise PermissionError(f"tool {name} has no declared capability")
+        for capability in capabilities:
+            if mode not in capability.modes and "all" not in capability.modes:
+                raise PermissionError(f"tool {name} is unavailable in mode {mode}")
+            if capability.name == "process.execute":
+                service = context.get("execution_service")
+                if service is None:
+                    raise PermissionError("process.execute requires ExecutionService")
+            if capability.name == "filesystem.write" and mode == "coding":
+                if context.get("workspace_id") is None or context.get("task_id") is None:
+                    raise PermissionError("filesystem.write requires active TaskWorkspace")
+            if capability.name == "network.access" and context.get("network_policy") != "unrestricted-with-approval":
+                raise PermissionError("network.access requires server-authorized network policy")
+            if capability.name == "host.integration" and mode == "coding":
+                raise PermissionError("host integration is unavailable to Coding Agent")
+        if definition.handler is None:
+            raise ToolNotFoundError(f"tool handler not configured: {name}")
+        handler_params = dict(params)
+        if any(capability.name == "process.execute" for capability in capabilities):
+            handler_params["execution_service"] = context.get("execution_service")
+            handler_params["task_id"] = context.get("task_id")
+            handler_params["workspace_id"] = context.get("workspace_id")
+        if any(capability.name.startswith("vcs.") for capability in capabilities):
+            handler_params["execution_service"] = context.get("execution_service")
+            handler_params["task_id"] = context.get("task_id")
+            handler_params["workspace_id"] = context.get("workspace_id")
+            handler_params["approval_context"] = context.get("approval_context")
+            handler_params["network_policy"] = context.get("network_policy", "none")
+            if name == "git_push":
+                handler_params["credential_context"] = context.get("credential_context")
+        if any(capability.name == "network.access" for capability in capabilities):
+            handler_params["network_policy"] = context.get("network_policy", "none")
+            handler_params["credential_context"] = context.get("credential_context")
+        if any(capability.name in {"remote.write", "remote.destructive-write"} for capability in capabilities):
+            handler_params["approval_context"] = context.get("approval_context")
+        if mode == "coding" and any(capability.name == "filesystem.write" for capability in capabilities):
+            handler_params["workspace_manager"] = context.get("workspace_manager")
+            handler_params["task_id"] = context.get("task_id")
+            handler_params["workspace_id"] = context.get("workspace_id")
+        return await definition.handler(**handler_params)
+
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:
         expected = schema.get("type")
         if "enum" in schema and value not in schema["enum"]:
@@ -95,6 +185,21 @@ class ToolRegistry:
                 return True
             return all(self._validate_schema_value(item_schema, item) for item in value)
         return True
+
+
+def _infer_capability(definition: ToolDefinition) -> ToolCapability | None:
+    name = definition.name
+    if name in {"terminal", "test_run", "sandbox_exec"} or name in {"process"}:
+        return ToolCapability("process.execute", frozenset(definition.modes), frozenset({"task-workspace"}))
+    if name in {"write_file", "multi_edit", "patch", "file_patch", "mkdir", "delete_file", "copy_file", "move_file"}:
+        return ToolCapability("filesystem.write", frozenset(definition.modes), frozenset({"task-workspace"}))
+    if name.startswith("git_"):
+        return ToolCapability("vcs.write" if definition.permission_level == "write" else "vcs.read", frozenset(definition.modes), frozenset({"task-workspace"}))
+    if name.startswith("github_"):
+        return ToolCapability("network.access", frozenset(definition.modes), frozenset({"user-selected"}))
+    if definition.permission_level == "read":
+        return ToolCapability("filesystem.read", frozenset(definition.modes), frozenset({"task-workspace", "app-data", "user-selected"}))
+    return ToolCapability("host.integration", frozenset(definition.modes), frozenset({"app-data", "user-selected"}))
 
 
 # Hermes batch 5: declarative specs for cron + history tools. Defined here
@@ -189,14 +294,26 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     from khaos.tools.github_tools import GITHUB_TOOL_SPECS
 
     for spec in [*CHANNEL_TOOLS, *GITHUB_TOOL_SPECS]:
+        classification = spec.get("classification")
+        capabilities: tuple[ToolCapability, ...] = ()
+        modes = ["all"]
+        if classification is not None:
+            modes = ["coding"]
+            capabilities = (
+                ToolCapability("process.execute", frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability(classification, frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability("network.access", frozenset({"coding"}), frozenset({"user-selected"})),
+                ToolCapability("credential.access", frozenset({"coding"}), frozenset({"temporary"})),
+            )
         registry.register(
             ToolDefinition(
                 name=spec["name"],
                 description=spec["description"],
                 parameters=spec["parameters"],
-                modes=["all"],
+                modes=modes,
                 permission_level="write" if spec["name"] in {"channel_enable", "channel_disable", "github_create_pr", "github_comment_issue", "github_request_review"} else "read",
                 parallel=spec["name"] in {"channel_list", "channel_health", "github_read_issue"},
+                capabilities=capabilities,
             )
         )
     registry.register(
@@ -641,6 +758,10 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["coding"],
             permission_level="execute",
             parallel=False,
+            capabilities=(
+                ToolCapability("process.execute", frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability("filesystem.write", frozenset({"coding"}), frozenset({"task-workspace"})),
+            ),
         )
     )
     registry.register(
@@ -657,9 +778,12 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 },
                 "required": ["dockerfile"],
             },
-            modes=["coding"],
+            modes=["internal"],
             permission_level="execute",
             parallel=False,
+            capabilities=(
+                ToolCapability("host.integration", frozenset({"internal"}), frozenset({"host-system"})),
+            ),
         )
     )
     registry.register(
@@ -863,6 +987,12 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["coding"],
             permission_level="write",
             parallel=False,
+            capabilities=(
+                ToolCapability("process.execute", frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability("vcs.remote-write", frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability("network.access", frozenset({"coding"}), frozenset({"user-selected"})),
+                ToolCapability("credential.access", frozenset({"coding"}), frozenset({"temporary"})),
+            ),
         )
     )
     registry.register(
@@ -1392,7 +1522,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
 
 def create_builtin_registry() -> ToolRegistry:
     """Create a registry with the Phase 1 built-in declarations."""
-    registry = ToolRegistry()
+    registry = ToolRegistry(enforce_capabilities=True)
     register_builtin_tools(registry)
     return registry
 

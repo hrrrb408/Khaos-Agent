@@ -1,0 +1,21 @@
+name: Docker Security E2E
+
+on:
+  pull_request:
+  push:
+    branches: [feature/coding-runtime-alignment]
+
+jobs:
+  docker-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Preload allowlisted image
+        run: docker pull python:3.13-slim
+      - name: Run real Docker isolation E2E
+        run: python -m pytest python/tests/tools/test_sandbox_tools.py -q -k real_docker_workspace_isolation_e2e

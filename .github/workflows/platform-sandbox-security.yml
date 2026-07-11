@@ -1,0 +1,117 @@
+name: Platform Sandbox Security E2E
+
+on:
+  pull_request:
+  push:
+    branches: [feature/coding-runtime-alignment]
+
+jobs:
+  linux-bwrap-security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install bubblewrap
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bubblewrap
+          bwrap --version
+      - name: Enable unprivileged user namespaces (if restricted by AppArmor)
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Ensure bwrap is setuid root
+        run: sudo chmod 4755 /usr/bin/bwrap
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Capture pre-test diagnostics
+        run: |
+          set +e
+          mkdir -p diagnostics
+          {
+            echo "=== uname ==="
+            uname -a
+            echo "=== bwrap version ==="
+            bwrap --version
+            echo "=== bwrap permissions ==="
+            ls -l /usr/bin/bwrap
+            echo "=== sysctl userns ==="
+            sysctl kernel.unprivileged_userns_clone 2>&1
+            sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1
+            echo "=== TMPDIR ==="
+            echo "TMPDIR=$TMPDIR"
+            python3 -c "import tempfile; print('gettempdir:', tempfile.gettempdir())"
+            echo "=== bwrap isolation probe (argv_prefix topology) ==="
+            tmpdir=$(mktemp -d)
+            bwrap --ro-bind / / --dev /dev --tmpfs /tmp --bind "$tmpdir" /tmp/workspace --unshare-net --unshare-pid --chdir /tmp/workspace -- /bin/sh -c 'echo probe > .probe && cat .probe' 2>&1
+            echo "probe exit: $?"
+            rm -rf "$tmpdir"
+          } > diagnostics/linux-bwrap-pre.txt
+          exit 0
+      - name: Run real bwrap isolation E2E
+        env:
+          KHAOS_REQUIRE_PLATFORM_SANDBOX: "1"
+        run: python -m pytest python/tests/coding/test_platform_backends.py -q -k real_bwrap -v
+      - name: Capture post-test diagnostics
+        if: always()
+        run: |
+          set +e
+          {
+            echo "=== residual bwrap processes ==="
+            pgrep -af bwrap 2>&1
+            echo "=== residual sleep processes ==="
+            pgrep -af "sleep 30" 2>&1
+            echo "=== done ==="
+          } > diagnostics/linux-bwrap-post.txt
+          exit 0
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-bwrap-diagnostics
+          path: diagnostics/
+
+  macos-sandbox-security:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Capture pre-test diagnostics
+        run: |
+          set +e
+          mkdir -p diagnostics
+          {
+            echo "=== uname ==="
+            uname -a
+            echo "=== sandbox-exec ==="
+            which sandbox-exec
+            sandbox-exec --version 2>&1
+          } > diagnostics/macos-sandbox-pre.txt
+          exit 0
+      - name: Run real sandbox-exec isolation E2E
+        env:
+          KHAOS_REQUIRE_PLATFORM_SANDBOX: "1"
+        run: python -m pytest python/tests/coding/test_platform_backends.py -q -k real_macos -v
+      - name: Capture post-test diagnostics
+        if: always()
+        run: |
+          set +e
+          {
+            echo "=== residual sandbox-exec processes ==="
+            pgrep -af sandbox-exec 2>&1
+            echo "=== done ==="
+          } > diagnostics/macos-sandbox-post.txt
+          exit 0
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-sandbox-diagnostics
+          path: diagnostics/

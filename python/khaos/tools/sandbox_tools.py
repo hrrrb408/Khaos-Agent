@@ -1,91 +1,16 @@
-"""Docker sandbox tools for isolated command execution."""
+"""Agent-facing Docker sandbox tools routed through ExecutionService."""
 
 from __future__ import annotations
 
-import asyncio
+import re
 import shlex
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-
-@dataclass
-class SandboxConfig:
-    """Sandbox resource and isolation configuration."""
-
-    image: str = "python:3.13-slim"
-    project_dir: str = "."
-    network: bool = False
-    cpus: float = 1.0
-    memory: str = "512m"
-    timeout: int = 30
+from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy, ResourceBudget
 
 
-class DockerSandboxClient:
-    """Small async wrapper around the Docker CLI."""
-
-    async def create(self, config: SandboxConfig) -> str:
-        """Create a stopped container and return its id."""
-        project_dir = str(Path(config.project_dir).expanduser().resolve())
-        command = [
-            "docker",
-            "create",
-            "--rm",
-            "--network",
-            "none" if not config.network else "bridge",
-            "--cpus",
-            str(config.cpus),
-            "--memory",
-            config.memory,
-            "-v",
-            f"{project_dir}:/workspace:rw",
-            "-w",
-            "/workspace",
-            config.image,
-            "sleep",
-            "3600",
-        ]
-        result = await _run_exec(command, timeout=config.timeout)
-        if result["returncode"] != 0:
-            raise RuntimeError(result["stderr"] or result["stdout"])
-        return result["stdout"].strip()
-
-    async def start(self, container_id: str, timeout: int) -> None:
-        result = await _run_exec(["docker", "start", container_id], timeout=timeout)
-        if result["returncode"] != 0:
-            raise RuntimeError(result["stderr"] or result["stdout"])
-
-    async def exec(self, container_id: str, command: str, timeout: int) -> dict[str, Any]:
-        return await _run_exec(
-            ["docker", "exec", container_id, "sh", "-lc", command],
-            timeout=timeout,
-        )
-
-    async def stop(self, container_id: str, timeout: int) -> None:
-        await _run_exec(["docker", "stop", container_id], timeout=timeout)
-
-    async def remove(self, container_id: str, timeout: int) -> None:
-        await _run_exec(["docker", "rm", "-f", container_id], timeout=timeout)
-
-    async def build(
-        self,
-        dockerfile: str,
-        context: str,
-        tag: str,
-        timeout: int,
-    ) -> dict[str, Any]:
-        return await _run_exec(
-            [
-                "docker",
-                "build",
-                "-f",
-                str(Path(dockerfile).expanduser().resolve()),
-                "-t",
-                tag,
-                str(Path(context).expanduser().resolve()),
-            ],
-            timeout=timeout,
-        )
+_MEMORY_PATTERN = re.compile(r"^(\d+)([kKmMgG])$")
 
 
 async def sandbox_exec(
@@ -96,31 +21,60 @@ async def sandbox_exec(
     cpus: float = 1.0,
     memory: str = "512m",
     timeout: int = 30,
-    client: DockerSandboxClient | None = None,
+    client: Any = None,
+    execution_service=None,
+    workspace_manager=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    """Create a Docker sandbox, execute a command, then destroy it."""
-    _validate_command(command)
-    config = SandboxConfig(image, project_dir, network, cpus, memory, timeout)
-    docker = client or DockerSandboxClient()
-    container_id = ""
-    try:
-        container_id = await docker.create(config)
-        await docker.start(container_id, timeout)
-        result = await docker.exec(container_id, command, timeout)
-        return {
-            "container_id": container_id,
-            "command": command,
-            "network": network,
-            "returncode": result["returncode"],
-            "stdout": result["stdout"],
-            "stderr": result["stderr"],
-        }
-    finally:
-        if container_id:
-            try:
-                await docker.stop(container_id, timeout)
-            finally:
-                await docker.remove(container_id, timeout)
+    """Execute fixed argv inside the active TaskWorkspace Docker sandbox."""
+    argv = tuple(shlex.split(command))
+    if not argv:
+        raise ValueError("command must not be empty")
+    if client is not None:
+        raise PermissionError("direct Docker clients are unavailable to Agent tools")
+    if execution_service is None or not task_id or not workspace_id:
+        raise PermissionError("sandbox_exec requires an active TaskWorkspace")
+    workspace = execution_service.workspace_manager.get(workspace_id)
+    if workspace is None or workspace.task_id != task_id:
+        raise PermissionError("task/workspace binding is invalid")
+    root = workspace.worktree_path.expanduser().resolve()
+    if project_dir not in {"", "."} and Path(project_dir).expanduser().resolve() != root:
+        raise PermissionError("project_dir must match the active TaskWorkspace")
+    if network:
+        raise PermissionError("unsupported: sandbox_exec network access is disabled")
+    if not 0.1 <= cpus <= 8.0:
+        raise ValueError("cpus must be between 0.1 and 8.0")
+    if not 1 <= timeout <= 3600:
+        raise ValueError("timeout must be between 1 and 3600 seconds")
+    memory_bytes = _parse_memory(memory)
+    request = ExecutionRequest(
+        argv=argv,
+        cwd=root,
+        environment={"KHAOS_DOCKER_IMAGE": image},
+        allowed_environment_keys=frozenset({"KHAOS_DOCKER_IMAGE"}),
+        network_policy=NetworkPolicy.NONE,
+        budget=ResourceBudget(
+            timeout_seconds=float(timeout), output_bytes=65536, pids=256,
+            cpu_count=cpus, memory_bytes=memory_bytes, tmpfs_bytes=256 * 1024 * 1024,
+        ),
+        task_id=task_id,
+        workspace_id=workspace_id,
+        access_mode="workspace-write",
+        backend_hint="docker",
+    )
+    result = await execution_service.execute(request)
+    return {
+        "container_id": str(result.diagnostics.get("container_id", "")),
+        "command": command,
+        "network": False,
+        "returncode": result.return_code if result.return_code is not None else -1,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "backend": "docker",
+        "workspace_id": workspace_id,
+        "cleanup": result.diagnostics.get("cleanup", "unknown"),
+    }
 
 
 async def sandbox_build(
@@ -128,40 +82,35 @@ async def sandbox_build(
     context: str = ".",
     tag: str = "khaos-sandbox:latest",
     timeout: int = 120,
-    client: DockerSandboxClient | None = None,
+    client: Any = None,
 ) -> dict[str, Any]:
-    """Build a Docker image for sandbox use."""
-    docker = client or DockerSandboxClient()
-    result = await docker.build(dockerfile, context, tag, timeout)
+    """Reject Agent-triggered image builds; images are administrator-managed."""
     return {
         "tag": tag,
-        "returncode": result["returncode"],
-        "stdout": result["stdout"],
-        "stderr": result["stderr"],
+        "returncode": -1,
+        "stdout": "",
+        "stderr": "unsupported: sandbox image builds are internal maintenance operations",
     }
 
 
-async def _run_exec(args: list[str], timeout: int) -> dict[str, Any]:
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-    except asyncio.TimeoutError as exc:
-        process.kill()
-        await process.wait()
-        raise TimeoutError(f"docker command timed out after {timeout}s") from exc
-    return {
-        "args": args,
-        "returncode": int(process.returncode or 0),
-        "stdout": stdout.decode("utf-8", errors="replace"),
-        "stderr": stderr.decode("utf-8", errors="replace"),
-    }
+def _parse_memory(value: str) -> int:
+    match = _MEMORY_PATTERN.fullmatch(value)
+    if match is None:
+        raise ValueError("memory must use k, m, or g units")
+    amount = int(match.group(1))
+    multiplier = {"k": 1024, "m": 1024**2, "g": 1024**3}[match.group(2).lower()]
+    result = amount * multiplier
+    if not 64 * 1024**2 <= result <= 16 * 1024**3:
+        raise ValueError("memory must be between 64m and 16g")
+    return result
 
 
-def _validate_command(command: str) -> None:
-    if not shlex.split(command):
-        raise ValueError("command must not be empty")
-
+def validate_task_workspace(workspace_path: str | Path, repository_root: str | Path) -> Path:
+    """Compatibility helper for internal mount validation; handlers use WorkspaceManager."""
+    workspace = Path(workspace_path).expanduser().resolve()
+    repository = Path(repository_root).expanduser().resolve()
+    if workspace == repository:
+        raise PermissionError("Docker sandbox cannot mount the main repository")
+    if not (workspace / ".git").is_file():
+        raise PermissionError("Docker sandbox requires an active Git Worktree")
+    return workspace

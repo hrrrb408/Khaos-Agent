@@ -6,9 +6,6 @@ import asyncio
 import os
 import shlex
 import signal
-import shutil
-import sys
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -128,8 +125,15 @@ async def terminal(
     cwd: str = ".",
     background: bool = False,
     timeout: int = 30,
+    execution_service=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
-    """Run a terminal command in the foreground or background."""
+    """Run a terminal command via ExecutionService.
+
+    Coding Agent reachable handler: fail closed when ExecutionService is
+    missing. Direct subprocess fallback is removed — no OS-sandbox auto-fallback.
+    """
     command_check = check_command_safety(command)
     if not command_check["safe"]:
         return {
@@ -144,66 +148,19 @@ async def terminal(
             "error": f"Command blocked: {safety['reason']}",
             "risk_level": "dangerous",
         }
-    workdir = str(Path(cwd).expanduser().resolve())
-    executable = _isolated_command(command, workdir)
-    if executable is None:
-        return {"ok": False, "error": "OS sandbox unavailable", "risk_level": "blocked"}
-    if background:
-        proc = await asyncio.create_subprocess_exec(
-            *executable,
-            cwd=workdir,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_build_safe_env(),
-        )
-        process_id = str(uuid.uuid4())
-        managed = ManagedProcess(process_id, command, proc)
-        managed._collector = asyncio.create_task(_collect_output(managed))
-        _PROCESSES[process_id] = managed
+    if execution_service is None:
         return {
-            "id": process_id,
-            "command": command,
-            "pid": proc.pid,
-            "running": True,
-            "safety": safety,
+            "ok": False,
+            "error": "ExecutionService unavailable: Coding mode requires sandboxed execution; direct subprocess fallback is disabled",
+            "risk_level": "blocked",
         }
-
-    proc = await asyncio.create_subprocess_exec(
-        *executable,
-        cwd=workdir,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=_build_safe_env(),
+    workdir = str(Path(cwd).expanduser().resolve())
+    parts = shlex.split(command)
+    from khaos.coding.execution import ExecutionRequest, ResourceBudget
+    result = await execution_service.execute(
+        ExecutionRequest(tuple(parts), Path(workdir), budget=ResourceBudget(timeout_seconds=timeout), task_id=task_id, workspace_id=workspace_id, access_mode="read-only" if safety["read_only"] else "workspace-write")
     )
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError as exc:
-        proc.kill()
-        await proc.wait()
-        raise TimeoutError(f"command timed out after {timeout}s") from exc
-    return {
-        "command": command,
-        "returncode": proc.returncode,
-        "stdout": stdout.decode("utf-8", errors="replace"),
-        "stderr": stderr.decode("utf-8", errors="replace"),
-        "safety": safety,
-    }
-
-
-def _isolated_command(command: str, workdir: str) -> list[str] | None:
-    """Wrap a shell command in the host OS sandbox."""
-    if os.environ.get("CODEX_SANDBOX"):
-        # The parent process is already constrained by an OS sandbox; nested
-        # sandbox-exec is rejected by macOS with EPERM, but child processes
-        # inherit the existing profile.
-        return ["/bin/sh", "-lc", command]
-    if sys.platform == "darwin" and shutil.which("sandbox-exec"):
-        escaped = workdir.replace('"', '\\"')
-        profile = f'(version 1)(deny default)(allow process*)(allow sysctl-read)(allow file-read*)(allow file-write* (subpath "{escaped}"))(allow file-write* (subpath "/tmp"))(allow network-outbound)'
-        return ["sandbox-exec", "-p", profile, "/bin/sh", "-lc", command]
-    if sys.platform.startswith("linux") and shutil.which("bwrap"):
-        return ["bwrap", "--ro-bind", "/", "/", "--bind", workdir, workdir, "--tmpfs", "/tmp", "--unshare-all", "--share-net", "/bin/sh", "-lc", command]
-    return None
+    return {"command": command, "returncode": result.return_code, "stdout": result.stdout, "stderr": result.stderr, "status": result.status, "safety": safety}
 
 
 def check_command_safety(command: str) -> dict[str, Any]:

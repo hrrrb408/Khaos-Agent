@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
 from khaos.security.middleware import SecurityMiddleware
-from khaos.tools.registry import ToolRegistry
+from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 
 
 ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
@@ -91,6 +91,7 @@ class ToolScheduler:
         # output formatting (line numbers, truncation) is unchanged. Writes and
         # any tool without a Rust fast path keep using the asyncio handler.
         self.use_rust_executor = use_rust_executor
+        self.invocation_broker = ToolInvocationBroker(registry)
 
     async def execute_batch(
         self,
@@ -98,10 +99,11 @@ class ToolScheduler:
         mode: str,
         session_id: str | None = None,
         confirm_callback: ConfirmCallback | None = None,
+        tool_context: dict[str, Any] | None = None,
     ) -> list[ToolResult]:
         """Execute a batch and return final tool results."""
         results: list[ToolResult] = []
-        async for event in self.stream_batch(tool_calls, mode, session_id, confirm_callback):
+        async for event in self.stream_batch(tool_calls, mode, session_id, confirm_callback, tool_context):
             if event.result is not None:
                 results.append(event.result)
         return results
@@ -112,10 +114,18 @@ class ToolScheduler:
         mode: str,
         session_id: str | None = None,
         confirm_callback: ConfirmCallback | None = None,
+        tool_context: dict[str, Any] | None = None,
     ):
         """Execute a batch while yielding permission and result events."""
         if self.budget.is_exhausted:
             return
+        tool_context = dict(tool_context or {})
+        network_guard = getattr(self.security_middleware, "network_guard", None)
+        tool_context["network_policy"] = (
+            "unrestricted-with-approval"
+            if network_guard is not None and network_guard.network_enabled
+            else "none"
+        )
 
         approved_calls: list[dict] = []
         for call in tool_calls:
@@ -160,18 +170,73 @@ class ToolScheduler:
                 )
                 continue
 
-            if decision.requires_user_confirm:
+            destructive_context = None
+            if mode == "coding":
+                from khaos.tools.git_tools import (
+                    prepare_destructive_git_approval,
+                    prepare_remote_git_approval,
+                )
+
+                try:
+                    destructive_context = await prepare_destructive_git_approval(
+                        tool.name,
+                        normalized["arguments"],
+                        tool_context or {},
+                        requester=session_id or "",
+                        approval_id=normalized["id"],
+                    )
+                    if destructive_context is None:
+                        destructive_context = await prepare_remote_git_approval(
+                            tool.name,
+                            normalized["arguments"],
+                            tool_context,
+                            requester=session_id or "",
+                            approval_id=normalized["id"],
+                        )
+                    if destructive_context is None:
+                        from khaos.tools.github_tools import prepare_github_approval
+
+                        destructive_context = await prepare_github_approval(
+                            tool.name,
+                            normalized["arguments"],
+                            tool_context,
+                            requester=session_id or "",
+                            approval_id=normalized["id"],
+                        )
+                except (PermissionError, ValueError) as exc:
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=normalized["id"],
+                            name=tool.name,
+                            success=False,
+                            error=str(exc),
+                            arguments=normalized["arguments"],
+                        ),
+                    )
+                    continue
+
+            if decision.requires_user_confirm or destructive_context is not None:
+                approval_target = decision.target
+                if destructive_context is not None:
+                    binding = destructive_context["binding"]
+                    approval_target = (
+                        f"{binding['operation']}:{binding['target']} "
+                        f"head={binding['head']} diff={binding['diff_hash']}"
+                    )
                 request = PermissionRequest(
                     tool_call_id=normalized["id"],
                     name=tool.name,
                     arguments=normalized["arguments"],
                     level=tool.permission_level,
-                    target=decision.target,
+                    target=approval_target,
                     reason=decision.reason,
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
                 if not confirmation.get("approved", False):
+                    if destructive_context is not None:
+                        await destructive_context["approval_broker"].cancel_operation(normalized["id"])
                     await self.permission_engine.audit(
                         tool.name,
                         decision.target,
@@ -190,6 +255,23 @@ class ToolScheduler:
                         ),
                     )
                     continue
+                if destructive_context is not None:
+                    approved = await destructive_context["approval_broker"].approve_operation(
+                        normalized["id"], session_id or ""
+                    )
+                    if not approved:
+                        yield SchedulerEvent(
+                            event="tool_result",
+                            result=ToolResult(
+                                tool_call_id=normalized["id"],
+                                name=tool.name,
+                                success=False,
+                                error="Destructive Git approval is stale or invalid",
+                                arguments=normalized["arguments"],
+                            ),
+                        )
+                        continue
+                    normalized["_approval_context"] = destructive_context
                 if confirmation.get("remember"):
                     await self.permission_engine.grant_rule(
                         PermissionRule(
@@ -204,7 +286,7 @@ class ToolScheduler:
 
         parallel_calls, serial_calls = self.registry.get_parallel_tools(approved_calls)
         if parallel_calls:
-            tasks = [self._execute_one(call, session_id) for call in parallel_calls]
+            tasks = [self._execute_one(call, session_id, mode, tool_context or {}) for call in parallel_calls]
             for result in await asyncio.gather(*tasks):
                 yield SchedulerEvent(event="tool_result", result=result)
         for call in serial_calls:
@@ -222,10 +304,10 @@ class ToolScheduler:
                 break
             yield SchedulerEvent(
                 event="tool_result",
-                result=await self._execute_one(call, session_id),
+                result=await self._execute_one(call, session_id, mode, tool_context or {}),
             )
 
-    async def _execute_one(self, call: dict, session_id: str | None) -> ToolResult:
+    async def _execute_one(self, call: dict, session_id: str | None, mode: str, tool_context: dict[str, Any]) -> ToolResult:
         start = time.monotonic()
         tool = self.registry.get(call["name"])
         if tool.handler is None:
@@ -263,8 +345,11 @@ class ToolScheduler:
                     duration_ms=int((time.monotonic() - start) * 1000),
                     arguments=call["arguments"],
                 )
+            invocation_context = dict(tool_context)
+            if call.get("_approval_context") is not None:
+                invocation_context["approval_context"] = call["_approval_context"]
             output = await asyncio.wait_for(
-                tool.handler(**call.get("arguments", {})),
+                self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
                 timeout=tool.timeout,
             )
             self.budget.record(len(str(output)))
