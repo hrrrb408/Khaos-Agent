@@ -758,6 +758,10 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["coding"],
             permission_level="execute",
             parallel=False,
+            capabilities=(
+                ToolCapability("process.execute", frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability("filesystem.write", frozenset({"coding"}), frozenset({"task-workspace"})),
+            ),
         )
     )
     registry.register(
@@ -774,9 +778,12 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 },
                 "required": ["dockerfile"],
             },
-            modes=["coding"],
+            modes=["internal"],
             permission_level="execute",
             parallel=False,
+            capabilities=(
+                ToolCapability("host.integration", frozenset({"internal"}), frozenset({"host-system"})),
+            ),
         )
     )
     registry.register(
