@@ -146,18 +146,17 @@ class TreeSitterAdapter:
         language, symbols_query, imports_query, spec = self._initialize(self._spec(file_path))
         tree_sitter = importlib.import_module("tree_sitter")
         tree = tree_sitter.Parser(language).parse(content)
-        error_nodes = _error_nodes(tree.root_node)
-        symbol_captures = tree_sitter.QueryCursor(symbols_query).captures(tree.root_node)
-        import_captures = tree_sitter.QueryCursor(imports_query).captures(tree.root_node)
-        symbol_ranges = {(node.start_byte, node.end_byte) for nodes in symbol_captures.values() for node in nodes}
-        import_ranges = {(node.start_byte, node.end_byte) for nodes in import_captures.values() for node in nodes}
-        symbols = _extract_symbols(spec, tree.root_node, content, file_path, error_nodes, symbol_ranges)
-        imports = _extract_imports(spec, tree.root_node, content, file_path, error_nodes, import_ranges)
+        all_nodes = list(_walk(tree.root_node))
+        error_nodes = [node for node in all_nodes if node.type == "ERROR" or node.is_missing]
+        symbol_matches = tree_sitter.QueryCursor(symbols_query).matches(tree.root_node)
+        import_matches = tree_sitter.QueryCursor(imports_query).matches(tree.root_node)
+        symbols = _extract_symbols(spec, symbol_matches, content, file_path, error_nodes)
+        imports = _extract_imports(spec, import_matches, content, file_path, error_nodes)
         diagnostics: list[ParseDiagnostic] = []
         if tree.root_node.has_error:
             node = error_nodes[0] if error_nodes else tree.root_node
             diagnostics.append(ParseDiagnostic("parse-error", "warning", "Tree-sitter recovered from syntax error", _node_location(file_path, content, node), True, self.source_name))
-        metadata = ParserMetadata(spec.module, importlib.metadata.version(spec.distribution), language.abi_version, spec.dialect, spec.query_version, len(error_nodes))
+        metadata = ParserMetadata(spec.module, importlib.metadata.version(spec.distribution), language.abi_version, spec.dialect, spec.query_version, len(error_nodes), len(all_nodes), len(symbol_matches), len(import_matches))
         return ParseResult(spec.language, file_path, tuple(symbols), tuple(imports), (), (), tuple(diagnostics), self.source_name, self.version, _hash(content), (time.perf_counter() - started) * 1000, metadata)
 
 
@@ -195,111 +194,174 @@ def _text(content: bytes, node: Any | None) -> str:
     return content[node.start_byte:node.end_byte].decode("utf-8") if node is not None else ""
 
 
-def _name_node(node: Any) -> Any | None:
-    return node.child_by_field_name("name")
+def _first_capture(captures: dict[str, list[Any]], name: str) -> Any | None:
+    nodes = captures.get(name, ())
+    return nodes[0] if nodes else None
 
 
-SYMBOL_TYPES = {
-    "python": {"class_definition": "class", "function_definition": "function"},
-    "javascript": {"class_declaration": "class", "function_declaration": "function", "generator_function_declaration": "generator", "method_definition": "method"},
-    "typescript": {"class_declaration": "class", "function_declaration": "function", "method_definition": "method", "interface_declaration": "interface", "type_alias_declaration": "type_alias", "enum_declaration": "enum", "internal_module": "namespace"},
-    "tsx": {"class_declaration": "class", "function_declaration": "function", "method_definition": "method", "interface_declaration": "interface", "type_alias_declaration": "type_alias", "enum_declaration": "enum", "internal_module": "namespace"},
-    "go": {"function_declaration": "function", "method_declaration": "method", "type_spec": "type", "const_spec": "constant", "var_spec": "variable"},
-    "rust": {"function_item": "function", "struct_item": "struct", "enum_item": "enum", "trait_item": "trait", "type_item": "type_alias", "mod_item": "module", "macro_definition": "macro"},
-}
-
-
-def _extract_symbols(spec: GrammarSpec, root: Any, content: bytes, file_path: str, errors: list[Any], captured_ranges: set[tuple[int, int]]) -> list[Symbol]:
+def _extract_symbols(spec: GrammarSpec, matches: list[tuple[int, dict[str, list[Any]]]], content: bytes, file_path: str, errors: list[Any]) -> list[Symbol]:
     found: dict[tuple[int, int, str, str], Symbol] = {}
-    parents: dict[int, Any] = {id(child): node for node in _walk(root) for child in node.children}
-    for node in _walk(root):
-        kind = SYMBOL_TYPES[spec.dialect].get(node.type)
-        name_node = _name_node(node)
-        if spec.dialect in {"javascript", "typescript", "tsx"} and node.type == "variable_declarator":
-            value = node.child_by_field_name("value")
-            if value is not None and value.type in {"arrow_function", "function_expression", "generator_function"}:
-                kind, name_node = "function", node.child_by_field_name("name")
-        if not kind or name_node is None:
+    kind_priority = {"type": 0, "function": 1, "class": 2, "interface": 2, "struct": 2, "method": 3}
+    for pattern_index, captures in matches:
+        definition_capture = next((name for name in captures if name.startswith("definition.")), None)
+        definition = _first_capture(captures, definition_capture) if definition_capture else None
+        name_node = _first_capture(captures, "name")
+        if definition is None or name_node is None:
             continue
-        if (name_node.start_byte, name_node.end_byte) not in captured_ranges:
-            continue
-        direct_parent = parents.get(id(node))
-        if spec.dialect == "python" and node.type == "function_definition" and direct_parent is not None and direct_parent.type == "block":
-            container = parents.get(id(direct_parent))
+        kind = definition_capture.removeprefix("definition.")
+        if kind == "type":
+            kind = "type_alias" if spec.dialect in {"typescript", "tsx", "rust"} else "named_type"
+        if spec.dialect == "python" and kind == "function":
+            parent = definition.parent
+            container = parent.parent if parent is not None and parent.type == "block" else None
             if container is not None and container.type == "class_definition":
                 kind = "method"
-        if spec.dialect == "rust" and node.type == "function_item":
-            ancestor = direct_parent
+            elif _text(content, definition).lstrip().startswith("async "):
+                kind = "async_function"
+        if spec.dialect == "rust" and kind == "function":
+            ancestor = definition.parent
             while ancestor is not None:
                 if ancestor.type == "impl_item":
                     kind = "method"
                     break
-                ancestor = parents.get(id(ancestor))
-        if spec.dialect == "go" and node.type == "type_spec":
-            declared = node.child_by_field_name("type")
-            kind = {"struct_type": "struct", "interface_type": "interface"}.get(declared.type if declared is not None else "", "named_type")
+                ancestor = ancestor.parent
         name = _text(content, name_node)
         if not name:
             continue
         owner_names: list[str] = []
-        parent = parents.get(id(node))
+        parent = definition.parent
         while parent is not None:
             if parent.type in {"class_definition", "class_declaration", "impl_item", "internal_module", "mod_item", "function_definition", "function_declaration", "method_definition"}:
-                owner = _name_node(parent) or parent.child_by_field_name("type")
+                owner = parent.child_by_field_name("name") or parent.child_by_field_name("type")
                 owner_text = _text(content, owner)
                 if owner_text:
                     owner_names.append(owner_text)
-            parent = parents.get(id(parent))
+            parent = parent.parent
         qualified = ".".join([*reversed(owner_names), name])
-        confidence = 0.5 if _overlaps(node, errors) else 0.98
+        confidence = 0.5 if _overlaps(definition, errors) else 0.98
         location = _node_location(file_path, content, name_node)
-        symbol = Symbol(name, kind, qualified, location, spec.language, "tree-sitter", confidence, {"dialect": spec.dialect, "node_type": node.type})
-        found[(location.byte_start, location.byte_end, kind, name)] = symbol
+        symbol = Symbol(name, kind, qualified, location, spec.language, "tree-sitter", confidence, {"dialect": spec.dialect, "node_type": definition.type, "query_pattern": pattern_index, "definition_byte_start": definition.start_byte, "definition_byte_end": definition.end_byte})
+        key = (location.byte_start, location.byte_end, kind, name)
+        competing = next((item for item in found if item[0] == key[0] and item[1] == key[1] and item[3] == name), None)
+        if competing is None or kind_priority.get(kind, 1) > kind_priority.get(competing[2], 1):
+            if competing is not None:
+                found.pop(competing)
+            found[key] = symbol
     return sorted(found.values(), key=lambda item: (item.location.byte_start, item.location.byte_end, item.kind, item.name))
 
 
-IMPORT_NODE_TYPES = {"python": {"import_statement", "import_from_statement"}, "javascript": {"import_statement", "export_statement"}, "typescript": {"import_statement", "export_statement"}, "tsx": {"import_statement", "export_statement"}, "go": {"import_spec"}, "rust": {"use_declaration", "extern_crate_declaration"}}
-
-
-def _extract_imports(spec: GrammarSpec, root: Any, content: bytes, file_path: str, errors: list[Any], captured_ranges: set[tuple[int, int]]) -> list[ImportReference]:
+def _extract_imports(spec: GrammarSpec, matches: list[tuple[int, dict[str, list[Any]]]], content: bytes, file_path: str, errors: list[Any]) -> list[ImportReference]:
     found: dict[tuple[int, int, str, str | None], ImportReference] = {}
-    for node in _walk(root):
-        if node.type not in IMPORT_NODE_TYPES[spec.dialect] or _overlaps(node, errors):
+    for pattern_index, captures in matches:
+        statement = _first_capture(captures, "import.statement") or _first_capture(captures, "import.reexport")
+        if statement is None or _overlaps(statement, errors):
             continue
-        if not any(node.start_byte >= start and node.end_byte <= end for start, end in captured_ranges):
-            continue
-        raw = _text(content, node)
-        module, names, alias = _parse_import_text(spec.dialect, raw)
-        if not module:
-            continue
-        location = _node_location(file_path, content, node)
-        item = ImportReference(module, tuple(names), alias, location, "tree-sitter", 0.98)
-        found[(location.byte_start, location.byte_end, module, alias)] = item
-    return sorted(found.values(), key=lambda item: (item.location.byte_start, item.location.byte_end, item.module, item.alias or ""))
+        if spec.dialect == "python":
+            items = _python_imports(statement, content)
+        elif spec.dialect in {"javascript", "typescript", "tsx"}:
+            items = _javascript_imports(statement, content, reexport="import.reexport" in captures)
+        elif spec.dialect == "go":
+            items = _go_imports(statement, content)
+        else:
+            items = _rust_imports(statement, content)
+        location = _node_location(file_path, content, statement)
+        for module, names, alias, metadata in items:
+            if not module:
+                continue
+            metadata.update({"dialect": spec.dialect, "query_pattern": pattern_index, "statement_byte_start": statement.start_byte, "statement_byte_end": statement.end_byte})
+            item = ImportReference(module, tuple(names), alias, location, "tree-sitter", 0.98, metadata)
+            found[(location.byte_start, location.byte_end, module, alias)] = item
+    return sorted(found.values(), key=lambda item: (item.location.byte_start, int(item.metadata.get("item_byte_start", item.location.byte_start)), item.module, item.alias or ""))
 
 
-def _parse_import_text(dialect: str, raw: str) -> tuple[str, list[str], str | None]:
-    if dialect == "python":
-        match = re.match(r"import\s+([\w.]+)(?:\s+as\s+(\w+))?", raw)
-        if match: return match.group(1), [], match.group(2)
-        match = re.match(r"from\s+([\w.]*)\s+import\s+(.+)", raw, re.S)
-        if match: return match.group(1), [part.strip().split(" as ")[0] for part in match.group(2).strip("() ").split(",")], None
-    elif dialect in {"javascript", "typescript", "tsx"}:
-        match = re.search(r"(?:from\s+)?[\"']([^\"']+)[\"']", raw)
-        if match:
-            names = re.findall(r"\b([A-Za-z_$][\w$]*)\s*(?:as\s+[A-Za-z_$][\w$]*)?(?:,|})", raw)
-            alias_match = re.search(r"\*\s+as\s+(\w+)", raw)
-            return match.group(1), names, alias_match.group(1) if alias_match else None
-    elif dialect == "go":
-        match = re.search(r"(?:(\w+|[._])\s+)?[\"']([^\"']+)[\"']", raw)
-        if match: return match.group(2), [], match.group(1)
-    else:
-        match = re.match(r"(?:use|extern\s+crate)\s+(.+?);?$", raw.strip(), re.S)
-        if match:
-            value = match.group(1).strip()
-            alias_match = re.search(r"\s+as\s+(\w+)$", value)
-            return re.sub(r"\s+as\s+\w+$", "", value), [], alias_match.group(1) if alias_match else None
-    return "", [], None
+def _python_imports(statement: Any, content: bytes) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    if statement.type == "import_statement":
+        result = []
+        for child in statement.named_children:
+            name = child.child_by_field_name("name") if child.type == "aliased_import" else child
+            alias = child.child_by_field_name("alias") if child.type == "aliased_import" else None
+            result.append((_text(content, name), [], _text(content, alias) or None, {"import_kind": "import", "item_byte_start": child.start_byte}))
+        return result
+    module_node = statement.child_by_field_name("module_name")
+    module = _text(content, module_node)
+    result = []
+    for child in statement.named_children:
+        if child == module_node:
+            continue
+        if child.type == "wildcard_import":
+            result.append((module, ["*"], None, {"import_kind": "from", "glob": True, "item_byte_start": child.start_byte}))
+        elif child.type in {"dotted_name", "aliased_import"}:
+            name = child.child_by_field_name("name") if child.type == "aliased_import" else child
+            alias = child.child_by_field_name("alias") if child.type == "aliased_import" else None
+            result.append((module, [_text(content, name)], _text(content, alias) or None, {"import_kind": "from", "relative": module.startswith("."), "item_byte_start": child.start_byte}))
+    return result
+
+
+def _javascript_imports(statement: Any, content: bytes, *, reexport: bool) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    source = statement.child_by_field_name("source")
+    module = _text(content, source).strip("\"'")
+    base = {"import_kind": "reexport" if reexport else "import", "reexport": reexport}
+    clause = next((child for child in statement.named_children if child.type in {"import_clause", "export_clause", "namespace_export"}), None)
+    if clause is None:
+        return [(module, [], None, {**base, "side_effect": not reexport})]
+    type_only = any(child.type == "type" for child in statement.children)
+    result = []
+    for child in _walk(clause):
+        if child.type == "import_specifier" or child.type == "export_specifier":
+            name = child.child_by_field_name("name")
+            alias = child.child_by_field_name("alias")
+            result.append((module, [_text(content, name)], _text(content, alias) or None, {**base, "type_only": type_only}))
+        elif child.type == "namespace_import":
+            name = next((node for node in child.named_children if node.type == "identifier"), None)
+            result.append((module, ["*"], _text(content, name) or None, {**base, "namespace": True, "type_only": type_only}))
+    direct = [child for child in clause.named_children if child.type == "identifier"]
+    if direct:
+        result.insert(0, (module, ["default"], _text(content, direct[0]), {**base, "default": True, "type_only": type_only}))
+    return result or [(module, [], None, {**base, "type_only": type_only})]
+
+
+def _go_imports(statement: Any, content: bytes) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    path = statement.child_by_field_name("path")
+    name = statement.child_by_field_name("name")
+    module = _text(content, path).strip("\"")
+    alias = _text(content, name) or None
+    return [(module, [], alias, {"import_kind": "import", "blank": alias == "_", "dot": alias == "."})]
+
+
+def _rust_imports(statement: Any, content: bytes) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    if statement.type == "extern_crate_declaration":
+        name = statement.child_by_field_name("name")
+        return [(_text(content, name), [], None, {"import_kind": "extern_crate"})]
+    argument = statement.child_by_field_name("argument")
+    return _expand_rust_use(argument, content, "")
+
+
+def _expand_rust_use(node: Any, content: bytes, prefix: str) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    if node.type == "scoped_use_list":
+        path = _text(content, node.child_by_field_name("path"))
+        base = f"{prefix}::{path}" if prefix else path
+        use_list = node.child_by_field_name("list") or next((child for child in node.named_children if child.type == "use_list"), None)
+        result = []
+        for child in use_list.named_children if use_list is not None else ():
+            result.extend(_expand_rust_use(child, content, base))
+        return result
+    if node.type == "use_as_clause":
+        path = node.child_by_field_name("path")
+        alias = node.child_by_field_name("alias")
+        module = _text(content, path)
+        if prefix:
+            module = f"{prefix}::{module}"
+        return [(module, [], _text(content, alias) or None, {"import_kind": "use", "alias": True})]
+    if node.type == "use_wildcard":
+        parts = [_text(content, child) for child in node.named_children]
+        module = "::".join(part for part in parts if part)
+        if prefix:
+            module = f"{prefix}::{module}"
+        return [(module, ["*"], None, {"import_kind": "use", "glob": True})]
+    module = _text(content, node)
+    if prefix:
+        module = f"{prefix}::{module}"
+    return [(module, [], None, {"import_kind": "use"})]
 
 
 # Existing offline adapters remain dependency-free.

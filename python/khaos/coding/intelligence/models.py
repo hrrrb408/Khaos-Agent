@@ -56,6 +56,7 @@ class ImportReference:
     location: SourceLocation
     source: str
     confidence: float
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def __str__(self) -> str:
         return self.module
@@ -106,6 +107,9 @@ class ParserMetadata:
     grammar_dialect: str | None = None
     query_version: str | None = None
     skipped_error_regions: int = 0
+    ast_node_count: int = 0
+    symbol_query_match_count: int = 0
+    import_query_match_count: int = 0
 
 
 @dataclass(frozen=True)
