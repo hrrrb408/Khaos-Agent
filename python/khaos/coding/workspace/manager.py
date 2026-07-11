@@ -40,14 +40,15 @@ class WorkspaceManager:
         self._task_ids: set[str] = set()
         self._lock = asyncio.Lock()
 
-    async def _git(self, repository: Path, *args: str) -> str:
+    async def _git(self, repository: Path, *args: str, preserve_output: bool = False) -> str:
         process = await asyncio.create_subprocess_exec(
             "git", *args, cwd=str(repository), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
             raise WorkspaceError(stderr.decode("utf-8", errors="replace").strip() or "git command failed")
-        return stdout.decode("utf-8", errors="replace").strip()
+        output = stdout.decode("utf-8", errors="replace")
+        return output if preserve_output else output.strip()
 
     async def create(self, repository_root: Path, task_id: str, *, base_ref: str = "HEAD") -> TaskWorkspace:
         repository = repository_root.resolve()
@@ -88,7 +89,7 @@ class WorkspaceManager:
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
             raise WorkspaceError("workspace not found")
-        patch = await self._git(workspace.worktree_path, "diff", "--binary", workspace.base_sha)
+        patch = await self._git(workspace.worktree_path, "diff", "--binary", workspace.base_sha, preserve_output=True)
         stat = await self._git(workspace.worktree_path, "diff", "--stat", workspace.base_sha)
         names = await self._git(workspace.worktree_path, "diff", "--name-only", workspace.base_sha)
         changeset = ChangeSet.create(id=uuid.uuid4().hex[:12], workspace_id=workspace_id, base_sha=workspace.base_sha, head_sha=None, patch=patch, diff_stat=stat, changed_files=tuple(line for line in names.splitlines() if line))
@@ -100,7 +101,7 @@ class WorkspaceManager:
         workspace = self._workspaces.get(workspace_id)
         if workspace is None or changeset.workspace_id != workspace_id:
             raise WorkspaceError("workspace or changeset not found")
-        current = await self._git(workspace.worktree_path, "diff", "--binary", workspace.base_sha)
+        current = await self._git(workspace.worktree_path, "diff", "--binary", workspace.base_sha, preserve_output=True)
         if current.encode("utf-8") != changeset.patch.encode("utf-8"):
             raise WorkspaceError("changeset content changed; approval is stale")
         await self._git(workspace.worktree_path, "add", "--", *changeset.changed_files)

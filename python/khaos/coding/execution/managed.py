@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import os
+import signal
 import shutil
 from pathlib import Path
 
@@ -53,12 +55,18 @@ class ManagedProcessHandle:
         return code
 
     async def terminate(self) -> None:
+        """Terminate the complete process group created by ExecutionService.
+
+        Managed processes are launched in a new session.  Signalling only the
+        immediate LSP process leaves language-server helpers alive, so use the
+        group on POSIX and retain the normal asyncio fallback on Windows.
+        """
         if self._process.returncode is None:
-            self._process.terminate()
+            _signal_process_tree(self._process.pid, signal.SIGTERM, self._process.terminate)
 
     async def kill(self) -> None:
         if self._process.returncode is None:
-            self._process.kill()
+            _signal_process_tree(self._process.pid, signal.SIGKILL, self._process.kill)
 
     async def aclose(self) -> None:
         if self._closed:
@@ -94,3 +102,19 @@ class ManagedProcessHandle:
             await self._stderr_task
             return
         await self._stderr_task
+
+
+def _signal_process_tree(pid: int | None, sig: signal.Signals, fallback) -> None:
+    """Signal a session/process group when the host supports it."""
+    if pid is None:
+        return
+    if os.name == "posix":
+        try:
+            os.killpg(pid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except OSError:
+            # A factory used by a test may not have created a new session.
+            pass
+    fallback()
