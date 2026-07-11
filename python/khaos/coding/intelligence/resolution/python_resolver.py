@@ -38,24 +38,23 @@ def resolve_python_imports(
         names: tuple[str, ...] = tuple(imp.get("imported_names", ()))
         alias: str | None = imp.get("alias")
         metadata: dict[str, Any] = imp.get("metadata", {})
-        import_kind = metadata.get("import_kind", "import")
         is_relative = metadata.get("relative", module.startswith("."))
 
-        # Whole-module import: import module [as alias]
-        if import_kind == "import" or (not names and not is_relative):
+        # Whole-module import: import module [as alias] (no imported_names)
+        if not names:
             target_file = _resolve_python_module_path(module, source_file, table)
             if target_file:
                 results.append(ResolvedImport(
                     source_file, module, "", alias, ResolutionStatus.RESOLVED,
                     target_file, None, 0.95, "python-module-path",
-                    (target_file,), {"import_kind": import_kind},
+                    (target_file,), {"import_kind": "import"},
                 ))
                 table.register_reverse_dep(source_file, target_file)
             else:
                 results.append(ResolvedImport(
                     source_file, module, "", alias, ResolutionStatus.EXTERNAL,
                     None, None, 0.9, "module-not-in-repository",
-                    (), {"import_kind": import_kind},
+                    (), {"import_kind": "import"},
                 ))
             continue
 

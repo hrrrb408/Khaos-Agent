@@ -14,6 +14,11 @@ from khaos.coding.intelligence.resolution.models import (
     ResolvedImport,
     ResolvedReferenceEdge,
 )
+from khaos.coding.intelligence.resolution.persistence import (
+    apply_resolution_schema,
+    commit_file_resolution,
+    remove_file_resolution,
+)
 from khaos.coding.intelligence.resolution.service import ResolutionService
 from khaos.coding.intelligence.resolution.symbol_table import (
     RepositorySymbolTable,
@@ -31,5 +36,8 @@ __all__ = [
     "ResolvedCallEdge",
     "ResolvedImport",
     "ResolvedReferenceEdge",
+    "apply_resolution_schema",
     "build_symbol_table",
+    "commit_file_resolution",
+    "remove_file_resolution",
 ]

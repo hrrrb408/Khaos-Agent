@@ -30,6 +30,11 @@ from khaos.coding.intelligence.resolution.models import (
     ResolutionStatus,
     RepositoryResolutionReport,
 )
+from khaos.coding.intelligence.resolution.persistence import (
+    apply_resolution_schema,
+    commit_file_resolution,
+    remove_file_resolution,
+)
 from khaos.coding.intelligence.resolution.symbol_table import (
     RepositorySymbolTable,
     build_symbol_table,
@@ -39,10 +44,19 @@ logger = logging.getLogger(__name__)
 
 
 class ResolutionService:
-    """Orchestrates conservative repository-level semantic resolution."""
+    """Orchestrates conservative repository-level semantic resolution.
 
-    def __init__(self, conn: sqlite3.Connection) -> None:
+    When ``persist=True`` (default), resolution results are atomically
+    committed to the database per-file. ParseResult indexing is never
+    rolled back on resolution failure — only the semantic edge transaction
+    is aborted, preserving the previous graph.
+    """
+
+    def __init__(self, conn: sqlite3.Connection, *, persist: bool = True) -> None:
         self._conn = conn
+        self._persist = persist
+        if persist:
+            apply_resolution_schema(conn)
 
     def resolve(
         self,
@@ -84,8 +98,13 @@ class ResolutionService:
             affected = table.reverse_dep_closure(affected)
             to_resolve = affected
 
-        # Remove deleted files from the table
+        # Persist deletions and remove from the in-memory table
         for path in deleted:
+            if self._persist:
+                try:
+                    remove_file_resolution(self._conn, repository_id, path)
+                except sqlite3.DatabaseError as exc:
+                    logger.warning("Failed to remove resolution for %s: %s", path, exc)
             table.remove_file(path)
 
         report = RepositoryResolutionReport(repository_id=repository_id)
@@ -110,6 +129,13 @@ class ResolutionService:
                 for edge in result.resolved_references:
                     self._increment_status(report, edge.status, "reference")
                 report.diagnostics.extend(result.diagnostics)
+                # Persist atomically — failure does not roll back ParseResult
+                if self._persist:
+                    try:
+                        commit_file_resolution(self._conn, repository_id, result)
+                    except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                        logger.warning("Failed to persist resolution for %s: %s", file_path, exc)
+                        report.diagnostics.append(ResolutionDiagnostic(file_path, "persistence-failed", "warning", str(exc)))
             except (RuntimeError, ValueError, KeyError) as exc:
                 logger.warning("Resolution failed for %s: %s", file_path, exc)
                 report.diagnostics.append(ResolutionDiagnostic(file_path, "resolution-failed", "warning", str(exc)))

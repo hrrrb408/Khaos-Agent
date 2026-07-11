@@ -96,7 +96,7 @@ class RepositoryParseStateCache:
 
 
 class RepositoryIndexer:
-    def __init__(self, store: IndexStore, *, registry: LanguageRegistry | None = None, ignored_dirs: set[str] | None = None) -> None:
+    def __init__(self, store: IndexStore, *, registry: LanguageRegistry | None = None, ignored_dirs: set[str] | None = None, resolution_service: Any | None = None) -> None:
         self.store = store
         self.registry = registry or LanguageRegistry()
         self.cache = RepositoryParseStateCache()
@@ -104,6 +104,7 @@ class RepositoryIndexer:
         self._file_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
         self._closed = False
+        self._resolution_service = resolution_service
 
     async def index(self, repository_id: str, root: Path, *, full_reindex: bool = False) -> dict[str, Any]:
         if self._closed:
@@ -114,8 +115,10 @@ class RepositoryIndexer:
         current = {path.relative_to(root).as_posix() for path in paths}
         indexed = await self.store.indexed_paths(repository_id)
         report: dict[str, Any] = {"scanned_files": len(paths), "parsed_files": 0, "incremental_files": 0, "full_fallback_files": 0, "unchanged_files": 0, "deleted_files": 0, "unsupported_files": 0, "failed_files": 0, "stale_read_files": 0, "statuses": {}, "rejected_paths": rejected_paths}
+        deleted_paths: set[str] = set()
+        changed_paths: set[str] = set()
         for relative in sorted(indexed - current):
-            await self.store.remove(repository_id, relative); self.cache.remove_path(repository_id, root_identity, relative); report["deleted_files"] += 1; report["statuses"][relative] = "deleted"
+            await self.store.remove(repository_id, relative); self.cache.remove_path(repository_id, root_identity, relative); report["deleted_files"] += 1; report["statuses"][relative] = "deleted"; deleted_paths.add(relative)
         results = await asyncio.gather(*(self._refresh_file(repository_id, root, root_identity, path, full_reindex) for path in paths))
         for relative, status in results:
             report["statuses"][relative] = status
@@ -125,9 +128,23 @@ class RepositoryIndexer:
             elif status == "parse-failed": report["failed_files"] += 1
             elif status.startswith("indexed-"):
                 report["parsed_files"] += 1
+                changed_paths.add(relative)
                 if status == "indexed-incremental": report["incremental_files"] += 1
                 if status == "indexed-full-fallback": report["full_fallback_files"] += 1
-        report.update({f"cache_{key}": value for key, value in self.cache.stats().items()}); report["total_duration_ms"] = (time.perf_counter() - started) * 1000
+        report.update({f"cache_{key}": value for key, value in self.cache.stats().items()})
+        # Run semantic resolution if a resolution service is configured
+        if self._resolution_service is not None:
+            try:
+                resolution_report = self._resolution_service.resolve(
+                    repository_id, root,
+                    changed_paths=changed_paths,
+                    deleted_paths=deleted_paths,
+                    full_rebuild=full_reindex,
+                )
+                report["resolution"] = resolution_report.to_dict()
+            except (RuntimeError, ValueError) as exc:
+                report["resolution_error"] = str(exc)
+        report["total_duration_ms"] = (time.perf_counter() - started) * 1000
         return report
 
     async def _refresh_file(self, repository_id: str, root: Path, root_identity: str, path: Path, force: bool) -> tuple[str, str]:

@@ -138,7 +138,12 @@ class RepositorySymbolTable:
 
 
 def build_symbol_table(conn: sqlite3.Connection, repository_id: str) -> RepositorySymbolTable:
-    """Build a complete symbol table from IndexStore persisted data."""
+    """Build a complete symbol table from IndexStore persisted data.
+
+    Also loads reverse dependency edges from the persisted resolution graph
+    (if available) so that incremental invalidation can find dependents of
+    changed/deleted files without a full re-resolution.
+    """
     table = RepositorySymbolTable(repository_id)
     # Load file records
     for row in conn.execute("SELECT path, language, generation FROM code_files WHERE project_id=? ORDER BY path", (repository_id,)):
@@ -164,6 +169,24 @@ def build_symbol_table(conn: sqlite3.Connection, repository_id: str) -> Reposito
         path = row["path"] if isinstance(row, sqlite3.Row) else row[0]
         payload = json.loads(row["payload_json"] if isinstance(row, sqlite3.Row) else row[2])
         table.add_import(path, payload)
+    # Load reverse deps from persisted resolution edges (if table exists)
+    try:
+        for row in conn.execute(
+            "SELECT DISTINCT source_file, target_file FROM resolved_imports WHERE repository_id=? AND target_file IS NOT NULL",
+            (repository_id,),
+        ).fetchall():
+            source = row[0] if isinstance(row, sqlite3.Row) else row[0]
+            target = row[1] if isinstance(row, sqlite3.Row) else row[1]
+            table.register_reverse_dep(source, target)
+        for row in conn.execute(
+            "SELECT DISTINCT source_file, target_file FROM resolved_call_edges WHERE repository_id=? AND target_file IS NOT NULL",
+            (repository_id,),
+        ).fetchall():
+            source = row[0] if isinstance(row, sqlite3.Row) else row[0]
+            target = row[1] if isinstance(row, sqlite3.Row) else row[1]
+            table.register_reverse_dep(source, target)
+    except sqlite3.OperationalError:
+        pass  # resolution tables don't exist yet
     return table
 
 
