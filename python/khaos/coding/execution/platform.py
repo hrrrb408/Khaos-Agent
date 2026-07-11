@@ -96,10 +96,17 @@ class LinuxBubblewrapBackend:
         (the default pytest tmp_path location), making the writable bind
         invisible and the sandboxed process fall back to read-only ``/``.
 
+        Mount topology: ``--ro-bind / /`` first (read-only root), then
+        ``--tmpfs /tmp`` (fresh writable tmpfs), then ``--bind <worktree>
+        /tmp/workspace``.  The tmpfs must precede the bind so that bwrap
+        can ``mkdir /tmp/workspace`` inside the writable tmpfs — a
+        ``--bind`` to a top-level path that does not exist on the host
+        (e.g. ``/workspace``) fails because ``--ro-bind / /`` makes the
+        root read-only and bwrap cannot create the mount point.
+
         This probe runs the real sandbox with the same mount topology as
-        ``argv_prefix`` (bind to ``/workspace`` + ``--chdir /workspace``)
-        and actually writes a probe file, so it catches both the namespace
-        failure and the bind-shadow failure.
+        ``argv_prefix`` and actually writes a probe file, so it catches
+        both the namespace failure and the bind-shadow failure.
         """
         if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
             return BackendAvailability(self.name, False, False, "bwrap unavailable on this platform")
@@ -107,9 +114,11 @@ class LinuxBubblewrapBackend:
             return LinuxBubblewrapBackend._capability_cache
         with tempfile.TemporaryDirectory() as tmp:
             completed = subprocess.run(
-                ("bwrap", "--ro-bind", "/", "/", "--bind", tmp, "/workspace",
-                 "--tmpfs", "/tmp", "--unshare-net", "--unshare-pid",
-                 "--chdir", "/workspace",
+                ("bwrap", "--ro-bind", "/", "/",
+                 "--tmpfs", "/tmp",
+                 "--bind", tmp, self.SANDBOX_WORKDIR,
+                 "--unshare-net", "--unshare-pid",
+                 "--chdir", self.SANDBOX_WORKDIR,
                  "--", "/bin/sh", "-c", "echo probe > .probe && cat .probe"),
                 capture_output=True, timeout=10,
             )
@@ -124,21 +133,21 @@ class LinuxBubblewrapBackend:
         LinuxBubblewrapBackend._capability_cache = availability
         return availability
 
-    # The worktree is bound to a deterministic sandbox-internal path (/workspace)
-    # instead of its host path.  This avoids the tmpfs-shadow problem: when the
-    # host worktree lives under /tmp (pytest's default tmp_path), a ``--tmpfs /tmp``
-    # would shadow the writable ``--bind <worktree> <worktree>`` mount, causing the
-    # sandboxed process to fall back to the read-only root bind.  Binding to
-    # /workspace (outside /tmp) and using --chdir keeps the writable mount visible
-    # regardless of where the host worktree lives.
-    SANDBOX_WORKDIR = "/workspace"
+    # The worktree is bound to /tmp/workspace inside the sandbox.  --tmpfs /tmp
+    # is applied BEFORE the bind so that /tmp is a fresh writable tmpfs; bwrap
+    # can then mkdir /tmp/workspace (inside the tmpfs) and mount the worktree
+    # there.  Binding to a path under /tmp avoids the tmpfs-shadow problem
+    # (host worktree under /tmp being shadowed by --tmpfs /tmp) AND avoids the
+    # read-only-root problem (bwrap cannot create a top-level path like
+    # /workspace because --ro-bind / / makes the root read-only).
+    SANDBOX_WORKDIR = "/tmp/workspace"
 
     def argv_prefix(self, worktree: Path) -> tuple[str, ...]:
         return (
             "bwrap",
             "--ro-bind", "/", "/",
-            "--bind", str(worktree.resolve()), self.SANDBOX_WORKDIR,
             "--tmpfs", "/tmp",
+            "--bind", str(worktree.resolve()), self.SANDBOX_WORKDIR,
             "--unshare-net", "--unshare-pid",
             "--chdir", self.SANDBOX_WORKDIR,
         )
