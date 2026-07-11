@@ -13,7 +13,7 @@ from khaos.coding.intelligence.adapters import TreeSitterAdapter
 import khaos.coding.intelligence.adapters as adapter_module
 
 
-QUERY_ROOT = Path("python/khaos/coding/intelligence/queries")
+QUERY_ROOT = Path(__file__).resolve().parents[2] / "khaos" / "coding" / "intelligence" / "queries"
 
 
 def test_symbol_queries_have_no_wildcard_candidate() -> None:

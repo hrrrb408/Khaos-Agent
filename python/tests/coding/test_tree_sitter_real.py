@@ -29,7 +29,7 @@ def test_real_parser_initializes_and_records_locked_metadata(extension: str, dia
     assert result.metadata.grammar_dialect == dialect
     assert result.metadata.grammar_abi == abi
     assert tree_sitter.MIN_COMPATIBLE_LANGUAGE_VERSION <= abi <= tree_sitter.LANGUAGE_VERSION
-    assert result.calls == () and result.references == ()
+    assert all(item.metadata["resolution"] == "unresolved" for item in (*result.calls, *result.references))
 
 
 @pytest.mark.parametrize("extension", ["py", "js", "ts", "go", "rs"])
@@ -104,8 +104,8 @@ def test_empty_file_is_real_tree_sitter_result() -> None:
 def test_queries_are_packaged_resources_only() -> None:
     root = importlib.resources.files("khaos.coding.intelligence")
     for spec in GRAMMARS.values():
-        assert root.joinpath(spec.query_resource_path, "symbols.scm").is_file()
-        assert root.joinpath(spec.query_resource_path, "imports.scm").is_file()
+        for name in ("symbols.scm", "imports.scm", "calls.scm", "references.scm"):
+            assert root.joinpath(spec.query_resource_path, name).is_file()
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     assert '"khaos.coding.intelligence" = ["queries/**/*.scm"]' in pyproject
 
