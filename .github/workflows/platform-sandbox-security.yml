@@ -1,0 +1,37 @@
+name: Platform Sandbox Security E2E
+
+on:
+  pull_request:
+  push:
+    branches: [feature/coding-runtime-alignment]
+
+jobs:
+  linux-bwrap-isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Run real bwrap isolation E2E
+        env:
+          KHAOS_REQUIRE_PLATFORM_SANDBOX: "1"
+        run: python -m pytest python/tests/coding/test_platform_backends.py -q -k real_bwrap
+
+  macos-sandbox-isolation:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Run real sandbox-exec isolation E2E
+        env:
+          KHAOS_REQUIRE_PLATFORM_SANDBOX: "1"
+        run: python -m pytest python/tests/coding/test_platform_backends.py -q -k real_macos
