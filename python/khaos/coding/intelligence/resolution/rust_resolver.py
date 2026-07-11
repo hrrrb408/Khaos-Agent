@@ -95,14 +95,14 @@ def resolve_rust_imports(
             if len(target_symbols) == 1:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.RESOLVED,
-                    target_file, target_symbols[0].symbol_id, 0.93, "rust-use-named",
+                    target_file, target_symbols[0].stable_symbol_id, 0.93, "rust-use-named",
                     (target_file,), {"import_kind": import_kind},
                 ))
             elif len(target_symbols) > 1:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.AMBIGUOUS,
                     target_file, None, 0.4, "rust-use-multiple",
-                    tuple(s.symbol_id for s in target_symbols), {"import_kind": import_kind, "count": len(target_symbols)},
+                    tuple(s.stable_symbol_id for s in target_symbols), {"import_kind": import_kind, "count": len(target_symbols)},
                 ))
             else:
                 results.append(ResolvedImport(

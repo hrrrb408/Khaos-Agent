@@ -112,7 +112,7 @@ def resolve_python_imports(
             if len(matching) == 1:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.RESOLVED,
-                    target_file, matching[0].symbol_id, 0.95, "python-from-import",
+                    target_file, matching[0].stable_symbol_id, 0.95, "python-from-import",
                     (target_file,), {"import_kind": "from"},
                 ))
                 table.register_reverse_dep(source_file, target_file)
@@ -120,7 +120,7 @@ def resolve_python_imports(
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.AMBIGUOUS,
                     target_file, None, 0.5, f"multiple-symbols-named-{name}",
-                    tuple(s.symbol_id for s in matching), {"import_kind": "from", "count": len(matching)},
+                    tuple(s.stable_symbol_id for s in matching), {"import_kind": "from", "count": len(matching)},
                 ))
                 table.register_reverse_dep(source_file, target_file)
 

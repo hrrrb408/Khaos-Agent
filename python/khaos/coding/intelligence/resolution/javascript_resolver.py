@@ -90,7 +90,7 @@ def resolve_javascript_imports(
                 if len(default_syms) == 1:
                     results.append(ResolvedImport(
                         source_file, module, "default", alias, ResolutionStatus.RESOLVED,
-                        target_file, default_syms[0].symbol_id, 0.92, "js-default-import",
+                        target_file, default_syms[0].stable_symbol_id, 0.92, "js-default-import",
                         (target_file,), {"import_kind": "import", "default": True},
                     ))
                 else:
@@ -108,14 +108,14 @@ def resolve_javascript_imports(
             if len(target_symbols) == 1:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.RESOLVED,
-                    target_file, target_symbols[0].symbol_id, 0.93, "js-named-import",
+                    target_file, target_symbols[0].stable_symbol_id, 0.93, "js-named-import",
                     (target_file,), {"import_kind": "import"},
                 ))
             elif len(target_symbols) > 1:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.AMBIGUOUS,
                     target_file, None, 0.4, "js-named-import-multiple",
-                    tuple(s.symbol_id for s in target_symbols), {"import_kind": "import", "count": len(target_symbols)},
+                    tuple(s.stable_symbol_id for s in target_symbols), {"import_kind": "import", "count": len(target_symbols)},
                 ))
             else:
                 results.append(ResolvedImport(
