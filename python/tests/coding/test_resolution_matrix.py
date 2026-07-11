@@ -715,7 +715,15 @@ def test_ground_truth_precision_no_false_positives():
 
 
 def test_ground_truth_precision_coverage_report():
-    """Report precision and coverage metrics."""
+    """Report precision and coverage metrics with mutual exclusivity.
+
+    Verifies:
+      1. candidate_total == resolved + ambiguous + unresolved + external + dynamic + invalid
+         for each edge type (imports, calls, references)
+      2. No false positives (FP=0): all resolved edges point to real targets
+      3. precision = TP / (TP + FP) = 1.0
+      4. coverage = resolved / eligible (eligible = resolved + ambiguous + unresolved)
+    """
     async def run():
         store = IndexStore(sqlite3.connect(":memory:"))
         await _write_synthetic(store, "r", "util.py", "python",
@@ -731,16 +739,57 @@ def test_ground_truth_precision_coverage_report():
             ])
         report = _resolve(store, "r", full_rebuild=True)
         counts = resolution_counts(store._conn, "r")
-        total = counts["imports"] + counts["call_edges"] + counts["reference_edges"]
-        resolved = counts["imports_resolved"] + counts["calls_resolved"] + counts["references_resolved"]
-        # All resolved edges are true positives (no false positives by construction)
-        # Precision = TP / (TP + FP) = 1.0
-        precision = 1.0 if resolved == 0 else resolved / resolved  # no FP
-        # Coverage = resolved / total candidates
-        coverage = resolved / total if total > 0 else 0
-        assert precision == 1.0
-        assert coverage >= 0.0
-        print(f"\nGround truth: total={total}, resolved={resolved}, precision={precision:.2f}, coverage={coverage:.2f}")
+
+        # --- Mutual exclusivity per edge type ---
+        for edge_type, total_key in (
+            ("imports", "imports"),
+            ("calls", "call_edges"),
+            ("references", "reference_edges"),
+        ):
+            total = counts[total_key]
+            status_sum = (
+                counts[f"{edge_type}_resolved"] + counts[f"{edge_type}_ambiguous"]
+                + counts[f"{edge_type}_unresolved"] + counts[f"{edge_type}_external"]
+                + counts[f"{edge_type}_dynamic"] + counts[f"{edge_type}_invalid"]
+            )
+            assert total == status_sum, (
+                f"{edge_type} mutual exclusivity violated: total={total} != status_sum={status_sum}"
+            )
+
+        # --- TP/FP/precision/coverage ---
+        # FP: resolved edges pointing to missing target_file
+        fp = int(store._conn.execute(
+            "SELECT COUNT(*) FROM resolved_imports WHERE repository_id='r' AND status='resolved' "
+            "AND target_file IS NOT NULL AND target_file NOT IN "
+            "(SELECT path FROM code_files WHERE project_id='r')"
+        ).fetchone()[0])
+        fp += int(store._conn.execute(
+            "SELECT COUNT(*) FROM resolved_call_edges WHERE repository_id='r' AND status='resolved' "
+            "AND target_file IS NOT NULL AND target_file NOT IN "
+            "(SELECT path FROM code_files WHERE project_id='r')"
+        ).fetchone()[0])
+        fp += int(store._conn.execute(
+            "SELECT COUNT(*) FROM resolved_reference_edges WHERE repository_id='r' AND status='resolved' "
+            "AND target_file IS NOT NULL AND target_file NOT IN "
+            "(SELECT path FROM code_files WHERE project_id='r')"
+        ).fetchone()[0])
+
+        tp = counts["imports_resolved"] + counts["calls_resolved"] + counts["references_resolved"]
+        precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+        eligible = (
+            counts["imports_resolved"] + counts["imports_ambiguous"] + counts["imports_unresolved"]
+            + counts["calls_resolved"] + counts["calls_ambiguous"] + counts["calls_unresolved"]
+            + counts["references_resolved"] + counts["references_ambiguous"] + counts["references_unresolved"]
+        )
+        coverage = tp / eligible if eligible > 0 else 0.0
+
+        assert fp == 0, f"Expected 0 false positives, got {fp}"
+        assert precision == 1.0, f"Expected precision 1.0, got {precision}"
+        assert 0.0 <= coverage <= 1.0
+        print(
+            f"\nGround truth: TP={tp}, FP={fp}, precision={precision:.2f}, "
+            f"eligible={eligible}, resolved={tp}, coverage={coverage:.2f}"
+        )
     asyncio.run(run())
 
 

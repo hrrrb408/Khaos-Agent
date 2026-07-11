@@ -39,6 +39,105 @@ from khaos.coding.intelligence.resolution import ResolutionService
 from khaos.coding.intelligence.resolution.persistence import resolution_counts
 
 
+# ---- Ground truth helpers (Section 6) ----
+
+_STATUSES = ("resolved", "ambiguous", "unresolved", "external", "dynamic", "invalid")
+
+
+def _raw_candidate_counts(conn: sqlite3.Connection, repo_id: str) -> dict[str, int]:
+    """Count raw pre-resolution candidates from code_imports/calls/references."""
+    return {
+        "imports": int(conn.execute(
+            "SELECT COUNT(*) FROM code_imports WHERE project_id=?", (repo_id,)
+        ).fetchone()[0]),
+        "calls": int(conn.execute(
+            "SELECT COUNT(*) FROM code_calls WHERE project_id=?", (repo_id,)
+        ).fetchone()[0]),
+        "references": int(conn.execute(
+            "SELECT COUNT(*) FROM code_references WHERE project_id=?", (repo_id,)
+        ).fetchone()[0]),
+    }
+
+
+def _assert_mutual_exclusivity(counts: dict[str, int]) -> None:
+    """Verify candidate_total == resolved + ambiguous + unresolved + external + dynamic + invalid.
+
+    Each persisted edge has exactly one final status, so the sum of
+    per-status counts must equal the total edge count for each type.
+    This catches the "candidate_total=4, classification_sum=5" bug.
+    """
+    for edge_type, total_key in (
+        ("imports", "imports"),
+        ("calls", "call_edges"),
+        ("references", "reference_edges"),
+    ):
+        total = counts[total_key]
+        status_sum = sum(counts[f"{edge_type}_{s}"] for s in _STATUSES)
+        assert total == status_sum, (
+            f"{edge_type} mutual exclusivity violated: "
+            f"total={total} != status_sum={status_sum} "
+            f"(resolved={counts[f'{edge_type}_resolved']}, "
+            f"ambiguous={counts[f'{edge_type}_ambiguous']}, "
+            f"unresolved={counts[f'{edge_type}_unresolved']}, "
+            f"external={counts[f'{edge_type}_external']}, "
+            f"dynamic={counts[f'{edge_type}_dynamic']}, "
+            f"invalid={counts[f'{edge_type}_invalid']})"
+        )
+
+
+def _ground_truth_metrics(store: IndexStore, repo_id: str, counts: dict[str, int]) -> dict[str, float | int]:
+    """Compute TP/FP/precision/eligible/coverage.
+
+    - TP: resolved edges pointing to real targets (no dangling edges)
+    - FP: resolved edges pointing to missing targets (must be 0)
+    - precision: TP / (TP + FP)
+    - eligible: candidates that can be resolved (resolved + ambiguous + unresolved);
+      external/dynamic/invalid are excluded from the denominator
+    - coverage: resolved / eligible
+    """
+    conn = store._conn
+    # FP: resolved edges whose target_file doesn't exist in code_files
+    fp_imports = int(conn.execute(
+        "SELECT COUNT(*) FROM resolved_imports WHERE repository_id=? AND status='resolved' "
+        "AND target_file IS NOT NULL AND target_file NOT IN "
+        "(SELECT path FROM code_files WHERE project_id=?)",
+        (repo_id, repo_id),
+    ).fetchone()[0])
+    fp_calls = int(conn.execute(
+        "SELECT COUNT(*) FROM resolved_call_edges WHERE repository_id=? AND status='resolved' "
+        "AND target_file IS NOT NULL AND target_file NOT IN "
+        "(SELECT path FROM code_files WHERE project_id=?)",
+        (repo_id, repo_id),
+    ).fetchone()[0])
+    fp_refs = int(conn.execute(
+        "SELECT COUNT(*) FROM resolved_reference_edges WHERE repository_id=? AND status='resolved' "
+        "AND target_file IS NOT NULL AND target_file NOT IN "
+        "(SELECT path FROM code_files WHERE project_id=?)",
+        (repo_id, repo_id),
+    ).fetchone()[0])
+    fp = fp_imports + fp_calls + fp_refs
+
+    tp = counts["imports_resolved"] + counts["calls_resolved"] + counts["references_resolved"]
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+
+    # Eligible: resolved + ambiguous + unresolved (external/dynamic/invalid cannot be resolved)
+    eligible = (
+        counts["imports_resolved"] + counts["imports_ambiguous"] + counts["imports_unresolved"]
+        + counts["calls_resolved"] + counts["calls_ambiguous"] + counts["calls_unresolved"]
+        + counts["references_resolved"] + counts["references_ambiguous"] + counts["references_unresolved"]
+    )
+    coverage = tp / eligible if eligible > 0 else 0.0
+
+    return {
+        "tp": tp,
+        "fp": fp,
+        "precision": precision,
+        "eligible": eligible,
+        "resolved": tp,
+        "coverage": coverage,
+    }
+
+
 # ---- Fixture generation ----
 
 
@@ -175,6 +274,22 @@ def test_1000_file_resolution_performance_and_incremental_correctness():
         qs = CodeQueryService(store)
         _assert_no_dangling_edges(store, "perf")
 
+        # --- Ground truth verification (Section 5 + 6) ---
+        counts_a = resolution_counts(store._conn, "perf")
+        raw_a = _raw_candidate_counts(store._conn, "perf")
+        # Spec Section 5: CallCandidate > 0, resolved_call_edges > 0
+        assert raw_a["calls"] > 0, f"CallCandidate count must be > 0, got {raw_a['calls']}"
+        assert counts_a["call_edges"] > 0, f"resolved_call_edges count must be > 0, got {counts_a['call_edges']}"
+        assert counts_a["calls_resolved"] > 0, f"resolved call edges must be > 0, got {counts_a['calls_resolved']}"
+        # Spec Section 5: ReferenceCandidate > 0, resolved/unresolved reference edge > 0
+        assert raw_a["references"] > 0, f"ReferenceCandidate count must be > 0, got {raw_a['references']}"
+        assert counts_a["reference_edges"] > 0, f"reference edge count must be > 0, got {counts_a['reference_edges']}"
+        assert counts_a["references_resolved"] + counts_a["references_unresolved"] > 0, (
+            "resolved/unresolved reference edge count must be > 0"
+        )
+        # Spec Section 6: mutual exclusivity
+        _assert_mutual_exclusivity(counts_a)
+
         # --- B. No-modification refresh ---
         t0 = time.perf_counter()
         report_b = asyncio.run(indexer.index("perf", root))
@@ -271,6 +386,14 @@ def test_1000_file_resolution_performance_and_incremental_correctness():
         counts_incremental = resolution_counts(store._conn, "perf")
         targets_incremental = qs.find_symbol_targets("perf", "commons_func_0")
         imports_incremental = qs.resolved_imports("perf", layout["mid"][0])
+        calls_incremental = qs.call_edges_for_file("perf", layout["mid"][0])
+        refs_incremental = qs.reference_edges_for_file("perf", layout["mid"][0])
+        # Collect stable_symbol_ids for all symbols in the incremental store
+        stable_ids_incremental = {
+            row[0] for row in store._conn.execute(
+                "SELECT stable_symbol_id FROM repository_symbols WHERE repository_id=?", ("perf",)
+            ).fetchall()
+        }
 
         # Fresh rebuild from scratch (same on-disk state — file is deleted)
         store2 = IndexStore(sqlite3.connect(":memory:"))
@@ -283,57 +406,108 @@ def test_1000_file_resolution_performance_and_incremental_correctness():
         counts_rebuild = resolution_counts(store2._conn, "perf")
         targets_rebuild = qs2.find_symbol_targets("perf", "commons_func_0")
         imports_rebuild = qs2.resolved_imports("perf", layout["mid"][0])
+        calls_rebuild = qs2.call_edges_for_file("perf", layout["mid"][0])
+        refs_rebuild = qs2.reference_edges_for_file("perf", layout["mid"][0])
+        stable_ids_rebuild = {
+            row[0] for row in store2._conn.execute(
+                "SELECT stable_symbol_id FROM repository_symbols WHERE repository_id=?", ("perf",)
+            ).fetchall()
+        }
 
         # Incremental result must equal full rebuild.
-        # Note: symbol IDs include the file's generation (by design, per Section 3),
-        # so they may differ between incremental (which went through modifications
-        # that bumped the generation) and a fresh rebuild (generation=1). We compare
-        # resolution *results* (counts, target paths, statuses) instead of
-        # generation-dependent symbol IDs.
+        # Spec Section 5: incremental results and full rebuild produce identical
+        # stable IDs, statuses, and targets.
         assert counts_incremental == counts_rebuild, (
             f"incremental counts != rebuild counts:\n"
             f"incremental={counts_incremental}\nrebuild={counts_rebuild}"
+        )
+        # stable_symbol_id set must be identical (stable across rebuilds)
+        assert stable_ids_incremental == stable_ids_rebuild, (
+            f"stable_symbol_id set mismatch: "
+            f"only-incremental={stable_ids_incremental - stable_ids_rebuild}, "
+            f"only-rebuild={stable_ids_rebuild - stable_ids_incremental}"
         )
         assert len(targets_incremental) == len(targets_rebuild), (
             f"target count mismatch: incremental={len(targets_incremental)} "
             f"rebuild={len(targets_rebuild)}"
         )
         if targets_incremental and targets_rebuild:
-            # Same target path and language (resolution result), even if symbol_id
-            # differs due to generation
+            # Same target path, language, and stable_symbol_id
             assert targets_incremental[0]["path"] == targets_rebuild[0]["path"], (
                 f"target path mismatch: incremental={targets_incremental[0]['path']} "
                 f"rebuild={targets_rebuild[0]['path']}"
             )
+            assert targets_incremental[0]["stable_symbol_id"] == targets_rebuild[0]["stable_symbol_id"], (
+                f"stable_symbol_id mismatch: "
+                f"incremental={targets_incremental[0]['stable_symbol_id']} "
+                f"rebuild={targets_rebuild[0]['stable_symbol_id']}"
+            )
+        # Import edges: same count, status, target_file, target_symbol_id
         assert len(imports_incremental) == len(imports_rebuild), (
             f"import count mismatch: incremental={len(imports_incremental)} "
             f"rebuild={len(imports_rebuild)}"
         )
         if imports_incremental and imports_rebuild:
-            assert imports_incremental[0]["status"] == imports_rebuild[0]["status"], (
-                f"import status mismatch: incremental={imports_incremental[0]['status']} "
-                f"rebuild={imports_rebuild[0]['status']}"
+            assert imports_incremental[0]["status"] == imports_rebuild[0]["status"]
+            assert imports_incremental[0]["target_file"] == imports_rebuild[0]["target_file"]
+            assert imports_incremental[0]["target_symbol_id"] == imports_rebuild[0]["target_symbol_id"], (
+                f"import target_symbol_id mismatch: "
+                f"incremental={imports_incremental[0]['target_symbol_id']} "
+                f"rebuild={imports_rebuild[0]['target_symbol_id']}"
             )
-            assert imports_incremental[0]["target_file"] == imports_rebuild[0]["target_file"], (
-                f"import target_file mismatch: incremental={imports_incremental[0]['target_file']} "
-                f"rebuild={imports_rebuild[0]['target_file']}"
+        # Call edges: same count, status, target_file, target_symbol_id
+        assert len(calls_incremental) == len(calls_rebuild), (
+            f"call edge count mismatch: incremental={len(calls_incremental)} "
+            f"rebuild={len(calls_rebuild)}"
+        )
+        if calls_incremental and calls_rebuild:
+            assert calls_incremental[0]["status"] == calls_rebuild[0]["status"]
+            assert calls_incremental[0]["target_file"] == calls_rebuild[0]["target_file"]
+            assert calls_incremental[0]["target_symbol_id"] == calls_rebuild[0]["target_symbol_id"], (
+                f"call target_symbol_id mismatch: "
+                f"incremental={calls_incremental[0]['target_symbol_id']} "
+                f"rebuild={calls_rebuild[0]['target_symbol_id']}"
+            )
+        # Reference edges: same count, status, target_file, target_symbol_id
+        assert len(refs_incremental) == len(refs_rebuild), (
+            f"reference edge count mismatch: incremental={len(refs_incremental)} "
+            f"rebuild={len(refs_rebuild)}"
+        )
+        if refs_incremental and refs_rebuild:
+            assert refs_incremental[0]["status"] == refs_rebuild[0]["status"]
+            assert refs_incremental[0]["target_file"] == refs_rebuild[0]["target_file"]
+            assert refs_incremental[0]["target_symbol_id"] == refs_rebuild[0]["target_symbol_id"], (
+                f"reference target_symbol_id mismatch: "
+                f"incremental={refs_incremental[0]['target_symbol_id']} "
+                f"rebuild={refs_rebuild[0]['target_symbol_id']}"
             )
 
         # --- Report (printed to stdout for visibility, not asserted on absolute values) ---
+        gt = _ground_truth_metrics(store, "perf", counts_rebuild)
+        # Sum counts across all edge types for the report
+        total_ambiguous = sum(counts_rebuild.get(f"{t}_ambiguous", 0) for t in ("imports", "calls", "references"))
+        total_unresolved = sum(counts_rebuild.get(f"{t}_unresolved", 0) for t in ("imports", "calls", "references"))
+        total_external = sum(counts_rebuild.get(f"{t}_external", 0) for t in ("imports", "calls", "references"))
+        total_dynamic = sum(counts_rebuild.get(f"{t}_dynamic", 0) for t in ("imports", "calls", "references"))
+        total_invalid = sum(counts_rebuild.get(f"{t}_invalid", 0) for t in ("imports", "calls", "references"))
         print(
             f"\n=== 1,000-file resolution performance report ===\n"
             f"Total files: {total_files}\n"
             f"Symbols: {counts_rebuild.get('symbols', 0)}\n"
+            f"Raw candidates: imports={raw_a['imports']}, calls={raw_a['calls']}, references={raw_a['references']}\n"
             f"Import edges: {counts_rebuild.get('imports', 0)}\n"
             f"Call edges: {counts_rebuild.get('call_edges', 0)}\n"
             f"Reference edges: {counts_rebuild.get('reference_edges', 0)}\n"
             f"Resolved imports: {counts_rebuild.get('imports_resolved', 0)}\n"
             f"Resolved calls: {counts_rebuild.get('calls_resolved', 0)}\n"
             f"Resolved references: {counts_rebuild.get('references_resolved', 0)}\n"
-            f"Ambiguous: {counts_rebuild.get('ambiguous', 0)}\n"
-            f"Unresolved: {counts_rebuild.get('unresolved', 0)}\n"
-            f"External: {counts_rebuild.get('external', 0)}\n"
-            f"Dynamic: {counts_rebuild.get('dynamic', 0)}\n"
+            f"Ambiguous: {total_ambiguous}\n"
+            f"Unresolved: {total_unresolved}\n"
+            f"External: {total_external}\n"
+            f"Dynamic: {total_dynamic}\n"
+            f"Invalid: {total_invalid}\n"
+            f"Ground truth: TP={gt['tp']}, FP={gt['fp']}, precision={gt['precision']:.4f}, "
+            f"eligible={gt['eligible']}, resolved={gt['resolved']}, coverage={gt['coverage']:.4f}\n"
             f"A. First resolution: {first_ms:.1f} ms\n"
             f"B. No-mod refresh: {nomod_ms:.1f} ms (affected={len(res_b['affected_files'])})\n"
             f"C. Leaf modify: {leafmod_ms:.1f} ms (affected={len(affected_c)})\n"
@@ -431,3 +605,73 @@ def test_generation_prevents_stale_resolution_overwrite():
         assert len(new_targets) == 1
         # No dangling edges
         _assert_no_dangling_edges(store, "r")
+
+
+def test_ground_truth_mutual_exclusivity_and_no_false_positives():
+    """Ground truth metrics: mutual exclusivity, TP/FP/precision/coverage.
+
+    Builds a small controlled repository with known resolvable, external,
+    dynamic, and unresolved candidates. Verifies:
+      1. candidate_total == resolved + ambiguous + unresolved + external + dynamic + invalid
+      2. No false positives (all resolved edges point to real targets)
+      3. precision == 1.0 (no FP)
+      4. coverage = resolved / eligible (eligible = resolved + ambiguous + unresolved)
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        # util.py: defines helper (resolvable target)
+        (root / "util.py").write_text(
+            "def helper():\n    return 42\n",
+            encoding="utf-8",
+        )
+        # app.py: imports helper (resolvable), os (external), nonexistent (unresolved);
+        #         calls helper() (resolvable), obj.method() (dynamic)
+        (root / "app.py").write_text(
+            "from util import helper\n"
+            "import os\n"
+            "from nonexistent import thing\n"
+            "def main():\n"
+            "    helper()\n"
+            "    os.getcwd()\n"
+            "    obj.method()\n"
+            "    thing()\n",
+            encoding="utf-8",
+        )
+
+        store = IndexStore(sqlite3.connect(":memory:"))
+        svc = ResolutionService(store._conn, persist=True)
+        indexer = RepositoryIndexer(store, resolution_service=svc)
+        asyncio.run(indexer.index("gt", root))
+
+        counts = resolution_counts(store._conn, "gt")
+        # Mutual exclusivity per edge type
+        _assert_mutual_exclusivity(counts)
+
+        # Ground truth metrics
+        gt = _ground_truth_metrics(store, "gt", counts)
+        # No false positives: all resolved edges point to real targets
+        assert gt["fp"] == 0, f"Expected 0 false positives, got {gt['fp']}"
+        # Precision must be 1.0 (no FP)
+        assert gt["precision"] == 1.0, f"Expected precision 1.0, got {gt['precision']}"
+        # At least one resolved edge (helper import + helper call)
+        assert gt["tp"] >= 1, f"Expected at least 1 TP, got {gt['tp']}"
+        # At least one external (os import)
+        assert counts["imports_external"] + counts["calls_external"] >= 1, "Expected at least 1 external"
+        # At least one dynamic (obj.method)
+        assert counts["calls_dynamic"] >= 1, f"Expected at least 1 dynamic call, got {counts['calls_dynamic']}"
+        # Coverage in [0, 1]
+        assert 0.0 <= gt["coverage"] <= 1.0
+        # Eligible = resolved + ambiguous + unresolved (excludes external/dynamic/invalid)
+        eligible_computed = (
+            counts["imports_resolved"] + counts["imports_ambiguous"] + counts["imports_unresolved"]
+            + counts["calls_resolved"] + counts["calls_ambiguous"] + counts["calls_unresolved"]
+            + counts["references_resolved"] + counts["references_ambiguous"] + counts["references_unresolved"]
+        )
+        assert gt["eligible"] == eligible_computed
+
+        print(
+            f"\n=== Ground truth metrics ===\n"
+            f"Counts: {counts}\n"
+            f"TP={gt['tp']}, FP={gt['fp']}, precision={gt['precision']:.4f}, "
+            f"eligible={gt['eligible']}, resolved={gt['resolved']}, coverage={gt['coverage']:.4f}\n"
+        )
