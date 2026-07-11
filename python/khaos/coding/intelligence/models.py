@@ -99,6 +99,16 @@ class ParseState:
 
 
 @dataclass(frozen=True)
+class ParserMetadata:
+    grammar_name: str | None = None
+    grammar_version: str | None = None
+    grammar_abi: int | None = None
+    grammar_dialect: str | None = None
+    query_version: str | None = None
+    skipped_error_regions: int = 0
+
+
+@dataclass(frozen=True)
 class ParseResult:
     language: str
     file_path: str
@@ -111,6 +121,7 @@ class ParseResult:
     parser_version: str = "unknown"
     content_hash: str = ""
     parse_duration_ms: float = 0.0
+    metadata: ParserMetadata = field(default_factory=ParserMetadata)
 
     @property
     def path(self) -> Path:

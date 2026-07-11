@@ -91,7 +91,7 @@ class LanguageRegistry:
             return self._rejected(resolution.language, file_path, digest, "file-too-large", f"file exceeds {self.max_file_bytes} byte parse limit")
         diagnostics: list[ParseDiagnostic] = []
         for adapter in self._chains[resolution.language]:
-            status = adapter.availability()
+            status = adapter.availability(file_path)
             if not status.available:
                 diagnostics.append(ParseDiagnostic(status.code, "warning", status.message, None, True, adapter.source_name))
                 continue
