@@ -44,6 +44,7 @@ async def _spawn(context, temporary_home):
         *context.argv, cwd=str(context.cwd), env=context.environment,
         stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
     )
     return ManagedProcessHandle(
         context.correlation_id, process, temporary_home=temporary_home,

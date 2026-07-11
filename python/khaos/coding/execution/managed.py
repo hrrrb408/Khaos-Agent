@@ -116,5 +116,14 @@ def _signal_process_tree(pid: int | None, sig: signal.Signals, fallback) -> None
             return
         except OSError:
             # A factory used by a test may not have created a new session.
-            pass
+            # Still signal the direct child explicitly; ``Process.terminate``
+            # is not reliable when a restricted runner cannot address the
+            # process group.
+            try:
+                os.kill(pid, sig)
+                return
+            except ProcessLookupError:
+                return
+            except OSError:
+                pass
     fallback()
