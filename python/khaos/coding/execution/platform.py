@@ -97,12 +97,17 @@ class LinuxBubblewrapBackend:
         invisible and the sandboxed process fall back to read-only ``/``.
 
         Mount topology: ``--ro-bind / /`` first (read-only root), then
-        ``--tmpfs /tmp`` (fresh writable tmpfs), then ``--bind <worktree>
-        /tmp/workspace``.  The tmpfs must precede the bind so that bwrap
-        can ``mkdir /tmp/workspace`` inside the writable tmpfs — a
-        ``--bind`` to a top-level path that does not exist on the host
-        (e.g. ``/workspace``) fails because ``--ro-bind / /`` makes the
-        root read-only and bwrap cannot create the mount point.
+        ``--dev /dev`` (fresh devtmpfs so /dev/null etc. are accessible),
+        then ``--tmpfs /tmp`` (fresh writable tmpfs), then ``--bind
+        <worktree> /tmp/workspace``.  The tmpfs must precede the bind so
+        that bwrap can ``mkdir /tmp/workspace`` inside the writable tmpfs
+        — a ``--bind`` to a top-level path that does not exist on the
+        host (e.g. ``/workspace``) fails because ``--ro-bind / /`` makes
+        the root read-only and bwrap cannot create the mount point.
+
+        Without ``--dev /dev``, the read-only root bind exposes the
+        host's /dev/null as a read-only device node, and subprocess
+        redirection (subprocess.DEVNULL) fails with EACCES.
 
         This probe runs the real sandbox with the same mount topology as
         ``argv_prefix`` and actually writes a probe file, so it catches
@@ -115,6 +120,7 @@ class LinuxBubblewrapBackend:
         with tempfile.TemporaryDirectory() as tmp:
             completed = subprocess.run(
                 ("bwrap", "--ro-bind", "/", "/",
+                 "--dev", "/dev",
                  "--tmpfs", "/tmp",
                  "--bind", tmp, self.SANDBOX_WORKDIR,
                  "--unshare-net", "--unshare-pid",
@@ -146,6 +152,7 @@ class LinuxBubblewrapBackend:
         return (
             "bwrap",
             "--ro-bind", "/", "/",
+            "--dev", "/dev",
             "--tmpfs", "/tmp",
             "--bind", str(worktree.resolve()), self.SANDBOX_WORKDIR,
             "--unshare-net", "--unshare-pid",

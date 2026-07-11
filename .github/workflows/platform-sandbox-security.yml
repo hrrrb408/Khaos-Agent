@@ -46,7 +46,7 @@ jobs:
             python3 -c "import tempfile; print('gettempdir:', tempfile.gettempdir())"
             echo "=== bwrap isolation probe (argv_prefix topology) ==="
             tmpdir=$(mktemp -d)
-            bwrap --ro-bind / / --tmpfs /tmp --bind "$tmpdir" /tmp/workspace --unshare-net --unshare-pid --chdir /tmp/workspace -- /bin/sh -c 'echo probe > .probe && cat .probe' 2>&1
+            bwrap --ro-bind / / --dev /dev --tmpfs /tmp --bind "$tmpdir" /tmp/workspace --unshare-net --unshare-pid --chdir /tmp/workspace -- /bin/sh -c 'echo probe > .probe && cat .probe' 2>&1
             echo "probe exit: $?"
             rm -rf "$tmpdir"
           } > diagnostics/linux-bwrap-pre.txt
