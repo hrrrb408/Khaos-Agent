@@ -10,13 +10,16 @@ import pytest
 
 from khaos.tools.git_tools import git_create_branch, git_pr_body, git_push
 from khaos.tools.registry import create_runtime_registry
+from khaos.coding.execution.host import HostExecutionBackend
+from khaos.coding.execution.service import ExecutionService
 from khaos.coding.workspace.models import WorkspaceState
 
 
 def _ctx(repo, access_mode="vcs.destructive-write"):
     workspace = SimpleNamespace(task_id="task", worktree_path=repo, state=WorkspaceState.RUNNING)
     manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
-    return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": SimpleNamespace(workspace_manager=manager)}
+    service = ExecutionService(HostExecutionBackend(), manager)
+    return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}
 
 
 async def _git(repo, *args):
@@ -124,7 +127,7 @@ async def test_pr_body_generation(tmp_path) -> None:
     await _git(repo, "add", "b.py")
     await _git(repo, "commit", "-m", "fix(api): handle null")
 
-    result = json.loads(await git_pr_body(str(repo)))
+    result = json.loads(await git_pr_body(str(repo), **_ctx(repo, "read-only")))
 
     # git log lists newest-first; the title reflects the most recent
     # conventional-commit subject on the branch.
@@ -140,7 +143,7 @@ async def test_pr_body_empty_branch(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
     await git_create_branch(str(repo), "feat/empty", **_ctx(repo))
 
-    result = json.loads(await git_pr_body(str(repo)))
+    result = json.loads(await git_pr_body(str(repo), **_ctx(repo, "read-only")))
 
     assert result["title"] == ""
     assert result["files"] == []

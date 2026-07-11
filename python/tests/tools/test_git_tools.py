@@ -14,13 +14,16 @@ from khaos.tools.git_tools import (
     git_undo,
 )
 from khaos.tools.registry import create_runtime_registry
+from khaos.coding.execution.host import HostExecutionBackend
+from khaos.coding.execution.service import ExecutionService
 from khaos.coding.workspace.models import WorkspaceState
 
 
 def _ctx(repo, access_mode="vcs.write"):
     workspace = SimpleNamespace(task_id="task", worktree_path=repo, state=WorkspaceState.RUNNING)
     manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
-    return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": SimpleNamespace(workspace_manager=manager)}
+    service = ExecutionService(HostExecutionBackend(), manager)
+    return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}
 
 
 async def _git(repo, *args):
@@ -51,7 +54,7 @@ async def test_git_diff(tmp_path):
     repo = await _repo(tmp_path)
     (repo / "a.txt").write_text("two\n", encoding="utf-8")
 
-    result = await git_diff(str(repo))
+    result = await git_diff(str(repo), **_ctx(repo, "read-only"))
 
     assert result["returncode"] == 0
     assert "-one" in result["stdout"]
@@ -63,7 +66,7 @@ async def test_git_commit_and_log(tmp_path):
     await _git(repo, "add", "b.txt")
 
     commit = await git_commit(str(repo), "add b", **_ctx(repo))
-    log = await git_log(str(repo), limit=1)
+    log = await git_log(str(repo), limit=1, **_ctx(repo, "read-only"))
 
     assert commit["returncode"] == 0
     assert "add b" in log["stdout"]
@@ -72,7 +75,7 @@ async def test_git_commit_and_log(tmp_path):
 async def test_git_branch_show_current(tmp_path):
     repo = await _repo(tmp_path)
 
-    result = await git_branch(str(repo))
+    result = await git_branch(str(repo), **_ctx(repo, "read-only"))
 
     assert result["returncode"] == 0
     assert result["stdout"].strip() in {"main", "master"}
@@ -93,7 +96,7 @@ def test_runtime_registry_binds_git_tools():
 async def test_git_status_clean_repo(tmp_path):
     repo = await _repo(tmp_path)
 
-    result = json.loads(await git_status(str(repo)))
+    result = json.loads(await git_status(str(repo), **_ctx(repo, "read-only")))
 
     assert result["branch"] in {"main", "master"}
     assert result["is_clean"] is True
@@ -109,7 +112,7 @@ async def test_git_status_classifies_changes(tmp_path):
     (repo / "b.txt").write_text("b\n", encoding="utf-8")  # untracked
     await _git(repo, "add", "b.txt")  # now staged/new
 
-    result = json.loads(await git_status(str(repo)))
+    result = json.loads(await git_status(str(repo), **_ctx(repo, "read-only")))
 
     assert result["is_clean"] is False
     assert "a.txt" in result["modified"]
@@ -145,7 +148,7 @@ async def test_git_smart_commit_auto_message_for_new_file(tmp_path):
     assert len(result["commit"]) >= 7
     assert all(c in "0123456789abcdef" for c in result["commit"])
     # Confirm the commit actually landed.
-    log = await git_log(str(repo), limit=1)
+    log = await git_log(str(repo), limit=1, **_ctx(repo, "read-only"))
     assert result["commit"] in log["stdout"]
 
 
@@ -189,7 +192,7 @@ async def test_git_undo_restores_changes_staged(tmp_path):
     # The file content survives the soft reset.
     assert (repo / "c.txt").read_text(encoding="utf-8") == "c\n"
     # And it should be staged again after undo.
-    status = json.loads(await git_status(str(repo)))
+    status = json.loads(await git_status(str(repo), **_ctx(repo, "read-only")))
     assert "c.txt" in status["staged"]
 
 
