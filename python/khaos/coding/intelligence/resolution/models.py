@@ -179,6 +179,36 @@ class FileResolutionResult:
     diagnostics: tuple[ResolutionDiagnostic, ...] = ()
 
 
+@dataclass(frozen=True)
+class StaleResolutionResult:
+    """Structured rejection from a stale generation CAS failure.
+
+    Returned by ``commit_file_resolution`` when the result's generation
+    is older than the current code file generation or the persisted
+    resolution generation. The previous graph is preserved intact.
+
+    Rejection conditions:
+    - ``result.generation < code_generation``: file was re-indexed after resolution
+    - ``result.generation < persisted_generation``: a newer resolution was already committed
+    - ``code_generation is None``: file was deleted from IndexStore
+    """
+
+    source_file: str
+    result_generation: int
+    code_generation: int | None
+    persisted_generation: int
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "source_file": self.source_file,
+            "result_generation": self.result_generation,
+            "code_generation": self.code_generation,
+            "persisted_generation": self.persisted_generation,
+            "reason": self.reason,
+        }
+
+
 @dataclass
 class RepositoryResolutionReport:
     repository_id: str

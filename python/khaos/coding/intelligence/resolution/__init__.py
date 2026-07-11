@@ -14,6 +14,7 @@ from khaos.coding.intelligence.resolution.models import (
     ResolvedCallEdge,
     ResolvedImport,
     ResolvedReferenceEdge,
+    StaleResolutionResult,
 )
 from khaos.coding.intelligence.resolution.persistence import (
     apply_resolution_schema,
@@ -37,6 +38,7 @@ __all__ = [
     "ResolvedCallEdge",
     "ResolvedImport",
     "ResolvedReferenceEdge",
+    "StaleResolutionResult",
     "apply_resolution_schema",
     "build_symbol_table",
     "commit_file_resolution",

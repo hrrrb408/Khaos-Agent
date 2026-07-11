@@ -139,6 +139,16 @@ def _make_store() -> IndexStore:
     return store
 
 
+def _seed_code_file(store: IndexStore, repo_id: str, path: str, generation: int = 1) -> None:
+    """Insert a minimal code_files row so CAS can verify generation."""
+    conn = store._conn
+    conn.execute(
+        "INSERT OR REPLACE INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+        (repo_id, path, "python", 100, 0, "abc", "test", "test", "{}", 0, generation),
+    )
+    conn.commit()
+
+
 # ---- Tests ----
 
 
@@ -162,14 +172,16 @@ def test_two_repos_same_file_coexist_in_database():
     """Both call edges can exist simultaneously in the same database."""
     store = _make_store()
     conn = store._conn
+    _seed_code_file(store, "repo-a", "app.py")
+    _seed_code_file(store, "repo-b", "app.py")
 
     sym_a = _repo_symbol("repo-a", "foo", "app.py", "python")
     sym_b = _repo_symbol("repo-b", "foo", "app.py", "python")
     edge_a = _call_edge("repo-a", "foo", "app.py", target_symbol_id=sym_a.stable_symbol_id, target_file="app.py")
     edge_b = _call_edge("repo-b", "foo", "app.py", target_symbol_id=sym_b.stable_symbol_id, target_file="app.py")
 
-    commit_file_resolution(conn, "repo-a", _file_result("repo-a", "app.py", symbols=[sym_a], calls=[edge_a]))
-    commit_file_resolution(conn, "repo-b", _file_result("repo-b", "app.py", symbols=[sym_b], calls=[edge_b]))
+    assert commit_file_resolution(conn, "repo-a", _file_result("repo-a", "app.py", symbols=[sym_a], calls=[edge_a])) is None
+    assert commit_file_resolution(conn, "repo-b", _file_result("repo-b", "app.py", symbols=[sym_b], calls=[edge_b])) is None
 
     qs = CodeQueryService(store)
     edges_a = qs.call_edges_for_file("repo-a", "app.py")
@@ -185,6 +197,8 @@ def test_querying_repo_a_does_not_return_repo_b_data():
     """Querying Repo A's symbols/edges must not return Repo B's data."""
     store = _make_store()
     conn = store._conn
+    _seed_code_file(store, "repo-a", "app.py")
+    _seed_code_file(store, "repo-b", "app.py")
 
     sym_a = _repo_symbol("repo-a", "foo", "app.py", "python")
     sym_b = _repo_symbol("repo-b", "foo", "app.py", "python")
@@ -221,6 +235,8 @@ def test_reference_edges_are_isolated():
     """Reference edges are scoped by repository_id."""
     store = _make_store()
     conn = store._conn
+    _seed_code_file(store, "repo-a", "app.py")
+    _seed_code_file(store, "repo-b", "app.py")
 
     sym_a = _repo_symbol("repo-a", "value", "app.py", "python")
     sym_b = _repo_symbol("repo-b", "value", "app.py", "python")
@@ -250,6 +266,8 @@ def test_deleting_repo_a_does_not_affect_repo_b():
     """Removing Repo A's file resolution must not affect Repo B's data."""
     store = _make_store()
     conn = store._conn
+    _seed_code_file(store, "repo-a", "app.py")
+    _seed_code_file(store, "repo-b", "app.py")
 
     sym_a = _repo_symbol("repo-a", "foo", "app.py", "python")
     sym_b = _repo_symbol("repo-b", "foo", "app.py", "python")
@@ -276,6 +294,8 @@ def test_resolution_counts_are_scoped():
     """resolution_counts only counts edges for the specified repository."""
     store = _make_store()
     conn = store._conn
+    _seed_code_file(store, "repo-a", "app.py")
+    _seed_code_file(store, "repo-b", "app.py")
 
     sym_a = _repo_symbol("repo-a", "foo", "app.py", "python")
     sym_b = _repo_symbol("repo-b", "foo", "app.py", "python")
@@ -312,6 +332,7 @@ def test_duplicate_edge_id_in_same_repo_rejected():
     """Inserting the same edge_id twice in the same repo must fail."""
     store = _make_store()
     conn = store._conn
+    _seed_code_file(store, "repo-a", "app.py")
 
     sym = _repo_symbol("repo-a", "foo", "app.py", "python")
     edge = _call_edge("repo-a", "foo", "app.py", target_symbol_id=sym.stable_symbol_id, target_file="app.py")

@@ -29,6 +29,7 @@ from khaos.coding.intelligence.resolution.models import (
     ResolutionDiagnostic,
     ResolutionStatus,
     RepositoryResolutionReport,
+    StaleResolutionResult,
 )
 from khaos.coding.intelligence.resolution.persistence import (
     apply_resolution_schema,
@@ -132,7 +133,16 @@ class ResolutionService:
                 # Persist atomically — failure does not roll back ParseResult
                 if self._persist:
                     try:
-                        commit_file_resolution(self._conn, repository_id, result)
+                        stale = commit_file_resolution(self._conn, repository_id, result)
+                        if stale is not None:
+                            logger.info("Stale resolution rejected for %s: %s (result=%d, code=%s, persisted=%d)",
+                                        file_path, stale.reason, stale.result_generation,
+                                        stale.code_generation, stale.persisted_generation)
+                            report.diagnostics.append(ResolutionDiagnostic(
+                                file_path, "stale-resolution", "info",
+                                f"generation {stale.result_generation} rejected ({stale.reason}); code={stale.code_generation}, persisted={stale.persisted_generation}",
+                            ))
+                            report.skipped_files.append(file_path)
                     except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
                         logger.warning("Failed to persist resolution for %s: %s", file_path, exc)
                         report.diagnostics.append(ResolutionDiagnostic(file_path, "persistence-failed", "warning", str(exc)))

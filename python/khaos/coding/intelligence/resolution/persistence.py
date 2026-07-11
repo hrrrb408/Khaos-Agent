@@ -25,6 +25,7 @@ from khaos.coding.intelligence.resolution.models import (
     ResolvedCallEdge,
     ResolvedImport,
     ResolvedReferenceEdge,
+    StaleResolutionResult,
 )
 
 logger = logging.getLogger(__name__)
@@ -176,11 +177,23 @@ def commit_file_resolution(
     conn: sqlite3.Connection,
     repository_id: str,
     result: FileResolutionResult,
-) -> None:
-    """Atomically persist a single file's resolution results.
+) -> None | StaleResolutionResult:
+    """Atomically persist a single file's resolution results with generation CAS.
 
-    Deletes all old edges for this file+repository, then inserts new ones
-    in a single transaction. On failure, the previous graph is preserved.
+    Performs a Compare-And-Swap within a single BEGIN IMMEDIATE transaction:
+    1. Queries ``code_files`` for the current file generation.
+    2. Queries ``resolution_generation`` for the persisted resolution generation.
+    3. Compares ``result.generation`` against both.
+    4. Rejects stale writes without modifying the existing graph.
+
+    Acceptance conditions (all must hold):
+      - File exists in ``code_files`` (not deleted)
+      - ``result.generation == code_files.generation`` (matches current index)
+      - ``result.generation >= resolution_generation.generation`` (not older than persisted)
+
+    Rejection returns a structured ``StaleResolutionResult`` without mutating
+    any tables. On success, old edges for the file are deleted and new ones
+    inserted atomically. Transaction failure preserves the previous graph.
     """
     import time
 
@@ -188,6 +201,50 @@ def commit_file_resolution(
     generation = result.generation
     try:
         conn.execute("BEGIN IMMEDIATE")
+        # --- CAS: compare generations before writing ---
+        code_row = conn.execute(
+            "SELECT generation FROM code_files WHERE project_id=? AND path=?",
+            (repository_id, file_path),
+        ).fetchone()
+        code_generation = int(code_row[0]) if code_row else None
+
+        persisted_row = conn.execute(
+            "SELECT generation FROM resolution_generation WHERE repository_id=? AND source_file=?",
+            (repository_id, file_path),
+        ).fetchone()
+        persisted_generation = int(persisted_row[0]) if persisted_row else 0
+
+        # Reject if file was deleted from IndexStore
+        if code_generation is None:
+            conn.rollback()
+            return StaleResolutionResult(
+                source_file=file_path,
+                result_generation=generation,
+                code_generation=None,
+                persisted_generation=persisted_generation,
+                reason="file-deleted",
+            )
+        # Reject if result is older than current code file generation
+        if generation < code_generation:
+            conn.rollback()
+            return StaleResolutionResult(
+                source_file=file_path,
+                result_generation=generation,
+                code_generation=code_generation,
+                persisted_generation=persisted_generation,
+                reason="stale-code-generation",
+            )
+        # Reject if result is older than already-persisted resolution generation
+        if generation < persisted_generation:
+            conn.rollback()
+            return StaleResolutionResult(
+                source_file=file_path,
+                result_generation=generation,
+                code_generation=code_generation,
+                persisted_generation=persisted_generation,
+                reason="stale-resolution-generation",
+            )
+        # --- CAS passed: proceed with atomic write ---
         # Remove old symbols and edges for this file
         conn.execute("DELETE FROM repository_symbols WHERE repository_id=? AND path=?", (repository_id, file_path))
         conn.execute("DELETE FROM resolved_imports WHERE repository_id=? AND source_file=?", (repository_id, file_path))
@@ -225,6 +282,7 @@ def commit_file_resolution(
             (repository_id, file_path, generation, time.time()),
         )
         conn.commit()
+        return None
     except (sqlite3.DatabaseError, TypeError, ValueError):
         conn.rollback()
         raise
