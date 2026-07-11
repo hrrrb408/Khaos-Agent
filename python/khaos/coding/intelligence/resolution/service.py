@@ -118,7 +118,33 @@ class ResolutionService:
                 continue
             try:
                 result = self._resolve_file(file_path, table, go_module_path)
-                report.resolved_files.append(file_path)
+                # Persist atomically — failure does not roll back ParseResult.
+                # Stats are ONLY counted after successful persistence (or when
+                # persist=False, after computation). Stale rejections do NOT
+                # contribute to any stat field and are tracked separately.
+                if self._persist:
+                    try:
+                        stale = commit_file_resolution(self._conn, repository_id, result)
+                        if stale is not None:
+                            logger.info("Stale resolution rejected for %s: %s (result=%d, code=%s, persisted=%d)",
+                                        file_path, stale.reason, stale.result_generation,
+                                        stale.code_generation, stale.persisted_generation)
+                            report.stale_rejected_files.append(file_path)
+                            report.stale_rejected_count += 1
+                            report.diagnostics.append(ResolutionDiagnostic(
+                                file_path, "stale-resolution", "info",
+                                f"generation {stale.result_generation} rejected ({stale.reason}); code={stale.code_generation}, persisted={stale.persisted_generation}",
+                            ))
+                            continue
+                    except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                        logger.warning("Failed to persist resolution for %s: %s", file_path, exc)
+                        report.diagnostics.append(ResolutionDiagnostic(file_path, "persistence-failed", "warning", str(exc)))
+                        continue
+                    report.resolved_files.append(file_path)
+                else:
+                    # persist=False — track as computed but NOT persisted to database
+                    report.computed_files.append(file_path)
+                # Count stats only after successful persistence (or computation when persist=False)
                 report.symbol_count += len(result.symbols)
                 report.import_count += len(result.resolved_imports)
                 report.call_count += len(result.resolved_calls)
@@ -130,22 +156,6 @@ class ResolutionService:
                 for edge in result.resolved_references:
                     self._increment_status(report, edge.status, "reference")
                 report.diagnostics.extend(result.diagnostics)
-                # Persist atomically — failure does not roll back ParseResult
-                if self._persist:
-                    try:
-                        stale = commit_file_resolution(self._conn, repository_id, result)
-                        if stale is not None:
-                            logger.info("Stale resolution rejected for %s: %s (result=%d, code=%s, persisted=%d)",
-                                        file_path, stale.reason, stale.result_generation,
-                                        stale.code_generation, stale.persisted_generation)
-                            report.diagnostics.append(ResolutionDiagnostic(
-                                file_path, "stale-resolution", "info",
-                                f"generation {stale.result_generation} rejected ({stale.reason}); code={stale.code_generation}, persisted={stale.persisted_generation}",
-                            ))
-                            report.skipped_files.append(file_path)
-                    except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
-                        logger.warning("Failed to persist resolution for %s: %s", file_path, exc)
-                        report.diagnostics.append(ResolutionDiagnostic(file_path, "persistence-failed", "warning", str(exc)))
             except (RuntimeError, ValueError, KeyError) as exc:
                 logger.warning("Resolution failed for %s: %s", file_path, exc)
                 report.diagnostics.append(ResolutionDiagnostic(file_path, "resolution-failed", "warning", str(exc)))

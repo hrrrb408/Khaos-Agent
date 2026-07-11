@@ -181,16 +181,18 @@ class FileResolutionResult:
 
 @dataclass(frozen=True)
 class StaleResolutionResult:
-    """Structured rejection from a stale generation CAS failure.
+    """Structured rejection from an exact generation CAS failure.
 
     Returned by ``commit_file_resolution`` when the result's generation
-    is older than the current code file generation or the persisted
-    resolution generation. The previous graph is preserved intact.
+    does not exactly match the current code file generation, or is older
+    than the already-persisted resolution generation. The previous graph
+    is preserved intact — no symbols or edges are deleted or inserted.
 
-    Rejection conditions:
-    - ``result.generation < code_generation``: file was re-indexed after resolution
-    - ``result.generation < persisted_generation``: a newer resolution was already committed
-    - ``code_generation is None``: file was deleted from IndexStore
+    Rejection conditions (4-way classification):
+    - ``file-deleted``: ``code_generation is None`` — file removed from IndexStore
+    - ``stale-code-generation``: ``result.generation < code_generation`` — file was re-indexed after resolution
+    - ``future-code-generation``: ``result.generation > code_generation`` — speculative future result
+    - ``stale-resolution-generation``: ``result.generation < persisted_generation`` — a newer resolution was already committed
     """
 
     source_file: str
@@ -211,8 +213,24 @@ class StaleResolutionResult:
 
 @dataclass
 class RepositoryResolutionReport:
+    """Report for a repository resolution pass.
+
+    Stat fields (symbol_count, import_count, call_count, reference_count,
+    and per-status counts) are ONLY updated after successful persistence.
+    Files rejected by the generation CAS are tracked in ``stale_rejected_files``
+    and do NOT contribute to any stat field. A file can never appear in both
+    ``resolved_files`` and ``stale_rejected_files``.
+
+    When ``persist=False``, resolved files are tracked in ``computed_files``
+    instead of ``resolved_files`` — the stats reflect computation only, not
+    database persistence.
+    """
+
     repository_id: str
     resolved_files: list[str] = field(default_factory=list)
+    computed_files: list[str] = field(default_factory=list)
+    stale_rejected_files: list[str] = field(default_factory=list)
+    stale_rejected_count: int = 0
     symbol_count: int = 0
     import_count: int = 0
     call_count: int = 0
@@ -234,6 +252,9 @@ class RepositoryResolutionReport:
         return {
             "repository_id": self.repository_id,
             "resolved_files": self.resolved_files,
+            "computed_files": self.computed_files,
+            "stale_rejected_files": self.stale_rejected_files,
+            "stale_rejected_count": self.stale_rejected_count,
             "symbol_count": self.symbol_count,
             "import_count": self.import_count,
             "call_count": self.call_count,

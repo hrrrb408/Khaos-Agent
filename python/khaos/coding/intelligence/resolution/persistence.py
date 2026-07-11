@@ -178,18 +178,24 @@ def commit_file_resolution(
     repository_id: str,
     result: FileResolutionResult,
 ) -> None | StaleResolutionResult:
-    """Atomically persist a single file's resolution results with generation CAS.
+    """Atomically persist a single file's resolution results with exact generation CAS.
 
     Performs a Compare-And-Swap within a single BEGIN IMMEDIATE transaction:
     1. Queries ``code_files`` for the current file generation.
     2. Queries ``resolution_generation`` for the persisted resolution generation.
     3. Compares ``result.generation`` against both.
-    4. Rejects stale writes without modifying the existing graph.
+    4. Rejects any mismatch without modifying the existing graph.
 
-    Acceptance conditions (all must hold):
+    Acceptance condition (all must hold):
       - File exists in ``code_files`` (not deleted)
-      - ``result.generation == code_files.generation`` (matches current index)
+      - ``result.generation == code_files.generation`` (exact match — no future, no stale)
       - ``result.generation >= resolution_generation.generation`` (not older than persisted)
+
+    Rejection reasons (4-way classification):
+      - ``file-deleted``: file not in ``code_files``
+      - ``stale-code-generation``: ``result.generation < code_files.generation``
+      - ``future-code-generation``: ``result.generation > code_files.generation``
+      - ``stale-resolution-generation``: ``result.generation < resolution_generation.generation``
 
     Rejection returns a structured ``StaleResolutionResult`` without mutating
     any tables. On success, old edges for the file are deleted and new ones
@@ -233,6 +239,16 @@ def commit_file_resolution(
                 code_generation=code_generation,
                 persisted_generation=persisted_generation,
                 reason="stale-code-generation",
+            )
+        # Reject if result is newer than current code file generation (speculative future)
+        if generation > code_generation:
+            conn.rollback()
+            return StaleResolutionResult(
+                source_file=file_path,
+                result_generation=generation,
+                code_generation=code_generation,
+                persisted_generation=persisted_generation,
+                reason="future-code-generation",
             )
         # Reject if result is older than already-persisted resolution generation
         if generation < persisted_generation:
