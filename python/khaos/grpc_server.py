@@ -65,10 +65,11 @@ class ConfirmRequest:
 class AgentService:
     """Agent RPC service backed by AgentLoop."""
 
-    def __init__(self, db: Database, project_root: Path | None = None, config_path: Path | None = None):
+    def __init__(self, db: Database, project_root: Path | None = None, config_path: Path | None = None, router=None):
         self.db = db
         self.project_root = project_root or Path.cwd()
         self.config_path = config_path or self.project_root / "config.yaml"
+        self._router = router
         self.pending_confirmations: dict[str, dict] = {}
         self.approval_broker = ApprovalBroker()
         # Shared coding-task tracker so the TUI / TaskService can observe
@@ -168,6 +169,7 @@ class AgentService:
             db=self.db, audit_logger=AuditLogger(self.db) if self._policy.audit_enabled else None,
             task_manager=self.task_manager,
             approval_broker=self.approval_broker,
+            router=self._router,
         ))
         return result.mode_manager, result.loop
 
@@ -352,12 +354,13 @@ async def serve_json_lines(
     project_root: Path | None = None,
     config_path: Path | None = None,
     enable_subagents: bool = False,
+    router=None,
 ) -> None:
     """Serve JSON-line RPC requests over TCP."""
     db = Database(db_path)
     await db.connect()
     await db.run_migrations()
-    agent = AgentService(db, project_root=project_root, config_path=config_path)
+    agent = AgentService(db, project_root=project_root, config_path=config_path, router=router)
     await agent.start()
     memory = MemoryService(MemoryStore(db))
     audit_service = AuditService(AuditLogger(db))
