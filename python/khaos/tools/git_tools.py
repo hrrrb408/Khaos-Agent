@@ -12,8 +12,15 @@ from pathlib import Path
 from typing import Any
 
 from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy
+from khaos.coding.workspace.models import WorkspaceState
 
 logger = logging.getLogger(__name__)
+
+_PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "production", "release"})
+_WRITABLE_WORKSPACE_STATES = frozenset(
+    {WorkspaceState.READY, WorkspaceState.RUNNING, WorkspaceState.VERIFYING}
+)
+_GIT_SAFE_CONFIG = ("-c", "core.pager=cat", "-c", "core.hooksPath=/dev/null")
 
 
 @dataclass(frozen=True)
@@ -42,7 +49,8 @@ async def git_commit(repo: str = ".", message: str = "", *, task_id: str | None 
     """Create a git commit."""
     if not message:
         raise ValueError("commit message is required")
-    return await _git(["git", "commit", "-m", message], repo, _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, network_policy))
+    args = ["git", *_GIT_SAFE_CONFIG, "-c", "commit.gpgSign=false", "commit", "--no-verify", "--no-gpg-sign", "-m", message]
+    return await _git(args, repo, _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, "none"))
 
 
 async def git_branch(repo: str = ".", name: str = "", checkout: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
@@ -51,7 +59,8 @@ async def git_branch(repo: str = ".", name: str = "", checkout: bool = False, *,
         context = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, network_policy)
         return await _git(["git", "checkout", "-b", name], repo, context)
     if name:
-        return await _git(["git", "branch", name], repo, _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, network_policy))
+        _validate_branch_name(name)
+        return await _git(["git", *_GIT_SAFE_CONFIG, "branch", name], repo, _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, "none"))
     return await _git(["git", "branch", "--show-current"], repo, _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none"))
 
 
@@ -119,9 +128,14 @@ async def git_smart_commit(cwd: str = ".", message: str = "", *, task_id: str | 
     the resulting commit, or ``{"message": "Nothing to commit."}`` when the
     tree is clean.
     """
-    ctx = _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, network_policy)
-    await _git(["git", "add", "-A"], cwd, ctx)
-    diff = await _git(["git", "diff", "--cached", "--name-status"], cwd, ctx)
+    write_ctx = _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, "none")
+    read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
+    await _git(["git", *_GIT_SAFE_CONFIG, "add", "-A", "--", "."], cwd, write_ctx)
+    diff = await _git(
+        ["git", "-c", "core.pager=cat", "diff", "--no-ext-diff", "--cached", "--name-status"],
+        cwd,
+        read_ctx,
+    )
     diff_lines = [
         line for line in diff["stdout"].splitlines() if line.strip()
     ]
@@ -134,7 +148,11 @@ async def git_smart_commit(cwd: str = ".", message: str = "", *, task_id: str | 
     if not message:
         message = _generate_message(files)
 
-    commit = await _git(["git", "commit", "-m", message], cwd, ctx)
+    commit = await _git(
+        ["git", *_GIT_SAFE_CONFIG, "-c", "commit.gpgSign=false", "commit", "--no-verify", "--no-gpg-sign", "-m", message],
+        cwd,
+        write_ctx,
+    )
     if commit["returncode"] != 0:
         return json.dumps(
             {
@@ -144,13 +162,13 @@ async def git_smart_commit(cwd: str = ".", message: str = "", *, task_id: str | 
             ensure_ascii=False,
         )
 
-    branch_result = await _git(["git", "branch", "--show-current"], cwd, ctx)
+    branch_result = await _git(["git", "branch", "--show-current"], cwd, read_ctx)
     branch = branch_result["stdout"].strip()
     # ``git commit`` prints "[<branch> (root-commit) <hash>] <subject>"; pull
     # the trailing 7-char hash out of the brackets, fall back to rev-parse.
     revision = _extract_commit_hash(commit["stdout"])
     if not revision:
-        rev = await _git(["git", "rev-parse", "--short", "HEAD"], cwd, ctx)
+        rev = await _git(["git", "rev-parse", "--short", "HEAD"], cwd, read_ctx)
         revision = rev["stdout"].strip()
     logger.info("git_smart_commit: %s on %s (%d files)", message, branch, len(files))
     return json.dumps(
@@ -477,6 +495,8 @@ def _describe(paths: list[str]) -> str:
 async def _git(args: list[str], repo: str, context: _GitExecutionContext) -> dict[str, Any]:
     if context.access_mode == "read-only":
         return await _git_read_via_execution_service(args, repo, context)
+    if context.access_mode == "vcs.write":
+        return await _git_write_via_execution_service(args, repo, context)
     if context.access_mode != "read-only":
         if not context.task_id or not context.workspace_id or context.execution_service is None:
             raise PermissionError(f"{context.access_mode} requires an active TaskWorkspace")
@@ -541,6 +561,128 @@ async def _git_read_via_execution_service(
         access_mode="read-only",
     )
     result = await context.execution_service.execute(request)
+    return {
+        "command": args,
+        "returncode": int(result.return_code) if result.return_code is not None else -1,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
+
+
+async def _git_write_via_execution_service(
+    args: list[str], repo: str, context: _GitExecutionContext
+) -> dict[str, Any]:
+    """Execute an allowlisted local Git mutation in the active task worktree."""
+    workspace, cwd = _resolve_git_workspace(repo, context, require_writable=True)
+    _validate_local_write_argv(args)
+    await _verify_task_branch(workspace, cwd, context)
+    environment = _git_environment()
+    request = ExecutionRequest(
+        argv=tuple(args),
+        cwd=cwd,
+        writable_roots=(cwd,),
+        environment=environment,
+        allowed_environment_keys=frozenset(environment),
+        network_policy=NetworkPolicy.NONE,
+        task_id=context.task_id,
+        workspace_id=context.workspace_id,
+        access_mode="workspace-write",
+    )
+    result = await context.execution_service.execute(request)
+    return _legacy_git_result(args, result)
+
+
+def _resolve_git_workspace(
+    repo: str, context: _GitExecutionContext, *, require_writable: bool
+) -> tuple[Any, Path]:
+    if not context.task_id or not context.workspace_id or context.execution_service is None:
+        raise PermissionError(f"{context.access_mode} requires an active TaskWorkspace")
+    manager = context.execution_service.workspace_manager
+    workspace = manager.get(context.workspace_id) if manager is not None else None
+    if workspace is None or workspace.task_id != context.task_id:
+        raise PermissionError("task/workspace binding is invalid")
+    if require_writable and workspace.state not in _WRITABLE_WORKSPACE_STATES:
+        raise PermissionError("workspace is not available for writable Git operations")
+    if not require_writable and workspace.state in {
+        WorkspaceState.CANCELLED,
+        WorkspaceState.FAILED,
+        WorkspaceState.CLEANING,
+        WorkspaceState.CLEANED,
+    }:
+        raise PermissionError("workspace is not available for Git operations")
+    cwd = workspace.worktree_path.expanduser().resolve()
+    repository_root = workspace.repository_root.expanduser().resolve()
+    if cwd == repository_root:
+        raise PermissionError("Git writes cannot target the main worktree")
+    if repo not in {"", "."} and Path(repo).expanduser().resolve() != cwd:
+        raise PermissionError("repo must match the active TaskWorkspace")
+    return workspace, cwd
+
+
+async def _verify_task_branch(
+    workspace: Any, cwd: Path, context: _GitExecutionContext
+) -> None:
+    read_context = _context(
+        context.task_id,
+        context.workspace_id,
+        "read-only",
+        context.execution_service,
+        context.approval_context,
+        "none",
+    )
+    result = await _git_read_via_execution_service(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], str(cwd), read_context
+    )
+    branch = result["stdout"].strip()
+    if result["returncode"] != 0 or not branch:
+        raise PermissionError("detached HEAD is not writable")
+    if branch in _PROTECTED_BRANCHES:
+        raise PermissionError("commits on protected branches are not allowed")
+    if branch != workspace.branch_name:
+        raise PermissionError("current branch does not match the TaskWorkspace branch")
+
+
+def _validate_local_write_argv(args: list[str]) -> None:
+    allowed = False
+    if args[:1] == ["git"] and "commit" in args:
+        allowed = "--no-verify" in args and "--no-gpg-sign" in args and "-m" in args
+    elif args[-4:] == ["add", "-A", "--", "."]:
+        allowed = True
+    elif len(args) >= 2 and args[-2] == "branch":
+        _validate_branch_name(args[-1])
+        allowed = True
+    if not allowed:
+        raise PermissionError("Git write argv is not allowlisted")
+
+
+def _validate_branch_name(name: str) -> None:
+    if name in _PROTECTED_BRANCHES:
+        raise ValueError("protected branch name is not allowed")
+    if (
+        not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", name)
+        or ".." in name
+        or "//" in name
+        or "@{" in name
+        or name.endswith(("/", ".", ".lock"))
+        or any(part in {"", ".", ".."} for part in name.split("/"))
+    ):
+        raise ValueError("invalid branch name")
+
+
+def _git_environment() -> dict[str, str]:
+    return {
+        "PATH": os.environ.get("PATH", ""),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "GIT_PAGER": "cat",
+        "PAGER": "cat",
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_EDITOR": ":",
+        "GIT_SEQUENCE_EDITOR": ":",
+        "GIT_CONFIG_NOSYSTEM": "1",
+    }
+
+
+def _legacy_git_result(args: list[str], result: Any) -> dict[str, Any]:
     return {
         "command": args,
         "returncode": int(result.return_code) if result.return_code is not None else -1,

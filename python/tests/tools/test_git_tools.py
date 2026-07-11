@@ -20,7 +20,13 @@ from khaos.coding.workspace.models import WorkspaceState
 
 
 def _ctx(repo, access_mode="vcs.write"):
-    workspace = SimpleNamespace(task_id="task", worktree_path=repo, state=WorkspaceState.RUNNING)
+    workspace = SimpleNamespace(
+        task_id="task",
+        worktree_path=repo,
+        repository_root=repo.parent / "main-worktree",
+        branch_name="task/test",
+        state=WorkspaceState.RUNNING,
+    )
     manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
     service = ExecutionService(HostExecutionBackend(), manager)
     return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}
@@ -47,6 +53,7 @@ async def _repo(tmp_path):
     (tmp_path / "a.txt").write_text("one\n", encoding="utf-8")
     await _git(tmp_path, "add", "a.txt")
     await _git(tmp_path, "commit", "-m", "initial")
+    await _git(tmp_path, "checkout", "-b", "task/test")
     return tmp_path
 
 
@@ -72,13 +79,54 @@ async def test_git_commit_and_log(tmp_path):
     assert "add b" in log["stdout"]
 
 
+async def test_git_commit_stays_in_task_worktree_and_skips_hooks(tmp_path):
+    main = tmp_path / "main"
+    task = tmp_path / "task"
+    main.mkdir()
+    await _git(main, "init", "-b", "main")
+    await _git(main, "config", "user.email", "test@example.com")
+    await _git(main, "config", "user.name", "Tester")
+    (main / "tracked.txt").write_text("base\n", encoding="utf-8")
+    await _git(main, "add", "tracked.txt")
+    await _git(main, "commit", "-m", "initial")
+    await _git(main, "branch", "task/test")
+    await _git(main, "worktree", "add", str(task), "task/test")
+    marker = tmp_path / "hook-ran"
+    hook = main / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch '{marker}'\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    (task / "tracked.txt").write_text("task change\n", encoding="utf-8")
+    await _git(task, "add", "tracked.txt")
+    workspace = SimpleNamespace(
+        task_id="task",
+        worktree_path=task,
+        repository_root=main,
+        branch_name="task/test",
+        state=WorkspaceState.RUNNING,
+    )
+    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    context = {
+        "task_id": "task",
+        "workspace_id": "workspace",
+        "execution_service": ExecutionService(HostExecutionBackend(), manager),
+    }
+
+    result = await git_commit(str(task), "feat: task-only", **context)
+
+    assert result["returncode"] == 0
+    assert not marker.exists()
+    assert (main / "tracked.txt").read_text(encoding="utf-8") == "base\n"
+    assert (await _git(main, "status", "--porcelain")).strip() == ""
+    assert (await _git(task, "branch", "--show-current")).strip() == "task/test"
+
+
 async def test_git_branch_show_current(tmp_path):
     repo = await _repo(tmp_path)
 
     result = await git_branch(str(repo), **_ctx(repo, "read-only"))
 
     assert result["returncode"] == 0
-    assert result["stdout"].strip() in {"main", "master"}
+    assert result["stdout"].strip() == "task/test"
 
 
 def test_runtime_registry_binds_git_tools():
@@ -98,7 +146,7 @@ async def test_git_status_clean_repo(tmp_path):
 
     result = json.loads(await git_status(str(repo), **_ctx(repo, "read-only")))
 
-    assert result["branch"] in {"main", "master"}
+    assert result["branch"] == "task/test"
     assert result["is_clean"] is True
     assert result["modified"] == []
     assert result["untracked"] == []
@@ -143,7 +191,7 @@ async def test_git_smart_commit_auto_message_for_new_file(tmp_path):
     assert result["files_changed"] == 1
     assert result["message"].startswith("feat")
     assert "feature.py" in result["message"]
-    assert result["branch"] in {"main", "master"}
+    assert result["branch"] == "task/test"
     # git's default short hash is 7-12 hex chars depending on repo size.
     assert len(result["commit"]) >= 7
     assert all(c in "0123456789abcdef" for c in result["commit"])
