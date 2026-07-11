@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -34,7 +35,7 @@ class WorkspaceManager:
     """Create isolated worktrees and immutable ChangeSets."""
 
     def __init__(self, root: Path | None = None) -> None:
-        self.root = (root or Path.home() / ".cache" / "khaos" / "worktrees").expanduser().resolve()
+        self.root = (root or Path(tempfile.gettempdir()) / "khaos" / "worktrees").expanduser().resolve()
         self._workspaces: dict[str, TaskWorkspace] = {}
         self._task_ids: set[str] = set()
         self._lock = asyncio.Lock()

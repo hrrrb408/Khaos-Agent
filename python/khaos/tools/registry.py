@@ -124,7 +124,7 @@ class ToolInvocationBroker:
                 if service is None:
                     raise PermissionError("process.execute requires ExecutionService")
             if capability.name == "filesystem.write":
-                if context.get("coding_workspace_enforced", True) and (context.get("workspace_id") is None or context.get("task_id") is None):
+                if context.get("workspace_id") is None or context.get("task_id") is None:
                     raise PermissionError("filesystem.write requires active TaskWorkspace")
             if capability.name == "host.integration" and mode == "coding":
                 raise PermissionError("host integration is unavailable to Coding Agent")
@@ -136,10 +136,9 @@ class ToolInvocationBroker:
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
         if any(capability.name == "filesystem.write" for capability in capabilities):
-            if context.get("coding_workspace_enforced", True):
-                handler_params["workspace_manager"] = context.get("workspace_manager")
-                handler_params["task_id"] = context.get("task_id")
-                handler_params["workspace_id"] = context.get("workspace_id")
+            handler_params["workspace_manager"] = context.get("workspace_manager")
+            handler_params["task_id"] = context.get("task_id")
+            handler_params["workspace_id"] = context.get("workspace_id")
         return await definition.handler(**handler_params)
 
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:
@@ -177,7 +176,7 @@ def _infer_capability(definition: ToolDefinition) -> ToolCapability | None:
     name = definition.name
     if name in {"terminal", "test_run", "sandbox_exec"} or name in {"process"}:
         return ToolCapability("process.execute", frozenset(definition.modes), frozenset({"task-workspace"}))
-    if name in {"write_file", "multi_edit", "file_patch", "mkdir", "delete_file"}:
+    if name in {"write_file", "multi_edit", "patch", "file_patch", "mkdir", "delete_file", "copy_file", "move_file"}:
         return ToolCapability("filesystem.write", frozenset(definition.modes), frozenset({"task-workspace"}))
     if name.startswith("git_"):
         return ToolCapability("vcs.write" if definition.permission_level == "write" else "vcs.read", frozenset(definition.modes), frozenset({"task-workspace"}))

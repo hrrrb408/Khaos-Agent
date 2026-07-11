@@ -364,8 +364,15 @@ def _tree_view_sync(path: str, max_depth: int) -> dict[str, Any]:
     }
 
 
-async def copy_file(src: str, dst: str) -> dict[str, Any]:
+async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
     """Copy a file or directory."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding copy requires matching active TaskWorkspace")
+        from khaos.coding.workspace.boundary import resolve_write_target
+        src = str(resolve_write_target(workspace.worktree_path, src))
+        dst = str(resolve_write_target(workspace.worktree_path, dst))
     return await asyncio.to_thread(_copy_file_sync, src, dst)
 
 
@@ -400,8 +407,15 @@ def _copy_file_sync(src: str, dst: str) -> dict[str, Any]:
     return {"ok": True, "src": str(src_path), "dst": str(dst_path), "size_bytes": size_bytes}
 
 
-async def move_file(src: str, dst: str) -> dict[str, Any]:
+async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
     """Move or rename a file or directory."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding move requires matching active TaskWorkspace")
+        from khaos.coding.workspace.boundary import resolve_write_target
+        src = str(resolve_write_target(workspace.worktree_path, src))
+        dst = str(resolve_write_target(workspace.worktree_path, dst))
     return await asyncio.to_thread(_move_file_sync, src, dst)
 
 

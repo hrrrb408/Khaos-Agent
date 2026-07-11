@@ -1,3 +1,5 @@
+import subprocess
+
 import pytest
 
 from khaos.db import Database
@@ -80,14 +82,20 @@ async def test_task_service_only_approves_or_rejects_blocked_tasks():
 
 
 async def test_agent_service_permission_waits_for_confirm(tmp_path):
-    (tmp_path / "prompts").mkdir()
-    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
-    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    project = tmp_path / "project"
+    (project / "prompts").mkdir(parents=True)
+    (project / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (project / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=project, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=project, check=True)
+    subprocess.run(["git", "add", "."], cwd=project, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=project, check=True)
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    service = AgentService(db, project_root=tmp_path)
-    target = tmp_path / "agent.txt"
+    service = AgentService(db, project_root=project)
+    target = "agent.txt"
 
     stream = service.chat(ChatRequest("s1", f"/tool write_file {target} hello", "coding"))
     first = await stream.__anext__()
@@ -99,7 +107,11 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
     events = [event async for event in stream]
 
     assert any(event["event"] == "tool_result" and event["data"]["success"] for event in events)
-    assert target.read_text(encoding="utf-8") == "hello"
+    task = next(iter(service.task_manager._tasks.values()))
+    target_path = task.metadata["worktree_path"]
+    from pathlib import Path
+    assert (Path(target_path) / target).read_text(encoding="utf-8") == "hello"
+    assert not (project / target).exists()
     await db.close()
 
 
