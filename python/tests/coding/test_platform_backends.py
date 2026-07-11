@@ -110,9 +110,13 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
         "assert pid < 100, f'unexpected host PID {pid}'",
         "_log.write('pid ok: %s\\n' % pid); _log.flush()",
         # 8. Background child — must be killed when bwrap tears down the namespace.
-        #    First verify the test passes WITHOUT a background child to isolate
-        #    whether the Popen is causing bwrap to hang on teardown.
-        "_log.write('all steps done, exiting normally\\n'); _log.flush()",
+        #    Use os.system with shell background (&) and full stdio redirection to
+        #    /dev/null.  This avoids subprocess.Popen's internal pipe/fd bookkeeping
+        #    which was causing bwrap to hang on teardown.  The shell starts sleep in
+        #    the background and exits immediately; os.system returns.  Python then
+        #    exits normally.  When PID 1 exits, the kernel SIGKILLs the orphaned sleep.
+        "os.system('sleep 30 </dev/null >/dev/null 2>&1 &')",
+        "_log.write('spawned sleep via shell\\n'); _log.flush()",
     ])
 
     # 1. Real bwrap execution
