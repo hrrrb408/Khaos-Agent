@@ -9,11 +9,15 @@ import importlib.resources
 import re
 import threading
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from khaos.coding.intelligence.models import CallCandidate, ImportReference, ParseDiagnostic, ParseResult, ParserMetadata, ParseState, ReferenceCandidate, SourceLocation, Symbol
+from khaos.coding.intelligence.models import CallCandidate, ChangedRange, ImportReference, ParseDiagnostic, ParseResult, ParserMetadata, ParseState, ReferenceCandidate, SourceLocation, Symbol
+
+
+INCREMENTAL_STATE_VERSION = 1
+INCREMENTAL_MAX_CHANGED_RATIO = 0.50
 
 
 @dataclass(frozen=True)
@@ -76,7 +80,7 @@ def _node_location(file_path: str, content: bytes, node: Any) -> SourceLocation:
 
 class TreeSitterAdapter:
     source_name = "tree-sitter"
-    supports_incremental = False
+    supports_incremental = True
 
     def __init__(self, language: str, extensions: frozenset[str]) -> None:
         self.language = self.language_id = language
@@ -145,11 +149,12 @@ class TreeSitterAdapter:
             return value
 
     def parse(self, *, file_path: str, content: bytes, previous_state: ParseState | None = None) -> ParseResult:
-        del previous_state
         started = time.perf_counter()
         language, symbols_query, imports_query, calls_query, references_query, spec = self._initialize(self._spec(file_path))
         tree_sitter = importlib.import_module("tree_sitter")
-        tree = tree_sitter.Parser(language).parse(content)
+        grammar_version = importlib.metadata.version(spec.distribution)
+        fingerprint = _grammar_fingerprint(self.version, spec, grammar_version, language.abi_version)
+        tree, telemetry, state_diagnostic = self._parse_tree(language, spec, grammar_version, fingerprint, file_path, content, previous_state)
         all_nodes = list(_walk(tree.root_node))
         error_nodes = [node for node in all_nodes if node.type == "ERROR" or node.is_missing]
         symbol_matches = tree_sitter.QueryCursor(symbols_query).matches(tree.root_node)
@@ -161,11 +166,166 @@ class TreeSitterAdapter:
         calls, skipped_calls = _extract_calls(spec, call_matches, symbols, content, file_path, error_nodes)
         references, skipped_references = _extract_references(spec, reference_matches, symbols, imports, calls, content, file_path, error_nodes)
         diagnostics: list[ParseDiagnostic] = []
+        if state_diagnostic is not None:
+            diagnostics.append(state_diagnostic)
         if tree.root_node.has_error:
             node = error_nodes[0] if error_nodes else tree.root_node
             diagnostics.append(ParseDiagnostic("parse-error", "warning", "Tree-sitter recovered from syntax error", _node_location(file_path, content, node), True, self.source_name))
-        metadata = ParserMetadata(spec.module, importlib.metadata.version(spec.distribution), language.abi_version, spec.dialect, spec.query_version, len(error_nodes), len(all_nodes), len(symbol_matches), len(import_matches), len(call_matches), len(reference_matches), skipped_calls, skipped_references)
-        return ParseResult(spec.language, file_path, tuple(symbols), tuple(imports), tuple(calls), tuple(references), tuple(diagnostics), self.source_name, self.version, _hash(content), (time.perf_counter() - started) * 1000, metadata)
+        metadata = ParserMetadata(spec.module, grammar_version, language.abi_version, spec.dialect, spec.query_version, len(error_nodes), len(all_nodes), len(symbol_matches), len(import_matches), len(call_matches), len(reference_matches), skipped_calls, skipped_references, **telemetry)
+        internal_state = _TreeSitterParseState(INCREMENTAL_STATE_VERSION, file_path, spec.language, spec.dialect, self.source_name, self.version, spec.module, grammar_version, language.abi_version, spec.query_version, fingerprint, _hash(content), len(content), content, tree, telemetry["incremental_generation"])
+        parse_state = ParseState(self.source_name, internal_state.content_hash, internal_state)
+        return ParseResult(spec.language, file_path, tuple(symbols), tuple(imports), tuple(calls), tuple(references), tuple(diagnostics), self.source_name, self.version, _hash(content), (time.perf_counter() - started) * 1000, metadata, parse_state)
+
+    def _parse_tree(self, language: Any, spec: GrammarSpec, grammar_version: str, fingerprint: str, file_path: str, content: bytes, previous_state: ParseState | None) -> tuple[Any, dict[str, Any], ParseDiagnostic | None]:
+        tree_sitter = importlib.import_module("tree_sitter")
+        base = {"parse_mode": "full", "incremental_used": False, "incremental_generation": 0, "previous_content_hash": None, "changed_range_count": 0, "changed_byte_count": 0, "changed_ranges": (), "edit_start_byte": None, "edit_old_end_byte": None, "edit_new_end_byte": None, "full_reparse_reason": None, "semantic_refresh_mode": "full-file"}
+        if previous_state is None:
+            return tree_sitter.Parser(language).parse(content), base, None
+        valid, code, message, old = _validate_state(previous_state, language, spec, self.version, grammar_version, fingerprint, file_path)
+        if not valid or old is None:
+            telemetry = {**base, "parse_mode": "full-fallback", "full_reparse_reason": code, "previous_content_hash": previous_state.content_hash}
+            diagnostic = ParseDiagnostic(code, "warning", message, None, True, self.source_name)
+            return tree_sitter.Parser(language).parse(content), telemetry, diagnostic
+        generation = old.generation + 1
+        if old.content_hash == _hash(content):
+            telemetry = {**base, "parse_mode": "noop", "incremental_generation": generation, "previous_content_hash": old.content_hash}
+            return old.native_tree.copy(), telemetry, None
+        edit = canonical_edit(old.source_bytes, content)
+        changed_size = max(edit.old_end_byte - edit.start_byte, edit.new_end_byte - edit.start_byte)
+        ratio = changed_size / max(len(old.source_bytes), len(content), 1)
+        edit_fields = {"edit_start_byte": edit.start_byte, "edit_old_end_byte": edit.old_end_byte, "edit_new_end_byte": edit.new_end_byte, "previous_content_hash": old.content_hash, "incremental_generation": generation}
+        if ratio > INCREMENTAL_MAX_CHANGED_RATIO:
+            telemetry = {**base, **edit_fields, "parse_mode": "full-fallback", "full_reparse_reason": "changed-ratio-exceeded"}
+            return tree_sitter.Parser(language).parse(content), telemetry, None
+        try:
+            edited_tree = old.native_tree.copy()
+            edited_tree.edit(edit.start_byte, edit.old_end_byte, edit.new_end_byte, edit.start_point, edit.old_end_point, edit.new_end_point)
+            new_tree = tree_sitter.Parser(language).parse(content, edited_tree)
+            native_ranges = edited_tree.changed_ranges(new_tree)
+            ranges = tuple(_safe_changed_range(item) for item in native_ranges)
+            if not ranges:
+                ranges = (_changed_range_from_edit(edit, content),)
+            if any(item.end_byte < item.start_byte or item.end_byte > len(content) for item in ranges):
+                raise ValueError("invalid changed range returned by Tree-sitter")
+            telemetry = {**base, **edit_fields, "parse_mode": "incremental", "incremental_used": True, "changed_range_count": len(ranges), "changed_byte_count": sum(item.end_byte - item.start_byte for item in ranges), "changed_ranges": ranges}
+            return new_tree, telemetry, None
+        except (RuntimeError, TypeError, ValueError) as exc:
+            telemetry = {**base, **edit_fields, "parse_mode": "full-fallback", "full_reparse_reason": "incremental-parse-failed"}
+            diagnostic = ParseDiagnostic("incremental-state-invalid", "warning", str(exc), None, True, self.source_name)
+            return tree_sitter.Parser(language).parse(content), telemetry, diagnostic
+
+
+@dataclass(frozen=True, repr=False)
+class _TreeSitterParseState:
+    state_version: int
+    file_path: str
+    language: str
+    dialect: str
+    adapter_source: str
+    parser_version: str
+    grammar_name: str
+    grammar_version: str
+    grammar_abi: int
+    query_version: str
+    grammar_fingerprint: str
+    content_hash: str
+    content_length: int
+    source_bytes: bytes = field(repr=False, compare=False)
+    native_tree: Any = field(repr=False, compare=False)
+    generation: int = 0
+
+    def __reduce__(self) -> object:
+        raise TypeError("native Tree-sitter state cannot be pickled")
+
+
+@dataclass(frozen=True)
+class CanonicalEdit:
+    start_byte: int
+    old_end_byte: int
+    new_end_byte: int
+    start_point: Any
+    old_end_point: Any
+    new_end_point: Any
+
+
+def byte_offset_to_tree_sitter_point(content: bytes, offset: int) -> Any:
+    if offset < 0 or offset > len(content):
+        raise ValueError("byte offset outside content")
+    if offset < len(content) and content[offset] & 0xC0 == 0x80:
+        raise ValueError("byte offset is not a UTF-8 code-point boundary")
+    prefix = content[:offset]
+    row = prefix.count(b"\n")
+    column = len(prefix.rsplit(b"\n", 1)[-1])
+    return (row, column)
+
+
+def canonical_edit(old: bytes, new: bytes) -> CanonicalEdit:
+    prefix = 0
+    limit = min(len(old), len(new))
+    while prefix < limit and old[prefix] == new[prefix]:
+        prefix += 1
+    while prefix > 0 and ((_is_continuation(old, prefix)) or (_is_continuation(new, prefix))):
+        prefix -= 1
+    suffix = 0
+    old_remaining = len(old) - prefix
+    new_remaining = len(new) - prefix
+    while suffix < old_remaining and suffix < new_remaining and old[len(old) - suffix - 1] == new[len(new) - suffix - 1]:
+        suffix += 1
+    old_end = len(old) - suffix
+    new_end = len(new) - suffix
+    while suffix > 0 and (_is_continuation(old, old_end) or _is_continuation(new, new_end)):
+        suffix -= 1
+        old_end += 1
+        new_end += 1
+    return CanonicalEdit(prefix, old_end, new_end, byte_offset_to_tree_sitter_point(old, prefix), byte_offset_to_tree_sitter_point(old, old_end), byte_offset_to_tree_sitter_point(new, new_end))
+
+
+def _is_continuation(content: bytes, offset: int) -> bool:
+    return offset < len(content) and content[offset] & 0xC0 == 0x80
+
+
+def _grammar_fingerprint(parser_version: str, spec: GrammarSpec, grammar_version: str, grammar_abi: int) -> str:
+    value = f"{parser_version}|{spec.module}|{grammar_version}|{grammar_abi}|{spec.dialect}|{spec.query_version}"
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _validate_state(previous: ParseState, language: Any, spec: GrammarSpec, parser_version: str, grammar_version: str, fingerprint: str, file_path: str) -> tuple[bool, str, str, _TreeSitterParseState | None]:
+    if previous.adapter_source != "tree-sitter":
+        return False, "incremental-state-incompatible", "previous adapter is not tree-sitter", None
+    old = previous.opaque
+    if not isinstance(old, _TreeSitterParseState):
+        return False, "incremental-state-invalid", "opaque incremental state has an invalid type", None
+    if old.state_version != INCREMENTAL_STATE_VERSION:
+        return False, "incremental-state-version-mismatch", "unsupported incremental state version", None
+    if old.file_path != file_path:
+        return False, "incremental-state-file-mismatch", "incremental state belongs to another file", None
+    if old.language != spec.language:
+        return False, "incremental-state-incompatible", "incremental state language mismatch", None
+    if old.dialect != spec.dialect:
+        return False, "incremental-state-dialect-mismatch", "incremental state dialect mismatch", None
+    expected = (parser_version, spec.module, grammar_version, language.abi_version, spec.query_version, fingerprint)
+    actual = (old.parser_version, old.grammar_name, old.grammar_version, old.grammar_abi, old.query_version, old.grammar_fingerprint)
+    if actual != expected:
+        return False, "incremental-state-grammar-mismatch", "parser, grammar, ABI, query, or fingerprint mismatch", None
+    if previous.content_hash != old.content_hash or _hash(old.source_bytes) != old.content_hash or len(old.source_bytes) != old.content_length:
+        return False, "incremental-state-invalid", "incremental source integrity check failed", None
+    if old.adapter_source != "tree-sitter" or old.native_tree is None or old.native_tree.language != language:
+        return False, "incremental-state-invalid", "native Tree language or adapter mismatch", None
+    return True, "available", "incremental state is compatible", old
+
+
+def _safe_changed_range(value: Any) -> ChangedRange:
+    return ChangedRange(value.start_byte, value.end_byte, value.start_point.row, value.start_point.column, value.end_point.row, value.end_point.column)
+
+
+def _changed_range_from_edit(edit: CanonicalEdit, content: bytes) -> ChangedRange:
+    end_byte = edit.new_end_byte
+    if end_byte == edit.start_byte and content:
+        end_byte = min(len(content), edit.start_byte + 1)
+        while end_byte < len(content) and _is_continuation(content, end_byte):
+            end_byte += 1
+    end_point = byte_offset_to_tree_sitter_point(content, end_byte)
+    return ChangedRange(edit.start_byte, end_byte, edit.start_point[0], edit.start_point[1], end_point[0], end_point[1])
 
 
 class GrammarVersionError(RuntimeError): pass

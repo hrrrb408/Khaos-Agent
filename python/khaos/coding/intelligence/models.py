@@ -7,7 +7,7 @@ boundaries and is deliberately not represented by these values.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -98,7 +98,28 @@ class ParseState:
 
     adapter_source: str
     content_hash: str
-    opaque: object | None = None
+    opaque: object | None = field(default=None, repr=False, compare=False)
+
+    def __reduce__(self) -> object:
+        raise TypeError("ParseState is process-local and cannot be pickled")
+
+    def safe_summary(self) -> dict[str, Any]:
+        value = {"adapter_source": self.adapter_source, "content_hash": self.content_hash}
+        opaque = self.opaque
+        for name in ("language", "dialect", "generation", "state_version"):
+            if opaque is not None and hasattr(opaque, name):
+                value[name] = getattr(opaque, name)
+        return value
+
+
+@dataclass(frozen=True)
+class ChangedRange:
+    start_byte: int
+    end_byte: int
+    start_line: int
+    start_byte_column: int
+    end_line: int
+    end_byte_column: int
 
 
 @dataclass(frozen=True)
@@ -116,6 +137,18 @@ class ParserMetadata:
     reference_query_match_count: int = 0
     skipped_error_call_count: int = 0
     skipped_error_reference_count: int = 0
+    parse_mode: str = "full"
+    incremental_used: bool = False
+    incremental_generation: int = 0
+    previous_content_hash: str | None = None
+    changed_range_count: int = 0
+    changed_byte_count: int = 0
+    changed_ranges: tuple[ChangedRange, ...] = ()
+    edit_start_byte: int | None = None
+    edit_old_end_byte: int | None = None
+    edit_new_end_byte: int | None = None
+    full_reparse_reason: str | None = None
+    semantic_refresh_mode: str = "full-file"
 
 
 @dataclass(frozen=True)
@@ -132,14 +165,18 @@ class ParseResult:
     content_hash: str = ""
     parse_duration_ms: float = 0.0
     metadata: ParserMetadata = field(default_factory=ParserMetadata)
+    parse_state: ParseState | None = field(default=None, repr=False, compare=False)
 
     @property
     def path(self) -> Path:
         """Compatibility alias for the Phase 0 ``ParsedFile.path`` field."""
         return Path(self.file_path)
 
-    def to_dict(self, *, include_duration: bool = True) -> dict[str, Any]:
-        value = asdict(self)
+    def to_dict(self, *, include_duration: bool = True, include_parse_state: bool = False) -> dict[str, Any]:
+        value = asdict(replace(self, parse_state=None))
+        value.pop("parse_state", None)
         if not include_duration:
             value.pop("parse_duration_ms", None)
+        if include_parse_state:
+            value["parse_state"] = self.parse_state.safe_summary() if self.parse_state else None
         return value
