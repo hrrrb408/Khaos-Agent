@@ -145,6 +145,11 @@ class ToolInvocationBroker:
             handler_params["network_policy"] = context.get("network_policy", "none")
             if name == "git_push":
                 handler_params["credential_context"] = context.get("credential_context")
+        if any(capability.name == "network.access" for capability in capabilities):
+            handler_params["network_policy"] = context.get("network_policy", "none")
+            handler_params["credential_context"] = context.get("credential_context")
+        if any(capability.name in {"remote.write", "remote.destructive-write"} for capability in capabilities):
+            handler_params["approval_context"] = context.get("approval_context")
         if mode == "coding" and any(capability.name == "filesystem.write" for capability in capabilities):
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
@@ -289,14 +294,26 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     from khaos.tools.github_tools import GITHUB_TOOL_SPECS
 
     for spec in [*CHANNEL_TOOLS, *GITHUB_TOOL_SPECS]:
+        classification = spec.get("classification")
+        capabilities: tuple[ToolCapability, ...] = ()
+        modes = ["all"]
+        if classification is not None:
+            modes = ["coding"]
+            capabilities = (
+                ToolCapability("process.execute", frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability(classification, frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability("network.access", frozenset({"coding"}), frozenset({"user-selected"})),
+                ToolCapability("credential.access", frozenset({"coding"}), frozenset({"temporary"})),
+            )
         registry.register(
             ToolDefinition(
                 name=spec["name"],
                 description=spec["description"],
                 parameters=spec["parameters"],
-                modes=["all"],
+                modes=modes,
                 permission_level="write" if spec["name"] in {"channel_enable", "channel_disable", "github_create_pr", "github_comment_issue", "github_request_review"} else "read",
                 parallel=spec["name"] in {"channel_list", "channel_health", "github_read_issue"},
+                capabilities=capabilities,
             )
         )
     registry.register(

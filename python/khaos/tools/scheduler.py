@@ -193,6 +193,16 @@ class ToolScheduler:
                             requester=session_id or "",
                             approval_id=normalized["id"],
                         )
+                    if destructive_context is None:
+                        from khaos.tools.github_tools import prepare_github_approval
+
+                        destructive_context = await prepare_github_approval(
+                            tool.name,
+                            normalized["arguments"],
+                            tool_context,
+                            requester=session_id or "",
+                            approval_id=normalized["id"],
+                        )
                 except (PermissionError, ValueError) as exc:
                     yield SchedulerEvent(
                         event="tool_result",
