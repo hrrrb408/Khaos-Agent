@@ -79,44 +79,36 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
     (main_repo / "README.txt").write_text("main\n", encoding="utf-8")
 
     command = "\n".join([
-        "import os, socket, subprocess, time",
+        "import os, socket",
         "from pathlib import Path",
-        "_log = open('debug.log', 'w')",
-        "_log.write('start: %s\\n' % time.time()); _log.flush()",
         # 2. Worktree writable
         "Path('inside.txt').write_text('ok')",
-        "_log.write('wrote inside.txt\\n'); _log.flush()",
         # 6. /tmp is a fresh controlled tmpfs — writable
         "assert Path('/tmp').is_dir()",
         "Path('/tmp/sandbox.tmp').write_text('tmp-ok')",
-        "_log.write('wrote /tmp/sandbox.tmp\\n'); _log.flush()",
         # 4. Outside-worktree write fails (read-only root bind)
         f"try: Path({str(outside)!r}).write_text('no')",
         "except OSError: pass",
         "else: raise SystemExit('outside write allowed')",
-        "_log.write('outside write blocked\\n'); _log.flush()",
         # 3. Main repository is read-only
         f"try: Path({str(main_repo / 'README.txt')!r}).write_text('tampered')",
         "except OSError: pass",
         "else: raise SystemExit('main repo write allowed')",
-        "_log.write('main repo write blocked\\n'); _log.flush()",
         # 5. Network access truly fails
         "try: socket.create_connection(('1.1.1.1', 53), timeout=1)",
         "except OSError: pass",
         "else: raise SystemExit('network allowed')",
-        "_log.write('network blocked\\n'); _log.flush()",
         # 7. PID isolation — new PID namespace yields a low namespace-local PID
         "pid = os.getpid()",
         "assert pid < 100, f'unexpected host PID {pid}'",
-        "_log.write('pid ok: %s\\n' % pid); _log.flush()",
-        # 8. Background child — must be killed when bwrap tears down the namespace.
-        #    Use os.system with shell background (&) and full stdio redirection to
-        #    /dev/null.  This avoids subprocess.Popen's internal pipe/fd bookkeeping
-        #    which was causing bwrap to hang on teardown.  The shell starts sleep in
-        #    the background and exits immediately; os.system returns.  Python then
-        #    exits normally.  When PID 1 exits, the kernel SIGKILLs the orphaned sleep.
+        # 8. Background child — bwrap waits for ALL processes in the PID
+        #    namespace to exit before returning (it does NOT SIGKILL them
+        #    when PID 1 exits).  A short-lived sleep (3s < 15s budget) lets
+        #    bwrap return within the test budget while still exercising the
+        #    teardown path.  os.system with shell background (&) and full
+        #    stdio redirection to /dev/null avoids subprocess.Popen's fd
+        #    bookkeeping which previously caused teardown hangs.
         "os.system('sleep 3 </dev/null >/dev/null 2>&1 &')",
-        "_log.write('spawned sleep 3 via shell\\n'); _log.flush()",
     ])
 
     # 1. Real bwrap execution
@@ -127,15 +119,7 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
             budget=ResourceBudget(timeout_seconds=15),
         )
     )
-    # Read debug log from workspace (persists even on timeout because the
-    # worktree is bind-mounted on the host).
-    debug_log = ""
-    debug_path = workspace / "debug.log"
-    if debug_path.exists():
-        debug_log = debug_path.read_text(encoding="utf-8")
-    assert result.status == "passed", (
-        f"status={result.status} stderr={result.stderr!r} debug_log={debug_log!r}"
-    )
+    assert result.status == "passed", result.stderr
 
     # 2. Worktree writable — evidence
     assert (workspace / "inside.txt").read_text(encoding="utf-8") == "ok"
