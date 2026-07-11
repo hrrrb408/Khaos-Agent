@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -94,6 +95,7 @@ class AgentLoop:
         task_id: str | None = None,
         skill_generator=None,
         workspace_manager=None,
+        execution_service=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -128,6 +130,11 @@ class AgentLoop:
         self.skill_generator = skill_generator
         self.workspace_manager = workspace_manager
         self.active_workspace = None
+        self.execution_service = execution_service
+        if self.execution_service is None:
+            from khaos.coding.execution import ExecutionService, HostExecutionBackend
+
+            self.execution_service = ExecutionService(HostExecutionBackend())
 
     async def run(
         self,
@@ -283,12 +290,21 @@ class AgentLoop:
                     )
                     return
 
-                async for event in self.tool_scheduler.stream_batch(
-                    tool_calls,
-                    self.mode_manager.current_mode.value,
-                    session_id=session_id,
-                    confirm_callback=self.confirm_callback,
-                ):
+                stream_args = {
+                    "session_id": session_id,
+                    "confirm_callback": self.confirm_callback,
+                    "tool_context": {
+                        "execution_service": self.execution_service,
+                        "task_id": active_task_id,
+                        "workspace_id": getattr(self.active_workspace, "id", None),
+                        "workspace_manager": self.workspace_manager,
+                        "coding_workspace_enforced": self.active_workspace is not None,
+                    },
+                }
+                if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:
+                    stream_args.pop("tool_context")
+                event_stream = self.tool_scheduler.stream_batch(tool_calls, self.mode_manager.current_mode.value, **stream_args)
+                async for event in event_stream:
                     if event.permission_request is not None:
                         request = event.permission_request
                         if self.task_manager is not None and active_task_id:

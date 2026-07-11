@@ -128,6 +128,9 @@ async def terminal(
     cwd: str = ".",
     background: bool = False,
     timeout: int = 30,
+    execution_service=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Run a terminal command in the foreground or background."""
     command_check = check_command_safety(command)
@@ -145,6 +148,13 @@ async def terminal(
             "risk_level": "dangerous",
         }
     workdir = str(Path(cwd).expanduser().resolve())
+    if execution_service is not None:
+        parts = shlex.split(command)
+        from khaos.coding.execution import ExecutionRequest, ResourceBudget
+        result = await execution_service.execute(
+            ExecutionRequest(tuple(parts), Path(workdir), budget=ResourceBudget(timeout_seconds=timeout), task_id=task_id, workspace_id=workspace_id, access_mode="read-only" if safety["read_only"] else "workspace-write")
+        )
+        return {"command": command, "returncode": result.return_code, "stdout": result.stdout, "stderr": result.stderr, "status": result.status, "safety": safety}
     executable = _isolated_command(command, workdir)
     if executable is None:
         return {"ok": False, "error": "OS sandbox unavailable", "risk_level": "blocked"}

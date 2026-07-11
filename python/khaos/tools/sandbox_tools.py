@@ -108,9 +108,14 @@ async def sandbox_exec(
     memory: str = "512m",
     timeout: int = 30,
     client: DockerSandboxClient | None = None,
+    execution_service=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Create a Docker sandbox, execute a command, then destroy it."""
     _validate_command(command)
+    if execution_service is not None and (task_id is None or workspace_id is None):
+        raise PermissionError("sandbox_exec requires an active TaskWorkspace")
     config = SandboxConfig(image, project_dir, network, cpus, memory, timeout)
     docker = client or DockerSandboxClient()
     container_id = ""

@@ -24,7 +24,13 @@ logger = logging.getLogger(__name__)
 TEST_RUN_TIMEOUT: int = 120
 
 
-async def test_run(command: str, cwd: str) -> str:
+async def test_run(
+    command: str,
+    cwd: str,
+    execution_service=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
+) -> str:
     """Run a test command and return a structured JSON summary.
 
     The command is split with :mod:`shlex` and executed via
@@ -46,6 +52,24 @@ async def test_run(command: str, cwd: str) -> str:
             {"success": False, "error": f"invalid command: {exc}"},
             ensure_ascii=False,
         )
+
+    if execution_service is not None:
+        from khaos.coding.execution import ExecutionRequest, ResourceBudget
+
+        result = await execution_service.execute(
+            ExecutionRequest(
+                tuple(parts),
+                Path(workdir),
+                budget=ResourceBudget(timeout_seconds=TEST_RUN_TIMEOUT),
+                task_id=task_id,
+                workspace_id=workspace_id,
+                access_mode="workspace-write",
+            )
+        )
+        output = f"{result.stdout}{result.stderr}"
+        exit_code = int(result.return_code or 0)
+        parsed = _parse_result(command, output, exit_code)
+        return json.dumps(parsed, ensure_ascii=False)
 
     try:
         isolated = _isolated_command(shlex.join(parts), workdir)

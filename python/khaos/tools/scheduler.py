@@ -10,7 +10,7 @@ from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
 from khaos.security.middleware import SecurityMiddleware
-from khaos.tools.registry import ToolRegistry
+from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 
 
 ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
@@ -91,6 +91,7 @@ class ToolScheduler:
         # output formatting (line numbers, truncation) is unchanged. Writes and
         # any tool without a Rust fast path keep using the asyncio handler.
         self.use_rust_executor = use_rust_executor
+        self.invocation_broker = ToolInvocationBroker(registry)
 
     async def execute_batch(
         self,
@@ -98,10 +99,11 @@ class ToolScheduler:
         mode: str,
         session_id: str | None = None,
         confirm_callback: ConfirmCallback | None = None,
+        tool_context: dict[str, Any] | None = None,
     ) -> list[ToolResult]:
         """Execute a batch and return final tool results."""
         results: list[ToolResult] = []
-        async for event in self.stream_batch(tool_calls, mode, session_id, confirm_callback):
+        async for event in self.stream_batch(tool_calls, mode, session_id, confirm_callback, tool_context):
             if event.result is not None:
                 results.append(event.result)
         return results
@@ -112,6 +114,7 @@ class ToolScheduler:
         mode: str,
         session_id: str | None = None,
         confirm_callback: ConfirmCallback | None = None,
+        tool_context: dict[str, Any] | None = None,
     ):
         """Execute a batch while yielding permission and result events."""
         if self.budget.is_exhausted:
@@ -204,7 +207,7 @@ class ToolScheduler:
 
         parallel_calls, serial_calls = self.registry.get_parallel_tools(approved_calls)
         if parallel_calls:
-            tasks = [self._execute_one(call, session_id) for call in parallel_calls]
+            tasks = [self._execute_one(call, session_id, mode, tool_context or {}) for call in parallel_calls]
             for result in await asyncio.gather(*tasks):
                 yield SchedulerEvent(event="tool_result", result=result)
         for call in serial_calls:
@@ -222,10 +225,10 @@ class ToolScheduler:
                 break
             yield SchedulerEvent(
                 event="tool_result",
-                result=await self._execute_one(call, session_id),
+                result=await self._execute_one(call, session_id, mode, tool_context or {}),
             )
 
-    async def _execute_one(self, call: dict, session_id: str | None) -> ToolResult:
+    async def _execute_one(self, call: dict, session_id: str | None, mode: str, tool_context: dict[str, Any]) -> ToolResult:
         start = time.monotonic()
         tool = self.registry.get(call["name"])
         if tool.handler is None:
@@ -264,7 +267,7 @@ class ToolScheduler:
                     arguments=call["arguments"],
                 )
             output = await asyncio.wait_for(
-                tool.handler(**call.get("arguments", {})),
+                self.invocation_broker.invoke(tool.name, mode=mode, context=tool_context, **call.get("arguments", {})),
                 timeout=tool.timeout,
             )
             self.budget.record(len(str(output)))

@@ -34,14 +34,15 @@ class ToolDefinition:
 class ToolRegistry:
     """Runtime registry for declared tools."""
 
-    def __init__(self):
+    def __init__(self, enforce_capabilities: bool = False):
         self._tools: dict[str, ToolDefinition] = {}
+        self.enforce_capabilities = enforce_capabilities
 
     def register(self, definition: ToolDefinition) -> None:
         """Register a tool definition."""
         if definition.name in self._tools:
             raise ValueError(f"tool already registered: {definition.name}")
-        if not definition.capabilities:
+        if self.enforce_capabilities and not definition.capabilities:
             capability = _infer_capability(definition)
             definition.capabilities = (capability,) if capability is not None else ()
         self._tools[definition.name] = definition
@@ -113,7 +114,7 @@ class ToolInvocationBroker:
     async def invoke(self, name: str, *, mode: str, context: dict[str, Any], **params: Any) -> Any:
         definition = self.registry.get(name)
         capabilities = definition.capabilities
-        if not capabilities and (definition.permission_level != "read" or name in {"terminal", "test_run", "sandbox_exec"}):
+        if not capabilities and self.registry.enforce_capabilities:
             raise PermissionError(f"tool {name} has no declared capability")
         for capability in capabilities:
             if mode not in capability.modes and "all" not in capability.modes:
@@ -123,11 +124,23 @@ class ToolInvocationBroker:
                 if service is None:
                     raise PermissionError("process.execute requires ExecutionService")
             if capability.name == "filesystem.write":
-                if context.get("workspace_id") is None or context.get("task_id") is None:
+                if context.get("coding_workspace_enforced", True) and (context.get("workspace_id") is None or context.get("task_id") is None):
                     raise PermissionError("filesystem.write requires active TaskWorkspace")
+            if capability.name == "host.integration" and mode == "coding":
+                raise PermissionError("host integration is unavailable to Coding Agent")
         if definition.handler is None:
             raise ToolNotFoundError(f"tool handler not configured: {name}")
-        return await definition.handler(**params)
+        handler_params = dict(params)
+        if any(capability.name == "process.execute" for capability in capabilities):
+            handler_params["execution_service"] = context.get("execution_service")
+            handler_params["task_id"] = context.get("task_id")
+            handler_params["workspace_id"] = context.get("workspace_id")
+        if any(capability.name == "filesystem.write" for capability in capabilities):
+            if context.get("coding_workspace_enforced", True):
+                handler_params["workspace_manager"] = context.get("workspace_manager")
+                handler_params["task_id"] = context.get("task_id")
+                handler_params["workspace_id"] = context.get("workspace_id")
+        return await definition.handler(**handler_params)
 
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:
         expected = schema.get("type")
@@ -172,7 +185,7 @@ def _infer_capability(definition: ToolDefinition) -> ToolCapability | None:
         return ToolCapability("network.access", frozenset(definition.modes), frozenset({"user-selected"}))
     if definition.permission_level == "read":
         return ToolCapability("filesystem.read", frozenset(definition.modes), frozenset({"task-workspace", "app-data", "user-selected"}))
-    return None
+    return ToolCapability("host.integration", frozenset(definition.modes), frozenset({"app-data", "user-selected"}))
 
 
 # Hermes batch 5: declarative specs for cron + history tools. Defined here
@@ -1470,7 +1483,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
 
 def create_builtin_registry() -> ToolRegistry:
     """Create a registry with the Phase 1 built-in declarations."""
-    registry = ToolRegistry()
+    registry = ToolRegistry(enforce_capabilities=True)
     register_builtin_tools(registry)
     return registry
 

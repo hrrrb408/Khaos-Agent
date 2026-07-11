@@ -151,5 +151,6 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         skill_generator=skill_generator, project_root=root,
         coding_context_builder=cfg.coding_context_builder,
         workspace_manager=workspace_manager,
+        execution_service=execution_service,
     )
     return RuntimeResult(loop, mode_manager, task_manager, skill_generator, scheduler, memory_manager, skill_manager, verify_factory, execution_service)

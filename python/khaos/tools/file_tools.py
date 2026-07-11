@@ -73,8 +73,14 @@ def _read_file_sync(path: str, offset: int, limit: int) -> dict[str, Any]:
     }
 
 
-async def write_file(path: str, content: str) -> dict[str, Any]:
+async def write_file(path: str, content: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
     """Overwrite a file, creating parent directories as needed."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding write requires matching active TaskWorkspace")
+        from khaos.coding.workspace.boundary import resolve_write_target
+        path = str(resolve_write_target(workspace.worktree_path, path))
     return await asyncio.to_thread(_write_file_sync, path, content)
 
 
@@ -94,8 +100,14 @@ def _write_file_sync(path: str, content: str) -> dict[str, Any]:
     return {"path": str(file_path), "bytes": len(content.encode("utf-8"))}
 
 
-async def patch(path: str, old: str, new: str, fuzzy: bool = True) -> dict[str, Any]:
+async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
     """Atomically replace text in a file, with optional fuzzy block matching."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding patch requires matching active TaskWorkspace")
+        from khaos.coding.workspace.boundary import resolve_write_target
+        path = str(resolve_write_target(workspace.worktree_path, path))
     return await asyncio.to_thread(_patch_sync, path, old, new, fuzzy)
 
 
@@ -118,8 +130,14 @@ def _patch_sync(path: str, old: str, new: str, fuzzy: bool) -> dict[str, Any]:
     return {"path": str(file_path), "replaced": 1, "fuzzy": True, "score": score}
 
 
-async def multi_edit(path: str, edits: list[dict]) -> str:
+async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> str:
     """Apply multiple exact search-and-replace edits to one file atomically."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding edit requires matching active TaskWorkspace")
+        from khaos.coding.workspace.boundary import resolve_write_target
+        path = str(resolve_write_target(workspace.worktree_path, path))
     return await asyncio.to_thread(_multi_edit_sync, path, edits)
 
 
