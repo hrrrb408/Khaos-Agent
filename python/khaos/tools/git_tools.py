@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -10,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -34,10 +34,11 @@ class _GitExecutionContext:
     execution_service: Any
     approval_context: dict[str, Any] | None
     network_policy: str
+    credential_context: dict[str, Any] | None = None
 
 
-def _context(task_id: str | None, workspace_id: str | None, access_mode: str, execution_service: Any, approval_context: dict[str, Any] | None, network_policy: str) -> _GitExecutionContext:
-    return _GitExecutionContext(task_id, workspace_id, access_mode, execution_service, approval_context, network_policy)
+def _context(task_id: str | None, workspace_id: str | None, access_mode: str, execution_service: Any, approval_context: dict[str, Any] | None, network_policy: str, credential_context: dict[str, Any] | None = None) -> _GitExecutionContext:
+    return _GitExecutionContext(task_id, workspace_id, access_mode, execution_service, approval_context, network_policy, credential_context)
 
 
 async def git_diff(repo: str = ".", staged: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
@@ -305,7 +306,7 @@ async def git_create_branch(
 
 
 async def git_push(
-    cwd: str = ".", remote: str = "origin", branch: str = "", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.remote-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none"
+    cwd: str = ".", remote: str = "origin", branch: str = "", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.remote-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", credential_context: dict[str, Any] | None = None
 ) -> str:
     """Push the current (or named) branch to ``remote``.
 
@@ -317,20 +318,32 @@ async def git_push(
     Returns JSON ``{"remote", "branch", "pushed": bool, ...}``.
     """
     remote = remote or "origin"
-    ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy)
-    if not branch:
-        branch_result = await _git(["git", "branch", "--show-current"], cwd, ctx)
-        branch = branch_result["stdout"].strip() or "HEAD"
-
-    # ``-u`` sets up tracking so future ``git push`` needs no args.
-    push = await _git(
-        ["git", "push", "-u", remote, branch], cwd, ctx
-    )
+    _validate_remote_name(remote)
+    ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy, credential_context)
+    read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
+    branch_result = await _git(["git", "branch", "--show-current"], cwd, read_ctx)
+    current_branch = branch_result["stdout"].strip()
+    if branch and branch != current_branch:
+        raise PermissionError("git_push only permits the current TaskWorkspace branch")
+    branch = current_branch
+    _validate_branch_name(branch)
+    try:
+        push = await _git(
+            ["git", *_GIT_SAFE_CONFIG, "push", "--set-upstream", remote, f"{branch}:{branch}"], cwd, ctx
+        )
+    except PermissionError as exc:
+        return json.dumps(
+            {"remote": remote, "branch": branch, "pushed": False, "error": f"unsupported: {exc}"},
+            ensure_ascii=False,
+        )
     pushed = push["returncode"] == 0
+    binding = (approval_context or {}).get("binding", {})
     payload: dict[str, Any] = {
         "remote": remote,
         "branch": branch,
         "pushed": pushed,
+        "remote_host": binding.get("remote_host", ""),
+        "credential_scope": binding.get("credential_scope", "none"),
     }
     if not pushed:
         payload["error"] = (push["stderr"].strip() or push["stdout"].strip())[
@@ -523,32 +536,9 @@ async def _git(args: list[str], repo: str, context: _GitExecutionContext) -> dic
         return await _git_write_via_execution_service(args, repo, context)
     if context.access_mode == "vcs.destructive-write":
         return await _git_destructive_via_execution_service(args, repo, context)
-    if context.access_mode != "read-only":
-        if not context.task_id or not context.workspace_id or context.execution_service is None:
-            raise PermissionError(f"{context.access_mode} requires an active TaskWorkspace")
-    if context.execution_service is not None and context.workspace_id:
-        manager = context.execution_service.workspace_manager
-        workspace = manager.get(context.workspace_id) if manager is not None else None
-        if workspace is None or workspace.task_id != context.task_id:
-            raise PermissionError("task/workspace binding is invalid")
-        if workspace.state.value in {"cancelled", "failed", "cleaning", "cleaned"}:
-            raise PermissionError("workspace is not available for Git operations")
-        cwd = str(workspace.worktree_path.resolve())
-    else:
-        cwd = str(Path(repo).expanduser().resolve())
-    process = await asyncio.create_subprocess_exec(
-        *args,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await process.communicate()
-    return {
-        "command": args,
-        "returncode": int(process.returncode or 0),
-        "stdout": stdout.decode("utf-8", errors="replace"),
-        "stderr": stderr.decode("utf-8", errors="replace"),
-    }
+    if context.access_mode == "vcs.remote-write":
+        return await _git_remote_via_execution_service(args, repo, context)
+    raise PermissionError(f"unsupported Git access mode: {context.access_mode}")
 
 
 async def _git_read_via_execution_service(
@@ -642,6 +632,42 @@ async def _git_destructive_via_execution_service(
     return _legacy_git_result(args, result)
 
 
+async def _git_remote_via_execution_service(
+    args: list[str], repo: str, context: _GitExecutionContext
+) -> dict[str, Any]:
+    """Consume a remote-operation approval and execute one fixed push argv."""
+    if context.network_policy != NetworkPolicy.UNRESTRICTED_WITH_APPROVAL.value:
+        approval = context.approval_context
+        if isinstance(approval, dict) and approval.get("approval_broker") is not None:
+            await approval["approval_broker"].cancel_operation(approval.get("approval_id", ""))
+        raise PermissionError("git_push requires server-authorized network policy")
+    workspace, cwd = _resolve_git_workspace(repo, context, require_writable=True)
+    remote, branch, refspec = _validate_push_argv(args)
+    await _consume_remote_approval(workspace, cwd, context, remote, branch, refspec)
+    credential_scope, credential_environment = _credential_material(
+        context.approval_context.get("binding", {}).get("remote_url", ""),
+        context.credential_context,
+    )
+    if credential_scope != context.approval_context["binding"].get("credential_scope"):
+        raise PermissionError("credential scope changed after approval")
+    with tempfile.TemporaryDirectory(prefix="khaos-git-remote-home-") as temporary_home:
+        environment = _git_environment(temporary_home)
+        environment.update(credential_environment)
+        request = ExecutionRequest(
+            argv=tuple(args),
+            cwd=cwd,
+            writable_roots=(cwd,),
+            environment=environment,
+            allowed_environment_keys=frozenset(environment),
+            network_policy=NetworkPolicy.UNRESTRICTED_WITH_APPROVAL,
+            task_id=context.task_id,
+            workspace_id=context.workspace_id,
+            access_mode="workspace-write",
+        )
+        result = await context.execution_service.execute(request)
+    return _legacy_git_result(args, result)
+
+
 async def prepare_destructive_git_approval(
     tool_name: str,
     arguments: dict[str, Any],
@@ -724,6 +750,89 @@ async def prepare_destructive_git_approval(
     }
 
 
+async def prepare_remote_git_approval(
+    tool_name: str,
+    arguments: dict[str, Any],
+    tool_context: dict[str, Any],
+    *,
+    requester: str,
+    approval_id: str,
+) -> dict[str, Any] | None:
+    """Bind a push approval to workspace, refspec, remote identity and state."""
+    if tool_name != "git_push":
+        return None
+    if tool_context.get("network_policy") != NetworkPolicy.UNRESTRICTED_WITH_APPROVAL.value:
+        raise PermissionError("git_push requires explicit network permission")
+    broker = tool_context.get("approval_broker")
+    if broker is None:
+        raise PermissionError("git_push requires ApprovalBroker")
+    context = _context(
+        tool_context.get("task_id"),
+        tool_context.get("workspace_id"),
+        "read-only",
+        tool_context.get("execution_service"),
+        None,
+        "none",
+    )
+    cwd_argument = str(arguments.get("cwd", "."))
+    workspace, cwd = _resolve_git_workspace(cwd_argument, context, require_writable=True)
+    branch_result = await _git_read_via_execution_service(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], str(cwd), context
+    )
+    branch = branch_result["stdout"].strip()
+    if branch_result["returncode"] != 0 or not branch:
+        raise PermissionError("detached HEAD cannot be pushed")
+    if branch != workspace.branch_name:
+        raise PermissionError("current branch does not match the TaskWorkspace branch")
+    if branch in _PROTECTED_BRANCHES:
+        raise PermissionError("protected branches cannot be pushed")
+    requested_branch = str(arguments.get("branch") or branch)
+    if requested_branch != branch:
+        raise PermissionError("git_push only permits the current TaskWorkspace branch")
+    _validate_branch_name(branch)
+    remote = str(arguments.get("remote") or "origin")
+    _validate_remote_name(remote)
+    remote_result = await _git_read_via_execution_service(
+        ["git", "remote", "get-url", "--push", remote], str(cwd), context
+    )
+    if remote_result["returncode"] != 0 or not remote_result["stdout"].strip():
+        raise PermissionError("configured push remote does not exist")
+    remote_url = remote_result["stdout"].strip()
+    remote_host = _remote_host(remote_url)
+    credential_scope, _ = _credential_material(
+        remote_url, tool_context.get("credential_context")
+    )
+    head, diff_hash = await _git_state(cwd, context)
+    refspec = f"{branch}:{branch}"
+    expiry = time.time() + 120.0
+    binding = {
+        "task_id": workspace.task_id,
+        "workspace_id": context.workspace_id,
+        "operation": "git.push-set-upstream",
+        "target": f"{remote}/{refspec}",
+        "remote": remote,
+        "remote_url": remote_url,
+        "remote_host": remote_host,
+        "local_branch": branch,
+        "remote_branch": branch,
+        "head": head,
+        "diff_hash": diff_hash,
+        "refspec": refspec,
+        "set_upstream": True,
+        "network_policy": NetworkPolicy.UNRESTRICTED_WITH_APPROVAL.value,
+        "credential_scope": credential_scope,
+        "expiry": expiry,
+        "requester": requester,
+    }
+    await broker.register_operation(approval_id, binding, expiry)
+    return {
+        "approval_broker": broker,
+        "approval_id": approval_id,
+        "binding": binding,
+        "credential_context": tool_context.get("credential_context"),
+    }
+
+
 def _destructive_operation_target(
     tool_name: str, arguments: dict[str, Any]
 ) -> tuple[str, str] | None:
@@ -786,6 +895,63 @@ async def _consume_destructive_approval(
     broker = approval.get("approval_broker")
     if broker is None or not await broker.consume_operation(approval.get("approval_id", ""), current):
         raise PermissionError("destructive Git approval is missing, stale, or replayed")
+
+
+async def _consume_remote_approval(
+    workspace: Any,
+    cwd: Path,
+    context: _GitExecutionContext,
+    remote: str,
+    branch: str,
+    refspec: str,
+) -> None:
+    approval = context.approval_context
+    if not isinstance(approval, dict):
+        raise PermissionError("git_push requires approval")
+    binding = dict(approval.get("binding") or {})
+    read_context = _context(
+        context.task_id, context.workspace_id, "read-only", context.execution_service, None, "none"
+    )
+    branch_result = await _git_read_via_execution_service(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], str(cwd), read_context
+    )
+    current_branch = branch_result["stdout"].strip()
+    if branch_result["returncode"] != 0 or not current_branch:
+        raise PermissionError("detached HEAD cannot be pushed")
+    if current_branch != workspace.branch_name or branch != current_branch:
+        raise PermissionError("current branch does not match the approved TaskWorkspace branch")
+    if current_branch in _PROTECTED_BRANCHES:
+        raise PermissionError("protected branches cannot be pushed")
+    remote_result = await _git_read_via_execution_service(
+        ["git", "remote", "get-url", "--push", remote], str(cwd), read_context
+    )
+    if remote_result["returncode"] != 0:
+        raise PermissionError("approved remote is no longer configured")
+    remote_url = remote_result["stdout"].strip()
+    credential_scope, _ = _credential_material(remote_url, context.credential_context)
+    head, diff_hash = await _git_state(cwd, read_context)
+    current = {
+        "task_id": workspace.task_id,
+        "workspace_id": context.workspace_id,
+        "operation": "git.push-set-upstream",
+        "target": f"{remote}/{refspec}",
+        "remote": remote,
+        "remote_url": remote_url,
+        "remote_host": _remote_host(remote_url),
+        "local_branch": branch,
+        "remote_branch": branch,
+        "head": head,
+        "diff_hash": diff_hash,
+        "refspec": refspec,
+        "set_upstream": True,
+        "network_policy": NetworkPolicy.UNRESTRICTED_WITH_APPROVAL.value,
+        "credential_scope": credential_scope,
+        "expiry": binding.get("expiry"),
+        "requester": binding.get("requester"),
+    }
+    broker = approval.get("approval_broker")
+    if broker is None or not await broker.consume_operation(approval.get("approval_id", ""), current):
+        raise PermissionError("git_push approval is missing, stale, or replayed")
 
 
 async def _git_state(cwd: Path, context: _GitExecutionContext) -> tuple[str, str]:
@@ -932,6 +1098,65 @@ def _validate_revision(revision: str) -> None:
         or revision.endswith(("/", ".", ".lock"))
     ):
         raise ValueError("invalid Git revision")
+
+
+def _validate_remote_name(remote: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", remote):
+        raise ValueError("invalid Git remote name")
+
+
+def _validate_push_argv(args: list[str]) -> tuple[str, str, str]:
+    if len(args) < 5 or args[-4] != "push" or args[-3] != "--set-upstream":
+        raise PermissionError("remote Git argv is not allowlisted")
+    remote, refspec = args[-2], args[-1]
+    _validate_remote_name(remote)
+    if refspec.count(":") != 1:
+        raise PermissionError("push refspec must map one local branch to itself")
+    local_branch, remote_branch = refspec.split(":", 1)
+    _validate_branch_name(local_branch)
+    _validate_branch_name(remote_branch)
+    if local_branch != remote_branch:
+        raise PermissionError("push refspec branches must match")
+    return remote, local_branch, refspec
+
+
+def _remote_host(remote_url: str) -> str:
+    if remote_url.startswith("file://") or remote_url.startswith(('/', './', '../')):
+        return "local"
+    if re.match(r"^[^/@:]+@[^/:]+:", remote_url):
+        return remote_url.split("@", 1)[1].split(":", 1)[0].lower()
+    parsed = urlparse(remote_url)
+    if parsed.username or parsed.password:
+        raise PermissionError("credentials embedded in remote URL are not allowed")
+    if parsed.scheme not in {"ssh", "https", "http"} or not parsed.hostname:
+        raise PermissionError("unsupported Git remote URL")
+    return parsed.hostname.lower()
+
+
+def _credential_material(
+    remote_url: str, credential_context: dict[str, Any] | None
+) -> tuple[str, dict[str, str]]:
+    host = _remote_host(remote_url)
+    if host == "local":
+        return "none", {}
+    if remote_url.startswith("ssh://") or re.match(r"^[^/@:]+@[^/:]+:", remote_url):
+        required_scope = "ssh-agent"
+        allowed_keys = {"SSH_AUTH_SOCK"}
+    else:
+        required_scope = "https-askpass"
+        allowed_keys = {"GIT_ASKPASS", "GIT_USERNAME", "GIT_PASSWORD"}
+    if not isinstance(credential_context, dict) or credential_context.get("scope") != required_scope:
+        raise PermissionError(f"credential authorization required: {required_scope}")
+    environment = credential_context.get("environment")
+    if not isinstance(environment, dict) or not environment:
+        raise PermissionError("authorized credential environment is missing")
+    if not set(environment).issubset(allowed_keys):
+        raise PermissionError("credential environment contains unauthorized keys")
+    if required_scope == "ssh-agent" and not environment.get("SSH_AUTH_SOCK"):
+        raise PermissionError("authorized SSH agent socket is missing")
+    if required_scope == "https-askpass" and not environment.get("GIT_ASKPASS"):
+        raise PermissionError("authorized askpass helper is missing")
+    return required_scope, {str(key): str(value) for key, value in environment.items()}
 
 
 def _legacy_git_result(args: list[str], result: Any) -> dict[str, Any]:

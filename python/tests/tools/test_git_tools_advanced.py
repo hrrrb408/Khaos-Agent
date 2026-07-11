@@ -4,16 +4,25 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
-from khaos.tools.git_tools import git_create_branch, git_pr_body, git_push, prepare_destructive_git_approval
+from khaos.tools.git_tools import git_create_branch, git_pr_body, git_push, prepare_destructive_git_approval, prepare_remote_git_approval
 from khaos.agent.approval import ApprovalBroker
 from khaos.tools.registry import create_runtime_registry
 from khaos.coding.execution.host import HostExecutionBackend
+from khaos.coding.execution.models import NetworkPolicy
 from khaos.coding.execution.service import ExecutionService
 from khaos.coding.workspace.models import WorkspaceState
+
+
+class _LocalRemoteBackend(HostExecutionBackend):
+    """Test-only backend that permits a local bare remote without public network."""
+
+    async def execute(self, request):
+        return await super().execute(replace(request, network_policy=NetworkPolicy.NONE))
 
 
 def _ctx(repo, access_mode="vcs.destructive-write"):
@@ -25,7 +34,7 @@ def _ctx(repo, access_mode="vcs.destructive-write"):
         state=WorkspaceState.RUNNING,
     )
     manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
-    service = ExecutionService(HostExecutionBackend(), manager)
+    service = ExecutionService(_LocalRemoteBackend(), manager)
     return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}
 
 
@@ -35,16 +44,30 @@ async def _approved_ctx(repo, tool_name, arguments):
         await _git(repo, "branch", "--show-current")
     ).strip()
     broker = ApprovalBroker()
+    tool_context = {
+        **context,
+        "approval_broker": broker,
+        "network_policy": "unrestricted-with-approval",
+    }
     approval = await prepare_destructive_git_approval(
         tool_name,
         arguments,
-        {**context, "approval_broker": broker},
+        tool_context,
         requester="session",
         approval_id="approval",
     )
+    if approval is None:
+        approval = await prepare_remote_git_approval(
+            tool_name,
+            arguments,
+            tool_context,
+            requester="session",
+            approval_id="approval",
+        )
     assert approval is not None
     assert await broker.approve_operation("approval", "session")
     context["approval_context"] = approval
+    context["network_policy"] = "unrestricted-with-approval"
     return context
 
 
@@ -132,7 +155,10 @@ async def test_push_branch(tmp_path) -> None:
     await _git(remote.parent, "init", "--bare", str(remote))
     await _git(repo, "remote", "add", "origin", str(remote))
 
-    result = json.loads(await git_push(str(repo), **_ctx(repo, "vcs.remote-write")))
+    context = await _approved_ctx(
+        repo, "git_push", {"cwd": str(repo), "remote": "origin", "branch": ""}
+    )
+    result = json.loads(await git_push(str(repo), **context))
 
     assert result["pushed"] is True
     assert result["branch"] == "feat/push"
@@ -141,8 +167,12 @@ async def test_push_branch(tmp_path) -> None:
 
 async def test_push_no_remote_fails_gracefully(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
+    await _git(repo, "checkout", "-b", "task/no-remote")
 
-    result = json.loads(await git_push(str(repo), **_ctx(repo, "vcs.remote-write")))
+    context = _ctx(repo, "vcs.remote-write")
+    context["execution_service"].workspace_manager.get("workspace").branch_name = "task/no-remote"
+    context["network_policy"] = "unrestricted-with-approval"
+    result = json.loads(await git_push(str(repo), **context))
 
     assert result["pushed"] is False
     assert "error" in result

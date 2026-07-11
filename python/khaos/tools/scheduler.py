@@ -119,6 +119,13 @@ class ToolScheduler:
         """Execute a batch while yielding permission and result events."""
         if self.budget.is_exhausted:
             return
+        tool_context = dict(tool_context or {})
+        network_guard = getattr(self.security_middleware, "network_guard", None)
+        tool_context["network_policy"] = (
+            "unrestricted-with-approval"
+            if network_guard is not None and network_guard.network_enabled
+            else "none"
+        )
 
         approved_calls: list[dict] = []
         for call in tool_calls:
@@ -165,7 +172,10 @@ class ToolScheduler:
 
             destructive_context = None
             if mode == "coding":
-                from khaos.tools.git_tools import prepare_destructive_git_approval
+                from khaos.tools.git_tools import (
+                    prepare_destructive_git_approval,
+                    prepare_remote_git_approval,
+                )
 
                 try:
                     destructive_context = await prepare_destructive_git_approval(
@@ -175,6 +185,14 @@ class ToolScheduler:
                         requester=session_id or "",
                         approval_id=normalized["id"],
                     )
+                    if destructive_context is None:
+                        destructive_context = await prepare_remote_git_approval(
+                            tool.name,
+                            normalized["arguments"],
+                            tool_context,
+                            requester=session_id or "",
+                            approval_id=normalized["id"],
+                        )
                 except (PermissionError, ValueError) as exc:
                     yield SchedulerEvent(
                         event="tool_result",

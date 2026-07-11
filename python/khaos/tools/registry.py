@@ -126,6 +126,8 @@ class ToolInvocationBroker:
             if capability.name == "filesystem.write" and mode == "coding":
                 if context.get("workspace_id") is None or context.get("task_id") is None:
                     raise PermissionError("filesystem.write requires active TaskWorkspace")
+            if capability.name == "network.access" and context.get("network_policy") != "unrestricted-with-approval":
+                raise PermissionError("network.access requires server-authorized network policy")
             if capability.name == "host.integration" and mode == "coding":
                 raise PermissionError("host integration is unavailable to Coding Agent")
         if definition.handler is None:
@@ -141,6 +143,8 @@ class ToolInvocationBroker:
             handler_params["workspace_id"] = context.get("workspace_id")
             handler_params["approval_context"] = context.get("approval_context")
             handler_params["network_policy"] = context.get("network_policy", "none")
+            if name == "git_push":
+                handler_params["credential_context"] = context.get("credential_context")
         if mode == "coding" and any(capability.name == "filesystem.write" for capability in capabilities):
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
@@ -959,6 +963,12 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["coding"],
             permission_level="write",
             parallel=False,
+            capabilities=(
+                ToolCapability("process.execute", frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability("vcs.remote-write", frozenset({"coding"}), frozenset({"task-workspace"})),
+                ToolCapability("network.access", frozenset({"coding"}), frozenset({"user-selected"})),
+                ToolCapability("credential.access", frozenset({"coding"}), frozenset({"temporary"})),
+            ),
         )
     )
     registry.register(
