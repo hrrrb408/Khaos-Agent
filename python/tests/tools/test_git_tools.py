@@ -12,7 +12,9 @@ from khaos.tools.git_tools import (
     git_smart_commit,
     git_status,
     git_undo,
+    prepare_destructive_git_approval,
 )
+from khaos.agent.approval import ApprovalBroker
 from khaos.tools.registry import create_runtime_registry
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.service import ExecutionService
@@ -30,6 +32,22 @@ def _ctx(repo, access_mode="vcs.write"):
     manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
     service = ExecutionService(HostExecutionBackend(), manager)
     return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}
+
+
+async def _approved_ctx(repo, tool_name, arguments):
+    context = _ctx(repo, "vcs.destructive-write")
+    context["execution_service"].workspace_manager.get("workspace").branch_name = (
+        await _git(repo, "branch", "--show-current")
+    ).strip()
+    broker = ApprovalBroker()
+    tool_context = {**context, "approval_broker": broker}
+    approval = await prepare_destructive_git_approval(
+        tool_name, arguments, tool_context, requester="session", approval_id="approval"
+    )
+    assert approval is not None
+    assert await broker.approve_operation("approval", "session")
+    context["approval_context"] = approval
+    return context
 
 
 async def _git(repo, *args):
@@ -233,7 +251,8 @@ async def test_git_undo_restores_changes_staged(tmp_path):
     (repo / "c.txt").write_text("c\n", encoding="utf-8")
     await git_smart_commit(str(repo), message="feat: add c", **_ctx(repo))
 
-    result = json.loads(await git_undo(str(repo), **_ctx(repo, "vcs.destructive-write")))
+    context = await _approved_ctx(repo, "git_undo", {"cwd": str(repo)})
+    result = json.loads(await git_undo(str(repo), **context))
 
     assert "Undone commit" in result["message"]
     assert "c.txt" in result["files"]

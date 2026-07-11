@@ -8,7 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from khaos.tools.git_tools import git_create_branch, git_pr_body, git_push
+from khaos.tools.git_tools import git_create_branch, git_pr_body, git_push, prepare_destructive_git_approval
+from khaos.agent.approval import ApprovalBroker
 from khaos.tools.registry import create_runtime_registry
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.service import ExecutionService
@@ -16,10 +17,35 @@ from khaos.coding.workspace.models import WorkspaceState
 
 
 def _ctx(repo, access_mode="vcs.destructive-write"):
-    workspace = SimpleNamespace(task_id="task", worktree_path=repo, state=WorkspaceState.RUNNING)
+    workspace = SimpleNamespace(
+        task_id="task",
+        worktree_path=repo,
+        repository_root=repo.parent / "main-worktree",
+        branch_name="main",
+        state=WorkspaceState.RUNNING,
+    )
     manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
     service = ExecutionService(HostExecutionBackend(), manager)
     return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}
+
+
+async def _approved_ctx(repo, tool_name, arguments):
+    context = _ctx(repo)
+    context["execution_service"].workspace_manager.get("workspace").branch_name = (
+        await _git(repo, "branch", "--show-current")
+    ).strip()
+    broker = ApprovalBroker()
+    approval = await prepare_destructive_git_approval(
+        tool_name,
+        arguments,
+        {**context, "approval_broker": broker},
+        requester="session",
+        approval_id="approval",
+    )
+    assert approval is not None
+    assert await broker.approve_operation("approval", "session")
+    context["approval_context"] = approval
+    return context
 
 
 async def _git(repo, *args):
@@ -59,7 +85,10 @@ def test_new_git_tools_registered() -> None:
 async def test_create_branch(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
 
-    result = json.loads(await git_create_branch(str(repo), "feat/cool", **_ctx(repo)))
+    context = await _approved_ctx(
+        repo, "git_create_branch", {"cwd": str(repo), "branch_name": "feat/cool", "from_base": "main"}
+    )
+    result = json.loads(await git_create_branch(str(repo), "feat/cool", **context))
 
     assert result["created"] is True
     assert result["branch"] == "feat/cool"
@@ -93,7 +122,10 @@ async def test_push_branch(tmp_path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     await _repo_with_main(repo)
-    await git_create_branch(str(repo), "feat/push", **_ctx(repo))
+    context = await _approved_ctx(
+        repo, "git_create_branch", {"cwd": str(repo), "branch_name": "feat/push", "from_base": "main"}
+    )
+    await git_create_branch(str(repo), "feat/push", **context)
 
     # Set up a bare remote and point origin at it.
     remote = tmp_path / "remote.git"
@@ -118,7 +150,10 @@ async def test_push_no_remote_fails_gracefully(tmp_path) -> None:
 
 async def test_pr_body_generation(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
-    await git_create_branch(str(repo), "feat/pr", **_ctx(repo))
+    context = await _approved_ctx(
+        repo, "git_create_branch", {"cwd": str(repo), "branch_name": "feat/pr", "from_base": "main"}
+    )
+    await git_create_branch(str(repo), "feat/pr", **context)
     # Add a couple of conventional commits on the feature branch.
     (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
     await _git(repo, "add", "a.py")
@@ -141,7 +176,10 @@ async def test_pr_body_generation(tmp_path) -> None:
 async def test_pr_body_empty_branch(tmp_path) -> None:
     """A branch with no commits ahead of main yields an empty title."""
     repo = await _repo_with_main(tmp_path)
-    await git_create_branch(str(repo), "feat/empty", **_ctx(repo))
+    context = await _approved_ctx(
+        repo, "git_create_branch", {"cwd": str(repo), "branch_name": "feat/empty", "from_base": "main"}
+    )
+    await git_create_branch(str(repo), "feat/empty", **context)
 
     result = json.loads(await git_pr_body(str(repo), **_ctx(repo, "read-only")))
 

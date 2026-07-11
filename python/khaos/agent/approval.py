@@ -20,6 +20,7 @@ class ApprovalBroker:
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._decisions: dict[str, ApprovalDecision] = {}
         self._bindings: dict[str, tuple[str, float | None]] = {}
+        self._operation_approvals: dict[str, dict] = {}
         self._lock = asyncio.Lock()
 
     async def bind(self, tool_call_id: str, approval_key: str, expiry: float | None = None) -> None:
@@ -66,3 +67,49 @@ class ApprovalBroker:
             future.set_result(ApprovalDecision(approved, remember))
             self._bindings.pop(tool_call_id, None)
             return True
+
+    async def register_operation(
+        self, approval_id: str, binding: dict, expiry: float
+    ) -> None:
+        """Register immutable destructive-operation state before prompting."""
+        async with self._lock:
+            self._operation_approvals[approval_id] = {
+                "binding": dict(binding),
+                "expiry": expiry,
+                "approved": False,
+                "used": False,
+            }
+
+    async def approve_operation(self, approval_id: str, requester: str) -> bool:
+        """Mark a registered operation approved by its bound requester."""
+        async with self._lock:
+            record = self._operation_approvals.get(approval_id)
+            if (
+                record is None
+                or record["used"]
+                or time.time() >= record["expiry"]
+                or record["binding"].get("requester") != requester
+            ):
+                return False
+            record["approved"] = True
+            return True
+
+    async def consume_operation(self, approval_id: str, binding: dict) -> bool:
+        """Atomically consume an approved operation; every attempt is one-shot."""
+        async with self._lock:
+            record = self._operation_approvals.get(approval_id)
+            if record is None or record["used"]:
+                return False
+            record["used"] = True
+            return bool(
+                record["approved"]
+                and time.time() < record["expiry"]
+                and record["binding"] == binding
+            )
+
+    async def cancel_operation(self, approval_id: str) -> None:
+        """Make a denied or cancelled destructive approval non-replayable."""
+        async with self._lock:
+            record = self._operation_approvals.get(approval_id)
+            if record is not None:
+                record["used"] = True

@@ -96,6 +96,7 @@ class AgentLoop:
         skill_generator=None,
         workspace_manager=None,
         execution_service=None,
+        approval_broker=None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -131,6 +132,7 @@ class AgentLoop:
         self.workspace_manager = workspace_manager
         self.active_workspace = None
         self.execution_service = execution_service
+        self.approval_broker = approval_broker
         if self.execution_service is None:
             from khaos.coding.execution import ExecutionService, HostExecutionBackend
 
@@ -299,6 +301,8 @@ class AgentLoop:
                         "workspace_id": getattr(self.active_workspace, "id", None),
                         "workspace_manager": self.workspace_manager,
                         "coding_workspace_enforced": self.active_workspace is not None,
+                        "approval_broker": self.approval_broker,
+                        "requester": session_id,
                     },
                 }
                 if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:

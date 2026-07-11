@@ -52,6 +52,7 @@ class RuntimeConfig:
     tool_scheduler: ToolScheduler | None = None
     workspace_manager: WorkspaceManager | None = None
     execution_service: ExecutionService | None = None
+    approval_broker: Any = None
 
 
 @dataclass
@@ -152,5 +153,6 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         coding_context_builder=cfg.coding_context_builder,
         workspace_manager=workspace_manager,
         execution_service=execution_service,
+        approval_broker=cfg.approval_broker,
     )
     return RuntimeResult(loop, mode_manager, task_manager, skill_generator, scheduler, memory_manager, skill_manager, verify_factory, execution_service)

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -20,7 +23,7 @@ _PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "pr
 _WRITABLE_WORKSPACE_STATES = frozenset(
     {WorkspaceState.READY, WorkspaceState.RUNNING, WorkspaceState.VERIFYING}
 )
-_GIT_SAFE_CONFIG = ("-c", "core.pager=cat", "-c", "core.hooksPath=/dev/null")
+_GIT_SAFE_CONFIG = ("-c", "core.pager=cat", "-c", f"core.hooksPath={os.devnull}")
 
 
 @dataclass(frozen=True)
@@ -56,8 +59,13 @@ async def git_commit(repo: str = ".", message: str = "", *, task_id: str | None 
 async def git_branch(repo: str = ".", name: str = "", checkout: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
     """List, create, or checkout branches."""
     if name and checkout:
-        context = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, network_policy)
-        return await _git(["git", "checkout", "-b", name], repo, context)
+        _validate_branch_name(name)
+        context = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none")
+        result = await _git(["git", *_GIT_SAFE_CONFIG, "switch", "-c", name], repo, context)
+        if result["returncode"] == 0:
+            workspace = execution_service.workspace_manager.get(workspace_id)
+            workspace.branch_name = name
+        return result
     if name:
         _validate_branch_name(name)
         return await _git(["git", *_GIT_SAFE_CONFIG, "branch", name], repo, _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, "none"))
@@ -188,8 +196,9 @@ async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: 
     Returns the hash and message of the commit that was undone plus the list
     of files now staged as a result.
     """
-    ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, network_policy)
-    log = await _git(["git", "log", "-1", "--pretty=%H%x09%s"], cwd, ctx)
+    destructive_ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none")
+    read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
+    log = await _git(["git", "log", "-1", "--pretty=%H%x09%s"], cwd, read_ctx)
     if log["returncode"] != 0 or not log["stdout"].strip():
         return json.dumps(
             {"error": "no commit history to undo"}, ensure_ascii=False
@@ -199,7 +208,7 @@ async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: 
     if not sep:
         revision, subject = revision, ""
 
-    reset = await _git(["git", "reset", "--soft", "HEAD~1"], cwd, ctx)
+    reset = await _git(["git", *_GIT_SAFE_CONFIG, "reset", "--soft", "HEAD~1"], cwd, destructive_ctx)
     if reset["returncode"] != 0:
         return json.dumps(
             {
@@ -209,7 +218,7 @@ async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: 
             ensure_ascii=False,
         )
 
-    porcelain = await _git(["git", "status", "--porcelain"], cwd, ctx)
+    porcelain = await _git(["git", "status", "--porcelain"], cwd, read_ctx)
     files = [line[3:] for line in porcelain["stdout"].splitlines() if line.strip()]
     logger.info("git_undo: undid %s (%s)", revision[:8], subject)
     return json.dumps(
@@ -245,8 +254,11 @@ async def git_create_branch(
     # Fetch the base so we branch off its latest tip. Missing base is reported
     # explicitly rather than crashing mid-checkout.
     base = from_base or "main"
-    ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, network_policy)
-    base_lookup = await _git(["git", "rev-parse", "--verify", base], cwd, ctx)
+    _validate_branch_name(branch_name)
+    _validate_revision(base)
+    destructive_ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none")
+    read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
+    base_lookup = await _git(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], cwd, read_ctx)
     if base_lookup["returncode"] != 0:
         return json.dumps(
             {
@@ -258,7 +270,17 @@ async def git_create_branch(
             ensure_ascii=False,
         )
 
-    checkout = await _git(["git", "checkout", "-b", branch_name, base], cwd, ctx)
+    existing = await _git(["git", "rev-parse", "--verify", f"refs/heads/{branch_name}"], cwd, read_ctx)
+    if existing["returncode"] == 0:
+        return json.dumps(
+            {"branch": branch_name, "base": base, "created": False, "error": "branch already exists"},
+            ensure_ascii=False,
+        )
+    checkout = await _git(
+        ["git", *_GIT_SAFE_CONFIG, "switch", "-c", branch_name, base_lookup["stdout"].strip()],
+        cwd,
+        destructive_ctx,
+    )
     if checkout["returncode"] != 0:
         message = checkout["stderr"].strip() or checkout["stdout"].strip()
         created = "already exists" not in message
@@ -274,6 +296,8 @@ async def git_create_branch(
         )
 
     logger.info("git_create_branch: created %s from %s", branch_name, base)
+    workspace = execution_service.workspace_manager.get(workspace_id)
+    workspace.branch_name = branch_name
     return json.dumps(
         {"branch": branch_name, "base": base, "created": True},
         ensure_ascii=False,
@@ -497,6 +521,8 @@ async def _git(args: list[str], repo: str, context: _GitExecutionContext) -> dic
         return await _git_read_via_execution_service(args, repo, context)
     if context.access_mode == "vcs.write":
         return await _git_write_via_execution_service(args, repo, context)
+    if context.access_mode == "vcs.destructive-write":
+        return await _git_destructive_via_execution_service(args, repo, context)
     if context.access_mode != "read-only":
         if not context.task_id or not context.workspace_id or context.execution_service is None:
             raise PermissionError(f"{context.access_mode} requires an active TaskWorkspace")
@@ -592,6 +618,217 @@ async def _git_write_via_execution_service(
     return _legacy_git_result(args, result)
 
 
+async def _git_destructive_via_execution_service(
+    args: list[str], repo: str, context: _GitExecutionContext
+) -> dict[str, Any]:
+    """Consume a bound approval and execute one allowlisted destructive argv."""
+    workspace, cwd = _resolve_git_workspace(repo, context, require_writable=True)
+    operation, target = _validate_destructive_argv(args)
+    await _consume_destructive_approval(workspace, cwd, context, operation, target)
+    with tempfile.TemporaryDirectory(prefix="khaos-git-home-") as temporary_home:
+        environment = _git_environment(temporary_home)
+        request = ExecutionRequest(
+            argv=tuple(args),
+            cwd=cwd,
+            writable_roots=(cwd,),
+            environment=environment,
+            allowed_environment_keys=frozenset(environment),
+            network_policy=NetworkPolicy.NONE,
+            task_id=context.task_id,
+            workspace_id=context.workspace_id,
+            access_mode="workspace-write",
+        )
+        result = await context.execution_service.execute(request)
+    return _legacy_git_result(args, result)
+
+
+async def prepare_destructive_git_approval(
+    tool_name: str,
+    arguments: dict[str, Any],
+    tool_context: dict[str, Any],
+    *,
+    requester: str,
+    approval_id: str,
+) -> dict[str, Any] | None:
+    """Capture immutable Git state before the scheduler asks the user."""
+    operation_target = _destructive_operation_target(tool_name, arguments)
+    if operation_target is None:
+        return None
+    broker = tool_context.get("approval_broker")
+    if broker is None:
+        raise PermissionError("destructive Git operations require ApprovalBroker")
+    context = _context(
+        tool_context.get("task_id"),
+        tool_context.get("workspace_id"),
+        "read-only",
+        tool_context.get("execution_service"),
+        None,
+        "none",
+    )
+    repo = arguments.get("repo", arguments.get("cwd", "."))
+    workspace, cwd = _resolve_git_workspace(repo, context, require_writable=True)
+    operation, target_hint = operation_target
+    branch_result = await _git_read_via_execution_service(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"], str(cwd), context
+    )
+    if branch_result["returncode"] != 0 or not branch_result["stdout"].strip():
+        raise PermissionError("detached HEAD is not allowed for destructive Git operations")
+    if branch_result["stdout"].strip() != workspace.branch_name:
+        raise PermissionError("current branch does not match the TaskWorkspace branch")
+    if operation in {"git.create-and-switch", "git.create-branch-from-base"}:
+        status = await _git_read_via_execution_service(
+            ["git", "status", "--porcelain"], str(cwd), context
+        )
+        if status["stdout"].strip():
+            raise PermissionError("branch switching requires a clean worktree")
+        branch_name = target_hint.split("@", 1)[0]
+        existing = await _git_read_via_execution_service(
+            ["git", "rev-parse", "--verify", f"refs/heads/{branch_name}"], str(cwd), context
+        )
+        if existing["returncode"] == 0:
+            raise PermissionError("target branch already exists")
+    head, diff_hash = await _git_state(cwd, context)
+    if operation == "git.undo":
+        parent = await _git_read_via_execution_service(
+            ["git", "rev-parse", "--verify", "HEAD~1^{commit}"], str(cwd), context
+        )
+        if parent["returncode"] != 0:
+            raise PermissionError("no commit history to undo")
+        target = parent["stdout"].strip()
+    elif operation == "git.create-branch-from-base":
+        branch, base = target_hint.split("@", 1)
+        base_result = await _git_read_via_execution_service(
+            ["git", "rev-parse", "--verify", f"{base}^{{commit}}"], str(cwd), context
+        )
+        if base_result["returncode"] != 0:
+            raise PermissionError("base revision does not exist")
+        target = f"{branch}@{base_result['stdout'].strip()}"
+    else:
+        target = f"{target_hint}@{head}"
+    expiry = time.time() + 120.0
+    binding = {
+        "task_id": workspace.task_id,
+        "workspace_id": context.workspace_id,
+        "operation": operation,
+        "target": target,
+        "head": head,
+        "diff_hash": diff_hash,
+        "expiry": expiry,
+        "requester": requester,
+    }
+    await broker.register_operation(approval_id, binding, expiry)
+    return {
+        "approval_broker": broker,
+        "approval_id": approval_id,
+        "binding": binding,
+    }
+
+
+def _destructive_operation_target(
+    tool_name: str, arguments: dict[str, Any]
+) -> tuple[str, str] | None:
+    if tool_name == "git_undo":
+        return "git.undo", "HEAD~1"
+    if tool_name == "git_branch" and arguments.get("checkout") and arguments.get("name"):
+        name = str(arguments["name"])
+        _validate_branch_name(name)
+        return "git.create-and-switch", name
+    if tool_name == "git_create_branch":
+        branch = str(arguments.get("branch_name", ""))
+        base = str(arguments.get("from_base") or "main")
+        _validate_branch_name(branch)
+        _validate_revision(base)
+        return "git.create-branch-from-base", f"{branch}@{base}"
+    return None
+
+
+async def _consume_destructive_approval(
+    workspace: Any,
+    cwd: Path,
+    context: _GitExecutionContext,
+    operation: str,
+    target_hint: str,
+) -> None:
+    approval = context.approval_context
+    if not isinstance(approval, dict):
+        raise PermissionError("destructive Git operation requires approval")
+    binding = dict(approval.get("binding") or {})
+    head, diff_hash = await _git_state(cwd, _context(
+        context.task_id, context.workspace_id, "read-only", context.execution_service, None, "none"
+    ))
+    branch_result = await _git_read_via_execution_service(
+        ["git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+        str(cwd),
+        _context(context.task_id, context.workspace_id, "read-only", context.execution_service, None, "none"),
+    )
+    if branch_result["returncode"] != 0 or not branch_result["stdout"].strip():
+        raise PermissionError("detached HEAD is not allowed for destructive Git operations")
+    if branch_result["stdout"].strip() != workspace.branch_name:
+        raise PermissionError("current branch does not match the TaskWorkspace branch")
+    expected_target = target_hint
+    if operation == "git.undo":
+        expected_target = binding.get("target", "")
+    elif operation == "git.create-and-switch":
+        expected_target = f"{target_hint}@{head}"
+    elif operation == "git.create-branch-from-base":
+        branch = target_hint.split("@", 1)[0]
+        expected_target = f"{branch}@{target_hint.split('@', 1)[1]}"
+    current = {
+        "task_id": workspace.task_id,
+        "workspace_id": context.workspace_id,
+        "operation": operation,
+        "target": expected_target,
+        "head": head,
+        "diff_hash": diff_hash,
+        "expiry": binding.get("expiry"),
+        "requester": binding.get("requester"),
+    }
+    broker = approval.get("approval_broker")
+    if broker is None or not await broker.consume_operation(approval.get("approval_id", ""), current):
+        raise PermissionError("destructive Git approval is missing, stale, or replayed")
+
+
+async def _git_state(cwd: Path, context: _GitExecutionContext) -> tuple[str, str]:
+    head_result = await _git_read_via_execution_service(
+        ["git", "rev-parse", "--verify", "HEAD"], str(cwd), context
+    )
+    if head_result["returncode"] != 0:
+        raise PermissionError("unable to resolve current HEAD")
+    diff_result = await _git_read_via_execution_service(
+        ["git", "diff", "--no-ext-diff", "--binary", "HEAD", "--"], str(cwd), context
+    )
+    if diff_result["returncode"] != 0:
+        raise PermissionError("unable to capture worktree diff")
+    status_result = await _git_read_via_execution_service(
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], str(cwd), context
+    )
+    if status_result["returncode"] != 0:
+        raise PermissionError("unable to capture worktree status")
+    digest = hashlib.sha256()
+    digest.update(diff_result["stdout"].encode())
+    digest.update(b"\0")
+    digest.update(status_result["stdout"].encode())
+    for entry in status_result["stdout"].split("\0"):
+        if not entry.startswith("?? "):
+            continue
+        path = (cwd / entry[3:]).resolve()
+        if path != cwd and cwd not in path.parents:
+            raise PermissionError("untracked path escapes the TaskWorkspace")
+        if path.is_file() and not path.is_symlink():
+            digest.update(path.read_bytes())
+    return head_result["stdout"].strip(), digest.hexdigest()
+
+
+def _validate_destructive_argv(args: list[str]) -> tuple[str, str]:
+    if args[-3:] == ["reset", "--soft", "HEAD~1"]:
+        return "git.undo", "HEAD~1"
+    if len(args) >= 3 and args[-3:-1] == ["switch", "-c"]:
+        return "git.create-and-switch", args[-1]
+    if len(args) >= 4 and args[-4:-2] == ["switch", "-c"]:
+        return "git.create-branch-from-base", f"{args[-2]}@{args[-1]}"
+    raise PermissionError("destructive Git argv is not allowlisted")
+
+
 def _resolve_git_workspace(
     repo: str, context: _GitExecutionContext, *, require_writable: bool
 ) -> tuple[Any, Path]:
@@ -669,8 +906,8 @@ def _validate_branch_name(name: str) -> None:
         raise ValueError("invalid branch name")
 
 
-def _git_environment() -> dict[str, str]:
-    return {
+def _git_environment(home: str | None = None) -> dict[str, str]:
+    environment = {
         "PATH": os.environ.get("PATH", ""),
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "GIT_PAGER": "cat",
@@ -680,6 +917,21 @@ def _git_environment() -> dict[str, str]:
         "GIT_SEQUENCE_EDITOR": ":",
         "GIT_CONFIG_NOSYSTEM": "1",
     }
+    if home is not None:
+        environment["HOME"] = home
+    return environment
+
+
+def _validate_revision(revision: str) -> None:
+    if (
+        not revision
+        or revision.startswith("-")
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*", revision)
+        or ".." in revision
+        or "@{" in revision
+        or revision.endswith(("/", ".", ".lock"))
+    ):
+        raise ValueError("invalid Git revision")
 
 
 def _legacy_git_result(args: list[str], result: Any) -> dict[str, Any]:

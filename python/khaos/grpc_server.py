@@ -167,6 +167,7 @@ class AgentService:
             mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
             db=self.db, audit_logger=AuditLogger(self.db) if self._policy.audit_enabled else None,
             task_manager=self.task_manager,
+            approval_broker=self.approval_broker,
         ))
         return result.mode_manager, result.loop
 
