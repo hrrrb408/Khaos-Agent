@@ -41,9 +41,12 @@ jobs:
             echo "=== sysctl userns ==="
             sysctl kernel.unprivileged_userns_clone 2>&1
             sysctl kernel.apparmor_restrict_unprivileged_userns 2>&1
-            echo "=== bwrap isolation probe ==="
+            echo "=== TMPDIR ==="
+            echo "TMPDIR=$TMPDIR"
+            python3 -c "import tempfile; print('gettempdir:', tempfile.gettempdir())"
+            echo "=== bwrap isolation probe (argv_prefix topology) ==="
             tmpdir=$(mktemp -d)
-            bwrap --ro-bind / / --bind "$tmpdir" "$tmpdir" --tmpfs /tmp --unshare-net --unshare-pid -- /bin/true 2>&1
+            bwrap --ro-bind / / --bind "$tmpdir" /workspace --tmpfs /tmp --unshare-net --unshare-pid --chdir /workspace -- /bin/sh -c 'echo probe > .probe && cat .probe' 2>&1
             echo "probe exit: $?"
             rm -rf "$tmpdir"
           } > diagnostics/linux-bwrap-pre.txt

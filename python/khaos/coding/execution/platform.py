@@ -86,14 +86,20 @@ class LinuxBubblewrapBackend:
         return self.probe_capability()
 
     def probe_capability(self) -> BackendAvailability:
-        """Actually execute bwrap to verify --unshare-net/--unshare-pid work.
+        """Actually execute bwrap to verify --unshare-net/--unshare-pid AND
+        the writable workspace bind actually work.
 
         A ``shutil.which`` check is not sufficient: some platforms (notably
         GitHub-hosted ubuntu-latest) ship bwrap but block the network
-        namespace creation with EPERM on RTM_NEWADDR.  This probe runs the
-        real sandbox and reports the platform limitation so the
-        BackendSelector can fail closed as infrastructure-unsupported instead
-        of degrading to a plain host subprocess.
+        namespace creation with EPERM on RTM_NEWADDR.  Additionally, a
+        ``--tmpfs /tmp`` can shadow a worktree that lives under ``/tmp``
+        (the default pytest tmp_path location), making the writable bind
+        invisible and the sandboxed process fall back to read-only ``/``.
+
+        This probe runs the real sandbox with the same mount topology as
+        ``argv_prefix`` (bind to ``/workspace`` + ``--chdir /workspace``)
+        and actually writes a probe file, so it catches both the namespace
+        failure and the bind-shadow failure.
         """
         if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
             return BackendAvailability(self.name, False, False, "bwrap unavailable on this platform")
@@ -101,12 +107,13 @@ class LinuxBubblewrapBackend:
             return LinuxBubblewrapBackend._capability_cache
         with tempfile.TemporaryDirectory() as tmp:
             completed = subprocess.run(
-                ("bwrap", "--ro-bind", "/", "/", "--bind", tmp, tmp,
+                ("bwrap", "--ro-bind", "/", "/", "--bind", tmp, "/workspace",
                  "--tmpfs", "/tmp", "--unshare-net", "--unshare-pid",
-                 "--", "/bin/true"),
+                 "--chdir", "/workspace",
+                 "--", "/bin/sh", "-c", "echo probe > .probe && cat .probe"),
                 capture_output=True, timeout=10,
             )
-        if completed.returncode == 0:
+        if completed.returncode == 0 and b"probe" in completed.stdout:
             availability = BackendAvailability(self.name, True, True)
         else:
             stderr = completed.stderr.decode("utf-8", errors="replace").strip()
@@ -117,8 +124,24 @@ class LinuxBubblewrapBackend:
         LinuxBubblewrapBackend._capability_cache = availability
         return availability
 
+    # The worktree is bound to a deterministic sandbox-internal path (/workspace)
+    # instead of its host path.  This avoids the tmpfs-shadow problem: when the
+    # host worktree lives under /tmp (pytest's default tmp_path), a ``--tmpfs /tmp``
+    # would shadow the writable ``--bind <worktree> <worktree>`` mount, causing the
+    # sandboxed process to fall back to the read-only root bind.  Binding to
+    # /workspace (outside /tmp) and using --chdir keeps the writable mount visible
+    # regardless of where the host worktree lives.
+    SANDBOX_WORKDIR = "/workspace"
+
     def argv_prefix(self, worktree: Path) -> tuple[str, ...]:
-        return ("bwrap", "--ro-bind", "/", "/", "--bind", str(worktree.resolve()), str(worktree.resolve()), "--tmpfs", "/tmp", "--unshare-net", "--unshare-pid")
+        return (
+            "bwrap",
+            "--ro-bind", "/", "/",
+            "--bind", str(worktree.resolve()), self.SANDBOX_WORKDIR,
+            "--tmpfs", "/tmp",
+            "--unshare-net", "--unshare-pid",
+            "--chdir", self.SANDBOX_WORKDIR,
+        )
 
     async def execute(self, request):
         from khaos.coding.execution.host import HostExecutionBackend
