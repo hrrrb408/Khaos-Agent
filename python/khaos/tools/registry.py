@@ -123,7 +123,7 @@ class ToolInvocationBroker:
                 service = context.get("execution_service")
                 if service is None:
                     raise PermissionError("process.execute requires ExecutionService")
-            if capability.name == "filesystem.write":
+            if capability.name == "filesystem.write" and mode == "coding":
                 if context.get("workspace_id") is None or context.get("task_id") is None:
                     raise PermissionError("filesystem.write requires active TaskWorkspace")
             if capability.name == "host.integration" and mode == "coding":
@@ -135,7 +135,7 @@ class ToolInvocationBroker:
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
-        if any(capability.name == "filesystem.write" for capability in capabilities):
+        if mode == "coding" and any(capability.name == "filesystem.write" for capability in capabilities):
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
