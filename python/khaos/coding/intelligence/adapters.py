@@ -143,12 +143,16 @@ class TreeSitterAdapter:
     def parse(self, *, file_path: str, content: bytes, previous_state: ParseState | None = None) -> ParseResult:
         del previous_state
         started = time.perf_counter()
-        language, _symbols_query, _imports_query, spec = self._initialize(self._spec(file_path))
+        language, symbols_query, imports_query, spec = self._initialize(self._spec(file_path))
         tree_sitter = importlib.import_module("tree_sitter")
         tree = tree_sitter.Parser(language).parse(content)
         error_nodes = _error_nodes(tree.root_node)
-        symbols = _extract_symbols(spec, tree.root_node, content, file_path, error_nodes)
-        imports = _extract_imports(spec, tree.root_node, content, file_path, error_nodes)
+        symbol_captures = tree_sitter.QueryCursor(symbols_query).captures(tree.root_node)
+        import_captures = tree_sitter.QueryCursor(imports_query).captures(tree.root_node)
+        symbol_ranges = {(node.start_byte, node.end_byte) for nodes in symbol_captures.values() for node in nodes}
+        import_ranges = {(node.start_byte, node.end_byte) for nodes in import_captures.values() for node in nodes}
+        symbols = _extract_symbols(spec, tree.root_node, content, file_path, error_nodes, symbol_ranges)
+        imports = _extract_imports(spec, tree.root_node, content, file_path, error_nodes, import_ranges)
         diagnostics: list[ParseDiagnostic] = []
         if tree.root_node.has_error:
             node = error_nodes[0] if error_nodes else tree.root_node
@@ -205,7 +209,7 @@ SYMBOL_TYPES = {
 }
 
 
-def _extract_symbols(spec: GrammarSpec, root: Any, content: bytes, file_path: str, errors: list[Any]) -> list[Symbol]:
+def _extract_symbols(spec: GrammarSpec, root: Any, content: bytes, file_path: str, errors: list[Any], captured_ranges: set[tuple[int, int]]) -> list[Symbol]:
     found: dict[tuple[int, int, str, str], Symbol] = {}
     parents: dict[int, Any] = {id(child): node for node in _walk(root) for child in node.children}
     for node in _walk(root):
@@ -216,6 +220,8 @@ def _extract_symbols(spec: GrammarSpec, root: Any, content: bytes, file_path: st
             if value is not None and value.type in {"arrow_function", "function_expression", "generator_function"}:
                 kind, name_node = "function", node.child_by_field_name("name")
         if not kind or name_node is None:
+            continue
+        if (name_node.start_byte, name_node.end_byte) not in captured_ranges:
             continue
         direct_parent = parents.get(id(node))
         if spec.dialect == "python" and node.type == "function_definition" and direct_parent is not None and direct_parent.type == "block":
@@ -255,10 +261,12 @@ def _extract_symbols(spec: GrammarSpec, root: Any, content: bytes, file_path: st
 IMPORT_NODE_TYPES = {"python": {"import_statement", "import_from_statement"}, "javascript": {"import_statement", "export_statement"}, "typescript": {"import_statement", "export_statement"}, "tsx": {"import_statement", "export_statement"}, "go": {"import_spec"}, "rust": {"use_declaration", "extern_crate_declaration"}}
 
 
-def _extract_imports(spec: GrammarSpec, root: Any, content: bytes, file_path: str, errors: list[Any]) -> list[ImportReference]:
+def _extract_imports(spec: GrammarSpec, root: Any, content: bytes, file_path: str, errors: list[Any], captured_ranges: set[tuple[int, int]]) -> list[ImportReference]:
     found: dict[tuple[int, int, str, str | None], ImportReference] = {}
     for node in _walk(root):
         if node.type not in IMPORT_NODE_TYPES[spec.dialect] or _overlaps(node, errors):
+            continue
+        if not any(node.start_byte >= start and node.end_byte <= end for start, end in captured_ranges):
             continue
         raw = _text(content, node)
         module, names, alias = _parse_import_text(spec.dialect, raw)

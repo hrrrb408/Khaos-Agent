@@ -1,1 +1,1 @@
-(identifier) @name
+(_) @candidate
