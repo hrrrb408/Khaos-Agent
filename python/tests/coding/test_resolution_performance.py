@@ -28,6 +28,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -36,6 +37,7 @@ from khaos.coding.intelligence.index import IndexStore
 from khaos.coding.intelligence.index.repository import RepositoryIndexer
 from khaos.coding.intelligence.query import CodeQueryService
 from khaos.coding.intelligence.resolution import ResolutionService
+from khaos.coding.intelligence.resolution.ids import stable_symbol_id
 from khaos.coding.intelligence.resolution.persistence import resolution_counts
 
 
@@ -86,10 +88,16 @@ def _assert_mutual_exclusivity(counts: dict[str, int]) -> None:
 
 
 def _ground_truth_metrics(store: IndexStore, repo_id: str, counts: dict[str, int]) -> dict[str, float | int]:
-    """Compute TP/FP/precision/eligible/coverage.
+    """Compute integrity metrics (target_file existence, NOT exact-target correctness).
 
-    - TP: resolved edges pointing to real targets (no dangling edges)
-    - FP: resolved edges pointing to missing targets (must be 0)
+    This is a COMPLETENESS INTEGRITY CHECK, not semantic precision. It verifies
+    that no resolved edge points to a missing target_file (dangling edge). It
+    does NOT verify that the resolved edge points to the CORRECT target file
+    or symbol. For exact-target semantic precision, use
+    ``compute_exact_ground_truth`` with explicit expected edges.
+
+    - TP: resolved edges pointing to existing target files (no dangling)
+    - FP: resolved edges pointing to missing target files (must be 0)
     - precision: TP / (TP + FP)
     - eligible: candidates that can be resolved (resolved + ambiguous + unresolved);
       external/dynamic/invalid are excluded from the denominator
@@ -272,7 +280,7 @@ def test_1000_file_resolution_performance_and_incremental_correctness():
         assert res_a["resolved_imports"] > 0
         # No dangling resolved edges: every resolved edge must have a target
         qs = CodeQueryService(store)
-        _assert_no_dangling_edges(store, "perf")
+        _assert_no_dangling_resolved_edges(store, "perf")
 
         # --- Ground truth verification (Section 5 + 6) ---
         counts_a = resolution_counts(store._conn, "perf")
@@ -366,7 +374,7 @@ def test_1000_file_resolution_performance_and_incremental_correctness():
         affected_e = set(res_e["affected_files"])
         assert delete_path in affected_e, "deleted file should be in affected set"
         # No dangling resolved edges after deletion
-        _assert_no_dangling_edges(store, "perf")
+        _assert_no_dangling_resolved_edges(store, "perf")
         # Dependents of the deleted file should now have unresolved/external imports
         mid_dependents_of_deleted = {
             f"mid/mid_{i:03d}.py" for i in range(500) if i % 50 == 1
@@ -517,8 +525,14 @@ def test_1000_file_resolution_performance_and_incremental_correctness():
         )
 
 
-def _assert_no_dangling_edges(store: IndexStore, repo_id: str) -> None:
-    """Assert that no resolved edge points to a missing target file/symbol."""
+def _assert_no_dangling_resolved_edges(store: IndexStore, repo_id: str) -> None:
+    """Integrity check: assert no resolved edge points to a missing target file.
+
+    This is a COMPLETENESS INTEGRITY CHECK, not semantic precision. It verifies
+    that every resolved edge has a target_file that exists in code_files. It does
+    NOT verify that the target is the CORRECT one. For exact-target semantic
+    precision, use ``compute_exact_ground_truth`` with explicit expected edges.
+    """
     conn = store._conn
     # Check resolved_imports: every resolved edge must have a target_file that exists in code_files
     dangling_imports = conn.execute(
@@ -604,18 +618,22 @@ def test_generation_prevents_stale_resolution_overwrite():
         new_targets = qs.find_symbol_targets("r", "renamed")
         assert len(new_targets) == 1
         # No dangling edges
-        _assert_no_dangling_edges(store, "r")
+        _assert_no_dangling_resolved_edges(store, "r")
 
 
-def test_ground_truth_mutual_exclusivity_and_no_false_positives():
-    """Ground truth metrics: mutual exclusivity, TP/FP/precision/coverage.
+def test_integrity_mutual_exclusivity_and_no_dangling_targets():
+    """Integrity check: mutual exclusivity and no dangling resolved targets.
 
     Builds a small controlled repository with known resolvable, external,
     dynamic, and unresolved candidates. Verifies:
       1. candidate_total == resolved + ambiguous + unresolved + external + dynamic + invalid
-      2. No false positives (all resolved edges point to real targets)
-      3. precision == 1.0 (no FP)
-      4. coverage = resolved / eligible (eligible = resolved + ambiguous + unresolved)
+      2. No dangling resolved edges (target_file exists in code_files)
+      3. Integrity precision == 1.0 (all resolved targets exist)
+      4. Coverage = resolved / eligible (eligible = resolved + ambiguous + unresolved)
+
+    This is an INTEGRITY CHECK, not semantic precision. It does NOT verify
+    that resolved edges point to the CORRECT target. For exact-target
+    semantic precision, see test_exact_semantic_ground_truth below.
     """
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
@@ -674,4 +692,341 @@ def test_ground_truth_mutual_exclusivity_and_no_false_positives():
             f"Counts: {counts}\n"
             f"TP={gt['tp']}, FP={gt['fp']}, precision={gt['precision']:.4f}, "
             f"eligible={gt['eligible']}, resolved={gt['resolved']}, coverage={gt['coverage']:.4f}\n"
+        )
+
+
+# ---- Exact-target semantic ground truth (M3 Batch 5.2) ----
+
+
+@dataclass
+class ExpectedEdge:
+    """An expected resolution edge for exact-target ground truth verification.
+
+    Each expected candidate specifies:
+    - edge_type: "import", "call", or "reference"
+    - source_file: the file containing the edge
+    - name: callee name (call), "module.imported_name" (import), or reference name
+    - expected_status: the expected resolution status
+    - expected_target_file: the expected target file (None for non-resolved)
+    - expected_target_symbol_id: the expected stable_symbol_id (None for non-resolved)
+    """
+
+    edge_type: str
+    source_file: str
+    name: str
+    expected_status: str
+    expected_target_file: str | None = None
+    expected_target_symbol_id: str | None = None
+
+
+def compute_exact_ground_truth(
+    conn: sqlite3.Connection, repo_id: str, expected_edges: list[ExpectedEdge]
+) -> dict[str, Any]:
+    """Compute exact-target TP/FP/FN with explicit expected edges.
+
+    Unlike ``_ground_truth_metrics`` (which only checks target_file existence),
+    this function verifies that each resolved edge points to the CORRECT target
+    (correct file AND correct stable_symbol_id).
+
+    Definitions:
+    - TP: expected status matches actual status. If resolved, target_file AND
+      target_symbol_id must also match exactly.
+    - FP: actual is "resolved" but target is wrong (wrong file or wrong symbol),
+      OR actual is "resolved" but expected status is not "resolved".
+    - FN: expected "resolved" but actual is not "resolved" (or no edge found).
+
+    Returns dict with tp, fp, fn, precision, recall, and details list.
+    """
+    tp = 0
+    fp = 0
+    fn = 0
+    details: list[str] = []
+
+    for expected in expected_edges:
+        # Query the actual edge from DB
+        if expected.edge_type == "call":
+            rows = conn.execute(
+                "SELECT status, target_file, target_symbol_id FROM resolved_call_edges "
+                "WHERE repository_id=? AND source_file=? AND call_callee=?",
+                (repo_id, expected.source_file, expected.name),
+            ).fetchall()
+        elif expected.edge_type == "import":
+            parts = expected.name.split(".", 1)
+            module = parts[0]
+            imported_name = parts[1] if len(parts) == 2 else ""
+            rows = conn.execute(
+                "SELECT status, target_file, target_symbol_id FROM resolved_imports "
+                "WHERE repository_id=? AND source_file=? AND import_module=? AND imported_name=?",
+                (repo_id, expected.source_file, module, imported_name),
+            ).fetchall()
+        else:  # reference
+            rows = conn.execute(
+                "SELECT status, target_file, target_symbol_id FROM resolved_reference_edges "
+                "WHERE repository_id=? AND source_file=? AND name=?",
+                (repo_id, expected.source_file, expected.name),
+            ).fetchall()
+
+        if not rows:
+            if expected.expected_status == "resolved":
+                fn += 1
+                details.append(f"FN: {expected.edge_type} '{expected.name}' in {expected.source_file} "
+                               f"expected resolved but no edge found")
+            continue
+
+        for row in rows:
+            actual_status = row[0]
+            actual_target_file = row[1]
+            actual_target_symbol_id = row[2]
+
+            if expected.expected_status == "resolved":
+                if actual_status == "resolved":
+                    if (actual_target_file == expected.expected_target_file and
+                            actual_target_symbol_id == expected.expected_target_symbol_id):
+                        tp += 1
+                    else:
+                        fp += 1
+                        details.append(
+                            f"FP: {expected.edge_type} '{expected.name}' in {expected.source_file} "
+                            f"resolved but wrong target "
+                            f"(expected file={expected.expected_target_file}, "
+                            f"symbol={expected.expected_target_symbol_id}; "
+                            f"actual file={actual_target_file}, "
+                            f"symbol={actual_target_symbol_id})"
+                        )
+                else:
+                    fn += 1
+                    details.append(
+                        f"FN: {expected.edge_type} '{expected.name}' in {expected.source_file} "
+                        f"expected resolved but actual={actual_status}"
+                    )
+            else:
+                # Expected non-resolved status
+                if actual_status == expected.expected_status:
+                    tp += 1
+                elif actual_status == "resolved":
+                    fp += 1
+                    details.append(
+                        f"FP: {expected.edge_type} '{expected.name}' in {expected.source_file} "
+                        f"expected {expected.expected_status} but resolved"
+                    )
+
+    precision = tp / (tp + fp) if (tp + fp) > 0 else 1.0
+    recall = tp / (tp + fn) if (tp + fn) > 0 else 1.0
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "precision": precision,
+        "recall": recall,
+        "details": details,
+    }
+
+
+def _build_exact_ground_truth_fixture(root: Path) -> None:
+    """Build a deterministic fixture for exact-target ground truth verification.
+
+    Files:
+      util.py:  defines helper() — the CORRECT import target
+      other.py: defines helper() — same name, different file (wrong target)
+      app.py:   imports helper from util (should resolve to util.py)
+                imports os (external)
+                calls helper() (should resolve to util.py:helper via import)
+                calls missing() (should be unresolved)
+    """
+    (root / "util.py").write_text("def helper():\n    return 42\n", encoding="utf-8")
+    (root / "other.py").write_text("def helper():\n    return 99\n", encoding="utf-8")
+    (root / "app.py").write_text(
+        "from util import helper\n"
+        "import os\n"
+        "def main():\n"
+        "    helper()\n"
+        "    os.getcwd()\n"
+        "    missing()\n",
+        encoding="utf-8",
+    )
+
+
+def test_exact_semantic_ground_truth():
+    """Verify exact-target TP/FP/FN with explicit expected edges.
+
+    This test goes beyond the integrity check (target_file existence) to
+    verify that each resolved edge points to the CORRECT target file and
+    the CORRECT stable_symbol_id. A resolved edge pointing to the wrong
+    file (even if it exists) is counted as FP.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _build_exact_ground_truth_fixture(root)
+
+        store = IndexStore(sqlite3.connect(":memory:"))
+        svc = ResolutionService(store._conn, persist=True)
+        indexer = RepositoryIndexer(store, resolution_service=svc)
+        asyncio.run(indexer.index("gt", root))
+
+        conn = store._conn
+
+        # Look up the stable_symbol_id of helper in util.py (the CORRECT target)
+        util_helper = conn.execute(
+            "SELECT stable_symbol_id FROM repository_symbols "
+            "WHERE repository_id='gt' AND path='util.py' AND name='helper'",
+        ).fetchone()
+        assert util_helper is not None, "helper symbol must exist in util.py"
+        util_helper_ssid = util_helper[0]
+
+        # Look up the stable_symbol_id of helper in other.py (the WRONG target)
+        other_helper = conn.execute(
+            "SELECT stable_symbol_id FROM repository_symbols "
+            "WHERE repository_id='gt' AND path='other.py' AND name='helper'",
+        ).fetchone()
+        assert other_helper is not None, "helper symbol must exist in other.py"
+        other_helper_ssid = other_helper[0]
+
+        # The two stable_symbol_ids must be different (different files)
+        assert util_helper_ssid != other_helper_ssid, (
+            "stable_symbol_id for helper in util.py and other.py must differ"
+        )
+
+        # Define expected edges with exact targets
+        expected_edges = [
+            # import "util.helper" → resolved, target=util.py:helper
+            ExpectedEdge(
+                edge_type="import", source_file="app.py", name="util.helper",
+                expected_status="resolved",
+                expected_target_file="util.py",
+                expected_target_symbol_id=util_helper_ssid,
+            ),
+            # import "os" → external (no target)
+            ExpectedEdge(
+                edge_type="import", source_file="app.py", name="os",
+                expected_status="external",
+            ),
+            # call "helper" → resolved, target=util.py:helper (via import)
+            ExpectedEdge(
+                edge_type="call", source_file="app.py", name="helper",
+                expected_status="resolved",
+                expected_target_file="util.py",
+                expected_target_symbol_id=util_helper_ssid,
+            ),
+            # call "missing" → unresolved (no target)
+            ExpectedEdge(
+                edge_type="call", source_file="app.py", name="missing",
+                expected_status="unresolved",
+            ),
+        ]
+
+        result = compute_exact_ground_truth(conn, "gt", expected_edges)
+
+        # All expected edges must match → TP >= 4, FP = 0, FN = 0
+        assert result["fp"] == 0, (
+            f"Expected 0 false positives, got {result['fp']}: {result['details']}"
+        )
+        assert result["fn"] == 0, (
+            f"Expected 0 false negatives, got {result['fn']}: {result['details']}"
+        )
+        assert result["tp"] >= 4, (
+            f"Expected at least 4 true positives, got {result['tp']}: {result['details']}"
+        )
+        assert result["precision"] == 1.0, (
+            f"Expected precision 1.0, got {result['precision']}"
+        )
+        assert result["recall"] == 1.0, (
+            f"Expected recall 1.0, got {result['recall']}"
+        )
+
+        print(
+            f"\n=== Exact semantic ground truth ===\n"
+            f"TP={result['tp']}, FP={result['fp']}, FN={result['fn']}, "
+            f"precision={result['precision']:.4f}, recall={result['recall']:.4f}\n"
+            f"util.py helper ssid: {util_helper_ssid}\n"
+            f"other.py helper ssid: {other_helper_ssid}\n"
+        )
+
+
+def test_intentional_wrong_target_detected_as_fp():
+    """A resolved edge pointing to an existing-but-wrong file must be counted as FP.
+
+    This test PROVES that ``compute_exact_ground_truth`` detects wrong-target
+    false positives (not just missing-target dangling edges). It:
+    1. Builds a normal resolution where helper() call resolves to util.py:helper
+    2. Corrupts the resolved call edge's target to point to other.py:helper
+       (other.py EXISTS but is the WRONG target)
+    3. Runs the exact ground truth check
+    4. Verifies the corrupted edge is detected as FP
+
+    The integrity check (_assert_no_dangling_resolved_edges) would NOT catch
+    this because other.py exists in code_files. Only the exact-target check
+    catches it.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        _build_exact_ground_truth_fixture(root)
+
+        store = IndexStore(sqlite3.connect(":memory:"))
+        svc = ResolutionService(store._conn, persist=True)
+        indexer = RepositoryIndexer(store, resolution_service=svc)
+        asyncio.run(indexer.index("gt", root))
+
+        conn = store._conn
+
+        # Look up stable_symbol_ids
+        util_helper_ssid = conn.execute(
+            "SELECT stable_symbol_id FROM repository_symbols "
+            "WHERE repository_id='gt' AND path='util.py' AND name='helper'",
+        ).fetchone()[0]
+        other_helper_ssid = conn.execute(
+            "SELECT stable_symbol_id FROM repository_symbols "
+            "WHERE repository_id='gt' AND path='other.py' AND name='helper'",
+        ).fetchone()[0]
+
+        # Before corruption: integrity check passes (no dangling edges)
+        _assert_no_dangling_resolved_edges(store, "gt")
+
+        # Before corruption: exact ground truth has FP=0
+        expected_edges = [
+            ExpectedEdge(
+                edge_type="call", source_file="app.py", name="helper",
+                expected_status="resolved",
+                expected_target_file="util.py",
+                expected_target_symbol_id=util_helper_ssid,
+            ),
+        ]
+        result_before = compute_exact_ground_truth(conn, "gt", expected_edges)
+        assert result_before["fp"] == 0, "Before corruption, FP must be 0"
+        assert result_before["tp"] >= 1, "Before corruption, TP must be >= 1"
+
+        # CORRUPTION: change the resolved call edge's target to other.py
+        # (other.py EXISTS in code_files, so the integrity check won't catch this)
+        conn.execute(
+            "UPDATE resolved_call_edges SET target_file='other.py', target_symbol_id=? "
+            "WHERE repository_id='gt' AND source_file='app.py' AND call_callee='helper' "
+            "AND status='resolved'",
+            (other_helper_ssid,),
+        )
+        conn.commit()
+
+        # After corruption: integrity check STILL passes (other.py exists)
+        _assert_no_dangling_resolved_edges(store, "gt")
+
+        # After corruption: exact ground truth MUST detect FP
+        result_after = compute_exact_ground_truth(conn, "gt", expected_edges)
+        assert result_after["fp"] >= 1, (
+            f"After corruption, FP must be >= 1 (wrong target detected), "
+            f"got FP={result_after['fp']}: {result_after['details']}"
+        )
+        assert result_after["tp"] == 0, (
+            f"After corruption, TP must be 0 (no correct match), "
+            f"got TP={result_after['tp']}"
+        )
+        assert result_after["precision"] == 0.0, (
+            f"After corruption, precision must be 0.0, got {result_after['precision']}"
+        )
+
+        print(
+            f"\n=== Intentional wrong-target FP detection ===\n"
+            f"Before: TP={result_before['tp']}, FP={result_before['fp']}, "
+            f"precision={result_before['precision']:.4f}\n"
+            f"After:  TP={result_after['tp']}, FP={result_after['fp']}, "
+            f"precision={result_after['precision']:.4f}\n"
+            f"Integrity check passed both times (other.py exists) — "
+            f"only exact-target check caught the FP\n"
         )

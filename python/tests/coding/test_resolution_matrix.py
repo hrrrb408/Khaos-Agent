@@ -5,8 +5,11 @@ Tests run without tree-sitter by injecting synthetic parse data for
 non-Python languages. Python uses the real PythonAstAdapter via
 RepositoryIndexer.
 
-Ground truth precision is enforced: resolved edges must have zero false
-positives. Dynamic scenarios remaining unresolved is the correct result.
+Resolved edge integrity is enforced: resolved edges must have zero
+dangling targets (target_file must exist in code_files). This is an
+integrity check, NOT semantic precision — it does not verify that the
+target is the CORRECT one. For exact-target semantic precision, see
+test_resolution_performance.py::test_exact_semantic_ground_truth.
 """
 from __future__ import annotations
 
@@ -676,11 +679,16 @@ def test_30_same_repo_rebuild_identical():
     asyncio.run(run())
 
 
-# ---- Ground truth precision/coverage (Section 19) ----
+# ---- Resolved edge integrity checks (NOT semantic precision) ----
 
 
-def test_ground_truth_precision_no_false_positives():
-    """Resolved edges must have zero false positives in ground truth."""
+def test_resolved_edge_integrity_no_dangling_targets():
+    """Integrity check: resolved edges must not point to missing target files.
+
+    This is a COMPLETENESS INTEGRITY CHECK, not semantic precision. It verifies
+    that every resolved edge has a non-null target pointing to an existing file.
+    It does NOT verify that the target is the CORRECT file or symbol.
+    """
     async def run():
         store = IndexStore(sqlite3.connect(":memory:"))
         # Ground truth: only helper in util.py is truly resolvable
@@ -714,15 +722,18 @@ def test_ground_truth_precision_no_false_positives():
     asyncio.run(run())
 
 
-def test_ground_truth_precision_coverage_report():
-    """Report precision and coverage metrics with mutual exclusivity.
+def test_resolved_edge_integrity_and_mutual_exclusivity():
+    """Integrity check: mutual exclusivity and no dangling resolved edges.
 
     Verifies:
       1. candidate_total == resolved + ambiguous + unresolved + external + dynamic + invalid
          for each edge type (imports, calls, references)
-      2. No false positives (FP=0): all resolved edges point to real targets
-      3. precision = TP / (TP + FP) = 1.0
-      4. coverage = resolved / eligible (eligible = resolved + ambiguous + unresolved)
+      2. No dangling resolved edges (target_file exists in code_files)
+      3. Integrity precision = 1.0 (all resolved targets exist)
+
+    This is an INTEGRITY CHECK, not semantic precision. It does NOT verify
+    that resolved edges point to the CORRECT target. For exact-target
+    semantic precision, see test_resolution_performance.py.
     """
     async def run():
         store = IndexStore(sqlite3.connect(":memory:"))
