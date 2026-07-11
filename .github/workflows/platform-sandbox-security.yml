@@ -2,8 +2,13 @@ name: Platform Sandbox Security E2E
 
 on:
   pull_request:
+    branches:
+      - main
   push:
-    branches: [feature/coding-runtime-alignment]
+    branches:
+      - main
+      - "feature/**"
+  workflow_dispatch:
 
 jobs:
   linux-bwrap-security:
