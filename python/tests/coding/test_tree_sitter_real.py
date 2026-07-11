@@ -66,14 +66,14 @@ def test_symbol_coverage_and_qualified_names() -> None:
 @pytest.mark.parametrize(("extension", "content", "module", "alias"), [
     ("py", b"import os as operating\nfrom .x import y\nfrom pkg import *\n", "os", "operating"),
     ("js", b'import value from "pkg"; import * as ns from "space"; import "side"; export {x} from "other";', "space", "ns"),
-    ("ts", b'import {A as B} from "pkg"; export * from "other";', "pkg", None),
+    ("ts", b'import {A as B} from "pkg"; export * from "other";', "pkg", "B"),
     ("go", b'package p\nimport ( alias "one"\n_ "two"\n. "three" )', "one", "alias"),
     ("rs", b"use crate::{a, b::C};\nuse other::*;\nuse thing::X as Y;\nextern crate core;", "thing::X", "Y"),
 ])
 def test_import_coverage_alias_group_and_nested(extension: str, content: bytes, module: str, alias: str | None) -> None:
     result = LanguageRegistry().parse(file_path=f"x.{extension}", content=content)
     assert any(item.module == module and item.alias == alias for item in result.imports)
-    assert list(result.imports) == sorted(result.imports, key=lambda item: (item.location.byte_start, item.location.byte_end, item.module, item.alias or ""))
+    assert list(result.imports) == sorted(result.imports, key=lambda item: (item.location.byte_start, int(item.metadata.get("item_byte_start", item.location.byte_start)), item.module, item.alias or ""))
 
 
 @pytest.mark.parametrize("content", ["😀 = 1\ndef 函数(): pass", "e\u0301 = 1\r\ndef 函数(): pass", "前缀 = '😀'; def 函数(): pass"])
