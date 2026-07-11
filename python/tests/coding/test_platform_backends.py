@@ -79,33 +79,42 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
     (main_repo / "README.txt").write_text("main\n", encoding="utf-8")
 
     command = "\n".join([
-        "import os, socket, subprocess",
+        "import os, socket, subprocess, time",
         "from pathlib import Path",
+        "_log = open('debug.log', 'w')",
+        "_log.write('start: %s\\n' % time.time()); _log.flush()",
         # 2. Worktree writable
         "Path('inside.txt').write_text('ok')",
+        "_log.write('wrote inside.txt\\n'); _log.flush()",
         # 6. /tmp is a fresh controlled tmpfs — writable
         "assert Path('/tmp').is_dir()",
         "Path('/tmp/sandbox.tmp').write_text('tmp-ok')",
+        "_log.write('wrote /tmp/sandbox.tmp\\n'); _log.flush()",
         # 4. Outside-worktree write fails (read-only root bind)
         f"try: Path({str(outside)!r}).write_text('no')",
         "except OSError: pass",
         "else: raise SystemExit('outside write allowed')",
+        "_log.write('outside write blocked\\n'); _log.flush()",
         # 3. Main repository is read-only
         f"try: Path({str(main_repo / 'README.txt')!r}).write_text('tampered')",
         "except OSError: pass",
         "else: raise SystemExit('main repo write allowed')",
+        "_log.write('main repo write blocked\\n'); _log.flush()",
         # 5. Network access truly fails
         "try: socket.create_connection(('1.1.1.1', 53), timeout=1)",
         "except OSError: pass",
         "else: raise SystemExit('network allowed')",
+        "_log.write('network blocked\\n'); _log.flush()",
         # 7. PID isolation — new PID namespace yields a low namespace-local PID
         "pid = os.getpid()",
         "assert pid < 100, f'unexpected host PID {pid}'",
+        "_log.write('pid ok: %s\\n' % pid); _log.flush()",
         # 8. Background child — must be killed when bwrap tears down the namespace.
         #    os._exit(0) bypasses atexit (including subprocess._cleanup which
         #    would block on wait() for the 30-second sleep), so the Python init
         #    process exits immediately and the PID namespace SIGKILLs the orphan.
         "subprocess.Popen(['sleep', '30'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)",
+        "_log.write('spawned sleep\\n'); _log.flush()",
         "os._exit(0)",
     ])
 
@@ -117,7 +126,15 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
             budget=ResourceBudget(timeout_seconds=15),
         )
     )
-    assert result.status == "passed", result.stderr
+    # Read debug log from workspace (persists even on timeout because the
+    # worktree is bind-mounted on the host).
+    debug_log = ""
+    debug_path = workspace / "debug.log"
+    if debug_path.exists():
+        debug_log = debug_path.read_text(encoding="utf-8")
+    assert result.status == "passed", (
+        f"status={result.status} stderr={result.stderr!r} debug_log={debug_log!r}"
+    )
 
     # 2. Worktree writable — evidence
     assert (workspace / "inside.txt").read_text(encoding="utf-8") == "ok"
