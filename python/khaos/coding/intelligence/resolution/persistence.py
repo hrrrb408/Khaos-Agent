@@ -197,17 +197,22 @@ def remove_file_resolution(conn: sqlite3.Connection, repository_id: str, file_pa
         conn.execute("DELETE FROM resolved_reference_edges WHERE repository_id=? AND source_file=?", (repository_id, file_path))
         conn.execute("DELETE FROM resolution_diagnostics WHERE repository_id=? AND source_file=?", (repository_id, file_path))
         conn.execute("DELETE FROM resolution_generation WHERE repository_id=? AND source_file=?", (repository_id, file_path))
-        # Invalidate edges that point TO this file (dangling targets)
+        # Invalidate edges that point TO this file. We keep target_file so the
+        # reverse-dependency lookup can still find dependents when the file is
+        # later restored — only the *resolved* status is cleared (target_symbol_id
+        # is set to NULL because the symbol itself no longer exists). This means
+        # no resolved edge points to a missing file (no dangling resolved target),
+        # but the dependency relationship is preserved for re-resolution.
         conn.execute(
-            "UPDATE resolved_imports SET status='unresolved', target_file=NULL, target_symbol_id=NULL, confidence=0.4, reason='target-file-deleted' WHERE repository_id=? AND target_file=?",
+            "UPDATE resolved_imports SET status='unresolved', target_symbol_id=NULL, confidence=0.4, reason='target-file-deleted' WHERE repository_id=? AND target_file=? AND status='resolved'",
             (repository_id, file_path),
         )
         conn.execute(
-            "UPDATE resolved_call_edges SET status='unresolved', target_file=NULL, target_symbol_id=NULL, confidence=0.4, resolution_rule='target-file-deleted' WHERE repository_id=? AND target_file=?",
+            "UPDATE resolved_call_edges SET status='unresolved', target_symbol_id=NULL, confidence=0.4, resolution_rule='target-file-deleted' WHERE repository_id=? AND target_file=? AND status='resolved'",
             (repository_id, file_path),
         )
         conn.execute(
-            "UPDATE resolved_reference_edges SET status='unresolved', target_file=NULL, target_symbol_id=NULL, confidence=0.4, resolution_rule='target-file-deleted' WHERE repository_id=? AND target_file=?",
+            "UPDATE resolved_reference_edges SET status='unresolved', target_symbol_id=NULL, confidence=0.4, resolution_rule='target-file-deleted' WHERE repository_id=? AND target_file=? AND status='resolved'",
             (repository_id, file_path),
         )
         conn.commit()
