@@ -69,6 +69,7 @@ class CallCandidate:
     location: SourceLocation
     source: str
     confidence: float
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ class ReferenceCandidate:
     location: SourceLocation
     source: str
     confidence: float
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -110,6 +112,10 @@ class ParserMetadata:
     ast_node_count: int = 0
     symbol_query_match_count: int = 0
     import_query_match_count: int = 0
+    call_query_match_count: int = 0
+    reference_query_match_count: int = 0
+    skipped_error_call_count: int = 0
+    skipped_error_reference_count: int = 0
 
 
 @dataclass(frozen=True)

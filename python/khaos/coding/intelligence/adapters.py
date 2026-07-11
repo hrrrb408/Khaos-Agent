@@ -13,7 +13,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Protocol
 
-from khaos.coding.intelligence.models import ImportReference, ParseDiagnostic, ParseResult, ParserMetadata, ParseState, SourceLocation, Symbol
+from khaos.coding.intelligence.models import CallCandidate, ImportReference, ParseDiagnostic, ParseResult, ParserMetadata, ParseState, ReferenceCandidate, SourceLocation, Symbol
 
 
 @dataclass(frozen=True)
@@ -82,7 +82,7 @@ class TreeSitterAdapter:
         self.language = self.language_id = language
         self.extensions = extensions
         self._lock = threading.RLock()
-        self._initialized: dict[str, tuple[Any, Any, Any, GrammarSpec]] = {}
+        self._initialized: dict[str, tuple[Any, Any, Any, Any, Any, GrammarSpec]] = {}
         try:
             self.version = importlib.metadata.version("tree-sitter")
         except importlib.metadata.PackageNotFoundError:
@@ -113,7 +113,7 @@ class TreeSitterAdapter:
         except (ImportError, RuntimeError, TypeError, ValueError) as exc:
             return AdapterAvailability(False, "parser-initialization-failed", str(exc), self.version)
 
-    def _initialize(self, spec: GrammarSpec) -> tuple[Any, Any, Any, GrammarSpec]:
+    def _initialize(self, spec: GrammarSpec) -> tuple[Any, Any, Any, Any, Any, GrammarSpec]:
         with self._lock:
             if spec.dialect in self._initialized:
                 return self._initialized[spec.dialect]
@@ -129,35 +129,43 @@ class TreeSitterAdapter:
             try:
                 symbols_query = tree_sitter.Query(language, _query_text(spec, "symbols.scm"))
                 imports_query = tree_sitter.Query(language, _query_text(spec, "imports.scm"))
+                calls_query = tree_sitter.Query(language, _query_text(spec, "calls.scm"))
+                references_query = tree_sitter.Query(language, _query_text(spec, "references.scm"))
                 tree_sitter.QueryCursor(symbols_query)
                 tree_sitter.QueryCursor(imports_query)
+                tree_sitter.QueryCursor(calls_query)
+                tree_sitter.QueryCursor(references_query)
             except tree_sitter.QueryError as exc:
                 raise QueryLoadError(str(exc)) from exc
             parser = tree_sitter.Parser(language)
             if parser.parse(_minimum_source(spec.dialect)).root_node is None:
                 raise RuntimeError("minimum grammar parse returned no root")
-            value = (language, symbols_query, imports_query, spec)
+            value = (language, symbols_query, imports_query, calls_query, references_query, spec)
             self._initialized[spec.dialect] = value
             return value
 
     def parse(self, *, file_path: str, content: bytes, previous_state: ParseState | None = None) -> ParseResult:
         del previous_state
         started = time.perf_counter()
-        language, symbols_query, imports_query, spec = self._initialize(self._spec(file_path))
+        language, symbols_query, imports_query, calls_query, references_query, spec = self._initialize(self._spec(file_path))
         tree_sitter = importlib.import_module("tree_sitter")
         tree = tree_sitter.Parser(language).parse(content)
         all_nodes = list(_walk(tree.root_node))
         error_nodes = [node for node in all_nodes if node.type == "ERROR" or node.is_missing]
         symbol_matches = tree_sitter.QueryCursor(symbols_query).matches(tree.root_node)
         import_matches = tree_sitter.QueryCursor(imports_query).matches(tree.root_node)
+        call_matches = tree_sitter.QueryCursor(calls_query).matches(tree.root_node)
+        reference_matches = tree_sitter.QueryCursor(references_query).matches(tree.root_node)
         symbols = _extract_symbols(spec, symbol_matches, content, file_path, error_nodes)
         imports = _extract_imports(spec, import_matches, content, file_path, error_nodes)
+        calls, skipped_calls = _extract_calls(spec, call_matches, symbols, content, file_path, error_nodes)
+        references, skipped_references = _extract_references(spec, reference_matches, symbols, imports, calls, content, file_path, error_nodes)
         diagnostics: list[ParseDiagnostic] = []
         if tree.root_node.has_error:
             node = error_nodes[0] if error_nodes else tree.root_node
             diagnostics.append(ParseDiagnostic("parse-error", "warning", "Tree-sitter recovered from syntax error", _node_location(file_path, content, node), True, self.source_name))
-        metadata = ParserMetadata(spec.module, importlib.metadata.version(spec.distribution), language.abi_version, spec.dialect, spec.query_version, len(error_nodes), len(all_nodes), len(symbol_matches), len(import_matches))
-        return ParseResult(spec.language, file_path, tuple(symbols), tuple(imports), (), (), tuple(diagnostics), self.source_name, self.version, _hash(content), (time.perf_counter() - started) * 1000, metadata)
+        metadata = ParserMetadata(spec.module, importlib.metadata.version(spec.distribution), language.abi_version, spec.dialect, spec.query_version, len(error_nodes), len(all_nodes), len(symbol_matches), len(import_matches), len(call_matches), len(reference_matches), skipped_calls, skipped_references)
+        return ParseResult(spec.language, file_path, tuple(symbols), tuple(imports), tuple(calls), tuple(references), tuple(diagnostics), self.source_name, self.version, _hash(content), (time.perf_counter() - started) * 1000, metadata)
 
 
 class GrammarVersionError(RuntimeError): pass
@@ -362,6 +370,106 @@ def _expand_rust_use(node: Any, content: bytes, prefix: str) -> list[tuple[str, 
     if prefix:
         module = f"{prefix}::{module}"
     return [(module, [], None, {"import_kind": "use"})]
+
+
+def _extract_calls(spec: GrammarSpec, matches: list[tuple[int, dict[str, list[Any]]]], symbols: list[Symbol], content: bytes, file_path: str, errors: list[Any]) -> tuple[list[CallCandidate], int]:
+    found: dict[tuple[int, int, str, str | None, str], CallCandidate] = {}
+    skipped = 0
+    for pattern_index, captures in matches:
+        call = _first_capture(captures, "call") or _first_capture(captures, "call.constructor") or _first_capture(captures, "call.macro")
+        callee_node = _first_capture(captures, "callee")
+        if call is None or callee_node is None:
+            skipped += 1
+            continue
+        callee = _text(content, callee_node).strip()
+        if not callee or callee_node.is_missing:
+            skipped += 1
+            continue
+        error_region = _overlaps(call, errors)
+        call_kind = "macro" if "call.macro" in captures else "constructor" if "call.constructor" in captures else "call"
+        if call_kind == "macro" and not callee.endswith("!"):
+            callee = f"{callee}!"
+        caller = _caller_for_range(symbols, call.start_byte, call.end_byte)
+        receiver_node = callee_node.child_by_field_name("object") or callee_node.child_by_field_name("operand") or callee_node.child_by_field_name("value")
+        receiver = _text(content, receiver_node) or None
+        callee_form = "member" if callee_node.type in {"attribute", "member_expression", "selector_expression", "field_expression"} else "path" if callee_node.type in {"scoped_identifier"} else "identifier"
+        ambiguity = "possible-type-conversion" if spec.dialect == "go" else None
+        location = _node_location(file_path, content, callee_node)
+        metadata = {"dialect": spec.dialect, "node_type": call.type, "query_pattern": pattern_index, "call_kind": call_kind, "callee_form": callee_form, "call_byte_start": call.start_byte, "call_byte_end": call.end_byte, "receiver": receiver, "resolution": "unresolved", "ambiguity": ambiguity, "error_region": error_region, "capture_byte_start": callee_node.start_byte, "capture_byte_end": callee_node.end_byte}
+        item = CallCandidate(callee, caller, location, "tree-sitter", 0.5 if error_region else 0.95, metadata)
+        found[(location.byte_start, location.byte_end, callee, caller, call_kind)] = item
+    values = sorted(found.values(), key=lambda item: (item.location.byte_start, item.location.byte_end, item.callee, item.caller or "", item.metadata["call_kind"]))
+    return values, skipped
+
+
+def _caller_for_range(symbols: list[Symbol], start: int, end: int) -> str | None:
+    containers = [symbol for symbol in symbols if int(symbol.metadata.get("definition_byte_start", -1)) <= start and int(symbol.metadata.get("definition_byte_end", -1)) >= end and symbol.kind not in {"class", "interface", "struct", "enum", "trait", "type_alias", "named_type", "module"}]
+    if not containers:
+        return None
+    return min(containers, key=lambda symbol: int(symbol.metadata["definition_byte_end"]) - int(symbol.metadata["definition_byte_start"])).qualified_name
+
+
+def _extract_references(spec: GrammarSpec, matches: list[tuple[int, dict[str, list[Any]]]], symbols: list[Symbol], imports: list[ImportReference], calls: list[CallCandidate], content: bytes, file_path: str, errors: list[Any]) -> tuple[list[ReferenceCandidate], int]:
+    found: dict[tuple[int, int, str, str], ReferenceCandidate] = {}
+    skipped = 0
+    symbol_ranges = {(symbol.location.byte_start, symbol.location.byte_end) for symbol in symbols}
+    call_ranges = [(call.location.byte_start, call.location.byte_end) for call in calls]
+    for pattern_index, captures in matches:
+        capture_name = next((name for name in captures if name.startswith("reference.")), None)
+        node = _first_capture(captures, capture_name) if capture_name else None
+        if node is None or (node.start_byte, node.end_byte) in symbol_ranges or _excluded_reference_node(node):
+            continue
+        name = _text(content, node)
+        if not name or node.is_missing:
+            skipped += 1
+            continue
+        context = _reference_context(capture_name or "", node, call_ranges)
+        error_region = _overlaps(node, errors)
+        location = _node_location(file_path, content, node)
+        owner = _caller_for_range(symbols, node.start_byte, node.end_byte)
+        metadata = {"dialect": spec.dialect, "node_type": node.type, "query_pattern": pattern_index, "context": context, "owner": owner, "resolution": "unresolved", "error_region": error_region, "capture_byte_start": node.start_byte, "capture_byte_end": node.end_byte}
+        item = ReferenceCandidate(name, context, location, "tree-sitter", 0.5 if error_region else 0.9, metadata)
+        found[(location.byte_start, location.byte_end, name, context)] = item
+    values = sorted(found.values(), key=lambda item: (item.location.byte_start, item.location.byte_end, item.name, item.reference_kind))
+    return values, skipped
+
+
+def _excluded_reference_node(node: Any) -> bool:
+    parent = node.parent
+    while parent is not None:
+        if parent.type in {"import_statement", "import_from_statement", "import_spec", "use_declaration", "extern_crate_declaration", "formal_parameters", "parameters", "parameter_list", "parameter", "required_parameter", "optional_parameter", "label_name", "labeled_statement", "field_declaration", "field_definition"}:
+            return True
+        if parent.type in {"function_definition", "function_declaration", "class_definition", "class_declaration", "interface_declaration", "type_alias_declaration", "type_spec", "struct_item", "enum_item", "trait_item", "type_item", "mod_item"} and parent.child_by_field_name("name") == node:
+            return True
+        parent = parent.parent
+    return False
+
+
+def _reference_context(capture_name: str, node: Any, call_ranges: list[tuple[int, int]]) -> str:
+    if any(start <= node.start_byte and end >= node.end_byte for start, end in call_ranges):
+        return "member" if capture_name == "reference.member" else "call"
+    if capture_name == "reference.member":
+        return "member"
+    if capture_name == "reference.type":
+        return "type"
+    if capture_name == "reference.jsx":
+        return "jsx"
+    parent = node.parent
+    while parent is not None:
+        if parent.type in {"jsx_opening_element", "jsx_closing_element", "jsx_self_closing_element"}:
+            return "jsx"
+        if parent.type in {"augmented_assignment", "update_expression", "inc_statement", "dec_statement", "compound_assignment_expr"}:
+            return "readwrite"
+        if parent.type in {"assignment", "assignment_expression", "assignment_statement", "short_var_declaration", "let_declaration", "variable_declarator"}:
+            left = parent.child_by_field_name("left") or parent.child_by_field_name("name") or parent.child_by_field_name("pattern")
+            if left is not None and left.start_byte <= node.start_byte and left.end_byte >= node.end_byte:
+                return "write"
+        if parent.type in {"type", "type_annotation", "type_identifier", "generic_type", "base_class_clause", "implements_clause", "type_arguments"}:
+            return "annotation"
+        if parent.type in {"call", "call_expression", "new_expression", "macro_invocation"}:
+            break
+        parent = parent.parent
+    return "read"
 
 
 # Existing offline adapters remain dependency-free.
