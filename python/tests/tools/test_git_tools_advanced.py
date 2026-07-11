@@ -4,11 +4,19 @@ from __future__ import annotations
 
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from khaos.tools.git_tools import git_create_branch, git_pr_body, git_push
 from khaos.tools.registry import create_runtime_registry
+from khaos.coding.workspace.models import WorkspaceState
+
+
+def _ctx(repo, access_mode="vcs.destructive-write"):
+    workspace = SimpleNamespace(task_id="task", worktree_path=repo, state=WorkspaceState.RUNNING)
+    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": SimpleNamespace(workspace_manager=manager)}
 
 
 async def _git(repo, *args):
@@ -48,7 +56,7 @@ def test_new_git_tools_registered() -> None:
 async def test_create_branch(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
 
-    result = json.loads(await git_create_branch(str(repo), "feat/cool"))
+    result = json.loads(await git_create_branch(str(repo), "feat/cool", **_ctx(repo)))
 
     assert result["created"] is True
     assert result["branch"] == "feat/cool"
@@ -61,7 +69,7 @@ async def test_create_branch(tmp_path) -> None:
 async def test_create_branch_requires_name(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
 
-    result = json.loads(await git_create_branch(str(repo), ""))
+    result = json.loads(await git_create_branch(str(repo), "", **_ctx(repo)))
 
     assert "error" in result
 
@@ -70,7 +78,7 @@ async def test_create_branch_missing_base(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
 
     result = json.loads(
-        await git_create_branch(str(repo), "feat/x", from_base="nonexistent")
+        await git_create_branch(str(repo), "feat/x", from_base="nonexistent", **_ctx(repo))
     )
 
     assert result["created"] is False
@@ -82,14 +90,14 @@ async def test_push_branch(tmp_path) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
     await _repo_with_main(repo)
-    await git_create_branch(str(repo), "feat/push")
+    await git_create_branch(str(repo), "feat/push", **_ctx(repo))
 
     # Set up a bare remote and point origin at it.
     remote = tmp_path / "remote.git"
     await _git(remote.parent, "init", "--bare", str(remote))
     await _git(repo, "remote", "add", "origin", str(remote))
 
-    result = json.loads(await git_push(str(repo)))
+    result = json.loads(await git_push(str(repo), **_ctx(repo, "vcs.remote-write")))
 
     assert result["pushed"] is True
     assert result["branch"] == "feat/push"
@@ -99,7 +107,7 @@ async def test_push_branch(tmp_path) -> None:
 async def test_push_no_remote_fails_gracefully(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
 
-    result = json.loads(await git_push(str(repo)))
+    result = json.loads(await git_push(str(repo), **_ctx(repo, "vcs.remote-write")))
 
     assert result["pushed"] is False
     assert "error" in result
@@ -107,7 +115,7 @@ async def test_push_no_remote_fails_gracefully(tmp_path) -> None:
 
 async def test_pr_body_generation(tmp_path) -> None:
     repo = await _repo_with_main(tmp_path)
-    await git_create_branch(str(repo), "feat/pr")
+    await git_create_branch(str(repo), "feat/pr", **_ctx(repo))
     # Add a couple of conventional commits on the feature branch.
     (repo / "a.py").write_text("x = 1\n", encoding="utf-8")
     await _git(repo, "add", "a.py")
@@ -130,7 +138,7 @@ async def test_pr_body_generation(tmp_path) -> None:
 async def test_pr_body_empty_branch(tmp_path) -> None:
     """A branch with no commits ahead of main yields an empty title."""
     repo = await _repo_with_main(tmp_path)
-    await git_create_branch(str(repo), "feat/empty")
+    await git_create_branch(str(repo), "feat/empty", **_ctx(repo))
 
     result = json.loads(await git_pr_body(str(repo)))
 

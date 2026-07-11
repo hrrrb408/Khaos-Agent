@@ -135,6 +135,12 @@ class ToolInvocationBroker:
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
+        if any(capability.name.startswith("vcs.") for capability in capabilities):
+            handler_params["execution_service"] = context.get("execution_service")
+            handler_params["task_id"] = context.get("task_id")
+            handler_params["workspace_id"] = context.get("workspace_id")
+            handler_params["approval_context"] = context.get("approval_context")
+            handler_params["network_policy"] = context.get("network_policy", "none")
         if mode == "coding" and any(capability.name == "filesystem.write" for capability in capabilities):
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")

@@ -1,5 +1,6 @@
 import asyncio
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -13,6 +14,13 @@ from khaos.tools.git_tools import (
     git_undo,
 )
 from khaos.tools.registry import create_runtime_registry
+from khaos.coding.workspace.models import WorkspaceState
+
+
+def _ctx(repo, access_mode="vcs.write"):
+    workspace = SimpleNamespace(task_id="task", worktree_path=repo, state=WorkspaceState.RUNNING)
+    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": SimpleNamespace(workspace_manager=manager)}
 
 
 async def _git(repo, *args):
@@ -54,7 +62,7 @@ async def test_git_commit_and_log(tmp_path):
     (repo / "b.txt").write_text("b\n", encoding="utf-8")
     await _git(repo, "add", "b.txt")
 
-    commit = await git_commit(str(repo), "add b")
+    commit = await git_commit(str(repo), "add b", **_ctx(repo))
     log = await git_log(str(repo), limit=1)
 
     assert commit["returncode"] == 0
@@ -118,7 +126,7 @@ async def test_git_status_classifies_changes(tmp_path):
 async def test_git_smart_commit_nothing_to_commit(tmp_path):
     repo = await _repo(tmp_path)
 
-    result = json.loads(await git_smart_commit(str(repo)))
+    result = json.loads(await git_smart_commit(str(repo), **_ctx(repo)))
 
     assert result == {"message": "Nothing to commit."}
 
@@ -127,7 +135,7 @@ async def test_git_smart_commit_auto_message_for_new_file(tmp_path):
     repo = await _repo(tmp_path)
     (repo / "feature.py").write_text("print('hi')\n", encoding="utf-8")
 
-    result = json.loads(await git_smart_commit(str(repo)))
+    result = json.loads(await git_smart_commit(str(repo), **_ctx(repo)))
 
     assert result["files_changed"] == 1
     assert result["message"].startswith("feat")
@@ -146,7 +154,7 @@ async def test_git_smart_commit_custom_message(tmp_path):
     (repo / "fix.txt").write_text("fix\n", encoding="utf-8")
 
     result = json.loads(
-        await git_smart_commit(str(repo), message="fix: custom msg")
+        await git_smart_commit(str(repo), message="fix: custom msg", **_ctx(repo))
     )
 
     assert result["message"] == "fix: custom msg"
@@ -159,7 +167,7 @@ async def test_git_smart_commit_test_file_type(tmp_path):
     (repo / "test_things.py").write_text("# tests\n", encoding="utf-8")
     (repo / "test_more.py").write_text("# more\n", encoding="utf-8")
 
-    result = json.loads(await git_smart_commit(str(repo)))
+    result = json.loads(await git_smart_commit(str(repo), **_ctx(repo)))
 
     assert result["message"].startswith("test")
 
@@ -172,9 +180,9 @@ async def test_git_smart_commit_test_file_type(tmp_path):
 async def test_git_undo_restores_changes_staged(tmp_path):
     repo = await _repo(tmp_path)
     (repo / "c.txt").write_text("c\n", encoding="utf-8")
-    await git_smart_commit(str(repo), message="feat: add c")
+    await git_smart_commit(str(repo), message="feat: add c", **_ctx(repo))
 
-    result = json.loads(await git_undo(str(repo)))
+    result = json.loads(await git_undo(str(repo), **_ctx(repo, "vcs.destructive-write")))
 
     assert "Undone commit" in result["message"]
     assert "c.txt" in result["files"]
@@ -188,7 +196,7 @@ async def test_git_undo_restores_changes_staged(tmp_path):
 async def test_git_undo_without_commits_returns_error(tmp_path):
     await _git(tmp_path, "init")
 
-    result = json.loads(await git_undo(str(tmp_path)))
+    result = json.loads(await git_undo(str(tmp_path), **_ctx(tmp_path, "vcs.destructive-write")))
 
     assert "error" in result
 
@@ -209,5 +217,3 @@ def test_runtime_registry_binds_new_git_and_test_tools():
     assert registry.get("git_smart_commit").permission_level == "write"
     assert registry.get("git_undo").permission_level == "write"
     assert registry.get("test_run").permission_level == "write"
-
-
