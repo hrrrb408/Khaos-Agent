@@ -115,8 +115,8 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
         #    which was causing bwrap to hang on teardown.  The shell starts sleep in
         #    the background and exits immediately; os.system returns.  Python then
         #    exits normally.  When PID 1 exits, the kernel SIGKILLs the orphaned sleep.
-        "os.system('sleep 30 </dev/null >/dev/null 2>&1 &')",
-        "_log.write('spawned sleep via shell\\n'); _log.flush()",
+        "os.system('sleep 3 </dev/null >/dev/null 2>&1 &')",
+        "_log.write('spawned sleep 3 via shell\\n'); _log.flush()",
     ])
 
     # 1. Real bwrap execution
@@ -147,7 +147,7 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
     # 8. No residual processes — the background sleep must have been killed
     # when the bwrap PID namespace was torn down.
     ps = subprocess.run(
-        ["pgrep", "-f", "sleep 30"], capture_output=True, text=True,
+        ["pgrep", "-f", "sleep 3"], capture_output=True, text=True,
     )
     assert ps.stdout.strip() == "", f"residual process survived bwrap teardown: {ps.stdout}"
 
