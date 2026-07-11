@@ -32,7 +32,8 @@ logger = logging.getLogger(__name__)
 
 RESOLUTION_SCHEMA = """
 CREATE TABLE IF NOT EXISTS repository_symbols (
-    symbol_id TEXT PRIMARY KEY,
+    symbol_id TEXT NOT NULL,
+    stable_symbol_id TEXT NOT NULL,
     repository_id TEXT NOT NULL,
     path TEXT NOT NULL,
     language TEXT NOT NULL,
@@ -42,11 +43,13 @@ CREATE TABLE IF NOT EXISTS repository_symbols (
     byte_start INTEGER NOT NULL,
     byte_end INTEGER NOT NULL,
     start_line INTEGER NOT NULL,
-    generation INTEGER NOT NULL
+    generation INTEGER NOT NULL,
+    PRIMARY KEY (repository_id, symbol_id)
 );
 CREATE INDEX IF NOT EXISTS idx_repo_symbols_repo_name ON repository_symbols(repository_id, name);
 CREATE INDEX IF NOT EXISTS idx_repo_symbols_repo_path ON repository_symbols(repository_id, path);
 CREATE INDEX IF NOT EXISTS idx_repo_symbols_repo_qname ON repository_symbols(repository_id, qualified_name);
+CREATE INDEX IF NOT EXISTS idx_repo_symbols_stable ON repository_symbols(repository_id, stable_symbol_id);
 
 CREATE TABLE IF NOT EXISTS resolved_imports (
     repository_id TEXT NOT NULL,
@@ -68,7 +71,7 @@ CREATE INDEX IF NOT EXISTS idx_resolved_imports_source ON resolved_imports(repos
 CREATE INDEX IF NOT EXISTS idx_resolved_imports_target ON resolved_imports(repository_id, target_file);
 
 CREATE TABLE IF NOT EXISTS resolved_call_edges (
-    edge_id TEXT PRIMARY KEY,
+    edge_id TEXT NOT NULL,
     repository_id TEXT NOT NULL,
     source_file TEXT NOT NULL,
     caller_symbol_id TEXT,
@@ -80,13 +83,14 @@ CREATE TABLE IF NOT EXISTS resolved_call_edges (
     resolution_rule TEXT NOT NULL,
     ambiguity_reason TEXT,
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    generation INTEGER NOT NULL
+    generation INTEGER NOT NULL,
+    PRIMARY KEY (repository_id, edge_id)
 );
 CREATE INDEX IF NOT EXISTS idx_call_edges_repo_source ON resolved_call_edges(repository_id, source_file);
 CREATE INDEX IF NOT EXISTS idx_call_edges_repo_target ON resolved_call_edges(repository_id, target_symbol_id);
 
 CREATE TABLE IF NOT EXISTS resolved_reference_edges (
-    edge_id TEXT PRIMARY KEY,
+    edge_id TEXT NOT NULL,
     repository_id TEXT NOT NULL,
     source_file TEXT NOT NULL,
     name TEXT NOT NULL,
@@ -97,7 +101,8 @@ CREATE TABLE IF NOT EXISTS resolved_reference_edges (
     confidence REAL NOT NULL,
     resolution_rule TEXT NOT NULL,
     metadata_json TEXT NOT NULL DEFAULT '{}',
-    generation INTEGER NOT NULL
+    generation INTEGER NOT NULL,
+    PRIMARY KEY (repository_id, edge_id)
 );
 CREATE INDEX IF NOT EXISTS idx_ref_edges_repo_source ON resolved_reference_edges(repository_id, source_file);
 CREATE INDEX IF NOT EXISTS idx_ref_edges_repo_target ON resolved_reference_edges(repository_id, target_symbol_id);
@@ -123,8 +128,46 @@ CREATE TABLE IF NOT EXISTS resolution_generation (
 """
 
 
+def _table_primary_key(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return the set of column names in the primary key of ``table``."""
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})") if row[5]}
+
+
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Return the set of column names in ``table``."""
+    return {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
 def apply_resolution_schema(conn: sqlite3.Connection) -> None:
-    """Apply resolution schema migration. Idempotent and backward-compatible."""
+    """Apply resolution schema migration. Idempotent and backward-compatible.
+
+    For databases with an older schema (missing ``stable_symbol_id`` column
+    or single-column primary keys without ``repository_id``), the affected
+    tables are dropped and recreated. This is safe because the resolution
+    graph is fully rebuildable from the IndexStore's persisted ParseResult
+    data.
+    """
+    conn.executescript(RESOLUTION_SCHEMA)
+    # Migration: ensure repository_symbols has stable_symbol_id and composite PK
+    try:
+        cols = _table_columns(conn, "repository_symbols")
+        if cols and ("stable_symbol_id" not in cols or _table_primary_key(conn, "repository_symbols") != {"repository_id", "symbol_id"}):
+            conn.execute("DROP TABLE repository_symbols")
+    except sqlite3.OperationalError:
+        pass
+    # Migration: ensure resolved_call_edges has composite PK (repository_id, edge_id)
+    try:
+        if _table_primary_key(conn, "resolved_call_edges") != {"repository_id", "edge_id"}:
+            conn.execute("DROP TABLE resolved_call_edges")
+    except sqlite3.OperationalError:
+        pass
+    # Migration: ensure resolved_reference_edges has composite PK (repository_id, edge_id)
+    try:
+        if _table_primary_key(conn, "resolved_reference_edges") != {"repository_id", "edge_id"}:
+            conn.execute("DROP TABLE resolved_reference_edges")
+    except sqlite3.OperationalError:
+        pass
+    # Re-create any tables that were dropped
     conn.executescript(RESOLUTION_SCHEMA)
     conn.commit()
 
@@ -153,7 +196,7 @@ def commit_file_resolution(
         conn.execute("DELETE FROM resolution_diagnostics WHERE repository_id=? AND source_file=?", (repository_id, file_path))
         # Insert symbols
         conn.executemany(
-            "INSERT INTO repository_symbols VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO repository_symbols VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             [_symbol_row(s) for s in result.symbols],
         )
         # Insert imports
@@ -370,7 +413,7 @@ def resolution_counts(conn: sqlite3.Connection, repository_id: str) -> dict[str,
 
 
 def _symbol_row(sym: RepositorySymbol) -> tuple[Any, ...]:
-    return (sym.symbol_id, sym.repository_id, sym.path, sym.language, sym.kind, sym.name, sym.qualified_name, sym.byte_start, sym.byte_end, sym.start_line, sym.generation)
+    return (sym.symbol_id, sym.stable_symbol_id, sym.repository_id, sym.path, sym.language, sym.kind, sym.name, sym.qualified_name, sym.byte_start, sym.byte_end, sym.start_line, sym.generation)
 
 
 def _import_row(repository_id: str, file_path: str, generation: int, imp: ResolvedImport) -> tuple[Any, ...]:
@@ -404,7 +447,7 @@ def _diagnostic_row(repository_id: str, file_path: str, ordinal: int, diag: Reso
 
 
 def _symbol_dict(row: sqlite3.Row | tuple) -> dict[str, Any]:
-    keys = ("symbol_id", "repository_id", "path", "language", "kind", "name", "qualified_name", "byte_start", "byte_end", "start_line", "generation")
+    keys = ("symbol_id", "stable_symbol_id", "repository_id", "path", "language", "kind", "name", "qualified_name", "byte_start", "byte_end", "start_line", "generation")
     return dict(zip(keys, row))
 
 

@@ -21,9 +21,19 @@ class ResolutionStatus(str, Enum):
 
 @dataclass(frozen=True)
 class RepositorySymbol:
-    """Stable repository-level symbol with deterministic ID."""
+    """Stable repository-level symbol with deterministic ID.
+
+    ``symbol_id`` is the revision ID (includes generation).
+    ``stable_symbol_id`` is the generation-independent identity (same
+    definition position + same kind + same qualified name = same stable ID).
+
+    Resolved edges target ``stable_symbol_id`` so that incremental updates
+    and full rebuilds produce identical target IDs when the definition
+    hasn't moved.
+    """
 
     symbol_id: str
+    stable_symbol_id: str
     repository_id: str
     path: str
     language: str
@@ -38,6 +48,7 @@ class RepositorySymbol:
     def to_dict(self) -> dict[str, Any]:
         return {
             "symbol_id": self.symbol_id,
+            "stable_symbol_id": self.stable_symbol_id,
             "repository_id": self.repository_id,
             "path": self.path,
             "language": self.language,

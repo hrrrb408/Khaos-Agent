@@ -171,8 +171,8 @@ class ResolutionService:
                 resolve_python_references,
             )
             resolved_imports = resolve_python_imports(file_path, imports, table, generation)
-            resolved_calls = resolve_python_calls(file_path, calls, table, resolved_imports, generation)
-            resolved_references = resolve_python_references(file_path, references, table, resolved_imports, generation)
+            resolved_calls = resolve_python_calls(table.repository_id, file_path, calls, table, resolved_imports, generation)
+            resolved_references = resolve_python_references(table.repository_id, file_path, references, table, resolved_imports, generation)
         elif language in ("javascript", "typescript"):
             from khaos.coding.intelligence.resolution.javascript_resolver import (
                 resolve_javascript_calls,
@@ -180,8 +180,8 @@ class ResolutionService:
                 resolve_javascript_references,
             )
             resolved_imports = resolve_javascript_imports(file_path, imports, table, generation)
-            resolved_calls = resolve_javascript_calls(file_path, calls, table, resolved_imports, generation)
-            resolved_references = resolve_javascript_references(file_path, references, table, resolved_imports, generation)
+            resolved_calls = resolve_javascript_calls(table.repository_id, file_path, calls, table, resolved_imports, generation)
+            resolved_references = resolve_javascript_references(table.repository_id, file_path, references, table, resolved_imports, generation)
         elif language == "go":
             from khaos.coding.intelligence.resolution.go_resolver import (
                 resolve_go_calls,
@@ -189,8 +189,8 @@ class ResolutionService:
                 resolve_go_references,
             )
             resolved_imports = resolve_go_imports(file_path, imports, table, generation, go_module_path)
-            resolved_calls = resolve_go_calls(file_path, calls, table, resolved_imports, generation)
-            resolved_references = resolve_go_references(file_path, references, table, resolved_imports, generation)
+            resolved_calls = resolve_go_calls(table.repository_id, file_path, calls, table, resolved_imports, generation)
+            resolved_references = resolve_go_references(table.repository_id, file_path, references, table, resolved_imports, generation)
         elif language == "rust":
             from khaos.coding.intelligence.resolution.rust_resolver import (
                 resolve_rust_calls,
@@ -198,8 +198,8 @@ class ResolutionService:
                 resolve_rust_references,
             )
             resolved_imports = resolve_rust_imports(file_path, imports, table, generation)
-            resolved_calls = resolve_rust_calls(file_path, calls, table, resolved_imports, generation)
-            resolved_references = resolve_rust_references(file_path, references, table, resolved_imports, generation)
+            resolved_calls = resolve_rust_calls(table.repository_id, file_path, calls, table, resolved_imports, generation)
+            resolved_references = resolve_rust_references(table.repository_id, file_path, references, table, resolved_imports, generation)
         else:
             resolved_imports = ()
             resolved_calls = ()

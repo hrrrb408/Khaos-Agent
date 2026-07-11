@@ -82,6 +82,7 @@ def resolve_go_imports(
 
 
 def resolve_go_calls(
+    repository_id: str,
     source_file: str,
     calls: list[dict[str, Any]],
     table: RepositorySymbolTable,
@@ -113,7 +114,7 @@ def resolve_go_calls(
         location = call.get("location", {})
         byte_start = location.get("byte_start", 0)
         byte_end = location.get("byte_end", 0)
-        eid = call_edge_id(source_file, callee, byte_start, byte_end, generation)
+        eid = call_edge_id(repository_id, source_file, callee, byte_start, byte_end, generation)
         caller_sym_id = _find_caller_symbol_id(source_file, caller, table)
 
         if callee_form == "identifier":
@@ -124,7 +125,7 @@ def resolve_go_calls(
                 candidates.extend(s for s in table.symbols_by_file(pkg_file) if s.name == callee and s.kind in ("function", "type", "method"))
             if len(candidates) == 1:
                 results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.RESOLVED,
-                    candidates[0].symbol_id, candidates[0].path, 0.93, "go-same-package-function", None, metadata))
+                    candidates[0].stable_symbol_id, candidates[0].path, 0.93, "go-same-package-function", None, metadata))
                 continue
             if len(candidates) > 1:
                 results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.AMBIGUOUS,
@@ -149,7 +150,7 @@ def resolve_go_calls(
                     candidates.extend(s for s in table.symbols_by_file(tf) if s.name == member_name and s.kind in ("function", "type", "method"))
                 if len(candidates) == 1:
                     results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.RESOLVED,
-                        candidates[0].symbol_id, candidates[0].path, 0.92, "go-package-selector-call", None, metadata))
+                        candidates[0].stable_symbol_id, candidates[0].path, 0.92, "go-package-selector-call", None, metadata))
                 elif len(candidates) > 1:
                     results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.AMBIGUOUS,
                         None, None, 0.4, "go-package-selector-multiple", f"{len(candidates)} candidates", metadata))
@@ -175,6 +176,7 @@ def resolve_go_calls(
 
 
 def resolve_go_references(
+    repository_id: str,
     source_file: str,
     references: list[dict[str, Any]],
     table: RepositorySymbolTable,
@@ -191,7 +193,7 @@ def resolve_go_references(
         location = ref.get("location", {})
         byte_start = location.get("byte_start", 0)
         byte_end = location.get("byte_end", 0)
-        eid = reference_edge_id(source_file, name, ref_kind, byte_start, byte_end, generation)
+        eid = reference_edge_id(repository_id, source_file, name, ref_kind, byte_start, byte_end, generation)
 
         # Same-package symbol lookup
         same_pkg_files = sorted(p for p in table.indexed_paths() if str(PurePosixPath(p).parent) == source_dir and p.endswith(".go"))
@@ -200,7 +202,7 @@ def resolve_go_references(
             candidates.extend(s for s in table.symbols_by_file(pkg_file) if s.name == name)
         if len(candidates) == 1:
             results.append(ResolvedReferenceEdge(eid, source_file, name, ref_kind, ResolutionStatus.RESOLVED,
-                candidates[0].symbol_id, candidates[0].path, 0.90, "go-same-package-symbol", metadata))
+                candidates[0].stable_symbol_id, candidates[0].path, 0.90, "go-same-package-symbol", metadata))
             continue
         if len(candidates) > 1:
             results.append(ResolvedReferenceEdge(eid, source_file, name, ref_kind, ResolutionStatus.AMBIGUOUS,

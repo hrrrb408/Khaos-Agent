@@ -116,6 +116,7 @@ def resolve_rust_imports(
 
 
 def resolve_rust_calls(
+    repository_id: str,
     source_file: str,
     calls: list[dict[str, Any]],
     table: RepositorySymbolTable,
@@ -142,7 +143,7 @@ def resolve_rust_calls(
         location = call.get("location", {})
         byte_start = location.get("byte_start", 0)
         byte_end = location.get("byte_end", 0)
-        eid = call_edge_id(source_file, callee, byte_start, byte_end, generation)
+        eid = call_edge_id(repository_id, source_file, callee, byte_start, byte_end, generation)
         caller_sym_id = _find_caller_symbol_id(source_file, caller, table)
 
         if callee_form == "identifier":
@@ -155,11 +156,11 @@ def resolve_rust_calls(
             if callee in import_map:
                 target_file, target_sym_id = import_map[callee]
                 if target_sym_id:
-                    candidates.append(RepositorySymbol(target_sym_id, table.repository_id, target_file or "", "rust", "function", callee, callee, 0, 0, 0, 0))
+                    candidates.append(RepositorySymbol(target_sym_id, target_sym_id, table.repository_id, target_file or "", "rust", "function", callee, callee, 0, 0, 0, 0))
 
             if len(candidates) == 1:
                 results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.RESOLVED,
-                    candidates[0].symbol_id, candidates[0].path, 0.93, "rust-same-module-function", None, metadata))
+                    candidates[0].stable_symbol_id, candidates[0].path, 0.93, "rust-same-module-function", None, metadata))
                 continue
             if len(candidates) > 1:
                 results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.AMBIGUOUS,
@@ -178,7 +179,7 @@ def resolve_rust_calls(
                 target_symbols = [s for s in table.symbols_by_file(target_file) if s.name == func_name and s.kind in ("function", "method")]
                 if len(target_symbols) == 1:
                     results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.RESOLVED,
-                        target_symbols[0].symbol_id, target_file, 0.92, "rust-path-call", None, metadata))
+                        target_symbols[0].stable_symbol_id, target_file, 0.92, "rust-path-call", None, metadata))
                     continue
                 if len(target_symbols) > 1:
                     results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.AMBIGUOUS,
@@ -218,7 +219,7 @@ def resolve_rust_calls(
                 target_symbols = [s for s in table.symbols_by_file(target_file) if s.name == member_name]
                 if len(target_symbols) == 1:
                     results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.RESOLVED,
-                        target_symbols[0].symbol_id, target_file, 0.92, "rust-module-attribute-call", None, metadata))
+                        target_symbols[0].stable_symbol_id, target_file, 0.92, "rust-module-attribute-call", None, metadata))
                 elif len(target_symbols) > 1:
                     results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.AMBIGUOUS,
                         None, target_file, 0.4, "rust-module-attribute-multiple", None, metadata))
@@ -238,6 +239,7 @@ def resolve_rust_calls(
 
 
 def resolve_rust_references(
+    repository_id: str,
     source_file: str,
     references: list[dict[str, Any]],
     table: RepositorySymbolTable,
@@ -262,7 +264,7 @@ def resolve_rust_references(
         location = ref.get("location", {})
         byte_start = location.get("byte_start", 0)
         byte_end = location.get("byte_end", 0)
-        eid = reference_edge_id(source_file, name, ref_kind, byte_start, byte_end, generation)
+        eid = reference_edge_id(repository_id, source_file, name, ref_kind, byte_start, byte_end, generation)
 
         # Same-module symbol lookup
         candidates = []
@@ -270,7 +272,7 @@ def resolve_rust_references(
             candidates.extend(s for s in table.symbols_by_file(mod_file) if s.name == name)
         if len(candidates) == 1:
             results.append(ResolvedReferenceEdge(eid, source_file, name, ref_kind, ResolutionStatus.RESOLVED,
-                candidates[0].symbol_id, candidates[0].path, 0.90, "rust-same-module-symbol", metadata))
+                candidates[0].stable_symbol_id, candidates[0].path, 0.90, "rust-same-module-symbol", metadata))
             continue
         if len(candidates) > 1:
             results.append(ResolvedReferenceEdge(eid, source_file, name, ref_kind, ResolutionStatus.AMBIGUOUS,

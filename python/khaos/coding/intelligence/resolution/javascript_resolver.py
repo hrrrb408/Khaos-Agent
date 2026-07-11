@@ -129,6 +129,7 @@ def resolve_javascript_imports(
 
 
 def resolve_javascript_calls(
+    repository_id: str,
     source_file: str,
     calls: list[dict[str, Any]],
     table: RepositorySymbolTable,
@@ -152,14 +153,14 @@ def resolve_javascript_calls(
         location = call.get("location", {})
         byte_start = location.get("byte_start", 0)
         byte_end = location.get("byte_end", 0)
-        eid = call_edge_id(source_file, callee, byte_start, byte_end, generation)
+        eid = call_edge_id(repository_id, source_file, callee, byte_start, byte_end, generation)
         caller_sym_id = _find_caller_symbol_id(source_file, caller, table)
 
         if callee_form == "identifier":
             same_file = [s for s in table.symbols_by_file(source_file) if s.name == callee and s.kind in ("function", "async_function", "class", "method")]
             if len(same_file) == 1:
                 results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.RESOLVED,
-                    same_file[0].symbol_id, same_file[0].path, 0.95, "same-file-unique-function", None, metadata))
+                    same_file[0].stable_symbol_id, same_file[0].path, 0.95, "same-file-unique-function", None, metadata))
                 continue
             if len(same_file) > 1:
                 results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.AMBIGUOUS,
@@ -197,7 +198,7 @@ def resolve_javascript_calls(
                 target_symbols = [s for s in table.symbols_by_file(target_file) if s.name == member_name]
                 if len(target_symbols) == 1:
                     results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.RESOLVED,
-                        target_symbols[0].symbol_id, target_file, 0.92, "namespace-member-call", None, metadata))
+                        target_symbols[0].stable_symbol_id, target_file, 0.92, "namespace-member-call", None, metadata))
                 elif len(target_symbols) > 1:
                     results.append(ResolvedCallEdge(eid, source_file, caller_sym_id, callee, ResolutionStatus.AMBIGUOUS,
                         None, target_file, 0.4, "namespace-member-multiple", f"{len(target_symbols)} candidates", metadata))
@@ -216,6 +217,7 @@ def resolve_javascript_calls(
 
 
 def resolve_javascript_references(
+    repository_id: str,
     source_file: str,
     references: list[dict[str, Any]],
     table: RepositorySymbolTable,
@@ -238,12 +240,12 @@ def resolve_javascript_references(
         location = ref.get("location", {})
         byte_start = location.get("byte_start", 0)
         byte_end = location.get("byte_end", 0)
-        eid = reference_edge_id(source_file, name, ref_kind, byte_start, byte_end, generation)
+        eid = reference_edge_id(repository_id, source_file, name, ref_kind, byte_start, byte_end, generation)
 
         same_file = [s for s in table.symbols_by_file(source_file) if s.name == name]
         if len(same_file) == 1:
             results.append(ResolvedReferenceEdge(eid, source_file, name, ref_kind, ResolutionStatus.RESOLVED,
-                same_file[0].symbol_id, same_file[0].path, 0.92, "same-file-symbol", metadata))
+                same_file[0].stable_symbol_id, same_file[0].path, 0.92, "same-file-symbol", metadata))
             continue
         if len(same_file) > 1:
             results.append(ResolvedReferenceEdge(eid, source_file, name, ref_kind, ResolutionStatus.AMBIGUOUS,

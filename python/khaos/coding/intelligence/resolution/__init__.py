@@ -4,6 +4,7 @@ Provides cross-file import, call, and reference resolution for Python,
 JavaScript/TypeScript/TSX, Go, and Rust — without LSP, type inference,
 or external dependency resolution.
 """
+from khaos.coding.intelligence.resolution.ids import stable_symbol_id
 from khaos.coding.intelligence.resolution.models import (
     FileResolutionResult,
     ResolutionDiagnostic,
@@ -40,4 +41,5 @@ __all__ = [
     "build_symbol_table",
     "commit_file_resolution",
     "remove_file_resolution",
+    "stable_symbol_id",
 ]

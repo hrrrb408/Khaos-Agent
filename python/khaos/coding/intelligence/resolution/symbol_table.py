@@ -15,7 +15,7 @@ from collections import defaultdict
 from pathlib import PurePosixPath
 from typing import Any
 
-from khaos.coding.intelligence.resolution.ids import symbol_id
+from khaos.coding.intelligence.resolution.ids import stable_symbol_id, symbol_id
 from khaos.coding.intelligence.resolution.models import RepositorySymbol
 
 
@@ -52,7 +52,8 @@ class RepositorySymbolTable:
 
     def add_symbol(self, path: str, language: str, generation: int, name: str, kind: str, qualified_name: str, byte_start: int, byte_end: int, start_line: int) -> RepositorySymbol:
         sid = symbol_id(self.repository_id, path, language, kind, qualified_name, byte_start, byte_end, generation)
-        sym = RepositorySymbol(sid, self.repository_id, path, language, kind, name, qualified_name, byte_start, byte_end, start_line, generation)
+        ssid = stable_symbol_id(self.repository_id, path, language, kind, qualified_name, byte_start, byte_end)
+        sym = RepositorySymbol(sid, ssid, self.repository_id, path, language, kind, name, qualified_name, byte_start, byte_end, start_line, generation)
         self._file_symbols[path].append(sym)
         self._name_symbols[name].append(sym)
         self._qualified_symbols[qualified_name].append(sym)
