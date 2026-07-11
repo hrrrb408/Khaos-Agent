@@ -50,7 +50,7 @@ class DockerBackend:
             "--security-opt", "no-new-privileges", "--pids-limit", str(context.budget.pids),
             "--cpus", str(context.budget.cpu_count), "--memory", str(context.budget.memory_bytes),
             "--network", "none", "--mount",
-            f"type=bind,src={context.worktree_path},dst=/workspace,rw",
+            f"type=bind,src={context.worktree_path},dst=/workspace",
             "--workdir", str(container_cwd),
         ]
         env_file = self._write_env_file(context)

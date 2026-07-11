@@ -244,7 +244,7 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     assert argv[argv.index("--cpus") + 1] == "1.0"
     assert argv[argv.index("--memory") + 1] == str(512 * 1024 * 1024)
     mount = argv[argv.index("--mount") + 1]
-    assert mount == f"type=bind,src={tmp_path / 'worktree'},dst=/workspace,rw"
+    assert mount == f"type=bind,src={tmp_path / 'worktree'},dst=/workspace"
     assert str(tmp_path / "repo") not in " ".join(argv)
     assert "/var/run/docker.sock" not in " ".join(argv)
     assert result.diagnostics["cleanup"] == "removed"
@@ -404,11 +404,69 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
         "\nprint('isolated')"
     )
     result = await sandbox_exec(
-        f"python -c {script!r}", execution_service=service,
+        f'python -c "{script}"', execution_service=service,
         task_id="task", workspace_id="workspace", timeout=10,
     )
     assert result["returncode"] == 0, result["stderr"]
     assert result["stdout"].strip() == "isolated"
     assert (worktree / "container.txt").read_text(encoding="utf-8") == "ok"
     assert not (repository / "container.txt").exists()
+    await service.shutdown()
+
+
+@pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
+@pytest.mark.parametrize("action", ["timeout", "cancel", "shutdown"])
+async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
+    repository = tmp_path / "repo"
+    worktree = tmp_path / "worktree"
+    repository.mkdir()
+    subprocess.run(["git", "init", "-b", "main"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=repository, check=True)
+    subprocess.run(["git", "config", "user.name", "Tester"], cwd=repository, check=True)
+    (repository / "base.txt").write_text("base\n", encoding="utf-8")
+    subprocess.run(["git", "add", "base.txt"], cwd=repository, check=True)
+    subprocess.run(["git", "commit", "-m", "base"], cwd=repository, check=True, capture_output=True)
+    subprocess.run(
+        ["git", "worktree", "add", "-b", f"task/{action}", str(worktree), "HEAD"],
+        cwd=repository, check=True, capture_output=True,
+    )
+    worktree.chmod(0o777)
+    workspace = SimpleNamespace(
+        task_id="task", worktree_path=worktree, repository_root=repository,
+        state=WorkspaceState.RUNNING,
+    )
+    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    backend = DockerBackend(allowed_images={"python:3.13-slim"})
+    service = ExecutionService(HostExecutionBackend(), manager, backend)
+    running = asyncio.create_task(sandbox_exec(
+        'python -c "import time; time.sleep(30)"',
+        execution_service=service, task_id="task", workspace_id="workspace",
+        timeout=1 if action == "timeout" else 30,
+    ))
+    if action != "timeout":
+        for _ in range(100):
+            if backend._active:
+                break
+            await asyncio.sleep(0.05)
+        assert backend._active
+        execution_id = next(iter(backend._active))
+        container_name = backend._active[execution_id]
+        if action == "cancel":
+            await service.terminate(execution_id)
+        else:
+            await service.shutdown()
+        await running
+        inspected = subprocess.run(
+            ["docker", "inspect", container_name], capture_output=True, check=False
+        )
+        assert inspected.returncode != 0
+    else:
+        result = await running
+        assert result["returncode"] == -1
+        assert result["cleanup"] == "removed"
+    leftovers = subprocess.run(
+        ["docker", "ps", "-aq", "--filter", "name=khaos-"],
+        check=True, capture_output=True, text=True,
+    ).stdout.strip()
+    assert leftovers == ""
     await service.shutdown()
