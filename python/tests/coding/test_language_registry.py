@@ -51,7 +51,7 @@ def test_adapter_availability_is_queryable() -> None:
 def test_tree_sitter_missing_or_grammar_missing_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = LanguageRegistry()
     tree = registry.adapters("javascript")[0]
-    monkeypatch.setattr(tree, "availability", lambda: AdapterAvailability(False, "grammar-missing", "missing"))
+    monkeypatch.setattr(tree, "availability", lambda _path=None: AdapterAvailability(False, "grammar-missing", "missing"))
     result = registry.parse(file_path="sample.js", content=b"function run() {}")
     assert result.parser_source == "legacy-regex"
     assert any(item.code == "grammar-missing" for item in result.diagnostics)
@@ -60,7 +60,7 @@ def test_tree_sitter_missing_or_grammar_missing_falls_back(monkeypatch: pytest.M
 def test_tree_sitter_initialization_failure_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = LanguageRegistry()
     tree = registry.adapters("go")[0]
-    monkeypatch.setattr(tree, "availability", lambda: AdapterAvailability(True, "available", "ok"))
+    monkeypatch.setattr(tree, "availability", lambda _path=None: AdapterAvailability(True, "available", "ok"))
     monkeypatch.setattr(tree, "parse", lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")))
     result = registry.parse(file_path="sample.go", content=b"package main\nfunc run() {}")
     assert result.parser_source == "legacy-regex"
@@ -70,7 +70,7 @@ def test_tree_sitter_initialization_failure_falls_back(monkeypatch: pytest.Monke
 def test_python_fallback_order_reaches_ast_then_legacy(monkeypatch: pytest.MonkeyPatch) -> None:
     registry = LanguageRegistry()
     tree, python_ast, _legacy = registry.adapters("python")
-    monkeypatch.setattr(tree, "availability", lambda: AdapterAvailability(False, "dependency-missing", "missing"))
+    monkeypatch.setattr(tree, "availability", lambda _path=None: AdapterAvailability(False, "dependency-missing", "missing"))
     ast_result = registry.parse(file_path="sample.py", content=b"def run():\n    return 1\n")
     assert ast_result.parser_source == "python-ast"
     monkeypatch.setattr(python_ast, "parse", lambda **kwargs: (_ for _ in ()).throw(SyntaxError("bad")))
@@ -84,7 +84,7 @@ def test_non_python_tree_sitter_unavailable_uses_legacy(extension: str, monkeypa
     registry = LanguageRegistry()
     language = registry.resolve(f"sample.{extension}").language
     tree = registry.adapters(language)[0]
-    monkeypatch.setattr(tree, "availability", lambda: AdapterAvailability(False, "grammar-missing", "missing"))
+    monkeypatch.setattr(tree, "availability", lambda _path=None: AdapterAvailability(False, "grammar-missing", "missing"))
     result = registry.parse(file_path=f"sample.{extension}", content=b"")
     assert result.parser_source == "legacy-regex"
 
