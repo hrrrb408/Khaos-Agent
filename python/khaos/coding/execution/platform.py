@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -23,7 +25,7 @@ class UnsupportedBackend:
         return BackendAvailability(self.name, False, False, "no supported sandbox backend")
 
     async def execute(self, request):
-        raise PermissionError("workspace-write refused: no safe execution backend")
+        raise PermissionError("workspace-write refused: no safe execution backend (infrastructure unsupported)")
 
     async def terminate(self, execution_id: str) -> None:
         return None
@@ -39,8 +41,15 @@ class BackendSelector:
                 return backend
         elif sys.platform.startswith("linux"):
             backend = LinuxBubblewrapBackend()
-            if shutil.which("bwrap"):
+            availability = backend.probe_capability()
+            if availability.available and availability.network_enforced:
                 return backend
+            # bwrap present but cannot enforce isolation (e.g. GitHub-hosted
+            # runner blocks network namespace creation).  Writable execution
+            # must fail closed as infrastructure-unsupported, never degrade to
+            # a plain host subprocess.
+            if writable:
+                return UnsupportedBackend()
         if writable:
             return UnsupportedBackend()
         from khaos.coding.execution.host import HostExecutionBackend
@@ -71,10 +80,42 @@ class MacOSSandboxBackend:
 
 class LinuxBubblewrapBackend:
     name = "linux-bwrap"
+    _capability_cache: "BackendAvailability | None" = None
 
     async def probe(self) -> BackendAvailability:
-        available = sys.platform.startswith("linux") and shutil.which("bwrap") is not None
-        return BackendAvailability(self.name, available, available, "bwrap unavailable" if not available else "")
+        return self.probe_capability()
+
+    def probe_capability(self) -> BackendAvailability:
+        """Actually execute bwrap to verify --unshare-net/--unshare-pid work.
+
+        A ``shutil.which`` check is not sufficient: some platforms (notably
+        GitHub-hosted ubuntu-latest) ship bwrap but block the network
+        namespace creation with EPERM on RTM_NEWADDR.  This probe runs the
+        real sandbox and reports the platform limitation so the
+        BackendSelector can fail closed as infrastructure-unsupported instead
+        of degrading to a plain host subprocess.
+        """
+        if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
+            return BackendAvailability(self.name, False, False, "bwrap unavailable on this platform")
+        if LinuxBubblewrapBackend._capability_cache is not None:
+            return LinuxBubblewrapBackend._capability_cache
+        with tempfile.TemporaryDirectory() as tmp:
+            completed = subprocess.run(
+                ("bwrap", "--ro-bind", "/", "/", "--bind", tmp, tmp,
+                 "--tmpfs", "/tmp", "--unshare-net", "--unshare-pid",
+                 "--", "/bin/true"),
+                capture_output=True, timeout=10,
+            )
+        if completed.returncode == 0:
+            availability = BackendAvailability(self.name, True, True)
+        else:
+            stderr = completed.stderr.decode("utf-8", errors="replace").strip()
+            availability = BackendAvailability(
+                self.name, False, False,
+                f"bwrap isolation probe failed (rc={completed.returncode}): {stderr}",
+            )
+        LinuxBubblewrapBackend._capability_cache = availability
+        return availability
 
     def argv_prefix(self, worktree: Path) -> tuple[str, ...]:
         return ("bwrap", "--ro-bind", "/", "/", "--bind", str(worktree.resolve()), str(worktree.resolve()), "--tmpfs", "/tmp", "--unshare-net", "--unshare-pid")
