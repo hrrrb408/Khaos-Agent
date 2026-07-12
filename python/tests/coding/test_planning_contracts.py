@@ -24,9 +24,9 @@ async def planner(tmp_path: Path):
         "typescript_lib.ts": "export function publicTs():number{return 1}; const dyn=(x:string)=>(globalThis as any)[x]()\n",
         "tsx_view.tsx": "import {publicTs} from './typescript_lib'; export const View=()=> <button>{publicTs()}</button>\n",
         "tsx_view_test.tsx": "import {View} from './tsx_view'; export const TestView=()=> <View/>; const dyn=(x:string)=>(globalThis as any)[x]()\n",
-        "go_lib.go": "package fixture\nfunc PublicGo() int { return 1 }\n",
+        "go_lib.go": "package fixture\nfunc PublicGo() int { return 1 }\nfunc DynamicGo() { UnknownGo() }\n",
         "go_test.go": "package fixture\nfunc TestPublicGo() { PublicGo() }\n",
-        "rust_lib.rs": "pub fn public_rust()->i32 {1}\npub fn dynamic(_: &str)->i32 {1}\n",
+        "rust_lib.rs": "pub fn public_rust()->i32 {1}\npub fn dynamic(_: &str)->i32 { unknown_rust() }\n",
         "rust_test.rs": "use crate::public_rust; fn test_public_rust(){ public_rust(); }\n",
     }
     for name, content in files.items(): (tmp_path / name).write_text(content)

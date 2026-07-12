@@ -131,7 +131,7 @@ class DeterministicPlanningService:
         impact=self.analyze_impacts(repository_id=repository_id,target_symbols=tuple(s.stable_symbol_id for s in symbols if s.stable_symbol_id),target_files=tuple(f.path for f in files if f.exists)) if files else ImpactAnalysis((),(),(),(),(),(),(),(),0,False,ImplementationPlan.digest({}))
         diagnostics.extend(impact.diagnostics)
         known_paths={f.path for f in files}
-        for edge in impact.direct_impacts + impact.indirect_impacts:
+        for edge in impact.direct_impacts + impact.indirect_impacts + impact.dynamic_impacts + impact.external_impacts + impact.excluded_impacts:
             impacts.append(DependencyImpact(edge.source_file,edge.target_file,edge.relation,edge.status.value,edge.confidence,edge.reason))
             if edge.status in (ImpactStatus.DIRECT,ImpactStatus.INDIRECT) and edge.source_file and edge.source_file not in known_paths:
                 record=self._query.file_evidence(repository_id,edge.source_file)
