@@ -202,56 +202,92 @@ class ApprovalBroker:
         approved: bool,
         actor_id: str,
         actor_type: str = "user",
+        authenticated_source: str = "broker",
         reason: str = "",
-    ) -> PlanApprovalOutcome:
-        """Apply an approve/reject decision to a plan-execution request.
+        binding_digest: str = "",
+        receipt_sink=None,
+        clock=None,
+    ):
+        """Apply an approve/reject decision and mint an authenticated receipt.
 
-        Returns a :class:`PlanApprovalOutcome` describing the result:
+        This is the ONLY method that creates a :class:`BrokerDecisionReceipt`.
+        The receipt's actor identity comes from the broker's authenticated
+        context (``actor_id`` / ``actor_type`` / ``authenticated_source``),
+        never from the later caller of
+        :meth:`PlanApprovalService.apply_broker_decision`.
 
-        * Unknown broker request → ``ok=False``, ``decision=None``.
-        * Expired request → ``ok=False``, ``decision=None``.
-        * Duplicate identical decision → ``ok=True``, idempotent
-          (``decision`` reflects the prior decision, ``decide_count>1``).
-        * Conflicting decision (approve after reject or vice versa) →
-          ``ok=False``, ``decision`` reflects the ORIGINAL decision. The
-          caller surfaces this as a conflict; the state machine never flips.
-        * First decision → ``ok=True``, ``decision`` set accordingly.
+        Returns a :class:`BrokerDecisionReceipt` on success, or ``None`` if
+        the broker request is unknown, expired, or conflicts with a prior
+        opposite decision. Idempotent repeats of the SAME decision re-mint a
+        fresh receipt (the store dedups on token hash).
 
-        The broker does NOT decide whether the approval is *valid* against the
-        current plan/repository state — that re-validation happens in
-        :class:`PlanApprovalService` before persisting the decision. The
-        broker only serializes concurrent callbacks so that exactly one
-        wins.
+        If ``receipt_sink`` is supplied it is called with the receipt's
+        ``(receipt_id, token_hash, approval_request_id, broker_request_id,
+        binding_digest, decision, expires_at)`` so the durable outbox row can
+        be persisted in the same atomic transaction as the decision.
         """
-        decision_value = "approved" if approved else "rejected"
+        import time as _time
+        import uuid as _uuid
+
+        # Lazy import to avoid a circular dependency at module load time.
+        from khaos.coding.planning.approval.models import (
+            BrokerDecisionReceipt,
+            PlanApprovalStatus,
+            generate_receipt_token,
+            hash_receipt_token,
+        )
+
+        now = (clock or _time.time)()
+        decision_status = PlanApprovalStatus.APPROVED if approved else PlanApprovalStatus.REJECTED
+        decision_value = decision_status.value
+
         async with self._lock:
             record = self._plan_approvals.get(broker_request_id)
             if record is None:
-                return PlanApprovalOutcome(ok=False, decision=None, reason="unknown-broker-request")
-            if time.time() >= record.expires_at:
-                return PlanApprovalOutcome(ok=False, decision=None, reason="expired")
+                return None
+            if now >= record.expires_at:
+                return None
             record.decide_count += 1
             if record.decision is None:
                 record.decision = decision_value
-                return PlanApprovalOutcome(
-                    ok=True,
-                    decision=decision_value,
-                    reason=reason or f"{decision_value}-by-{actor_type}:{actor_id}",
-                )
-            # A decision was already recorded for this broker request.
-            if record.decision == decision_value:
-                # Idempotent repeat of the SAME decision — succeed silently.
-                return PlanApprovalOutcome(
-                    ok=True,
-                    decision=record.decision,
-                    reason=f"idempotent:{record.decision}",
-                )
-            # Opposite decision after a prior one — conflict, original wins.
-            return PlanApprovalOutcome(
-                ok=False,
-                decision=record.decision,
-                reason=f"conflict:already-{record.decision}",
+            elif record.decision != decision_value:
+                # Opposite decision after a prior one — conflict, no receipt.
+                return None
+            # Same decision (first or idempotent repeat) → mint a receipt.
+
+            token = generate_receipt_token()
+            token_hash = hash_receipt_token(token)
+            receipt = BrokerDecisionReceipt(
+                receipt_id=f"rec_{_uuid.uuid4().hex}",
+                namespace=PLAN_APPROVAL_NAMESPACE,
+                broker_request_id=broker_request_id,
+                approval_request_id=record.approval_request_id,
+                decision=decision_status,
+                authenticated_actor_id=actor_id,
+                authenticated_actor_type=actor_type,
+                authenticated_source=authenticated_source,
+                binding_digest=binding_digest or record.binding.get("binding_digest", ""),
+                decided_at=now,
+                expires_at=record.expires_at,
+                one_time_token=token,
+                token_hash=token_hash,
+                metadata={"reason": reason or f"{decision_value}-by-{actor_type}:{actor_id}"},
             )
+
+        # Persist the receipt outbox row outside the broker lock. The sink
+        # is responsible for its own durability; if it raises the receipt is
+        # still valid in-memory but the caller will see the error.
+        if receipt_sink is not None:
+            receipt_sink(
+                receipt_id=receipt.receipt_id,
+                token_hash=receipt.token_hash,
+                approval_request_id=receipt.approval_request_id,
+                broker_request_id=receipt.broker_request_id,
+                binding_digest=receipt.binding_digest,
+                decision=receipt.decision.value,
+                expires_at=receipt.expires_at,
+            )
+        return receipt
 
     async def get_plan_approval(self, broker_request_id: str) -> PlanApprovalRecord | None:
         async with self._lock:

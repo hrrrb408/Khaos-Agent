@@ -33,10 +33,20 @@ import hmac
 import secrets
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from khaos.coding.planning.contracts import ImplementationPlan
+
+
+# ---------------------------------------------------------------------------
+# Unified clock (§9)
+# ---------------------------------------------------------------------------
+
+#: Authoritative time source injected into every service/store/gate. Business
+#: logic must NEVER call ``time.time()`` directly — it reads ``clock()`` so
+#: tests can control expiry deterministically via a FakeClock.
+Clock = Callable[[], float]
 
 
 # ---------------------------------------------------------------------------
@@ -49,14 +59,18 @@ class PlanApprovalStatus(str, Enum):
 
     Transitions (enforced by :class:`PlanApprovalService`):
 
-    * ``not-required`` → ``consumed`` | ``expired``
-    * ``pending``      → ``approved`` | ``rejected`` | ``stale`` | ``expired``
-    * ``approved``     → ``consumed`` | ``revoked`` | ``stale`` | ``expired``
+    * ``registering``      → ``pending`` | ``registration-failed``
+    * ``not-required``     → ``consumed`` | ``expired``
+    * ``pending``          → ``approved`` | ``rejected`` | ``stale`` | ``expired``
+    * ``approved``         → ``consumed`` | ``revoked`` | ``stale`` | ``expired``
 
-    ``rejected``, ``revoked``, ``stale``, ``expired`` and ``consumed`` are
-    terminal. Recovery requires a brand new plan and a brand new request.
+    ``rejected``, ``revoked``, ``stale``, ``expired``, ``consumed`` and
+    ``registration-failed`` are terminal. Recovery requires a brand new plan
+    and a brand new request.
     """
 
+    REGISTERING = "registering"
+    REGISTRATION_FAILED = "registration-failed"
     NOT_REQUIRED = "not-required"
     PENDING = "pending"
     APPROVED = "approved"
@@ -74,11 +88,18 @@ class PlanApprovalStatus(str, Enum):
             PlanApprovalStatus.STALE,
             PlanApprovalStatus.EXPIRED,
             PlanApprovalStatus.CONSUMED,
+            PlanApprovalStatus.REGISTRATION_FAILED,
         )
 
 
 # Allowed forward transitions (source → {targets}). Everything else is invalid.
 ALLOWED_APPROVAL_TRANSITIONS: dict[PlanApprovalStatus, frozenset[PlanApprovalStatus]] = {
+    PlanApprovalStatus.REGISTERING: frozenset({
+        PlanApprovalStatus.PENDING,
+        PlanApprovalStatus.REGISTRATION_FAILED,
+        PlanApprovalStatus.STALE,
+        PlanApprovalStatus.EXPIRED,
+    }),
     PlanApprovalStatus.NOT_REQUIRED: frozenset({PlanApprovalStatus.CONSUMED, PlanApprovalStatus.EXPIRED}),
     PlanApprovalStatus.PENDING: frozenset({
         PlanApprovalStatus.APPROVED,
@@ -274,6 +295,34 @@ def verify_nonce(nonce: str, expected_hash: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Broker decision receipt helpers (§1)
+# ---------------------------------------------------------------------------
+
+#: Length of the receipt one-time-token in bytes (256 bits of entropy). The
+#: plaintext token travels only inside the in-memory receipt returned by
+#: ``ApprovalBroker.resolve_plan_approval``; only its hash is persisted in the
+#: ``plan_approval_receipts`` outbox table. A forged dataclass receipt fails
+#: because the store compares the token hash against a row that only the
+#: broker could have created.
+RECEIPT_TOKEN_BYTES = 32
+
+
+def generate_receipt_token() -> str:
+    """Return a high-entropy one-time token for a broker decision receipt."""
+    return secrets.token_hex(RECEIPT_TOKEN_BYTES)
+
+
+def hash_receipt_token(token: str) -> str:
+    """Hash a receipt token for storage (only the hash is persisted)."""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def verify_receipt_token(token: str, expected_hash: str) -> bool:
+    """Constant-time receipt-token verification against a stored hash."""
+    return hmac.compare_digest(hash_receipt_token(token), expected_hash)
+
+
+# ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
 
@@ -388,3 +437,59 @@ class PlanApprovalAuditEvent:
     workspace_id: str
     repository_id: str
     correlation_id: str
+
+
+@dataclass(frozen=True)
+class BrokerDecisionReceipt:
+    """Authenticated, one-time decision receipt minted by the ApprovalBroker.
+
+    This is the ONLY authority that :meth:`PlanApprovalService.apply_broker_decision`
+    accepts. It cannot be forged by callers because:
+
+    * The ``one_time_token`` plaintext lives only inside this in-memory object
+      (returned by ``ApprovalBroker.resolve_plan_approval``).
+    * The store persists only ``hash_receipt_token(one_time_token)`` in the
+      ``plan_approval_receipts`` outbox — a row the broker creates at resolve
+      time.
+    * :meth:`PlanApprovalStore.apply_authenticated_decision` verifies the
+      token hash against that outbox row inside the same ``BEGIN IMMEDIATE``
+      transaction that applies the decision, and marks the row consumed.
+    * Actor identity (``authenticated_actor_id`` / ``authenticated_actor_type``)
+      comes from the broker's authenticated context, NOT from caller args.
+
+    The receipt is namespaced (``namespace == "plan-execution"``) so it can
+    never be confused with a Task or ChangeSet approval.
+    """
+
+    receipt_id: str
+    namespace: str
+    broker_request_id: str
+    approval_request_id: str
+    decision: PlanApprovalStatus  # APPROVED or REJECTED
+    authenticated_actor_id: str
+    authenticated_actor_type: str
+    authenticated_source: str
+    binding_digest: str
+    decided_at: float
+    expires_at: float
+    one_time_token: str  # plaintext; never persisted, never logged
+    token_hash: str  # persisted surrogate (hash of one_time_token)
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class PlanValidationContext:
+    """Frozen view of a plan + repository produced by :class:`PlanLiveValidator`.
+
+    Used at four identical validation stages (request creation, broker
+    decision, authorization mint, authorization consume) so they cannot
+    diverge.
+    """
+
+    plan: Any  # ImplementationPlan (typed loosely to avoid a runtime import cycle)
+    state: Any  # CurrentRepositoryState
+    binding_digest: str
+    verification_digest: str
+    risk_level: str
+    requires_approval: bool
+    reason_codes: tuple[str, ...]
