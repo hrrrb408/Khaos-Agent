@@ -27,10 +27,10 @@ from khaos.coding.planning.approval import (
     PlanApprovalStatus,
     PlanApprovalStore,
     PlanExecutionGate,
-    PlanSnapshotStore,
     PlanStaleError,
     UnauthenticatedReceiptError,
 )
+from khaos.coding.planning.approval.repository import PlanSnapshotStore
 from khaos.coding.planning.approval.gate import (
     ApprovalMissingError,
     PlanBlockedError,

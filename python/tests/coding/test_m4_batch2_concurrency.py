@@ -25,8 +25,8 @@ from khaos.coding.planning.approval import (
     PlanApprovalStatus,
     PlanApprovalStore,
     PlanExecutionGate,
-    PlanSnapshotStore,
 )
+from khaos.coding.planning.approval.repository import PlanSnapshotStore
 from khaos.coding.planning.approval.service import ApprovalPolicy
 
 from _m4_batch2_helpers import (  # type: ignore[import-not-found]

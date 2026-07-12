@@ -15,8 +15,12 @@ Public API:
 * :class:`PlanExecutionGate` — single authorization mint+consume point with
   server_epoch restart-invalidation.
 * :class:`PlanLiveValidator` — shared live-plan validation used at four stages.
-* :class:`PlanSnapshotStore` / :class:`PlanRepository` — authoritative plan
-  snapshot source.
+* :class:`PersistedPlanRepository` / :class:`PlanRepository` — authoritative
+  plan snapshot source. ``PlanSnapshotStore`` (in-memory) is NOT exported
+  as a production option; it is only importable from
+  ``khaos.coding.planning.approval.repository`` for test use.
+* :class:`ApprovalRuntime` / :class:`BootContext` — production bootstrap
+  that self-wires the Broker → Receipt outbox and fences stale boots.
 * :class:`PlannedExecutionGuard` / :class:`AuthorizedExecutionContext` —
   Batch 3 execution contract (failure-only stubs in this batch).
 """
@@ -62,7 +66,6 @@ from khaos.coding.planning.approval.models import (
 from khaos.coding.planning.approval.repository import (
     PersistedPlanRepository,
     PlanRepository,
-    PlanSnapshotStore,
 )
 from khaos.coding.planning.approval.requirement import (
     ApprovalRequirementOutcome,
@@ -127,7 +130,6 @@ __all__ = [
     "PlanLiveValidator",
     "PlanNotRequestableError",
     "PlanRepository",
-    "PlanSnapshotStore",
     "PlanStaleError",
     "PlanValidationContext",
     "PlannedExecutionGuard",

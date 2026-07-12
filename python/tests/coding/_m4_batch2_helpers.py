@@ -23,8 +23,8 @@ from khaos.coding.planning.approval import (
     PlanApprovalStatus,
     PlanApprovalStore,
     PlanExecutionGate,
-    PlanSnapshotStore,
 )
+from khaos.coding.planning.approval.repository import PlanSnapshotStore
 from khaos.coding.planning.contracts import (
     AffectedFile,
     AffectedSymbol,
