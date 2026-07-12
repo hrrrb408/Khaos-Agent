@@ -421,7 +421,7 @@ def test_16_file_drift_after_mint_refuses_consume():
         PlanEvidence("file", "repo", path="auth.py", content_hash="hash_v2", generation=1, confidence=1.0),
         plan.evidence[1],
     ))
-    repo.register(drifted)
+    store._conn.execute("UPDATE plan_snapshots SET canonical_plan_json=? WHERE plan_id=?", (repo._canonicalize(drifted), plan.plan_id))
     with pytest.raises((AuthorizationMismatchError, PlanBlockedError)):
         gate.acquire_lease(
             authorization_id=auth.authorization_id, nonce=auth.nonce,
@@ -439,7 +439,7 @@ def test_17_symbol_drift_after_mint_refuses_consume():
     drifted = replace(plan, affected_symbols=(
         AffectedSymbol("ssym_OTHER", "other", "function", "auth.py", "direct", 1.0, ()),
     ))
-    repo.register(drifted)
+    store._conn.execute("UPDATE plan_snapshots SET canonical_plan_json=? WHERE plan_id=?", (repo._canonicalize(drifted), plan.plan_id))
     with pytest.raises((AuthorizationMismatchError, PlanBlockedError)):
         gate.acquire_lease(
             authorization_id=auth.authorization_id, nonce=auth.nonce,
@@ -455,7 +455,7 @@ def test_18_config_drift_after_mint_refuses_consume():
     drifted = replace(plan, evidence=(
         replace(plan.evidence[0], metadata={**plan.evidence[0].metadata, "config_hash": "changed"}),
     ) + tuple(plan.evidence[1:]))
-    repo.register(drifted)
+    store._conn.execute("UPDATE plan_snapshots SET canonical_plan_json=? WHERE plan_id=?", (repo._canonicalize(drifted), plan.plan_id))
     with pytest.raises((AuthorizationMismatchError, PlanBlockedError)):
         gate.acquire_lease(
             authorization_id=auth.authorization_id, nonce=auth.nonce,

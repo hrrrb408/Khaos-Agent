@@ -138,7 +138,7 @@ def make_plan(
         "base_sha": base_sha, "risks": risks[0].level,
     }
     ch = content_hash or ImplementationPlan.digest(body)
-    return ImplementationPlan(
+    plan = ImplementationPlan(
         plan_id=plan_id, repository_id=repository_id, task_id=task_id,
         workspace_id=workspace_id, user_goal="modify public_api",
         normalized_goal="modify public_api", base_sha=base_sha,
@@ -156,6 +156,10 @@ def make_plan(
         ),
         content_hash=ch, created_at=0.0,
     )
+    if not content_hash:
+        from khaos.coding.planning.approval.repository import PersistedPlanRepository
+        plan = replace(plan, content_hash=PersistedPlanRepository._recompute_plan_content_hash(plan))
+    return plan
 
 
 # ---------------------------------------------------------------------------
@@ -274,20 +278,28 @@ def broker_decide(
     insert_receipt accepts the row.
     """
     from khaos.coding.planning.approval.models import ApprovalAuthenticator
+    from khaos.coding.planning.approval.models import AuthenticatedSession
 
     # Use the broker's authenticator to issue a signed context.
     authenticator = broker._authenticator if isinstance(broker, SyncBroker) else broker._authenticator
+    session = AuthenticatedSession(
+        session_id=session_request_id, principal_id=actor_id,
+        principal_type=actor_type, authenticated_at=__import__("time").time(),
+        session_expiry=__import__("time").time() + 600,
+        granted_capabilities=(ApprovalAuthenticator.CAPABILITY_PLAN_APPROVAL,),
+    )
+    authenticator.register_session(session)
+    approval_request_id = getattr(request, "approval_request_id", request.broker_request_id.split(":", 1)[-1])
     ctx = authenticator.issue_context(
-        actor_id=actor_id, actor_type=actor_type,
-        session_request_id=session_request_id,
+        session=session, approval_request_id=approval_request_id,
         authenticated_source=authenticated_source,
         capability=ApprovalAuthenticator.CAPABILITY_PLAN_APPROVAL,
     )
     bd = binding_digest if binding_digest is not None else request.binding_digest
-    writer_cap = store.receipt_writer_token
+    writer = store._broker_receipt_writer()
 
     def sink(**kw):
-        store.insert_receipt(writer_capability=writer_cap, **kw)
+        writer.write(**kw)
 
     if isinstance(broker, SyncBroker):
         return broker.resolve_plan_approval(

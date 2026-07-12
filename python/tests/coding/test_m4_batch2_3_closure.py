@@ -195,14 +195,20 @@ def test_16_hand_constructed_context_rejected():
 def test_17_legitimate_authenticator_context_succeeds():
     """17. A legitimate ApprovalAuthenticator.issue_context succeeds."""
     auth = ApprovalAuthenticator(secret_key="server-secret")
-    ctx = auth.issue_context(actor_id="admin", actor_type="user", session_request_id="sess1")
+    from khaos.coding.planning.approval import AuthenticatedSession
+    session = AuthenticatedSession("sess1", "admin", "user", time.time(), time.time()+300, (auth.CAPABILITY_PLAN_APPROVAL,))
+    auth.register_session(session)
+    ctx = auth.issue_context(session=session, approval_request_id="request1")
     assert auth.verify_context(ctx) is True
 
 
 def test_18_capability_tamper_rejected():
     """18. Tampering the capability → rejected."""
     auth = ApprovalAuthenticator(secret_key="server-secret")
-    ctx = auth.issue_context(actor_id="admin", actor_type="user", session_request_id="sess1")
+    from khaos.coding.planning.approval import AuthenticatedSession
+    session = AuthenticatedSession("sess1", "admin", "user", time.time(), time.time()+300, (auth.CAPABILITY_PLAN_APPROVAL,))
+    auth.register_session(session)
+    ctx = auth.issue_context(session=session, approval_request_id="request1")
     tampered = replace(ctx, server_capability="other-capability")
     # The signature was computed over the original capability, so tampering
     # breaks the HMAC match.
@@ -212,7 +218,7 @@ def test_18_capability_tamper_rejected():
 def test_19_direct_store_receipt_write_rejected():
     """19. Direct store.insert_receipt without the capability is rejected."""
     store = PlanApprovalStore(sqlite3.connect(":memory:"))
-    with pytest.raises(PermissionError):
+    with pytest.raises(AttributeError):
         store.insert_receipt(
             receipt_id="r", token_hash="t", approval_request_id="a",
             broker_request_id="b", binding_digest="bd", decision="approved",
@@ -223,25 +229,25 @@ def test_19_direct_store_receipt_write_rejected():
 def test_20_receipt_outbox_refuses_replace():
     """20. The same receipt_id or token_hash cannot be silently overwritten."""
     store = PlanApprovalStore(sqlite3.connect(":memory:"))
-    cap = store.receipt_writer_token
-    store.insert_receipt(
+    writer = store._broker_receipt_writer()
+    writer.write(
         receipt_id="r1", token_hash="th1", approval_request_id="a",
         broker_request_id="b", binding_digest="bd", decision="approved",
-        expires_at=9999999999.0, writer_capability=cap,
+        expires_at=9999999999.0,
     )
     # Same receipt_id → IntegrityError (plain INSERT, no REPLACE).
     with pytest.raises(sqlite3.IntegrityError):
-        store.insert_receipt(
+        writer.write(
             receipt_id="r1", token_hash="th2", approval_request_id="a2",
             broker_request_id="b2", binding_digest="bd2", decision="rejected",
-            expires_at=9999999999.0, writer_capability=cap,
+            expires_at=9999999999.0,
         )
     # Same token_hash → IntegrityError.
     with pytest.raises(sqlite3.IntegrityError):
-        store.insert_receipt(
+        writer.write(
             receipt_id="r2", token_hash="th1", approval_request_id="a3",
             broker_request_id="b3", binding_digest="bd3", decision="approved",
-            expires_at=9999999999.0, writer_capability=cap,
+            expires_at=9999999999.0,
         )
 
 
@@ -458,11 +464,13 @@ def test_static_store_has_no_public_consume():
     assert "PermissionError" in src
 
 
-def test_static_insert_receipt_requires_capability():
-    """§12: insert_receipt checks writer_capability and uses plain INSERT."""
+def test_static_insert_receipt_is_private_and_requires_capability():
+    """§12: receipt insertion is private, capability-gated, and immutable."""
     from khaos.coding.planning.approval import PlanApprovalStore
-    src = inspect.getsource(PlanApprovalStore.insert_receipt)
-    assert "writer_capability" in src
+    assert not hasattr(PlanApprovalStore, "insert_receipt")
+    assert not hasattr(PlanApprovalStore, "receipt_writer_token")
+    src = inspect.getsource(PlanApprovalStore._insert_receipt)
+    assert "capability" in src
     assert "PermissionError" in src
     # The SQL must be a plain INSERT, not INSERT OR REPLACE. Check only the
     # execute(...) block, not the docstring text.
