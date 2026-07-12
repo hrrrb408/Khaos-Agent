@@ -106,12 +106,13 @@ def test_recovery_seal_crash_boundaries_are_deterministic(tmp_path, boundary):
         status, now, now,
     )
     runtime._store.create_execution_run(run)
-    recovery = workspace.worktree_path.parent / ".khaos-recovery" / run_id
+    recovery = workspace.recovery_root / run_id
     if boundary != "deleted-before-terminal":
         recovery.mkdir(parents=True)
         os.chmod(recovery.parent, 0o700)
         os.chmod(recovery, 0o700)
-        (recovery / "artifact").write_text("x", encoding="utf-8")
+        if boundary != "before-sealing":
+            (recovery / "artifact").write_text("x", encoding="utf-8")
         if boundary == "partial-delete":
             (recovery / "artifact").unlink()
     if boundary == "before-sealing":
@@ -126,13 +127,8 @@ def test_recovery_seal_crash_boundaries_are_deterministic(tmp_path, boundary):
     if boundary == "before-sealing":
         assert current.status == ExecutionRunStatus.ROLLED_BACK
     else:
-        assert current.status == ExecutionRunStatus.MUTATED
-        assert current.execution_run_id in recovered
-        row = runtime._store._conn.execute(
-            "SELECT recovery_sealed_at,recovery_seal_digest FROM plan_execution_runs "
-            "WHERE execution_run_id=?", (run_id,),
-        ).fetchone()
-        assert row[0] is not None and row[1]
+        assert current.status == ExecutionRunStatus.POISONED
+        assert current.execution_run_id not in recovered
 
 
 def test_seal_failure_never_leaves_mutated(tmp_path, monkeypatch):
@@ -319,7 +315,8 @@ def test_scoped_recovery_does_not_clear_unrelated_poison(tmp_path):
         now, now,
     ))
     recovered = runtime._mutation_engine.recover_incomplete_runs()
-    assert run_id in recovered
+    assert run_id not in recovered
+    assert runtime._store.get_execution_run(run_id).status == ExecutionRunStatus.POISONED
     scopes = runtime._store.list_workspace_poison_scopes("ws1")
     assert any(owner == "lease:l1" for _, owner, _ in scopes)
     assert runtime.mutation_fence.is_poisoned("ws1")

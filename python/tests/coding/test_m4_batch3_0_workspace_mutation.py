@@ -39,6 +39,7 @@ from khaos.coding.planning.workspace_mutation import (
     WorkspaceMutationError,
 )
 from khaos.coding.planning.safe_workspace_path import WorkspacePathHandle
+from khaos.coding.planning.recovery_directory import RecoveryDirectory
 from khaos.coding.workspace.models import TaskWorkspace, WorkspaceState
 
 
@@ -57,6 +58,7 @@ def _workspace(tmp_path, manager, *, workspace_id="ws1", task_id="task1"):
     workspace = TaskWorkspace(
         workspace_id, task_id, repository, worktree, "HEAD", "abc123",
         "task-branch", WorkspaceState.RUNNING, (worktree,),
+        recovery_root=tmp_path / "private-recovery",
     )
     manager._workspaces[workspace_id] = workspace
     manager._task_ids.add(task_id)
@@ -422,8 +424,8 @@ def test_durable_preparation_faults_leave_source_unchanged(tmp_path, monkeypatch
         )
     elif failure == "backup":
         monkeypatch.setattr(
-            engine, "_copy_durable",
-            lambda *args: (_ for _ in ()).throw(OSError("backup")),
+            RecoveryDirectory, "create_backup",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("backup")),
         )
     elif failure == "replace":
         monkeypatch.setattr(
@@ -432,8 +434,8 @@ def test_durable_preparation_faults_leave_source_unchanged(tmp_path, monkeypatch
         )
     else:
         monkeypatch.setattr(
-            engine, "_fsync_directory",
-            lambda *args: (_ for _ in ()).throw(OSError("fsync")),
+            RecoveryDirectory, "create_backup",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("fsync")),
         )
     with pytest.raises((OSError, sqlite3.Error, WorkspaceMutationError)):
         _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
@@ -601,9 +603,10 @@ def test_recovery_artifact_is_outside_git_root_and_removed_after_success(tmp_pat
     )
     runtime, workspace, plan, authorization = _setup(tmp_path, (edit,))
     _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
-    recovery_root = workspace.worktree_path.parent / ".khaos-recovery"
+    recovery_root = workspace.recovery_root
     assert workspace.worktree_path not in recovery_root.parents
-    assert not recovery_root.exists()
+    assert recovery_root.is_dir()
+    assert not tuple(recovery_root.iterdir())
 
 
 @pytest.mark.parametrize("corrupt", [False, True])
@@ -620,7 +623,7 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
         ExecutionRunStatus.MUTATING, now, now,
     )
     runtime._store.create_execution_run(run)
-    recovery = workspace.worktree_path.parent / ".khaos-recovery" / run_id
+    recovery = workspace.recovery_root / run_id
     recovery.mkdir(parents=True)
     os.chmod(recovery.parent, 0o700)
     os.chmod(recovery, 0o700)
