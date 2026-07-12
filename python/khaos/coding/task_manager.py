@@ -136,9 +136,8 @@ class TaskManager:
         # Batch 2.6 §5: optional per-workspace mutation fence. When set,
         # cancel() acquires the fence BEFORE lease invalidation so cancel
         # is serialized with active lease acquisition / Batch 3 execution.
-        # Maps task_id -> workspace_id (set when a task acquires a lease).
         self._mutation_fence: Any = None
-        self._task_workspace: dict[str, str] = {}
+        self._execution_scope_resolver: Any = None
 
     def set_lease_invalidation_hook(self, hook: Any) -> None:
         """Register a callable invoked during cancel to release execution leases."""
@@ -148,9 +147,9 @@ class TaskManager:
         """Batch 2.6 §5: register the shared per-workspace mutation fence."""
         self._mutation_fence = fence
 
-    def bind_task_workspace(self, task_id: str, workspace_id: str) -> None:
-        """Batch 2.6 §5: record which workspace a task's lease is on."""
-        self._task_workspace[task_id] = workspace_id
+    def set_execution_scope_resolver(self, resolver: Any) -> None:
+        """Install the persisted ACTIVE-lease task/workspace resolver."""
+        self._execution_scope_resolver = resolver
 
     async def load(self) -> None:
         """Restore tasks and mark interrupted in-flight work as blocked."""
@@ -328,8 +327,13 @@ class TaskManager:
         # Batch 2.6 §5: acquire the mutation fence FIRST (outermost lock)
         # if a workspace binding exists. This serializes cancel with
         # lease acquisition and cleanup on the same workspace.
-        workspace_id = self._task_workspace.get(task_id)
-        if self._mutation_fence is not None and workspace_id is not None:
+        if self._mutation_fence is not None:
+            if self._execution_scope_resolver is None:
+                raise RuntimeError("TaskManager execution scope resolver is not configured")
+            workspace_id = self._execution_scope_resolver(task_id)
+        else:
+            workspace_id = None
+        if workspace_id is not None:
             async with self._mutation_fence.use(
                 workspace_id, owner=f"cancel:{task_id}",
             ):
@@ -362,10 +366,6 @@ class TaskManager:
             task.status = TaskStatus.CANCELLED
             task.touch()
             await self._persist(task)
-            # Batch 2.6 §5: clear the workspace binding now that the task
-            # is terminal (lease invalidation hook should have released
-            # the ACTIVE lease).
-            self._task_workspace.pop(task_id, None)
             return TransitionResult.UPDATED
 
     async def record_trace(self, task_id: str, entry: dict[str, Any]) -> None:

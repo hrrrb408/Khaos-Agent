@@ -55,6 +55,7 @@ class WorkspaceMutationFence:
 
         self._locks: dict[str, "asyncio.Lock"] = {}
         self._owners: dict[str, str] = {}
+        self._poisoned: dict[str, str] = {}
         # Protects _locks and _owners dicts (not the asyncio locks themselves).
         self._registry_lock = threading.Lock()
 
@@ -76,6 +77,12 @@ class WorkspaceMutationFence:
         ``"lease:{lease_id}"``). Planned mutations verify ownership via
         :meth:`assert_owner`.
         """
+        with self._registry_lock:
+            reason = self._poisoned.get(workspace_id)
+        if reason is not None:
+            raise PermissionError(
+                f"workspace {workspace_id!r} is poisoned: {reason}"
+            )
         lock = self._get_or_create_lock(workspace_id)
         await lock.acquire()
         try:
@@ -107,6 +114,11 @@ class WorkspaceMutationFence:
         owner before performing a planned mutation.
         """
         with self._registry_lock:
+            if workspace_id in self._poisoned:
+                raise PermissionError(
+                    f"workspace {workspace_id!r} is poisoned: "
+                    f"{self._poisoned[workspace_id]}"
+                )
             current = self._owners.get(workspace_id)
             if current != owner:
                 raise PermissionError(
@@ -124,6 +136,19 @@ class WorkspaceMutationFence:
         """Return the current fence owner for ``workspace_id`` (or None)."""
         with self._registry_lock:
             return self._owners.get(workspace_id)
+
+    def poison(self, workspace_id: str, reason: str) -> None:
+        """Quarantine a workspace before its mutation lock is released."""
+        with self._registry_lock:
+            self._poisoned[workspace_id] = reason
+
+    def clear_poison(self, workspace_id: str) -> None:
+        with self._registry_lock:
+            self._poisoned.pop(workspace_id, None)
+
+    def is_poisoned(self, workspace_id: str) -> bool:
+        with self._registry_lock:
+            return workspace_id in self._poisoned
 
 
 class PlannedHeadMutationAdapter:
@@ -263,8 +288,20 @@ def fenced_acquire_lease(
                 yield ctx
             finally:
                 try:
-                    coordinator._runtime.gate.release_lease(ctx.lease_id)
-                except Exception:
-                    pass
+                    released = coordinator._runtime.gate.release_lease(ctx.lease_id)
+                    if not released:
+                        raise RuntimeError("execution lease release was not committed")
+                except Exception as exc:
+                    reason = f"lease-release-failed:{type(exc).__name__}"
+                    fence.poison(expected_workspace_id, reason)
+                    try:
+                        coordinator._runtime._store.poison_workspace(
+                            expected_workspace_id, ctx.lease_id, reason=reason,
+                        )
+                    except Exception as poison_exc:
+                        raise RuntimeError(
+                            "lease release failed and durable quarantine could not be recorded"
+                        ) from poison_exc
+                    raise
 
     return _ctx()

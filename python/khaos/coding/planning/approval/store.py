@@ -181,7 +181,10 @@ CREATE TABLE IF NOT EXISTS plan_approval_receipts (
     expires_at               REAL NOT NULL,
     canonical_payload_digest TEXT NOT NULL DEFAULT '',
     broker_signature         TEXT NOT NULL DEFAULT '',
-    signer_key_id            TEXT NOT NULL DEFAULT ''
+    signer_key_id            TEXT NOT NULL DEFAULT '',
+    signer_epoch             INTEGER NOT NULL DEFAULT 0,
+    signer_boot_id           TEXT NOT NULL DEFAULT '',
+    issued_at                REAL NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_token
@@ -197,8 +200,32 @@ CREATE TABLE IF NOT EXISTS receipt_verification_keys (
     public_key   TEXT NOT NULL,
     key_version  INTEGER NOT NULL,
     boot_epoch   INTEGER NOT NULL,
+    boot_id      TEXT NOT NULL DEFAULT '',
     created_at   REAL NOT NULL,
     active       INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS approval_runtime_boots (
+    server_epoch INTEGER NOT NULL,
+    boot_id TEXT PRIMARY KEY,
+    started_at REAL NOT NULL,
+    replaced_at REAL
+);
+
+CREATE TABLE IF NOT EXISTS workspace_mutation_poison (
+    workspace_id TEXT PRIMARY KEY,
+    lease_id TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    poisoned_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS workspace_mutation_audit (
+    event_id TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    lease_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 
 -- Batch 2.2: persisted monotonic server epoch. The gate reads and rotates
@@ -305,9 +332,19 @@ def _post_schema(conn: sqlite3.Connection) -> None:
         ("canonical_payload_digest", "TEXT NOT NULL DEFAULT ''"),
         ("broker_signature", "TEXT NOT NULL DEFAULT ''"),
         ("signer_key_id", "TEXT NOT NULL DEFAULT ''"),
+        ("signer_epoch", "INTEGER NOT NULL DEFAULT 0"),
+        ("signer_boot_id", "TEXT NOT NULL DEFAULT ''"),
+        ("issued_at", "REAL NOT NULL DEFAULT 0"),
     ):
         if col not in receipt_cols:
             conn.execute(f"ALTER TABLE plan_approval_receipts ADD COLUMN {col} {decl}")
+    verifier_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(receipt_verification_keys)")
+    }
+    if "boot_id" not in verifier_cols:
+        conn.execute(
+            "ALTER TABLE receipt_verification_keys ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''"
+        )
     # Batch 2.3: add server_epoch to the leases table for old 2.2 databases.
     lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_leases)")}
     if "server_epoch" not in lease_cols:
@@ -413,8 +450,10 @@ class PlanApprovalStore:
         import time as _time
         self._conn.execute(
             "INSERT OR REPLACE INTO receipt_verification_keys "
-            "(key_id, public_key, key_version, boot_epoch, created_at, active) VALUES (?, ?, ?, ?, ?, 1)",
-            (verifier.key_id, verifier.public_key, verifier.key_version, verifier.boot_epoch, _time.time()),
+            "(key_id, public_key, key_version, boot_epoch, boot_id, created_at, active) "
+            "VALUES (?, ?, ?, ?, ?, ?, 1)",
+            (verifier.key_id, verifier.public_key, verifier.key_version,
+             verifier.boot_epoch, verifier.boot_id, _time.time()),
         )
         self._conn.commit()
         self.__receipt_verifiers[verifier.key_id] = verifier
@@ -423,9 +462,13 @@ class PlanApprovalStore:
         """Return public-only verifier objects; legacy HMAC rows are ignored."""
         from khaos.coding.planning.approval.receipt_crypto import ReceiptPublicVerifier
         rows = self._conn.execute(
-            "SELECT key_id,public_key,key_version,boot_epoch FROM receipt_verification_keys WHERE active = 1"
+            "SELECT key_id,public_key,key_version,boot_epoch,boot_id "
+            "FROM receipt_verification_keys WHERE active = 1"
         ).fetchall()
-        return [ReceiptPublicVerifier(str(row["key_id"]),str(row["public_key"]),int(row["key_version"]),int(row["boot_epoch"])) for row in rows]
+        return [ReceiptPublicVerifier(
+            str(row["key_id"]), str(row["public_key"]), int(row["key_version"]),
+            int(row["boot_epoch"]), str(row["boot_id"]),
+        ) for row in rows]
 
     # ------------------------------------------------------------------
     # Schema bootstrap
@@ -463,6 +506,9 @@ class PlanApprovalStore:
         canonical_payload_digest: str = "",
         broker_signature: str = "",
         signer_key_id: str = "",
+        signer_epoch: int = 0,
+        signer_boot_id: str = "",
+        issued_at: float = 0.0,
         created_at: float | None = None,
         now: float | None = None,
     ) -> None:
@@ -493,17 +539,28 @@ class PlanApprovalStore:
                 "and canonical_payload_digest; unsigned receipts are refused"
             )
         ts = float(created_at if created_at is not None else (now if now is not None else time.time()))
-        # Plain INSERT — refuses to overwrite an existing receipt_id or
-        # token_hash (both UNIQUE). A replay attempt raises IntegrityError.
-        self._conn.execute(
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if not self._verify_persisted_boot_context(
+                server_epoch=signer_epoch, boot_id=signer_boot_id,
+            ):
+                raise PermissionError("receipt signer boot is no longer current")
+            key = self._conn.execute(
+                "SELECT boot_epoch,boot_id FROM receipt_verification_keys WHERE key_id=?",
+                (signer_key_id,),
+            ).fetchone()
+            if key is None or int(key["boot_epoch"]) != int(signer_epoch) or str(key["boot_id"]) != signer_boot_id:
+                raise PermissionError("receipt signer key is not bound to current boot")
+            self._conn.execute(
             """
             INSERT INTO plan_approval_receipts (
                 receipt_id, token_hash, approval_request_id, broker_request_id,
                 binding_digest, decision, namespace, authenticated_actor_id,
                 authenticated_actor_type, authenticated_source, session_request_id,
                 server_capability, decided_at, reason_digest, consumed, created_at,
-                expires_at, canonical_payload_digest, broker_signature, signer_key_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
+                expires_at, canonical_payload_digest, broker_signature, signer_key_id,
+                signer_epoch, signer_boot_id, issued_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 receipt_id, token_hash, approval_request_id, broker_request_id,
@@ -511,9 +568,13 @@ class PlanApprovalStore:
                 authenticated_actor_type, authenticated_source, session_request_id,
                 server_capability, float(decided_at), reason_digest, ts, float(expires_at),
                 canonical_payload_digest, broker_signature, signer_key_id,
+                int(signer_epoch), signer_boot_id, float(issued_at),
             ),
-        )
-        self._conn.commit()
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def get_receipt_by_token(self, token: str) -> sqlite3.Row | None:
         """Look up a receipt row by verifying a plaintext token.
@@ -786,6 +847,24 @@ class PlanApprovalStore:
                 # Unknown signer key — fail closed.
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
+            signer_epoch = int(receipt_row["signer_epoch"])
+            signer_boot_id = str(receipt_row["signer_boot_id"])
+            issued_at = float(receipt_row["issued_at"])
+            if (verifier.boot_epoch != signer_epoch
+                    or verifier.boot_id != signer_boot_id):
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+            boot = self._conn.execute(
+                "SELECT started_at,replaced_at FROM approval_runtime_boots "
+                "WHERE server_epoch=? AND boot_id=?",
+                (signer_epoch, signer_boot_id),
+            ).fetchone()
+            if (boot is None or issued_at < float(boot["started_at"])
+                    or (boot["replaced_at"] is not None
+                        and issued_at >= float(boot["replaced_at"]))
+                    or abs(float(receipt_row["created_at"]) - issued_at) > 1e-6):
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
             # Recompute the canonical payload digest from the DURABLE ROW
             # fields (not the in-memory receipt) so a tampered in-memory
             # receipt is detected even if it claims the same signature.
@@ -806,6 +885,9 @@ class PlanApprovalStore:
                 f"{float(receipt_row['expires_at']):.6f}",
                 str(receipt_row["reason_digest"]),
                 str(receipt_row["token_hash"]),
+                str(signer_epoch),
+                signer_boot_id,
+                f"{issued_at:.6f}",
             ])
             row_digest_recomputed = _hashlib.sha256(canonical_from_row.encode("utf-8")).hexdigest()
             if row_digest_recomputed != row_payload_digest:
@@ -817,7 +899,14 @@ class PlanApprovalStore:
                 return ApprovalTransitionResult.CONFLICT
             # Also verify the in-memory receipt's signature matches (catches
             # a tampered in-memory receipt whose fields differ from the row).
-            if receipt.signer_key_id != verifier.key_id or not verifier.verify_payload_digest(receipt.compute_canonical_payload_digest(), receipt.broker_signature):
+            if (receipt.signer_key_id != verifier.key_id
+                    or receipt.signer_epoch != signer_epoch
+                    or receipt.signer_boot_id != signer_boot_id
+                    or abs(receipt.issued_at - issued_at) > 1e-6
+                    or not verifier.verify_payload_digest(
+                        receipt.compute_canonical_payload_digest(),
+                        receipt.broker_signature,
+                    )):
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
 
@@ -1611,7 +1700,7 @@ class PlanApprovalStore:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute(
-                "SELECT current_epoch FROM plan_execution_server_state WHERE singleton_key = 'global'"
+                "SELECT current_epoch,boot_id FROM plan_execution_server_state WHERE singleton_key = 'global'"
             ).fetchone()
             if row is None:
                 new_epoch = 1
@@ -1623,10 +1712,20 @@ class PlanApprovalStore:
             else:
                 new_epoch = int(row["current_epoch"]) + 1
                 self._conn.execute(
+                    "UPDATE approval_runtime_boots SET replaced_at=? "
+                    "WHERE boot_id=? AND replaced_at IS NULL",
+                    (now, str(row["boot_id"])),
+                )
+                self._conn.execute(
                     "UPDATE plan_execution_server_state SET current_epoch = ?, boot_id = ?, updated_at = ? "
                     "WHERE singleton_key = 'global'",
                     (new_epoch, new_boot_id, now),
                 )
+            self._conn.execute(
+                "INSERT INTO approval_runtime_boots "
+                "(server_epoch,boot_id,started_at,replaced_at) VALUES (?,?,?,NULL)",
+                (new_epoch, new_boot_id, now),
+            )
             # Revoke all ACTIVE authorizations from prior epochs.
             cur = self._conn.execute(
                 "UPDATE plan_execution_authorizations SET status = ? "
@@ -1902,6 +2001,18 @@ class PlanApprovalStore:
                 (lease_id,),
             )
             ok = int(cur.rowcount or 0) > 0
+            if ok:
+                lease = self._conn.execute(
+                    "SELECT workspace_id FROM plan_execution_leases WHERE lease_id=?",
+                    (lease_id,),
+                ).fetchone()
+                self._conn.execute(
+                    "INSERT INTO workspace_mutation_audit "
+                    "(event_id,workspace_id,lease_id,event_type,reason,created_at) "
+                    "VALUES (?,?,?,?,?,?)",
+                    (uuid.uuid4().hex, str(lease["workspace_id"]), lease_id,
+                     "released", "context-exit", time.time()),
+                )
             self._conn.commit()
             return ok
         except Exception:
@@ -1913,6 +2024,101 @@ class PlanApprovalStore:
             "SELECT * FROM plan_execution_leases WHERE lease_id = ?",
             (lease_id,),
         ).fetchone()
+
+    def active_lease_scope_for_task(self, task_id: str) -> str | None:
+        """Resolve a task's unique ACTIVE workspace from durable leases."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT workspace_id FROM plan_execution_leases "
+            "WHERE task_id=? AND status='active' ORDER BY workspace_id",
+            (task_id,),
+        ).fetchall()
+        if len(rows) > 1:
+            raise RuntimeError("task has ACTIVE leases in multiple workspaces")
+        return None if not rows else str(rows[0]["workspace_id"])
+
+    def validate_repository_workspace_scope(
+        self, repository_id: str, workspace_id: str
+    ) -> bool:
+        """Reject ambiguity while validating an explicit mutation scope."""
+        rows = self._conn.execute(
+            "SELECT DISTINCT workspace_id FROM plan_execution_leases "
+            "WHERE repository_id=? AND status='active' ORDER BY workspace_id",
+            (repository_id,),
+        ).fetchall()
+        active = {str(row["workspace_id"]) for row in rows}
+        return not active or workspace_id in active
+
+    def poison_workspace(self, workspace_id: str, lease_id: str, *, reason: str) -> None:
+        """Persist quarantine before a failed release exits the fence."""
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO workspace_mutation_poison "
+                "(workspace_id,lease_id,reason,poisoned_at) VALUES (?,?,?,?)",
+                (workspace_id, lease_id, reason, now),
+            )
+            self._conn.execute(
+                "INSERT INTO workspace_mutation_audit "
+                "(event_id,workspace_id,lease_id,event_type,reason,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (uuid.uuid4().hex, workspace_id, lease_id, "poisoned", reason, now),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def list_poisoned_workspaces(self) -> tuple[tuple[str, str], ...]:
+        rows = self._conn.execute(
+            "SELECT workspace_id,reason FROM workspace_mutation_poison "
+            "ORDER BY workspace_id"
+        ).fetchall()
+        return tuple((str(row["workspace_id"]), str(row["reason"])) for row in rows)
+
+    def recover_poisoned_workspace(
+        self, workspace_id: str, *, force: bool = False, now: float | None = None
+    ) -> bool:
+        """Expire the quarantined lease, clear poison, and write recovery audit."""
+        now = time.time() if now is None else now
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            poison = self._conn.execute(
+                "SELECT lease_id,reason FROM workspace_mutation_poison WHERE workspace_id=?",
+                (workspace_id,),
+            ).fetchone()
+            if poison is None:
+                self._conn.rollback()
+                return False
+            lease = self._conn.execute(
+                "SELECT status,expiry FROM plan_execution_leases WHERE lease_id=?",
+                (poison["lease_id"],),
+            ).fetchone()
+            if (lease is not None and lease["status"] == "active"
+                    and float(lease["expiry"]) > now and not force):
+                self._conn.rollback()
+                raise RuntimeError("active poisoned lease has not expired")
+            self._conn.execute(
+                "UPDATE plan_execution_leases SET status='expired' "
+                "WHERE lease_id=? AND status='active'",
+                (poison["lease_id"],),
+            )
+            self._conn.execute(
+                "DELETE FROM workspace_mutation_poison WHERE workspace_id=?",
+                (workspace_id,),
+            )
+            self._conn.execute(
+                "INSERT INTO workspace_mutation_audit "
+                "(event_id,workspace_id,lease_id,event_type,reason,created_at) "
+                "VALUES (?,?,?,?,?,?)",
+                (uuid.uuid4().hex, workspace_id, poison["lease_id"],
+                 "recovered", "forced" if force else "expired", now),
+            )
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # Lease-first atomic consume (Batch 2.3 §1) — the single transaction

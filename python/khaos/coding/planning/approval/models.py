@@ -698,6 +698,9 @@ class BrokerDecisionReceipt:
     canonical_payload_digest: str = ""
     broker_signature: str = ""
     signer_key_id: str = ""
+    signer_epoch: int = 0
+    signer_boot_id: str = ""
+    issued_at: float = 0.0
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def canonical_payload(self) -> str:
@@ -723,6 +726,9 @@ class BrokerDecisionReceipt:
             f"{self.expires_at:.6f}",
             self.reason_digest,
             self.token_hash,
+            str(self.signer_epoch),
+            self.signer_boot_id,
+            f"{self.issued_at:.6f}",
         ])
 
     def compute_canonical_payload_digest(self) -> str:

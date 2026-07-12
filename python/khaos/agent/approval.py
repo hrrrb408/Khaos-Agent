@@ -75,9 +75,11 @@ class ApprovalBroker:
     def _receipt_public_verifier(self):
         return self.__receipt_signing_authority.verifier
 
-    def _rotate_receipt_signing_authority(self, boot_epoch: int) -> None:
+    def _rotate_receipt_signing_authority(self, boot_epoch: int, boot_id: str) -> None:
         from khaos.coding.planning.approval.receipt_crypto import _ReceiptSigningAuthority
-        self.__receipt_signing_authority = _ReceiptSigningAuthority(boot_epoch=boot_epoch)
+        self.__receipt_signing_authority = _ReceiptSigningAuthority(
+            boot_epoch=boot_epoch, boot_id=boot_id
+        )
 
     def _install_runtime_receipt_writer(
         self, writer, *, runtime_token: object, runtime_capability=None
@@ -351,6 +353,9 @@ class ApprovalBroker:
                 reason_digest=reason_digest,
                 one_time_token=token,
                 token_hash=token_hash,
+                signer_epoch=self.__receipt_signing_authority.verifier.boot_epoch,
+                signer_boot_id=self.__receipt_signing_authority.verifier.boot_id,
+                issued_at=now,
                 metadata={"reason": reason_text},
             )
         # Batch 2.7: sign with the broker-private Ed25519 authority. The key
@@ -389,6 +394,9 @@ class ApprovalBroker:
                 canonical_payload_digest=receipt.canonical_payload_digest,
                 broker_signature=receipt.broker_signature,
                 signer_key_id=receipt.signer_key_id,
+                signer_epoch=receipt.signer_epoch,
+                signer_boot_id=receipt.signer_boot_id,
+                issued_at=receipt.issued_at,
                 created_at=now,
             )
         return receipt

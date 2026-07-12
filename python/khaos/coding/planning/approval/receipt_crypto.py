@@ -16,6 +16,7 @@ class ReceiptPublicVerifier:
     public_key: str
     key_version: int
     boot_epoch: int
+    boot_id: str = ""
 
     def verify_payload_digest(self, payload_digest: str, signature: str) -> bool:
         try:
@@ -30,13 +31,17 @@ class _ReceiptSigningAuthority:
     """Broker-private signer; repr and public verifier never expose private bytes."""
     __slots__ = ("__private_key", "_verifier")
 
-    def __init__(self, *, boot_epoch: int = 0, key_version: int = 1) -> None:
+    def __init__(
+        self, *, boot_epoch: int = 0, boot_id: str = "", key_version: int = 1
+    ) -> None:
         private = Ed25519PrivateKey.generate()
         public_bytes = private.public_key().public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
         public_text = base64.b64encode(public_bytes).decode("ascii")
         key_id = hashlib.sha256(public_bytes).hexdigest()[:24]
         self.__private_key = private
-        self._verifier = ReceiptPublicVerifier(key_id, public_text, key_version, boot_epoch)
+        self._verifier = ReceiptPublicVerifier(
+            key_id, public_text, key_version, boot_epoch, boot_id
+        )
 
     @property
     def verifier(self) -> ReceiptPublicVerifier:

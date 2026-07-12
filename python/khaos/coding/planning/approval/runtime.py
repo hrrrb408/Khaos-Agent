@@ -85,6 +85,12 @@ class _RuntimeAuthorityRegistry:
             for cap_id,record in list(self._capabilities.items()):
                 if record[0] == runtime_id: self._capabilities.pop(cap_id,None)
 
+    def is_active(self, runtime_id: str | None, boot: BootContext) -> bool:
+        if runtime_id is None:
+            return False
+        with self._lock:
+            return self._boots.get(runtime_id) == boot
+
 _RUNTIME_AUTHORITIES = _RuntimeAuthorityRegistry()
 
 def _consume_runtime_capability(capability: Any, scope: str) -> BootContext:
@@ -153,13 +159,15 @@ class ApprovalRuntime:
             from khaos.coding.planning.approval.mutation_fence import WorkspaceMutationFence, PlannedHeadMutationAdapter
             from khaos.coding.planning.approval.execution_contract import PlannedExecutionGuard
             self._mutation_fence=WorkspaceMutationFence()
-            for dependency in (self._task_manager,self._workspace_manager,self._repository_indexer):
+            for poisoned_workspace, poison_reason in self._store.list_poisoned_workspaces():
+                self._mutation_fence.poison(poisoned_workspace, poison_reason)
+            for dependency in (self._task_manager, self._workspace_manager):
                 dependency.set_mutation_fence(self._mutation_fence)
 
             # 2. Wire Broker → durable Receipt outbox (Batch 2.6 §1)
             self._state = RuntimeState.RECEIPT_BOUND
             store = self._store
-            self._broker._rotate_receipt_signing_authority(epoch)
+            self._broker._rotate_receipt_signing_authority(epoch, boot_id)
             verifier = self._broker._receipt_public_verifier()
             store_receipt_capability = _RUNTIME_AUTHORITIES.issue(
                 self._runtime_authority_id, "receipt-store"
@@ -168,6 +176,10 @@ class ApprovalRuntime:
                 self._runtime_authority_id, "receipt-broker"
             )
             def _writer(**fields):
+                if not _RUNTIME_AUTHORITIES.is_active(
+                    self._runtime_authority_id, self.boot_context
+                ):
+                    raise PermissionError("receipt runtime authority is revoked")
                 store._insert_signed_receipt(runtime_token=self._runtime_token, **fields)
             store._install_runtime_receipt_writer(
                 _writer,
@@ -203,6 +215,14 @@ class ApprovalRuntime:
             self.guard.set_mutation_fence(self._mutation_fence)
             self._coordinator=WorkspaceExecutionLeaseCoordinator(self)
             self._head_mutation_adapter=PlannedHeadMutationAdapter(self._mutation_fence,self._coordinator)
+            self._repository_indexer.set_mutation_fence(
+                self._mutation_fence,
+                workspace_resolver=self._coordinator.resolve_repository_workspace,
+            )
+            if callable(getattr(self._task_manager, "set_execution_scope_resolver", None)):
+                self._task_manager.set_execution_scope_resolver(
+                    self._coordinator.resolve_task_workspace
+                )
             if callable(getattr(self._task_manager, "set_lease_invalidation_hook", None)):
                 self._task_manager.set_lease_invalidation_hook(self._coordinator.cancel_task)
             if callable(getattr(self._workspace_manager, "set_lease_invalidation_hook", None)):
@@ -288,6 +308,18 @@ class ApprovalRuntime:
     def require_active_lease(self, *args: Any, **kwargs: Any):
         self.require_ready(); return self.gate.require_active_lease(*args, **kwargs)
 
+    def recover_poisoned_workspace(
+        self, workspace_id: str, *, force: bool = False
+    ) -> bool:
+        """Run the controlled lease reaper and clear in-memory quarantine."""
+        self.require_ready()
+        recovered = self._store.recover_poisoned_workspace(
+            workspace_id, force=force
+        )
+        if recovered:
+            self._mutation_fence.clear_poison(workspace_id)
+        return recovered
+
     def shutdown(self) -> None:
         """Atomically invalidate this boot's auth/lease/context.
 
@@ -346,13 +378,20 @@ class ApprovalRuntime:
                 task_manager.set_lease_invalidation_hook(coordinator.cancel_task)
             if hasattr(task_manager, "set_mutation_fence"):
                 task_manager.set_mutation_fence(self._mutation_fence)
+            if hasattr(task_manager, "set_execution_scope_resolver"):
+                task_manager.set_execution_scope_resolver(
+                    coordinator.resolve_task_workspace
+                )
         if workspace_manager is not None:
             if hasattr(workspace_manager, "set_lease_invalidation_hook"):
                 workspace_manager.set_lease_invalidation_hook(coordinator.cleanup_workspace)
             if hasattr(workspace_manager, "set_mutation_fence"):
                 workspace_manager.set_mutation_fence(self._mutation_fence)
         if repository_indexer is not None and hasattr(repository_indexer, "set_mutation_fence"):
-            repository_indexer.set_mutation_fence(self._mutation_fence)
+            repository_indexer.set_mutation_fence(
+                self._mutation_fence,
+                workspace_resolver=coordinator.resolve_repository_workspace,
+            )
         return coordinator
 
     @property
@@ -378,6 +417,27 @@ class WorkspaceExecutionLeaseCoordinator:
 
     def before_generation_or_head_update(self, ctx: Any) -> None:
         self.require_owner(ctx)
+
+    def resolve_task_workspace(self, task_id: str) -> str | None:
+        """Resolve Task→Workspace from the durable ACTIVE lease relation."""
+        self._runtime.require_ready()
+        return self._runtime._store.active_lease_scope_for_task(task_id)
+
+    def resolve_repository_workspace(
+        self, repository_id: str, workspace_id: str
+    ) -> str:
+        """Validate an explicit canonical workspace mutation scope."""
+        self._runtime.require_ready()
+        workspace_getter = getattr(self._runtime._workspace_manager, "get", None)
+        if callable(workspace_getter):
+            workspace = workspace_getter(workspace_id)
+            if workspace is None or getattr(workspace, "repository_root", None) is None:
+                raise RuntimeError("workspace is missing or inactive")
+        if not self._runtime._store.validate_repository_workspace_scope(
+            repository_id, workspace_id
+        ):
+            raise RuntimeError("repository/workspace scope is ambiguous")
+        return workspace_id
 
     def cancel_task(self, *, task_id: str | None = None, workspace_id: str | None = None, owner_execution_id: str | None = None, reason: str = "task-cancelled", now: float | None = None) -> int:
         """Cancel active execution scope by task and/or workspace.

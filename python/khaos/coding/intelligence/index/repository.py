@@ -124,7 +124,10 @@ class RepositoryIndexer:
         self._mutation_fence = fence
         self._fence_workspace_resolver = workspace_resolver
 
-    async def index(self, repository_id: str, root: Path, *, full_reindex: bool = False) -> dict[str, Any]:
+    async def index(
+        self, repository_id: str, root: Path, *, workspace_id: str | None = None,
+        full_reindex: bool = False,
+    ) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("RepositoryIndexer is closed")
         # Batch 2.6 §5: acquire the mutation fence BEFORE writing parse
@@ -132,11 +135,13 @@ class RepositoryIndexer:
         # acquisition / Batch 3 execution / cleanup. Falls back to
         # repository_id as the workspace key when no resolver is set.
         if self._mutation_fence is not None:
-            workspace_id = repository_id
-            if self._fence_workspace_resolver is not None:
-                resolved = self._fence_workspace_resolver(repository_id)
-                if resolved is not None:
-                    workspace_id = resolved
+            if not workspace_id:
+                raise RuntimeError("workspace_id is required for fenced repository indexing")
+            if self._fence_workspace_resolver is None:
+                raise RuntimeError("canonical repository/workspace resolver is required")
+            resolved = self._fence_workspace_resolver(repository_id, workspace_id)
+            if resolved != workspace_id:
+                raise RuntimeError("repository/workspace mutation scope is invalid or ambiguous")
             async with self._mutation_fence.use(
                 workspace_id, owner=f"indexer:{repository_id}",
             ):
