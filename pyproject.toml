@@ -47,4 +47,7 @@ khaos = "khaos.cli.main:main"
 asyncio_mode = "auto"
 pythonpath = ["python"]
 testpaths = ["python/tests"]
-markers = ["tree_sitter_real: requires locked Tree-sitter optional dependencies"]
+markers = [
+    "tree_sitter_real: requires locked Tree-sitter optional dependencies",
+    "lsp_real: requires a trusted pre-installed Language Server (never downloaded at test time)",
+]
