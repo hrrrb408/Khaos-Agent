@@ -8,6 +8,7 @@ from typing import Any
 
 from khaos.coding.intelligence.query import CodeQueryService
 from khaos.coding.planning.contracts import *  # noqa: F403
+from khaos.coding.planning.dag import validate_steps
 
 MAX_GOAL_LENGTH = 4096
 
@@ -55,7 +56,8 @@ class DeterministicPlanningService:
         return ImpactAnalysis((), tuple(sorted(target_symbols)), tuple(direct), tuple(indirect), (), tuple(dynamic), (), tuple(diagnostics), max((x.depth for x in direct+indirect), default=0), truncated, digest)
 
     def plan(self, *, repository_id: str, task_id: str, workspace_id: str, user_goal: str, base_sha: str) -> ImplementationPlan:
-        normalized = " ".join(user_goal.split()).casefold()
+        raw_goal = " ".join(user_goal.split())
+        normalized = raw_goal.casefold()
         diagnostics: list[PlanDiagnostic] = []
         repo = self._repositories.get(repository_id)
         if not normalized or len(normalized) > MAX_GOAL_LENGTH or repo is None or repo.get("workspace_id") != workspace_id or repo.get("head") != base_sha:
@@ -63,7 +65,7 @@ class DeterministicPlanningService:
             diagnostics.append(PlanDiagnostic(code, "error", code.replace("-", " "), False))
             return self._build(repository_id, task_id, workspace_id, user_goal, normalized, base_sha, int(repo.get("generation", 0)) if repo else 0, PlanStatus.BLOCKED, (), (), (), (), (), (), diagnostics)
         operation = self._operation(normalized)
-        token = self._target(normalized)
+        token = self._target(raw_goal)
         candidates = self._query.find_symbol_targets(repository_id, token) if token else []
         if not candidates and token:
             candidates = self._query.indexed_symbol_candidates(repository_id, token)
@@ -94,7 +96,9 @@ class DeterministicPlanningService:
         risks = self._risks(operation, files, symbols, normalized)
         requirements = self._verification(repo, files, evidence)
         status = PlanStatus.READY if files and not any(d.code == "ambiguous-symbol" for d in diagnostics) else PlanStatus.BLOCKED
-        step = () if not files else (PlanStep("step-1", "Plan repository change", normalized, operation, tuple(f.path for f in files), tuple(s.stable_symbol_id for s in symbols if s.stable_symbol_id), (), "reviewable implementation scope", tuple(requirements), risks[0], risks[0].requires_approval, tuple(evidence)),)
+        step = self._steps(operation, normalized, files, symbols, requirements, risks[0], evidence, status)
+        diagnostics.extend(validate_steps(step))
+        if any(d.severity == "error" for d in diagnostics): status = PlanStatus.BLOCKED
         return self._build(repository_id, task_id, workspace_id, user_goal, normalized, base_sha, int(repo["generation"]), status, step, files, symbols, impacts, requirements, risks, diagnostics, evidence)
 
     def validate_plan(self, plan: ImplementationPlan, *, current_head: str, current_repository_generation: int) -> PlanValidationResult:
@@ -123,6 +127,15 @@ class DeterministicPlanningService:
             match = re.search(r"(?:rename|modify|change|delete|create)\s+[`'\"]?([\w./-]+)", goal)
         value = match.group(1) if match else ""
         return value if "." in value else value.split("/")[-1]
+    @staticmethod
+    def _steps(operation, goal, files, symbols, requirements, risk, evidence, status):
+        if not files: return ()
+        targets=tuple(f.path for f in files); symbols=tuple(s.stable_symbol_id for s in symbols if s.stable_symbol_id)
+        inspect=PlanStep("inspect-1", "Inspect evidence", "confirm indexed target and assumptions", PlanOperation.INSPECT, targets, symbols, (), "confirmed scope", (), risk, risk.requires_approval, tuple(evidence))
+        if status != PlanStatus.READY: return (inspect,)
+        primary=PlanStep("modify-1", "Apply planned source update", goal, operation, targets, symbols, ("inspect-1",) if operation in (PlanOperation.DELETE, PlanOperation.RENAME) else (), "source update prepared", (), risk, risk.requires_approval, tuple(evidence))
+        tests=PlanStep("verify-1", "Verify affected scope", "run trusted verification later", PlanOperation.TEST, targets, (), ("modify-1",), "verification requirements satisfied", tuple(requirements), risk, risk.requires_approval, tuple(evidence))
+        return (inspect, primary, tests)
     @staticmethod
     def _language(path):
         return {"py":"python", "js":"javascript", "ts":"typescript", "tsx":"typescript", "go":"go", "rs":"rust"}.get(path.rsplit(".", 1)[-1]) if "." in path else None
