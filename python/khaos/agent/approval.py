@@ -200,9 +200,7 @@ class ApprovalBroker:
         *,
         broker_request_id: str,
         approved: bool,
-        actor_id: str,
-        actor_type: str = "user",
-        authenticated_source: str = "broker",
+        context,
         reason: str = "",
         binding_digest: str = "",
         receipt_sink=None,
@@ -211,35 +209,46 @@ class ApprovalBroker:
         """Apply an approve/reject decision and mint an authenticated receipt.
 
         This is the ONLY method that creates a :class:`BrokerDecisionReceipt`.
-        The receipt's actor identity comes from the broker's authenticated
-        context (``actor_id`` / ``actor_type`` / ``authenticated_source``),
-        never from the later caller of
-        :meth:`PlanApprovalService.apply_broker_decision`.
+        Actor identity comes from ``context`` — an
+        :class:`AuthenticatedApprovalContext` that ONLY the authenticated
+        API/session layer may construct. Bare actor strings are NOT accepted,
+        so a caller cannot self-assert an authenticated identity.
 
         Returns a :class:`BrokerDecisionReceipt` on success, or ``None`` if
         the broker request is unknown, expired, or conflicts with a prior
         opposite decision. Idempotent repeats of the SAME decision re-mint a
         fresh receipt (the store dedups on token hash).
 
-        If ``receipt_sink`` is supplied it is called with the receipt's
-        ``(receipt_id, token_hash, approval_request_id, broker_request_id,
-        binding_digest, decision, expires_at)`` so the durable outbox row can
-        be persisted in the same atomic transaction as the decision.
+        If ``receipt_sink`` is supplied it is called with EVERY authoritative
+        field of the receipt so the durable outbox row is complete;
+        ``apply_authenticated_decision`` later compares all of them.
         """
         import time as _time
         import uuid as _uuid
 
         # Lazy import to avoid a circular dependency at module load time.
         from khaos.coding.planning.approval.models import (
+            AuthenticatedApprovalContext,
             BrokerDecisionReceipt,
             PlanApprovalStatus,
+            compute_reason_digest,
             generate_receipt_token,
             hash_receipt_token,
         )
 
+        # The context MUST be a real AuthenticatedApprovalContext — refuse
+        # bare strings/dicts that a caller might try to smuggle through.
+        if not isinstance(context, AuthenticatedApprovalContext):
+            raise TypeError(
+                "resolve_plan_approval requires an AuthenticatedApprovalContext; "
+                "bare actor strings are not accepted"
+            )
+
         now = (clock or _time.time)()
         decision_status = PlanApprovalStatus.APPROVED if approved else PlanApprovalStatus.REJECTED
         decision_value = decision_status.value
+        reason_text = reason or f"{decision_value}-by-{context.actor_type}:{context.actor_id}"
+        reason_digest = compute_reason_digest(reason_text)
 
         async with self._lock:
             record = self._plan_approvals.get(broker_request_id)
@@ -263,20 +272,23 @@ class ApprovalBroker:
                 broker_request_id=broker_request_id,
                 approval_request_id=record.approval_request_id,
                 decision=decision_status,
-                authenticated_actor_id=actor_id,
-                authenticated_actor_type=actor_type,
-                authenticated_source=authenticated_source,
+                authenticated_actor_id=context.actor_id,
+                authenticated_actor_type=context.actor_type,
+                authenticated_source=context.authenticated_source,
+                session_request_id=context.session_request_id,
+                server_capability=context.server_capability,
                 binding_digest=binding_digest or record.binding.get("binding_digest", ""),
                 decided_at=now,
                 expires_at=record.expires_at,
+                reason_digest=reason_digest,
                 one_time_token=token,
                 token_hash=token_hash,
-                metadata={"reason": reason or f"{decision_value}-by-{actor_type}:{actor_id}"},
+                metadata={"reason": reason_text},
             )
 
         # Persist the receipt outbox row outside the broker lock. The sink
-        # is responsible for its own durability; if it raises the receipt is
-        # still valid in-memory but the caller will see the error.
+        # receives EVERY authoritative field so apply_authenticated_decision
+        # can compare them all.
         if receipt_sink is not None:
             receipt_sink(
                 receipt_id=receipt.receipt_id,
@@ -285,7 +297,16 @@ class ApprovalBroker:
                 broker_request_id=receipt.broker_request_id,
                 binding_digest=receipt.binding_digest,
                 decision=receipt.decision.value,
+                namespace=receipt.namespace,
+                authenticated_actor_id=receipt.authenticated_actor_id,
+                authenticated_actor_type=receipt.authenticated_actor_type,
+                authenticated_source=receipt.authenticated_source,
+                session_request_id=receipt.session_request_id,
+                server_capability=receipt.server_capability,
+                decided_at=receipt.decided_at,
+                reason_digest=receipt.reason_digest,
                 expires_at=receipt.expires_at,
+                created_at=now,
             )
         return receipt
 

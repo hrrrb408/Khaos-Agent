@@ -322,6 +322,55 @@ def verify_receipt_token(token: str, expected_hash: str) -> bool:
     return hmac.compare_digest(hash_receipt_token(token), expected_hash)
 
 
+def compute_reason_digest(reason: str) -> str:
+    """Stable SHA-256 over a decision's free-text reason.
+
+    Bound into the durable receipt so tampering with the reason text (which
+    could carry authorization-relevant semantics) is detected at apply time.
+    """
+    return hashlib.sha256(reason.encode("utf-8")).hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# Authenticated approval context (§1)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class AuthenticatedApprovalContext:
+    """The ONLY sanctioned carrier of actor identity into the broker.
+
+    This may ONLY be constructed by the authenticated API/session layer (a
+    real login, RPC auth context, or test factory that explicitly simulates
+    one). The broker accepts this object — it does NOT accept bare
+    ``actor_id`` / ``authenticated_source`` strings, so a caller cannot
+    self-assert an authenticated identity.
+
+    Fields are intentionally minimal and verifiable:
+    * ``actor_id`` — the authenticated principal.
+    * ``actor_type`` — "user" / "admin" / "system-service".
+    * ``session_request_id`` — the authenticating session or request id.
+    * ``authenticated_source`` — the mechanism ("api", "rpc", "session").
+    * ``authentication_time`` — when the session authenticated (epoch seconds).
+    * ``server_capability`` — the capability token granting approval rights.
+    """
+
+    actor_id: str
+    actor_type: str
+    session_request_id: str
+    authenticated_source: str
+    authentication_time: float
+    server_capability: str
+
+    def __post_init__(self) -> None:
+        # Reject empty/placeholder identities — an authenticated context must
+        # carry real values, not blanks a caller could smuggle through.
+        for field_name in ("actor_id", "actor_type", "session_request_id", "authenticated_source", "server_capability"):
+            value = getattr(self, field_name)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"AuthenticatedApprovalContext.{field_name} must be a non-empty string")
+
+
 # ---------------------------------------------------------------------------
 # Dataclasses
 # ---------------------------------------------------------------------------
@@ -450,12 +499,17 @@ class BrokerDecisionReceipt:
       (returned by ``ApprovalBroker.resolve_plan_approval``).
     * The store persists only ``hash_receipt_token(one_time_token)`` in the
       ``plan_approval_receipts`` outbox — a row the broker creates at resolve
-      time.
+      time — alongside EVERY authoritative field (namespace, actor identity,
+      source, session, capability, decided_at, reason_digest, binding_digest,
+      decision).
     * :meth:`PlanApprovalStore.apply_authenticated_decision` verifies the
-      token hash against that outbox row inside the same ``BEGIN IMMEDIATE``
-      transaction that applies the decision, and marks the row consumed.
-    * Actor identity (``authenticated_actor_id`` / ``authenticated_actor_type``)
-      comes from the broker's authenticated context, NOT from caller args.
+      token hash AND compares EVERY authoritative field against the outbox row
+      inside the same ``BEGIN IMMEDIATE`` transaction that applies the decision.
+      Tampering ANY field (actor_id, source, decided_at, reason_digest, …) on
+      a real receipt is detected and refused as CONFLICT.
+    * Actor identity originates from :class:`AuthenticatedApprovalContext`,
+      which only the authenticated API/session layer may construct — never
+      from caller args to ``apply_broker_decision``.
 
     The receipt is namespaced (``namespace == "plan-execution"``) so it can
     never be confused with a Task or ChangeSet approval.
@@ -469,9 +523,12 @@ class BrokerDecisionReceipt:
     authenticated_actor_id: str
     authenticated_actor_type: str
     authenticated_source: str
+    session_request_id: str
+    server_capability: str
     binding_digest: str
     decided_at: float
     expires_at: float
+    reason_digest: str  # SHA-256 of the decision reason; bound into the durable row
     one_time_token: str  # plaintext; never persisted, never logged
     token_hash: str  # persisted surrogate (hash of one_time_token)
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -493,3 +550,32 @@ class PlanValidationContext:
     risk_level: str
     requires_approval: bool
     reason_codes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class WorkspaceExecutionLease:
+    """Exclusive short-lived workspace execution lease (Batch 2.2 §7).
+
+    Closes the TOCTOU between live validation and consume: the lease holds
+    HEAD + generation + evidence digest at acquire time, and any concurrent
+    HEAD/generation/workspace change is mutually exclusive with the lease
+    (enforced by the ``uq_plan_execution_leases_active_workspace`` partial
+    unique index — at most one ACTIVE lease per workspace).
+
+    The lease is bound to a single consumed authorization; it cannot be
+    replayed across workspaces or tasks.
+    """
+
+    lease_id: str
+    task_id: str
+    workspace_id: str
+    repository_id: str
+    plan_id: str
+    head_sha: str
+    repository_generation: int
+    evidence_digest: str
+    binding_digest: str
+    authorization_id: str
+    expiry: float
+    owner_execution_id: str
+    status: str  # "active" / "released" / "expired"
