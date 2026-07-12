@@ -265,21 +265,28 @@ CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_request
 CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_plan
     ON plan_approval_audit_events(plan_id, timestamp);
 
--- M4 Batch 2.1: Broker authenticity and atomic authorization closure.
--- Durable broker-decision receipt outbox. Only ApprovalBroker can create a
--- row here (via the receipt_sink callback); apply_authenticated_decision
--- verifies the token hash against this row inside the same transaction that
--- applies the decision, and marks it consumed.
+-- M4 Batch 2.1 + 2.2: Broker authenticity and atomic authorization closure.
+-- Durable broker-decision receipt outbox with FULL field binding. Only
+-- ApprovalBroker can create a row here; apply_authenticated_decision
+-- verifies the token hash AND every authoritative field against this row.
 CREATE TABLE IF NOT EXISTS plan_approval_receipts (
-    receipt_id            TEXT PRIMARY KEY,
-    token_hash            TEXT NOT NULL UNIQUE,
-    approval_request_id   TEXT NOT NULL,
-    broker_request_id     TEXT NOT NULL,
-    binding_digest        TEXT NOT NULL,
-    decision              TEXT NOT NULL,
-    consumed              INTEGER NOT NULL DEFAULT 0,
-    created_at            REAL NOT NULL,
-    expires_at            REAL NOT NULL
+    receipt_id               TEXT PRIMARY KEY,
+    token_hash               TEXT NOT NULL UNIQUE,
+    approval_request_id      TEXT NOT NULL,
+    broker_request_id        TEXT NOT NULL,
+    binding_digest           TEXT NOT NULL,
+    decision                 TEXT NOT NULL,
+    namespace                TEXT NOT NULL DEFAULT 'plan-execution',
+    authenticated_actor_id   TEXT NOT NULL DEFAULT '',
+    authenticated_actor_type TEXT NOT NULL DEFAULT '',
+    authenticated_source     TEXT NOT NULL DEFAULT '',
+    session_request_id       TEXT NOT NULL DEFAULT '',
+    server_capability        TEXT NOT NULL DEFAULT '',
+    decided_at               REAL NOT NULL DEFAULT 0,
+    reason_digest            TEXT NOT NULL DEFAULT '',
+    consumed                 INTEGER NOT NULL DEFAULT 0,
+    created_at               REAL NOT NULL,
+    expires_at               REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_token
@@ -297,3 +304,56 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_exec_auth_active_per_request
 -- used '' and many can coexist).
 CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_approval_requests_broker
     ON plan_approval_requests(broker_request_id) WHERE broker_request_id != '';
+
+-- M4 Batch 2.2: persisted monotonic server epoch. The gate reads and rotates
+-- this atomically at startup so a restart genuinely invalidates old
+-- authorizations (the in-memory default epoch was not a real safety property).
+CREATE TABLE IF NOT EXISTS plan_execution_server_state (
+    singleton_key  TEXT PRIMARY KEY DEFAULT 'global',
+    current_epoch  INTEGER NOT NULL DEFAULT 0,
+    boot_id        TEXT NOT NULL DEFAULT '',
+    updated_at     REAL NOT NULL DEFAULT 0
+);
+
+-- M4 Batch 2.2: persisted authoritative plan snapshots. The gate and decision
+-- path resolve plans by plan_id from here, not from a caller-supplied object.
+-- A plan_id cannot be silently replaced with different content.
+CREATE TABLE IF NOT EXISTS plan_snapshots (
+    plan_id              TEXT PRIMARY KEY,
+    content_hash         TEXT NOT NULL,
+    binding_digest       TEXT NOT NULL,
+    repository_id        TEXT NOT NULL,
+    task_id              TEXT NOT NULL,
+    workspace_id         TEXT NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'khaos.planning.v1',
+    canonical_plan_json  TEXT NOT NULL,
+    created_at           REAL NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_snapshots_repo
+    ON plan_snapshots(repository_id, task_id, workspace_id);
+
+-- M4 Batch 2.2: workspace execution leases (TOCTOU closure for consume).
+CREATE TABLE IF NOT EXISTS plan_execution_leases (
+    lease_id              TEXT PRIMARY KEY,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    plan_id               TEXT NOT NULL,
+    head_sha              TEXT NOT NULL,
+    repository_generation INTEGER NOT NULL,
+    evidence_digest       TEXT NOT NULL,
+    binding_digest        TEXT NOT NULL,
+    authorization_id      TEXT NOT NULL,
+    expiry                REAL NOT NULL,
+    owner_execution_id    TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'active',
+    created_at            REAL NOT NULL
+);
+
+-- At most one ACTIVE lease per workspace — enforces workspace exclusivity.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_execution_leases_active_workspace
+    ON plan_execution_leases(workspace_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_plan_execution_leases_task
+    ON plan_execution_leases(task_id, status);

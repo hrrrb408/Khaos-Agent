@@ -154,23 +154,85 @@ CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_plan
 -- Batch 2.1: durable broker-decision receipt outbox. Only
 -- ApprovalBroker.resolve_plan_approval can create a row here (via the
 -- receipt_sink callback); apply_authenticated_decision verifies the token
--- hash against this row and marks it consumed inside the same transaction.
+-- hash AND every authoritative field against this row and marks it consumed
+-- inside the same transaction.
 CREATE TABLE IF NOT EXISTS plan_approval_receipts (
-    receipt_id            TEXT PRIMARY KEY,
-    token_hash            TEXT NOT NULL UNIQUE,
-    approval_request_id   TEXT NOT NULL,
-    broker_request_id     TEXT NOT NULL,
-    binding_digest        TEXT NOT NULL,
-    decision              TEXT NOT NULL,
-    consumed              INTEGER NOT NULL DEFAULT 0,
-    created_at            REAL NOT NULL,
-    expires_at            REAL NOT NULL
+    receipt_id               TEXT PRIMARY KEY,
+    token_hash               TEXT NOT NULL UNIQUE,
+    approval_request_id      TEXT NOT NULL,
+    broker_request_id        TEXT NOT NULL,
+    binding_digest           TEXT NOT NULL,
+    decision                 TEXT NOT NULL,
+    namespace                TEXT NOT NULL DEFAULT 'plan-execution',
+    authenticated_actor_id   TEXT NOT NULL DEFAULT '',
+    authenticated_actor_type TEXT NOT NULL DEFAULT '',
+    authenticated_source     TEXT NOT NULL DEFAULT '',
+    session_request_id       TEXT NOT NULL DEFAULT '',
+    server_capability        TEXT NOT NULL DEFAULT '',
+    decided_at               REAL NOT NULL DEFAULT 0,
+    reason_digest            TEXT NOT NULL DEFAULT '',
+    consumed                 INTEGER NOT NULL DEFAULT 0,
+    created_at               REAL NOT NULL,
+    expires_at               REAL NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_token
     ON plan_approval_receipts(token_hash);
 CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_request
     ON plan_approval_receipts(approval_request_id);
+
+-- Batch 2.2: persisted monotonic server epoch. The gate reads and rotates
+-- this atomically at startup so a restart genuinely invalidates old
+-- authorizations (the in-memory default epoch was not a real safety property).
+CREATE TABLE IF NOT EXISTS plan_execution_server_state (
+    singleton_key  TEXT PRIMARY KEY DEFAULT 'global',
+    current_epoch  INTEGER NOT NULL DEFAULT 0,
+    boot_id        TEXT NOT NULL DEFAULT '',
+    updated_at     REAL NOT NULL DEFAULT 0
+);
+
+-- Batch 2.2: persisted authoritative plan snapshots. The gate and decision
+-- path resolve plans by plan_id from here, not from a caller-supplied object.
+-- A plan_id cannot be silently replaced with different content.
+CREATE TABLE IF NOT EXISTS plan_snapshots (
+    plan_id              TEXT PRIMARY KEY,
+    content_hash         TEXT NOT NULL,
+    binding_digest       TEXT NOT NULL,
+    repository_id        TEXT NOT NULL,
+    task_id              TEXT NOT NULL,
+    workspace_id         TEXT NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'khaos.planning.v1',
+    canonical_plan_json  TEXT NOT NULL,
+    created_at           REAL NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_snapshots_repo
+    ON plan_snapshots(repository_id, task_id, workspace_id);
+
+-- Batch 2.2: workspace execution leases (TOCTOU closure for consume).
+CREATE TABLE IF NOT EXISTS plan_execution_leases (
+    lease_id              TEXT PRIMARY KEY,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    plan_id               TEXT NOT NULL,
+    head_sha              TEXT NOT NULL,
+    repository_generation INTEGER NOT NULL,
+    evidence_digest       TEXT NOT NULL,
+    binding_digest        TEXT NOT NULL,
+    authorization_id      TEXT NOT NULL,
+    expiry                REAL NOT NULL,
+    owner_execution_id    TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'active',
+    created_at            REAL NOT NULL
+);
+
+-- At most one ACTIVE lease per workspace — enforces workspace exclusivity.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_execution_leases_active_workspace
+    ON plan_execution_leases(workspace_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_plan_execution_leases_task
+    ON plan_execution_leases(task_id, status);
 """
 
 
@@ -198,6 +260,20 @@ def _post_schema(conn: sqlite3.Connection) -> None:
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_approval_requests_broker "
         "ON plan_approval_requests(broker_request_id) WHERE broker_request_id != ''"
     )
+    # Batch 2.2: add the full-binding receipt columns to old 2.1 databases.
+    receipt_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_approval_receipts)")}
+    for col, decl in (
+        ("namespace", "TEXT NOT NULL DEFAULT 'plan-execution'"),
+        ("authenticated_actor_id", "TEXT NOT NULL DEFAULT ''"),
+        ("authenticated_actor_type", "TEXT NOT NULL DEFAULT ''"),
+        ("authenticated_source", "TEXT NOT NULL DEFAULT ''"),
+        ("session_request_id", "TEXT NOT NULL DEFAULT ''"),
+        ("server_capability", "TEXT NOT NULL DEFAULT ''"),
+        ("decided_at", "REAL NOT NULL DEFAULT 0"),
+        ("reason_digest", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if col not in receipt_cols:
+            conn.execute(f"ALTER TABLE plan_approval_receipts ADD COLUMN {col} {decl}")
 
 
 class ApprovalTransitionResult(str, Enum):
@@ -248,31 +324,39 @@ class PlanApprovalStore:
         broker_request_id: str,
         binding_digest: str,
         decision: str,
+        namespace: str = "plan-execution",
+        authenticated_actor_id: str = "",
+        authenticated_actor_type: str = "",
+        authenticated_source: str = "",
+        session_request_id: str = "",
+        server_capability: str = "",
+        decided_at: float = 0.0,
+        reason_digest: str = "",
         expires_at: float,
         created_at: float | None = None,
+        now: float | None = None,
     ) -> None:
-        """Persist a broker-decision receipt outbox row.
+        """Persist a broker-decision receipt outbox row with ALL authoritative fields.
 
         Called by the broker's receipt_sink at resolve time. Only the broker
         produces these rows, so a forged dataclass receipt cannot supply a
-        matching token hash.
+        matching token hash OR matching authoritative fields.
         """
+        ts = float(created_at if created_at is not None else (now if now is not None else time.time()))
         self._conn.execute(
             """
             INSERT OR REPLACE INTO plan_approval_receipts (
                 receipt_id, token_hash, approval_request_id, broker_request_id,
-                binding_digest, decision, consumed, created_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+                binding_digest, decision, namespace, authenticated_actor_id,
+                authenticated_actor_type, authenticated_source, session_request_id,
+                server_capability, decided_at, reason_digest, consumed, created_at, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
             """,
             (
-                receipt_id,
-                token_hash,
-                approval_request_id,
-                broker_request_id,
-                binding_digest,
-                decision,
-                float(created_at if created_at is not None else time.time()),
-                float(expires_at),
+                receipt_id, token_hash, approval_request_id, broker_request_id,
+                binding_digest, decision, namespace, authenticated_actor_id,
+                authenticated_actor_type, authenticated_source, session_request_id,
+                server_capability, float(decided_at), reason_digest, ts, float(expires_at),
             ),
         )
         self._conn.commit()
@@ -446,8 +530,7 @@ class PlanApprovalStore:
         self,
         *,
         approval_request_id: str,
-        receipt_token: str,
-        decision: PlanApprovalStatus,
+        receipt,
         decision_record: PlanApprovalDecision,
         audit_event: PlanApprovalAuditEvent,
         new_expiry: float | None,
@@ -460,24 +543,32 @@ class PlanApprovalStore:
         status is unchanged, no decision row, no audit row, expiry unchanged,
         receipt not consumed.
 
-        Token authenticity: ``receipt_token`` is hashed and matched against
-        the ``plan_approval_receipts`` outbox row created by the broker at
-        resolve time. A forged dataclass receipt cannot supply a token whose
-        hash matches an unconsumed outbox row.
+        Full-field authenticity (Batch 2.2): the receipt's one-time token is
+        hashed and matched against the ``plan_approval_receipts`` outbox row,
+        AND EVERY authoritative field on the receipt (namespace, actor_id,
+        actor_type, source, session_request_id, server_capability, decided_at,
+        reason_digest, binding_digest, decision) is compared against that row.
+        Tampering ANY field on a real receipt is detected and refused as
+        CONFLICT. A forged dataclass receipt cannot supply a token whose hash
+        matches an unconsumed outbox row in the first place.
+
+        The idempotent path (request already in the decision state) STILL
+        verifies the token + all fields before returning UNCHANGED — there is
+        no early return that skips receipt verification.
 
         Returns:
             * ``UPDATED`` — decision applied atomically.
             * ``UNCHANGED`` — request already in ``decision`` (idempotent).
-            * ``CONFLICT`` — request in a different non-target state, or the
-              receipt's bound decision differs from ``decision``, or the
-              receipt is already consumed (replay).
+            * ``CONFLICT`` — receipt replay, cross-request, field tamper, or
+              state conflict.
             * ``STALE`` — binding drift detected.
             * ``NOT_FOUND`` — request or receipt unknown.
         """
+        decision = receipt.decision
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             # 1. Verify the receipt token against the outbox.
-            receipt_row = self.get_receipt_by_token(receipt_token)
+            receipt_row = self.get_receipt_by_token(receipt.one_time_token)
             if receipt_row is None:
                 self._conn.rollback()
                 return ApprovalTransitionResult.NOT_FOUND
@@ -497,6 +588,30 @@ class PlanApprovalStore:
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
 
+            # 1b. Verify EVERY authoritative field (Batch 2.2 §1). Tampering
+            # any of these on a real receipt is a CONFLICT. We compare against
+            # the durable outbox row, not the in-memory receipt object.
+            field_checks = (
+                ("namespace", receipt.namespace),
+                ("authenticated_actor_id", receipt.authenticated_actor_id),
+                ("authenticated_actor_type", receipt.authenticated_actor_type),
+                ("authenticated_source", receipt.authenticated_source),
+                ("session_request_id", receipt.session_request_id),
+                ("server_capability", receipt.server_capability),
+                ("reason_digest", receipt.reason_digest),
+            )
+            for col, expected in field_checks:
+                if str(receipt_row[col]) != str(expected):
+                    self._conn.rollback()
+                    return ApprovalTransitionResult.CONFLICT
+            # decided_at is a float; compare with small tolerance for JSON round-trip.
+            if abs(float(receipt_row["decided_at"]) - float(receipt.decided_at)) > 1e-6:
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+            if str(receipt_row["binding_digest"]) != str(receipt.binding_digest):
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+
             # 2. Verify the request status + binding.
             row = self._conn.execute(
                 "SELECT status, binding_digest FROM plan_approval_requests "
@@ -508,7 +623,8 @@ class PlanApprovalStore:
                 return ApprovalTransitionResult.NOT_FOUND
             current = PlanApprovalStatus(row["status"])
             if current == decision:
-                # Idempotent — still consume the receipt so it can't be reused.
+                # Idempotent — STILL consume the receipt (after the full field
+                # verification above passed) so it can't be reused.
                 self._conn.execute(
                     "UPDATE plan_approval_receipts SET consumed = 1 WHERE receipt_id = ?",
                     (receipt_row["receipt_id"],),
@@ -817,25 +933,33 @@ class PlanApprovalStore:
     # Execution authorizations
     # ------------------------------------------------------------------
 
-    def insert_authorization(self, auth: PlanExecutionAuthorization, *, server_epoch: int = 0) -> None:
-        """Persist a freshly-minted authorization (nonce hash only)."""
-        self._conn.execute(
-            """
-            INSERT INTO plan_execution_authorizations (
-                authorization_id, approval_request_id, plan_id, plan_content_hash,
-                repository_id, task_id, workspace_id, base_sha, repository_generation,
-                issued_at, expires_at, nonce_hash, binding_digest, status, server_epoch
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                auth.authorization_id, auth.approval_request_id, auth.plan_id,
-                auth.plan_content_hash, auth.repository_id, auth.task_id,
-                auth.workspace_id, auth.base_sha, int(auth.repository_generation),
-                float(auth.issued_at), float(auth.expires_at), auth.nonce_hash,
-                auth.binding_digest, auth.status.value, int(server_epoch),
-            ),
+    def insert_authorization(self, *args, **kwargs) -> None:
+        """DISABLED (Batch 2.2 §2). Direct authorization insertion bypasses
+        the gate's live validation + single-execution invariants.
+
+        This public stub ALWAYS raises — it is retained only so accidental
+        callers fail loudly instead of silently mutating the DB. The real
+        mint path is :meth:`mint_authorization_if_request_active`, which is
+        gate-internal and enforces all safety checks atomically.
+        """
+        raise PermissionError(
+            "direct PlanApprovalStore.insert_authorization is disabled; "
+            "use PlanExecutionGate.authorize_execution"
         )
-        self._conn.commit()
+
+    def consume_authorization(self, *args, **kwargs) -> bool:
+        """DISABLED (Batch 2.2 §2). Direct authorization consumption bypasses
+        the gate's live validation + request-consumption invariants.
+
+        This public stub ALWAYS raises — retained so accidental callers fail
+        loudly. The real consume path is
+        :meth:`consume_authorization_with_request` (gate-internal) or the
+        lease-based :meth:`PlanExecutionGate.acquire_lease`.
+        """
+        raise PermissionError(
+            "direct PlanApprovalStore.consume_authorization is disabled; "
+            "use PlanExecutionGate.acquire_lease / require_authorization"
+        )
 
     def get_authorization(self, authorization_id: str) -> PlanExecutionAuthorization | None:
         row = self._conn.execute(
@@ -1084,58 +1208,6 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
-    def consume_authorization(
-        self,
-        authorization_id: str,
-        *,
-        expected_plan_id: str,
-        expected_task_id: str,
-        expected_workspace_id: str,
-        expected_repository_id: str,
-        nonce: str,
-    ) -> bool:
-        """Legacy single-row consume (retained for back-compat; new code uses
-        :meth:`consume_authorization_with_request`)."""
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT * FROM plan_execution_authorizations WHERE authorization_id = ?",
-                (authorization_id,),
-            ).fetchone()
-            if row is None:
-                self._conn.rollback()
-                return False
-            if row["status"] != AuthorizationStatus.ACTIVE.value:
-                self._conn.rollback()
-                return False
-            if (
-                row["plan_id"] != expected_plan_id
-                or row["task_id"] != expected_task_id
-                or row["workspace_id"] != expected_workspace_id
-                or row["repository_id"] != expected_repository_id
-            ):
-                self._conn.rollback()
-                return False
-            if not verify_nonce(nonce, row["nonce_hash"]):
-                self._conn.rollback()
-                return False
-            if time.time() >= float(row["expires_at"]):
-                self._conn.execute(
-                    "UPDATE plan_execution_authorizations SET status = ? WHERE authorization_id = ?",
-                    (AuthorizationStatus.EXPIRED.value, authorization_id),
-                )
-                self._conn.commit()
-                return False
-            self._conn.execute(
-                "UPDATE plan_execution_authorizations SET status = ? WHERE authorization_id = ?",
-                (AuthorizationStatus.CONSUMED.value, authorization_id),
-            )
-            self._conn.commit()
-            return True
-        except Exception:
-            self._conn.rollback()
-            raise
-
     def revoke_authorization(self, authorization_id: str) -> bool:
         """Externally invalidate an authorization (e.g. on Task cancel)."""
         self._conn.execute("BEGIN IMMEDIATE")
@@ -1242,6 +1314,305 @@ class PlanApprovalStore:
             (plan_id, binding_digest),
         ).fetchone()
         return self._row_to_request(row) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # Persisted server epoch (Batch 2.2 §3)
+    # ------------------------------------------------------------------
+
+    def get_current_epoch(self) -> tuple[int, str]:
+        """Return ``(current_epoch, boot_id)`` from the persisted singleton.
+
+        Initializes the row to epoch 0 / empty boot_id on first call.
+        """
+        row = self._conn.execute(
+            "SELECT current_epoch, boot_id FROM plan_execution_server_state WHERE singleton_key = 'global'"
+        ).fetchone()
+        if row is None:
+            self._conn.execute(
+                "INSERT INTO plan_execution_server_state (singleton_key, current_epoch, boot_id, updated_at) "
+                "VALUES ('global', 0, '', ?)",
+                (time.time(),),
+            )
+            self._conn.commit()
+            return 0, ""
+        return int(row["current_epoch"]), str(row["boot_id"])
+
+    def rotate_epoch(self, *, now: float | None = None) -> tuple[int, str, int]:
+        """Atomically increment the persisted epoch and generate a fresh boot_id.
+
+        ONE ``BEGIN IMMEDIATE``: read current epoch, increment, generate
+        boot_id, persist, revoke all ACTIVE authorizations outside the new
+        epoch → COMMIT. Returns ``(new_epoch, new_boot_id, revoked_count)``.
+
+        Concurrent startup: two calls race on the singleton row; BEGIN
+        IMMEDIATE serializes them so the epoch increments twice and only the
+        latest boot_id can mint/consume.
+        """
+        now = time.time() if now is None else now
+        new_boot_id = uuid.uuid4().hex
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT current_epoch FROM plan_execution_server_state WHERE singleton_key = 'global'"
+            ).fetchone()
+            if row is None:
+                new_epoch = 1
+                self._conn.execute(
+                    "INSERT INTO plan_execution_server_state (singleton_key, current_epoch, boot_id, updated_at) "
+                    "VALUES ('global', ?, ?, ?)",
+                    (new_epoch, new_boot_id, now),
+                )
+            else:
+                new_epoch = int(row["current_epoch"]) + 1
+                self._conn.execute(
+                    "UPDATE plan_execution_server_state SET current_epoch = ?, boot_id = ?, updated_at = ? "
+                    "WHERE singleton_key = 'global'",
+                    (new_epoch, new_boot_id, now),
+                )
+            # Revoke all ACTIVE authorizations from prior epochs.
+            cur = self._conn.execute(
+                "UPDATE plan_execution_authorizations SET status = ? "
+                "WHERE status = ? AND server_epoch != ?",
+                (AuthorizationStatus.REVOKED.value, AuthorizationStatus.ACTIVE.value, new_epoch),
+            )
+            revoked = int(cur.rowcount or 0)
+            self._conn.commit()
+            return new_epoch, new_boot_id, revoked
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    # ------------------------------------------------------------------
+    # Persisted plan snapshots (Batch 2.2 §4)
+    # ------------------------------------------------------------------
+
+    def save_plan_snapshot(
+        self,
+        *,
+        plan_id: str,
+        content_hash: str,
+        binding_digest: str,
+        repository_id: str,
+        task_id: str,
+        workspace_id: str,
+        canonical_plan_json: str,
+        schema_version: str = "khaos.planning.v1",
+        now: float | None = None,
+    ) -> bool:
+        """Persist an authoritative plan snapshot.
+
+        Returns True on insert, False if a snapshot with the SAME plan_id and
+        DIFFERENT content_hash already existed (refused — a plan_id cannot be
+        silently replaced with different content; use a new plan_id or
+        explicit revision).
+        """
+        now = time.time() if now is None else now
+        existing = self._conn.execute(
+            "SELECT content_hash FROM plan_snapshots WHERE plan_id = ?",
+            (plan_id,),
+        ).fetchone()
+        if existing is not None and existing["content_hash"] != content_hash:
+            return False
+        self._conn.execute(
+            """
+            INSERT INTO plan_snapshots (
+                plan_id, content_hash, binding_digest, repository_id, task_id,
+                workspace_id, schema_version, canonical_plan_json, created_at, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+            ON CONFLICT(plan_id) DO UPDATE SET status = 'active'
+            """,
+            (
+                plan_id, content_hash, binding_digest, repository_id, task_id,
+                workspace_id, schema_version, canonical_plan_json, now,
+            ),
+        )
+        self._conn.commit()
+        return True
+
+    def load_plan_snapshot(self, plan_id: str) -> tuple[str, str, str] | None:
+        """Return ``(canonical_plan_json, content_hash, binding_digest)`` for
+        a plan_id, or None."""
+        row = self._conn.execute(
+            "SELECT canonical_plan_json, content_hash, binding_digest FROM plan_snapshots "
+            "WHERE plan_id = ? AND status = 'active'",
+            (plan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row["canonical_plan_json"]), str(row["content_hash"]), str(row["binding_digest"])
+
+    # ------------------------------------------------------------------
+    # Atomic request + authorization invalidation (Batch 2.2 §6)
+    # ------------------------------------------------------------------
+
+    def invalidate_request_and_authorizations(
+        self,
+        request_id: str,
+        *,
+        target_status: PlanApprovalStatus,
+        expected_statuses: set[PlanApprovalStatus],
+        audit_event: PlanApprovalAuditEvent | None = None,
+        now: float | None = None,
+    ) -> ApprovalTransitionResult:
+        """Atomically transition a request AND revoke all its ACTIVE
+        authorizations in ONE ``BEGIN IMMEDIATE``.
+
+        Replaces the non-atomic compositions in revoke / invalidate_for_task
+        / _mark_authorization_stale. Guarantees no request=stale/revoked/
+        expired can coexist with an active authorization.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT status FROM plan_approval_requests WHERE approval_request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                return ApprovalTransitionResult.NOT_FOUND
+            current = PlanApprovalStatus(row["status"])
+            if current == target_status:
+                # Still revoke any stray active authorizations (idempotent).
+                self._conn.execute(
+                    "UPDATE plan_execution_authorizations SET status = ? "
+                    "WHERE approval_request_id = ? AND status = ?",
+                    (AuthorizationStatus.REVOKED.value, request_id, AuthorizationStatus.ACTIVE.value),
+                )
+                if audit_event is not None:
+                    self._conn.execute(
+                        """
+                        INSERT INTO plan_approval_audit_events (
+                            event_id, event_type, approval_request_id, plan_id, previous_status,
+                            new_status, actor_id, actor_type, authenticated_source, timestamp,
+                            reason_code, task_id, workspace_id, repository_id, correlation_id
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            audit_event.event_id, audit_event.event_type,
+                            audit_event.approval_request_id, audit_event.plan_id,
+                            audit_event.previous_status, audit_event.new_status,
+                            audit_event.actor_id, audit_event.actor_type,
+                            audit_event.authenticated_source, float(audit_event.timestamp),
+                            audit_event.reason_code, audit_event.task_id,
+                            audit_event.workspace_id, audit_event.repository_id,
+                            audit_event.correlation_id,
+                        ),
+                    )
+                self._conn.commit()
+                return ApprovalTransitionResult.UNCHANGED
+            if current not in expected_statuses:
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+            allowed = ALLOWED_APPROVAL_TRANSITIONS.get(current, frozenset())
+            if target_status not in allowed:
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+            self._conn.execute(
+                "UPDATE plan_approval_requests SET status = ? WHERE approval_request_id = ?",
+                (target_status.value, request_id),
+            )
+            self._conn.execute(
+                "UPDATE plan_execution_authorizations SET status = ? "
+                "WHERE approval_request_id = ? AND status = ?",
+                (AuthorizationStatus.REVOKED.value, request_id, AuthorizationStatus.ACTIVE.value),
+            )
+            if audit_event is not None:
+                self._conn.execute(
+                    """
+                    INSERT INTO plan_approval_audit_events (
+                        event_id, event_type, approval_request_id, plan_id, previous_status,
+                        new_status, actor_id, actor_type, authenticated_source, timestamp,
+                        reason_code, task_id, workspace_id, repository_id, correlation_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        audit_event.event_id, audit_event.event_type,
+                        audit_event.approval_request_id, audit_event.plan_id,
+                        audit_event.previous_status, audit_event.new_status,
+                        audit_event.actor_id, audit_event.actor_type,
+                        audit_event.authenticated_source, float(audit_event.timestamp),
+                        audit_event.reason_code, audit_event.task_id,
+                        audit_event.workspace_id, audit_event.repository_id,
+                        audit_event.correlation_id,
+                    ),
+                )
+            self._conn.commit()
+            return ApprovalTransitionResult.UPDATED
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    # ------------------------------------------------------------------
+    # Execution leases (Batch 2.2 §7)
+    # ------------------------------------------------------------------
+
+    def acquire_lease(
+        self,
+        *,
+        lease_id: str,
+        task_id: str,
+        workspace_id: str,
+        repository_id: str,
+        plan_id: str,
+        head_sha: str,
+        repository_generation: int,
+        evidence_digest: str,
+        binding_digest: str,
+        authorization_id: str,
+        owner_execution_id: str,
+        expiry: float,
+        now: float | None = None,
+    ) -> bool:
+        """Atomically acquire an exclusive workspace execution lease.
+
+        The partial unique index ``uq_plan_execution_leases_active_workspace``
+        ensures at most one ACTIVE lease per workspace — a concurrent acquire
+        on the same workspace fails with IntegrityError.
+        """
+        now = time.time() if now is None else now
+        try:
+            self._conn.execute(
+                """
+                INSERT INTO plan_execution_leases (
+                    lease_id, task_id, workspace_id, repository_id, plan_id,
+                    head_sha, repository_generation, evidence_digest, binding_digest,
+                    authorization_id, expiry, owner_execution_id, status, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                """,
+                (
+                    lease_id, task_id, workspace_id, repository_id, plan_id,
+                    head_sha, int(repository_generation), evidence_digest, binding_digest,
+                    authorization_id, float(expiry), owner_execution_id, now,
+                ),
+            )
+            self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # Another ACTIVE lease already holds this workspace.
+            self._conn.rollback()
+            return False
+
+    def release_lease(self, lease_id: str) -> bool:
+        """Release (mark released) an execution lease."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_execution_leases SET status = 'released' "
+                "WHERE lease_id = ? AND status = 'active'",
+                (lease_id,),
+            )
+            ok = int(cur.rowcount or 0) > 0
+            self._conn.commit()
+            return ok
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_lease(self, lease_id: str) -> sqlite3.Row | None:
+        return self._conn.execute(
+            "SELECT * FROM plan_execution_leases WHERE lease_id = ?",
+            (lease_id,),
+        ).fetchone()
 
 
 def new_authorization_id() -> str:
