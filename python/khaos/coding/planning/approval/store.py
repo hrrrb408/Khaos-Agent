@@ -2016,6 +2016,7 @@ class PlanApprovalStore:
         task_id: str | None = None,
         workspace_id: str | None = None,
         owner_execution_id: str | None = None,
+        boot_id: str | None = None,
         reason: str = "execution-cancelled",
         now: float | None = None,
     ) -> int:
@@ -2029,9 +2030,14 @@ class PlanApprovalStore:
         This method does NOT touch the approval request status at all — it
         only expires the lease and revokes still-ACTIVE authorizations.
 
+        Batch 2.5 §7: when ``boot_id`` is supplied and all scope params are
+        None, cancels ALL active leases for that boot (used by
+        ``Runtime.shutdown``). When scope params are supplied, they filter
+        within the matching set (optionally also filtered by boot_id).
+
         ONE ``BEGIN IMMEDIATE``:
         1. Find matching ACTIVE leases (by task_id and/or workspace_id and/or
-           owner_execution_id).
+           owner_execution_id, and/or boot_id).
         2. Each matching lease → 'cancelled'.
         3. For each lease's authorization_id: if the authorization is still
            ACTIVE, revoke it. (CONSUMED authorizations stay CONSUMED.)
@@ -2040,7 +2046,8 @@ class PlanApprovalStore:
 
         Returns the count of invalidated leases.
         """
-        if task_id is None and workspace_id is None and owner_execution_id is None:
+        if (task_id is None and workspace_id is None
+                and owner_execution_id is None and boot_id is None):
             return 0
         now = time.time() if now is None else now
         if self._conn.in_transaction:
@@ -2059,6 +2066,9 @@ class PlanApprovalStore:
             if owner_execution_id is not None:
                 clauses.append("owner_execution_id = ?")
                 params.append(owner_execution_id)
+            if boot_id is not None:
+                clauses.append("boot_id = ?")
+                params.append(boot_id)
             where = " AND ".join(clauses)
             leases = self._conn.execute(
                 f"SELECT lease_id, task_id, workspace_id, repository_id, plan_id, "

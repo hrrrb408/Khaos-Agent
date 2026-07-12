@@ -53,7 +53,12 @@ class ApprovalRuntime:
         Batch 2.5 §1: this method self-wires the Broker → Receipt outbox
         channel. On failure, ``ready`` stays False and no half-bound broker
         state remains.
+
+        Batch 2.5 §7: ``initialize()`` can only succeed once per instance.
+        A second call on an already-ready runtime is explicitly refused.
         """
+        if self.ready:
+            raise RuntimeError("approval runtime is already initialized — call shutdown() first")
         try:
             # 1. Rotate epoch (generates fresh boot_id, revokes old auths/leases)
             epoch, boot_id, _ = self._store.rotate_epoch()
@@ -122,8 +127,10 @@ class ApprovalRuntime:
         operations refuse.
         """
         if self.ready:
-            # Cancel all ACTIVE leases before rotating the epoch.
-            self._store.invalidate_active_execution_scope(reason="runtime-shutdown")
+            # Cancel all ACTIVE leases for this boot before rotating the epoch.
+            self._store.invalidate_active_execution_scope(
+                boot_id=self.boot_context.boot_id, reason="runtime-shutdown",
+            )
             self._store.rotate_epoch()
             self.ready = False
             self.gate = None
