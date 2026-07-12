@@ -296,23 +296,21 @@ def broker_decide(
         capability=ApprovalAuthenticator.CAPABILITY_PLAN_APPROVAL,
     )
     bd = binding_digest if binding_digest is not None else request.binding_digest
-    writer = store._broker_receipt_writer()
-
-    def sink(**kw):
-        writer.write(**kw)
+    real_broker = broker._real if isinstance(broker, SyncBroker) else broker
+    store._bind_receipt_broker(real_broker)
 
     if isinstance(broker, SyncBroker):
         return broker.resolve_plan_approval(
             broker_request_id=request.broker_request_id,
             approved=approved, context=ctx, reason=reason,
-            binding_digest=bd, receipt_sink=sink,
+            binding_digest=bd, receipt_sink=None,
         )
     # Real async broker.
     return broker._loop.run_until_complete(  # type: ignore[attr-defined]
         broker.resolve_plan_approval(
             broker_request_id=request.broker_request_id,
             approved=approved, context=ctx, reason=reason,
-            binding_digest=bd, receipt_sink=sink,
+            binding_digest=bd, receipt_sink=None,
         )
     )
 

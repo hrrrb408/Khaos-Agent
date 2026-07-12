@@ -324,9 +324,11 @@ class PlanApprovalStore:
         # store callers cannot create receipt rows.
         self.__receipt_writer_capability = object()
 
-    def _broker_receipt_writer(self) -> _BrokerReceiptWriter:
-        """Internal broker wiring hook; never exported from the package."""
-        return _BrokerReceiptWriter(self, self.__receipt_writer_capability)
+    def _bind_receipt_broker(self, broker: Any) -> None:
+        """Inject the writer into the real broker without returning it."""
+        if broker.__class__.__module__ != "khaos.agent.approval" or broker.__class__.__name__ != "ApprovalBroker":
+            raise TypeError("receipt writer can only be bound to ApprovalBroker")
+        broker._receipt_writer = _BrokerReceiptWriter(self, self.__receipt_writer_capability)
 
     # ------------------------------------------------------------------
     # Schema bootstrap

@@ -229,7 +229,10 @@ def test_19_direct_store_receipt_write_rejected():
 def test_20_receipt_outbox_refuses_replace():
     """20. The same receipt_id or token_hash cannot be silently overwritten."""
     store = PlanApprovalStore(sqlite3.connect(":memory:"))
-    writer = store._broker_receipt_writer()
+    from khaos.agent.approval import ApprovalBroker
+    broker = ApprovalBroker()
+    store._bind_receipt_broker(broker)
+    writer = broker._receipt_writer
     writer.write(
         receipt_id="r1", token_hash="th1", approval_request_id="a",
         broker_request_id="b", binding_digest="bd", decision="approved",

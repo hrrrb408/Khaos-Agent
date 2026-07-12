@@ -61,6 +61,7 @@ class ApprovalBroker:
         # AuthenticatedApprovalContext signatures. If None, the broker
         # refuses all plan-approval decisions (fail closed).
         self._authenticator = authenticator
+        self._receipt_writer = None
 
     async def bind(self, tool_call_id: str, approval_key: str, expiry: float | None = None) -> None:
         """Bind a pending approval to an immutable ChangeSet operation."""
@@ -307,8 +308,9 @@ class ApprovalBroker:
         # Persist the receipt outbox row outside the broker lock. The sink
         # receives EVERY authoritative field so apply_authenticated_decision
         # can compare them all.
-        if receipt_sink is not None:
-            receipt_sink(
+        sink = receipt_sink or (self._receipt_writer.write if self._receipt_writer is not None else None)
+        if sink is not None:
+            sink(
                 receipt_id=receipt.receipt_id,
                 token_hash=receipt.token_hash,
                 approval_request_id=receipt.approval_request_id,
