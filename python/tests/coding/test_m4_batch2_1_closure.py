@@ -75,7 +75,7 @@ def test_02_forged_actor_rejected():
     request = service.request_approval(plan)
     # Caller cannot inject an actor_id into apply_broker_decision.
     receipt = broker_decide(broker=broker, store=store, request=request, approved=True, actor_id="legit-user")
-    updated = service.apply_broker_decision(receipt, current_plan=plan)
+    updated = service.apply_broker_decision(receipt)
     # The decision record's actor is the one the broker authenticated.
     decisions = store.list_decisions(request.approval_request_id)
     assert decisions[-1].actor_id == "legit-user"
@@ -83,41 +83,36 @@ def test_02_forged_actor_rejected():
 
 def test_03_unbrokered_decision_rejected():
     """3. A decision that never went through resolve_plan_approval is refused."""
+    from _m4_batch2_helpers import make_forged_receipt
+
     plan = make_plan(risks=(high_risk(),), plan_id="p_unbrokered")
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
-    # Construct a receipt whose token is NOT in the outbox.
-    forged = BrokerDecisionReceipt(
-        receipt_id="x", namespace="plan-execution",
+    forged = make_forged_receipt(
         broker_request_id=request.broker_request_id,
         approval_request_id=request.approval_request_id,
-        decision=PlanApprovalStatus.APPROVED,
-        authenticated_actor_id="u", authenticated_actor_type="user",
-        authenticated_source="s", binding_digest=request.binding_digest,
-        decided_at=0, expires_at=9999999999.0,
-        one_time_token="never-minted", token_hash="never-minted-hash", metadata={},
+        binding_digest=request.binding_digest,
+        one_time_token="never-minted",
     )
     with pytest.raises(UnauthenticatedReceiptError):
-        service.apply_broker_decision(forged, current_plan=plan)
+        service.apply_broker_decision(forged)
 
 
 def test_04_forged_receipt_rejected():
     """4. A forged dataclass receipt fails token-hash verification."""
+    from _m4_batch2_helpers import make_forged_receipt
+
     plan = make_plan(risks=(high_risk(),), plan_id="p_forge")
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
-    forged = BrokerDecisionReceipt(
-        receipt_id="forged", namespace="plan-execution",
+    forged = make_forged_receipt(
         broker_request_id=request.broker_request_id,
         approval_request_id=request.approval_request_id,
-        decision=PlanApprovalStatus.APPROVED,
-        authenticated_actor_id="rogue", authenticated_actor_type="agent",
-        authenticated_source="forged", binding_digest=request.binding_digest,
-        decided_at=0, expires_at=9999999999.0,
-        one_time_token="forged", token_hash="wrong", metadata={},
+        binding_digest=request.binding_digest,
+        one_time_token="forged",
     )
     with pytest.raises(UnauthenticatedReceiptError):
-        service.apply_broker_decision(forged, current_plan=plan)
+        service.apply_broker_decision(forged)
 
 
 def test_05_receipt_cross_request_replay_rejected():
@@ -131,7 +126,7 @@ def test_05_receipt_cross_request_replay_rejected():
     # Tamper: point receipt_a at req_b.
     tampered = replace(receipt_a, approval_request_id=req_b.approval_request_id)
     with pytest.raises(UnauthenticatedReceiptError):
-        service.apply_broker_decision(tampered, current_plan=plan_b)
+        service.apply_broker_decision(tampered)
 
 
 def test_06_receipt_duplicate_consume_rejected():
@@ -147,7 +142,7 @@ def test_06_receipt_duplicate_consume_rejected():
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
     receipt = broker_decide(broker=broker, store=store, request=request, approved=True)
-    service.apply_broker_decision(receipt, current_plan=plan)
+    service.apply_broker_decision(receipt)
     # The receipt is now consumed.
     row = store.get_receipt_by_token(receipt.one_time_token)
     assert int(row["consumed"]) == 1
@@ -163,7 +158,7 @@ def test_07_atomic_decision_commit():
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
     receipt = broker_decide(broker=broker, store=store, request=request, approved=True)
-    updated = service.apply_broker_decision(receipt, current_plan=plan)
+    updated = service.apply_broker_decision(receipt)
     assert updated.status is PlanApprovalStatus.APPROVED
     # All four artifacts exist together.
     assert store.list_decisions(request.approval_request_id)
@@ -194,7 +189,7 @@ def test_08_fault_injection_full_rollback():
     conn.execute("ALTER TABLE plan_approval_audit_events RENAME TO _audit_hidden")
     try:
         with pytest.raises(Exception):
-            service.apply_broker_decision(receipt, current_plan=plan)
+            service.apply_broker_decision(receipt)
     finally:
         conn.execute("ALTER TABLE _audit_hidden RENAME TO plan_approval_audit_events")
 
@@ -308,7 +303,7 @@ def test_13_revoke_mint_race(tmp_path):
         )
     )
     receipt = broker_decide(broker=broker0, store=store0, request=request, approved=True)
-    svc0.apply_broker_decision(receipt, current_plan=plan)
+    svc0.apply_broker_decision(receipt)
     conn0.close()
 
     barrier = threading.Barrier(2)
@@ -503,28 +498,30 @@ def test_21_workspace_cleanup_after_mint_refuses_consume():
 def test_22_forged_plan_does_not_affect_validation():
     """22. A caller cannot influence validation by passing a forged plan.
 
-    The gate resolves the plan by plan_id from the authoritative repository.
-    A forged plan object (even with a different content_hash) is irrelevant —
-    authorize_execution takes plan_id, not a plan object. The authoritative
-    snapshot registered at request time is what's validated.
+    The gate resolves the plan by plan_id from the AUTHORITATIVE persisted
+    repository. A forged plan object is irrelevant — authorize_execution
+    takes plan_id, not a plan object. The persisted repository REFUSES to
+    silently replace a snapshot with different content (Batch 2.2 §4), so a
+    caller cannot mutate the validated plan either.
     """
     plan = make_plan(risks=(low_risk(),), plan_id="p_authoritative")
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)  # registers authoritative snapshot
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
-    # The gate resolves by plan_id; there is no plan= parameter to forge.
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     assert auth.status is AuthorizationStatus.ACTIVE
-    # Even if the caller re-registers a MUTATED snapshot, the next consume
-    # validates the mutated snapshot's binding (which differs from the auth's).
+    # A mutated plan with a different content_hash CANNOT replace the
+    # authoritative snapshot (persisted repository refuses).
     mutated = replace(plan, content_hash="forged-hash")
-    repo.register(mutated)
-    with pytest.raises((AuthorizationMismatchError, PlanBlockedError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
-            expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
-            expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
-        )
+    replaced = repo.register(mutated)
+    assert replaced is False, "persisted repository must refuse silent content replacement"
+    # The original authorization still consumes cleanly (no drift — the
+    # authoritative snapshot is unchanged).
+    gate.require_authorization(
+        auth.authorization_id, auth.nonce,
+        expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
+        expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+    )
 
 
 # ===========================================================================
@@ -615,12 +612,13 @@ def test_27_restart_invalidates_old_authorizations(tmp_path):
     plan = make_plan(risks=(low_risk(),), plan_id="p_epoch")
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
-    gate = make_gate(store=store, context=ctx, plan_repository=repo, server_epoch=1)
+    gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     # Simulate restart: new gate with a rotated epoch.
-    gate2 = make_gate(store=store, context=ctx, plan_repository=repo, server_epoch=2)
+    gate2 = make_gate(store=store, context=ctx, plan_repository=repo)
     revoked = gate2.rotate_epoch()  # bulk-revoke epoch-1 authorizations
-    assert revoked >= 1
+    # rotate_epoch returns (new_epoch, new_boot_id, revoked_count)
+    assert revoked[2] >= 1
     # The old authorization can no longer be consumed.
     with pytest.raises((AuthorizationRevokedError, AuthorizationMismatchError)):
         gate2.require_authorization(
@@ -718,7 +716,7 @@ def test_30_real_sqlite_concurrent_approve_mint_consume(tmp_path):
             plan_repository=repo_local,
         )
         try:
-            service.apply_broker_decision(receipt, current_plan=plan)
+            service.apply_broker_decision(receipt)
             return "ok"
         except ApprovalConflictError:
             return "conflict"
@@ -779,12 +777,13 @@ def test_static_no_multiple_active_authorizations_per_request():
 
 
 def test_static_no_revoked_request_with_active_auth():
-    """§12: request=revoked + auth=active = 0 (revoke revokes authorizations)."""
+    """§12: request=revoked + auth=active = 0 (revoke uses the atomic
+    invalidate_request_and_authorizations which revokes auths in the same tx)."""
     from khaos.coding.planning.approval import PlanApprovalService
     import inspect
 
     src = inspect.getsource(PlanApprovalService.revoke)
-    assert "revoke_authorizations_for_request" in src
+    assert "invalidate_request_and_authorizations" in src
 
 
 def test_static_no_mint_after_consume():

@@ -129,7 +129,7 @@ def test_two_concurrent_approves_only_one_wins(tmp_path):
             policy=ApprovalPolicy(pending_ttl_seconds=3600, approved_ttl_seconds=3600),
         )
         try:
-            service.apply_broker_decision(receipt, current_plan=plan)
+            service.apply_broker_decision(receipt)
             return "ok"
         except ApprovalConflictError:
             return "conflict"
@@ -248,7 +248,7 @@ def test_task_cancel_races_with_authorize(tmp_path):
     )
     request = store0.get_request_by_broker(brid)
     receipt = broker_decide(broker=broker0, store=store0, request=request, approved=True)
-    service0.apply_broker_decision(receipt, current_plan=plan)
+    service0.apply_broker_decision(receipt)
     conn0.close()
 
     ctx = _Ctx()

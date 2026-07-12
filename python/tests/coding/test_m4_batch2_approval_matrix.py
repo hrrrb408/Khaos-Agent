@@ -260,7 +260,7 @@ def test_18_broker_reject_succeeds():
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
     receipt = broker_decide(broker=broker, store=store, request=request, approved=False)
-    updated = service.apply_broker_decision(receipt, current_plan=plan)
+    updated = service.apply_broker_decision(receipt)
     assert updated.status is PlanApprovalStatus.REJECTED
 
 
@@ -283,10 +283,10 @@ def test_20_duplicate_approve_is_idempotent():
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
     r1 = broker_decide(broker=broker, store=store, request=request, approved=True, actor_id="u1")
-    updated1 = service.apply_broker_decision(r1, current_plan=plan)
+    updated1 = service.apply_broker_decision(r1)
     # A second receipt for the same decision can be minted (idempotent) and applied.
     r2 = broker_decide(broker=broker, store=store, request=request, approved=True, actor_id="u1")
-    updated2 = service.apply_broker_decision(r2, current_plan=plan)
+    updated2 = service.apply_broker_decision(r2)
     assert updated1.status is PlanApprovalStatus.APPROVED
     assert updated2.status is PlanApprovalStatus.APPROVED
 
@@ -296,7 +296,7 @@ def test_22_approve_then_reject_conflicts():
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
     r1 = broker_decide(broker=broker, store=store, request=request, approved=True, actor_id="u1")
-    service.apply_broker_decision(r1, current_plan=plan)
+    service.apply_broker_decision(r1)
     # Broker refuses to mint a reject receipt after an approve (conflict).
     r2 = broker_decide(broker=broker, store=store, request=request, approved=False, actor_id="u2")
     assert r2 is None  # broker returns None on conflicting decision
@@ -307,22 +307,27 @@ def test_23_reject_then_approve_conflicts():
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
     r1 = broker_decide(broker=broker, store=store, request=request, approved=False, actor_id="u1")
-    service.apply_broker_decision(r1, current_plan=plan)
+    service.apply_broker_decision(r1)
     r2 = broker_decide(broker=broker, store=store, request=request, approved=True, actor_id="u2")
     assert r2 is None
 
 
 def test_24_plan_content_hash_change_stales_decision():
+    """Batch 2.2: the authoritative plan is resolved from the persisted
+    repository by plan_id. A caller cannot influence validation by
+    constructing a drifted plan — the repository's snapshot is what's
+    validated. We verify the persisted snapshot cannot be silently replaced
+    with different content (register returns False)."""
     plan = make_plan(risks=(high_risk(),), plan_id="plan_drift1")
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
     r1 = broker_decide(broker=broker, store=store, request=request, approved=True, actor_id="u1")
-    service.apply_broker_decision(r1, current_plan=plan)
-    # A re-approval attempt with a drifted plan (different content_hash) stales.
+    service.apply_broker_decision(r1)
+    # A drifted plan with a different content_hash cannot replace the
+    # authoritative snapshot (persisted repository refuses silent overwrite).
     drifted = replace(plan, content_hash="changed_hash")
-    r2 = broker_decide(broker=broker, store=store, request=request, approved=True, actor_id="u1")
-    with pytest.raises(PlanStaleError):
-        service.apply_broker_decision(r2, current_plan=drifted)
+    replaced = repo.register(drifted)
+    assert replaced is False, "persisted repository must refuse silent content replacement"
 
 
 def test_25_risk_increase_invalidates_binding():
@@ -665,44 +670,36 @@ def test_54_no_direct_bool_approve_entry():
 
 def test_55_forged_receipt_rejected():
     """A dataclass receipt with a forged token cannot pass validation."""
-    from khaos.coding.planning.approval import BrokerDecisionReceipt
+    from _m4_batch2_helpers import make_forged_receipt
 
     plan = make_plan(risks=(high_risk(),), plan_id="plan_forge_receipt")
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
-    forged = BrokerDecisionReceipt(
-        receipt_id="forged", namespace="plan-execution",
+    forged = make_forged_receipt(
         broker_request_id=request.broker_request_id,
         approval_request_id=request.approval_request_id,
-        decision=PlanApprovalStatus.APPROVED,
-        authenticated_actor_id="rogue", authenticated_actor_type="agent",
-        authenticated_source="forged", binding_digest=request.binding_digest,
-        decided_at=0, expires_at=9999999999.0,
-        one_time_token="forged-token", token_hash="forged-hash", metadata={},
+        binding_digest=request.binding_digest,
     )
     with pytest.raises(UnauthenticatedReceiptError):
-        service.apply_broker_decision(forged, current_plan=plan)
+        service.apply_broker_decision(forged)
 
 
 def test_56_unauthenticated_namespace_rejected():
     """A receipt with the wrong namespace is refused."""
-    from khaos.coding.planning.approval import BrokerDecisionReceipt
+    from _m4_batch2_helpers import make_forged_receipt
+    from dataclasses import replace
 
     plan = make_plan(risks=(high_risk(),), plan_id="plan_ns")
     service, store, ctx, broker, repo = make_service()
     request = service.request_approval(plan)
-    wrong_ns = BrokerDecisionReceipt(
-        receipt_id="x", namespace="task",  # wrong namespace
+    receipt = make_forged_receipt(
         broker_request_id=request.broker_request_id,
         approval_request_id=request.approval_request_id,
-        decision=PlanApprovalStatus.APPROVED,
-        authenticated_actor_id="u", authenticated_actor_type="user",
-        authenticated_source="s", binding_digest=request.binding_digest,
-        decided_at=0, expires_at=9999999999.0,
-        one_time_token="t", token_hash="h", metadata={},
+        binding_digest=request.binding_digest,
     )
+    wrong_ns = replace(receipt, namespace="task")  # wrong namespace
     with pytest.raises(UnauthenticatedReceiptError, match="namespace"):
-        service.apply_broker_decision(wrong_ns, current_plan=plan)
+        service.apply_broker_decision(wrong_ns)
 
 
 # ===========================================================================

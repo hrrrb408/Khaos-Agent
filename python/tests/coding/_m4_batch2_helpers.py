@@ -18,6 +18,7 @@ from khaos.coding.planning.approval import (
     ContextProvider,
     CurrentRepositoryState,
     GatePolicy,
+    PersistedPlanRepository,
     PlanApprovalService,
     PlanApprovalStatus,
     PlanApprovalStore,
@@ -188,15 +189,13 @@ class SyncBroker:
         )
 
     def resolve_plan_approval(
-        self, *, broker_request_id, approved, actor_id, actor_type="user",
-        authenticated_source="broker", reason="", binding_digest="",
+        self, *, broker_request_id, approved, context, reason="", binding_digest="",
         receipt_sink=None, clock=None,
     ):
         return self._loop.run_until_complete(
             self._real.resolve_plan_approval(
                 broker_request_id=broker_request_id, approved=approved,
-                actor_id=actor_id, actor_type=actor_type,
-                authenticated_source=authenticated_source, reason=reason,
+                context=context, reason=reason,
                 binding_digest=binding_digest, receipt_sink=receipt_sink, clock=clock,
             )
         )
@@ -225,7 +224,9 @@ def make_service(
     if broker is None:
         broker = SyncBroker()
     if plan_repository is None:
-        plan_repository = PlanSnapshotStore()
+        # Batch 2.2: default to the persisted repository so plan snapshots
+        # survive restart and tests don't need manual repo.register(plan).
+        plan_repository = PersistedPlanRepository(store)
     service = PlanApprovalService(
         store=store, broker=broker, context_provider=context,
         plan_repository=plan_repository, planning_service=None,
@@ -234,12 +235,11 @@ def make_service(
     return service, store, context, broker, plan_repository
 
 
-def make_gate(*, store, context, plan_repository=None, policy=None, clock=None, server_epoch=1):
+def make_gate(*, store, context, plan_repository=None, policy=None, clock=None):
     return PlanExecutionGate(
         store=store, context_provider=context,
         plan_repository=plan_repository or PlanSnapshotStore(),
         policy=policy, clock=clock or __import__("time").time,
-        server_epoch=server_epoch,
     )
 
 
@@ -260,15 +260,29 @@ def broker_decide(
     approved: bool,
     actor_id: str = "user1",
     actor_type: str = "user",
+    authenticated_source: str = "api",
+    session_request_id: str = "sess_test",
+    server_capability: str = "approve-plan-execution",
     binding_digest: str | None = None,
+    reason: str = "",
 ) -> BrokerDecisionReceipt | None:
     """Drive the real broker to resolve a decision and persist its receipt.
 
-    Returns the minted :class:`BrokerDecisionReceipt`, or ``None`` if the
-    broker refused (unknown/expired/conflict). The receipt's one-time token
-    hash is durably persisted into the ``plan_approval_receipts`` outbox so
-    :meth:`PlanApprovalService.apply_broker_decision` can verify it.
+    Builds an :class:`AuthenticatedApprovalContext` (the ONLY sanctioned
+    carrier of actor identity) and passes it to the broker. Returns the
+    minted :class:`BrokerDecisionReceipt`, or ``None`` if the broker refused.
     """
+    from khaos.coding.planning.approval.models import AuthenticatedApprovalContext
+
+    import time as _time
+
+    ctx = AuthenticatedApprovalContext(
+        actor_id=actor_id, actor_type=actor_type,
+        session_request_id=session_request_id,
+        authenticated_source=authenticated_source,
+        authentication_time=_time.time(),
+        server_capability=server_capability,
+    )
     bd = binding_digest if binding_digest is not None else request.binding_digest
 
     def sink(**kw):
@@ -277,14 +291,14 @@ def broker_decide(
     if isinstance(broker, SyncBroker):
         return broker.resolve_plan_approval(
             broker_request_id=request.broker_request_id,
-            approved=approved, actor_id=actor_id, actor_type=actor_type,
+            approved=approved, context=ctx, reason=reason,
             binding_digest=bd, receipt_sink=sink,
         )
     # Real async broker.
     return broker._loop.run_until_complete(  # type: ignore[attr-defined]
         broker.resolve_plan_approval(
             broker_request_id=request.broker_request_id,
-            approved=approved, actor_id=actor_id, actor_type=actor_type,
+            approved=approved, context=ctx, reason=reason,
             binding_digest=bd, receipt_sink=sink,
         )
     )
@@ -296,12 +310,67 @@ def approve_and_apply(
     broker,
     store: PlanApprovalStore,
     request,
-    plan,
+    plan=None,  # retained for call-site compat; no longer passed to apply_broker_decision
     actor_id: str = "user1",
 ):
-    """Convenience: broker-approve then apply the receipt. Returns the request."""
+    """Convenience: broker-approve then apply the receipt. Returns the request.
+
+    Batch 2.2: ``plan`` is no longer passed to ``apply_broker_decision`` —
+    the service resolves the authoritative plan from the persisted repository.
+    """
     receipt = broker_decide(
         broker=broker, store=store, request=request, approved=True, actor_id=actor_id,
     )
     assert receipt is not None, "broker refused to mint a receipt"
-    return service.apply_broker_decision(receipt, current_plan=plan)
+    return service.apply_broker_decision(receipt)
+
+
+def make_forged_receipt(
+    *,
+    broker_request_id,
+    approval_request_id,
+    binding_digest,
+    decision="approved",
+    actor_id="rogue",
+    actor_type="agent",
+    authenticated_source="forged",
+    session_request_id="forged-sess",
+    server_capability="forged-cap",
+    reason_digest="forged-reason-digest",
+    decided_at=0.0,
+    expires_at=9999999999.0,
+    one_time_token="forged-token",
+    token_hash="forged-hash",
+):
+    """Build a forged BrokerDecisionReceipt with ALL required fields.
+
+    Used by tests that verify a forged dataclass receipt (whose token is NOT
+    in the outbox) is rejected. The receipt is structurally valid but its
+    one_time_token has no matching outbox row.
+    """
+    from dataclasses import replace as _replace
+
+    from khaos.coding.planning.approval.models import (
+        BrokerDecisionReceipt,
+        PlanApprovalStatus,
+    )
+
+    return BrokerDecisionReceipt(
+        receipt_id="forged",
+        namespace="plan-execution",
+        broker_request_id=broker_request_id,
+        approval_request_id=approval_request_id,
+        decision=PlanApprovalStatus.APPROVED if decision == "approved" else PlanApprovalStatus.REJECTED,
+        authenticated_actor_id=actor_id,
+        authenticated_actor_type=actor_type,
+        authenticated_source=authenticated_source,
+        session_request_id=session_request_id,
+        server_capability=server_capability,
+        binding_digest=binding_digest,
+        decided_at=decided_at,
+        expires_at=expires_at,
+        reason_digest=reason_digest,
+        one_time_token=one_time_token,
+        token_hash=token_hash,
+        metadata={},
+    )
