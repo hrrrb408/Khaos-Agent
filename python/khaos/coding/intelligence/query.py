@@ -21,6 +21,7 @@ from khaos.coding.intelligence.resolution.persistence import (
     resolved_imports_for_file,
     symbol_targets,
     unresolved_candidates_for_file,
+    reverse_dependency_files,
 )
 
 
@@ -83,6 +84,17 @@ class CodeQueryService:
     def dependency_files(self, project_id: str, path: str) -> list[str]:
         """Get files that this file depends on (via resolved edges)."""
         return _dependency_files(self.store._conn, project_id, path)
+
+    def reverse_dependency_files(self, project_id: str, path: str) -> list[str]:
+        """Return stable reverse import/call/reference dependencies."""
+        return reverse_dependency_files(self.store._conn, project_id, path)
+
+    def symbol_by_stable_id(self, project_id: str, stable_symbol_id: str) -> dict[str, Any] | None:
+        row = self.store._conn.execute(
+            "SELECT * FROM repository_symbols WHERE repository_id=? AND stable_symbol_id=?",
+            (project_id, stable_symbol_id),
+        ).fetchone()
+        return dict(row) if row else None
 
     def call_edges_for_file(self, project_id: str, path: str) -> list[dict[str, Any]]:
         """Get all call edges for a file."""

@@ -8,6 +8,8 @@ from typing import Any
 from khaos.coding.intelligence.query import CodeQueryService
 from khaos.coding.planning.contracts import *  # noqa: F403
 from khaos.coding.planning.dag import validate_steps
+from khaos.coding.planning.risk import RiskEvaluator
+from khaos.coding.planning.verification import TrustedVerificationSelector
 
 MAX_GOAL_LENGTH = 4096
 
@@ -41,8 +43,9 @@ class ResolvedGoalTarget:
 
 class DeterministicPlanningService:
     """No tools, shell, writes, ChangeSets, or approval transitions are exposed here."""
-    def __init__(self, query: CodeQueryService, *, repositories: dict[str, dict[str, Any]]) -> None:
+    def __init__(self, query: CodeQueryService, *, repositories: dict[str, dict[str, Any]], max_depth: int = 3, max_nodes: int = 200, max_files: int = 100, max_symbols: int = 100) -> None:
         self._query, self._repositories = query, repositories
+        self._limits=(max_depth,max_nodes,max_files,max_symbols); self._verification_selector=TrustedVerificationSelector(); self._risk_evaluator=RiskEvaluator()
 
     def classify_goal(self, *, repository_id: str, user_goal: str) -> GoalIntentResult:
         """Classify only explicit wording; it never guesses a target."""
@@ -51,9 +54,10 @@ class DeterministicPlanningService:
         parsed = resolved.parsed
         return GoalIntentResult(raw_goal, (resolved.action.intent,), (GoalTarget(parsed.raw_token, parsed.explicit_kind, parsed.requested_symbol, parsed.requested_path, self._language(parsed.requested_path or ""), resolved.action.operation.value, resolved.status, (resolved.selected_file,) if resolved.selected_file else (), tuple(x.get("stable_symbol_id", "") for x in resolved.symbol_candidates), resolved.evidence, resolved.diagnostics),), 1.0 if resolved.status == "resolved" else 0.0, resolved.diagnostics)
 
-    def analyze_impacts(self, *, repository_id: str, target_symbols: tuple[str, ...], max_depth: int = 3, max_nodes: int = 200, max_files: int = 100) -> ImpactAnalysis:
+    def analyze_impacts(self, *, repository_id: str, target_symbols: tuple[str, ...], target_files: tuple[str, ...] = (), max_depth: int | None = None, max_nodes: int | None = None, max_files: int | None = None, max_symbols: int | None = None) -> ImpactAnalysis:
         """Cycle-safe reverse call/reference traversal over persisted resolution edges."""
-        queue = [(sid, 0) for sid in sorted(target_symbols)]; seen: set[str] = set(); direct=[]; indirect=[]; dynamic=[]; diagnostics=[]; files=set(); truncated=False
+        max_depth=max_depth if max_depth is not None else self._limits[0]; max_nodes=max_nodes if max_nodes is not None else self._limits[1]; max_files=max_files if max_files is not None else self._limits[2]; max_symbols=max_symbols if max_symbols is not None else self._limits[3]
+        queue = [(sid, 0) for sid in sorted(target_symbols)]; seen: set[str] = set(); direct=[]; indirect=[]; dynamic=[]; external=[]; excluded=[]; diagnostics=[]; files=set(target_files); truncated=False
         while queue:
             sid, depth = queue.pop(0)
             if sid in seen: continue
@@ -67,11 +71,29 @@ class DeterministicPlanningService:
                 (direct if depth==0 else indirect).append(item)
                 caller=edge.get("caller_symbol_id")
                 if caller: queue.append((caller, depth+1))
-                if len(files) > max_files: truncated=True; break
+                if len(files) > max_files or len(seen) > max_symbols: truncated=True; break
             if truncated: break
+        for target_file in sorted(target_files or tuple({item.get("path", "") for sid in target_symbols for item in [self._query.symbol_by_stable_id(repository_id, sid) or {}] if item})):
+            for source in self._query.reverse_dependency_files(repository_id, target_file):
+                if source in files and any(item.source_file == source for item in direct + indirect): continue
+                record=self._query.file_evidence(repository_id, source) or {}; ev=PlanEvidence("resolution-graph",repository_id,source,generation=record.get("generation"),content_hash=record.get("content_hash"),query=target_file,confidence=.9)
+                relation="re-export" if source.endswith(("__init__.py","index.js","index.ts")) else "reverse-import"
+                direct.append(ImpactEdge(source,None,target_file,None,relation,1,ImpactStatus.DIRECT,.9,"resolved reverse dependency",(ev,))); files.add(source)
+            for item in self._query.unresolved_candidates(repository_id, target_file):
+                status=str(item.get("status","unresolved")); impact_status=ImpactStatus.DYNAMIC if status == "dynamic" else ImpactStatus.EXTERNAL if status == "external" else ImpactStatus.AMBIGUOUS if status == "ambiguous" else ImpactStatus.POSSIBLE
+                ev=PlanEvidence("resolution-graph",repository_id,target_file,query=str(item.get("callee") or item.get("name") or item.get("import_module") or ""),confidence=.3)
+                edge=ImpactEdge(target_file,None,"",None,item.get("edge_type","unknown"),1,impact_status,.3,status,(ev,))
+                (external if impact_status is ImpactStatus.EXTERNAL else dynamic).append(edge)
+            stem=target_file.rsplit(".",1)[0].split("/")[-1]
+            for row in self._query.store._conn.execute("SELECT path FROM code_files WHERE project_id=? ORDER BY path",(repository_id,)).fetchall():
+                candidate=str(row[0]); lower=candidate.casefold()
+                if candidate != target_file and stem.casefold() in lower and ("test" in lower or "spec" in lower):
+                    record=self._query.file_evidence(repository_id,candidate) or {}; ev=PlanEvidence("test-layout-rule",repository_id,candidate,generation=record.get("generation"),content_hash=record.get("content_hash"),query=target_file,confidence=.55)
+                    dynamic.append(ImpactEdge(candidate,None,target_file,None,"associated-test",1,ImpactStatus.POSSIBLE,.55,"server test-layout heuristic",(ev,)))
         if truncated: diagnostics.append(PlanDiagnostic("impact-truncated", "warning", "fixed graph traversal limit reached", True))
-        digest=ImplementationPlan.digest({"targets":sorted(target_symbols),"direct":[asdict(x) for x in direct],"indirect":[asdict(x) for x in indirect],"truncated":truncated})
-        return ImpactAnalysis((), tuple(sorted(target_symbols)), tuple(direct), tuple(indirect), (), tuple(dynamic), (), tuple(diagnostics), max((x.depth for x in direct+indirect), default=0), truncated, digest)
+        direct=sorted(direct,key=lambda x:(x.depth,x.source_file,x.relation,x.source_symbol or "")); indirect=sorted(indirect,key=lambda x:(x.depth,x.source_file,x.relation,x.source_symbol or "")); dynamic=sorted(dynamic,key=lambda x:(x.source_file,x.relation,x.reason)); external=sorted(external,key=lambda x:(x.source_file,x.relation))
+        digest=ImplementationPlan.digest({"target_files":sorted(target_files),"targets":sorted(target_symbols),"direct":[asdict(x) for x in direct],"indirect":[asdict(x) for x in indirect],"dynamic":[asdict(x) for x in dynamic],"external":[asdict(x) for x in external],"truncated":truncated})
+        return ImpactAnalysis(tuple(sorted(target_files)), tuple(sorted(target_symbols)), tuple(direct), tuple(indirect), tuple(external), tuple(dynamic), tuple(excluded), tuple(diagnostics), max((x.depth for x in direct+indirect), default=0), truncated, digest, len(seen), len(files), len(seen))
 
     def plan(self, *, repository_id: str, task_id: str, workspace_id: str, user_goal: str, base_sha: str) -> ImplementationPlan:
         raw_goal = " ".join(user_goal.split())
@@ -96,26 +118,36 @@ class DeterministicPlanningService:
         if resolved.selected_file and file_record and operation is not PlanOperation.CREATE:
             path = resolved.selected_file
             ev = PlanEvidence("index-store", repository_id, path, generation=file_record["generation"], content_hash=file_record["content_hash"], query=token, confidence=1.0)
-            evidence.append(ev); files.append(AffectedFile(path, operation, "indexed file target", 1.0, True, file_record["language"], (ev,)))
+            evidence.append(ev); files.append(AffectedFile(path, operation, "indexed file target", 1.0, True, file_record["language"], (ev,), path if operation is PlanOperation.RENAME else None, parsed.requested_destination if operation is PlanOperation.RENAME else None))
         elif resolved.status == "resolved" and operation == PlanOperation.CREATE and parsed.requested_path:
             ev = PlanEvidence("goal", repository_id, path=parsed.requested_path, query=token, confidence=.5)
             evidence.append(ev); files.append(AffectedFile(parsed.requested_path, operation, "explicit new file target", .5, False, self._language(parsed.requested_path), (ev,)))
         elif resolved.selected_symbol:
             item = resolved.selected_symbol; path = item["path"]; sid = item.get("stable_symbol_id")
             record = self._query.file_evidence(repository_id, path) or {}
-            ev = PlanEvidence("resolution-graph", repository_id, path, sid, record.get("generation", item.get("generation")), record.get("content_hash"), token, 1.0, {"kind": item.get("kind")})
-            evidence.append(ev); symbols.append(AffectedSymbol(sid, item.get("qualified_name", item["name"]), item["kind"], path, operation.value, 1.0, (ev,)))
+            ev = PlanEvidence("resolution-graph", repository_id, path, sid, record.get("generation", item.get("generation")), record.get("content_hash"), token, 1.0, {"kind": item.get("kind"),"qualified_name":item.get("qualified_name")})
+            evidence.append(ev); symbols.append(AffectedSymbol(sid, item.get("qualified_name", item["name"]), item["kind"], path, operation.value, 1.0, (ev,), parsed.requested_destination if operation is PlanOperation.RENAME else None))
             files.append(AffectedFile(path, operation, "unique symbol match", 1.0, True, item.get("language"), (ev,)))
-            for edge in self._query.callers_of(repository_id, sid) if sid else ():
-                impacts.append(DependencyImpact(edge["source_file"], path, "calls", edge["status"], edge["confidence"], "direct caller of public symbol"))
-        for item in self._query.unresolved_candidates(repository_id, files[0].path) if files else []:
-            diagnostics.append(PlanDiagnostic("dynamic-or-unresolved-call", "warning", item["status"], True))
-        risks = self._risks(operation, files, symbols, raw_goal.casefold())
-        requirements = self._verification(repo, files, evidence)
+        impact=self.analyze_impacts(repository_id=repository_id,target_symbols=tuple(s.stable_symbol_id for s in symbols if s.stable_symbol_id),target_files=tuple(f.path for f in files if f.exists)) if files else ImpactAnalysis((),(),(),(),(),(),(),(),0,False,ImplementationPlan.digest({}))
+        diagnostics.extend(impact.diagnostics)
+        known_paths={f.path for f in files}
+        for edge in impact.direct_impacts + impact.indirect_impacts:
+            impacts.append(DependencyImpact(edge.source_file,edge.target_file,edge.relation,edge.status.value,edge.confidence,edge.reason))
+            if edge.status in (ImpactStatus.DIRECT,ImpactStatus.INDIRECT) and edge.source_file and edge.source_file not in known_paths:
+                record=self._query.file_evidence(repository_id,edge.source_file)
+                if record:
+                    files.append(AffectedFile(edge.source_file,PlanOperation.MODIFY,edge.reason,edge.confidence,True,record["language"],edge.evidence)); known_paths.add(edge.source_file); evidence.extend(edge.evidence)
+        public=bool(symbols and symbols[0].kind in {"class","interface","struct","enum"}) or bool(symbols and not symbols[0].qualified_name.split(".")[-1].startswith("_"))
+        has_tests=any(edge.relation == "associated-test" for edge in impact.dynamic_impacts) or any("test" in f.path.casefold() for f in files)
+        risk=self._risk_evaluator.evaluate(operation,raw_goal,impact,public=public,has_tests=has_tests,paths=tuple(sorted(f.path for f in files)))
+        risks=(risk,)
+        languages={f.language for f in files if f.language}; repo_metadata=dict(repo); repo_metadata["repository_id"]=repository_id
+        requirements=self._verification_selector.select(repo_metadata,languages,tuple(evidence),security=resolved.action.intent is GoalIntent.SECURITY_CHANGE,schema=resolved.action.intent is GoalIntent.SCHEMA_CHANGE)
         status = PlanStatus.READY if resolved.status == "resolved" and files and not any(d.severity == "error" for d in diagnostics) else PlanStatus.BLOCKED
-        step = self._steps(operation, raw_goal, files, symbols, requirements, risks[0], evidence, status)
+        step = self._steps(operation, raw_goal, files, symbols, requirements, risks[0], evidence, status, impact)
         diagnostics.extend(validate_steps(step))
         if any(d.severity == "error" for d in diagnostics): status = PlanStatus.BLOCKED
+        diagnostics.append(PlanDiagnostic("impact-summary","info",f"visited_nodes={impact.visited_nodes};visited_files={impact.visited_files};visited_symbols={impact.visited_symbols};impact_hash={impact.content_hash}",True))
         return self._build(repository_id, task_id, workspace_id, user_goal, normalized, base_sha, int(repo["generation"]), status, step, files, symbols, impacts, requirements, risks, diagnostics, evidence)
 
     def validate_plan(self, plan: ImplementationPlan, *, current_head: str, current_repository_generation: int) -> PlanValidationResult:
@@ -126,7 +158,12 @@ class DeterministicPlanningService:
             if ev.path and ev.content_hash:
                 record = self._query.file_evidence(plan.repository_id, ev.path)
                 if not record or record["content_hash"] != ev.content_hash: issues.append(PlanDiagnostic("evidence-drift", "error", f"evidence changed: {ev.path}", False, (ev,)))
-            if ev.symbol_id and not self._query.find_symbol_targets(plan.repository_id, ev.query): issues.append(PlanDiagnostic("symbol-drift", "error", "symbol removed or moved", False, (ev,)))
+            if ev.symbol_id and ev.metadata.get("qualified_name"):
+                current=self._query.symbol_by_stable_id(plan.repository_id,ev.symbol_id); expected=ev.metadata
+                if not current or current.get("path") != ev.path or current.get("qualified_name") != expected.get("qualified_name") or current.get("kind") != expected.get("kind") or int(current.get("generation",-1)) != ev.generation:
+                    issues.append(PlanDiagnostic("symbol-drift", "error", "exact symbol evidence changed", False, (ev,)))
+        for affected in plan.affected_files:
+            if affected.destination_path and self._query.file_evidence(plan.repository_id,affected.destination_path): issues.append(PlanDiagnostic("destination-drift","error",affected.destination_path,False,affected.evidence))
         return PlanValidationResult(not issues, PlanStatus.READY if not issues else PlanStatus.STALE, tuple(issues))
 
     def _build(self, repository_id, task_id, workspace_id, goal, normalized, sha, generation, status, steps, files, symbols, impacts, requirements, risks, diagnostics, evidence=()):
@@ -228,7 +265,12 @@ class DeterministicPlanningService:
             else: diagnostics.append(PlanDiagnostic("target-not-found", "warning", parsed.raw_token or "target", True))
         if action.operation is PlanOperation.RENAME and not parsed.requested_destination:
             diagnostics.append(PlanDiagnostic("missing-destination", "warning", parsed.raw_token, True))
-        blocking = {"ambiguous-target", "ambiguous-symbol", "kind-mismatch", "target-not-found", "missing-destination", "unsafe-path", "target-already-exists"}
+        if action.operation is PlanOperation.RENAME and parsed.requested_destination:
+            if parsed.requested_destination == parsed.requested_path:
+                diagnostics.append(PlanDiagnostic("same-destination", "error", parsed.requested_destination, False))
+            elif self._query.file_evidence(repository_id, parsed.requested_destination):
+                diagnostics.append(PlanDiagnostic("destination-exists", "error", parsed.requested_destination, False))
+        blocking = {"ambiguous-target", "ambiguous-symbol", "kind-mismatch", "target-not-found", "missing-destination", "unsafe-path", "target-already-exists", "same-destination", "destination-exists"}
         status = "resolved" if (selected_file or selected_symbol) and not any(item.code in blocking for item in diagnostics) else "rejected" if any(item.code == "unsafe-path" for item in diagnostics) else "ambiguous" if any(item.code.startswith("ambiguous") for item in diagnostics) else "unresolved"
         evidence: list[PlanEvidence] = []
         if selected_symbol: evidence.append(self._symbol_evidence(repository_id, parsed.raw_token, selected_symbol))
@@ -238,16 +280,21 @@ class DeterministicPlanningService:
 
     def _symbol_evidence(self, repository_id: str, query: str, item: dict[str, Any]) -> PlanEvidence:
         record = self._query.file_evidence(repository_id, item["path"]) or {}
-        return PlanEvidence("resolution-graph", repository_id, item["path"], item.get("stable_symbol_id"), record.get("generation", item.get("generation")), record.get("content_hash"), query, 1.0, {"kind": item.get("kind")})
+        return PlanEvidence("resolution-graph", repository_id, item["path"], item.get("stable_symbol_id"), record.get("generation", item.get("generation")), record.get("content_hash"), query, 1.0, {"kind": item.get("kind"),"qualified_name":item.get("qualified_name")})
     @staticmethod
-    def _steps(operation, goal, files, symbols, requirements, risk, evidence, status):
+    def _steps(operation, goal, files, symbols, requirements, risk, evidence, status, impact):
         if not files: return ()
         targets=tuple(f.path for f in files); symbols=tuple(s.stable_symbol_id for s in symbols if s.stable_symbol_id)
         inspect=PlanStep("inspect-1", "Inspect evidence", "confirm indexed target and assumptions", PlanOperation.INSPECT, targets, symbols, (), "confirmed scope", (), risk, risk.requires_approval, tuple(evidence))
         if status != PlanStatus.READY or operation is PlanOperation.INSPECT: return (inspect,)
-        primary=PlanStep("modify-1", "Apply planned source update", goal, operation, targets, symbols, ("inspect-1",), "source update prepared", (), risk, risk.requires_approval, tuple(evidence))
-        tests=PlanStep("verify-1", "Verify affected scope", "run trusted verification later", PlanOperation.TEST, targets, (), ("modify-1",), "verification requirements satisfied", tuple(requirements), risk, risk.requires_approval, tuple(evidence))
-        return (inspect, primary, tests)
+        primary_targets=tuple(f.path for f in files if f.operation is operation) or (targets[0],)
+        primary=PlanStep("modify-1", "Apply planned source update", goal, operation, primary_targets, symbols, ("inspect-1",), "source update prepared", (), risk, risk.requires_approval, tuple(evidence))
+        steps=[inspect,primary]
+        dependent=tuple(sorted(f.path for f in files if f.path not in primary_targets and "test" not in f.path.casefold()))
+        if dependent: steps.append(PlanStep("dependent-1","Update resolved dependents","update direct and indirect resolved dependents",PlanOperation.MODIFY,dependent,(),("modify-1",),"dependents remain compatible",(),risk,risk.requires_approval,tuple(evidence)))
+        modification_ids=tuple(step.step_id for step in steps if step.operation is not PlanOperation.INSPECT)
+        steps.append(PlanStep("verify-1", "Verify affected scope", "run trusted verification later", PlanOperation.TEST, targets, (), modification_ids or ("modify-1",), "verification requirements satisfied", tuple(requirements), risk, risk.requires_approval, tuple(evidence)))
+        return tuple(steps)
     @staticmethod
     def _language(path):
         return {"py":"python", "js":"javascript", "ts":"typescript", "tsx":"typescript", "go":"go", "rs":"rust"}.get(path.rsplit(".", 1)[-1]) if "." in path else None

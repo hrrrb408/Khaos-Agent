@@ -39,6 +39,7 @@ class ImpactEdge:
 @dataclass(frozen=True)
 class ImpactAnalysis:
     target_files: tuple[str, ...]; target_symbols: tuple[str, ...]; direct_impacts: tuple[ImpactEdge, ...]; indirect_impacts: tuple[ImpactEdge, ...]; external_impacts: tuple[ImpactEdge, ...]; dynamic_impacts: tuple[ImpactEdge, ...]; excluded_impacts: tuple[ImpactEdge, ...]; diagnostics: tuple[PlanDiagnostic, ...]; traversal_depth: int; truncated: bool; content_hash: str
+    visited_nodes: int = 0; visited_files: int = 0; visited_symbols: int = 0
 
 
 @dataclass(frozen=True)
@@ -51,11 +52,13 @@ class PlanEvidence:
 class AffectedFile:
     path: str; operation: PlanOperation; reason: str; confidence: float; exists: bool
     language: str | None; evidence: tuple[PlanEvidence, ...]
+    source_path: str | None = None; destination_path: str | None = None
 
 @dataclass(frozen=True)
 class AffectedSymbol:
     stable_symbol_id: str | None; qualified_name: str; kind: str; path: str
     impact_type: str; confidence: float; evidence: tuple[PlanEvidence, ...]
+    requested_new_name: str | None = None
 
 @dataclass(frozen=True)
 class DependencyImpact:
