@@ -29,6 +29,7 @@ class WorkspaceTransition(str, Enum):
     UPDATED = "updated"
     NOT_FOUND = "not_found"
     INVALID = "invalid_transition"
+    FAILED = "failed"  # Batch 2.6 §4: lease invalidation failure (retryable)
 
 
 @dataclass

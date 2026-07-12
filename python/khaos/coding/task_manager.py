@@ -67,6 +67,7 @@ class TransitionResult(Enum):
     UNCHANGED = "unchanged"
     NOT_FOUND = "not_found"
     INVALID_TRANSITION = "invalid_transition"
+    LEASE_INVALIDATION_FAILED = "lease_invalidation_failed"  # Batch 2.6 §4
 
 
 @dataclass
@@ -297,9 +298,13 @@ class TaskManager:
     async def cancel(self, task_id: str) -> TransitionResult:
         """Cancel an active task without overwriting a terminal state.
 
-        Batch 2.5 §4: if a lease invalidation hook is registered, calls it
-        BEFORE transitioning the task to CANCELLED, so the ACTIVE execution
-        lease is released. This prevents Task terminal + lease active.
+        Batch 2.6 §4: if a lease invalidation hook is registered, calls it
+        BEFORE transitioning the task to CANCELLED. If the hook raises,
+        cancel FAILS CLOSED — the task does NOT transition to CANCELLED,
+        and ``TransitionResult.LEASE_INVALIDATION_FAILED`` is returned.
+        The task stays in its current state so cancel can be retried.
+
+        Invariant: ``TaskStatus`` terminal ⇒ ACTIVE lease count = 0.
         """
         async with self._lock:
             task = self._tasks.get(task_id)
@@ -308,11 +313,20 @@ class TaskManager:
             if task.status in TERMINAL_STATUSES:
                 return TransitionResult.INVALID_TRANSITION
             # Release any ACTIVE execution lease for this task.
+            # Batch 2.6 §4: fail closed on lease invalidation error — do
+            # NOT transition to CANCELLED. The task stays in its current
+            # state so cancel can be retried after the lease issue is
+            # resolved.
             if self._lease_invalidation_hook is not None:
                 try:
                     self._lease_invalidation_hook(task_id=task_id)
-                except Exception:
-                    pass  # lease invalidation failure doesn't block cancel
+                except Exception as exc:
+                    logger.warning(
+                        "lease invalidation failed for task %s; "
+                        "cancel refused (fail-closed): %s",
+                        task_id, exc,
+                    )
+                    return TransitionResult.LEASE_INVALIDATION_FAILED
             task.status = TaskStatus.CANCELLED
             task.touch()
             await self._persist(task)

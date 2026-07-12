@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import tempfile
 import uuid
 from pathlib import Path
 
 from khaos.coding.workspace.models import ChangeSet, TaskWorkspace, WorkspaceState, WorkspaceTransition
+
+logger = logging.getLogger(__name__)
 
 
 class WorkspaceError(RuntimeError):
@@ -120,9 +123,13 @@ class WorkspaceManager:
     async def cleanup(self, workspace_id: str, *, force: bool = False) -> WorkspaceTransition:
         """Clean up a workspace worktree.
 
-        Batch 2.5 §4: if a lease invalidation hook is registered, calls it
-        BEFORE removing the worktree so the ACTIVE execution lease is
-        released. This prevents Workspace cleaned + lease active.
+        Batch 2.6 §4: if a lease invalidation hook is registered, calls it
+        BEFORE removing the worktree. If the hook raises, cleanup FAILS
+        CLOSED — the worktree is NOT removed, the workspace does NOT enter
+        CLEANED, and ``WorkspaceTransition.FAILED`` is returned. The
+        workspace stays in its current state so cleanup can be retried.
+
+        Invariant: ``WorkspaceState.CLEANED`` ⇒ ACTIVE lease count = 0.
         """
         async with self._lock:
             workspace = self._workspaces.get(workspace_id)
@@ -131,11 +138,20 @@ class WorkspaceManager:
             if workspace.state not in {WorkspaceState.APPLIED, WorkspaceState.FAILED, WorkspaceState.CANCELLED} and not force:
                 return WorkspaceTransition.INVALID
             # Release any ACTIVE execution lease for this workspace.
+            # Batch 2.6 §4: fail closed on lease invalidation error — do
+            # NOT continue to CLEANING/CLEANED. The workspace stays in its
+            # current state so cleanup can be retried after the lease
+            # issue is resolved.
             if self._lease_invalidation_hook is not None:
                 try:
                     self._lease_invalidation_hook(workspace_id=workspace_id)
-                except Exception:
-                    pass  # lease invalidation failure doesn't block cleanup
+                except Exception as exc:
+                    logger.warning(
+                        "lease invalidation failed for workspace %s; "
+                        "cleanup refused (fail-closed): %s",
+                        workspace_id, exc,
+                    )
+                    return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANING
             if force:
                 await self._git(workspace.repository_root, "worktree", "remove", "--force", str(workspace.worktree_path))
