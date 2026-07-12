@@ -10,6 +10,7 @@ from khaos.coding.planning.contracts import *  # noqa: F403
 from khaos.coding.planning.dag import validate_steps
 from khaos.coding.planning.risk import RiskEvaluator
 from khaos.coding.planning.verification import TrustedVerificationSelector
+from khaos.coding.planning.verification_catalog import VerificationCatalog
 
 MAX_GOAL_LENGTH = 4096
 
@@ -46,6 +47,29 @@ class DeterministicPlanningService:
     def __init__(self, query: CodeQueryService, *, repositories: dict[str, dict[str, Any]], max_depth: int = 3, max_nodes: int = 200, max_files: int = 100, max_symbols: int = 100) -> None:
         self._query, self._repositories = query, repositories
         self._limits=(max_depth,max_nodes,max_files,max_symbols); self._verification_selector=TrustedVerificationSelector(); self._risk_evaluator=RiskEvaluator()
+        self._catalogs: dict[str, VerificationCatalog] = {}
+
+    def _get_catalog(self, repository_id: str) -> VerificationCatalog:
+        """Build and cache a VerificationCatalog for the repository.
+
+        The catalog is read-only — it scans config files (pyproject.toml,
+        package.json, go.mod, Cargo.toml) from the repository root and server
+        rules from the repository metadata. It never writes, executes, or
+        modifies approval state.
+        """
+        if repository_id not in self._catalogs:
+            repo = self._repositories.get(repository_id, {})
+            root = repo.get("root")
+            server_rules = tuple(
+                rule for rule in repo.get("trusted_verification", ())
+                if isinstance(rule, dict) and rule.get("language")
+            )
+            from pathlib import Path
+            self._catalogs[repository_id] = VerificationCatalog(
+                Path(root) if root else None,
+                server_rules=server_rules,
+            )
+        return self._catalogs[repository_id]
 
     def classify_goal(self, *, repository_id: str, user_goal: str) -> GoalIntentResult:
         """Classify only explicit wording; it never guesses a target."""
@@ -55,46 +79,180 @@ class DeterministicPlanningService:
         return GoalIntentResult(raw_goal, (resolved.action.intent,), (GoalTarget(parsed.raw_token, parsed.explicit_kind, parsed.requested_symbol, parsed.requested_path, self._language(parsed.requested_path or ""), resolved.action.operation.value, resolved.status, (resolved.selected_file,) if resolved.selected_file else (), tuple(x.get("stable_symbol_id", "") for x in resolved.symbol_candidates), resolved.evidence, resolved.diagnostics),), 1.0 if resolved.status == "resolved" else 0.0, resolved.diagnostics)
 
     def analyze_impacts(self, *, repository_id: str, target_symbols: tuple[str, ...], target_files: tuple[str, ...] = (), max_depth: int | None = None, max_nodes: int | None = None, max_files: int | None = None, max_symbols: int | None = None) -> ImpactAnalysis:
-        """Cycle-safe reverse call/reference traversal over persisted resolution edges."""
-        max_depth=max_depth if max_depth is not None else self._limits[0]; max_nodes=max_nodes if max_nodes is not None else self._limits[1]; max_files=max_files if max_files is not None else self._limits[2]; max_symbols=max_symbols if max_symbols is not None else self._limits[3]
-        queue = [(sid, 0) for sid in sorted(target_symbols)]; seen: set[str] = set(); direct=[]; indirect=[]; dynamic=[]; external=[]; excluded=[]; diagnostics=[]; files=set(target_files); truncated=False
+        """Cycle-safe reverse call/reference traversal over persisted resolution edges.
+
+        Uses a single :class:`ImpactTraversalBudget` shared across ALL impact
+        sources: callers, references, reverse imports, re-exports, module
+        dependencies, unresolved/dynamic candidates, and test associations.
+        Never scans the entire repository — test association uses bounded
+        :meth:`CodeQueryService.associated_tests` with indexed LIMIT queries.
+        """
+        budget = ImpactTraversalBudget(
+            max_depth=max_depth if max_depth is not None else self._limits[0],
+            max_nodes=max_nodes if max_nodes is not None else self._limits[1],
+            max_files=max_files if max_files is not None else self._limits[2],
+            max_symbols=max_symbols if max_symbols is not None else self._limits[3],
+        )
+        queue = [(sid, 0) for sid in sorted(target_symbols)]
+        direct: list[ImpactEdge] = []
+        indirect: list[ImpactEdge] = []
+        dynamic: list[ImpactEdge] = []
+        external: list[ImpactEdge] = []
+        excluded: list[ImpactEdge] = []
+        diagnostics: list[PlanDiagnostic] = []
+        # Seed affected files with target files (bounded by budget)
+        for tf in target_files:
+            budget.add_affected_file(tf)
+
+        # --- Phase 1: Reverse call/reference graph traversal (budgeted) ---
         while queue:
             sid, depth = queue.pop(0)
-            if sid in seen: continue
-            seen.add(sid)
-            if len(seen) > max_nodes or depth > max_depth: truncated=True; break
-            edges = sorted(self._query.callers_of(repository_id, sid) + self._query.references_to(repository_id, sid), key=lambda e: (e.get("source_file", ""), e.get("edge_id", "")))
+            if not budget.can_visit_node(sid, depth):
+                continue
+            budget.mark_visited(sid)
+            budget.add_affected_symbol(sid)
+            edges = sorted(
+                self._query.callers_of(repository_id, sid) + self._query.references_to(repository_id, sid),
+                key=lambda e: (e.get("source_file", ""), e.get("edge_id", "")),
+            )
             for edge in edges:
-                path=edge["source_file"]; files.add(path)
-                ev=PlanEvidence("resolution-graph", repository_id, path, sid, query=sid, confidence=float(edge.get("confidence",0)))
-                item=ImpactEdge(path, edge.get("caller_symbol_id"), edge.get("target_file") or "", sid, "calls" if "call_callee" in edge else "references", depth+1, ImpactStatus.DIRECT if depth==0 else ImpactStatus.INDIRECT, float(edge.get("confidence",0)), edge.get("resolution_rule", "resolved"), (ev,))
-                (direct if depth==0 else indirect).append(item)
-                caller=edge.get("caller_symbol_id")
-                if caller: queue.append((caller, depth+1))
-                if len(files) > max_files or len(seen) > max_symbols: truncated=True; break
-            if truncated: break
-        for target_file in sorted(target_files or tuple({item.get("path", "") for sid in target_symbols for item in [self._query.symbol_by_stable_id(repository_id, sid) or {}] if item})):
+                if not budget.can_inspect_edge():
+                    break
+                path = edge["source_file"]
+                if not budget.add_affected_file(path):
+                    break
+                ev = PlanEvidence("resolution-graph", repository_id, path, sid, query=sid, confidence=float(edge.get("confidence", 0)))
+                relation = "calls" if "call_callee" in edge else "references"
+                item = ImpactEdge(path, edge.get("caller_symbol_id"), edge.get("target_file") or "", sid, relation, depth + 1,
+                                  ImpactStatus.DIRECT if depth == 0 else ImpactStatus.INDIRECT,
+                                  float(edge.get("confidence", 0)), edge.get("resolution_rule", "resolved"), (ev,))
+                (direct if depth == 0 else indirect).append(item)
+                caller = edge.get("caller_symbol_id")
+                if caller:
+                    queue.append((caller, depth + 1))
+
+        # --- Phase 2: Reverse imports + semantic re-export evidence (budgeted) ---
+        resolved_target_files = sorted(target_files or tuple(
+            item.get("path", "") for sid in target_symbols
+            for item in [self._query.symbol_by_stable_id(repository_id, sid) or {}] if item
+        ))
+        for target_file in resolved_target_files:
             for import_edge in self._query.reverse_imports_to(repository_id, target_file):
-                source=str(import_edge["source_file"])
-                if source in files and any(item.source_file == source for item in direct + indirect): continue
-                record=self._query.file_evidence(repository_id, source) or {}; ev=PlanEvidence("resolution-graph",repository_id,source,generation=record.get("generation"),content_hash=record.get("content_hash"),query=target_file,confidence=.9)
-                relation="re-export" if source.endswith(("__init__.py","index.js","index.ts")) else "reverse-import"
-                direct.append(ImpactEdge(source,None,target_file,None,relation,1,ImpactStatus.DIRECT,.9,"resolved reverse dependency",(ev,))); files.add(source)
+                if not budget.can_inspect_reverse_import():
+                    break
+                source = str(import_edge["source_file"])
+                meta = import_edge.get("metadata", {})
+                # Semantic re-export evidence from ParseResult/Resolution metadata:
+                # - JS/TS: metadata.reexport == True or import_kind == "reexport"
+                # - Rust: metadata.pub_use == True
+                # - Python __init__.py: conservative possible-reexport (no __all__ parsing)
+                # - Go: no re-exports (never fabricated)
+                is_semantic_reexport = bool(meta.get("reexport") or meta.get("pub_use"))
+                is_init_py = source.endswith("__init__.py")
+                if is_semantic_reexport:
+                    relation = "re-export"
+                    impact_status = ImpactStatus.DIRECT
+                    confidence = 0.92
+                    reason = "semantic re-export evidence"
+                elif is_init_py:
+                    # Strategy B: conservative downgrade — Python __init__.py
+                    # without __all__ parsing is only possible-reexport, never
+                    # a confirmed dependency modification target.
+                    relation = "possible-reexport"
+                    impact_status = ImpactStatus.POSSIBLE
+                    confidence = 0.5
+                    reason = "python __init__.py layout推测 — not semantic evidence"
+                else:
+                    relation = "reverse-import"
+                    impact_status = ImpactStatus.DIRECT
+                    confidence = 0.9
+                    reason = "resolved reverse dependency"
+                if source in budget.affected_files and any(item.source_file == source for item in direct + indirect):
+                    continue
+                if not budget.add_affected_file(source):
+                    break
+                record = self._query.file_evidence(repository_id, source) or {}
+                ev = PlanEvidence("resolution-graph", repository_id, source,
+                                  generation=record.get("generation"),
+                                  content_hash=record.get("content_hash"),
+                                  query=target_file, confidence=confidence,
+                                  metadata={"reexport": is_semantic_reexport, "possible_reexport": is_init_py})
+                edge_item = ImpactEdge(source, None, target_file, None, relation, 1,
+                                       impact_status, confidence, reason, (ev,))
+                if impact_status is ImpactStatus.POSSIBLE:
+                    dynamic.append(edge_item)
+                else:
+                    direct.append(edge_item)
+
+            # --- Phase 3: Unresolved/dynamic candidates (budgeted) ---
             for item in self._query.unresolved_candidates(repository_id, target_file):
-                status=str(item.get("status","unresolved")); impact_status=ImpactStatus.DYNAMIC if status == "dynamic" else ImpactStatus.EXTERNAL if status == "external" else ImpactStatus.AMBIGUOUS if status == "ambiguous" else ImpactStatus.POSSIBLE
-                ev=PlanEvidence("resolution-graph",repository_id,target_file,query=str(item.get("callee") or item.get("name") or item.get("import_module") or ""),confidence=.3)
-                edge=ImpactEdge(target_file,None,"",None,item.get("edge_type","unknown"),1,impact_status,.3,status,(ev,))
-                (external if impact_status is ImpactStatus.EXTERNAL else dynamic).append(edge)
-            stem=target_file.rsplit(".",1)[0].split("/")[-1]
-            for row in self._query.store._conn.execute("SELECT path FROM code_files WHERE project_id=? ORDER BY path",(repository_id,)).fetchall():
-                candidate=str(row[0]); lower=candidate.casefold()
-                if candidate != target_file and stem.casefold() in lower and ("test" in lower or "spec" in lower):
-                    record=self._query.file_evidence(repository_id,candidate) or {}; ev=PlanEvidence("test-layout-rule",repository_id,candidate,generation=record.get("generation"),content_hash=record.get("content_hash"),query=target_file,confidence=.55)
-                    dynamic.append(ImpactEdge(candidate,None,target_file,None,"associated-test",1,ImpactStatus.POSSIBLE,.55,"server test-layout heuristic",(ev,)))
-        if truncated: diagnostics.append(PlanDiagnostic("impact-truncated", "warning", "fixed graph traversal limit reached", True))
-        direct=sorted(direct,key=lambda x:(x.depth,x.source_file,x.relation,x.source_symbol or "")); indirect=sorted(indirect,key=lambda x:(x.depth,x.source_file,x.relation,x.source_symbol or "")); dynamic=sorted(dynamic,key=lambda x:(x.source_file,x.relation,x.reason)); external=sorted(external,key=lambda x:(x.source_file,x.relation))
-        digest=ImplementationPlan.digest({"target_files":sorted(target_files),"targets":sorted(target_symbols),"direct":[asdict(x) for x in direct],"indirect":[asdict(x) for x in indirect],"dynamic":[asdict(x) for x in dynamic],"external":[asdict(x) for x in external],"truncated":truncated})
-        return ImpactAnalysis(tuple(sorted(target_files)), tuple(sorted(target_symbols)), tuple(direct), tuple(indirect), tuple(external), tuple(dynamic), tuple(excluded), tuple(diagnostics), max((x.depth for x in direct+indirect), default=0), truncated, digest, len(seen), len(files), len(seen))
+                if not budget.can_inspect_edge():
+                    break
+                status = str(item.get("status", "unresolved"))
+                impact_status = (ImpactStatus.DYNAMIC if status == "dynamic"
+                                 else ImpactStatus.EXTERNAL if status == "external"
+                                 else ImpactStatus.AMBIGUOUS if status == "ambiguous"
+                                 else ImpactStatus.POSSIBLE)
+                ev = PlanEvidence("resolution-graph", repository_id, target_file,
+                                  query=str(item.get("callee") or item.get("name") or item.get("import_module") or ""),
+                                  confidence=0.3)
+                edge_item = ImpactEdge(target_file, None, "", None, item.get("edge_type", "unknown"),
+                                       1, impact_status, 0.3, status, (ev,))
+                (external if impact_status is ImpactStatus.EXTERNAL else dynamic).append(edge_item)
+
+        # --- Phase 4: Bounded test association (NO full-repo scan) ---
+        test_result = self._query.associated_tests(
+            repository_id,
+            target_files=tuple(resolved_target_files),
+            target_symbols=target_symbols,
+            max_results=budget.max_test_candidates,
+        )
+        budget.record_sql_rows(test_result.inspected_candidates)
+        for candidate in test_result.candidates:
+            if not budget.can_inspect_test_candidate():
+                break
+            path = candidate.get("path", "")
+            if not budget.add_affected_file(path):
+                break
+            record = self._query.file_evidence(repository_id, path) or {}
+            ev = PlanEvidence("test-layout-rule", repository_id, path,
+                              generation=record.get("generation"),
+                              content_hash=record.get("content_hash"),
+                              query=",".join(resolved_target_files),
+                              confidence=candidate.get("confidence", 0.5),
+                              metadata={"source": candidate.get("source", "heuristic"),
+                                        "edge_type": candidate.get("edge_type", "")})
+            dynamic.append(ImpactEdge(path, None, ",".join(resolved_target_files), None,
+                                      "associated-test", 1, ImpactStatus.POSSIBLE,
+                                      candidate.get("confidence", 0.5),
+                                      candidate.get("reason", "server test-layout heuristic"), (ev,)))
+
+        # --- Finalize ---
+        if budget.truncated:
+            diagnostics.append(PlanDiagnostic("impact-truncated", "warning",
+                                              f"budget limit reached: {budget.limit_code}", True))
+        direct = sorted(direct, key=lambda x: (x.depth, x.source_file, x.relation, x.source_symbol or ""))
+        indirect = sorted(indirect, key=lambda x: (x.depth, x.source_file, x.relation, x.source_symbol or ""))
+        dynamic = sorted(dynamic, key=lambda x: (x.source_file, x.relation, x.reason))
+        external = sorted(external, key=lambda x: (x.source_file, x.relation))
+        digest = ImplementationPlan.digest({
+            "target_files": sorted(target_files),
+            "targets": sorted(target_symbols),
+            "direct": [asdict(x) for x in direct],
+            "indirect": [asdict(x) for x in indirect],
+            "dynamic": [asdict(x) for x in dynamic],
+            "external": [asdict(x) for x in external],
+            "truncated": budget.truncated,
+        })
+        return ImpactAnalysis(
+            tuple(sorted(target_files)), tuple(sorted(target_symbols)),
+            tuple(direct), tuple(indirect), tuple(external), tuple(dynamic), tuple(excluded),
+            tuple(diagnostics), max((x.depth for x in direct + indirect), default=0),
+            budget.truncated, digest,
+            budget.visited_nodes_count, budget.affected_files_count, budget.affected_symbols_count,
+            budget.inspected_edges, budget.inspected_file_candidates, budget.inspected_test_candidates,
+            budget.inspected_reverse_imports, budget.sql_rows_enumerated, budget.limit_code,
+        )
 
     def plan(self, *, repository_id: str, task_id: str, workspace_id: str, user_goal: str, base_sha: str) -> ImplementationPlan:
         raw_goal = " ".join(user_goal.split())
@@ -143,19 +301,30 @@ class DeterministicPlanningService:
         risk=self._risk_evaluator.evaluate(operation,raw_goal,impact,public=public,has_tests=has_tests,paths=tuple(sorted(f.path for f in files)))
         risks=(risk,)
         languages={f.language for f in files if f.language}; repo_metadata=dict(repo); repo_metadata["repository_id"]=repository_id
-        requirements=self._verification_selector.select(repo_metadata,languages,tuple(evidence),security=resolved.action.intent is GoalIntent.SECURITY_CHANGE,schema=resolved.action.intent is GoalIntent.SCHEMA_CHANGE)
+        catalog=self._get_catalog(repository_id)
+        requirements=self._verification_selector.select(repo_metadata,languages,tuple(evidence),catalog=catalog,security=resolved.action.intent is GoalIntent.SECURITY_CHANGE,schema=resolved.action.intent is GoalIntent.SCHEMA_CHANGE)
+        # Include config hash evidence so config file changes invalidate plans.
+        config_hash=catalog.combined_config_hash()
+        if config_hash:
+            evidence.append(PlanEvidence("verification-config",repository_id,query="config-hash",confidence=1.0,metadata={"config_hash":config_hash,"config_files":dict(catalog.config_hashes)}))
         status = PlanStatus.READY if resolved.status == "resolved" and files and not any(d.severity == "error" for d in diagnostics) else PlanStatus.BLOCKED
         step = self._steps(operation, raw_goal, files, symbols, requirements, risks[0], evidence, status, impact)
         diagnostics.extend(validate_steps(step))
         if any(d.severity == "error" for d in diagnostics): status = PlanStatus.BLOCKED
-        diagnostics.append(PlanDiagnostic("impact-summary","info",f"visited_nodes={impact.visited_nodes};visited_files={impact.visited_files};visited_symbols={impact.visited_symbols};impact_hash={impact.content_hash}",True))
+        diagnostics.append(PlanDiagnostic("impact-summary","info",f"visited_nodes={impact.visited_nodes};visited_files={impact.visited_files};visited_symbols={impact.visited_symbols};inspected_edges={impact.inspected_edges};inspected_file_candidates={impact.inspected_file_candidates};inspected_test_candidates={impact.inspected_test_candidates};inspected_reverse_imports={impact.inspected_reverse_imports};sql_rows_enumerated={impact.sql_rows_enumerated};truncated={impact.truncated};limit_code={impact.limit_code or 'none'};impact_hash={impact.content_hash}",True))
         return self._build(repository_id, task_id, workspace_id, user_goal, normalized, base_sha, int(repo["generation"]), status, step, files, symbols, impacts, requirements, risks, diagnostics, evidence)
 
     def validate_plan(self, plan: ImplementationPlan, *, current_head: str, current_repository_generation: int) -> PlanValidationResult:
         issues: list[PlanDiagnostic] = []
         if plan.base_sha != current_head: issues.append(PlanDiagnostic("head-drift", "error", "HEAD changed", False))
         if plan.repository_generation != current_repository_generation: issues.append(PlanDiagnostic("generation-drift", "error", "repository generation changed", False))
+        # Rule 8: config file changes invalidate old plans.
+        current_catalog = self._get_catalog(plan.repository_id)
+        current_config_hash = current_catalog.combined_config_hash()
         for ev in plan.evidence:
+            if ev.source == "verification-config" and ev.metadata.get("config_hash"):
+                if ev.metadata["config_hash"] != current_config_hash:
+                    issues.append(PlanDiagnostic("config-hash-drift", "error", "verification config file changed", False, (ev,)))
             if ev.path and ev.content_hash:
                 record = self._query.file_evidence(plan.repository_id, ev.path)
                 if not record or record["content_hash"] != ev.content_hash: issues.append(PlanDiagnostic("evidence-drift", "error", f"evidence changed: {ev.path}", False, (ev,)))
