@@ -13,6 +13,7 @@ class ExecutionRunStatus(str, Enum):
     CREATED = "created"
     VALIDATING = "validating"
     MUTATING = "mutating"
+    SEALING = "sealing"
     MUTATED = "mutated"
     ROLLING_BACK = "rolling-back"
     ROLLED_BACK = "rolled-back"

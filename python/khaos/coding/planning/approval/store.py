@@ -219,6 +219,14 @@ CREATE TABLE IF NOT EXISTS workspace_mutation_poison (
     poisoned_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS workspace_mutation_poison_scopes (
+    workspace_id TEXT NOT NULL,
+    poison_owner TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    poisoned_at REAL NOT NULL,
+    PRIMARY KEY(workspace_id, poison_owner)
+);
+
 CREATE TABLE IF NOT EXISTS workspace_mutation_audit (
     event_id TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
@@ -248,6 +256,8 @@ CREATE TABLE IF NOT EXISTS plan_execution_runs (
     updated_at REAL NOT NULL,
     completed_at REAL,
     failure_code TEXT NOT NULL DEFAULT '',
+    recovery_sealed_at REAL,
+    recovery_seal_digest TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -421,6 +431,15 @@ def _post_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE plan_execution_leases ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''"
         )
+    run_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_runs)")}
+    if run_cols:
+        if "recovery_sealed_at" not in run_cols:
+            conn.execute("ALTER TABLE plan_execution_runs ADD COLUMN recovery_sealed_at REAL")
+        if "recovery_seal_digest" not in run_cols:
+            conn.execute(
+                "ALTER TABLE plan_execution_runs ADD COLUMN "
+                "recovery_seal_digest TEXT NOT NULL DEFAULT ''"
+            )
 
 
 class ApprovalTransitionResult(str, Enum):
@@ -2133,6 +2152,45 @@ class PlanApprovalStore:
         ).fetchall()
         return tuple((str(row["workspace_id"]), str(row["reason"])) for row in rows)
 
+    def add_workspace_poison_scope(
+        self, workspace_id: str, *, owner: str, reason: str
+    ) -> None:
+        self._conn.execute(
+            "INSERT OR REPLACE INTO workspace_mutation_poison_scopes "
+            "(workspace_id,poison_owner,reason,poisoned_at) VALUES (?,?,?,?)",
+            (workspace_id, owner, reason, time.time()),
+        )
+        self._conn.commit()
+
+    def clear_workspace_poison_scope(self, workspace_id: str, *, owner: str) -> bool:
+        cur = self._conn.execute(
+            "DELETE FROM workspace_mutation_poison_scopes "
+            "WHERE workspace_id=? AND poison_owner=?",
+            (workspace_id, owner),
+        )
+        self._conn.commit()
+        return int(cur.rowcount or 0) == 1
+
+    def list_workspace_poison_scopes(
+        self, workspace_id: str | None = None
+    ) -> tuple[tuple[str, str, str], ...]:
+        if workspace_id is None:
+            rows = self._conn.execute(
+                "SELECT workspace_id,poison_owner,reason "
+                "FROM workspace_mutation_poison_scopes "
+                "ORDER BY workspace_id,poison_owner"
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT workspace_id,poison_owner,reason "
+                "FROM workspace_mutation_poison_scopes WHERE workspace_id=? "
+                "ORDER BY poison_owner", (workspace_id,),
+            ).fetchall()
+        return tuple(
+            (str(row["workspace_id"]), str(row["poison_owner"]), str(row["reason"]))
+            for row in rows
+        )
+
     def recover_poisoned_workspace(
         self, workspace_id: str, *, force: bool = False, now: float | None = None
     ) -> bool:
@@ -2619,7 +2677,8 @@ class PlanApprovalStore:
         allowed = {
             "created": frozenset({"validating", "cancelled"}),
             "validating": frozenset({"mutating", "rolling-back", "failed", "poisoned", "cancelled"}),
-            "mutating": frozenset({"mutated", "rolling-back", "poisoned", "cancelled"}),
+            "mutating": frozenset({"sealing", "rolling-back", "poisoned", "cancelled"}),
+            "sealing": frozenset({"mutated", "poisoned"}),
             "rolling-back": frozenset({"rolled-back", "poisoned", "cancelled"}),
             "poisoned": frozenset({"rolling-back", "rolled-back"}),
         }
@@ -2678,31 +2737,57 @@ class PlanApprovalStore:
 
     def update_edit_event(
         self, execution_run_id: str, edit_id: str, *, status: str,
-        after_hash: str = "", after_mode: int | None = None,
+        after_hash: str | None = None, after_mode: int | None = None,
         error_code: str = "",
     ) -> None:
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute(
-                "SELECT operation,path,before_hash FROM plan_execution_edit_events "
+                "SELECT operation,path,before_hash,after_hash,after_mode "
+                "FROM plan_execution_edit_events "
                 "WHERE execution_run_id=? AND edit_id=?",
                 (execution_run_id, edit_id),
             ).fetchone()
             if row is None:
                 raise RuntimeError("execution edit event not found")
+            stored_after_hash = row["after_hash"] if after_hash is None else after_hash
+            stored_after_mode = row["after_mode"] if after_mode is None else after_mode
             self._conn.execute(
                 "UPDATE plan_execution_edit_events SET status=?,after_hash=?,"
                 "after_mode=?,error_code=?,updated_at=? WHERE execution_run_id=? "
                 "AND edit_id=?",
-                (status, after_hash, after_mode, error_code, now,
+                (status, stored_after_hash, stored_after_mode, error_code, now,
                  execution_run_id, edit_id),
             )
             self._insert_execution_audit(
                 execution_run_id, "edit-transition", operation=row["operation"],
                 path=row["path"], before_hash=row["before_hash"] or "",
-                after_hash=after_hash, result=status, error_code=error_code,
+                after_hash=stored_after_hash or "", result=status, error_code=error_code,
                 correlation_id=edit_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def mark_execution_recovery_sealed(
+        self, execution_run_id: str, *, seal_digest: str
+    ) -> None:
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET recovery_sealed_at=?,"
+                "recovery_seal_digest=?,updated_at=? WHERE execution_run_id=? "
+                "AND status='sealing'",
+                (now, seal_digest, now, execution_run_id),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("execution run is not sealing")
+            self._insert_execution_audit(
+                execution_run_id, "recovery-sealed", result="sealed",
+                correlation_id=execution_run_id,
             )
             self._conn.commit()
         except Exception:
@@ -2741,7 +2826,7 @@ class PlanApprovalStore:
     def list_incomplete_execution_runs(self) -> tuple[Any, ...]:
         rows = self._conn.execute(
             "SELECT * FROM plan_execution_runs WHERE status IN "
-            "('validating','mutating','rolling-back','poisoned') "
+            "('validating','mutating','sealing','rolling-back','poisoned') "
             "ORDER BY started_at,execution_run_id"
         ).fetchall()
         return tuple(self._row_to_execution_run(row) for row in rows)

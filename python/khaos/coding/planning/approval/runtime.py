@@ -161,6 +161,10 @@ class ApprovalRuntime:
             self._mutation_fence=WorkspaceMutationFence()
             for poisoned_workspace, poison_reason in self._store.list_poisoned_workspaces():
                 self._mutation_fence.poison(poisoned_workspace, poison_reason)
+            for poisoned_workspace, poison_owner, poison_reason in self._store.list_workspace_poison_scopes():
+                self._mutation_fence.poison(
+                    poisoned_workspace, poison_reason, owner=poison_owner
+                )
             for dependency in (self._task_manager, self._workspace_manager):
                 dependency.set_mutation_fence(self._mutation_fence)
 

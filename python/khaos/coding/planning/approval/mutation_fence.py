@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from contextlib import contextmanager
 from typing import Any, AsyncIterator, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -55,7 +56,8 @@ class WorkspaceMutationFence:
 
         self._locks: dict[str, "asyncio.Lock"] = {}
         self._owners: dict[str, str] = {}
-        self._poisoned: dict[str, str] = {}
+        self._poisoned: dict[str, dict[str, str]] = {}
+        self._sync_locks: dict[str, Any] = {}
         # Protects _locks and _owners dicts (not the asyncio locks themselves).
         self._registry_lock = threading.Lock()
 
@@ -78,13 +80,46 @@ class WorkspaceMutationFence:
         :meth:`assert_owner`.
         """
         with self._registry_lock:
-            reason = self._poisoned.get(workspace_id)
-        if reason is not None:
+            reasons = self._poisoned.get(workspace_id, {})
+        if reasons:
             raise PermissionError(
-                f"workspace {workspace_id!r} is poisoned: {reason}"
+                f"workspace {workspace_id!r} is poisoned: "
+                f"{','.join(sorted(reasons.values()))}"
             )
+        import asyncio
+
         lock = self._get_or_create_lock(workspace_id)
-        await lock.acquire()
+        with self._registry_lock:
+            sync_lock = self._sync_locks.setdefault(workspace_id, __import__("threading").Lock())
+        await asyncio.to_thread(sync_lock.acquire)
+        acquired_async = False
+        try:
+            await lock.acquire()
+            acquired_async = True
+            with self._registry_lock:
+                reasons = self._poisoned.get(workspace_id, {})
+                if reasons:
+                    raise PermissionError(
+                        f"workspace {workspace_id!r} is poisoned: "
+                        f"{','.join(sorted(reasons.values()))}"
+                    )
+                self._owners[workspace_id] = owner
+            yield
+        finally:
+            with self._registry_lock:
+                self._owners.pop(workspace_id, None)
+            if acquired_async:
+                lock.release()
+            sync_lock.release()
+
+    @contextmanager
+    def use_sync(self, workspace_id: str, *, owner: str) -> Any:
+        """Startup/recovery acquisition of the same canonical workspace fence."""
+        import threading
+
+        with self._registry_lock:
+            lock = self._sync_locks.setdefault(workspace_id, threading.Lock())
+        lock.acquire()
         try:
             with self._registry_lock:
                 self._owners[workspace_id] = owner
@@ -114,10 +149,10 @@ class WorkspaceMutationFence:
         owner before performing a planned mutation.
         """
         with self._registry_lock:
-            if workspace_id in self._poisoned:
+            if self._poisoned.get(workspace_id):
                 raise PermissionError(
                     f"workspace {workspace_id!r} is poisoned: "
-                    f"{self._poisoned[workspace_id]}"
+                    f"{','.join(sorted(self._poisoned[workspace_id].values()))}"
                 )
             current = self._owners.get(workspace_id)
             if current != owner:
@@ -137,14 +172,19 @@ class WorkspaceMutationFence:
         with self._registry_lock:
             return self._owners.get(workspace_id)
 
-    def poison(self, workspace_id: str, reason: str) -> None:
+    def poison(self, workspace_id: str, reason: str, *, owner: str = "legacy") -> None:
         """Quarantine a workspace before its mutation lock is released."""
         with self._registry_lock:
-            self._poisoned[workspace_id] = reason
+            self._poisoned.setdefault(workspace_id, {})[owner] = reason
 
-    def clear_poison(self, workspace_id: str) -> None:
+    def clear_poison(self, workspace_id: str, *, owner: str = "legacy") -> None:
         with self._registry_lock:
-            self._poisoned.pop(workspace_id, None)
+            reasons = self._poisoned.get(workspace_id)
+            if reasons is None:
+                return
+            reasons.pop(owner, None)
+            if not reasons:
+                self._poisoned.pop(workspace_id, None)
 
     def is_poisoned(self, workspace_id: str) -> bool:
         with self._registry_lock:
