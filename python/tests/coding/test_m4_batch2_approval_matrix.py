@@ -442,10 +442,11 @@ def test_36_forged_authorization_id_refused():
     service, store, ctx, broker, repo = make_service()
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     with pytest.raises(AuthorizationMismatchError, match="unknown"):
-        gate.require_authorization(
-            "pax_forged", "fakenonce",
+        gate.acquire_lease(
+            authorization_id="pax_forged", nonce="fakenonce",
             expected_plan_id="plan_forge", expected_task_id="task1",
             expected_workspace_id="ws1", expected_repository_id="repo",
+            owner_execution_id="exec_test",
         )
 
 
@@ -455,11 +456,12 @@ def test_37_cross_task_replay_refused():
     request = service.request_approval(plan)  # NOT_REQUIRED + registers snapshot
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
-    with pytest.raises(AuthorizationMismatchError, match="task id mismatch"):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+    with pytest.raises(AuthorizationMismatchError, match="scope mismatch"):
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id="OTHER",
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -469,11 +471,12 @@ def test_38_cross_workspace_replay_refused():
     request = service.request_approval(plan)
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
-    with pytest.raises(AuthorizationMismatchError, match="workspace id mismatch"):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+    with pytest.raises(AuthorizationMismatchError, match="scope mismatch"):
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id="OTHER", expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -483,11 +486,12 @@ def test_39_cross_repository_replay_refused():
     request = service.request_approval(plan)
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
-    with pytest.raises(AuthorizationMismatchError, match="repository id mismatch"):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+    with pytest.raises(AuthorizationMismatchError, match="scope mismatch"):
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id="OTHER",
+            owner_execution_id="exec_test",
         )
 
 
@@ -497,11 +501,12 @@ def test_40_cross_plan_replay_refused():
     request = service.request_approval(plan)
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
-    with pytest.raises(AuthorizationMismatchError, match="plan id mismatch"):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+    with pytest.raises(AuthorizationMismatchError, match="scope mismatch"):
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id="OTHER", expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -513,10 +518,11 @@ def test_41_expired_authorization_refused():
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     time.sleep(0.05)
     with pytest.raises(AuthorizationExpiredError):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -529,10 +535,11 @@ def test_42_revoked_approval_invalidates_authorization():
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     service.revoke(request.approval_request_id, actor_id="admin")
     with pytest.raises((AuthorizationRevokedError, AuthorizationMismatchError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -542,16 +549,18 @@ def test_43_authorization_single_consume_cas():
     request = service.request_approval(plan)
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
-    gate.require_authorization(
-        auth.authorization_id, auth.nonce,
+    gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
     )
     with pytest.raises(AuthorizationAlreadyConsumedError):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -618,6 +627,7 @@ def test_50_plan_approval_cannot_replace_tool_or_changeset_approval():
         auth.authorization_id, auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
     )
     with pytest.raises(NotImplementedError):
         guard.planned_workspace_edit(consumed_ctx, edit={})
@@ -642,6 +652,7 @@ def test_53_batch_has_no_changeset_creation_or_apply():
         auth.authorization_id, auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
     )
     with pytest.raises(NotImplementedError):
         guard.planned_changeset_creation(ctx_ok, changeset_spec={})

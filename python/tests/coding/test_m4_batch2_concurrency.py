@@ -174,10 +174,11 @@ def test_concurrent_authorization_consumes_only_one_wins(tmp_path):
         store = PlanApprovalStore(conn)
         gate = PlanExecutionGate(store=store, context_provider=_Ctx(), plan_repository=repo)
         try:
-            gate.require_authorization(
-                auth.authorization_id, auth.nonce,
+            gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
                 expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
                 expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
             )
             return "ok"
         except (AuthorizationAlreadyConsumedError, Exception):
@@ -218,10 +219,11 @@ def test_expiration_races_with_consume(tmp_path):
     from khaos.coding.planning.approval.gate import AuthorizationExpiredError
 
     with pytest.raises(AuthorizationExpiredError):
-        gate1.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate1.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
     conn1.close()
 

@@ -232,10 +232,11 @@ def test_10_consume_authorization_consumes_request():
     request = service.request_approval(plan)
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
-    gate.require_authorization(
-        auth.authorization_id, auth.nonce,
+    gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
     )
     assert store.get_request(request.approval_request_id).status is PlanApprovalStatus.CONSUMED
 
@@ -247,10 +248,11 @@ def test_11_request_consumed_then_mint_rejected():
     request = service.request_approval(plan)
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
-    gate.require_authorization(
-        auth.authorization_id, auth.nonce,
+    gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
     )
     # Mint again → refused (request is CONSUMED).
     with pytest.raises((ApprovalMissingError, AuthorizationAlreadyConsumedError)):
@@ -264,10 +266,11 @@ def test_12_not_required_single_execution():
     request = service.request_approval(plan)
     gate = make_gate(store=store, context=ctx, plan_repository=repo)
     auth = gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
-    gate.require_authorization(
-        auth.authorization_id, auth.nonce,
+    gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
     )
     assert store.get_request(request.approval_request_id).status is PlanApprovalStatus.CONSUMED
     with pytest.raises((ApprovalMissingError, AuthorizationAlreadyConsumedError)):
@@ -420,10 +423,11 @@ def test_16_file_drift_after_mint_refuses_consume():
     ))
     repo.register(drifted)
     with pytest.raises((AuthorizationMismatchError, PlanBlockedError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -437,10 +441,11 @@ def test_17_symbol_drift_after_mint_refuses_consume():
     ))
     repo.register(drifted)
     with pytest.raises((AuthorizationMismatchError, PlanBlockedError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -452,10 +457,11 @@ def test_18_config_drift_after_mint_refuses_consume():
     ) + tuple(plan.evidence[1:]))
     repo.register(drifted)
     with pytest.raises((AuthorizationMismatchError, PlanBlockedError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -464,10 +470,11 @@ def test_19_head_drift_after_mint_refuses_consume():
     plan, service, store, ctx, repo, gate, auth = _approved_high_risk_setup("p_drift_head")
     ctx.set(head_sha="different")
     with pytest.raises((PlanBlockedError, AuthorizationMismatchError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -476,10 +483,11 @@ def test_20_task_cancel_after_mint_refuses_consume():
     plan, service, store, ctx, repo, gate, auth = _approved_high_risk_setup("p_cancel")
     ctx.set(task_terminal=True)
     with pytest.raises((PlanBlockedError, AuthorizationMismatchError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -488,10 +496,11 @@ def test_21_workspace_cleanup_after_mint_refuses_consume():
     plan, service, store, ctx, repo, gate, auth = _approved_high_risk_setup("p_wscleanup")
     ctx.set(workspace_terminal=True)
     with pytest.raises((PlanBlockedError, AuthorizationMismatchError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -517,10 +526,11 @@ def test_22_forged_plan_does_not_affect_validation():
     assert replaced is False, "persisted repository must refuse silent content replacement"
     # The original authorization still consumes cleanly (no drift — the
     # authoritative snapshot is unchanged).
-    gate.require_authorization(
-        auth.authorization_id, auth.nonce,
+    gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
     )
 
 
@@ -621,10 +631,11 @@ def test_27_restart_invalidates_old_authorizations(tmp_path):
     assert revoked[2] >= 1
     # The old authorization can no longer be consumed.
     with pytest.raises((AuthorizationRevokedError, AuthorizationMismatchError)):
-        gate2.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate2.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -800,7 +811,7 @@ def test_static_no_consume_without_live_validation():
     from khaos.coding.planning.approval.gate import PlanExecutionGate
     import inspect
 
-    src = inspect.getsource(PlanExecutionGate.require_authorization)
+    src = inspect.getsource(PlanExecutionGate.acquire_lease)
     assert "self._validator.validate(" in src
 
 

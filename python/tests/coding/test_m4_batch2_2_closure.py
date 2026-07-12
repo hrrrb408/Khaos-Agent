@@ -193,10 +193,11 @@ def test_09_restart_old_authorization_rejected(tmp_path):
     gate2.rotate_epoch()  # new boot → old auth revoked
     from khaos.coding.planning.approval.gate import AuthorizationRevokedError
     with pytest.raises((AuthorizationMismatchError, AuthorizationRevokedError)):
-        gate2.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate2.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
     conn2.close()
 
@@ -288,10 +289,11 @@ def test_14_real_file_drift_refuses_consume():
     # Now drift HEAD — the consume-time validator catches it.
     ctx.set(head_sha="drifted")
     with pytest.raises((PlanBlockedError, AuthorizationMismatchError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan2.plan_id, expected_task_id=plan2.task_id,
             expected_workspace_id=plan2.workspace_id, expected_repository_id=plan2.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -386,10 +388,11 @@ def test_20_consume_validation_then_head_drift():
     plan, service, store, ctx, repo, gate, auth = _setup_approved_and_minted("p_head_drift_consume", risks=(low_risk(),))
     ctx.set(head_sha="drifted-after-mint")
     with pytest.raises((PlanBlockedError, AuthorizationMismatchError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -398,10 +401,11 @@ def test_21_consume_validation_then_task_cancel():
     plan, service, store, ctx, repo, gate, auth = _setup_approved_and_minted("p_task_cancel_consume", risks=(low_risk(),))
     ctx.set(task_terminal=True)
     with pytest.raises((PlanBlockedError, AuthorizationMismatchError)):
-        gate.require_authorization(
-            auth.authorization_id, auth.nonce,
+        gate.acquire_lease(
+            authorization_id=auth.authorization_id, nonce=auth.nonce,
             expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
             expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
+            owner_execution_id="exec_test",
         )
 
 
@@ -416,7 +420,7 @@ def test_22_execution_lease_acquire_and_release():
     gate2 = make_gate(store=store, context=ctx, plan_repository=repo)
     auth2 = gate2.authorize_execution(plan_id=plan2.plan_id, approval_request_id=request2.approval_request_id)
     consumed, lease = gate2.acquire_lease(
-        authorization_id=auth2.authorization_id, nonce=auth2.nonce,
+            authorization_id=auth2.authorization_id, nonce=auth2.nonce,
         expected_plan_id=plan2.plan_id, expected_task_id=plan2.task_id,
         expected_workspace_id=plan2.workspace_id, expected_repository_id=plan2.repository_id,
         owner_execution_id="exec_1",
@@ -435,7 +439,7 @@ def test_23_execution_lease_cross_workspace_replay():
     request2 = service.request_approval(plan2)
     auth2 = gate.authorize_execution(plan_id=plan2.plan_id, approval_request_id=request2.approval_request_id)
     gate.acquire_lease(
-        authorization_id=auth2.authorization_id, nonce=auth2.nonce,
+            authorization_id=auth2.authorization_id, nonce=auth2.nonce,
         expected_plan_id=plan2.plan_id, expected_task_id=plan2.task_id,
         expected_workspace_id=plan2.workspace_id, expected_repository_id=plan2.repository_id,
         owner_execution_id="exec_1",

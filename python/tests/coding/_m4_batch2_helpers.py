@@ -374,3 +374,30 @@ def make_forged_receipt(
         token_hash=token_hash,
         metadata={},
     )
+
+
+def consume_via_lease(
+    *,
+    gate,
+    auth,
+    expected_plan_id,
+    expected_task_id,
+    expected_workspace_id,
+    expected_repository_id,
+    owner_execution_id="exec_test",
+):
+    """Lease-first consume helper: the ONLY way tests should consume an
+    authorization. Returns (consumed_auth, lease). Raises on failure.
+
+    Batch 2.3: require_authorization is closed; all consume goes through
+    acquire_lease (lease-first atomic consume).
+    """
+    return gate.acquire_lease(
+        authorization_id=auth.authorization_id,
+        nonce=auth.nonce,
+        expected_plan_id=expected_plan_id,
+        expected_task_id=expected_task_id,
+        expected_workspace_id=expected_workspace_id,
+        expected_repository_id=expected_repository_id,
+        owner_execution_id=owner_execution_id,
+    )
