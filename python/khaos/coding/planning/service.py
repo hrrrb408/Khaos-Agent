@@ -214,16 +214,20 @@ class DeterministicPlanningService:
 
         # --- Phase 4: Bounded test association (NO full-repo scan) ---
         # HARD BUDGET: skip test association entirely if an earlier phase truncated.
+        test_result = None
         if not budget.truncated:
             test_result = self._query.associated_tests(
                 repository_id,
                 target_files=tuple(resolved_target_files),
                 target_symbols=target_symbols,
                 max_results=budget.max_test_candidates,
+                max_sql_queries=10,
+                max_indexed_rows=budget.max_test_candidates * 4,
             )
-            budget.record_sql_query(
+            budget.record_sql_batch(
+                queries_issued=test_result.sql_queries_issued,
                 rows_returned=test_result.sql_rows_returned,
-                indexed_rows=test_result.indexed_edge_rows_fetched,
+                indexed_rows_fetched=test_result.indexed_edge_rows_fetched,
             )
             for candidate in test_result.candidates:
                 if not budget.can_inspect_test_candidate():
@@ -270,6 +274,7 @@ class DeterministicPlanningService:
             budget.inspected_edges, budget.inspected_file_candidates, budget.inspected_test_candidates,
             budget.inspected_reverse_imports, budget.sql_rows_returned,
             budget.sql_queries_issued, budget.indexed_edge_rows_fetched, budget.limit_code,
+            bool(test_result and test_result.has_resolved_test_coverage),
         )
 
     def plan(self, *, repository_id: str, task_id: str, workspace_id: str, user_goal: str, base_sha: str) -> ImplementationPlan:
@@ -315,7 +320,9 @@ class DeterministicPlanningService:
                 if record:
                     files.append(AffectedFile(edge.source_file,PlanOperation.MODIFY,edge.reason,edge.confidence,True,record["language"],edge.evidence)); known_paths.add(edge.source_file); evidence.extend(edge.evidence)
         public=bool(symbols and symbols[0].kind in {"class","interface","struct","enum"}) or bool(symbols and not symbols[0].qualified_name.split(".")[-1].startswith("_"))
-        has_tests=any(edge.relation == "associated-test" for edge in impact.dynamic_impacts) or any("test" in f.path.casefold() for f in files)
+        # has_tests is ONLY triggered by resolved graph test edges or trusted
+        # mapping — never by possible_test_coverage or path-name heuristics.
+        has_tests = impact.has_resolved_test_coverage
         risk=self._risk_evaluator.evaluate(operation,raw_goal,impact,public=public,has_tests=has_tests,paths=tuple(sorted(f.path for f in files)))
         risks=(risk,)
         languages={f.language for f in files if f.language}; repo_metadata=dict(repo); repo_metadata["repository_id"]=repository_id
