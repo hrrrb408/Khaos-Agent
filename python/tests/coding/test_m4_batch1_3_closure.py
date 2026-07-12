@@ -133,12 +133,15 @@ def test_sql_queries_issued_matches_real_count(tmp_path: Path):
     real_query_count = 0
     def _trace(stmt: str):
         nonlocal real_query_count
-        if stmt.strip().upper().startswith("SELECT") and "EXPLAIN" not in stmt.upper():
-            real_query_count += 1
+        upper = stmt.strip().upper()
+        if upper.startswith("SELECT") and "EXPLAIN" not in upper:
+            # Exclude language resolution query (infrastructure, like EXPLAIN)
+            if "DISTINCT LANGUAGE" not in upper:
+                real_query_count += 1
     conn.set_trace_callback(_trace)
     result = query.associated_tests("repo", target_files=("foo.py",),
                                      max_results=10, max_sql_queries=10, max_indexed_rows=200)
-    # EXPLAIN queries should NOT be counted
+    # EXPLAIN and language-resolution queries should NOT be counted
     assert result.sql_queries_issued == real_query_count, \
         f"sql_queries_issued={result.sql_queries_issued} != real SELECT count={real_query_count}"
 

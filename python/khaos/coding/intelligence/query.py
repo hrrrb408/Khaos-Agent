@@ -137,6 +137,7 @@ class CodeQueryService:
         *,
         target_files: tuple[str, ...],
         target_symbols: tuple[str, ...] = (),
+        target_languages: set[str] | None = None,
         max_results: int = 50,
         max_sql_queries: int = 10,
         max_indexed_rows: int = 200,
@@ -151,9 +152,11 @@ class CodeQueryService:
         Evidence priority (each level checks remaining budget BEFORE running):
         1. Resolved graph edges (import/call/reference) where the source file
            has ``path_role='test'`` — uses indexed joins on target_file/target_symbol_id.
-        2. Subject/module/package key match — indexed equality on computed keys.
-           (Replaces the old "any test file" fallback that could associate
-           unrelated tests.)
+           Cross-language edges are retained as resolved evidence.
+        2. Subject/module key match — indexed equality on computed keys.
+           LANGUAGE-ISOLATED: only test files whose language is compatible with
+           ``target_languages`` are accepted. The package_key column is reserved
+           for future use and is NOT queried in this priority level.
 
         EXPLAIN QUERY PLAN queries are NOT counted in ``sql_queries_issued`` —
         they are audit-only and excluded from the budget.
@@ -162,6 +165,32 @@ class CodeQueryService:
         and coverage fields (``has_resolved_test_coverage``, ``possible_test_coverage``).
         """
         from khaos.coding.planning.contracts import TestAssociationResult
+
+        # --- Resolve target languages from code_files if not provided ---
+        if target_languages is None and target_files:
+            placeholders = ",".join("?" * len(target_files))
+            try:
+                lang_rows = self.store._conn.execute(
+                    f"SELECT DISTINCT language FROM code_files WHERE project_id=? AND path IN ({placeholders})",
+                    (repository_id, *target_files),
+                ).fetchall()
+                target_languages = {str(r[0]) for r in lang_rows if r[0]}
+            except sqlite3.OperationalError:
+                target_languages = set()
+        if target_languages is None:
+            target_languages = set()
+
+        # --- Build language compatibility set for heuristic queries ---
+        # JS and TypeScript are in the same compatibility group (TS is a
+        # superset of JS; they share test tooling). All other languages are
+        # strictly isolated — a Go test never associates with a Python target.
+        _JS_TS_GROUP = {"javascript", "typescript"}
+        heuristic_langs: set[str] = set()
+        for lang in target_languages:
+            if lang in _JS_TS_GROUP:
+                heuristic_langs |= _JS_TS_GROUP
+            else:
+                heuristic_langs.add(lang)
 
         remaining_candidates = max_results
         remaining_sql_queries = max_sql_queries
@@ -217,6 +246,7 @@ class CodeQueryService:
 
         # --- Priority 1: Resolved graph edges where source is a test file ---
         # Each sub-query uses LIMIT = min(remaining_candidates, remaining_indexed_rows).
+        # Cross-language resolved edges are retained (real graph evidence).
         if _can_continue() and target_files:
             ql = _query_limit()
             placeholders = ",".join("?" * len(target_files))
@@ -288,11 +318,13 @@ class CodeQueryService:
                                else "max_sql_queries" if remaining_sql_queries <= 0
                                else "max_indexed_rows")
 
-        # --- Priority 2: Subject/module/package key match (target-related only) ---
+        # --- Priority 2: Subject/module key match (target-related, language-isolated) ---
         # Replaces the old "any test file via path_role" fallback.
-        # Only test files whose subject/module/package key matches a target
-        # are returned — never arbitrary unrelated test files.
-        if _can_continue() and target_files:
+        # Only test files whose subject/module key matches a target AND whose
+        # language is compatible with target_languages are accepted.
+        # NOTE: package_key is NOT queried here — the column and index are
+        # reserved for future use but not part of the current heuristic.
+        if _can_continue() and target_files and heuristic_langs:
             target_subjects = set()
             target_modules = set()
             for tf in target_files:
@@ -304,25 +336,28 @@ class CodeQueryService:
                 target_modules.add(module_key)
             placeholders_subj = ",".join("?" * len(target_subjects))
             placeholders_mod = ",".join("?" * len(target_modules))
+            placeholders_lang = ",".join("?" * len(heuristic_langs))
             ql = _query_limit()
             sql = (
                 f"SELECT path, language, content_hash, generation, test_subject_key, module_key "
                 f"FROM code_files "
                 f"WHERE project_id = ? AND path_role = 'test' "
+                f"AND language IN ({placeholders_lang}) "
                 f"AND (test_subject_key IN ({placeholders_subj}) OR module_key IN ({placeholders_mod})) "
                 f"ORDER BY path LIMIT ?"
             )
-            params = (repository_id, *target_subjects, *target_modules, ql)
+            params = (repository_id, *heuristic_langs, *target_subjects, *target_modules, ql)
             query_plans.append(f"P2-subject-key: {_explain(sql, params)}")
             try:
                 rows = self.store._conn.execute(sql, params).fetchall()
             except sqlite3.OperationalError:
                 # Columns not yet migrated — skip P2 gracefully
                 rows = []
-            sql_queries_issued += 1
-            sql_rows_returned += len(rows)
-            indexed_edge_rows_fetched += len(rows)
-            _after_query(len(rows))
+            else:
+                sql_queries_issued += 1
+                sql_rows_returned += len(rows)
+                indexed_edge_rows_fetched += len(rows)
+                _after_query(len(rows))
             for row in rows:
                 path = str(row[0])
                 subject_match = str(row[4]) in target_subjects if row[4] else False
