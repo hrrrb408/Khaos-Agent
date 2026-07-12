@@ -305,6 +305,7 @@ class PlanExecutionGate:
         ok, returned = self._store.mint_authorization_if_request_active(
             candidate,
             server_epoch=self._server_epoch,
+            boot_id=self._boot_id,
             expected_binding_digest=current_binding,
             audit_event=audit,
             now=now,
@@ -362,7 +363,11 @@ class PlanExecutionGate:
         request=stale + auth=active window can exist.
         """
         if not auth.approval_request_id:
-            self._store.revoke_authorization(auth.authorization_id)
+            self._store.revoke_authorization(
+                auth.authorization_id,
+                current_server_epoch=self._server_epoch,
+                current_boot_id=self._boot_id,
+            )
             return
         audit = PlanApprovalAuditEvent(
             event_id=new_event_id(),
@@ -486,6 +491,7 @@ class PlanExecutionGate:
             expected_repository_id=expected_repository_id,
             expected_binding_digest=auth.binding_digest,
             current_server_epoch=self._server_epoch,
+            current_boot_id=self._boot_id,
             lease_id=lease_id,
             owner_execution_id=owner_execution_id,
             head_sha=state.head_sha,
@@ -560,6 +566,7 @@ class PlanExecutionGate:
             expected_repository_id=expected_repository_id,
             expected_plan_id=expected_plan_id,
             current_server_epoch=self._server_epoch,
+            current_boot_id=self._boot_id,
             now=now,
         )
         if not active:
@@ -578,15 +585,27 @@ class PlanExecutionGate:
         )
 
     def release_lease(self, lease_id: str) -> bool:
-        """Release an execution lease (Batch 3 calls this when execution ends)."""
-        return self._store.release_lease(lease_id)
+        """Release an execution lease (Batch 3 calls this when execution ends).
+
+        Batch 2.5 §2: passes the gate's boot context so the store can verify
+        it matches the persisted singleton. A stale gate cannot release.
+        """
+        return self._store.release_lease(
+            lease_id,
+            current_server_epoch=self._server_epoch,
+            current_boot_id=self._boot_id,
+        )
 
     # ------------------------------------------------------------------
     # External invalidation hooks
     # ------------------------------------------------------------------
 
     def revoke_authorization(self, authorization_id: str) -> bool:
-        return self._store.revoke_authorization(authorization_id)
+        return self._store.revoke_authorization(
+            authorization_id,
+            current_server_epoch=self._server_epoch,
+            current_boot_id=self._boot_id,
+        )
 
     def revoke_authorizations_for_request(self, approval_request_id: str) -> int:
         return self._store.revoke_authorizations_for_request(approval_request_id)

@@ -119,7 +119,8 @@ CREATE TABLE IF NOT EXISTS plan_execution_authorizations (
     nonce_hash            TEXT NOT NULL UNIQUE,
     binding_digest        TEXT NOT NULL,
     status                TEXT NOT NULL,
-    server_epoch          INTEGER NOT NULL DEFAULT 0
+    server_epoch          INTEGER NOT NULL DEFAULT 0,
+    boot_id               TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_plan
@@ -227,6 +228,7 @@ CREATE TABLE IF NOT EXISTS plan_execution_leases (
     owner_execution_id    TEXT NOT NULL,
     status                TEXT NOT NULL DEFAULT 'active',
     server_epoch          INTEGER NOT NULL DEFAULT 0,
+    boot_id               TEXT NOT NULL DEFAULT '',
     created_at            REAL NOT NULL
 );
 
@@ -281,6 +283,19 @@ def _post_schema(conn: sqlite3.Connection) -> None:
     if "server_epoch" not in lease_cols:
         conn.execute(
             "ALTER TABLE plan_execution_leases ADD COLUMN server_epoch INTEGER NOT NULL DEFAULT 0"
+        )
+    # Batch 2.5 §2: bind authorizations and leases to boot_id so a stale
+    # runtime cannot mint/consume/validate using a cached epoch alone — the
+    # persisted boot_id must also match.
+    auth_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_authorizations)")}
+    if "boot_id" not in auth_cols:
+        conn.execute(
+            "ALTER TABLE plan_execution_authorizations ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''"
+        )
+    lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_leases)")}
+    if "boot_id" not in lease_cols:
+        conn.execute(
+            "ALTER TABLE plan_execution_leases ADD COLUMN boot_id TEXT NOT NULL DEFAULT ''"
         )
 
 
@@ -1031,17 +1046,40 @@ class PlanApprovalStore:
             binding_digest=row["binding_digest"],
         )
 
+    def _verify_persisted_boot_context(
+        self, *, server_epoch: int, boot_id: str,
+    ) -> bool:
+        """Verify the supplied epoch + boot_id match the persisted singleton.
+
+        Batch 2.5 §2: must be called INSIDE a ``BEGIN IMMEDIATE`` transaction.
+        Returns True if both match; False otherwise. This prevents a stale
+        runtime (whose cached epoch/boot_id no longer matches the persisted
+        state) from minting, consuming, or validating.
+        """
+        row = self._conn.execute(
+            "SELECT current_epoch, boot_id FROM plan_execution_server_state "
+            "WHERE singleton_key = 'global'"
+        ).fetchone()
+        if row is None:
+            return False
+        return int(row["current_epoch"]) == int(server_epoch) and str(row["boot_id"]) == boot_id
+
     def mint_authorization_if_request_active(
         self,
         auth: PlanExecutionAuthorization,
         *,
         server_epoch: int,
+        boot_id: str = "",
         expected_binding_digest: str,
         audit_event: PlanApprovalAuditEvent | None = None,
         now: float,
     ) -> tuple[bool, PlanExecutionAuthorization | None]:
         """Atomically mint an authorization only if the request is still
         APPROVED/NOT_REQUIRED and no prior ACTIVE/CONSUMED authorization exists.
+
+        Batch 2.5 §2: verifies the supplied ``server_epoch`` AND ``boot_id``
+        match the persisted ``plan_execution_server_state`` singleton — a
+        stale runtime whose cached epoch/boot_id no longer match cannot mint.
 
         Returns ``(True, auth)`` on a fresh mint, ``(True, existing)`` if an
         ACTIVE authorization already exists for this request (idempotent —
@@ -1054,6 +1092,12 @@ class PlanApprovalStore:
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            # Batch 2.5 §2: verify persisted boot context first.
+            if not self._verify_persisted_boot_context(
+                server_epoch=server_epoch, boot_id=boot_id,
+            ):
+                self._conn.rollback()
+                return False, None
             req = self._conn.execute(
                 "SELECT status, expires_at, binding_digest FROM plan_approval_requests "
                 "WHERE approval_request_id = ?",
@@ -1094,15 +1138,15 @@ class PlanApprovalStore:
                 INSERT INTO plan_execution_authorizations (
                     authorization_id, approval_request_id, plan_id, plan_content_hash,
                     repository_id, task_id, workspace_id, base_sha, repository_generation,
-                    issued_at, expires_at, nonce_hash, binding_digest, status, server_epoch
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    issued_at, expires_at, nonce_hash, binding_digest, status, server_epoch, boot_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     auth.authorization_id, auth.approval_request_id, auth.plan_id,
                     auth.plan_content_hash, auth.repository_id, auth.task_id,
                     auth.workspace_id, auth.base_sha, int(auth.repository_generation),
                     float(auth.issued_at), float(auth.expires_at), auth.nonce_hash,
-                    auth.binding_digest, auth.status.value, int(server_epoch),
+                    auth.binding_digest, auth.status.value, int(server_epoch), boot_id,
                 ),
             )
             if audit_event is not None:
@@ -1142,25 +1186,33 @@ class PlanApprovalStore:
         expected_repository_id: str,
         expected_binding_digest: str,
         current_server_epoch: int,
+        current_boot_id: str = "",
         audit_event: PlanApprovalAuditEvent | None = None,
         now: float,
     ) -> bool:
         """Atomically consume an authorization AND flip its request to CONSUMED.
 
         Verifies (all within one ``BEGIN IMMEDIATE``):
-        1. Authorization exists, is ACTIVE, and belongs to the caller's scope.
-        2. The nonce hashes to the stored ``nonce_hash``.
-        3. The authorization has not expired and its ``server_epoch`` matches
-           the current epoch (restart-invalidation).
-        4. The bound binding digest equals ``expected_binding_digest`` (drift
+        1. Persisted boot context matches supplied epoch + boot_id (§2).
+        2. Authorization exists, is ACTIVE, and belongs to the caller's scope.
+        3. The nonce hashes to the stored ``nonce_hash``.
+        4. The authorization has not expired and its ``server_epoch`` +
+           ``boot_id`` match the current boot (restart-invalidation).
+        5. The bound binding digest equals ``expected_binding_digest`` (drift
            check at consume time — §6).
-        5. The request is still APPROVED/NOT_REQUIRED.
+        6. The request is still APPROVED/NOT_REQUIRED.
 
         On success: authorization → CONSUMED, request → CONSUMED, audit
         written, all committed atomically. Any mismatch rolls back.
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            # Batch 2.5 §2: verify persisted boot context first.
+            if not self._verify_persisted_boot_context(
+                server_epoch=current_server_epoch, boot_id=current_boot_id,
+            ):
+                self._conn.rollback()
+                return False
             row = self._conn.execute(
                 "SELECT * FROM plan_execution_authorizations WHERE authorization_id = ?",
                 (authorization_id,),
@@ -1179,8 +1231,8 @@ class PlanApprovalStore:
             ):
                 self._conn.rollback()
                 return False
-            if int(row["server_epoch"]) != int(current_server_epoch):
-                # Restart-invalidation: authorization minted under a prior epoch.
+            if int(row["server_epoch"]) != int(current_server_epoch) or str(row["boot_id"]) != current_boot_id:
+                # Restart-invalidation: authorization minted under a prior boot.
                 self._conn.execute(
                     "UPDATE plan_execution_authorizations SET status = ? WHERE authorization_id = ?",
                     (AuthorizationStatus.REVOKED.value, authorization_id),
@@ -1249,10 +1301,22 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
-    def revoke_authorization(self, authorization_id: str) -> bool:
-        """Externally invalidate an authorization (e.g. on Task cancel)."""
+    def revoke_authorization(
+        self, authorization_id: str, *,
+        current_server_epoch: int = 0, current_boot_id: str = "",
+    ) -> bool:
+        """Externally invalidate an authorization (e.g. on Task cancel).
+
+        Batch 2.5 §2: verifies the persisted boot context before revoking.
+        A stale runtime cannot revoke authorizations from a newer boot.
+        """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            if not self._verify_persisted_boot_context(
+                server_epoch=current_server_epoch, boot_id=current_boot_id,
+            ):
+                self._conn.rollback()
+                return False
             row = self._conn.execute(
                 "SELECT status FROM plan_execution_authorizations WHERE authorization_id = ?",
                 (authorization_id,),
@@ -1663,10 +1727,22 @@ class PlanApprovalStore:
             self._conn.rollback()
             return False
 
-    def release_lease(self, lease_id: str) -> bool:
-        """Release (mark released) an execution lease."""
+    def release_lease(
+        self, lease_id: str, *,
+        current_server_epoch: int = 0, current_boot_id: str = "",
+    ) -> bool:
+        """Release (mark released) an execution lease.
+
+        Batch 2.5 §2: verifies the persisted boot context before releasing.
+        A stale runtime cannot release leases from a newer boot.
+        """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            if not self._verify_persisted_boot_context(
+                server_epoch=current_server_epoch, boot_id=current_boot_id,
+            ):
+                self._conn.rollback()
+                return False
             cur = self._conn.execute(
                 "UPDATE plan_execution_leases SET status = 'released' "
                 "WHERE lease_id = ? AND status = 'active'",
@@ -1700,6 +1776,7 @@ class PlanApprovalStore:
         expected_repository_id: str,
         expected_binding_digest: str,
         current_server_epoch: int,
+        current_boot_id: str = "",
         lease_id: str,
         owner_execution_id: str,
         head_sha: str,
@@ -1710,14 +1787,16 @@ class PlanApprovalStore:
     ) -> bool:
         """Lease-first atomic consume: ONE ``BEGIN IMMEDIATE`` does ALL of:
 
-        1. Read authorization; verify ACTIVE, scope, nonce, epoch, expiry, binding.
-        2. Read approval request; verify APPROVED/NOT_REQUIRED.
-        3. Confirm workspace has NO existing ACTIVE lease (else rollback).
-        4. Insert ACTIVE lease (stamped with current epoch).
-        5. Authorization → CONSUMED.
-        6. Request → CONSUMED.
-        7. Insert audit event.
-        8. COMMIT.
+        1. Verify persisted boot context matches supplied epoch + boot_id (§2).
+        2. Read authorization; verify ACTIVE, scope, nonce, epoch, boot_id,
+           expiry, binding.
+        3. Read approval request; verify APPROVED/NOT_REQUIRED.
+        4. Confirm workspace has NO existing ACTIVE lease (else rollback).
+        5. Insert ACTIVE lease (stamped with current epoch + boot_id).
+        6. Authorization → CONSUMED.
+        7. Request → CONSUMED.
+        8. Insert audit event.
+        9. COMMIT.
 
         Any step failing rolls back the ENTIRE transaction: the authorization
         stays ACTIVE, the request stays APPROVED/NOT_REQUIRED, no lease row
@@ -1726,7 +1805,13 @@ class PlanApprovalStore:
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            # 1. Read + verify the authorization.
+            # 1. Batch 2.5 §2: verify persisted boot context first.
+            if not self._verify_persisted_boot_context(
+                server_epoch=current_server_epoch, boot_id=current_boot_id,
+            ):
+                self._conn.rollback()
+                return False
+            # 2. Read + verify the authorization.
             auth_row = self._conn.execute(
                 "SELECT * FROM plan_execution_authorizations WHERE authorization_id = ?",
                 (authorization_id,),
@@ -1745,7 +1830,7 @@ class PlanApprovalStore:
             ):
                 self._conn.rollback()
                 return False
-            if int(auth_row["server_epoch"]) != int(current_server_epoch):
+            if int(auth_row["server_epoch"]) != int(current_server_epoch) or str(auth_row["boot_id"]) != current_boot_id:
                 self._conn.rollback()
                 return False
             if not verify_nonce(nonce, auth_row["nonce_hash"]):
@@ -1758,7 +1843,7 @@ class PlanApprovalStore:
                 self._conn.rollback()
                 return False
 
-            # 2. Read + verify the approval request.
+            # 3. Read + verify the approval request.
             req_row = self._conn.execute(
                 "SELECT status FROM plan_approval_requests WHERE approval_request_id = ?",
                 (auth_row["approval_request_id"],),
@@ -1771,7 +1856,7 @@ class PlanApprovalStore:
                 self._conn.rollback()
                 return False
 
-            # 3 + 4. Insert the ACTIVE lease. The partial unique index
+            # 4 + 5. Insert the ACTIVE lease. The partial unique index
             # uq_plan_execution_leases_active_workspace makes a conflicting
             # ACTIVE lease raise IntegrityError → rollback (no consume).
             self._conn.execute(
@@ -1779,15 +1864,15 @@ class PlanApprovalStore:
                 INSERT INTO plan_execution_leases (
                     lease_id, task_id, workspace_id, repository_id, plan_id,
                     head_sha, repository_generation, evidence_digest, binding_digest,
-                    authorization_id, expiry, owner_execution_id, status, server_epoch, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                    authorization_id, expiry, owner_execution_id, status, server_epoch, boot_id, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
                 """,
                 (
                     lease_id, expected_task_id, expected_workspace_id, expected_repository_id,
                     expected_plan_id, head_sha, int(repository_generation),
                     evidence_digest, expected_binding_digest, authorization_id,
                     float(auth_row["expires_at"]), owner_execution_id,
-                    int(current_server_epoch), now,
+                    int(current_server_epoch), current_boot_id, now,
                 ),
             )
 
@@ -1843,58 +1928,87 @@ class PlanApprovalStore:
         expected_repository_id: str,
         expected_plan_id: str,
         current_server_epoch: int,
+        current_boot_id: str = "",
         now: float,
     ) -> bool:
         """Verify a lease is ACTIVE, owned by the caller, scope-correct,
-        unexpired, and bound to the current boot epoch.
+        unexpired, and bound to the current boot epoch + boot_id.
+
+        Batch 2.5 §2: verifies the persisted boot context matches the
+        supplied epoch + boot_id BEFORE checking the lease. A stale runtime
+        whose cached epoch/boot_id no longer match the persisted state
+        cannot validate contexts.
 
         Every Batch 3 execution entry must call this BEFORE touching the
         workspace. Returns True if the lease is valid; False otherwise.
         """
-        row = self._conn.execute(
-            "SELECT * FROM plan_execution_leases WHERE lease_id = ?",
-            (lease_id,),
-        ).fetchone()
-        if row is None:
-            return False
-        if row["status"] != "active":
-            return False
-        if now >= float(row["expiry"]):
-            # Auto-expire the stale lease so it doesn't permanently block.
-            self._conn.execute(
-                "UPDATE plan_execution_leases SET status = 'expired' WHERE lease_id = ?",
-                (lease_id,),
-            )
+        if self._conn.in_transaction:
             self._conn.commit()
-            return False
-        if row["owner_execution_id"] != owner_execution_id:
-            return False
-        if (
-            row["task_id"] != expected_task_id
-            or row["workspace_id"] != expected_workspace_id
-            or row["repository_id"] != expected_repository_id
-            or row["plan_id"] != expected_plan_id
-        ):
-            return False
-        if int(row["server_epoch"]) != int(current_server_epoch):
-            return False
-        auth = self._conn.execute(
-            "SELECT status,binding_digest,approval_request_id FROM plan_execution_authorizations WHERE authorization_id=?",
-            (row["authorization_id"],),
-        ).fetchone()
-        if auth is None or auth["status"] != AuthorizationStatus.CONSUMED.value:
-            return False
-        if auth["binding_digest"] != row["binding_digest"]:
-            return False
-        request = self._conn.execute(
-            "SELECT status,binding_digest FROM plan_approval_requests WHERE approval_request_id=?",
-            (auth["approval_request_id"],),
-        ).fetchone()
-        if request is None or request["status"] != PlanApprovalStatus.CONSUMED.value:
-            return False
-        if request["binding_digest"] != row["binding_digest"]:
-            return False
-        return True
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Batch 2.5 §2: verify persisted boot context first.
+            if not self._verify_persisted_boot_context(
+                server_epoch=current_server_epoch, boot_id=current_boot_id,
+            ):
+                self._conn.rollback()
+                return False
+            row = self._conn.execute(
+                "SELECT * FROM plan_execution_leases WHERE lease_id = ?",
+                (lease_id,),
+            ).fetchone()
+            if row is None:
+                self._conn.rollback()
+                return False
+            if row["status"] != "active":
+                self._conn.rollback()
+                return False
+            if now >= float(row["expiry"]):
+                # Auto-expire the stale lease so it doesn't permanently block.
+                self._conn.execute(
+                    "UPDATE plan_execution_leases SET status = 'expired' WHERE lease_id = ?",
+                    (lease_id,),
+                )
+                self._conn.commit()
+                return False
+            if row["owner_execution_id"] != owner_execution_id:
+                self._conn.rollback()
+                return False
+            if (
+                row["task_id"] != expected_task_id
+                or row["workspace_id"] != expected_workspace_id
+                or row["repository_id"] != expected_repository_id
+                or row["plan_id"] != expected_plan_id
+            ):
+                self._conn.rollback()
+                return False
+            if int(row["server_epoch"]) != int(current_server_epoch) or str(row["boot_id"]) != current_boot_id:
+                self._conn.rollback()
+                return False
+            auth = self._conn.execute(
+                "SELECT status,binding_digest,approval_request_id,boot_id FROM plan_execution_authorizations WHERE authorization_id=?",
+                (row["authorization_id"],),
+            ).fetchone()
+            if auth is None or auth["status"] != AuthorizationStatus.CONSUMED.value:
+                self._conn.rollback()
+                return False
+            if auth["binding_digest"] != row["binding_digest"]:
+                self._conn.rollback()
+                return False
+            request = self._conn.execute(
+                "SELECT status,binding_digest FROM plan_approval_requests WHERE approval_request_id=?",
+                (auth["approval_request_id"],),
+            ).fetchone()
+            if request is None or request["status"] != PlanApprovalStatus.CONSUMED.value:
+                self._conn.rollback()
+                return False
+            if request["binding_digest"] != row["binding_digest"]:
+                self._conn.rollback()
+                return False
+            self._conn.commit()
+            return True
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def count_active_leases_for_workspace(self, workspace_id: str) -> int:
         """Return the count of ACTIVE leases on a workspace (invariant check)."""
