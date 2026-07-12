@@ -36,6 +36,7 @@ import pytest
 
 from _m4_batch2_helpers import (  # type: ignore[import-not-found]
     FakeContextProvider,
+    FakeMutationParticipant,
     SyncBroker,
     broker_decide,
     high_risk,
@@ -97,6 +98,8 @@ def _runtime(store, *, broker=None, context=None, plan_repository=None, planning
         context_provider=context or FakeContextProvider(),
         plan_repository=plan_repository or PersistedPlanRepository(store),
         planning_service=planning_service or DeepFakePlanningService(),
+        task_manager=FakeMutationParticipant(), workspace_manager=FakeMutationParticipant(),
+        repository_indexer=FakeMutationParticipant(),
     )
     rt._test_sync = sync
     return rt
@@ -148,13 +151,15 @@ def _authorize_and_acquire_lease(runtime, plan, request):
     auth = runtime.authorize_execution(
         plan_id=plan.plan_id, approval_request_id=request.approval_request_id,
     )
-    guard = PlannedExecutionGuard(runtime.gate)
-    ctx = guard.authorize(
-        auth.authorization_id, auth.nonce,
+    guard = runtime.guard
+    cm = runtime.acquire_execution_context(
+        authorization_id=auth.authorization_id, nonce=auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
         owner_execution_id="exec_test",
     )
+    ctx = runtime._test_sync._loop.run_until_complete(cm.__aenter__())
+    guard._test_context_manager = cm
     return auth, ctx, guard
 
 

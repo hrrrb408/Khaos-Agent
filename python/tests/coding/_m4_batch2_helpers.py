@@ -69,6 +69,14 @@ class FakeContextProvider:
         )
 
 
+class FakeMutationParticipant:
+    def __init__(self):
+        self.fence = None
+
+    def set_mutation_fence(self, fence):
+        self.fence = fence
+
+
 # ---------------------------------------------------------------------------
 # Risk / verification factories
 # ---------------------------------------------------------------------------
@@ -378,12 +386,11 @@ def broker_decide(
     )
     bd = binding_digest if binding_digest is not None else request.binding_digest
     real_broker = broker._real if isinstance(broker, SyncBroker) else broker
-    # Batch 2.6: install the signed receipt writer + register the broker's
-    # ReceiptSigner with the store's verification registry. In production,
+    # Install the signed receipt writer + broker public verifier. In production,
     # ApprovalRuntime.initialize() does this automatically. The writer is
     # name-mangled and token-gated so ordinary code cannot install one.
-    signer = real_broker.receipt_signer
-    _wire_test_receipt_writer(store, real_broker, signer)
+    verifier = real_broker._receipt_public_verifier()
+    _wire_test_receipt_writer(store, real_broker, verifier)
 
     if isinstance(broker, SyncBroker):
         return broker.resolve_plan_approval(
@@ -401,24 +408,23 @@ def broker_decide(
     )
 
 
-def _wire_test_receipt_writer(store, broker, signer):
-    """Install the signed receipt writer + signer on store/broker for tests.
+def _wire_test_receipt_writer(store, broker, verifier):
+    """Install writer authority and public verifier for tests.
 
     Mirrors what ApprovalRuntime.initialize() does in production. Test-only.
-    Persists the signer's key and loads old signers so receipts from prior
-    broker instances remain verifiable (restart/concurrency scenarios).
+    Persists only public verification material so receipts from prior broker
+    instances remain verifiable (restart/concurrency scenarios).
     """
     token = object()
-    # Load old signers (for verifying receipts from prior broker instances).
-    for old_signer in store.load_receipt_signers():
-        if old_signer.key_id != signer.key_id:
-            store._register_receipt_signer(old_signer, runtime_token=token)
-    # Persist the current signer and register it.
-    store.persist_receipt_signer(signer)
-    store._register_receipt_signer(signer, runtime_token=token)
     def _writer(**fields):
-        store._insert_signed_receipt(**fields)
-    broker._install_runtime_receipt_writer(_writer, runtime_token=token)
+        store._insert_signed_receipt(runtime_token=token, **fields)
+    # Explicit unsafe test wiring: production install methods require an
+    # opaque, single-use ApprovalRuntime capability.
+    store._PlanApprovalStore__runtime_receipt_writer = _writer
+    store._PlanApprovalStore__runtime_receipt_token = token
+    store._persist_receipt_verifier(verifier, runtime_token=token)
+    broker._ApprovalBroker__runtime_receipt_writer = _writer
+    broker._ApprovalBroker__runtime_receipt_token = token
 
 
 def approve_and_apply(

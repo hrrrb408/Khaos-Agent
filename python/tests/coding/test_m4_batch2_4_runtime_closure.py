@@ -6,7 +6,7 @@ from dataclasses import replace
 
 import pytest
 
-from _m4_batch2_helpers import FakeContextProvider, SyncBroker, make_gate, make_plan, make_service
+from _m4_batch2_helpers import FakeContextProvider, FakeMutationParticipant, SyncBroker, make_gate, make_plan, make_service
 from khaos.coding.planning.approval import (
     ApprovalAuthenticator, ApprovalRuntime, AuthenticatedSession,
     PersistedPlanRepository, PlanApprovalStore,
@@ -61,7 +61,7 @@ class DeepFakePlanningService:
 def _runtime(store):
     # Batch 2.5: runtime requires a real ApprovalBroker with authenticator.
     sync=SyncBroker()
-    return ApprovalRuntime(store=store,broker=sync.real,context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=DeepFakePlanningService())
+    return ApprovalRuntime(store=store,broker=sync.real,context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=DeepFakePlanningService(),task_manager=FakeMutationParticipant(),workspace_manager=FakeMutationParticipant(),repository_indexer=FakeMutationParticipant())
 
 
 def test_production_runtime_dependencies_fail_closed():

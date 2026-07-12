@@ -232,9 +232,14 @@ def test_20_receipt_outbox_refuses_replace():
     """20. The same receipt_id or token_hash cannot be silently overwritten."""
     store = PlanApprovalStore(sqlite3.connect(":memory:"))
     # Batch 2.6: use _insert_signed_receipt with a valid signature.
-    from khaos.coding.planning.approval import ReceiptSigner
     from khaos.coding.planning.approval.models import BrokerDecisionReceipt, PlanApprovalStatus
-    signer = ReceiptSigner()
+    from khaos.coding.planning.approval.receipt_crypto import _ReceiptSigningAuthority
+    signer = _ReceiptSigningAuthority()
+    verifier = signer.verifier
+    runtime_token = object()
+    store._PlanApprovalStore__runtime_receipt_writer = lambda **fields: None
+    store._PlanApprovalStore__runtime_receipt_token = runtime_token
+    store._persist_receipt_verifier(verifier, runtime_token=runtime_token)
     # Build a minimal receipt to compute the canonical payload digest + signature.
     receipt = BrokerDecisionReceipt(
         receipt_id="r1", namespace="plan-execution", broker_request_id="b",
@@ -245,31 +250,34 @@ def test_20_receipt_outbox_refuses_replace():
         reason_digest="", one_time_token="", token_hash="th1",
     )
     payload_digest = receipt.compute_canonical_payload_digest()
-    signature = signer.sign_receipt_payload_digest(payload_digest)
+    signature = signer._sign_payload_digest(payload_digest)
     store._insert_signed_receipt(
+        runtime_token=runtime_token,
         receipt_id="r1", token_hash="th1", approval_request_id="a",
         broker_request_id="b", binding_digest="bd", decision="approved",
         expires_at=9999999999.0,
         canonical_payload_digest=payload_digest,
-        broker_signature=signature, signer_key_id=signer.key_id,
+        broker_signature=signature, signer_key_id=verifier.key_id,
     )
     # Same receipt_id → IntegrityError (plain INSERT, no REPLACE).
     with pytest.raises(sqlite3.IntegrityError):
         store._insert_signed_receipt(
+            runtime_token=runtime_token,
             receipt_id="r1", token_hash="th2", approval_request_id="a2",
             broker_request_id="b2", binding_digest="bd2", decision="rejected",
             expires_at=9999999999.0,
             canonical_payload_digest=payload_digest,
-            broker_signature=signature, signer_key_id=signer.key_id,
+            broker_signature=signature, signer_key_id=verifier.key_id,
         )
     # Same token_hash → IntegrityError.
     with pytest.raises(sqlite3.IntegrityError):
         store._insert_signed_receipt(
+            runtime_token=runtime_token,
             receipt_id="r2", token_hash="th1", approval_request_id="a3",
             broker_request_id="b3", binding_digest="bd3", decision="approved",
             expires_at=9999999999.0,
             canonical_payload_digest=payload_digest,
-            broker_signature=signature, signer_key_id=signer.key_id,
+            broker_signature=signature, signer_key_id=verifier.key_id,
         )
 
 

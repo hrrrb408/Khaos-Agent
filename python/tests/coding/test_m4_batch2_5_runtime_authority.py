@@ -27,6 +27,7 @@ import pytest
 
 from _m4_batch2_helpers import (  # type: ignore[import-not-found]
     FakeContextProvider,
+    FakeMutationParticipant,
     SyncBroker,
     broker_decide,
     high_risk,
@@ -89,6 +90,8 @@ def _runtime(store, *, broker=None, context=None, plan_repository=None, planning
         context_provider=context or FakeContextProvider(),
         plan_repository=plan_repository or PersistedPlanRepository(store),
         planning_service=planning_service or DeepFakePlanningService(),
+        task_manager=FakeMutationParticipant(), workspace_manager=FakeMutationParticipant(),
+        repository_indexer=FakeMutationParticipant(),
     )
     rt._test_sync = sync  # test-only: drive the broker via its event loop
     return rt
@@ -152,13 +155,15 @@ def _authorize_and_acquire_lease(runtime, plan, request):
     auth = runtime.authorize_execution(
         plan_id=plan.plan_id, approval_request_id=request.approval_request_id,
     )
-    guard = PlannedExecutionGuard(runtime.gate)
-    ctx = guard.authorize(
-        auth.authorization_id, auth.nonce,
+    guard = runtime.guard
+    cm = runtime.acquire_execution_context(
+        authorization_id=auth.authorization_id, nonce=auth.nonce,
         expected_plan_id=plan.plan_id, expected_task_id=plan.task_id,
         expected_workspace_id=plan.workspace_id, expected_repository_id=plan.repository_id,
         owner_execution_id="exec_test",
     )
+    ctx = runtime._test_sync._loop.run_until_complete(cm.__aenter__())
+    guard._test_context_manager = cm
     return auth, ctx, guard
 
 
@@ -209,7 +214,7 @@ def test_03_receipt_wiring_failure_leaves_runtime_not_ready():
     real_broker = sync.real
     # Monkey-patch the writer installation method to simulate failure.
     original = type(real_broker)._install_runtime_receipt_writer
-    def broken_install(self, writer, *, runtime_token):
+    def broken_install(self, writer, *, runtime_token, runtime_capability=None):
         raise RuntimeError("broker writer installation broken")
     type(real_broker)._install_runtime_receipt_writer = broken_install
     try:
@@ -218,6 +223,8 @@ def test_03_receipt_wiring_failure_leaves_runtime_not_ready():
             context_provider=FakeContextProvider(),
             plan_repository=PersistedPlanRepository(store),
             planning_service=DeepFakePlanningService(),
+            task_manager=FakeMutationParticipant(), workspace_manager=FakeMutationParticipant(),
+            repository_indexer=FakeMutationParticipant(),
         )
         with pytest.raises(RuntimeError):
             runtime.initialize()
@@ -574,7 +581,9 @@ def test_15_direct_gate_construction_without_runtime_capability_refuses():
             planning_service=DeepFakePlanningService(),
         )
     # runtime_capability present but plan_repository is PlanSnapshotStore.
-    cap = RuntimeCapability(boot_context=BootContext(server_epoch=1, boot_id="x"))
+    with pytest.raises(TypeError):
+        RuntimeCapability(boot_context=BootContext(server_epoch=1, boot_id="x"))
+    cap = object()
     with pytest.raises(TypeError):
         PlanExecutionGate(
             store=store, context_provider=FakeContextProvider(),
@@ -611,7 +620,9 @@ def test_16_direct_service_construction_without_deep_validator_refuses():
             store=store, broker=sync.real, context_provider=FakeContextProvider(),
             plan_repository=PersistedPlanRepository(store), planning_service=DeepFakePlanningService(),
         )
-    cap = RuntimeCapability(boot_context=BootContext(server_epoch=1, boot_id="x"))
+    with pytest.raises(TypeError):
+        RuntimeCapability(boot_context=BootContext(server_epoch=1, boot_id="x"))
+    cap = object()
     # runtime_capability present but planning_service is None.
     with pytest.raises(TypeError):
         PlanApprovalService(
