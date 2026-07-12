@@ -666,6 +666,13 @@ class BrokerDecisionReceipt:
     * Actor identity originates from :class:`AuthenticatedApprovalContext`,
       which only the authenticated API/session layer may construct — never
       from caller args to ``apply_broker_decision``.
+    * Batch 2.6 §1: the broker signs the canonical payload digest with an
+      internal HMAC key. ``broker_signature`` and ``signer_key_id`` are
+      persisted alongside the outbox row, and ``apply_authenticated_decision``
+      re-verifies the signature. Direct DB writes by ordinary code cannot
+      produce a valid signature, so a forged outbox row is rejected even if
+      it matches a known token hash. Old unsigned receipts (signature="")
+      are rejected fail-closed after the upgrade.
 
     The receipt is namespaced (``namespace == "plan-execution"``) so it can
     never be confused with a Task or ChangeSet approval.
@@ -687,7 +694,105 @@ class BrokerDecisionReceipt:
     reason_digest: str  # SHA-256 of the decision reason; bound into the durable row
     one_time_token: str  # plaintext; never persisted, never logged
     token_hash: str  # persisted surrogate (hash of one_time_token)
+    # Batch 2.6 §1: unforgeable broker signature over the canonical payload.
+    canonical_payload_digest: str = ""
+    broker_signature: str = ""
+    signer_key_id: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+
+    def canonical_payload(self) -> str:
+        """Canonical payload over which the broker signature is computed.
+
+        Includes every authoritative field plus the token hash (NOT the
+        plaintext token — that is never persisted). Tampering ANY field
+        changes the canonical payload and invalidates the signature.
+        """
+        return "|".join([
+            self.receipt_id,
+            self.namespace,
+            self.broker_request_id,
+            self.approval_request_id,
+            self.decision.value,
+            self.authenticated_actor_id,
+            self.authenticated_actor_type,
+            self.authenticated_source,
+            self.session_request_id,
+            self.server_capability,
+            self.binding_digest,
+            f"{self.decided_at:.6f}",
+            f"{self.expires_at:.6f}",
+            self.reason_digest,
+            self.token_hash,
+        ])
+
+    def compute_canonical_payload_digest(self) -> str:
+        """SHA-256 of the canonical payload. Persisted alongside the row so
+        signature verification can recompute it deterministically."""
+        return hashlib.sha256(self.canonical_payload().encode("utf-8")).hexdigest()
+
+
+class ReceiptSigner:
+    """Server-owned HMAC signer for :class:`BrokerDecisionReceipt` payloads.
+
+    Batch 2.6 §1: the broker holds a ``ReceiptSigner`` internally. The
+    signing key is generated at construction (or supplied for test
+    reproducibility) and is NEVER exposed as a property, attribute, or
+    return value. ``sign_receipt`` is the ONLY way to compute a valid
+    ``broker_signature`` for a receipt's canonical payload digest.
+
+    The ``signer_key_id`` is a stable identifier (hash of the key) that
+    ``apply_authenticated_decision`` uses to look up the verification key.
+    Key rotation strategy: a new ``ReceiptSigner`` generates a new key +
+    key_id. The store's ``plan_approval_receipts`` row records the
+    ``signer_key_id`` so old receipts remain verifiable against their
+    original signer. A signer whose key_id is not registered with the
+    store's verification registry is rejected fail-closed.
+    """
+
+    def __init__(self, secret_key: str | None = None) -> None:
+        self._key = secret_key or secrets.token_hex(32)
+        self._key_id = hashlib.sha256(self._key.encode("utf-8")).hexdigest()[:16]
+
+    @property
+    def key_id(self) -> str:
+        """Stable identifier for this signing key (NOT the key itself)."""
+        return self._key_id
+
+    def sign_receipt(self, receipt: BrokerDecisionReceipt) -> str:
+        """Compute the HMAC signature over the receipt's canonical payload digest.
+
+        Returns the hex digest of ``HMAC-SHA256(key, canonical_payload_digest)``.
+        The signature is bound to the receipt's token_hash + every
+        authoritative field — tampering any field invalidates it.
+        """
+        payload_digest = receipt.compute_canonical_payload_digest()
+        return self.sign_receipt_payload_digest(payload_digest)
+
+    def sign_receipt_payload_digest(self, payload_digest: str) -> str:
+        """Compute the HMAC signature over a precomputed payload digest.
+
+        Used by :meth:`PlanApprovalStore.apply_authenticated_decision` to
+        re-verify a persisted row's signature against the persisted
+        ``canonical_payload_digest`` without reconstructing a full receipt.
+        """
+        return hmac.new(
+            self._key.encode("utf-8"), payload_digest.encode("utf-8"), hashlib.sha256,
+        ).hexdigest()
+
+    def verify_receipt(self, receipt: BrokerDecisionReceipt) -> bool:
+        """Constant-time verification of a receipt's broker signature.
+
+        Returns False if:
+        * the signature is empty (old unsigned receipt — fail closed);
+        * the signer_key_id does not match this signer's key_id;
+        * the HMAC does not match (tampered field).
+        """
+        if not receipt.broker_signature or not receipt.signer_key_id:
+            return False
+        if not hmac.compare_digest(receipt.signer_key_id, self._key_id):
+            return False
+        expected = self.sign_receipt(receipt)
+        return hmac.compare_digest(receipt.broker_signature, expected)
 
 
 @dataclass(frozen=True)

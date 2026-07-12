@@ -50,9 +50,12 @@ class ApprovalRuntime:
     def initialize(self) -> BootContext:
         """Initialize the runtime: wire receipts, construct services, reconcile.
 
-        Batch 2.5 §1: this method self-wires the Broker → Receipt outbox
-        channel. On failure, ``ready`` stays False and no half-bound broker
-        state remains.
+        Batch 2.6 §1: self-wires the Broker → durable Receipt outbox via the
+        broker's internal ``ReceiptSigner``. The runtime installs a
+        name-mangled writer closure on the broker AND registers the broker's
+        signer with the store's verification registry. On failure, ``ready``
+        stays False, the broker's writer is cleared, and the store's signer
+        registry is cleared — no half-bound state remains.
 
         Batch 2.5 §7: ``initialize()`` can only succeed once per instance.
         A second call on an already-ready runtime is explicitly refused.
@@ -64,11 +67,31 @@ class ApprovalRuntime:
             epoch, boot_id, _ = self._store.rotate_epoch()
             self.boot_context = BootContext(epoch, boot_id)
 
-            # 2. Wire Broker → durable Receipt outbox (Batch 2.5 §1 + §6)
-            #    Create a sink closure from the store's internal capability
-            #    and register it with the broker via name-mangled attribute.
-            sink = self._store._create_receipt_sink()
-            self._broker._register_runtime_receipt_sink(sink, runtime_token=self._runtime_token)
+            # 2. Wire Broker → durable Receipt outbox (Batch 2.6 §1)
+            #    Install a writer closure on the broker that calls the
+            #    store's _insert_signed_receipt. Register the broker's
+            #    ReceiptSigner with the store's verification registry so
+            #    apply_authenticated_decision can re-verify the signature.
+            #    Also persist the signer's key and load old signers so
+            #    receipts from prior boots remain verifiable across restart.
+            signer = self._broker.receipt_signer
+            store = self._store
+            # Load old signers (for verifying receipts from prior boots).
+            for old_signer in store.load_receipt_signers():
+                if old_signer.key_id != signer.key_id:
+                    store._register_receipt_signer(
+                        old_signer, runtime_token=self._runtime_token,
+                    )
+            # Persist the current signer and register it.
+            store.persist_receipt_signer(signer)
+            store._register_receipt_signer(
+                signer, runtime_token=self._runtime_token,
+            )
+            def _writer(**fields):
+                store._insert_signed_receipt(**fields)
+            self._broker._install_runtime_receipt_writer(
+                _writer, runtime_token=self._runtime_token,
+            )
 
             # 3. Construct Gate and Service
             self.gate = PlanExecutionGate(
@@ -91,11 +114,19 @@ class ApprovalRuntime:
             logger.info("approval runtime initialized: epoch=%d boot=%s", epoch, boot_id[:8])
             return self.boot_context
         except Exception:
-            # On failure: not ready, no half-bound broker
+            # On failure: not ready, no half-bound broker, no registered signer.
             self.ready = False
             self.gate = None
             self.service = None
             self.boot_context = None
+            try:
+                self._broker._reset_runtime_receipt_writer()
+            except Exception:
+                pass
+            try:
+                self._store._reset_runtime_receipt_writer()
+            except Exception:
+                pass
             raise
 
     def require_ready(self) -> None:
@@ -125,6 +156,10 @@ class ApprovalRuntime:
         (leases + still-ACTIVE authorizations) for this boot, then rotates
         the epoch to fence any remaining state. After shutdown, all
         operations refuse.
+
+        Batch 2.6 §1: also clears the broker's receipt writer and the
+        store's signer registry so no further receipts can be minted or
+        verified under this boot.
         """
         if self.ready:
             # Cancel all ACTIVE leases for this boot before rotating the epoch.
@@ -132,6 +167,15 @@ class ApprovalRuntime:
                 boot_id=self.boot_context.boot_id, reason="runtime-shutdown",
             )
             self._store.rotate_epoch()
+            # Clear the broker's writer and the store's signer registry.
+            try:
+                self._broker._reset_runtime_receipt_writer()
+            except Exception:
+                pass
+            try:
+                self._store._reset_runtime_receipt_writer()
+            except Exception:
+                pass
             self.ready = False
             self.gate = None
             self.service = None

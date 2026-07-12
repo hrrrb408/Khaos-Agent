@@ -49,7 +49,7 @@ class PlanApprovalOutcome:
 class ApprovalBroker:
     """One await/resolve channel keyed by tool call id."""
 
-    def __init__(self, authenticator=None) -> None:
+    def __init__(self, authenticator=None, *, receipt_signer=None) -> None:
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._decisions: dict[str, ApprovalDecision] = {}
         self._bindings: dict[str, tuple[str, float | None]] = {}
@@ -61,25 +61,49 @@ class ApprovalBroker:
         # AuthenticatedApprovalContext signatures. If None, the broker
         # refuses all plan-approval decisions (fail closed).
         self._authenticator = authenticator
-        # Batch 2.5 §6: the receipt sink is stored name-mangled so ordinary
-        # code and tests cannot read or replace it. Only ApprovalRuntime
-        # can register it via _register_runtime_receipt_sink with the
-        # runtime-internal token.
-        self.__runtime_receipt_sink = None  # type: ignore[assignment]
+        # Batch 2.6 §1: server-owned ReceiptSigner for HMAC-signing durable
+        # BrokerDecisionReceipts. The signing key is NEVER exposed. If None,
+        # a new signer is generated lazily at first resolve. The runtime
+        # registers the signer with the store's verification registry so
+        # apply_authenticated_decision can re-verify the signature.
+        self._receipt_signer = receipt_signer
+        # Batch 2.6 §1: the durable receipt writer is stored name-mangled so
+        # ordinary code and tests cannot read or replace it. Only the runtime
+        # can install it via _install_runtime_receipt_writer with the
+        # runtime-internal token. Replaces the old _register_runtime_receipt_sink.
+        self.__runtime_receipt_writer = None  # type: ignore[assignment]
         self.__runtime_receipt_token = None  # type: ignore[assignment]
 
-    def _register_runtime_receipt_sink(self, sink, *, runtime_token: object) -> None:
-        """Register the durable receipt sink produced by ApprovalRuntime.
+    @property
+    def receipt_signer(self):
+        """Lazily create a ReceiptSigner (the signer, NOT the key)."""
+        if self._receipt_signer is None:
+            from khaos.coding.planning.approval.models import ReceiptSigner
+            self._receipt_signer = ReceiptSigner()
+        return self._receipt_signer
 
+    def _install_runtime_receipt_writer(self, writer, *, runtime_token: object) -> None:
+        """Install the durable receipt writer produced by ApprovalRuntime.
+
+        Batch 2.6 §1: replaces the old ``_register_runtime_receipt_sink``.
         The ``runtime_token`` is an opaque object that only
         :class:`ApprovalRuntime` possesses. A forged token (or a call
-        without one) is silently ignored — the sink stays ``None`` and
+        without one) is silently ignored — the writer stays ``None`` and
         receipt persistence is refused (fail-closed).
         """
         if runtime_token is None:
             return
         self.__runtime_receipt_token = runtime_token  # type: ignore[assignment]
-        self.__runtime_receipt_sink = sink  # type: ignore[assignment]
+        self.__runtime_receipt_writer = writer  # type: ignore[assignment]
+
+    def _reset_runtime_receipt_writer(self) -> None:
+        """Clear the runtime receipt writer (used by runtime rollback)."""
+        self.__runtime_receipt_writer = None  # type: ignore[assignment]
+        self.__runtime_receipt_token = None  # type: ignore[assignment]
+
+    def _has_runtime_receipt_writer(self) -> bool:
+        """Test-only introspection: does a writer exist?"""
+        return self.__runtime_receipt_writer is not None  # type: ignore[attr-defined]
 
     async def bind(self, tool_call_id: str, approval_key: str, expiry: float | None = None) -> None:
         """Bind a pending approval to an immutable ChangeSet operation."""
@@ -226,7 +250,7 @@ class ApprovalBroker:
         context,
         reason: str = "",
         binding_digest: str = "",
-        receipt_sink=None,
+        receipt_sink=None,  # DEPRECATED — ignored. See Batch 2.6 §1.
         clock=None,
     ):
         """Apply an approve/reject decision and mint an authenticated receipt.
@@ -237,14 +261,16 @@ class ApprovalBroker:
         API/session layer may construct. Bare actor strings are NOT accepted,
         so a caller cannot self-assert an authenticated identity.
 
+        Batch 2.6 §1: the receipt is signed by the broker's internal
+        ``ReceiptSigner`` (HMAC over the canonical payload digest). The
+        ``receipt_sink`` parameter is DEPRECATED and silently ignored —
+        the runtime-installed name-mangled writer is the ONLY path to the
+        durable outbox. An ordinary caller cannot inject a sink.
+
         Returns a :class:`BrokerDecisionReceipt` on success, or ``None`` if
         the broker request is unknown, expired, or conflicts with a prior
         opposite decision. Idempotent repeats of the SAME decision re-mint a
         fresh receipt (the store dedups on token hash).
-
-        If ``receipt_sink`` is supplied it is called with EVERY authoritative
-        field of the receipt so the durable outbox row is complete;
-        ``apply_authenticated_decision`` later compares all of them.
         """
         import time as _time
         import uuid as _uuid
@@ -322,16 +348,25 @@ class ApprovalBroker:
                 token_hash=token_hash,
                 metadata={"reason": reason_text},
             )
+            # Batch 2.6 §1: sign the receipt with the broker's internal
+            # ReceiptSigner. The signing key is never exposed. The signature
+            # is bound to every authoritative field + token_hash.
+            signer = self.receipt_signer
+            payload_digest = receipt.compute_canonical_payload_digest()
+            signature = signer.sign_receipt_payload_digest(payload_digest)
+            # frozen dataclass — use object.__setattr__ to set the signature fields.
+            object.__setattr__(receipt, "canonical_payload_digest", payload_digest)
+            object.__setattr__(receipt, "broker_signature", signature)
+            object.__setattr__(receipt, "signer_key_id", signer.key_id)
 
-        # Persist the receipt outbox row outside the broker lock. The sink
-        # receives EVERY authoritative field so apply_authenticated_decision
-        # can compare them all.
-        # Batch 2.5 §6: use the name-mangled runtime sink (not a public
-        # _receipt_writer attribute). An explicit receipt_sink override is
-        # still accepted for backward compatibility with test helpers.
-        sink = receipt_sink or self.__runtime_receipt_sink  # type: ignore[attr-defined]
-        if sink is not None:
-            sink(
+        # Persist the receipt outbox row outside the broker lock. The
+        # name-mangled runtime writer is the ONLY path — the deprecated
+        # receipt_sink parameter is silently ignored. An ordinary caller
+        # cannot inject a writer because it is installed by the runtime via
+        # _install_runtime_receipt_writer with a runtime-internal token.
+        writer = self.__runtime_receipt_writer  # type: ignore[attr-defined]
+        if writer is not None:
+            writer(
                 receipt_id=receipt.receipt_id,
                 token_hash=receipt.token_hash,
                 approval_request_id=receipt.approval_request_id,
@@ -347,6 +382,9 @@ class ApprovalBroker:
                 decided_at=receipt.decided_at,
                 reason_digest=receipt.reason_digest,
                 expires_at=receipt.expires_at,
+                canonical_payload_digest=receipt.canonical_payload_digest,
+                broker_signature=receipt.broker_signature,
+                signer_key_id=receipt.signer_key_id,
                 created_at=now,
             )
         return receipt

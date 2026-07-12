@@ -97,7 +97,9 @@ def test_authenticated_session_request_binding_revocation_and_replay():
 def test_receipt_writer_is_not_publicly_obtainable():
     store=PlanApprovalStore(sqlite3.connect(":memory:"))
     assert not hasattr(store,"receipt_writer_token") and not hasattr(store,"insert_receipt") and not hasattr(store,"_broker_receipt_writer")
-    with pytest.raises(PermissionError): store._insert_receipt(object(),receipt_id="r",token_hash="t",approval_request_id="a",broker_request_id="b",binding_digest="d",decision="approved",expires_at=time.time()+60)
+    # Batch 2.6 §1: _insert_receipt is now _insert_signed_receipt and
+    # requires a valid broker signature — unsigned writes are refused.
+    with pytest.raises(PermissionError): store._insert_signed_receipt(receipt_id="r",token_hash="t",approval_request_id="a",broker_request_id="b",binding_digest="d",decision="approved",expires_at=time.time()+60,broker_signature="",signer_key_id="",canonical_payload_digest="")
 
 
 @pytest.mark.parametrize(("column","value"),[("canonical_plan_json","{"),("content_hash","tampered"),("binding_digest","tampered"),("schema_version","future.v9")])

@@ -207,11 +207,11 @@ def test_03_receipt_wiring_failure_leaves_runtime_not_ready():
     store = _store()
     sync = SyncBroker()
     real_broker = sync.real
-    # Monkey-patch the registration method to simulate failure.
-    original = type(real_broker)._register_runtime_receipt_sink
-    def broken_register(self, sink, *, runtime_token):
-        raise RuntimeError("broker registration broken")
-    type(real_broker)._register_runtime_receipt_sink = broken_register
+    # Monkey-patch the writer installation method to simulate failure.
+    original = type(real_broker)._install_runtime_receipt_writer
+    def broken_install(self, writer, *, runtime_token):
+        raise RuntimeError("broker writer installation broken")
+    type(real_broker)._install_runtime_receipt_writer = broken_install
     try:
         runtime = ApprovalRuntime(
             store=store, broker=real_broker,
@@ -224,8 +224,10 @@ def test_03_receipt_wiring_failure_leaves_runtime_not_ready():
         assert not runtime.ready
         assert runtime.gate is None and runtime.service is None
         assert runtime.boot_context is None
+        # The broker's writer is not installed (rolled back).
+        assert not real_broker._has_runtime_receipt_writer()
     finally:
-        type(real_broker)._register_runtime_receipt_sink = original
+        type(real_broker)._install_runtime_receipt_writer = original
 
 
 # ===========================================================================
@@ -638,26 +640,22 @@ def test_18_broker_has_no_readable_writer_attribute():
 def test_19_store_caller_cannot_bind_writer():
     """Ordinary store callers cannot obtain a writer or bind one to the broker."""
     store = _store()
-    # The old _bind_receipt_broker helper is gone.
+    # The old _bind_receipt_broker / _create_receipt_sink helpers are gone.
     assert not hasattr(store, "_bind_receipt_broker")
-    # _insert_receipt requires the internal capability token.
+    assert not hasattr(store, "_create_receipt_sink")
+    # _insert_signed_receipt requires a valid broker signature — unsigned
+    # writes are refused fail-closed. There is no capability token to forge.
     with pytest.raises(PermissionError):
-        store._insert_receipt(
-            object(),  # forged capability
+        store._insert_signed_receipt(
             receipt_id="r", token_hash="t", approval_request_id="a",
             broker_request_id="b", binding_digest="d",
             decision="approved", expires_at=time.time() + 60,
+            broker_signature="", signer_key_id="", canonical_payload_digest="",
         )
-    # The sink closure returned by _create_receipt_sink is a plain callable —
-    # it has no readable 'capability' or 'write' attribute.
-    sink = store._create_receipt_sink()
-    assert callable(sink)
-    assert not hasattr(sink, "capability")
-    assert not hasattr(sink, "write")
-    # Forging a class module/name does not grant capability.
+    # Forging a class module/name does not grant a writer handle.
     forged_broker = type("X", (), {"__module__": "khaos.agent.approval", "__name__": "ApprovalBroker"})()
-    # A forged broker object cannot register a sink (it's not a real broker).
-    assert not hasattr(forged_broker, "_register_runtime_receipt_sink")
+    # A forged broker object cannot install a writer (no such method).
+    assert not hasattr(forged_broker, "_install_runtime_receipt_writer")
 
 
 # ===========================================================================

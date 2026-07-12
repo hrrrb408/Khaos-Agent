@@ -229,28 +229,45 @@ def test_19_direct_store_receipt_write_rejected():
 def test_20_receipt_outbox_refuses_replace():
     """20. The same receipt_id or token_hash cannot be silently overwritten."""
     store = PlanApprovalStore(sqlite3.connect(":memory:"))
-    from khaos.agent.approval import ApprovalBroker
-    broker = ApprovalBroker()
-    # Batch 2.5: use the store's receipt sink closure (no public writer).
-    sink = store._create_receipt_sink()
-    sink(
+    # Batch 2.6: use _insert_signed_receipt with a valid signature.
+    from khaos.coding.planning.approval import ReceiptSigner
+    from khaos.coding.planning.approval.models import BrokerDecisionReceipt, PlanApprovalStatus
+    signer = ReceiptSigner()
+    # Build a minimal receipt to compute the canonical payload digest + signature.
+    receipt = BrokerDecisionReceipt(
+        receipt_id="r1", namespace="plan-execution", broker_request_id="b",
+        approval_request_id="a", decision=PlanApprovalStatus.APPROVED,
+        authenticated_actor_id="", authenticated_actor_type="",
+        authenticated_source="", session_request_id="", server_capability="",
+        binding_digest="bd", decided_at=0.0, expires_at=9999999999.0,
+        reason_digest="", one_time_token="", token_hash="th1",
+    )
+    payload_digest = receipt.compute_canonical_payload_digest()
+    signature = signer.sign_receipt_payload_digest(payload_digest)
+    store._insert_signed_receipt(
         receipt_id="r1", token_hash="th1", approval_request_id="a",
         broker_request_id="b", binding_digest="bd", decision="approved",
         expires_at=9999999999.0,
+        canonical_payload_digest=payload_digest,
+        broker_signature=signature, signer_key_id=signer.key_id,
     )
     # Same receipt_id → IntegrityError (plain INSERT, no REPLACE).
     with pytest.raises(sqlite3.IntegrityError):
-        sink(
+        store._insert_signed_receipt(
             receipt_id="r1", token_hash="th2", approval_request_id="a2",
             broker_request_id="b2", binding_digest="bd2", decision="rejected",
             expires_at=9999999999.0,
+            canonical_payload_digest=payload_digest,
+            broker_signature=signature, signer_key_id=signer.key_id,
         )
     # Same token_hash → IntegrityError.
     with pytest.raises(sqlite3.IntegrityError):
-        sink(
+        store._insert_signed_receipt(
             receipt_id="r2", token_hash="th1", approval_request_id="a3",
             broker_request_id="b3", binding_digest="bd3", decision="approved",
             expires_at=9999999999.0,
+            canonical_payload_digest=payload_digest,
+            broker_signature=signature, signer_key_id=signer.key_id,
         )
 
 
@@ -468,12 +485,14 @@ def test_static_store_has_no_public_consume():
 
 
 def test_static_insert_receipt_is_private_and_requires_capability():
-    """§12: receipt insertion is private, capability-gated, and immutable."""
+    """§12: receipt insertion is private, signed, and immutable."""
     from khaos.coding.planning.approval import PlanApprovalStore
     assert not hasattr(PlanApprovalStore, "insert_receipt")
     assert not hasattr(PlanApprovalStore, "receipt_writer_token")
-    src = inspect.getsource(PlanApprovalStore._insert_receipt)
-    assert "capability" in src
+    # Batch 2.6 §1: _insert_receipt is now _insert_signed_receipt and
+    # requires broker_signature + signer_key_id + canonical_payload_digest.
+    src = inspect.getsource(PlanApprovalStore._insert_signed_receipt)
+    assert "broker_signature" in src
     assert "PermissionError" in src
     # The SQL must be a plain INSERT, not INSERT OR REPLACE. Check only the
     # execute(...) block, not the docstring text.

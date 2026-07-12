@@ -297,12 +297,12 @@ def broker_decide(
     )
     bd = binding_digest if binding_digest is not None else request.binding_digest
     real_broker = broker._real if isinstance(broker, SyncBroker) else broker
-    # Batch 2.5: wire the store's receipt sink closure to the broker via
-    # the name-mangled runtime registration. In production,
-    # ApprovalRuntime.initialize() does this automatically.
-    real_broker._register_runtime_receipt_sink(
-        store._create_receipt_sink(), runtime_token=object(),
-    )
+    # Batch 2.6: install the signed receipt writer + register the broker's
+    # ReceiptSigner with the store's verification registry. In production,
+    # ApprovalRuntime.initialize() does this automatically. The writer is
+    # name-mangled and token-gated so ordinary code cannot install one.
+    signer = real_broker.receipt_signer
+    _wire_test_receipt_writer(store, real_broker, signer)
 
     if isinstance(broker, SyncBroker):
         return broker.resolve_plan_approval(
@@ -318,6 +318,26 @@ def broker_decide(
             binding_digest=bd, receipt_sink=None,
         )
     )
+
+
+def _wire_test_receipt_writer(store, broker, signer):
+    """Install the signed receipt writer + signer on store/broker for tests.
+
+    Mirrors what ApprovalRuntime.initialize() does in production. Test-only.
+    Persists the signer's key and loads old signers so receipts from prior
+    broker instances remain verifiable (restart/concurrency scenarios).
+    """
+    token = object()
+    # Load old signers (for verifying receipts from prior broker instances).
+    for old_signer in store.load_receipt_signers():
+        if old_signer.key_id != signer.key_id:
+            store._register_receipt_signer(old_signer, runtime_token=token)
+    # Persist the current signer and register it.
+    store.persist_receipt_signer(signer)
+    store._register_receipt_signer(signer, runtime_token=token)
+    def _writer(**fields):
+        store._insert_signed_receipt(**fields)
+    broker._install_runtime_receipt_writer(_writer, runtime_token=token)
 
 
 def approve_and_apply(

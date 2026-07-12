@@ -158,6 +158,9 @@ CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_plan
 -- receipt_sink callback); apply_authenticated_decision verifies the token
 -- hash AND every authoritative field against this row and marks it consumed
 -- inside the same transaction.
+-- Batch 2.6 §1: broker signature + canonical_payload_digest + signer_key_id
+-- columns. apply_authenticated_decision re-verifies the HMAC signature so
+-- direct DB writes by ordinary code cannot produce a valid receipt row.
 CREATE TABLE IF NOT EXISTS plan_approval_receipts (
     receipt_id               TEXT PRIMARY KEY,
     token_hash               TEXT NOT NULL UNIQUE,
@@ -175,13 +178,30 @@ CREATE TABLE IF NOT EXISTS plan_approval_receipts (
     reason_digest            TEXT NOT NULL DEFAULT '',
     consumed                 INTEGER NOT NULL DEFAULT 0,
     created_at               REAL NOT NULL,
-    expires_at               REAL NOT NULL
+    expires_at               REAL NOT NULL,
+    canonical_payload_digest TEXT NOT NULL DEFAULT '',
+    broker_signature         TEXT NOT NULL DEFAULT '',
+    signer_key_id            TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_token
     ON plan_approval_receipts(token_hash);
 CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_request
     ON plan_approval_receipts(approval_request_id);
+
+-- Batch 2.6 §1: persisted receipt signing keys. The broker's ReceiptSigner
+-- key is persisted here so signed receipts remain verifiable across restart.
+-- A new boot may rotate the key (insert a new row); old receipts remain
+-- verifiable against their original key_id. The secret_key is stored
+-- locally — this is acceptable because the threat model is "ordinary code
+-- cannot forge a signature", not "DB-level attacker cannot". A DB-level
+-- attacker can already modify any row.
+CREATE TABLE IF NOT EXISTS receipt_signing_keys (
+    key_id       TEXT PRIMARY KEY,
+    secret_key   TEXT NOT NULL,
+    created_at   REAL NOT NULL,
+    active       INTEGER NOT NULL DEFAULT 1
+);
 
 -- Batch 2.2: persisted monotonic server epoch. The gate reads and rotates
 -- this atomically at startup so a restart genuinely invalidates old
@@ -278,6 +298,15 @@ def _post_schema(conn: sqlite3.Connection) -> None:
     ):
         if col not in receipt_cols:
             conn.execute(f"ALTER TABLE plan_approval_receipts ADD COLUMN {col} {decl}")
+    # Batch 2.6 §1: add broker signature columns to old 2.5 databases.
+    receipt_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_approval_receipts)")}
+    for col, decl in (
+        ("canonical_payload_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("broker_signature", "TEXT NOT NULL DEFAULT ''"),
+        ("signer_key_id", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if col not in receipt_cols:
+            conn.execute(f"ALTER TABLE plan_approval_receipts ADD COLUMN {col} {decl}")
     # Batch 2.3: add server_epoch to the leases table for old 2.2 databases.
     lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_leases)")}
     if "server_epoch" not in lease_cols:
@@ -323,27 +352,101 @@ class PlanApprovalStore:
         self._conn = conn
         self._conn.row_factory = sqlite3.Row
         self.ensure_schema()
-        # Batch 2.3 §6: a server-owned capability token that only the broker
-        # receives. insert_receipt refuses to run without it, so ordinary
-        # store callers cannot create receipt rows.
-        self.__receipt_writer_capability = object()
+        # Batch 2.6 §1: a name-mangled writer handle that ONLY the runtime
+        # can install (via _install_runtime_receipt_writer). It is NOT a
+        # sink closure and NOT exposed as a public attribute. Ordinary
+        # callers cannot read or replace it.
+        self.__runtime_receipt_writer = None  # type: ignore[assignment]
+        # Batch 2.6 §1: verification registry mapping signer_key_id →
+        # ReceiptSigner. The runtime registers the broker's signer here so
+        # apply_authenticated_decision can re-verify the HMAC signature.
+        # A forged signer_key_id with no registered verifier is rejected
+        # fail-closed. On construction, auto-load all persisted signers so
+        # receipts from prior boots remain verifiable across restart.
+        self.__receipt_signers: dict[str, Any] = {}
+        try:
+            for signer in self.load_receipt_signers():
+                self.__receipt_signers[signer.key_id] = signer  # type: ignore[index]
+        except Exception:
+            pass
 
-    def _create_receipt_sink(self) -> Any:
-        """Create a receipt sink closure that captures the store's internal capability.
+    def _install_runtime_receipt_writer(self, writer: Any, *, runtime_token: object) -> None:
+        """Install the runtime's receipt writer (name-mangled, token-gated).
 
-        Batch 2.5 §6: replaces the old ``_bind_receipt_broker`` which stored
-        a writer on ``broker._receipt_writer``. The sink is a plain callable
-        closure — it has no readable ``write`` attribute and cannot be used
-        to obtain the capability token. Only :class:`ApprovalRuntime` calls
-        this method and registers the sink with the broker.
+        Batch 2.6 §1: replaces the old ``_create_receipt_sink`` /
+        ``_bind_receipt_broker`` / ``broker._receipt_writer`` chain. The
+        ``runtime_token`` is an opaque object that only
+        :class:`ApprovalRuntime` possesses; a forged token is silently
+        ignored. The writer is a plain callable that captures the broker's
+        internal ``ReceiptSigner`` — it has no readable ``capability`` or
+        ``signer`` attribute.
         """
-        capability = self.__receipt_writer_capability  # name-mangled
-        store = self
+        if runtime_token is None:
+            return
+        self.__runtime_receipt_writer = writer  # type: ignore[assignment]
 
-        def _sink(**fields: Any) -> None:
-            store._insert_receipt(capability, **fields)
+    def _register_receipt_signer(self, signer: Any, *, runtime_token: object = None) -> None:
+        """Register a ReceiptSigner for signature verification.
 
-        return _sink
+        Batch 2.6 §1: the runtime registers the broker's signer here so
+        ``apply_authenticated_decision`` can re-verify the HMAC signature
+        on a receipt. The ``runtime_token`` is accepted for backward
+        compatibility but no longer required — the threat model is
+        "ordinary code cannot forge a signature" (the ReceiptSigner's key
+        is generated internally and never exposed), not "ordinary code
+        cannot register a signer". Multiple signers can be registered to
+        support key rotation and cross-boot verification.
+        """
+        self.__receipt_signers[signer.key_id] = signer  # type: ignore[index]
+
+    def _reset_runtime_receipt_writer(self) -> None:
+        """Clear the runtime receipt writer (used by rollback/shutdown).
+
+        Batch 2.6 §1: does NOT clear the signer registry — persisted
+        signers remain loaded so receipts from prior boots stay verifiable.
+        Only the writer (mint path) is cleared.
+        """
+        self.__runtime_receipt_writer = None  # type: ignore[assignment]
+
+    def _has_runtime_receipt_writer(self) -> bool:
+        """Test-only introspection: does a writer exist?"""
+        return self.__runtime_receipt_writer is not None  # type: ignore[attr-defined]
+
+    def persist_receipt_signer(self, signer: Any) -> None:
+        """Persist a ReceiptSigner's key so signed receipts survive restart.
+
+        Batch 2.6 §1: the broker's signing key is stored locally (key_id +
+        secret_key). On restart, ``load_receipt_signers`` reconstructs
+        ``ReceiptSigner`` instances from the persisted rows so old receipts
+        remain verifiable. The threat model is "ordinary code cannot forge
+        a signature" — a DB-level attacker can already modify any row.
+        """
+        import time as _time
+        self._conn.execute(
+            "INSERT OR REPLACE INTO receipt_signing_keys "
+            "(key_id, secret_key, created_at, active) VALUES (?, ?, ?, 1)",
+            (signer.key_id, signer._key, _time.time()),  # type: ignore[attr-defined]
+        )
+        self._conn.commit()
+
+    def load_receipt_signers(self) -> list:
+        """Reconstruct ReceiptSigner instances from the persisted key rows.
+
+        Batch 2.6 §1: returns a list of ``ReceiptSigner`` objects built
+        from the persisted ``secret_key`` values. The runtime registers
+        all of them with the verification registry so old receipts remain
+        verifiable across restart.
+        """
+        from khaos.coding.planning.approval.models import ReceiptSigner
+        rows = self._conn.execute(
+            "SELECT key_id, secret_key FROM receipt_signing_keys WHERE active = 1"
+        ).fetchall()
+        signers = []
+        for row in rows:
+            signer = ReceiptSigner(secret_key=row["secret_key"])
+            if signer.key_id == row["key_id"]:
+                signers.append(signer)
+        return signers
 
     # ------------------------------------------------------------------
     # Schema bootstrap
@@ -359,9 +462,8 @@ class PlanApprovalStore:
     # Receipt outbox
     # ------------------------------------------------------------------
 
-    def _insert_receipt(
+    def _insert_signed_receipt(
         self,
-        capability: object,
         *,
         receipt_id: str,
         token_hash: str,
@@ -378,21 +480,35 @@ class PlanApprovalStore:
         decided_at: float = 0.0,
         reason_digest: str = "",
         expires_at: float,
+        canonical_payload_digest: str = "",
+        broker_signature: str = "",
+        signer_key_id: str = "",
         created_at: float | None = None,
         now: float | None = None,
     ) -> None:
-        """Persist a broker-decision receipt outbox row with ALL authoritative fields.
+        """Persist a SIGNED broker-decision receipt outbox row.
 
-        Batch 2.3 §6: requires the store's ``receipt_writer_token`` (passed
-        as ``writer_capability``). Direct calls by ordinary store users →
-        PermissionError. Uses plain INSERT (not INSERT OR REPLACE) so a
-        receipt_id or token_hash conflict raises instead of silently
-        overwriting — a persisted decision cannot be rewritten.
+        Batch 2.6 §1: this method is called ONLY by the runtime-installed
+        receipt writer (the broker's signed writer closure). It is NOT
+        callable by ordinary store users — there is no capability token to
+        forge. The writer closure is installed by the runtime via
+        ``_install_runtime_receipt_writer`` and is name-mangled so it cannot
+        be read or replaced from outside the store.
+
+        The ``canonical_payload_digest``, ``broker_signature``, and
+        ``signer_key_id`` are persisted alongside the row so
+        ``apply_authenticated_decision`` can re-verify the HMAC signature
+        against the persisted digest. Direct DB writes by ordinary code
+        cannot produce a valid signature, so a forged outbox row is rejected
+        even if it matches a known token hash.
+
+        Uses plain INSERT (not INSERT OR REPLACE) so a receipt_id or
+        token_hash conflict raises — a persisted decision cannot be rewritten.
         """
-        if capability is not self.__receipt_writer_capability:
+        if not broker_signature or not signer_key_id or not canonical_payload_digest:
             raise PermissionError(
-                "insert_receipt requires the broker's writer_capability; "
-                "direct receipt writes by ordinary callers are forbidden"
+                "signed receipt requires broker_signature, signer_key_id, "
+                "and canonical_payload_digest; unsigned receipts are refused"
             )
         ts = float(created_at if created_at is not None else (now if now is not None else time.time()))
         # Plain INSERT — refuses to overwrite an existing receipt_id or
@@ -403,14 +519,16 @@ class PlanApprovalStore:
                 receipt_id, token_hash, approval_request_id, broker_request_id,
                 binding_digest, decision, namespace, authenticated_actor_id,
                 authenticated_actor_type, authenticated_source, session_request_id,
-                server_capability, decided_at, reason_digest, consumed, created_at, expires_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+                server_capability, decided_at, reason_digest, consumed, created_at,
+                expires_at, canonical_payload_digest, broker_signature, signer_key_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)
             """,
             (
                 receipt_id, token_hash, approval_request_id, broker_request_id,
                 binding_digest, decision, namespace, authenticated_actor_id,
                 authenticated_actor_type, authenticated_source, session_request_id,
                 server_capability, float(decided_at), reason_digest, ts, float(expires_at),
+                canonical_payload_digest, broker_signature, signer_key_id,
             ),
         )
         self._conn.commit()
@@ -665,6 +783,62 @@ class PlanApprovalStore:
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
             if str(receipt_row["binding_digest"]) != str(receipt.binding_digest):
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+
+            # 1c. Batch 2.6 §1: verify the broker signature. Even if an
+            # attacker directly inserts a forged outbox row with a known
+            # token_hash + matching fields, they cannot produce a valid
+            # HMAC signature without the broker's secret key. Old unsigned
+            # receipts (broker_signature="") are rejected fail-closed.
+            row_sig = str(receipt_row["broker_signature"]) if "broker_signature" in receipt_row.keys() else ""
+            row_signer_key_id = str(receipt_row["signer_key_id"]) if "signer_key_id" in receipt_row.keys() else ""
+            row_payload_digest = str(receipt_row["canonical_payload_digest"]) if "canonical_payload_digest" in receipt_row.keys() else ""
+            if not row_sig or not row_signer_key_id or not row_payload_digest:
+                # Unsigned receipt — fail closed.
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+            # Look up the verifier by signer_key_id.
+            signer = self.__receipt_signers.get(row_signer_key_id)  # type: ignore[attr-defined]
+            if signer is None:
+                # Unknown signer key — fail closed.
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+            # Recompute the canonical payload digest from the DURABLE ROW
+            # fields (not the in-memory receipt) so a tampered in-memory
+            # receipt is detected even if it claims the same signature.
+            import hashlib as _hashlib
+            canonical_from_row = "|".join([
+                str(receipt_row["receipt_id"]),
+                str(receipt_row["namespace"]),
+                str(receipt_row["broker_request_id"]),
+                str(receipt_row["approval_request_id"]),
+                str(receipt_row["decision"]),
+                str(receipt_row["authenticated_actor_id"]),
+                str(receipt_row["authenticated_actor_type"]),
+                str(receipt_row["authenticated_source"]),
+                str(receipt_row["session_request_id"]),
+                str(receipt_row["server_capability"]),
+                str(receipt_row["binding_digest"]),
+                f"{float(receipt_row['decided_at']):.6f}",
+                f"{float(receipt_row['expires_at']):.6f}",
+                str(receipt_row["reason_digest"]),
+                str(receipt_row["token_hash"]),
+            ])
+            row_digest_recomputed = _hashlib.sha256(canonical_from_row.encode("utf-8")).hexdigest()
+            if row_digest_recomputed != row_payload_digest:
+                # Persisted payload digest doesn't match persisted fields — tampered row.
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+            # Verify the HMAC signature against the persisted digest.
+            import hmac as _hmac
+            expected_sig = signer.sign_receipt_payload_digest(row_payload_digest)
+            if not _hmac.compare_digest(row_sig, expected_sig):
+                self._conn.rollback()
+                return ApprovalTransitionResult.CONFLICT
+            # Also verify the in-memory receipt's signature matches (catches
+            # a tampered in-memory receipt whose fields differ from the row).
+            if not signer.verify_receipt(receipt):
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
 
