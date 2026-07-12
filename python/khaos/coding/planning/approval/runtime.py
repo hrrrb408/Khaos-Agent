@@ -215,6 +215,23 @@ class ApprovalRuntime:
             self.guard.set_mutation_fence(self._mutation_fence)
             self._coordinator=WorkspaceExecutionLeaseCoordinator(self)
             self._head_mutation_adapter=PlannedHeadMutationAdapter(self._mutation_fence,self._coordinator)
+            mutation_capability = _RUNTIME_AUTHORITIES.issue(
+                self._runtime_authority_id, "mutation-engine"
+            )
+            self._mutation_call_authority = object()
+            from khaos.coding.planning.workspace_mutation import WorkspaceMutationEngine
+            self._mutation_engine = WorkspaceMutationEngine(
+                store=self._store, plan_repository=self._plan_repository,
+                workspace_manager=self._workspace_manager,
+                context_provider=self._context_provider, guard=self.guard,
+                mutation_fence=self._mutation_fence,
+                runtime_capability=mutation_capability,
+                call_authority=self._mutation_call_authority,
+            )
+            self.guard.set_mutation_engine(
+                self._mutation_engine,
+                call_authority=self._mutation_call_authority,
+            )
             self._repository_indexer.set_mutation_fence(
                 self._mutation_fence,
                 workspace_resolver=self._coordinator.resolve_repository_workspace,
@@ -229,6 +246,7 @@ class ApprovalRuntime:
                 self._workspace_manager.set_lease_invalidation_hook(
                     self._coordinator.cleanup_workspace
                 )
+            self._mutation_engine.recover_incomplete_runs()
 
             # 4. Mark ready
             self._state = RuntimeState.READY
@@ -304,6 +322,11 @@ class ApprovalRuntime:
         self.require_ready()
         from khaos.coding.planning.approval.mutation_fence import fenced_acquire_lease
         return fenced_acquire_lease(self._coordinator,self._mutation_fence,self.guard,**kwargs)
+
+    def apply_edit_bundle(self, *, context: Any, bundle: Any) -> Any:
+        """Only public planned-mutation route: Runtime → Guard → Engine."""
+        self.require_ready()
+        return self.guard.planned_workspace_edit(context, bundle=bundle)
 
     def require_active_lease(self, *args: Any, **kwargs: Any):
         self.require_ready(); return self.gate.require_active_lease(*args, **kwargs)

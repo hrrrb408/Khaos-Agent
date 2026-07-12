@@ -87,10 +87,17 @@ class PlannedExecutionGuard:
         # every planned_* method verifies the fence is held by
         # "lease:{ctx.lease_id}" before proceeding.
         self._mutation_fence: Any = None
+        self._mutation_engine: Any = None
+        self.__mutation_call_authority: object | None = None
 
     def set_mutation_fence(self, fence: Any) -> None:
         """Batch 2.6 §5: register the shared per-workspace mutation fence."""
         self._mutation_fence = fence
+
+    def set_mutation_engine(self, engine: Any, *, call_authority: object) -> None:
+        """Runtime-only wiring for the capability-constructed mutation engine."""
+        self._mutation_engine = engine
+        self.__mutation_call_authority = call_authority
 
     def require_active_execution_context(self, ctx: AuthorizedExecutionContext) -> None:
         """Validate the opaque server-issued capability and its live lease.
@@ -114,10 +121,22 @@ class PlannedExecutionGuard:
         if self._mutation_fence is not None:
             self._mutation_fence.assert_owner(ctx.workspace_id, f"lease:{ctx.lease_id}")
 
-    def planned_workspace_edit(self, ctx: AuthorizedExecutionContext, *, edit: dict) -> None:
-        """Apply a planned workspace file edit. (Batch 3)"""
+    def planned_workspace_edit(
+        self, ctx: AuthorizedExecutionContext, *, bundle: Any = None,
+        edit: dict | None = None,
+    ) -> Any:
+        """Apply one server-validated edit bundle in the active workspace."""
         self.require_active_execution_context(ctx)
-        raise NotImplementedError("planned_workspace_edit is implemented in Batch 3")
+        if bundle is None:
+            raise NotImplementedError(
+                "individual planned edits are forbidden; use a PlannedEditBundle"
+            )
+        if self._mutation_engine is None:
+            raise PermissionError("planned mutation engine is not runtime configured")
+        return self._mutation_engine.apply_bundle(
+            context=ctx, bundle=bundle,
+            _call_authority=self.__mutation_call_authority,
+        )
 
     def planned_tool_invocation(self, ctx: AuthorizedExecutionContext, *, invocation: dict) -> None:
         """Invoke a planned tool. (Batch 3)"""
