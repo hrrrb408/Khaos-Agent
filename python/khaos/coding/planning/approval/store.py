@@ -159,7 +159,7 @@ CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_plan
 -- hash AND every authoritative field against this row and marks it consumed
 -- inside the same transaction.
 -- Batch 2.6 §1: broker signature + canonical_payload_digest + signer_key_id
--- columns. apply_authenticated_decision re-verifies the HMAC signature so
+-- columns. apply_authenticated_decision re-verifies the Ed25519 signature so
 -- direct DB writes by ordinary code cannot produce a valid receipt row.
 CREATE TABLE IF NOT EXISTS plan_approval_receipts (
     receipt_id               TEXT PRIMARY KEY,
@@ -189,16 +189,14 @@ CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_token
 CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_request
     ON plan_approval_receipts(approval_request_id);
 
--- Batch 2.6 §1: persisted receipt signing keys. The broker's ReceiptSigner
--- key is persisted here so signed receipts remain verifiable across restart.
--- A new boot may rotate the key (insert a new row); old receipts remain
--- verifiable against their original key_id. The secret_key is stored
--- locally — this is acceptable because the threat model is "ordinary code
--- cannot forge a signature", not "DB-level attacker cannot". A DB-level
--- attacker can already modify any row.
-CREATE TABLE IF NOT EXISTS receipt_signing_keys (
+-- Batch 2.7: persisted Ed25519 public verification keys. Private signing
+-- material remains broker-local and is never written to SQLite. A new boot
+-- rotates the key while old public keys remain available for verification.
+CREATE TABLE IF NOT EXISTS receipt_verification_keys (
     key_id       TEXT PRIMARY KEY,
-    secret_key   TEXT NOT NULL,
+    public_key   TEXT NOT NULL,
+    key_version  INTEGER NOT NULL,
+    boot_epoch   INTEGER NOT NULL,
     created_at   REAL NOT NULL,
     active       INTEGER NOT NULL DEFAULT 1
 );
@@ -264,6 +262,9 @@ CREATE INDEX IF NOT EXISTS idx_plan_execution_leases_task
 # add a column with IF NOT EXISTS). Run after APPROVAL_SCHEMA.
 def _post_schema(conn: sqlite3.Connection) -> None:
     """Add columns / partial indexes introduced in Batch 2.1, idempotently."""
+    # Legacy HMAC rows contained private signing secrets. They are never
+    # migrated into verifier state; remove them fail-closed.
+    conn.execute("DROP TABLE IF EXISTS receipt_signing_keys")
     cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_authorizations)")}
     if "server_epoch" not in cols:
         conn.execute(
@@ -357,20 +358,19 @@ class PlanApprovalStore:
         # sink closure and NOT exposed as a public attribute. Ordinary
         # callers cannot read or replace it.
         self.__runtime_receipt_writer = None  # type: ignore[assignment]
-        # Batch 2.6 §1: verification registry mapping signer_key_id →
-        # ReceiptSigner. The runtime registers the broker's signer here so
-        # apply_authenticated_decision can re-verify the HMAC signature.
-        # A forged signer_key_id with no registered verifier is rejected
-        # fail-closed. On construction, auto-load all persisted signers so
-        # receipts from prior boots remain verifiable across restart.
-        self.__receipt_signers: dict[str, Any] = {}
+        self.__runtime_receipt_token = None
+        # Public-only verifier registry. Unknown keys fail closed; prior-boot
+        # public keys remain loadable across signing-key rotation.
+        self.__receipt_verifiers: dict[str, Any] = {}
         try:
-            for signer in self.load_receipt_signers():
-                self.__receipt_signers[signer.key_id] = signer  # type: ignore[index]
+            for verifier in self.load_receipt_verifiers():
+                self.__receipt_verifiers[verifier.key_id] = verifier
         except Exception:
             pass
 
-    def _install_runtime_receipt_writer(self, writer: Any, *, runtime_token: object) -> None:
+    def _install_runtime_receipt_writer(
+        self, writer: Any, *, runtime_token: object, runtime_capability: Any = None
+    ) -> None:
         """Install the runtime's receipt writer (name-mangled, token-gated).
 
         Batch 2.6 §1: replaces the old ``_create_receipt_sink`` /
@@ -381,72 +381,51 @@ class PlanApprovalStore:
         internal ``ReceiptSigner`` — it has no readable ``capability`` or
         ``signer`` attribute.
         """
+        from khaos.coding.planning.approval.runtime import _consume_runtime_capability
+
+        try:
+            _consume_runtime_capability(runtime_capability, "receipt-store")
+        except PermissionError as exc:
+            raise PermissionError("runtime receipt authority required") from exc
         if runtime_token is None:
-            return
+            raise PermissionError("runtime receipt token required")
         self.__runtime_receipt_writer = writer  # type: ignore[assignment]
-
-    def _register_receipt_signer(self, signer: Any, *, runtime_token: object = None) -> None:
-        """Register a ReceiptSigner for signature verification.
-
-        Batch 2.6 §1: the runtime registers the broker's signer here so
-        ``apply_authenticated_decision`` can re-verify the HMAC signature
-        on a receipt. The ``runtime_token`` is accepted for backward
-        compatibility but no longer required — the threat model is
-        "ordinary code cannot forge a signature" (the ReceiptSigner's key
-        is generated internally and never exposed), not "ordinary code
-        cannot register a signer". Multiple signers can be registered to
-        support key rotation and cross-boot verification.
-        """
-        self.__receipt_signers[signer.key_id] = signer  # type: ignore[index]
+        self.__runtime_receipt_token = runtime_token
 
     def _reset_runtime_receipt_writer(self) -> None:
         """Clear the runtime receipt writer (used by rollback/shutdown).
 
-        Batch 2.6 §1: does NOT clear the signer registry — persisted
-        signers remain loaded so receipts from prior boots stay verifiable.
+        Persisted public verifiers remain loaded so prior-boot receipts stay
+        verifiable after signing-key rotation.
         Only the writer (mint path) is cleared.
         """
         self.__runtime_receipt_writer = None  # type: ignore[assignment]
+        self.__runtime_receipt_token = None
 
     def _has_runtime_receipt_writer(self) -> bool:
         """Test-only introspection: does a writer exist?"""
         return self.__runtime_receipt_writer is not None  # type: ignore[attr-defined]
 
-    def persist_receipt_signer(self, signer: Any) -> None:
-        """Persist a ReceiptSigner's key so signed receipts survive restart.
-
-        Batch 2.6 §1: the broker's signing key is stored locally (key_id +
-        secret_key). On restart, ``load_receipt_signers`` reconstructs
-        ``ReceiptSigner`` instances from the persisted rows so old receipts
-        remain verifiable. The threat model is "ordinary code cannot forge
-        a signature" — a DB-level attacker can already modify any row.
-        """
+    def _persist_receipt_verifier(self, verifier: Any, *, runtime_token: object) -> None:
+        """Persist public verification material only."""
+        if runtime_token is not self.__runtime_receipt_token:
+            raise PermissionError("runtime authority required")
         import time as _time
         self._conn.execute(
-            "INSERT OR REPLACE INTO receipt_signing_keys "
-            "(key_id, secret_key, created_at, active) VALUES (?, ?, ?, 1)",
-            (signer.key_id, signer._key, _time.time()),  # type: ignore[attr-defined]
+            "INSERT OR REPLACE INTO receipt_verification_keys "
+            "(key_id, public_key, key_version, boot_epoch, created_at, active) VALUES (?, ?, ?, ?, ?, 1)",
+            (verifier.key_id, verifier.public_key, verifier.key_version, verifier.boot_epoch, _time.time()),
         )
         self._conn.commit()
+        self.__receipt_verifiers[verifier.key_id] = verifier
 
-    def load_receipt_signers(self) -> list:
-        """Reconstruct ReceiptSigner instances from the persisted key rows.
-
-        Batch 2.6 §1: returns a list of ``ReceiptSigner`` objects built
-        from the persisted ``secret_key`` values. The runtime registers
-        all of them with the verification registry so old receipts remain
-        verifiable across restart.
-        """
-        from khaos.coding.planning.approval.models import ReceiptSigner
+    def load_receipt_verifiers(self) -> list:
+        """Return public-only verifier objects; legacy HMAC rows are ignored."""
+        from khaos.coding.planning.approval.receipt_crypto import ReceiptPublicVerifier
         rows = self._conn.execute(
-            "SELECT key_id, secret_key FROM receipt_signing_keys WHERE active = 1"
+            "SELECT key_id,public_key,key_version,boot_epoch FROM receipt_verification_keys WHERE active = 1"
         ).fetchall()
-        signers = []
-        for row in rows:
-            signer = ReceiptSigner(secret_key=row["secret_key"])
-            if signer.key_id == row["key_id"]:
-                signers.append(signer)
-        return signers
+        return [ReceiptPublicVerifier(str(row["key_id"]),str(row["public_key"]),int(row["key_version"]),int(row["boot_epoch"])) for row in rows]
 
     # ------------------------------------------------------------------
     # Schema bootstrap
@@ -465,6 +444,7 @@ class PlanApprovalStore:
     def _insert_signed_receipt(
         self,
         *,
+        runtime_token: object = None,
         receipt_id: str,
         token_hash: str,
         approval_request_id: str,
@@ -497,7 +477,7 @@ class PlanApprovalStore:
 
         The ``canonical_payload_digest``, ``broker_signature``, and
         ``signer_key_id`` are persisted alongside the row so
-        ``apply_authenticated_decision`` can re-verify the HMAC signature
+        ``apply_authenticated_decision`` can re-verify the Ed25519 signature
         against the persisted digest. Direct DB writes by ordinary code
         cannot produce a valid signature, so a forged outbox row is rejected
         even if it matches a known token hash.
@@ -505,6 +485,8 @@ class PlanApprovalStore:
         Uses plain INSERT (not INSERT OR REPLACE) so a receipt_id or
         token_hash conflict raises — a persisted decision cannot be rewritten.
         """
+        if runtime_token is not self.__runtime_receipt_token:
+            raise PermissionError("runtime receipt authority required")
         if not broker_signature or not signer_key_id or not canonical_payload_digest:
             raise PermissionError(
                 "signed receipt requires broker_signature, signer_key_id, "
@@ -789,7 +771,7 @@ class PlanApprovalStore:
             # 1c. Batch 2.6 §1: verify the broker signature. Even if an
             # attacker directly inserts a forged outbox row with a known
             # token_hash + matching fields, they cannot produce a valid
-            # HMAC signature without the broker's secret key. Old unsigned
+            # Ed25519 signature without the broker's private key. Old unsigned
             # receipts (broker_signature="") are rejected fail-closed.
             row_sig = str(receipt_row["broker_signature"]) if "broker_signature" in receipt_row.keys() else ""
             row_signer_key_id = str(receipt_row["signer_key_id"]) if "signer_key_id" in receipt_row.keys() else ""
@@ -799,8 +781,8 @@ class PlanApprovalStore:
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
             # Look up the verifier by signer_key_id.
-            signer = self.__receipt_signers.get(row_signer_key_id)  # type: ignore[attr-defined]
-            if signer is None:
+            verifier = self.__receipt_verifiers.get(row_signer_key_id)  # type: ignore[attr-defined]
+            if verifier is None:
                 # Unknown signer key — fail closed.
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
@@ -830,15 +812,12 @@ class PlanApprovalStore:
                 # Persisted payload digest doesn't match persisted fields — tampered row.
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
-            # Verify the HMAC signature against the persisted digest.
-            import hmac as _hmac
-            expected_sig = signer.sign_receipt_payload_digest(row_payload_digest)
-            if not _hmac.compare_digest(row_sig, expected_sig):
+            if not verifier.verify_payload_digest(row_payload_digest, row_sig):
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
             # Also verify the in-memory receipt's signature matches (catches
             # a tampered in-memory receipt whose fields differ from the row).
-            if not signer.verify_receipt(receipt):
+            if receipt.signer_key_id != verifier.key_id or not verifier.verify_payload_digest(receipt.compute_canonical_payload_digest(), receipt.broker_signature):
                 self._conn.rollback()
                 return ApprovalTransitionResult.CONFLICT
 

@@ -168,23 +168,21 @@ class PlanApprovalService:
         # Batch 2.6 §2: production construction requires RuntimeCapability.
         # No boot_context=None implicit test mode — test code must use the
         # explicit UnsafeTestPlanApprovalService subclass in test helpers.
-        from khaos.coding.planning.approval.runtime import RuntimeCapability
-        if not isinstance(runtime_capability, RuntimeCapability):
-            raise TypeError(
-                "production PlanApprovalService requires RuntimeCapability "
-                "(obtain from ApprovalRuntime.initialize()); test code must "
-                "use UnsafeTestPlanApprovalService"
-            )
+        from khaos.coding.planning.approval.runtime import _consume_runtime_capability
+        try:
+            verified_boot_context = _consume_runtime_capability(runtime_capability, "service")
+        except PermissionError as exc:
+            raise TypeError("production PlanApprovalService requires runtime factory authority") from exc
         if plan_repository is None or not isinstance(plan_repository, PersistedPlanRepository):
             raise TypeError("production PlanApprovalService requires PersistedPlanRepository")
         if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
             raise TypeError("production PlanApprovalService requires deep planning validator")
         self._store = store
+        self._boot_context = verified_boot_context
         self._broker = broker
         self._context_provider = context_provider
         self._policy = policy or ApprovalPolicy()
         self._clock = clock
-        self._boot_context = runtime_capability.boot_context
         self._plan_repository = plan_repository
         self._planning_service = planning_service
         self._validator = PlanLiveValidator(

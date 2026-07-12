@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import enum
 import logging
+import secrets
+import threading
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,7 +36,6 @@ class RuntimeState(enum.Enum):
     READY = 4
 
 
-@dataclass(frozen=True)
 class RuntimeCapability:
     """Opaque capability token issued by :class:`ApprovalRuntime`.
 
@@ -48,7 +49,46 @@ class RuntimeCapability:
     production Gate/Service consume them. Test code must use the explicit
     ``UnsafeTest*`` subclasses in ``tests/coding/_m4_batch2_helpers.py``.
     """
-    boot_context: BootContext
+    __slots__ = ("_capability_id",)
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError("RuntimeCapability cannot be constructed directly")
+
+
+class _RuntimeAuthorityRegistry:
+    def __init__(self) -> None:
+        self._lock=threading.Lock(); self._boots={}; self._capabilities={}
+
+    def register_boot(self, boot: BootContext) -> str:
+        runtime_id=secrets.token_hex(32)
+        with self._lock: self._boots[runtime_id]=boot
+        return runtime_id
+
+    def issue(self, runtime_id: str, scope: str) -> RuntimeCapability:
+        with self._lock:
+            if runtime_id not in self._boots: raise PermissionError("runtime authority is revoked")
+            cap_id=secrets.token_hex(32); self._capabilities[cap_id]=(runtime_id,scope,False)
+        cap=object.__new__(RuntimeCapability); object.__setattr__(cap,"_capability_id",cap_id); return cap
+
+    def consume(self, capability: Any, scope: str) -> BootContext:
+        cap_id=getattr(capability,"_capability_id","")
+        with self._lock:
+            record=self._capabilities.get(cap_id)
+            if record is None or record[1] != scope or record[2]: raise PermissionError("invalid or reused runtime capability")
+            runtime_id=record[0]; boot=self._boots.get(runtime_id)
+            if boot is None: raise PermissionError("runtime authority is revoked")
+            self._capabilities[cap_id]=(runtime_id,scope,True); return boot
+
+    def revoke(self, runtime_id: str | None) -> None:
+        if runtime_id is None: return
+        with self._lock:
+            self._boots.pop(runtime_id,None)
+            for cap_id,record in list(self._capabilities.items()):
+                if record[0] == runtime_id: self._capabilities.pop(cap_id,None)
+
+_RUNTIME_AUTHORITIES = _RuntimeAuthorityRegistry()
+
+def _consume_runtime_capability(capability: Any, scope: str) -> BootContext:
+    return _RUNTIME_AUTHORITIES.consume(capability, scope)
 
 class ApprovalRuntime:
     """Production bootstrap for the approval + lease runtime.
@@ -60,7 +100,7 @@ class ApprovalRuntime:
     the failed boot_id, and ensures the runtime is safe to retry.
     """
 
-    def __init__(self, *, store: Any, broker: Any, context_provider: Any, plan_repository: PersistedPlanRepository, planning_service: Any) -> None:
+    def __init__(self, *, store: Any, broker: Any, context_provider: Any, plan_repository: PersistedPlanRepository, planning_service: Any, task_manager: Any = None, workspace_manager: Any = None, repository_indexer: Any = None) -> None:
         if not isinstance(plan_repository, PersistedPlanRepository):
             raise TypeError("production ApprovalRuntime requires PersistedPlanRepository")
         if planning_service is None or getattr(planning_service, "_unsafe_test_only", False) or not callable(getattr(planning_service, "validate_plan", None)):
@@ -74,12 +114,14 @@ class ApprovalRuntime:
             raise TypeError("production ApprovalRuntime requires broker with ApprovalAuthenticator")
         self._store=store; self._broker=broker; self._context_provider=context_provider
         self._plan_repository=plan_repository; self._planning_service=planning_service
+        self._task_manager=task_manager; self._workspace_manager=workspace_manager; self._repository_indexer=repository_indexer
         # Runtime-internal token — opaque object that only this instance
         # possesses. Used to register the receipt sink with the broker so
         # that forged callers cannot replace it.
         self._runtime_token = object()
         self.service=None; self.gate=None; self.boot_context=None; self.ready=False
         self._state = RuntimeState.UNINITIALIZED
+        self._runtime_authority_id: str | None = None
 
     @property
     def state(self) -> RuntimeState:
@@ -101,43 +143,72 @@ class ApprovalRuntime:
             # 1. Rotate epoch (generates fresh boot_id, revokes old auths/leases)
             epoch, boot_id, _ = self._store.rotate_epoch()
             self.boot_context = BootContext(epoch, boot_id)
+            self._runtime_authority_id = _RUNTIME_AUTHORITIES.register_boot(self.boot_context)
+
+            # Execution readiness requires one shared mutation fence wired to
+            # every mutable workspace subsystem before Gate construction.
+            for name, dependency in (("TaskManager",self._task_manager),("WorkspaceManager",self._workspace_manager),("RepositoryIndexer",self._repository_indexer)):
+                if dependency is None or not callable(getattr(dependency,"set_mutation_fence",None)):
+                    raise TypeError(f"execution-ready ApprovalRuntime requires {name}")
+            from khaos.coding.planning.approval.mutation_fence import WorkspaceMutationFence, PlannedHeadMutationAdapter
+            from khaos.coding.planning.approval.execution_contract import PlannedExecutionGuard
+            self._mutation_fence=WorkspaceMutationFence()
+            for dependency in (self._task_manager,self._workspace_manager,self._repository_indexer):
+                dependency.set_mutation_fence(self._mutation_fence)
 
             # 2. Wire Broker → durable Receipt outbox (Batch 2.6 §1)
             self._state = RuntimeState.RECEIPT_BOUND
-            signer = self._broker.receipt_signer
             store = self._store
-            # Load old signers (for verifying receipts from prior boots).
-            for old_signer in store.load_receipt_signers():
-                if old_signer.key_id != signer.key_id:
-                    store._register_receipt_signer(
-                        old_signer, runtime_token=self._runtime_token,
-                    )
-            # Persist the current signer and register it.
-            store.persist_receipt_signer(signer)
-            store._register_receipt_signer(
-                signer, runtime_token=self._runtime_token,
+            self._broker._rotate_receipt_signing_authority(epoch)
+            verifier = self._broker._receipt_public_verifier()
+            store_receipt_capability = _RUNTIME_AUTHORITIES.issue(
+                self._runtime_authority_id, "receipt-store"
+            )
+            broker_receipt_capability = _RUNTIME_AUTHORITIES.issue(
+                self._runtime_authority_id, "receipt-broker"
             )
             def _writer(**fields):
-                store._insert_signed_receipt(**fields)
+                store._insert_signed_receipt(runtime_token=self._runtime_token, **fields)
+            store._install_runtime_receipt_writer(
+                _writer,
+                runtime_token=self._runtime_token,
+                runtime_capability=store_receipt_capability,
+            )
+            store._persist_receipt_verifier(verifier, runtime_token=self._runtime_token)
             self._broker._install_runtime_receipt_writer(
-                _writer, runtime_token=self._runtime_token,
+                _writer,
+                runtime_token=self._runtime_token,
+                runtime_capability=broker_receipt_capability,
             )
 
             # 3. Construct Gate and Service + reconcile (Batch 2.6 §2)
             self._state = RuntimeState.RECONCILING
-            capability = RuntimeCapability(boot_context=self.boot_context)
+            gate_capability = _RUNTIME_AUTHORITIES.issue(self._runtime_authority_id, "gate")
+            service_capability = _RUNTIME_AUTHORITIES.issue(self._runtime_authority_id, "service")
+            self._lease_authority=object()
             self.gate = PlanExecutionGate(
                 store=self._store, context_provider=self._context_provider,
                 plan_repository=self._plan_repository, planning_service=self._planning_service,
-                runtime_capability=capability,
+                runtime_capability=gate_capability,
+                lease_authority=self._lease_authority,
             )
             self.service = PlanApprovalService(
                 store=self._store, broker=self._broker,
                 context_provider=self._context_provider,
                 plan_repository=self._plan_repository, planning_service=self._planning_service,
-                runtime_capability=capability,
+                runtime_capability=service_capability,
             )
             self.service.reconcile()
+            self.guard=PlannedExecutionGuard(self.gate,lease_authority=self._lease_authority)
+            self.guard.set_mutation_fence(self._mutation_fence)
+            self._coordinator=WorkspaceExecutionLeaseCoordinator(self)
+            self._head_mutation_adapter=PlannedHeadMutationAdapter(self._mutation_fence,self._coordinator)
+            if callable(getattr(self._task_manager, "set_lease_invalidation_hook", None)):
+                self._task_manager.set_lease_invalidation_hook(self._coordinator.cancel_task)
+            if callable(getattr(self._workspace_manager, "set_lease_invalidation_hook", None)):
+                self._workspace_manager.set_lease_invalidation_hook(
+                    self._coordinator.cleanup_workspace
+                )
 
             # 4. Mark ready
             self._state = RuntimeState.READY
@@ -187,6 +258,8 @@ class ApprovalRuntime:
                 pass
 
         self.boot_context = None
+        _RUNTIME_AUTHORITIES.revoke(self._runtime_authority_id)
+        self._runtime_authority_id = None
         logger.warning("approval runtime initialization failed at %s; rolled back", failed_state.name)
 
     def require_ready(self) -> None:
@@ -205,7 +278,12 @@ class ApprovalRuntime:
         self.require_ready(); return self.gate.authorize_execution(**kwargs)
 
     def acquire_lease(self, **kwargs: Any):
-        self.require_ready(); return self.gate.acquire_lease(**kwargs)
+        raise PermissionError("bare lease acquisition is closed; use acquire_execution_context")
+
+    def acquire_execution_context(self, **kwargs: Any):
+        self.require_ready()
+        from khaos.coding.planning.approval.mutation_fence import fenced_acquire_lease
+        return fenced_acquire_lease(self._coordinator,self._mutation_fence,self.guard,**kwargs)
 
     def require_active_lease(self, *args: Any, **kwargs: Any):
         self.require_ready(); return self.gate.require_active_lease(*args, **kwargs)
@@ -218,9 +296,8 @@ class ApprovalRuntime:
         the epoch to fence any remaining state. After shutdown, all
         operations refuse.
 
-        Batch 2.6 §1: also clears the broker's receipt writer and the
-        store's signer registry so no further receipts can be minted or
-        verified under this boot.
+        Also clears the broker/store writer binding so no further receipts
+        can be minted under this boot. Persisted public keys remain usable.
         """
         if self.ready:
             # Cancel all ACTIVE leases for this boot before rotating the epoch.
@@ -228,7 +305,7 @@ class ApprovalRuntime:
                 boot_id=self.boot_context.boot_id, reason="runtime-shutdown",
             )
             self._store.rotate_epoch()
-            # Clear the broker's writer and the store's signer registry.
+            # Clear runtime writer bindings; public verifiers are durable.
             try:
                 self._broker._reset_runtime_receipt_writer()
             except Exception:
@@ -242,6 +319,8 @@ class ApprovalRuntime:
             self.service = None
             self.boot_context = None
             self._state = RuntimeState.UNINITIALIZED
+            _RUNTIME_AUTHORITIES.revoke(self._runtime_authority_id)
+            self._runtime_authority_id = None
             logger.info("approval runtime shut down")
 
     def register_lease_coordinator(
@@ -261,13 +340,7 @@ class ApprovalRuntime:
         lease acquisition and Batch 3 execution.
         """
         self.require_ready()
-        coordinator = WorkspaceExecutionLeaseCoordinator(self)
-        # Batch 2.6 §5: create the shared mutation fence and wire it into
-        # all real components that mutate workspace state.
-        from khaos.coding.planning.approval.mutation_fence import (
-            WorkspaceMutationFence,
-        )
-        self._mutation_fence = WorkspaceMutationFence()
+        coordinator = self._coordinator
         if task_manager is not None:
             if hasattr(task_manager, "set_lease_invalidation_hook"):
                 task_manager.set_lease_invalidation_hook(coordinator.cancel_task)

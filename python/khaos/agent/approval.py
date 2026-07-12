@@ -49,7 +49,7 @@ class PlanApprovalOutcome:
 class ApprovalBroker:
     """One await/resolve channel keyed by tool call id."""
 
-    def __init__(self, authenticator=None, *, receipt_signer=None) -> None:
+    def __init__(self, authenticator=None) -> None:
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._decisions: dict[str, ApprovalDecision] = {}
         self._bindings: dict[str, tuple[str, float | None]] = {}
@@ -61,12 +61,10 @@ class ApprovalBroker:
         # AuthenticatedApprovalContext signatures. If None, the broker
         # refuses all plan-approval decisions (fail closed).
         self._authenticator = authenticator
-        # Batch 2.6 §1: server-owned ReceiptSigner for HMAC-signing durable
-        # BrokerDecisionReceipts. The signing key is NEVER exposed. If None,
-        # a new signer is generated lazily at first resolve. The runtime
-        # registers the signer with the store's verification registry so
-        # apply_authenticated_decision can re-verify the signature.
-        self._receipt_signer = receipt_signer
+        # Broker-private Ed25519 authority for durable decision receipts.
+        # Only its public verifier is persisted by the runtime.
+        from khaos.coding.planning.approval.receipt_crypto import _ReceiptSigningAuthority
+        self.__receipt_signing_authority = _ReceiptSigningAuthority()
         # Batch 2.6 §1: the durable receipt writer is stored name-mangled so
         # ordinary code and tests cannot read or replace it. Only the runtime
         # can install it via _install_runtime_receipt_writer with the
@@ -74,15 +72,16 @@ class ApprovalBroker:
         self.__runtime_receipt_writer = None  # type: ignore[assignment]
         self.__runtime_receipt_token = None  # type: ignore[assignment]
 
-    @property
-    def receipt_signer(self):
-        """Lazily create a ReceiptSigner (the signer, NOT the key)."""
-        if self._receipt_signer is None:
-            from khaos.coding.planning.approval.models import ReceiptSigner
-            self._receipt_signer = ReceiptSigner()
-        return self._receipt_signer
+    def _receipt_public_verifier(self):
+        return self.__receipt_signing_authority.verifier
 
-    def _install_runtime_receipt_writer(self, writer, *, runtime_token: object) -> None:
+    def _rotate_receipt_signing_authority(self, boot_epoch: int) -> None:
+        from khaos.coding.planning.approval.receipt_crypto import _ReceiptSigningAuthority
+        self.__receipt_signing_authority = _ReceiptSigningAuthority(boot_epoch=boot_epoch)
+
+    def _install_runtime_receipt_writer(
+        self, writer, *, runtime_token: object, runtime_capability=None
+    ) -> None:
         """Install the durable receipt writer produced by ApprovalRuntime.
 
         Batch 2.6 §1: replaces the old ``_register_runtime_receipt_sink``.
@@ -91,8 +90,14 @@ class ApprovalBroker:
         without one) is silently ignored — the writer stays ``None`` and
         receipt persistence is refused (fail-closed).
         """
+        from khaos.coding.planning.approval.runtime import _consume_runtime_capability
+
+        try:
+            _consume_runtime_capability(runtime_capability, "receipt-broker")
+        except PermissionError as exc:
+            raise PermissionError("runtime receipt authority required") from exc
         if runtime_token is None:
-            return
+            raise PermissionError("runtime receipt token required")
         self.__runtime_receipt_token = runtime_token  # type: ignore[assignment]
         self.__runtime_receipt_writer = writer  # type: ignore[assignment]
 
@@ -261,8 +266,8 @@ class ApprovalBroker:
         API/session layer may construct. Bare actor strings are NOT accepted,
         so a caller cannot self-assert an authenticated identity.
 
-        Batch 2.6 §1: the receipt is signed by the broker's internal
-        ``ReceiptSigner`` (HMAC over the canonical payload digest). The
+        Batch 2.7: the receipt is signed by the broker's private Ed25519
+        authority over the canonical payload digest. The
         ``receipt_sink`` parameter is DEPRECATED and silently ignored —
         the runtime-installed name-mangled writer is the ONLY path to the
         durable outbox. An ordinary caller cannot inject a sink.
@@ -292,7 +297,7 @@ class ApprovalBroker:
                 "resolve_plan_approval requires an AuthenticatedApprovalContext; "
                 "bare actor strings are not accepted"
             )
-        # Batch 2.3 §5: verify the server-owned HMAC signature. A
+        # Verify the server-owned authenticated-session HMAC. A
         # hand-constructed context has signature="" → rejected. An
         # authenticator MUST be wired or all decisions fail closed.
         if self._authenticator is None:
@@ -348,16 +353,15 @@ class ApprovalBroker:
                 token_hash=token_hash,
                 metadata={"reason": reason_text},
             )
-            # Batch 2.6 §1: sign the receipt with the broker's internal
-            # ReceiptSigner. The signing key is never exposed. The signature
+        # Batch 2.7: sign with the broker-private Ed25519 authority. The key
+        # is never exposed or persisted. The signature
             # is bound to every authoritative field + token_hash.
-            signer = self.receipt_signer
             payload_digest = receipt.compute_canonical_payload_digest()
-            signature = signer.sign_receipt_payload_digest(payload_digest)
+            signature = self.__receipt_signing_authority._sign_payload_digest(payload_digest)
             # frozen dataclass — use object.__setattr__ to set the signature fields.
             object.__setattr__(receipt, "canonical_payload_digest", payload_digest)
             object.__setattr__(receipt, "broker_signature", signature)
-            object.__setattr__(receipt, "signer_key_id", signer.key_id)
+            object.__setattr__(receipt, "signer_key_id", self.__receipt_signing_authority.verifier.key_id)
 
         # Persist the receipt outbox row outside the broker lock. The
         # name-mangled runtime writer is the ONLY path — the deprecated

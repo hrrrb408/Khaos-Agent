@@ -109,6 +109,7 @@ class PlanExecutionGate:
         context_provider: "ContextProvider",
         *,
         runtime_capability: Any = None,
+        lease_authority: object | None = None,
         plan_repository: PlanRepository | None = None,
         planning_service: Any | None = None,
         policy: GatePolicy | None = None,
@@ -117,13 +118,11 @@ class PlanExecutionGate:
         # Batch 2.6 §2: production construction requires RuntimeCapability.
         # No boot_context=None implicit test mode — test code must use the
         # explicit UnsafeTestPlanExecutionGate subclass in test helpers.
-        from khaos.coding.planning.approval.runtime import RuntimeCapability
-        if not isinstance(runtime_capability, RuntimeCapability):
-            raise TypeError(
-                "production PlanExecutionGate requires RuntimeCapability "
-                "(obtain from ApprovalRuntime.initialize()); test code must "
-                "use UnsafeTestPlanExecutionGate"
-            )
+        from khaos.coding.planning.approval.runtime import _consume_runtime_capability
+        try:
+            verified_boot_context = _consume_runtime_capability(runtime_capability, "gate")
+        except PermissionError as exc:
+            raise TypeError("production PlanExecutionGate requires runtime factory authority") from exc
         if plan_repository is None or not isinstance(plan_repository, PersistedPlanRepository):
             raise TypeError("production PlanExecutionGate requires PersistedPlanRepository")
         if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
@@ -132,7 +131,8 @@ class PlanExecutionGate:
         self._context_provider = context_provider
         self._policy = policy or GatePolicy()
         self._clock = clock
-        self._boot_context = runtime_capability.boot_context
+        self._boot_context = verified_boot_context
+        self.__lease_authority = lease_authority or object()
         self._plan_repository = plan_repository
         # Batch 2.2 §3: epoch is persisted, not a fixed default. The gate
         # reads the current epoch at construction; rotate_epoch() increments
@@ -407,6 +407,7 @@ class PlanExecutionGate:
         expected_workspace_id: str,
         expected_repository_id: str,
         owner_execution_id: str,
+        _lease_authority: object | None = None,
     ) -> tuple[PlanExecutionAuthorization, "WorkspaceExecutionLease"]:
         """Lease-first atomic consume: the ONLY public execution entry point.
 
@@ -425,6 +426,8 @@ class PlanExecutionGate:
         Returns ``(consumed_authorization, lease)``.
         """
         import uuid as _uuid
+        if not getattr(self, "_unsafe_test_only", False) and _lease_authority is not self.__lease_authority:
+            raise PermissionError("execution lease acquisition requires runtime mutation fence authority")
 
         # --- LIVE validation (before the atomic transaction) ---
         auth = self._store.get_authorization(authorization_id)

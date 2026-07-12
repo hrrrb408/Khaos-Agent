@@ -79,8 +79,9 @@ class PlannedExecutionGuard:
     still go through this guard.
     """
 
-    def __init__(self, gate: "PlanExecutionGate") -> None:
+    def __init__(self, gate: "PlanExecutionGate", *, lease_authority: object | None = None) -> None:
         self._gate = gate
+        self.__lease_authority = lease_authority
         self._contexts: dict[str, AuthorizedExecutionContext] = {}
         # Batch 2.6 §5: optional per-workspace mutation fence. When set,
         # every planned_* method verifies the fence is held by
@@ -108,10 +109,10 @@ class PlannedExecutionGuard:
         ):
             raise PermissionError("execution context lease is not active")
         # Batch 2.6 §5: verify the mutation fence is held by this lease.
+        if self._mutation_fence is None and not getattr(self._gate, "_unsafe_test_only", False):
+            raise PermissionError("planned execution guard requires mutation fence")
         if self._mutation_fence is not None:
-            self._mutation_fence.assert_owner(
-                ctx.workspace_id, f"lease:{ctx.lease_id}"
-            )
+            self._mutation_fence.assert_owner(ctx.workspace_id, f"lease:{ctx.lease_id}")
 
     def planned_workspace_edit(self, ctx: AuthorizedExecutionContext, *, edit: dict) -> None:
         """Apply a planned workspace file edit. (Batch 3)"""
@@ -174,6 +175,7 @@ class PlannedExecutionGuard:
             expected_workspace_id=expected_workspace_id,
             expected_repository_id=expected_repository_id,
             owner_execution_id=owner_execution_id,
+            _lease_authority=self.__lease_authority,
         )
         context_id = f"execctx_{secrets.token_hex(24)}"
         ctx = AuthorizedExecutionContext(
