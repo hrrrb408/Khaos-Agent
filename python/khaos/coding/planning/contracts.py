@@ -41,7 +41,7 @@ class ImpactAnalysis:
     target_files: tuple[str, ...]; target_symbols: tuple[str, ...]; direct_impacts: tuple[ImpactEdge, ...]; indirect_impacts: tuple[ImpactEdge, ...]; external_impacts: tuple[ImpactEdge, ...]; dynamic_impacts: tuple[ImpactEdge, ...]; excluded_impacts: tuple[ImpactEdge, ...]; diagnostics: tuple[PlanDiagnostic, ...]; traversal_depth: int; truncated: bool; content_hash: str
     visited_nodes: int = 0; visited_files: int = 0; visited_symbols: int = 0
     inspected_edges: int = 0; inspected_file_candidates: int = 0; inspected_test_candidates: int = 0
-    inspected_reverse_imports: int = 0; sql_rows_enumerated: int = 0; limit_code: str | None = None
+    inspected_reverse_imports: int = 0; sql_rows_returned: int = 0; sql_queries_issued: int = 0; indexed_edge_rows_fetched: int = 0; limit_code: str | None = None
 
 
 class ImpactTraversalBudget:
@@ -52,6 +52,13 @@ class ImpactTraversalBudget:
     consult this single object before inspecting or adding any edge/file/symbol.
     Reaching ANY limit stops further expansion, sets ``truncated=True``,
     records a concrete ``limit_code``, and leaves results in stable sort order.
+
+    HARD GLOBAL BUDGET: once ``truncated`` is set, ALL subsequent methods
+    (can_visit_node, can_inspect_edge, can_inspect_reverse_import,
+    can_inspect_test_candidate, can_inspect_file_candidate, add_affected_file,
+    add_affected_symbol) immediately return False without incrementing any
+    counter. This prevents later phases from continuing to their own local
+    limits after an earlier phase already triggered truncation.
     """
 
     __slots__ = (
@@ -59,7 +66,8 @@ class ImpactTraversalBudget:
         "max_reverse_imports", "max_test_candidates",
         "_visited_nodes", "_inspected_edges", "_inspected_file_candidates",
         "_inspected_test_candidates", "_inspected_reverse_imports",
-        "_sql_rows_enumerated", "_affected_files", "_affected_symbols",
+        "_sql_rows_returned", "_sql_queries_issued", "_indexed_edge_rows_fetched",
+        "_affected_files", "_affected_symbols",
         "_truncated", "_limit_code",
     )
 
@@ -78,7 +86,9 @@ class ImpactTraversalBudget:
         self._inspected_file_candidates = 0
         self._inspected_test_candidates = 0
         self._inspected_reverse_imports = 0
-        self._sql_rows_enumerated = 0
+        self._sql_rows_returned = 0
+        self._sql_queries_issued = 0
+        self._indexed_edge_rows_fetched = 0
         self._affected_files: set[str] = set()
         self._affected_symbols: set[str] = set()
         self._truncated = False
@@ -99,7 +109,11 @@ class ImpactTraversalBudget:
     @property
     def inspected_reverse_imports(self) -> int: return self._inspected_reverse_imports
     @property
-    def sql_rows_enumerated(self) -> int: return self._sql_rows_enumerated
+    def sql_rows_returned(self) -> int: return self._sql_rows_returned
+    @property
+    def sql_queries_issued(self) -> int: return self._sql_queries_issued
+    @property
+    def indexed_edge_rows_fetched(self) -> int: return self._indexed_edge_rows_fetched
     @property
     def affected_files_count(self) -> int: return len(self._affected_files)
     @property
@@ -109,11 +123,19 @@ class ImpactTraversalBudget:
     @property
     def affected_symbols(self) -> tuple[str, ...]: return tuple(sorted(self._affected_symbols))
 
-    def record_sql_rows(self, count: int) -> None:
-        """Record SQL rows enumerated by a bounded query (for audit)."""
-        self._sql_rows_enumerated += count
+    def record_sql_query(self, *, rows_returned: int, indexed_rows: int = 0) -> None:
+        """Record one SQL query and its returned/indexed row counts for audit.
+
+        ``rows_returned`` is the number of rows actually returned to the caller
+        (not the number of rows scanned). ``indexed_rows`` is the number of
+        rows fetched via an index seek (not a full table scan).
+        """
+        self._sql_queries_issued += 1
+        self._sql_rows_returned += rows_returned
+        self._indexed_edge_rows_fetched += indexed_rows
 
     def can_visit_node(self, sid: str, depth: int) -> bool:
+        if self._truncated: return False
         if sid in self._visited_nodes: return False
         if len(self._visited_nodes) >= self.max_nodes:
             self._truncate("max_nodes"); return False
@@ -125,24 +147,28 @@ class ImpactTraversalBudget:
         self._visited_nodes.add(sid)
 
     def can_inspect_edge(self) -> bool:
+        if self._truncated: return False
         if self._inspected_edges >= self.max_edges:
             self._truncate("max_edges"); return False
         self._inspected_edges += 1
         return True
 
     def can_inspect_reverse_import(self) -> bool:
+        if self._truncated: return False
         if self._inspected_reverse_imports >= self.max_reverse_imports:
             self._truncate("max_reverse_imports"); return False
         self._inspected_reverse_imports += 1
         return True
 
     def can_inspect_test_candidate(self) -> bool:
+        if self._truncated: return False
         if self._inspected_test_candidates >= self.max_test_candidates:
             self._truncate("max_test_candidates"); return False
         self._inspected_test_candidates += 1
         return True
 
     def can_inspect_file_candidate(self) -> bool:
+        if self._truncated: return False
         if self._inspected_file_candidates >= self.max_files:
             self._truncate("max_file_candidates"); return False
         self._inspected_file_candidates += 1
@@ -150,12 +176,14 @@ class ImpactTraversalBudget:
 
     def add_affected_file(self, path: str) -> bool:
         if path in self._affected_files: return True
+        if self._truncated: return False
         if len(self._affected_files) >= self.max_files:
             self._truncate("max_files"); return False
         self._affected_files.add(path); return True
 
     def add_affected_symbol(self, sid: str) -> bool:
         if sid in self._affected_symbols: return True
+        if self._truncated: return False
         if len(self._affected_symbols) >= self.max_symbols:
             self._truncate("max_symbols"); return False
         self._affected_symbols.add(sid); return True
@@ -173,6 +201,12 @@ class TestAssociationResult:
     ``status`` is always ``possible`` for heuristic results — never ``resolved``.
     ``inspected_candidates`` reports how many candidates were examined;
     ``max_candidates`` is the bounded limit that was enforced.
+
+    Query cost fields:
+    - ``sql_queries_issued``: number of SQL statements executed
+    - ``sql_rows_returned``: rows actually returned (not rows scanned)
+    - ``indexed_edge_rows_fetched``: rows fetched via index seeks
+    - ``query_plans``: EXPLAIN QUERY PLAN output for each query, for audit
     """
     candidates: tuple[dict[str, Any], ...]
     status: str  # "possible" for heuristic, "resolved" for graph-evidenced
@@ -181,6 +215,10 @@ class TestAssociationResult:
     max_candidates: int
     evidence_sources: tuple[str, ...]  # which priority levels produced candidates
     truncated: bool
+    sql_queries_issued: int = 0
+    sql_rows_returned: int = 0
+    indexed_edge_rows_fetched: int = 0
+    query_plans: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
