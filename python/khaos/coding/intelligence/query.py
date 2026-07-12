@@ -138,45 +138,81 @@ class CodeQueryService:
         target_files: tuple[str, ...],
         target_symbols: tuple[str, ...] = (),
         max_results: int = 50,
+        max_sql_queries: int = 10,
+        max_indexed_rows: int = 200,
     ) -> "tuple":
         """Bounded test-file association lookup — never scans the whole repository.
 
-        Uses indexed ``path_role`` equality queries (NOT ``LIKE '%test%'``) to
-        find test files. Every query is bounded by LIMIT and uses an index seek.
+        Uses a SINGLE remaining budget shared across ALL query sources:
+        ``remaining_candidates``, ``remaining_sql_queries``, ``remaining_indexed_rows``.
+        Each query's LIMIT is set to ``remaining_candidates`` (not ``max_results``),
+        so imports/calls/references cannot each fetch the full budget.
 
-        Evidence priority (each level is bounded by ``max_results``):
+        Evidence priority (each level checks remaining budget BEFORE running):
         1. Resolved graph edges (import/call/reference) where the source file
            has ``path_role='test'`` — uses indexed joins on target_file/target_symbol_id.
-        2. All test files (``path_role='test'``) in the repository — uses the
-           ``idx_code_files_role`` index for bounded equality scan.
+        2. Subject/module/package key match — indexed equality on computed keys.
+           (Replaces the old "any test file" fallback that could associate
+           unrelated tests.)
 
-        Returns a :class:`TestAssociationResult` with full query cost evidence:
-        ``sql_queries_issued``, ``sql_rows_returned``, ``indexed_edge_rows_fetched``,
-        and ``query_plans`` (EXPLAIN QUERY PLAN output for audit).
+        EXPLAIN QUERY PLAN queries are NOT counted in ``sql_queries_issued`` —
+        they are audit-only and excluded from the budget.
+
+        Returns a :class:`TestAssociationResult` with full query cost evidence
+        and coverage fields (``has_resolved_test_coverage``, ``possible_test_coverage``).
         """
         from khaos.coding.planning.contracts import TestAssociationResult
 
-        max_candidates = max_results
+        remaining_candidates = max_results
+        remaining_sql_queries = max_sql_queries
+        remaining_indexed_rows = max_indexed_rows
+        limit_code: str | None = None
+
         candidates: list[dict[str, Any]] = []
         seen_paths: set[str] = set()
         evidence_sources: list[str] = []
-        truncated = False
         sql_queries_issued = 0
         sql_rows_returned = 0
         indexed_edge_rows_fetched = 0
         query_plans: list[str] = []
+        has_resolved_test_coverage = False
 
         def _explain(sql: str, params: tuple) -> str:
-            """Run EXPLAIN QUERY PLAN and return a compact string."""
+            """Run EXPLAIN QUERY PLAN and return a compact string. Not counted in budget."""
             try:
                 plan_rows = self.store._conn.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
                 return " | ".join(str(r[3]) for r in plan_rows)
             except sqlite3.Error:
                 return "explain-failed"
 
+        def _can_continue() -> bool:
+            return (remaining_candidates > 0
+                    and remaining_sql_queries > 0
+                    and remaining_indexed_rows > 0)
+
+        def _set_limit(code: str) -> None:
+            nonlocal limit_code
+            if limit_code is None:
+                limit_code = code
+
+        def _after_query(rows_returned: int) -> None:
+            """Decrement budgets after a query returns rows."""
+            nonlocal remaining_sql_queries, remaining_indexed_rows
+            remaining_sql_queries -= 1
+            remaining_indexed_rows -= rows_returned
+
+        def _accept_candidate(path: str, candidate: dict[str, Any], resolved: bool) -> None:
+            nonlocal remaining_candidates, has_resolved_test_coverage
+            if path not in seen_paths:
+                seen_paths.add(path)
+                candidates.append(candidate)
+                remaining_candidates -= 1
+                if resolved:
+                    has_resolved_test_coverage = True
+
         # --- Priority 1: Resolved graph edges where source is a test file ---
-        # Uses idx_resolved_imports_target (on target_file) — indexed seek, not scan.
-        if target_files:
+        # Each sub-query uses LIMIT = remaining_candidates (not max_results).
+        if _can_continue() and target_files:
             placeholders = ",".join("?" * len(target_files))
             sql = (
                 f"SELECT DISTINCT ri.source_file, ri.target_file, ri.confidence, ri.reason, 'import' AS edge_type "
@@ -185,24 +221,35 @@ class CodeQueryService:
                 f"WHERE ri.repository_id = ? AND ri.target_file IN ({placeholders}) AND cf.path_role = 'test' "
                 f"ORDER BY ri.source_file LIMIT ?"
             )
-            params = (repository_id, *target_files, max_candidates)
+            params = (repository_id, *target_files, remaining_candidates)
             query_plans.append(f"P1-import: {_explain(sql, params)}")
-            rows = self.store._conn.execute(sql, params).fetchall()
-            sql_queries_issued += 1
-            sql_rows_returned += len(rows)
-            indexed_edge_rows_fetched += len(rows)
+            try:
+                rows = self.store._conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                # resolved_imports table may not exist if resolution hasn't run
+                rows = []
+            else:
+                sql_queries_issued += 1
+                sql_rows_returned += len(rows)
+                indexed_edge_rows_fetched += len(rows)
+                _after_query(len(rows))
             for row in rows:
                 path = str(row[0])
-                if path not in seen_paths:
-                    seen_paths.add(path)
-                    candidates.append({"path": path, "target_file": row[1], "confidence": float(row[2]),
-                                       "reason": str(row[3]), "edge_type": "import", "source": "resolution-graph"})
+                _accept_candidate(path, {"path": path, "target_file": row[1], "confidence": float(row[2]),
+                                         "reason": str(row[3]), "edge_type": "import", "source": "resolution-graph"},
+                                  resolved=True)
             if rows:
                 evidence_sources.append("resolved-imports")
+            if not _can_continue():
+                _set_limit("max_candidates" if remaining_candidates <= 0
+                           else "max_sql_queries" if remaining_sql_queries <= 0
+                           else "max_indexed_rows")
 
-        if target_symbols:
+        if _can_continue() and target_symbols:
             placeholders = ",".join("?" * len(target_symbols))
             for table, kind in (("resolved_call_edges", "call"), ("resolved_reference_edges", "reference")):
+                if not _can_continue():
+                    break
                 sql = (
                     f"SELECT DISTINCT e.source_file, e.target_file, e.target_symbol_id, e.confidence, e.resolution_rule, '{kind}' AS edge_type "
                     f"FROM {table} e "
@@ -210,61 +257,107 @@ class CodeQueryService:
                     f"WHERE e.repository_id = ? AND e.target_symbol_id IN ({placeholders}) AND cf.path_role = 'test' "
                     f"ORDER BY e.source_file LIMIT ?"
                 )
-                params = (repository_id, *target_symbols, max_candidates)
+                params = (repository_id, *target_symbols, remaining_candidates)
                 query_plans.append(f"P1-{kind}: {_explain(sql, params)}")
-                rows = self.store._conn.execute(sql, params).fetchall()
-                sql_queries_issued += 1
-                sql_rows_returned += len(rows)
-                indexed_edge_rows_fetched += len(rows)
+                try:
+                    rows = self.store._conn.execute(sql, params).fetchall()
+                except sqlite3.OperationalError:
+                    # resolved_{call,reference}_edges table may not exist
+                    rows = []
+                else:
+                    sql_queries_issued += 1
+                    sql_rows_returned += len(rows)
+                    indexed_edge_rows_fetched += len(rows)
+                    _after_query(len(rows))
                 for row in rows:
                     path = str(row[0])
-                    if path not in seen_paths:
-                        seen_paths.add(path)
-                        candidates.append({"path": path, "target_file": row[1], "confidence": float(row[3]),
-                                           "reason": str(row[4]), "edge_type": kind, "source": "resolution-graph"})
+                    _accept_candidate(path, {"path": path, "target_file": row[1], "confidence": float(row[3]),
+                                             "reason": str(row[4]), "edge_type": kind, "source": "resolution-graph"},
+                                      resolved=True)
                 if rows:
                     evidence_sources.append(f"resolved-{kind}-edges")
+                if not _can_continue():
+                    _set_limit("max_candidates" if remaining_candidates <= 0
+                               else "max_sql_queries" if remaining_sql_queries <= 0
+                               else "max_indexed_rows")
 
-        # --- Priority 2: All test files via path_role index (equality, not LIKE) ---
-        if len(candidates) < max_candidates:
-            remaining = max_candidates - len(candidates)
+        # --- Priority 2: Subject/module/package key match (target-related only) ---
+        # Replaces the old "any test file via path_role" fallback.
+        # Only test files whose subject/module/package key matches a target
+        # are returned — never arbitrary unrelated test files.
+        if _can_continue() and target_files:
+            target_subjects = set()
+            target_modules = set()
+            for tf in target_files:
+                normalized = tf.replace("\\", "/")
+                filename = normalized.split("/")[-1]
+                stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+                target_subjects.add(stem)
+                module_key = normalized.rsplit(".", 1)[0] if "." in normalized else normalized
+                target_modules.add(module_key)
+            placeholders_subj = ",".join("?" * len(target_subjects))
+            placeholders_mod = ",".join("?" * len(target_modules))
             sql = (
-                "SELECT path, language, content_hash, generation FROM code_files "
-                "WHERE project_id = ? AND path_role = 'test' ORDER BY path LIMIT ?"
+                f"SELECT path, language, content_hash, generation, test_subject_key, module_key "
+                f"FROM code_files "
+                f"WHERE project_id = ? AND path_role = 'test' "
+                f"AND (test_subject_key IN ({placeholders_subj}) OR module_key IN ({placeholders_mod})) "
+                f"ORDER BY path LIMIT ?"
             )
-            params = (repository_id, remaining)
-            query_plans.append(f"P2-test-role: {_explain(sql, params)}")
-            rows = self.store._conn.execute(sql, params).fetchall()
+            params = (repository_id, *target_subjects, *target_modules, remaining_candidates)
+            query_plans.append(f"P2-subject-key: {_explain(sql, params)}")
+            try:
+                rows = self.store._conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                # Columns not yet migrated — skip P2 gracefully
+                rows = []
             sql_queries_issued += 1
             sql_rows_returned += len(rows)
             indexed_edge_rows_fetched += len(rows)
+            _after_query(len(rows))
             for row in rows:
                 path = str(row[0])
-                if path not in seen_paths:
-                    seen_paths.add(path)
-                    candidates.append({"path": path, "language": row[1], "content_hash": row[2],
-                                       "generation": row[3], "confidence": 0.5,
-                                       "reason": "indexed test-role", "edge_type": "role-index",
-                                       "source": "path-role-index"})
+                subject_match = str(row[4]) in target_subjects if row[4] else False
+                module_match = str(row[5]) in target_modules if row[5] else False
+                if subject_match or module_match:
+                    _accept_candidate(path, {"path": path, "language": row[1], "content_hash": row[2],
+                                             "generation": row[3], "confidence": 0.4,
+                                             "reason": "subject/module key match", "edge_type": "subject-key",
+                                             "source": "subject-key-match"},
+                                      resolved=False)
             if rows:
-                evidence_sources.append("path-role-index")
+                evidence_sources.append("subject-key-match")
+            if not _can_continue():
+                _set_limit("max_candidates" if remaining_candidates <= 0
+                           else "max_sql_queries" if remaining_sql_queries <= 0
+                           else "max_indexed_rows")
 
-        if len(candidates) >= max_candidates:
-            truncated = True
+        # Final fallback: if budget was already exhausted at start (e.g. max_sql_queries=0)
+        # and no query ran to set limit_code, set it now.
+        if limit_code is None and not _can_continue():
+            _set_limit("max_candidates" if remaining_candidates <= 0
+                       else "max_sql_queries" if remaining_sql_queries <= 0
+                       else "max_indexed_rows")
 
+        possible_test_coverage = bool(candidates) and not has_resolved_test_coverage
+        truncated = limit_code is not None
         candidates.sort(key=lambda c: (c.get("path", ""), c.get("edge_type", "")))
         return TestAssociationResult(
-            candidates=tuple(candidates[:max_candidates]),
+            candidates=tuple(candidates[:max_results]),
             status="possible",
             confidence=0.5,
             inspected_candidates=sql_rows_returned,
-            max_candidates=max_candidates,
+            max_candidates=max_results,
             evidence_sources=tuple(sorted(set(evidence_sources))),
             truncated=truncated,
             sql_queries_issued=sql_queries_issued,
             sql_rows_returned=sql_rows_returned,
             indexed_edge_rows_fetched=indexed_edge_rows_fetched,
             query_plans=tuple(query_plans),
+            fetch_budget=max_indexed_rows,
+            limit_code=limit_code,
+            has_resolved_test_coverage=has_resolved_test_coverage,
+            possible_test_coverage=possible_test_coverage,
         )
 
     # ---- Optional LSP evidence fusion queries (Batch 6, additive) ----

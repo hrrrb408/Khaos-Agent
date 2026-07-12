@@ -42,6 +42,7 @@ class ImpactAnalysis:
     visited_nodes: int = 0; visited_files: int = 0; visited_symbols: int = 0
     inspected_edges: int = 0; inspected_file_candidates: int = 0; inspected_test_candidates: int = 0
     inspected_reverse_imports: int = 0; sql_rows_returned: int = 0; sql_queries_issued: int = 0; indexed_edge_rows_fetched: int = 0; limit_code: str | None = None
+    has_resolved_test_coverage: bool = False
 
 
 class ImpactTraversalBudget:
@@ -134,6 +135,18 @@ class ImpactTraversalBudget:
         self._sql_rows_returned += rows_returned
         self._indexed_edge_rows_fetched += indexed_rows
 
+    def record_sql_batch(self, *, queries_issued: int, rows_returned: int, indexed_rows_fetched: int) -> None:
+        """Record multiple SQL queries at once (e.g., from associated_tests).
+
+        This is the batch variant of :meth:`record_sql_query` — use it when a
+        single logical operation (such as :meth:`CodeQueryService.associated_tests`)
+        issues multiple SQL queries internally. The PlanningService must NOT
+        record a :class:`TestAssociationResult` as a single SQL query.
+        """
+        self._sql_queries_issued += queries_issued
+        self._sql_rows_returned += rows_returned
+        self._indexed_edge_rows_fetched += indexed_rows_fetched
+
     def can_visit_node(self, sid: str, depth: int) -> bool:
         if self._truncated: return False
         if sid in self._visited_nodes: return False
@@ -203,10 +216,19 @@ class TestAssociationResult:
     ``max_candidates`` is the bounded limit that was enforced.
 
     Query cost fields:
-    - ``sql_queries_issued``: number of SQL statements executed
+    - ``sql_queries_issued``: number of SQL statements executed (EXPLAIN excluded)
     - ``sql_rows_returned``: rows actually returned (not rows scanned)
     - ``indexed_edge_rows_fetched``: rows fetched via index seeks
     - ``query_plans``: EXPLAIN QUERY PLAN output for each query, for audit
+    - ``fetch_budget``: the total row budget that was enforced across ALL queries
+    - ``limit_code``: first budget trigger (e.g. ``max_candidates``, ``max_sql_queries``, ``max_indexed_rows``)
+
+    Coverage fields:
+    - ``has_resolved_test_coverage``: True only when a resolved graph test edge,
+      trusted mapping, or exact subject/module key match was found. This is the
+      ONLY field that may trigger ``has_tests=True`` in risk evaluation.
+    - ``possible_test_coverage``: True when only weak/possible candidates exist.
+      Must NOT eliminate ``test-gap`` risk.
     """
     candidates: tuple[dict[str, Any], ...]
     status: str  # "possible" for heuristic, "resolved" for graph-evidenced
@@ -219,6 +241,10 @@ class TestAssociationResult:
     sql_rows_returned: int = 0
     indexed_edge_rows_fetched: int = 0
     query_plans: tuple[str, ...] = ()
+    fetch_budget: int = 0
+    limit_code: str | None = None
+    has_resolved_test_coverage: bool = False
+    possible_test_coverage: bool = False
 
 
 @dataclass(frozen=True)
