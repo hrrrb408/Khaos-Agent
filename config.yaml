@@ -89,6 +89,17 @@ coding:
     incremental: true
     tree_sitter: {enabled: auto}
     lsp: {enabled: auto, request_timeout_seconds: 10, restart_limit: 1}
+    # Optional LSP evidence fusion (Batch 6). DEFAULT OFF — when disabled,
+    # the fusion service returns repository-only results and never sends
+    # an LSP request. Callers cannot toggle this per-tool-call.
+    lsp_evidence_fusion:
+      enabled: false
+      request_timeout_seconds: 10.0
+      restart_limit: 1
+      cache_max_entries: 2048
+      cache_ttl_seconds: 300.0
+      cache_max_bytes: 16777216
+      trusted_servers: []
   workspace:
     mode: worktree
     require_clean_base: true

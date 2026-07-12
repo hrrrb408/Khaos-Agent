@@ -1,0 +1,664 @@
+"""Offline fallback adapters and locked Tree-sitter grammar integration."""
+from __future__ import annotations
+
+import ast
+import hashlib
+import importlib
+import importlib.metadata
+import importlib.resources
+import re
+import threading
+import time
+from dataclasses import dataclass, field, replace
+from pathlib import Path
+from typing import Any, Protocol
+
+from khaos.coding.intelligence.models import CallCandidate, ChangedRange, ImportReference, ParseDiagnostic, ParseResult, ParserMetadata, ParseState, ReferenceCandidate, SourceLocation, Symbol
+
+
+INCREMENTAL_STATE_VERSION = 1
+INCREMENTAL_MAX_CHANGED_RATIO = 0.50
+
+
+@dataclass(frozen=True)
+class AdapterAvailability:
+    available: bool
+    code: str
+    message: str
+    version: str = "unknown"
+
+
+@dataclass(frozen=True)
+class GrammarSpec:
+    language: str
+    dialect: str
+    extensions: frozenset[str]
+    module: str
+    distribution: str
+    loader_name: str
+    expected_package_version: str
+    query_resource_path: str
+    query_version: str
+
+
+GRAMMARS = {
+    "python": GrammarSpec("python", "python", frozenset({".py"}), "tree_sitter_python", "tree-sitter-python", "language", "0.25.0", "queries/python", "v1"),
+    "javascript": GrammarSpec("javascript", "javascript", frozenset({".js", ".jsx"}), "tree_sitter_javascript", "tree-sitter-javascript", "language", "0.25.0", "queries/javascript", "v1"),
+    "typescript": GrammarSpec("typescript", "typescript", frozenset({".ts"}), "tree_sitter_typescript", "tree-sitter-typescript", "language_typescript", "0.23.2", "queries/typescript", "v1"),
+    "tsx": GrammarSpec("typescript", "tsx", frozenset({".tsx"}), "tree_sitter_typescript", "tree-sitter-typescript", "language_tsx", "0.23.2", "queries/tsx", "v1"),
+    "go": GrammarSpec("go", "go", frozenset({".go"}), "tree_sitter_go", "tree-sitter-go", "language", "0.25.0", "queries/go", "v1"),
+    "rust": GrammarSpec("rust", "rust", frozenset({".rs"}), "tree_sitter_rust", "tree-sitter-rust", "language", "0.24.2", "queries/rust", "v1"),
+}
+
+
+class ParseAdapter(Protocol):
+    language: str
+    source_name: str
+    supports_incremental: bool
+    version: str
+    extensions: frozenset[str]
+    def availability(self, file_path: str | None = None) -> AdapterAvailability: ...
+    def parse(self, *, file_path: str, content: bytes, previous_state: ParseState | None = None) -> ParseResult: ...
+
+
+def _hash(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def _point_column(content: bytes, byte_offset: int) -> tuple[int, int]:
+    before = content[:byte_offset]
+    line = before.count(b"\n")
+    line_bytes = before.rsplit(b"\n", 1)[-1]
+    return line, len(line_bytes.decode("utf-8"))
+
+
+def _node_location(file_path: str, content: bytes, node: Any) -> SourceLocation:
+    start_line, start_column = _point_column(content, node.start_byte)
+    end_line, end_column = _point_column(content, node.end_byte)
+    return SourceLocation(file_path, start_line, start_column, end_line, end_column, node.start_byte, node.end_byte)
+
+
+class TreeSitterAdapter:
+    source_name = "tree-sitter"
+    supports_incremental = True
+
+    def __init__(self, language: str, extensions: frozenset[str]) -> None:
+        self.language = self.language_id = language
+        self.extensions = extensions
+        self._lock = threading.RLock()
+        self._initialized: dict[str, tuple[Any, Any, Any, Any, Any, GrammarSpec]] = {}
+        try:
+            self.version = importlib.metadata.version("tree-sitter")
+        except importlib.metadata.PackageNotFoundError:
+            self.version = "unavailable"
+
+    def _spec(self, file_path: str | None) -> GrammarSpec:
+        if self.language == "typescript" and file_path and Path(file_path).suffix.lower() == ".tsx":
+            return GRAMMARS["tsx"]
+        return GRAMMARS[self.language]
+
+    def availability(self, file_path: str | None = None) -> AdapterAvailability:
+        try:
+            self._initialize(self._spec(file_path))
+            return AdapterAvailability(True, "available", "locked grammar and queries initialized", self.version)
+        except ModuleNotFoundError as exc:
+            code = "dependency-missing" if exc.name == "tree_sitter" else "grammar-missing"
+            return AdapterAvailability(False, code, str(exc), self.version)
+        except importlib.metadata.PackageNotFoundError as exc:
+            return AdapterAvailability(False, "grammar-missing", str(exc), self.version)
+        except AttributeError as exc:
+            return AdapterAvailability(False, "grammar-loader-missing", str(exc), self.version)
+        except GrammarVersionError as exc:
+            return AdapterAvailability(False, "grammar-version-mismatch", str(exc), self.version)
+        except GrammarAbiError as exc:
+            return AdapterAvailability(False, "grammar-abi-incompatible", str(exc), self.version)
+        except QueryLoadError as exc:
+            return AdapterAvailability(False, "query-invalid", str(exc), self.version)
+        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+            return AdapterAvailability(False, "parser-initialization-failed", str(exc), self.version)
+
+    def _initialize(self, spec: GrammarSpec) -> tuple[Any, Any, Any, Any, Any, GrammarSpec]:
+        with self._lock:
+            if spec.dialect in self._initialized:
+                return self._initialized[spec.dialect]
+            tree_sitter = importlib.import_module("tree_sitter")
+            module = importlib.import_module(spec.module)
+            version = importlib.metadata.version(spec.distribution)
+            if version != spec.expected_package_version:
+                raise GrammarVersionError(f"{spec.distribution} {version} != locked {spec.expected_package_version}")
+            loader = getattr(module, spec.loader_name)
+            language = tree_sitter.Language(loader())
+            if not tree_sitter.MIN_COMPATIBLE_LANGUAGE_VERSION <= language.abi_version <= tree_sitter.LANGUAGE_VERSION:
+                raise GrammarAbiError(f"grammar ABI {language.abi_version} outside {tree_sitter.MIN_COMPATIBLE_LANGUAGE_VERSION}..{tree_sitter.LANGUAGE_VERSION}")
+            try:
+                symbols_query = tree_sitter.Query(language, _query_text(spec, "symbols.scm"))
+                imports_query = tree_sitter.Query(language, _query_text(spec, "imports.scm"))
+                calls_query = tree_sitter.Query(language, _query_text(spec, "calls.scm"))
+                references_query = tree_sitter.Query(language, _query_text(spec, "references.scm"))
+                tree_sitter.QueryCursor(symbols_query)
+                tree_sitter.QueryCursor(imports_query)
+                tree_sitter.QueryCursor(calls_query)
+                tree_sitter.QueryCursor(references_query)
+            except tree_sitter.QueryError as exc:
+                raise QueryLoadError(str(exc)) from exc
+            parser = tree_sitter.Parser(language)
+            if parser.parse(_minimum_source(spec.dialect)).root_node is None:
+                raise RuntimeError("minimum grammar parse returned no root")
+            value = (language, symbols_query, imports_query, calls_query, references_query, spec)
+            self._initialized[spec.dialect] = value
+            return value
+
+    def parse(self, *, file_path: str, content: bytes, previous_state: ParseState | None = None) -> ParseResult:
+        started = time.perf_counter()
+        language, symbols_query, imports_query, calls_query, references_query, spec = self._initialize(self._spec(file_path))
+        tree_sitter = importlib.import_module("tree_sitter")
+        grammar_version = importlib.metadata.version(spec.distribution)
+        fingerprint = _grammar_fingerprint(self.version, spec, grammar_version, language.abi_version)
+        tree, telemetry, state_diagnostic = self._parse_tree(language, spec, grammar_version, fingerprint, file_path, content, previous_state)
+        all_nodes = list(_walk(tree.root_node))
+        error_nodes = [node for node in all_nodes if node.type == "ERROR" or node.is_missing]
+        symbol_matches = tree_sitter.QueryCursor(symbols_query).matches(tree.root_node)
+        import_matches = tree_sitter.QueryCursor(imports_query).matches(tree.root_node)
+        call_matches = tree_sitter.QueryCursor(calls_query).matches(tree.root_node)
+        reference_matches = tree_sitter.QueryCursor(references_query).matches(tree.root_node)
+        symbols = _extract_symbols(spec, symbol_matches, content, file_path, error_nodes)
+        imports = _extract_imports(spec, import_matches, content, file_path, error_nodes)
+        calls, skipped_calls = _extract_calls(spec, call_matches, symbols, content, file_path, error_nodes)
+        references, skipped_references = _extract_references(spec, reference_matches, symbols, imports, calls, content, file_path, error_nodes)
+        diagnostics: list[ParseDiagnostic] = []
+        if state_diagnostic is not None:
+            diagnostics.append(state_diagnostic)
+        if tree.root_node.has_error:
+            node = error_nodes[0] if error_nodes else tree.root_node
+            diagnostics.append(ParseDiagnostic("parse-error", "warning", "Tree-sitter recovered from syntax error", _node_location(file_path, content, node), True, self.source_name))
+        metadata = ParserMetadata(spec.module, grammar_version, language.abi_version, spec.dialect, spec.query_version, len(error_nodes), len(all_nodes), len(symbol_matches), len(import_matches), len(call_matches), len(reference_matches), skipped_calls, skipped_references, **telemetry)
+        internal_state = _TreeSitterParseState(INCREMENTAL_STATE_VERSION, file_path, spec.language, spec.dialect, self.source_name, self.version, spec.module, grammar_version, language.abi_version, spec.query_version, fingerprint, _hash(content), len(content), content, tree, telemetry["incremental_generation"])
+        parse_state = ParseState(self.source_name, internal_state.content_hash, internal_state)
+        return ParseResult(spec.language, file_path, tuple(symbols), tuple(imports), tuple(calls), tuple(references), tuple(diagnostics), self.source_name, self.version, _hash(content), (time.perf_counter() - started) * 1000, metadata, parse_state)
+
+    def _parse_tree(self, language: Any, spec: GrammarSpec, grammar_version: str, fingerprint: str, file_path: str, content: bytes, previous_state: ParseState | None) -> tuple[Any, dict[str, Any], ParseDiagnostic | None]:
+        tree_sitter = importlib.import_module("tree_sitter")
+        base = {"parse_mode": "full", "incremental_used": False, "incremental_generation": 0, "previous_content_hash": None, "changed_range_count": 0, "changed_byte_count": 0, "changed_ranges": (), "edit_start_byte": None, "edit_old_end_byte": None, "edit_new_end_byte": None, "full_reparse_reason": None, "semantic_refresh_mode": "full-file"}
+        if previous_state is None:
+            return tree_sitter.Parser(language).parse(content), base, None
+        valid, code, message, old = _validate_state(previous_state, language, spec, self.version, grammar_version, fingerprint, file_path)
+        if not valid or old is None:
+            telemetry = {**base, "parse_mode": "full-fallback", "full_reparse_reason": code, "previous_content_hash": previous_state.content_hash}
+            diagnostic = ParseDiagnostic(code, "warning", message, None, True, self.source_name)
+            return tree_sitter.Parser(language).parse(content), telemetry, diagnostic
+        generation = old.generation + 1
+        if old.content_hash == _hash(content):
+            telemetry = {**base, "parse_mode": "noop", "incremental_generation": generation, "previous_content_hash": old.content_hash}
+            return old.native_tree.copy(), telemetry, None
+        edit = canonical_edit(old.source_bytes, content)
+        changed_size = max(edit.old_end_byte - edit.start_byte, edit.new_end_byte - edit.start_byte)
+        ratio = changed_size / max(len(old.source_bytes), len(content), 1)
+        edit_fields = {"edit_start_byte": edit.start_byte, "edit_old_end_byte": edit.old_end_byte, "edit_new_end_byte": edit.new_end_byte, "previous_content_hash": old.content_hash, "incremental_generation": generation}
+        if ratio > INCREMENTAL_MAX_CHANGED_RATIO:
+            telemetry = {**base, **edit_fields, "parse_mode": "full-fallback", "full_reparse_reason": "changed-ratio-exceeded"}
+            return tree_sitter.Parser(language).parse(content), telemetry, None
+        try:
+            edited_tree = old.native_tree.copy()
+            edited_tree.edit(edit.start_byte, edit.old_end_byte, edit.new_end_byte, edit.start_point, edit.old_end_point, edit.new_end_point)
+            new_tree = tree_sitter.Parser(language).parse(content, edited_tree)
+            native_ranges = edited_tree.changed_ranges(new_tree)
+            ranges = tuple(_safe_changed_range(item) for item in native_ranges)
+            if not ranges:
+                ranges = (_changed_range_from_edit(edit, content),)
+            if any(item.end_byte < item.start_byte or item.end_byte > len(content) for item in ranges):
+                raise ValueError("invalid changed range returned by Tree-sitter")
+            telemetry = {**base, **edit_fields, "parse_mode": "incremental", "incremental_used": True, "changed_range_count": len(ranges), "changed_byte_count": sum(item.end_byte - item.start_byte for item in ranges), "changed_ranges": ranges}
+            return new_tree, telemetry, None
+        except (RuntimeError, TypeError, ValueError) as exc:
+            telemetry = {**base, **edit_fields, "parse_mode": "full-fallback", "full_reparse_reason": "incremental-parse-failed"}
+            diagnostic = ParseDiagnostic("incremental-state-invalid", "warning", str(exc), None, True, self.source_name)
+            return tree_sitter.Parser(language).parse(content), telemetry, diagnostic
+
+
+@dataclass(frozen=True, repr=False)
+class _TreeSitterParseState:
+    state_version: int
+    file_path: str
+    language: str
+    dialect: str
+    adapter_source: str
+    parser_version: str
+    grammar_name: str
+    grammar_version: str
+    grammar_abi: int
+    query_version: str
+    grammar_fingerprint: str
+    content_hash: str
+    content_length: int
+    source_bytes: bytes = field(repr=False, compare=False)
+    native_tree: Any = field(repr=False, compare=False)
+    generation: int = 0
+
+    def __reduce__(self) -> object:
+        raise TypeError("native Tree-sitter state cannot be pickled")
+
+
+@dataclass(frozen=True)
+class CanonicalEdit:
+    start_byte: int
+    old_end_byte: int
+    new_end_byte: int
+    start_point: Any
+    old_end_point: Any
+    new_end_point: Any
+
+
+def byte_offset_to_tree_sitter_point(content: bytes, offset: int) -> Any:
+    if offset < 0 or offset > len(content):
+        raise ValueError("byte offset outside content")
+    if offset < len(content) and content[offset] & 0xC0 == 0x80:
+        raise ValueError("byte offset is not a UTF-8 code-point boundary")
+    prefix = content[:offset]
+    row = prefix.count(b"\n")
+    column = len(prefix.rsplit(b"\n", 1)[-1])
+    return (row, column)
+
+
+def canonical_edit(old: bytes, new: bytes) -> CanonicalEdit:
+    prefix = 0
+    limit = min(len(old), len(new))
+    while prefix < limit and old[prefix] == new[prefix]:
+        prefix += 1
+    while prefix > 0 and ((_is_continuation(old, prefix)) or (_is_continuation(new, prefix))):
+        prefix -= 1
+    suffix = 0
+    old_remaining = len(old) - prefix
+    new_remaining = len(new) - prefix
+    while suffix < old_remaining and suffix < new_remaining and old[len(old) - suffix - 1] == new[len(new) - suffix - 1]:
+        suffix += 1
+    old_end = len(old) - suffix
+    new_end = len(new) - suffix
+    while suffix > 0 and (_is_continuation(old, old_end) or _is_continuation(new, new_end)):
+        suffix -= 1
+        old_end += 1
+        new_end += 1
+    return CanonicalEdit(prefix, old_end, new_end, byte_offset_to_tree_sitter_point(old, prefix), byte_offset_to_tree_sitter_point(old, old_end), byte_offset_to_tree_sitter_point(new, new_end))
+
+
+def _is_continuation(content: bytes, offset: int) -> bool:
+    return offset < len(content) and content[offset] & 0xC0 == 0x80
+
+
+def _grammar_fingerprint(parser_version: str, spec: GrammarSpec, grammar_version: str, grammar_abi: int) -> str:
+    value = f"{parser_version}|{spec.module}|{grammar_version}|{grammar_abi}|{spec.dialect}|{spec.query_version}"
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _validate_state(previous: ParseState, language: Any, spec: GrammarSpec, parser_version: str, grammar_version: str, fingerprint: str, file_path: str) -> tuple[bool, str, str, _TreeSitterParseState | None]:
+    if previous.adapter_source != "tree-sitter":
+        return False, "incremental-state-incompatible", "previous adapter is not tree-sitter", None
+    old = previous.opaque
+    if not isinstance(old, _TreeSitterParseState):
+        return False, "incremental-state-invalid", "opaque incremental state has an invalid type", None
+    if old.state_version != INCREMENTAL_STATE_VERSION:
+        return False, "incremental-state-version-mismatch", "unsupported incremental state version", None
+    if old.file_path != file_path:
+        return False, "incremental-state-file-mismatch", "incremental state belongs to another file", None
+    if old.language != spec.language:
+        return False, "incremental-state-incompatible", "incremental state language mismatch", None
+    if old.dialect != spec.dialect:
+        return False, "incremental-state-dialect-mismatch", "incremental state dialect mismatch", None
+    expected = (parser_version, spec.module, grammar_version, language.abi_version, spec.query_version, fingerprint)
+    actual = (old.parser_version, old.grammar_name, old.grammar_version, old.grammar_abi, old.query_version, old.grammar_fingerprint)
+    if actual != expected:
+        return False, "incremental-state-grammar-mismatch", "parser, grammar, ABI, query, or fingerprint mismatch", None
+    if previous.content_hash != old.content_hash or _hash(old.source_bytes) != old.content_hash or len(old.source_bytes) != old.content_length:
+        return False, "incremental-state-invalid", "incremental source integrity check failed", None
+    if old.adapter_source != "tree-sitter" or old.native_tree is None or old.native_tree.language != language:
+        return False, "incremental-state-invalid", "native Tree language or adapter mismatch", None
+    return True, "available", "incremental state is compatible", old
+
+
+def _safe_changed_range(value: Any) -> ChangedRange:
+    return ChangedRange(value.start_byte, value.end_byte, value.start_point.row, value.start_point.column, value.end_point.row, value.end_point.column)
+
+
+def _changed_range_from_edit(edit: CanonicalEdit, content: bytes) -> ChangedRange:
+    end_byte = edit.new_end_byte
+    if end_byte == edit.start_byte and content:
+        end_byte = min(len(content), edit.start_byte + 1)
+        while end_byte < len(content) and _is_continuation(content, end_byte):
+            end_byte += 1
+    end_point = byte_offset_to_tree_sitter_point(content, end_byte)
+    return ChangedRange(edit.start_byte, end_byte, edit.start_point[0], edit.start_point[1], end_point[0], end_point[1])
+
+
+class GrammarVersionError(RuntimeError): pass
+class GrammarAbiError(RuntimeError): pass
+class QueryLoadError(RuntimeError): pass
+
+
+def _query_text(spec: GrammarSpec, name: str) -> str:
+    resource = importlib.resources.files("khaos.coding.intelligence").joinpath(spec.query_resource_path, name)
+    if not resource.is_file():
+        raise QueryLoadError(f"missing packaged query: {spec.query_resource_path}/{name}")
+    return resource.read_text(encoding="utf-8")
+
+
+def _minimum_source(dialect: str) -> bytes:
+    return {"python": b"pass\n", "javascript": b"const x = 1;", "typescript": b"const x: number = 1;", "tsx": b"const X = () => <div />;", "go": b"package p\n", "rust": b"fn main() {}"}[dialect]
+
+
+def _walk(node: Any):
+    yield node
+    for child in node.children:
+        yield from _walk(child)
+
+
+def _error_nodes(root: Any) -> list[Any]:
+    return [node for node in _walk(root) if node.type == "ERROR" or node.is_missing]
+
+
+def _overlaps(node: Any, errors: list[Any]) -> bool:
+    return any(node.start_byte < error.end_byte and error.start_byte < node.end_byte for error in errors)
+
+
+def _text(content: bytes, node: Any | None) -> str:
+    return content[node.start_byte:node.end_byte].decode("utf-8") if node is not None else ""
+
+
+def _first_capture(captures: dict[str, list[Any]], name: str) -> Any | None:
+    nodes = captures.get(name, ())
+    return nodes[0] if nodes else None
+
+
+def _extract_symbols(spec: GrammarSpec, matches: list[tuple[int, dict[str, list[Any]]]], content: bytes, file_path: str, errors: list[Any]) -> list[Symbol]:
+    found: dict[tuple[int, int, str, str], Symbol] = {}
+    kind_priority = {"type": 0, "function": 1, "class": 2, "interface": 2, "struct": 2, "method": 3}
+    for pattern_index, captures in matches:
+        definition_capture = next((name for name in captures if name.startswith("definition.")), None)
+        definition = _first_capture(captures, definition_capture) if definition_capture else None
+        name_node = _first_capture(captures, "name")
+        if definition is None or name_node is None:
+            continue
+        kind = definition_capture.removeprefix("definition.")
+        if kind == "type":
+            kind = "type_alias" if spec.dialect in {"typescript", "tsx", "rust"} else "named_type"
+        if spec.dialect == "python" and kind == "function":
+            parent = definition.parent
+            container = parent.parent if parent is not None and parent.type == "block" else None
+            if container is not None and container.type == "class_definition":
+                kind = "method"
+            elif _text(content, definition).lstrip().startswith("async "):
+                kind = "async_function"
+        if spec.dialect == "rust" and kind == "function":
+            ancestor = definition.parent
+            while ancestor is not None:
+                if ancestor.type == "impl_item":
+                    kind = "method"
+                    break
+                ancestor = ancestor.parent
+        name = _text(content, name_node)
+        if not name:
+            continue
+        owner_names: list[str] = []
+        parent = definition.parent
+        while parent is not None:
+            if parent.type in {"class_definition", "class_declaration", "impl_item", "internal_module", "mod_item", "function_definition", "function_declaration", "method_definition"}:
+                owner = parent.child_by_field_name("name") or parent.child_by_field_name("type")
+                owner_text = _text(content, owner)
+                if owner_text:
+                    owner_names.append(owner_text)
+            parent = parent.parent
+        qualified = ".".join([*reversed(owner_names), name])
+        confidence = 0.5 if _overlaps(definition, errors) else 0.98
+        location = _node_location(file_path, content, name_node)
+        symbol = Symbol(name, kind, qualified, location, spec.language, "tree-sitter", confidence, {"dialect": spec.dialect, "node_type": definition.type, "query_pattern": pattern_index, "definition_byte_start": definition.start_byte, "definition_byte_end": definition.end_byte})
+        key = (location.byte_start, location.byte_end, kind, name)
+        competing = next((item for item in found if item[0] == key[0] and item[1] == key[1] and item[3] == name), None)
+        if competing is None or kind_priority.get(kind, 1) > kind_priority.get(competing[2], 1):
+            if competing is not None:
+                found.pop(competing)
+            found[key] = symbol
+    return sorted(found.values(), key=lambda item: (item.location.byte_start, item.location.byte_end, item.kind, item.name))
+
+
+def _extract_imports(spec: GrammarSpec, matches: list[tuple[int, dict[str, list[Any]]]], content: bytes, file_path: str, errors: list[Any]) -> list[ImportReference]:
+    found: dict[tuple[int, int, str, str | None], ImportReference] = {}
+    for pattern_index, captures in matches:
+        statement = _first_capture(captures, "import.statement") or _first_capture(captures, "import.reexport")
+        if statement is None or _overlaps(statement, errors):
+            continue
+        if spec.dialect == "python":
+            items = _python_imports(statement, content)
+        elif spec.dialect in {"javascript", "typescript", "tsx"}:
+            items = _javascript_imports(statement, content, reexport="import.reexport" in captures)
+        elif spec.dialect == "go":
+            items = _go_imports(statement, content)
+        else:
+            items = _rust_imports(statement, content)
+        location = _node_location(file_path, content, statement)
+        for module, names, alias, metadata in items:
+            if not module:
+                continue
+            metadata.update({"dialect": spec.dialect, "query_pattern": pattern_index, "statement_byte_start": statement.start_byte, "statement_byte_end": statement.end_byte})
+            item = ImportReference(module, tuple(names), alias, location, "tree-sitter", 0.98, metadata)
+            found[(location.byte_start, location.byte_end, module, alias)] = item
+    return sorted(found.values(), key=lambda item: (item.location.byte_start, int(item.metadata.get("item_byte_start", item.location.byte_start)), item.module, item.alias or ""))
+
+
+def _python_imports(statement: Any, content: bytes) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    if statement.type == "import_statement":
+        result = []
+        for child in statement.named_children:
+            name = child.child_by_field_name("name") if child.type == "aliased_import" else child
+            alias = child.child_by_field_name("alias") if child.type == "aliased_import" else None
+            result.append((_text(content, name), [], _text(content, alias) or None, {"import_kind": "import", "item_byte_start": child.start_byte}))
+        return result
+    module_node = statement.child_by_field_name("module_name")
+    module = _text(content, module_node)
+    result = []
+    for child in statement.named_children:
+        if child == module_node:
+            continue
+        if child.type == "wildcard_import":
+            result.append((module, ["*"], None, {"import_kind": "from", "glob": True, "item_byte_start": child.start_byte}))
+        elif child.type in {"dotted_name", "aliased_import"}:
+            name = child.child_by_field_name("name") if child.type == "aliased_import" else child
+            alias = child.child_by_field_name("alias") if child.type == "aliased_import" else None
+            result.append((module, [_text(content, name)], _text(content, alias) or None, {"import_kind": "from", "relative": module.startswith("."), "item_byte_start": child.start_byte}))
+    return result
+
+
+def _javascript_imports(statement: Any, content: bytes, *, reexport: bool) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    source = statement.child_by_field_name("source")
+    module = _text(content, source).strip("\"'")
+    base = {"import_kind": "reexport" if reexport else "import", "reexport": reexport}
+    clause = next((child for child in statement.named_children if child.type in {"import_clause", "export_clause", "namespace_export"}), None)
+    if clause is None:
+        return [(module, [], None, {**base, "side_effect": not reexport})]
+    type_only = any(child.type == "type" for child in statement.children)
+    result = []
+    for child in _walk(clause):
+        if child.type == "import_specifier" or child.type == "export_specifier":
+            name = child.child_by_field_name("name")
+            alias = child.child_by_field_name("alias")
+            result.append((module, [_text(content, name)], _text(content, alias) or None, {**base, "type_only": type_only}))
+        elif child.type == "namespace_import":
+            name = next((node for node in child.named_children if node.type == "identifier"), None)
+            result.append((module, ["*"], _text(content, name) or None, {**base, "namespace": True, "type_only": type_only}))
+    direct = [child for child in clause.named_children if child.type == "identifier"]
+    if direct:
+        result.insert(0, (module, ["default"], _text(content, direct[0]), {**base, "default": True, "type_only": type_only}))
+    return result or [(module, [], None, {**base, "type_only": type_only})]
+
+
+def _go_imports(statement: Any, content: bytes) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    path = statement.child_by_field_name("path")
+    name = statement.child_by_field_name("name")
+    module = _text(content, path).strip("\"")
+    alias = _text(content, name) or None
+    return [(module, [], alias, {"import_kind": "import", "blank": alias == "_", "dot": alias == "."})]
+
+
+def _rust_imports(statement: Any, content: bytes) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    if statement.type == "extern_crate_declaration":
+        name = statement.child_by_field_name("name")
+        return [(_text(content, name), [], None, {"import_kind": "extern_crate"})]
+    argument = statement.child_by_field_name("argument")
+    return _expand_rust_use(argument, content, "")
+
+
+def _expand_rust_use(node: Any, content: bytes, prefix: str) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:
+    if node.type == "scoped_use_list":
+        path = _text(content, node.child_by_field_name("path"))
+        base = f"{prefix}::{path}" if prefix else path
+        use_list = node.child_by_field_name("list") or next((child for child in node.named_children if child.type == "use_list"), None)
+        result = []
+        for child in use_list.named_children if use_list is not None else ():
+            result.extend(_expand_rust_use(child, content, base))
+        return result
+    if node.type == "use_as_clause":
+        path = node.child_by_field_name("path")
+        alias = node.child_by_field_name("alias")
+        module = _text(content, path)
+        if prefix:
+            module = f"{prefix}::{module}"
+        return [(module, [], _text(content, alias) or None, {"import_kind": "use", "alias": True})]
+    if node.type == "use_wildcard":
+        parts = [_text(content, child) for child in node.named_children]
+        module = "::".join(part for part in parts if part)
+        if prefix:
+            module = f"{prefix}::{module}"
+        return [(module, ["*"], None, {"import_kind": "use", "glob": True})]
+    module = _text(content, node)
+    if prefix:
+        module = f"{prefix}::{module}"
+    return [(module, [], None, {"import_kind": "use"})]
+
+
+def _extract_calls(spec: GrammarSpec, matches: list[tuple[int, dict[str, list[Any]]]], symbols: list[Symbol], content: bytes, file_path: str, errors: list[Any]) -> tuple[list[CallCandidate], int]:
+    found: dict[tuple[int, int, str, str | None, str], CallCandidate] = {}
+    skipped = 0
+    for pattern_index, captures in matches:
+        call = _first_capture(captures, "call") or _first_capture(captures, "call.constructor") or _first_capture(captures, "call.macro")
+        callee_node = _first_capture(captures, "callee")
+        if call is None or callee_node is None:
+            skipped += 1
+            continue
+        callee = _text(content, callee_node).strip()
+        if not callee or callee_node.is_missing:
+            skipped += 1
+            continue
+        error_region = _overlaps(call, errors)
+        call_kind = "macro" if "call.macro" in captures else "constructor" if "call.constructor" in captures else "call"
+        if call_kind == "macro" and not callee.endswith("!"):
+            callee = f"{callee}!"
+        caller = _caller_for_range(symbols, call.start_byte, call.end_byte)
+        receiver_node = callee_node.child_by_field_name("object") or callee_node.child_by_field_name("operand") or callee_node.child_by_field_name("value")
+        receiver = _text(content, receiver_node) or None
+        callee_form = "member" if callee_node.type in {"attribute", "member_expression", "selector_expression", "field_expression"} else "path" if callee_node.type in {"scoped_identifier"} else "identifier"
+        ambiguity = "possible-type-conversion" if spec.dialect == "go" else None
+        location = _node_location(file_path, content, callee_node)
+        metadata = {"dialect": spec.dialect, "node_type": call.type, "query_pattern": pattern_index, "call_kind": call_kind, "callee_form": callee_form, "call_byte_start": call.start_byte, "call_byte_end": call.end_byte, "receiver": receiver, "resolution": "unresolved", "ambiguity": ambiguity, "error_region": error_region, "capture_byte_start": callee_node.start_byte, "capture_byte_end": callee_node.end_byte}
+        item = CallCandidate(callee, caller, location, "tree-sitter", 0.5 if error_region else 0.95, metadata)
+        found[(location.byte_start, location.byte_end, callee, caller, call_kind)] = item
+    values = sorted(found.values(), key=lambda item: (item.location.byte_start, item.location.byte_end, item.callee, item.caller or "", item.metadata["call_kind"]))
+    return values, skipped
+
+
+def _caller_for_range(symbols: list[Symbol], start: int, end: int) -> str | None:
+    containers = [symbol for symbol in symbols if int(symbol.metadata.get("definition_byte_start", -1)) <= start and int(symbol.metadata.get("definition_byte_end", -1)) >= end and symbol.kind not in {"class", "interface", "struct", "enum", "trait", "type_alias", "named_type", "module"}]
+    if not containers:
+        return None
+    return min(containers, key=lambda symbol: int(symbol.metadata["definition_byte_end"]) - int(symbol.metadata["definition_byte_start"])).qualified_name
+
+
+def _extract_references(spec: GrammarSpec, matches: list[tuple[int, dict[str, list[Any]]]], symbols: list[Symbol], imports: list[ImportReference], calls: list[CallCandidate], content: bytes, file_path: str, errors: list[Any]) -> tuple[list[ReferenceCandidate], int]:
+    found: dict[tuple[int, int, str, str], ReferenceCandidate] = {}
+    skipped = 0
+    symbol_ranges = {(symbol.location.byte_start, symbol.location.byte_end) for symbol in symbols}
+    call_ranges = [(call.location.byte_start, call.location.byte_end) for call in calls]
+    for pattern_index, captures in matches:
+        capture_name = next((name for name in captures if name.startswith("reference.")), None)
+        node = _first_capture(captures, capture_name) if capture_name else None
+        if node is None or (node.start_byte, node.end_byte) in symbol_ranges or _excluded_reference_node(node):
+            continue
+        name = _text(content, node)
+        if not name or node.is_missing:
+            skipped += 1
+            continue
+        context = _reference_context(capture_name or "", node, call_ranges)
+        error_region = _overlaps(node, errors)
+        location = _node_location(file_path, content, node)
+        owner = _caller_for_range(symbols, node.start_byte, node.end_byte)
+        metadata = {"dialect": spec.dialect, "node_type": node.type, "query_pattern": pattern_index, "context": context, "owner": owner, "resolution": "unresolved", "error_region": error_region, "capture_byte_start": node.start_byte, "capture_byte_end": node.end_byte}
+        item = ReferenceCandidate(name, context, location, "tree-sitter", 0.5 if error_region else 0.9, metadata)
+        found[(location.byte_start, location.byte_end, name, context)] = item
+    values = sorted(found.values(), key=lambda item: (item.location.byte_start, item.location.byte_end, item.name, item.reference_kind))
+    return values, skipped
+
+
+def _excluded_reference_node(node: Any) -> bool:
+    parent = node.parent
+    while parent is not None:
+        if parent.type in {"import_statement", "import_from_statement", "import_spec", "use_declaration", "extern_crate_declaration", "formal_parameters", "parameters", "parameter_list", "parameter", "required_parameter", "optional_parameter", "label_name", "labeled_statement", "field_declaration", "field_definition"}:
+            return True
+        if parent.type in {"function_definition", "function_declaration", "class_definition", "class_declaration", "interface_declaration", "type_alias_declaration", "type_spec", "struct_item", "enum_item", "trait_item", "type_item", "mod_item"} and parent.child_by_field_name("name") == node:
+            return True
+        parent = parent.parent
+    return False
+
+
+def _reference_context(capture_name: str, node: Any, call_ranges: list[tuple[int, int]]) -> str:
+    if any(start <= node.start_byte and end >= node.end_byte for start, end in call_ranges):
+        return "member" if capture_name == "reference.member" else "call"
+    if capture_name == "reference.member":
+        return "member"
+    if capture_name == "reference.type":
+        return "type"
+    if capture_name == "reference.jsx":
+        return "jsx"
+    parent = node.parent
+    while parent is not None:
+        if parent.type in {"jsx_opening_element", "jsx_closing_element", "jsx_self_closing_element"}:
+            return "jsx"
+        if parent.type in {"augmented_assignment", "update_expression", "inc_statement", "dec_statement", "compound_assignment_expr"}:
+            return "readwrite"
+        if parent.type in {"assignment", "assignment_expression", "assignment_statement", "short_var_declaration", "let_declaration", "variable_declarator"}:
+            left = parent.child_by_field_name("left") or parent.child_by_field_name("name") or parent.child_by_field_name("pattern")
+            if left is not None and left.start_byte <= node.start_byte and left.end_byte >= node.end_byte:
+                return "write"
+        if parent.type in {"type", "type_annotation", "type_identifier", "generic_type", "base_class_clause", "implements_clause", "type_arguments"}:
+            return "annotation"
+        if parent.type in {"call", "call_expression", "new_expression", "macro_invocation"}:
+            break
+        parent = parent.parent
+    return "read"
+
+
+# Existing offline adapters remain dependency-free.
+class PythonAstAdapter:
+    language = language_id = "python"; source_name = "python-ast"; supports_incremental = False; version = "stdlib-ast"; extensions = frozenset({".py"})
+    def availability(self, file_path: str | None = None) -> AdapterAvailability: return AdapterAvailability(True, "available", "Python stdlib ast is available", self.version)
+    def parse(self, *, file_path: str, content: bytes, previous_state: ParseState | None = None) -> ParseResult:
+        del previous_state
+        started=time.perf_counter(); text=content.decode(); tree=ast.parse(text, filename=file_path); symbols=[]; imports=[]
+        parents={child:parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+        for node in ast.walk(tree):
+            if isinstance(node,(ast.ClassDef,ast.FunctionDef,ast.AsyncFunctionDef)):
+                parent=parents.get(node); owner=parent.name if isinstance(parent,(ast.ClassDef,ast.FunctionDef,ast.AsyncFunctionDef)) else None; kind="class" if isinstance(node,ast.ClassDef) else "method" if isinstance(parent,ast.ClassDef) else "async_function" if isinstance(node,ast.AsyncFunctionDef) else "function"; line=node.lineno-1; col=text.splitlines()[line].find(node.name,node.col_offset); start=sum(len(x.encode()) for x in text.splitlines(keepends=True)[:line])+len(text.splitlines(keepends=True)[line][:col].encode()); loc=SourceLocation(file_path,line,col,line,col+len(node.name),start,start+len(node.name.encode())); symbols.append(Symbol(node.name,kind,f"{owner}.{node.name}" if owner else node.name,loc,"python",self.source_name,1.0,{}))
+            elif isinstance(node,(ast.Import,ast.ImportFrom)):
+                line=node.lineno-1; start=sum(len(x.encode()) for x in text.splitlines(keepends=True)[:line]); loc=SourceLocation(file_path,line,0,line,len(text.splitlines()[line]),start,start+len(text.splitlines()[line].encode()));
+                if isinstance(node,ast.Import):
+                    imports.extend(ImportReference(a.name,(),a.asname,loc,self.source_name,1.0) for a in node.names)
+                else: imports.append(ImportReference("."*node.level+(node.module or ""),tuple(a.name for a in node.names),node.names[0].asname if len(node.names)==1 else None,loc,self.source_name,1.0))
+        return ParseResult("python",file_path,tuple(symbols),tuple(imports),parser_source=self.source_name,parser_version=self.version,content_hash=_hash(content),parse_duration_ms=(time.perf_counter()-started)*1000)
+
+
+class LegacyRegexAdapter:
+    source_name="legacy-regex"; supports_incremental=False; version="legacy-v2"
+    def __init__(self,language:str,extensions:frozenset[str])->None: self.language=self.language_id=language; self.extensions=extensions
+    def availability(self,file_path:str|None=None)->AdapterAvailability: return AdapterAvailability(True,"available","bundled offline fallback",self.version)
+    def parse(self,path:Path|None=None,content:bytes=b"",*,file_path:str|None=None,previous_state:ParseState|None=None)->ParseResult:
+        del previous_state
+        actual=file_path or str(path); text=content.decode(); patterns={"python":r"(?m)^\s*(?:async\s+)?(class|def)\s+([^\W\d]\w*)","javascript":r"(?m)^\s*(?:export\s+)?(?:async\s+)?(class|function)\s+([^\W\d]\w*)","typescript":r"(?m)^\s*(?:export\s+)?(?:async\s+)?(class|interface|function)\s+([^\W\d]\w*)","go":r"(?m)^\s*(type|func)\s+(?:\([^)]*\)\s*)?([^\W\d]\w*)","rust":r"(?m)^\s*(?:pub\s+)?(struct|trait|fn)\s+([^\W\d]\w*)"}; symbols=[]
+        for match in re.finditer(patterns[self.language],text):
+            start=match.start(2); line=text.count("\n",0,start); col=start-(text.rfind("\n",0,start)+1); loc=SourceLocation(actual,line,col,line,col+len(match.group(2)),len(text[:start].encode()),len(text[:match.end(2)].encode())); symbols.append(Symbol(match.group(2),match.group(1),match.group(2),loc,self.language,self.source_name,.55,{}))
+        diagnostic=() if all(text.count(a)==text.count(b) for a,b in (("(",")"),("{","}"),("[","]"))) else (ParseDiagnostic("syntax-error","warning","unbalanced delimiters",None,True,self.source_name),)
+        return ParseResult(self.language,actual,tuple(symbols),diagnostics=diagnostic,parser_source=self.source_name,parser_version=self.version,content_hash=_hash(content))
