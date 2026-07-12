@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import stat
@@ -19,10 +20,12 @@ from khaos.coding.planning.execution_models import (
     AttestedPathState,
     ExecutionRunStatus,
     FinalMutationAttestation,
+    MutationSealTombstone,
     PlanExecutionRun,
     PlannedEditBundle,
     PlannedEditOperation,
     PlannedFileEdit,
+    RollbackFinalAttestation,
     WorkspaceMutationResult,
 )
 from khaos.coding.workspace.models import WorkspaceState
@@ -34,6 +37,10 @@ from khaos.coding.planning.git_state import GitStateInspector
 from khaos.coding.planning.recovery_directory import (
     RecoveryDirectory,
     RecoveryDirectoryError,
+)
+from khaos.coding.planning.safe_identifiers import (
+    SafeRecoveryArtifactName, SafeRecoveryRunId, SafeWorkspaceRelativePath,
+    UnsafePersistedIdentifier,
 )
 
 MAX_BUNDLE_FILES = 64
@@ -228,7 +235,7 @@ class WorkspaceMutationEngine:
             if after_git.worktree_admin_identity != before_git.worktree_admin_identity:
                 raise WorkspaceMutationError("worktree-admin-drift", "worktree admin changed")
             unexpected = self._unexpected_changes(
-                dict(before_git.file_hashes), dict(after_git.file_hashes),
+                self._git_state_map(before_git), self._git_state_map(after_git),
                 frozenset(changed)
             )
             if unexpected:
@@ -243,15 +250,26 @@ class WorkspaceMutationEngine:
             self._store.transition_execution_run(
                 run.execution_run_id, expected=("mutating",), target="sealing",
             )
+            _, journal_digest = self._validated_journal(run)
+            self._validate_sealing_recovery(
+                run, workspace, self._store.list_execution_edit_events(run.execution_run_id),
+                journal_digest,
+            )
             self._seal_recovery(recovery, workspace.id, run.execution_run_id)
-            self._store.mark_execution_recovery_sealed(
-                run.execution_run_id,
+            tombstone_name, tombstone = self._write_seal_tombstone(
+                recovery, run, "mutation", attestation.attestation_digest,
+                journal_digest,
+            )
+            self._store.commit_terminal_seal(
+                run.execution_run_id, expected_status="sealing",
+                terminal_status="mutated",
                 seal_digest=self._recovery_seal_digest(run.execution_run_id),
+                tombstone_digest=tombstone.tombstone_digest, rollback=False,
             )
-            self._store.transition_execution_run(
-                run.execution_run_id, expected=("sealing",), target="mutated",
-                completed=True,
-            )
+            try:
+                recovery.delete_tombstone(tombstone_name)
+            except OSError:
+                pass  # terminal commit is authoritative; safe GC may retry
             return WorkspaceMutationResult(
                 run.execution_run_id, ExecutionRunStatus.MUTATED,
                 normalized.content_digest, tuple(sorted(set(changed))),
@@ -276,6 +294,7 @@ class WorkspaceMutationEngine:
                 run.execution_run_id, root, recovery,
                 workspace.id, failure_code=code,
                 poison_after=(code == "unexpected-workspace-mutation"),
+                baseline_git=before_git,
             )
             raise
         finally:
@@ -548,7 +567,7 @@ class WorkspaceMutationEngine:
 
     def _rollback(
         self, run_id: str, root: Path, recovery: RecoveryDirectory, workspace_id: str, *, failure_code: str,
-        poison_after: bool = False,
+        poison_after: bool = False, baseline_git: Any | None = None,
     ) -> None:
         try:
             current_run = self._store.get_execution_run(run_id)
@@ -566,8 +585,6 @@ class WorkspaceMutationEngine:
                     after_hash=current_hash or "", after_mode=current_mode,
                     error_code=failure_code,
                 )
-            if owns_handle:
-                handle.close()
             target = "cancelled" if failure_code == "execution-context-invalid" else "rolled-back"
             if poison_after:
                 self._poison_run(workspace_id, run_id, failure_code)
@@ -575,21 +592,48 @@ class WorkspaceMutationEngine:
                     run_id, expected=("rolling-back",), target="poisoned",
                     failure_code=failure_code, completed=True,
                 )
+                if owns_handle:
+                    handle.close()
                 return
+            current_run = self._store.get_execution_run(run_id)
+            events, journal_digest = self._validated_journal(current_run)
+            workspace = self._workspaces.get(workspace_id)
+            rollback_attestation = self._build_rollback_attestation(
+                current_run, workspace, handle, events, journal_digest,
+                failure_code, baseline_git,
+            )
+            self._store.save_rollback_final_attestation(rollback_attestation)
             self._store.transition_execution_run(
                 run_id, expected=("rolling-back",), target="rollback-sealing",
                 failure_code=failure_code,
             )
-            retained = recovery.seal_with_retention()
-            self._store.mark_execution_rollback_sealed(
-                run_id, seal_digest=self._recovery_seal_digest(run_id),
+            self._validate_rollback_sealing_recovery(
+                current_run, workspace, events, journal_digest,
             )
-            recovery.discard_retention(retained)
-            self._store.transition_execution_run(
-                run_id, expected=("rollback-sealing",), target=target,
-                failure_code=failure_code, completed=True,
+            recovery.seal()
+            tombstone_name, tombstone = self._write_seal_tombstone(
+                recovery, current_run, target,
+                rollback_attestation.attestation_digest, journal_digest,
             )
+            self._store.commit_terminal_seal(
+                run_id, expected_status="rollback-sealing",
+                terminal_status=target,
+                seal_digest=self._recovery_seal_digest(run_id),
+                tombstone_digest=tombstone.tombstone_digest, rollback=True,
+                failure_code=failure_code,
+            )
+            try:
+                recovery.delete_tombstone(tombstone_name)
+            except OSError:
+                pass  # terminal commit is authoritative; safe GC may retry
+            if owns_handle:
+                handle.close()
         except Exception as rollback_error:
+            if 'owns_handle' in locals() and owns_handle:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
             reason = f"rollback-failed:{type(rollback_error).__name__}"
             self._poison_run(workspace_id, run_id, reason)
             try:
@@ -671,9 +715,16 @@ class WorkspaceMutationEngine:
             parent.close()
 
     @staticmethod
-    def _workspace_state_digest(file_hashes: tuple[tuple[str, str], ...]) -> str:
-        payload = "|".join(f"{path}:{digest}" for path, digest in sorted(file_hashes))
+    def _workspace_state_digest(file_states: tuple[Any, ...]) -> str:
+        payload = "|".join(
+            f"{state.relative_path}:{state.state_digest}"
+            for state in sorted(file_states, key=lambda item: item.relative_path)
+        )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _git_state_map(snapshot: Any) -> dict[str, str]:
+        return {state.relative_path: state.state_digest for state in snapshot.file_states}
 
     def _attested_states(
         self, handle: WorkspacePathHandle, events: tuple[Any, ...],
@@ -733,15 +784,75 @@ class WorkspaceMutationEngine:
             head=final_git.head_commit, generation=final_git.repository_generation,
             index_digest=final_git.index_digest,
             worktree_admin_digest=final_git.worktree_admin_identity,
-            workspace_state_digest=self._workspace_state_digest(final_git.file_hashes),
+            workspace_state_digest=self._workspace_state_digest(final_git.file_states),
             execution_context_id=context.execution_context_id,
             lease_id=context.lease_id, binding_digest=context.binding_digest,
             attested_at=time.time(),
         ).normalized()
 
+    def _build_rollback_attestation(
+        self, run: PlanExecutionRun, workspace: Any, handle: WorkspacePathHandle,
+        events: tuple[Any, ...], journal_digest: str, reason: str,
+        baseline_git: Any | None,
+    ) -> RollbackFinalAttestation:
+        states: list[AttestedPathState] = []
+        for event in events:
+            operation = event["operation"]
+            source_hash, source_mode, _ = self._current_target(handle, event["path"])
+            if operation == "create":
+                if source_hash is not None:
+                    raise WorkspaceMutationError("rollback-attestation-drift", "created path remains")
+                states.append(AttestedPathState(event["path"], False))
+                continue
+            if source_hash != (event["before_hash"] or "") or source_mode != event["before_mode"]:
+                raise WorkspaceMutationError("rollback-attestation-drift", "before state mismatch")
+            states.append(AttestedPathState(event["path"], True, source_hash, source_mode))
+            if operation == "rename":
+                dest_hash, _, _ = self._current_target(handle, event["destination_path"])
+                if dest_hash is not None:
+                    raise WorkspaceMutationError("rollback-attestation-drift", "rename destination remains")
+                states.append(AttestedPathState(event["destination_path"], False))
+        state = self._context_provider.current_state(
+            repository_id=run.repository_id, task_id=run.task_id,
+            workspace_id=run.workspace_id,
+        )
+        git_state = self._git_inspector.snapshot(
+            workspace, repository_generation=state.repository_generation,
+        )
+        if baseline_git is not None:
+            declared = frozenset(
+                path for event in events
+                for path in (event["path"], event["destination_path"]) if path
+            )
+            if (git_state.head_commit != baseline_git.head_commit
+                    or git_state.repository_generation != baseline_git.repository_generation
+                    or git_state.index_digest != baseline_git.index_digest
+                    or git_state.worktree_admin_identity != baseline_git.worktree_admin_identity
+                    or self._unexpected_changes(
+                        self._git_state_map(baseline_git),
+                        self._git_state_map(git_state), declared,
+                    )):
+                raise WorkspaceMutationError(
+                    "rollback-workspace-drift", "workspace did not return to its initial state"
+                )
+        return RollbackFinalAttestation(
+            execution_run_id=run.execution_run_id,
+            bundle_digest=run.edit_bundle_digest,
+            ordered_states=tuple(states), path_state_digest="",
+            head=git_state.head_commit, generation=git_state.repository_generation,
+            index_digest=git_state.index_digest,
+            worktree_admin_digest=git_state.worktree_admin_identity,
+            workspace_state_digest=self._workspace_state_digest(git_state.file_states),
+            execution_context_id=run.execution_context_id,
+            lease_id=run.lease_id, binding_digest=run.binding_digest,
+            attested_at=time.time(), rollback_reason=reason,
+            journal_digest=journal_digest,
+        ).normalized()
+
     def _validate_sealing_recovery(
         self, run: PlanExecutionRun, workspace: Any, events: tuple[Any, ...],
-    ) -> None:
+        journal_digest: str,
+    ) -> FinalMutationAttestation:
         try:
             attestation = self._store.get_final_mutation_attestation(
                 run.execution_run_id
@@ -784,11 +895,69 @@ class WorkspaceMutationEngine:
                 or git_state.repository_generation != attestation.generation
                 or git_state.index_digest != attestation.index_digest
                 or git_state.worktree_admin_identity != attestation.worktree_admin_digest
-                or self._workspace_state_digest(git_state.file_hashes)
+                or self._workspace_state_digest(git_state.file_states)
                 != attestation.workspace_state_digest):
             raise WorkspaceMutationError(
                 "attestation-repository-drift", "repository state drifted after attestation"
             )
+        return attestation
+
+    def _validate_rollback_sealing_recovery(
+        self, run: PlanExecutionRun, workspace: Any, events: tuple[Any, ...],
+        journal_digest: str,
+    ) -> RollbackFinalAttestation:
+        try:
+            attestation = self._store.get_rollback_final_attestation(
+                run.execution_run_id
+            )
+        except RuntimeError as exc:
+            raise WorkspaceMutationError(
+                "rollback-attestation-invalid", "rollback attestation is invalid"
+            ) from exc
+        if attestation is None or attestation.journal_digest != journal_digest:
+            raise WorkspaceMutationError(
+                "rollback-attestation-missing", "rollback proof is missing"
+            )
+        if (attestation.bundle_digest != run.edit_bundle_digest
+                or attestation.execution_context_id != run.execution_context_id
+                or attestation.lease_id != run.lease_id
+                or attestation.binding_digest != run.binding_digest):
+            raise WorkspaceMutationError(
+                "rollback-attestation-binding", "rollback proof binding drifted"
+            )
+        handle = WorkspacePathHandle(workspace.worktree_path.resolve(strict=True))
+        try:
+            actual: list[AttestedPathState] = []
+            for expected in attestation.ordered_states:
+                content_hash, mode, _ = self._current_target(handle, expected.path)
+                actual.append(AttestedPathState(
+                    expected.path, content_hash is not None, content_hash or "", mode,
+                ))
+        finally:
+            handle.close()
+        if tuple(item.canonical() for item in actual) != tuple(
+            item.canonical() for item in attestation.ordered_states
+        ):
+            raise WorkspaceMutationError(
+                "rollback-attestation-drift", "rollback final paths drifted"
+            )
+        state = self._context_provider.current_state(
+            repository_id=run.repository_id, task_id=run.task_id,
+            workspace_id=run.workspace_id,
+        )
+        git_state = self._git_inspector.snapshot(
+            workspace, repository_generation=state.repository_generation,
+        )
+        if (git_state.head_commit != attestation.head
+                or git_state.repository_generation != attestation.generation
+                or git_state.index_digest != attestation.index_digest
+                or git_state.worktree_admin_identity != attestation.worktree_admin_digest
+                or self._workspace_state_digest(git_state.file_states)
+                != attestation.workspace_state_digest):
+            raise WorkspaceMutationError(
+                "rollback-repository-drift", "rollback repository state drifted"
+            )
+        return attestation
 
     def _poison_run(self, workspace_id: str, run_id: str, reason: str) -> None:
         owner = f"run:{run_id}"
@@ -796,6 +965,53 @@ class WorkspaceMutationEngine:
         self._store.add_workspace_poison_scope(
             workspace_id, owner=owner, reason=reason
         )
+
+    def _validated_journal(
+        self, run: PlanExecutionRun,
+    ) -> tuple[tuple[Any, ...], str]:
+        try:
+            SafeRecoveryRunId.parse(run.execution_run_id)
+            events = self._store.list_execution_edit_events(run.execution_run_id)
+            if not events:
+                raise UnsafePersistedIdentifier("execution journal is missing")
+            ordinals = [int(row["ordinal"]) for row in events]
+            if ordinals != list(range(len(events))):
+                raise UnsafePersistedIdentifier("journal ordinals are not contiguous")
+            if len({row["edit_id"] for row in events}) != len(events):
+                raise UnsafePersistedIdentifier("journal edit ids are not unique")
+            expected_count = int(run.metadata.get("edit_count", 0))
+            if expected_count and expected_count != len(events):
+                raise UnsafePersistedIdentifier("journal event count mismatch")
+            canonical: list[dict[str, Any]] = []
+            for row in events:
+                operation = str(row["operation"])
+                if operation not in {item.value for item in PlannedEditOperation}:
+                    raise UnsafePersistedIdentifier("journal operation invalid")
+                path = SafeWorkspaceRelativePath.parse(row["path"]).value
+                destination = row["destination_path"]
+                if destination is not None:
+                    destination = SafeWorkspaceRelativePath.parse(destination).value
+                if operation == "rename" and destination is None:
+                    raise UnsafePersistedIdentifier("rename destination missing")
+                artifact = row["recovery_artifact"]
+                if artifact is not None:
+                    artifact = SafeRecoveryArtifactName.parse(artifact).value
+                canonical.append({
+                    "ordinal": int(row["ordinal"]), "edit_id": row["edit_id"],
+                    "operation": operation, "path": path,
+                    "destination": destination, "before_hash": row["before_hash"] or "",
+                    "after_hash": row["after_hash"] or "",
+                    "before_mode": row["before_mode"], "after_mode": row["after_mode"],
+                    "artifact": artifact,
+                })
+        except (UnsafePersistedIdentifier, TypeError, ValueError) as exc:
+            raise WorkspaceMutationError(
+                "recovery-journal-invalid", "persisted recovery journal is invalid"
+            ) from exc
+        digest = hashlib.sha256(json.dumps(
+            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return events, digest
 
     def recover_incomplete_runs(self) -> tuple[str, ...]:
         """Startup scan: quarantine incomplete runs; recover only intact journals."""
@@ -812,41 +1028,79 @@ class WorkspaceMutationEngine:
                 run.workspace_id, owner=f"recovery:{run.execution_run_id}"
             ):
                 try:
-                    events = self._store.list_execution_edit_events(run.execution_run_id)
-                    if not events:
-                        raise WorkspaceMutationError(
-                            "recovery-journal-missing", "execution journal is missing"
-                        )
-                    recovery = self._open_recovery(workspace, run.execution_run_id, events)
+                    events, journal_digest = self._validated_journal(run)
+                    for event in events:
+                        self._resolve_safe_path(workspace, event["path"])
+                        if event["destination_path"]:
+                            self._resolve_safe_path(
+                                workspace, event["destination_path"]
+                            )
+                    recovery = self._open_recovery(
+                        workspace, run.execution_run_id, events,
+                        allow_missing_run=run.status in {
+                            ExecutionRunStatus.SEALING,
+                            ExecutionRunStatus.ROLLBACK_SEALING,
+                        },
+                    )
                     self._active_recovery = recovery
                     if run.status == ExecutionRunStatus.SEALING:
-                        self._validate_sealing_recovery(run, workspace, events)
-                        self._seal_recovery(
-                            recovery, run.workspace_id, run.execution_run_id,
+                        attestation = self._validate_sealing_recovery(
+                            run, workspace, events, journal_digest,
                         )
-                        self._store.mark_execution_recovery_sealed(
-                            run.execution_run_id,
+                        if recovery.run_exists:
+                            self._seal_recovery(
+                                recovery, run.workspace_id, run.execution_run_id,
+                            )
+                            tombstone_name, tombstone = self._write_seal_tombstone(
+                                recovery, run, "mutation",
+                                attestation.attestation_digest, journal_digest,
+                            )
+                        else:
+                            tombstone_name, tombstone = self._read_seal_tombstone(
+                                recovery, run, "mutation",
+                                attestation.attestation_digest, journal_digest,
+                            )
+                        self._store.commit_terminal_seal(
+                            run.execution_run_id, expected_status="sealing",
+                            terminal_status="mutated",
                             seal_digest=self._recovery_seal_digest(run.execution_run_id),
+                            tombstone_digest=tombstone.tombstone_digest,
+                            rollback=False,
                         )
-                        self._store.transition_execution_run(
-                            run.execution_run_id, expected=("sealing",),
-                            target="mutated", completed=True,
-                        )
+                        try:
+                            recovery.delete_tombstone(tombstone_name)
+                        except OSError:
+                            pass
                     elif run.status == ExecutionRunStatus.ROLLBACK_SEALING:
-                        retained = recovery.seal_with_retention()
-                        self._store.mark_execution_rollback_sealed(
-                            run.execution_run_id,
-                            seal_digest=self._recovery_seal_digest(run.execution_run_id),
+                        attestation = self._validate_rollback_sealing_recovery(
+                            run, workspace, events, journal_digest,
                         )
-                        recovery.discard_retention(retained)
                         final_status = (
                             "cancelled" if run.failure_code == "execution-context-invalid"
                             else "rolled-back"
                         )
-                        self._store.transition_execution_run(
-                            run.execution_run_id, expected=("rollback-sealing",),
-                            target=final_status, failure_code=run.failure_code, completed=True,
+                        if recovery.run_exists:
+                            recovery.seal()
+                            tombstone_name, tombstone = self._write_seal_tombstone(
+                                recovery, run, final_status,
+                                attestation.attestation_digest, journal_digest,
+                            )
+                        else:
+                            tombstone_name, tombstone = self._read_seal_tombstone(
+                                recovery, run, final_status,
+                                attestation.attestation_digest, journal_digest,
+                            )
+                        self._store.commit_terminal_seal(
+                            run.execution_run_id, expected_status="rollback-sealing",
+                            terminal_status=final_status,
+                            seal_digest=self._recovery_seal_digest(run.execution_run_id),
+                            tombstone_digest=tombstone.tombstone_digest,
+                            rollback=True, failure_code=run.failure_code,
                         )
+                        try:
+                            recovery.delete_tombstone(tombstone_name)
+                        except OSError:
+                            pass
                     else:
                         self._rollback(
                             run.execution_run_id,
@@ -889,6 +1143,7 @@ class WorkspaceMutationEngine:
 
     def _open_recovery(
         self, workspace: Any, run_id: str, events: tuple[Any, ...],
+        *, allow_missing_run: bool = False,
     ) -> RecoveryDirectory:
         container = self._validate_recovery_container(workspace)
         allowed = frozenset(
@@ -897,6 +1152,7 @@ class WorkspaceMutationEngine:
         try:
             return RecoveryDirectory(
                 container, run_id, create=False, allowed_artifacts=allowed,
+                allow_missing_run=allow_missing_run,
             )
         except (OSError, RecoveryDirectoryError) as exc:
             raise WorkspaceMutationError(
@@ -956,6 +1212,54 @@ class WorkspaceMutationEngine:
             f"{row['after_hash'] or ''}" for row in events
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _tombstone_name(run_id: str, seal_kind: str) -> str:
+        digest = hashlib.sha256(f"{run_id}:{seal_kind}".encode("utf-8")).hexdigest()
+        return f"seal-{digest[:32]}.json"
+
+    def _write_seal_tombstone(
+        self, recovery: RecoveryDirectory, run: PlanExecutionRun,
+        seal_kind: str, attestation_digest: str, journal_digest: str,
+    ) -> tuple[str, MutationSealTombstone]:
+        tombstone = MutationSealTombstone(
+            execution_run_id=run.execution_run_id, seal_kind=seal_kind,
+            bundle_digest=run.edit_bundle_digest,
+            attestation_digest=attestation_digest,
+            journal_digest=journal_digest,
+            recovery_container_identity=recovery.container_identity,
+            sealed_at=time.time(),
+        ).normalized()
+        name = self._tombstone_name(run.execution_run_id, seal_kind)
+        payload = {
+            **{key: value for key, value in tombstone.__dict__.items()},
+        }
+        recovery.write_tombstone(name, payload)
+        return name, tombstone
+
+    def _read_seal_tombstone(
+        self, recovery: RecoveryDirectory, run: PlanExecutionRun,
+        seal_kind: str, attestation_digest: str, journal_digest: str,
+    ) -> tuple[str, MutationSealTombstone]:
+        name = self._tombstone_name(run.execution_run_id, seal_kind)
+        try:
+            payload = recovery.read_tombstone(name)
+            value = MutationSealTombstone(**payload).normalized()
+        except (OSError, TypeError, ValueError, RecoveryDirectoryError) as exc:
+            raise WorkspaceMutationError(
+                "seal-tombstone-invalid", "terminal seal tombstone is invalid"
+            ) from exc
+        if (value.execution_run_id != run.execution_run_id
+                or value.seal_kind != seal_kind
+                or value.bundle_digest != run.edit_bundle_digest
+                or value.attestation_digest != attestation_digest
+                or value.journal_digest != journal_digest
+                or value.recovery_container_identity != recovery.container_identity
+                or value.tombstone_digest != payload.get("tombstone_digest")):
+            raise WorkspaceMutationError(
+                "seal-tombstone-invalid", "terminal seal tombstone binding mismatch"
+            )
+        return name, value
 
     @staticmethod
     def _unexpected_changes(

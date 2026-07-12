@@ -3,9 +3,28 @@ from __future__ import annotations
 
 import hashlib
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+
+
+@dataclass(frozen=True)
+class WorkspaceFileState:
+    relative_path: str
+    file_type: str
+    content_hash: str
+    mode: int
+    symlink_target_digest: str = ""
+    identity_digest: str = ""
+
+    @property
+    def state_digest(self) -> str:
+        payload = (
+            f"{self.relative_path}|{self.file_type}|{self.content_hash}|"
+            f"{self.mode}|{self.symlink_target_digest}|{self.identity_digest}"
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -15,6 +34,7 @@ class GitStateSnapshot:
     file_hashes: tuple[tuple[str, str], ...]
     worktree_admin_identity: str
     repository_generation: int
+    file_states: tuple[WorkspaceFileState, ...] = ()
 
 
 class GitStateInspector:
@@ -32,18 +52,36 @@ class GitStateInspector:
             info = git_dir.stat()
             admin_parts.extend((str(info.st_dev), str(info.st_ino), str(git_dir)))
         files: list[tuple[str, str]] = []
+        states: list[WorkspaceFileState] = []
         for path in sorted(root.rglob("*")):
             relative = path.relative_to(root).as_posix()
             if relative == ".git" or relative.startswith(".git/"):
                 continue
             if path.is_symlink():
-                files.append((relative, f"symlink:{os.readlink(path)}"))
+                target_digest = hashlib.sha256(os.readlink(path).encode("utf-8")).hexdigest()
+                digest = f"symlink:{target_digest}"
+                files.append((relative, digest))
+                states.append(WorkspaceFileState(
+                    relative, "symlink", "", stat.S_IMODE(path.lstat().st_mode),
+                    target_digest,
+                    hashlib.sha256(
+                        f"{path.lstat().st_dev}:{path.lstat().st_ino}".encode()
+                    ).hexdigest(),
+                ))
             elif path.is_file():
-                files.append((relative, self._hash_file(path)))
+                digest = self._hash_file(path)
+                files.append((relative, digest))
+                states.append(WorkspaceFileState(
+                    relative, "regular", digest,
+                    stat.S_IMODE(path.stat().st_mode),
+                    identity_digest=hashlib.sha256(
+                        f"{path.stat().st_dev}:{path.stat().st_ino}".encode()
+                    ).hexdigest(),
+                ))
         return GitStateSnapshot(
             head, index_digest, tuple(files),
             hashlib.sha256("|".join(admin_parts).encode("utf-8")).hexdigest(),
-            int(repository_generation),
+            int(repository_generation), tuple(states),
         )
 
     @staticmethod

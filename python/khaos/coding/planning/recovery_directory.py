@@ -2,10 +2,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import stat
 import uuid
 from pathlib import Path
+from khaos.coding.planning.safe_identifiers import (
+    SafeRecoveryArtifactName, SafeRecoveryRunId, SafeSealTombstoneName,
+    UnsafePersistedIdentifier,
+)
 
 
 class RecoveryDirectoryError(RuntimeError):
@@ -18,10 +23,16 @@ class RecoveryDirectory:
     def __init__(
         self, container: Path, run_id: str, *, create: bool,
         allowed_artifacts: frozenset[str] = frozenset(),
+        allow_missing_run: bool = False,
     ) -> None:
         self.container_path = container
-        self.run_id = run_id
-        self._allowed = set(allowed_artifacts)
+        try:
+            self.run_id = SafeRecoveryRunId.parse(run_id).value
+            self._allowed = {
+                SafeRecoveryArtifactName.parse(name).value for name in allowed_artifacts
+            }
+        except UnsafePersistedIdentifier as exc:
+            raise RecoveryDirectoryError(str(exc)) from exc
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         parent = container.parent
         self._parent_fd = os.open(parent, flags)
@@ -38,12 +49,21 @@ class RecoveryDirectory:
                 pass
             self._container_fd = os.open(container.name, flags, dir_fd=self._parent_fd)
             self._validate_fd(self._container_fd)
+            container_info = os.fstat(self._container_fd)
+            self.container_identity = f"{container_info.st_dev}:{container_info.st_ino}"
             if create:
                 os.mkdir(run_id, 0o700, dir_fd=self._container_fd)
                 os.fsync(self._container_fd)
-            self._run_fd = os.open(run_id, flags, dir_fd=self._container_fd)
-            self._validate_fd(self._run_fd)
-            self._identity = self._identity_of(self._run_fd)
+            try:
+                self._run_fd = os.open(run_id, flags, dir_fd=self._container_fd)
+            except FileNotFoundError:
+                if not allow_missing_run:
+                    raise
+                self._run_fd = -1
+                self._identity = (-1, -1)
+            else:
+                self._validate_fd(self._run_fd)
+                self._identity = self._identity_of(self._run_fd)
         except Exception:
             os.close(self._parent_fd)
             raise
@@ -65,7 +85,13 @@ class RecoveryDirectory:
     def path(self) -> Path:
         return self.container_path / self.run_id
 
+    @property
+    def run_exists(self) -> bool:
+        return self._run_fd >= 0
+
     def _assert_identity(self) -> None:
+        if self._run_fd < 0:
+            raise RecoveryDirectoryError("recovery run directory is absent")
         if self._identity_of(self._run_fd) != self._identity:
             raise RecoveryDirectoryError("recovery directory identity drifted")
 
@@ -91,6 +117,51 @@ class RecoveryDirectory:
             raise
         self._allowed.add(name)
         return name, hashlib.sha256(content).hexdigest()
+
+    def write_tombstone(self, name: str, payload: dict[str, object]) -> str:
+        safe = SafeSealTombstoneName.parse(name).value
+        data = json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        fd = os.open(
+            safe, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=self._container_fd,
+        )
+        try:
+            with os.fdopen(fd, "wb") as writer:
+                writer.write(data)
+                writer.flush()
+                os.fsync(writer.fileno())
+            os.fsync(self._container_fd)
+        except Exception:
+            try:
+                os.unlink(safe, dir_fd=self._container_fd)
+            except OSError:
+                pass
+            raise
+        return hashlib.sha256(data).hexdigest()
+
+    def read_tombstone(self, name: str) -> dict[str, object]:
+        safe = SafeSealTombstoneName.parse(name).value
+        fd = os.open(safe, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._container_fd)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise RecoveryDirectoryError("seal tombstone is not a regular file")
+            data = b""
+            while True:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    break
+                data += chunk
+            return json.loads(data.decode("utf-8"))
+        finally:
+            os.close(fd)
+
+    def delete_tombstone(self, name: str) -> None:
+        safe = SafeSealTombstoneName.parse(name).value
+        os.unlink(safe, dir_fd=self._container_fd)
+        os.fsync(self._container_fd)
 
     def discard_unreferenced(self, name: str) -> None:
         self._assert_identity()

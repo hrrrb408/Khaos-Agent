@@ -260,6 +260,7 @@ CREATE TABLE IF NOT EXISTS plan_execution_runs (
     recovery_seal_digest TEXT NOT NULL DEFAULT '',
     rollback_sealed_at REAL,
     rollback_seal_digest TEXT NOT NULL DEFAULT '',
+    terminal_tombstone_digest TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -298,6 +299,14 @@ CREATE TABLE IF NOT EXISTS plan_execution_audit_events (
 );
 
 CREATE TABLE IF NOT EXISTS plan_execution_final_attestations (
+    execution_run_id TEXT PRIMARY KEY,
+    bundle_digest TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    attestation_digest TEXT NOT NULL,
+    attested_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_execution_rollback_attestations (
     execution_run_id TEXT PRIMARY KEY,
     bundle_digest TEXT NOT NULL,
     canonical_json TEXT NOT NULL,
@@ -456,6 +465,11 @@ def _post_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE plan_execution_runs ADD COLUMN "
                 "rollback_seal_digest TEXT NOT NULL DEFAULT ''"
+            )
+        if "terminal_tombstone_digest" not in run_cols:
+            conn.execute(
+                "ALTER TABLE plan_execution_runs ADD COLUMN "
+                "terminal_tombstone_digest TEXT NOT NULL DEFAULT ''"
             )
 
 
@@ -2894,6 +2908,92 @@ class PlanApprovalStore:
                 or normalized.canonical() != value.canonical()):
             raise RuntimeError("final mutation attestation digest mismatch")
         return normalized
+
+    def save_rollback_final_attestation(self, attestation: Any) -> None:
+        normalized = attestation.normalized()
+        payload = json.dumps(
+            normalized.canonical(), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_execution_rollback_attestations "
+                "(execution_run_id,bundle_digest,canonical_json,attestation_digest,attested_at) "
+                "VALUES (?,?,?,?,?)",
+                (normalized.execution_run_id, normalized.bundle_digest, payload,
+                 normalized.attestation_digest, normalized.attested_at),
+            )
+            self._insert_execution_audit(
+                normalized.execution_run_id, "rollback-final-attested",
+                result="attested", correlation_id=normalized.attestation_digest,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_rollback_final_attestation(self, execution_run_id: str) -> Any | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_execution_rollback_attestations WHERE execution_run_id=?",
+            (execution_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        from khaos.coding.planning.execution_models import (
+            AttestedPathState, RollbackFinalAttestation,
+        )
+        try:
+            payload = json.loads(row["canonical_json"])
+            value = RollbackFinalAttestation(
+                execution_run_id=payload["execution_run_id"],
+                bundle_digest=payload["bundle_digest"],
+                ordered_states=tuple(AttestedPathState(**item) for item in payload["ordered_states"]),
+                path_state_digest=payload["path_state_digest"], head=payload["head"],
+                generation=int(payload["generation"]), index_digest=payload["index_digest"],
+                worktree_admin_digest=payload["worktree_admin_digest"],
+                workspace_state_digest=payload["workspace_state_digest"],
+                execution_context_id=payload["execution_context_id"],
+                lease_id=payload["lease_id"], binding_digest=payload["binding_digest"],
+                attested_at=float(payload["attested_at"]),
+                rollback_reason=payload["rollback_reason"],
+                journal_digest=payload["journal_digest"],
+                attestation_digest=row["attestation_digest"],
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("rollback attestation is corrupt") from exc
+        normalized = value.normalized()
+        if normalized.attestation_digest != row["attestation_digest"]:
+            raise RuntimeError("rollback attestation digest mismatch")
+        return normalized
+
+    def commit_terminal_seal(
+        self, execution_run_id: str, *, expected_status: str, terminal_status: str,
+        seal_digest: str, tombstone_digest: str, rollback: bool,
+        failure_code: str = "",
+    ) -> None:
+        now = time.time()
+        seal_time = "rollback_sealed_at" if rollback else "recovery_sealed_at"
+        seal_column = "rollback_seal_digest" if rollback else "recovery_seal_digest"
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                f"UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,"
+                f"failure_code=?,{seal_time}=?,{seal_column}=?,terminal_tombstone_digest=? "
+                "WHERE execution_run_id=? AND status=?",
+                (terminal_status, now, now, failure_code, now, seal_digest,
+                 tombstone_digest, execution_run_id, expected_status),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("invalid terminal seal transition")
+            self._insert_execution_audit(
+                execution_run_id, "terminal-seal-committed", result=terminal_status,
+                error_code=failure_code, correlation_id=tombstone_digest,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def _insert_execution_audit(
         self, execution_run_id: str, event_type: str, *, operation: str = "",

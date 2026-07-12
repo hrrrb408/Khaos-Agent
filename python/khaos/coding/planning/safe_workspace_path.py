@@ -10,6 +10,9 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Callable
+from khaos.coding.planning.safe_identifiers import (
+    SafeWorkspaceRelativePath, UnsafePersistedIdentifier,
+)
 
 
 class SafePathError(RuntimeError):
@@ -129,7 +132,11 @@ class WorkspacePathHandle:
         os.close(self.root_fd)
 
     def parent(self, relative: str) -> SafeParentDirectory:
-        pure = PurePosixPath(relative)
+        try:
+            validated = SafeWorkspaceRelativePath.parse(relative)
+        except UnsafePersistedIdentifier as exc:
+            raise SafePathError(str(exc)) from exc
+        pure = PurePosixPath(validated.value)
         parts = tuple(pure.parts[:-1])
         descriptor = os.dup(self.root_fd)
         try:

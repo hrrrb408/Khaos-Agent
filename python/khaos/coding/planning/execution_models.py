@@ -218,3 +218,60 @@ class FinalMutationAttestation:
             separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
         return replace(candidate, attestation_digest=digest)
+
+
+@dataclass(frozen=True)
+class RollbackFinalAttestation(FinalMutationAttestation):
+    rollback_reason: str = ""
+    journal_digest: str = ""
+
+    def canonical(self) -> dict[str, Any]:
+        value = super().canonical()
+        value.update({
+            "rollback_reason": self.rollback_reason,
+            "journal_digest": self.journal_digest,
+        })
+        return value
+
+    def normalized(self) -> "RollbackFinalAttestation":
+        ordered = tuple(sorted(self.ordered_states, key=lambda state: state.path))
+        path_digest = hashlib.sha256(json.dumps(
+            [state.canonical() for state in ordered], ensure_ascii=False,
+            sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        candidate = replace(
+            self, ordered_states=ordered, path_state_digest=path_digest,
+            attestation_digest="",
+        )
+        digest = hashlib.sha256(json.dumps(
+            candidate.canonical(), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return replace(candidate, attestation_digest=digest)
+
+
+@dataclass(frozen=True)
+class MutationSealTombstone:
+    execution_run_id: str
+    seal_kind: str
+    bundle_digest: str
+    attestation_digest: str
+    journal_digest: str
+    recovery_container_identity: str
+    sealed_at: float
+    tombstone_digest: str = ""
+
+    def normalized(self) -> "MutationSealTombstone":
+        payload = {
+            "execution_run_id": self.execution_run_id,
+            "seal_kind": self.seal_kind,
+            "bundle_digest": self.bundle_digest,
+            "attestation_digest": self.attestation_digest,
+            "journal_digest": self.journal_digest,
+            "recovery_container_identity": self.recovery_container_identity,
+            "sealed_at": self.sealed_at,
+        }
+        digest = hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return replace(self, tombstone_digest=digest)
