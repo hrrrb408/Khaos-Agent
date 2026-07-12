@@ -18,16 +18,18 @@ CREATE TABLE IF NOT EXISTS code_files (project_id TEXT NOT NULL, path TEXT NOT N
  language TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
  content_hash TEXT NOT NULL, parser_version TEXT NOT NULL, parser_source TEXT NOT NULL DEFAULT 'legacy',
  metadata_json TEXT NOT NULL DEFAULT '{}', indexed_at REAL NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 0,
+ path_role TEXT NOT NULL DEFAULT 'source',
  PRIMARY KEY(project_id, path));
 CREATE TABLE IF NOT EXISTS code_symbols (project_id TEXT NOT NULL, path TEXT NOT NULL,
  name TEXT NOT NULL, kind TEXT NOT NULL, line INTEGER NOT NULL, signature TEXT,
  source TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(project_id, path, name, line));
 CREATE TABLE IF NOT EXISTS code_imports (project_id TEXT NOT NULL, path TEXT NOT NULL,
  import_name TEXT NOT NULL, payload_json TEXT NOT NULL DEFAULT '{}', PRIMARY KEY(project_id, path, import_name));
-CREATE TABLE IF NOT EXISTS code_calls (project_id TEXT NOT NULL, path TEXT NOT NULL, ordinal INTEGER NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(project_id,path,ordinal));
-CREATE TABLE IF NOT EXISTS code_references (project_id TEXT NOT NULL, path TEXT NOT NULL, ordinal INTEGER NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(project_id,path,ordinal));
-CREATE TABLE IF NOT EXISTS code_diagnostics (project_id TEXT NOT NULL, path TEXT NOT NULL, ordinal INTEGER NOT NULL, payload_json TEXT NOT NULL, PRIMARY KEY(project_id,path,ordinal));
+CREATE TABLE IF NOT EXISTS code_calls (project_id TEXT NOT NULL, path TEXT NOT NULL, ordinal INTEGER NOT NULL, payload_json NOT NULL, PRIMARY KEY(project_id,path,ordinal));
+CREATE TABLE IF NOT EXISTS code_references (project_id TEXT NOT NULL, path TEXT NOT NULL, ordinal INTEGER NOT NULL, payload_json NOT NULL, PRIMARY KEY(project_id,path,ordinal));
+CREATE TABLE IF NOT EXISTS code_diagnostics (project_id TEXT NOT NULL, path TEXT NOT NULL, ordinal INTEGER NOT NULL, payload_json NOT NULL, PRIMARY KEY(project_id,path,ordinal));
 CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(project_id, name);
+CREATE INDEX IF NOT EXISTS idx_code_files_role ON code_files(project_id, path_role);
 """
 
 
@@ -43,10 +45,12 @@ class IndexStore:
     def _migrate(self) -> None:
         self._conn.executescript(SCHEMA)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(code_files)")}
-        additions = {"parser_source": "TEXT NOT NULL DEFAULT 'legacy'", "metadata_json": "TEXT NOT NULL DEFAULT '{}'", "indexed_at": "REAL NOT NULL DEFAULT 0", "generation": "INTEGER NOT NULL DEFAULT 0"}
+        additions = {"parser_source": "TEXT NOT NULL DEFAULT 'legacy'", "metadata_json": "TEXT NOT NULL DEFAULT '{}'", "indexed_at": "REAL NOT NULL DEFAULT 0", "generation": "INTEGER NOT NULL DEFAULT 0", "path_role": "TEXT NOT NULL DEFAULT 'source'"}
         for name, declaration in additions.items():
             if name not in columns:
                 self._conn.execute(f"ALTER TABLE code_files ADD COLUMN {name} {declaration}")
+        # Ensure the path_role index exists even on pre-existing databases
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_code_files_role ON code_files(project_id, path_role)")
         for table, column in (("code_symbols", "payload_json"), ("code_imports", "payload_json")):
             if column not in {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'")
@@ -69,6 +73,7 @@ class IndexStore:
     async def write_parse_result(self, project_id: str, path: str, result: ParseResult, *, size: int, mtime_ns: int, generation: int) -> None:
         safe = result.to_dict(include_duration=True)
         metadata_json = json.dumps({"parser_source": result.parser_source, "parser_version": result.parser_version, "metadata": safe["metadata"], "diagnostics": safe["diagnostics"]}, ensure_ascii=False, sort_keys=True)
+        path_role = _classify_path_role(path)
         async with self._lock:
             if self._closed:
                 raise RuntimeError("IndexStore is closed")
@@ -76,7 +81,7 @@ class IndexStore:
                 self._conn.execute("BEGIN IMMEDIATE")
                 for table in ("code_symbols", "code_imports", "code_calls", "code_references", "code_diagnostics", "code_files"):
                     self._conn.execute(f"DELETE FROM {table} WHERE project_id=? AND path=?", (project_id, path))
-                self._conn.execute("INSERT INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?)", (project_id, path, result.language, size, mtime_ns, result.content_hash, result.parser_version, result.parser_source, metadata_json, time.time(), generation))
+                self._conn.execute("INSERT INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (project_id, path, result.language, size, mtime_ns, result.content_hash, result.parser_version, result.parser_source, metadata_json, time.time(), generation, path_role))
                 self._conn.executemany("INSERT INTO code_symbols VALUES (?,?,?,?,?,?,?,?)", [(project_id, path, item.name, item.kind, item.location.start_line + 1, item.metadata.get("signature"), item.source, json.dumps(item_to_dict(item), ensure_ascii=False, sort_keys=True)) for item in result.symbols])
                 self._conn.executemany("INSERT INTO code_imports VALUES (?,?,?,?)", [(project_id, path, item.module, json.dumps(item_to_dict(item), ensure_ascii=False, sort_keys=True)) for item in result.imports])
                 for table, items in (("code_calls", result.calls), ("code_references", result.references), ("code_diagnostics", result.diagnostics)):
@@ -132,3 +137,38 @@ class IndexStore:
 def item_to_dict(item: Any) -> dict[str, Any]:
     from dataclasses import asdict
     return asdict(item)
+
+
+def _classify_path_role(path: str) -> str:
+    """Classify a file path into a role: ``test``, ``source``, or ``fixture``.
+
+    Uses explicit path patterns — NOT substring matching — to determine if a
+    file is a test file. This classification is stored in the ``path_role``
+    column of ``code_files`` and indexed for bounded equality queries.
+    """
+    # Normalize to forward slashes for consistent matching
+    normalized = path.replace("\\", "/")
+    parts = normalized.split("/")
+    filename = parts[-1] if parts else normalized
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+
+    # Test directories: tests/, test/, spec/, __tests__/, specs/
+    for part in parts[:-1]:
+        if part in ("tests", "test", "spec", "__tests__", "specs", "__tests__"):
+            return "test"
+    # Test file prefixes/suffixes: test_*, *_test.*, *_spec.*, *_test.*
+    if stem.startswith("test_") or stem.startswith("test-"):
+        return "test"
+    if stem.endswith("_test") or stem.endswith("-test") or stem.endswith("_spec") or stem.endswith("-spec") or stem.endswith("Test") or stem.endswith("Spec"):
+        return "test"
+    # Go test files: *_test.go (already caught by suffix, but be explicit)
+    if filename.endswith("_test.go"):
+        return "test"
+    # Python __init__.py is a package marker, not a test
+    if filename == "__init__.py":
+        return "source"
+    # Fixtures: files in fixtures/, __fixtures__/, or with .fixture extension
+    for part in parts[:-1]:
+        if part in ("fixtures", "__fixtures__", "testdata", "test_data"):
+            return "fixture"
+    return "source"

@@ -7,6 +7,7 @@ semantic resolution graph.
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -140,39 +141,56 @@ class CodeQueryService:
     ) -> "tuple":
         """Bounded test-file association lookup — never scans the whole repository.
 
-        Evidence priority (each level is bounded by ``max_results``):
-        1. Resolved import/call/reference edges where the source file matches
-           a test pattern (``test``/``spec``) and the target is one of our
-           target files or symbols.
-        2. Explicit test directories (``tests/``, ``test/``, ``spec/``) with
-           bounded LIMIT queries using the primary key index.
-        3. Bounded path-stem heuristics: ``test_{stem}%``, ``{stem}_test%``,
-           ``{stem}_spec%`` — prefix patterns that leverage the PK index.
+        Uses indexed ``path_role`` equality queries (NOT ``LIKE '%test%'``) to
+        find test files. Every query is bounded by LIMIT and uses an index seek.
 
-        Returns a :class:`TestAssociationResult` with ``status=possible`` for
-        heuristic results, ``inspected_candidates`` reporting how many rows
-        were examined, and ``max_candidates`` enforcing the bounded limit.
+        Evidence priority (each level is bounded by ``max_results``):
+        1. Resolved graph edges (import/call/reference) where the source file
+           has ``path_role='test'`` — uses indexed joins on target_file/target_symbol_id.
+        2. All test files (``path_role='test'``) in the repository — uses the
+           ``idx_code_files_role`` index for bounded equality scan.
+
+        Returns a :class:`TestAssociationResult` with full query cost evidence:
+        ``sql_queries_issued``, ``sql_rows_returned``, ``indexed_edge_rows_fetched``,
+        and ``query_plans`` (EXPLAIN QUERY PLAN output for audit).
         """
         from khaos.coding.planning.contracts import TestAssociationResult
 
         max_candidates = max_results
-        inspected = 0
         candidates: list[dict[str, Any]] = []
         seen_paths: set[str] = set()
         evidence_sources: list[str] = []
         truncated = False
+        sql_queries_issued = 0
+        sql_rows_returned = 0
+        indexed_edge_rows_fetched = 0
+        query_plans: list[str] = []
 
-        # --- Priority 1: Resolved graph edges (indexed on target_file/target_symbol_id) ---
+        def _explain(sql: str, params: tuple) -> str:
+            """Run EXPLAIN QUERY PLAN and return a compact string."""
+            try:
+                plan_rows = self.store._conn.execute(f"EXPLAIN QUERY PLAN {sql}", params).fetchall()
+                return " | ".join(str(r[3]) for r in plan_rows)
+            except sqlite3.Error:
+                return "explain-failed"
+
+        # --- Priority 1: Resolved graph edges where source is a test file ---
+        # Uses idx_resolved_imports_target (on target_file) — indexed seek, not scan.
         if target_files:
             placeholders = ",".join("?" * len(target_files))
-            rows = self.store._conn.execute(
-                f"SELECT DISTINCT source_file,target_file,confidence,reason,'import' AS edge_type "
-                f"FROM resolved_imports WHERE repository_id=? AND target_file IN ({placeholders}) "
-                f"AND (source_file LIKE '%test%' OR source_file LIKE '%spec%') "
-                f"ORDER BY source_file LIMIT ?",
-                (repository_id, *target_files, max_candidates),
-            ).fetchall()
-            inspected += len(rows)
+            sql = (
+                f"SELECT DISTINCT ri.source_file, ri.target_file, ri.confidence, ri.reason, 'import' AS edge_type "
+                f"FROM resolved_imports ri "
+                f"INNER JOIN code_files cf ON cf.project_id = ri.repository_id AND cf.path = ri.source_file "
+                f"WHERE ri.repository_id = ? AND ri.target_file IN ({placeholders}) AND cf.path_role = 'test' "
+                f"ORDER BY ri.source_file LIMIT ?"
+            )
+            params = (repository_id, *target_files, max_candidates)
+            query_plans.append(f"P1-import: {_explain(sql, params)}")
+            rows = self.store._conn.execute(sql, params).fetchall()
+            sql_queries_issued += 1
+            sql_rows_returned += len(rows)
+            indexed_edge_rows_fetched += len(rows)
             for row in rows:
                 path = str(row[0])
                 if path not in seen_paths:
@@ -185,14 +203,19 @@ class CodeQueryService:
         if target_symbols:
             placeholders = ",".join("?" * len(target_symbols))
             for table, kind in (("resolved_call_edges", "call"), ("resolved_reference_edges", "reference")):
-                rows = self.store._conn.execute(
-                    f"SELECT DISTINCT source_file,target_file,target_symbol_id,confidence,resolution_rule,'{kind}' AS edge_type "
-                    f"FROM {table} WHERE repository_id=? AND target_symbol_id IN ({placeholders}) "
-                    f"AND (source_file LIKE '%test%' OR source_file LIKE '%spec%') "
-                    f"ORDER BY source_file LIMIT ?",
-                    (repository_id, *target_symbols, max_candidates),
-                ).fetchall()
-                inspected += len(rows)
+                sql = (
+                    f"SELECT DISTINCT e.source_file, e.target_file, e.target_symbol_id, e.confidence, e.resolution_rule, '{kind}' AS edge_type "
+                    f"FROM {table} e "
+                    f"INNER JOIN code_files cf ON cf.project_id = e.repository_id AND cf.path = e.source_file "
+                    f"WHERE e.repository_id = ? AND e.target_symbol_id IN ({placeholders}) AND cf.path_role = 'test' "
+                    f"ORDER BY e.source_file LIMIT ?"
+                )
+                params = (repository_id, *target_symbols, max_candidates)
+                query_plans.append(f"P1-{kind}: {_explain(sql, params)}")
+                rows = self.store._conn.execute(sql, params).fetchall()
+                sql_queries_issued += 1
+                sql_rows_returned += len(rows)
+                indexed_edge_rows_fetched += len(rows)
                 for row in rows:
                     path = str(row[0])
                     if path not in seen_paths:
@@ -202,71 +225,46 @@ class CodeQueryService:
                 if rows:
                     evidence_sources.append(f"resolved-{kind}-edges")
 
-        # --- Priority 2: Explicit test directories (bounded, indexed) ---
+        # --- Priority 2: All test files via path_role index (equality, not LIKE) ---
         if len(candidates) < max_candidates:
-            for pattern in ("tests/%", "test/%", "spec/%", "__tests__/%"):
-                remaining = max_candidates - len(candidates)
-                if remaining <= 0:
-                    break
-                rows = self.store._conn.execute(
-                    "SELECT path,language,content_hash,generation FROM code_files "
-                    "WHERE project_id=? AND path LIKE ? ORDER BY path LIMIT ?",
-                    (repository_id, pattern, remaining),
-                ).fetchall()
-                inspected += len(rows)
-                for row in rows:
-                    path = str(row[0])
-                    if path not in seen_paths:
-                        seen_paths.add(path)
-                        candidates.append({"path": path, "language": row[1], "content_hash": row[2],
-                                           "generation": row[3], "confidence": 0.5,
-                                           "reason": "test-directory-pattern", "edge_type": "directory",
-                                           "source": "test-directory"})
-                if rows:
-                    evidence_sources.append("test-directory")
-
-        # --- Priority 3: Bounded path-stem heuristics (prefix patterns, indexed) ---
-        if len(candidates) < max_candidates:
-            for target_file in target_files:
-                if len(candidates) >= max_candidates:
-                    truncated = True
-                    break
-                stem = target_file.rsplit("/", 1)[-1].rsplit(".", 1)[0]
-                for pattern in (f"test_{stem}%", f"{stem}_test%", f"{stem}_spec%", f"test/{stem}%", f"tests/test_{stem}%"):
-                    remaining = max_candidates - len(candidates)
-                    if remaining <= 0:
-                        truncated = True
-                        break
-                    rows = self.store._conn.execute(
-                        "SELECT path,language,content_hash,generation FROM code_files "
-                        "WHERE project_id=? AND path LIKE ? ORDER BY path LIMIT ?",
-                        (repository_id, pattern, remaining),
-                    ).fetchall()
-                    inspected += len(rows)
-                    for row in rows:
-                        path = str(row[0])
-                        if path not in seen_paths:
-                            seen_paths.add(path)
-                            candidates.append({"path": path, "language": row[1], "content_hash": row[2],
-                                               "generation": row[3], "confidence": 0.45,
-                                               "reason": "test-stem-heuristic", "edge_type": "stem",
-                                               "source": "path-heuristic"})
-                    if rows and "path-heuristic" not in evidence_sources:
-                        evidence_sources.append("path-heuristic")
+            remaining = max_candidates - len(candidates)
+            sql = (
+                "SELECT path, language, content_hash, generation FROM code_files "
+                "WHERE project_id = ? AND path_role = 'test' ORDER BY path LIMIT ?"
+            )
+            params = (repository_id, remaining)
+            query_plans.append(f"P2-test-role: {_explain(sql, params)}")
+            rows = self.store._conn.execute(sql, params).fetchall()
+            sql_queries_issued += 1
+            sql_rows_returned += len(rows)
+            indexed_edge_rows_fetched += len(rows)
+            for row in rows:
+                path = str(row[0])
+                if path not in seen_paths:
+                    seen_paths.add(path)
+                    candidates.append({"path": path, "language": row[1], "content_hash": row[2],
+                                       "generation": row[3], "confidence": 0.5,
+                                       "reason": "indexed test-role", "edge_type": "role-index",
+                                       "source": "path-role-index"})
+            if rows:
+                evidence_sources.append("path-role-index")
 
         if len(candidates) >= max_candidates:
             truncated = True
 
-        # Stable sort by path for deterministic output
         candidates.sort(key=lambda c: (c.get("path", ""), c.get("edge_type", "")))
         return TestAssociationResult(
             candidates=tuple(candidates[:max_candidates]),
             status="possible",
             confidence=0.5,
-            inspected_candidates=inspected,
+            inspected_candidates=sql_rows_returned,
             max_candidates=max_candidates,
             evidence_sources=tuple(sorted(set(evidence_sources))),
             truncated=truncated,
+            sql_queries_issued=sql_queries_issued,
+            sql_rows_returned=sql_rows_returned,
+            indexed_edge_rows_fetched=indexed_edge_rows_fetched,
+            query_plans=tuple(query_plans),
         )
 
     # ---- Optional LSP evidence fusion queries (Batch 6, additive) ----
