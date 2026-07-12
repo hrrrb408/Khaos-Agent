@@ -39,6 +39,15 @@ class WorkspaceManager:
         self._workspaces: dict[str, TaskWorkspace] = {}
         self._task_ids: set[str] = set()
         self._lock = asyncio.Lock()
+        # Batch 2.5 §4: optional lease invalidation hook. When set
+        # (by ApprovalRuntime / WorkspaceExecutionLeaseCoordinator),
+        # cleanup() calls it BEFORE removing the worktree so the ACTIVE
+        # execution lease is released.
+        self._lease_invalidation_hook: Any = None
+
+    def set_lease_invalidation_hook(self, hook: Any) -> None:
+        """Register a callable invoked during cleanup to release execution leases."""
+        self._lease_invalidation_hook = hook
 
     async def _git(self, repository: Path, *args: str, preserve_output: bool = False) -> str:
         process = await asyncio.create_subprocess_exec(
@@ -109,12 +118,24 @@ class WorkspaceManager:
         return await self._git(workspace.worktree_path, "rev-parse", "HEAD")
 
     async def cleanup(self, workspace_id: str, *, force: bool = False) -> WorkspaceTransition:
+        """Clean up a workspace worktree.
+
+        Batch 2.5 §4: if a lease invalidation hook is registered, calls it
+        BEFORE removing the worktree so the ACTIVE execution lease is
+        released. This prevents Workspace cleaned + lease active.
+        """
         async with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace is None:
                 return WorkspaceTransition.NOT_FOUND
             if workspace.state not in {WorkspaceState.APPLIED, WorkspaceState.FAILED, WorkspaceState.CANCELLED} and not force:
                 return WorkspaceTransition.INVALID
+            # Release any ACTIVE execution lease for this workspace.
+            if self._lease_invalidation_hook is not None:
+                try:
+                    self._lease_invalidation_hook(workspace_id=workspace_id)
+                except Exception:
+                    pass  # lease invalidation failure doesn't block cleanup
             workspace.state = WorkspaceState.CLEANING
             if force:
                 await self._git(workspace.repository_root, "worktree", "remove", "--force", str(workspace.worktree_path))

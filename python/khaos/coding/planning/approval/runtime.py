@@ -116,16 +116,38 @@ class ApprovalRuntime:
     def shutdown(self) -> None:
         """Atomically invalidate this boot's auth/lease/context.
 
-        Batch 2.5 §7: rotates epoch (revokes all auths/leases from this
-        epoch), sets ready=False. After shutdown, all operations refuse.
+        Batch 2.5 §7: first invalidates all ACTIVE execution scopes
+        (leases + still-ACTIVE authorizations) for this boot, then rotates
+        the epoch to fence any remaining state. After shutdown, all
+        operations refuse.
         """
         if self.ready:
+            # Cancel all ACTIVE leases before rotating the epoch.
+            self._store.invalidate_active_execution_scope(reason="runtime-shutdown")
             self._store.rotate_epoch()
             self.ready = False
             self.gate = None
             self.service = None
             self.boot_context = None
             logger.info("approval runtime shut down")
+
+    def register_lease_coordinator(
+        self, *, task_manager: Any = None, workspace_manager: Any = None,
+    ) -> WorkspaceExecutionLeaseCoordinator:
+        """Wire the lease coordinator hooks into real Managers.
+
+        Batch 2.5 §4: connects TaskManager.cancel and WorkspaceManager.cleanup
+        to the coordinator's invalidate_active_execution_scope via the
+        Managers' lease_invalidation_hook. Returns the coordinator for
+        planned-mutation precondition checks (generation/HEAD updates).
+        """
+        self.require_ready()
+        coordinator = WorkspaceExecutionLeaseCoordinator(self)
+        if task_manager is not None and hasattr(task_manager, "set_lease_invalidation_hook"):
+            task_manager.set_lease_invalidation_hook(coordinator.cancel_task)
+        if workspace_manager is not None and hasattr(workspace_manager, "set_lease_invalidation_hook"):
+            workspace_manager.set_lease_invalidation_hook(coordinator.cleanup_workspace)
+        return coordinator
 
 
 class WorkspaceExecutionLeaseCoordinator:

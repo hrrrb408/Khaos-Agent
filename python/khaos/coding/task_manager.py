@@ -127,6 +127,15 @@ class TaskManager:
         self._lock = asyncio.Lock()
         self._db = db
         self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
+        # Batch 2.5 §4: optional lease invalidation hook. When set
+        # (by ApprovalRuntime / WorkspaceExecutionLeaseCoordinator),
+        # cancel() calls it BEFORE transitioning the task to CANCELLED
+        # so the ACTIVE execution lease is released.
+        self._lease_invalidation_hook: Any = None
+
+    def set_lease_invalidation_hook(self, hook: Any) -> None:
+        """Register a callable invoked during cancel to release execution leases."""
+        self._lease_invalidation_hook = hook
 
     async def load(self) -> None:
         """Restore tasks and mark interrupted in-flight work as blocked."""
@@ -286,13 +295,24 @@ class TaskManager:
             return [task.to_dict() for task in self._tasks.values()]
 
     async def cancel(self, task_id: str) -> TransitionResult:
-        """Cancel an active task without overwriting a terminal state."""
+        """Cancel an active task without overwriting a terminal state.
+
+        Batch 2.5 §4: if a lease invalidation hook is registered, calls it
+        BEFORE transitioning the task to CANCELLED, so the ACTIVE execution
+        lease is released. This prevents Task terminal + lease active.
+        """
         async with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
                 return TransitionResult.NOT_FOUND
             if task.status in TERMINAL_STATUSES:
                 return TransitionResult.INVALID_TRANSITION
+            # Release any ACTIVE execution lease for this task.
+            if self._lease_invalidation_hook is not None:
+                try:
+                    self._lease_invalidation_hook(task_id=task_id)
+                except Exception:
+                    pass  # lease invalidation failure doesn't block cancel
             task.status = TaskStatus.CANCELLED
             task.touch()
             await self._persist(task)

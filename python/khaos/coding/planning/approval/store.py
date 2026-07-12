@@ -2010,6 +2010,108 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
+    def invalidate_active_execution_scope(
+        self,
+        *,
+        task_id: str | None = None,
+        workspace_id: str | None = None,
+        owner_execution_id: str | None = None,
+        reason: str = "execution-cancelled",
+        now: float | None = None,
+    ) -> int:
+        """Atomically invalidate all ACTIVE leases + authorizations matching
+        the given scope, WITHOUT rolling back CONSUMED approval requests.
+
+        Batch 2.5 §3: a Task cancel / Workspace cleanup / Runtime shutdown
+        must be able to terminate the ACTIVE lease of a CONSUMED approval
+        request. The old ``invalidate_request_authorizations_leases_and_receipt``
+        tried to transition CONSUMED → REVOKED which is an illegal rollback.
+        This method does NOT touch the approval request status at all — it
+        only expires the lease and revokes still-ACTIVE authorizations.
+
+        ONE ``BEGIN IMMEDIATE``:
+        1. Find matching ACTIVE leases (by task_id and/or workspace_id and/or
+           owner_execution_id).
+        2. Each matching lease → 'cancelled'.
+        3. For each lease's authorization_id: if the authorization is still
+           ACTIVE, revoke it. (CONSUMED authorizations stay CONSUMED.)
+        4. Write an execution-cancelled audit event per lease.
+        5. COMMIT.
+
+        Returns the count of invalidated leases.
+        """
+        if task_id is None and workspace_id is None and owner_execution_id is None:
+            return 0
+        now = time.time() if now is None else now
+        if self._conn.in_transaction:
+            self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Build the WHERE clause for matching ACTIVE leases.
+            clauses = ["status = 'active'"]
+            params: list[Any] = []
+            if task_id is not None:
+                clauses.append("task_id = ?")
+                params.append(task_id)
+            if workspace_id is not None:
+                clauses.append("workspace_id = ?")
+                params.append(workspace_id)
+            if owner_execution_id is not None:
+                clauses.append("owner_execution_id = ?")
+                params.append(owner_execution_id)
+            where = " AND ".join(clauses)
+            leases = self._conn.execute(
+                f"SELECT lease_id, task_id, workspace_id, repository_id, plan_id, "
+                f"authorization_id, owner_execution_id FROM plan_execution_leases WHERE {where}",
+                tuple(params),
+            ).fetchall()
+            invalidated = 0
+            for lease in leases:
+                # Expire the lease.
+                self._conn.execute(
+                    "UPDATE plan_execution_leases SET status = 'cancelled' WHERE lease_id = ?",
+                    (lease["lease_id"],),
+                )
+                # Revoke the authorization if still ACTIVE (not CONSUMED).
+                auth_row = self._conn.execute(
+                    "SELECT status, approval_request_id, plan_id FROM plan_execution_authorizations "
+                    "WHERE authorization_id = ?",
+                    (lease["authorization_id"],),
+                ).fetchone()
+                if auth_row is not None and auth_row["status"] == AuthorizationStatus.ACTIVE.value:
+                    self._conn.execute(
+                        "UPDATE plan_execution_authorizations SET status = ? WHERE authorization_id = ?",
+                        (AuthorizationStatus.REVOKED.value, lease["authorization_id"]),
+                    )
+                # Write execution-cancelled audit. Use the approval_request_id
+                # from the auth row if available, else empty.
+                req_id = auth_row["approval_request_id"] if auth_row is not None else ""
+                plan_id = auth_row["plan_id"] if auth_row is not None else lease["plan_id"]
+                audit_id = f"audit_{uuid.uuid4().hex}"
+                self._conn.execute(
+                    """
+                    INSERT INTO plan_approval_audit_events (
+                        event_id, event_type, approval_request_id, plan_id, previous_status,
+                        new_status, actor_id, actor_type, authenticated_source, timestamp,
+                        reason_code, task_id, workspace_id, repository_id, correlation_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        audit_id, "execution:cancelled", req_id, plan_id,
+                        "active", "cancelled",
+                        "system", "system", "runtime-shutdown",
+                        float(now), reason,
+                        lease["task_id"], lease["workspace_id"],
+                        lease["repository_id"], lease["lease_id"],
+                    ),
+                )
+                invalidated += 1
+            self._conn.commit()
+            return invalidated
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def count_active_leases_for_workspace(self, workspace_id: str) -> int:
         """Return the count of ACTIVE leases on a workspace (invariant check)."""
         row = self._conn.execute(
