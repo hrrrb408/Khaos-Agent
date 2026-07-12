@@ -120,8 +120,8 @@ def _make_db() -> sqlite3.Connection:
     apply_resolution_schema(conn)
     # Insert a code_file record
     conn.execute(
-        "INSERT OR REPLACE INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        ("r", "src/app.py", "python", 1, 100, 0, "hash", "", "{}", 0, 1),
+        "INSERT OR REPLACE INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        ("r", "src/app.py", "python", 1, 100, 0, "hash", "", "{}", 0, 1, "source"),
     )
     conn.commit()
     return conn

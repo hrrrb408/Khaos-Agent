@@ -92,8 +92,8 @@ def test_large_repository_planning_matrix_is_bounded_deterministic_and_read_only
 
     # --- Leaf planning: must NOT scan the entire repository ---
     # The spec says: "测试不得只用 visited_nodes=1 affected_files<10 来推断没有全仓扫描"
-    # We must prove via sql_rows_enumerated and inspected_test_candidates.
-    leaf_sql = int(leaf_summary["sql_rows_enumerated"])
+    # We must prove via sql_rows_returned and inspected_test_candidates.
+    leaf_sql = int(leaf_summary["sql_rows_returned"])
     leaf_test_candidates = int(leaf_summary["inspected_test_candidates"])
     leaf_file_candidates = int(leaf_summary["inspected_file_candidates"])
     leaf_edges = int(leaf_summary["inspected_edges"])
@@ -103,7 +103,7 @@ def test_large_repository_planning_matrix_is_bounded_deterministic_and_read_only
 
     # Leaf_999 has no callers, no reverse imports, no references — it's a true leaf.
     # SQL rows enumerated must be MUCH less than 1000 (the total file count).
-    assert leaf_sql < _TOTAL_FILES, f"leaf sql_rows_enumerated={leaf_sql} must be < {_TOTAL_FILES}"
+    assert leaf_sql < _TOTAL_FILES, f"leaf sql_rows_returned={leaf_sql} must be < {_TOTAL_FILES}"
     assert leaf_test_candidates < _TOTAL_FILES, f"leaf inspected_test_candidates={leaf_test_candidates} must be < {_TOTAL_FILES}"
     # Affected files must be distinguished from scanned files.
     assert leaf_affected_files < _TOTAL_FILES
@@ -112,7 +112,7 @@ def test_large_repository_planning_matrix_is_bounded_deterministic_and_read_only
     assert leaf_edges >= 0
 
     # --- Public symbol: bounded dependency closure ---
-    public_sql = int(public_summary["sql_rows_enumerated"])
+    public_sql = int(public_summary["sql_rows_returned"])
     public_test_candidates = int(public_summary["inspected_test_candidates"])
     public_visited_nodes = int(public_summary["visited_nodes"])
     public_edges = int(public_summary["inspected_edges"])
@@ -123,7 +123,7 @@ def test_large_repository_planning_matrix_is_bounded_deterministic_and_read_only
     # PublicRoot has 40 callers (file_1..file_40), so visited_nodes should be
     # bounded but > 1. The closure must not enumerate all 1000 files.
     assert public_visited_nodes > 1, "public symbol must visit callers"
-    assert public_sql < _TOTAL_FILES, f"public sql_rows_enumerated={public_sql} must be < {_TOTAL_FILES}"
+    assert public_sql < _TOTAL_FILES, f"public sql_rows_returned={public_sql} must be < {_TOTAL_FILES}"
     assert public_test_candidates < _TOTAL_FILES, f"public inspected_test_candidates={public_test_candidates} must be < {_TOTAL_FILES}"
     assert public_affected_files < _TOTAL_FILES, f"public affected_files={public_affected_files} must be < {_TOTAL_FILES}"
 
@@ -153,13 +153,13 @@ def test_large_repository_planning_matrix_is_bounded_deterministic_and_read_only
         "leaf_inspected_edges": leaf_edges,
         "leaf_inspected_file_candidates": leaf_file_candidates,
         "leaf_inspected_test_candidates": leaf_test_candidates,
-        "leaf_sql_rows_enumerated": leaf_sql,
+        "leaf_sql_rows_returned": leaf_sql,
         "leaf_affected_files": leaf_affected_files,
         "leaf_affected_symbols": leaf_affected_symbols,
         "public_visited_nodes": public_visited_nodes,
         "public_inspected_edges": public_edges,
         "public_inspected_test_candidates": public_test_candidates,
-        "public_sql_rows_enumerated": public_sql,
+        "public_sql_rows_returned": public_sql,
         "public_affected_files": public_affected_files,
         "public_affected_symbols": public_affected_symbols,
         "public_truncated": public_truncated,
@@ -181,12 +181,12 @@ def test_leaf_planning_detects_full_table_scan_counterexample(tmp_path: Path):
     leaf = service.plan(repository_id="large", task_id="leaf", workspace_id="ws", user_goal="modify function leaf_500", base_sha="sha")
     assert leaf.status is PlanStatus.READY
     summary = _parse_impact_summary(leaf)
-    sql_rows = int(summary["sql_rows_enumerated"])
+    sql_rows = int(summary["sql_rows_returned"])
     test_candidates = int(summary["inspected_test_candidates"])
     # leaf_500 is a true leaf — no callers, no imports, no references.
     # The only SQL should be from bounded test association (max_test_candidates=50).
     # If sql_rows > 100, we're likely scanning the whole repo.
-    assert sql_rows <= 100, f"leaf_500 sql_rows_enumerated={sql_rows} —疑似全表扫描"
+    assert sql_rows <= 100, f"leaf_500 sql_rows_returned={sql_rows} —疑似全表扫描"
     assert test_candidates <= 50, f"leaf_500 inspected_test_candidates={test_candidates} —超过 max_test_candidates"
     # affected_files must not equal scanned_files (1000)
     assert len(leaf.affected_files) < _TOTAL_FILES

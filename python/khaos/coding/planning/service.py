@@ -44,31 +44,42 @@ class ResolvedGoalTarget:
 
 class DeterministicPlanningService:
     """No tools, shell, writes, ChangeSets, or approval transitions are exposed here."""
-    def __init__(self, query: CodeQueryService, *, repositories: dict[str, dict[str, Any]], max_depth: int = 3, max_nodes: int = 200, max_files: int = 100, max_symbols: int = 100) -> None:
+    def __init__(self, query: CodeQueryService, *, repositories: dict[str, dict[str, Any]], max_depth: int = 3, max_nodes: int = 200, max_files: int = 100, max_symbols: int = 100, max_edges: int = 500, max_reverse_imports: int = 50, max_test_candidates: int = 50) -> None:
         self._query, self._repositories = query, repositories
-        self._limits=(max_depth,max_nodes,max_files,max_symbols); self._verification_selector=TrustedVerificationSelector(); self._risk_evaluator=RiskEvaluator()
+        self._limits=(max_depth,max_nodes,max_files,max_symbols,max_edges,max_reverse_imports,max_test_candidates); self._verification_selector=TrustedVerificationSelector(); self._risk_evaluator=RiskEvaluator()
         self._catalogs: dict[str, VerificationCatalog] = {}
 
     def _get_catalog(self, repository_id: str) -> VerificationCatalog:
-        """Build and cache a VerificationCatalog for the repository.
+        """Build (or refresh) a VerificationCatalog for the repository.
 
         The catalog is read-only — it scans config files (pyproject.toml,
         package.json, go.mod, Cargo.toml) from the repository root and server
         rules from the repository metadata. It never writes, executes, or
         modifies approval state.
+
+        FRESHNESS: The cache is keyed by a fingerprint that binds repository_id,
+        config file hashes, server rules hash, and catalog parser version.
+        When any of these change, the cache entry is automatically invalidated
+        and a fresh catalog is built. Callers never need to manually clear
+        the cache — validate_plan() always sees the current state.
         """
-        if repository_id not in self._catalogs:
-            repo = self._repositories.get(repository_id, {})
-            root = repo.get("root")
-            server_rules = tuple(
-                rule for rule in repo.get("trusted_verification", ())
-                if isinstance(rule, dict) and rule.get("language")
+        repo = self._repositories.get(repository_id, {})
+        root = repo.get("root")
+        server_rules = tuple(
+            rule for rule in repo.get("trusted_verification", ())
+            if isinstance(rule, dict) and rule.get("language")
+        )
+        from pathlib import Path
+        root_path = Path(root) if root else None
+        fingerprint = VerificationCatalog.compute_fingerprint(
+            repository_id, root_path, server_rules,
+        )
+        cached = self._catalogs.get(repository_id)
+        if cached is None or cached.fingerprint != fingerprint:
+            catalog = VerificationCatalog(
+                root_path, server_rules=server_rules, repository_id=repository_id,
             )
-            from pathlib import Path
-            self._catalogs[repository_id] = VerificationCatalog(
-                Path(root) if root else None,
-                server_rules=server_rules,
-            )
+            self._catalogs[repository_id] = catalog
         return self._catalogs[repository_id]
 
     def classify_goal(self, *, repository_id: str, user_goal: str) -> GoalIntentResult:
@@ -78,7 +89,7 @@ class DeterministicPlanningService:
         parsed = resolved.parsed
         return GoalIntentResult(raw_goal, (resolved.action.intent,), (GoalTarget(parsed.raw_token, parsed.explicit_kind, parsed.requested_symbol, parsed.requested_path, self._language(parsed.requested_path or ""), resolved.action.operation.value, resolved.status, (resolved.selected_file,) if resolved.selected_file else (), tuple(x.get("stable_symbol_id", "") for x in resolved.symbol_candidates), resolved.evidence, resolved.diagnostics),), 1.0 if resolved.status == "resolved" else 0.0, resolved.diagnostics)
 
-    def analyze_impacts(self, *, repository_id: str, target_symbols: tuple[str, ...], target_files: tuple[str, ...] = (), max_depth: int | None = None, max_nodes: int | None = None, max_files: int | None = None, max_symbols: int | None = None) -> ImpactAnalysis:
+    def analyze_impacts(self, *, repository_id: str, target_symbols: tuple[str, ...], target_files: tuple[str, ...] = (), max_depth: int | None = None, max_nodes: int | None = None, max_files: int | None = None, max_symbols: int | None = None, max_edges: int | None = None, max_reverse_imports: int | None = None, max_test_candidates: int | None = None) -> ImpactAnalysis:
         """Cycle-safe reverse call/reference traversal over persisted resolution edges.
 
         Uses a single :class:`ImpactTraversalBudget` shared across ALL impact
@@ -92,6 +103,9 @@ class DeterministicPlanningService:
             max_nodes=max_nodes if max_nodes is not None else self._limits[1],
             max_files=max_files if max_files is not None else self._limits[2],
             max_symbols=max_symbols if max_symbols is not None else self._limits[3],
+            max_edges=max_edges if max_edges is not None else self._limits[4],
+            max_reverse_imports=max_reverse_imports if max_reverse_imports is not None else self._limits[5],
+            max_test_candidates=max_test_candidates if max_test_candidates is not None else self._limits[6],
         )
         queue = [(sid, 0) for sid in sorted(target_symbols)]
         direct: list[ImpactEdge] = []
@@ -105,7 +119,7 @@ class DeterministicPlanningService:
             budget.add_affected_file(tf)
 
         # --- Phase 1: Reverse call/reference graph traversal (budgeted) ---
-        while queue:
+        while queue and not budget.truncated:
             sid, depth = queue.pop(0)
             if not budget.can_visit_node(sid, depth):
                 continue
@@ -132,100 +146,103 @@ class DeterministicPlanningService:
                     queue.append((caller, depth + 1))
 
         # --- Phase 2: Reverse imports + semantic re-export evidence (budgeted) ---
+        # HARD BUDGET: skip this entire phase if Phase 1 already triggered truncation.
         resolved_target_files = sorted(target_files or tuple(
             item.get("path", "") for sid in target_symbols
             for item in [self._query.symbol_by_stable_id(repository_id, sid) or {}] if item
         ))
-        for target_file in resolved_target_files:
-            for import_edge in self._query.reverse_imports_to(repository_id, target_file):
-                if not budget.can_inspect_reverse_import():
+        if not budget.truncated:
+            for target_file in resolved_target_files:
+                if budget.truncated:
                     break
-                source = str(import_edge["source_file"])
-                meta = import_edge.get("metadata", {})
-                # Semantic re-export evidence from ParseResult/Resolution metadata:
-                # - JS/TS: metadata.reexport == True or import_kind == "reexport"
-                # - Rust: metadata.pub_use == True
-                # - Python __init__.py: conservative possible-reexport (no __all__ parsing)
-                # - Go: no re-exports (never fabricated)
-                is_semantic_reexport = bool(meta.get("reexport") or meta.get("pub_use"))
-                is_init_py = source.endswith("__init__.py")
-                if is_semantic_reexport:
-                    relation = "re-export"
-                    impact_status = ImpactStatus.DIRECT
-                    confidence = 0.92
-                    reason = "semantic re-export evidence"
-                elif is_init_py:
-                    # Strategy B: conservative downgrade — Python __init__.py
-                    # without __all__ parsing is only possible-reexport, never
-                    # a confirmed dependency modification target.
-                    relation = "possible-reexport"
-                    impact_status = ImpactStatus.POSSIBLE
-                    confidence = 0.5
-                    reason = "python __init__.py layout推测 — not semantic evidence"
-                else:
-                    relation = "reverse-import"
-                    impact_status = ImpactStatus.DIRECT
-                    confidence = 0.9
-                    reason = "resolved reverse dependency"
-                if source in budget.affected_files and any(item.source_file == source for item in direct + indirect):
-                    continue
-                if not budget.add_affected_file(source):
-                    break
-                record = self._query.file_evidence(repository_id, source) or {}
-                ev = PlanEvidence("resolution-graph", repository_id, source,
-                                  generation=record.get("generation"),
-                                  content_hash=record.get("content_hash"),
-                                  query=target_file, confidence=confidence,
-                                  metadata={"reexport": is_semantic_reexport, "possible_reexport": is_init_py})
-                edge_item = ImpactEdge(source, None, target_file, None, relation, 1,
-                                       impact_status, confidence, reason, (ev,))
-                if impact_status is ImpactStatus.POSSIBLE:
-                    dynamic.append(edge_item)
-                else:
-                    direct.append(edge_item)
+                for import_edge in self._query.reverse_imports_to(repository_id, target_file):
+                    if not budget.can_inspect_reverse_import():
+                        break
+                    source = str(import_edge["source_file"])
+                    meta = import_edge.get("metadata", {})
+                    is_semantic_reexport = bool(meta.get("reexport") or meta.get("pub_use"))
+                    is_init_py = source.endswith("__init__.py")
+                    if is_semantic_reexport:
+                        relation = "re-export"
+                        impact_status = ImpactStatus.DIRECT
+                        confidence = 0.92
+                        reason = "semantic re-export evidence"
+                    elif is_init_py:
+                        relation = "possible-reexport"
+                        impact_status = ImpactStatus.POSSIBLE
+                        confidence = 0.5
+                        reason = "python __init__.py layout推测 — not semantic evidence"
+                    else:
+                        relation = "reverse-import"
+                        impact_status = ImpactStatus.DIRECT
+                        confidence = 0.9
+                        reason = "resolved reverse dependency"
+                    if source in budget.affected_files and any(item.source_file == source for item in direct + indirect):
+                        continue
+                    if not budget.add_affected_file(source):
+                        break
+                    record = self._query.file_evidence(repository_id, source) or {}
+                    ev = PlanEvidence("resolution-graph", repository_id, source,
+                                      generation=record.get("generation"),
+                                      content_hash=record.get("content_hash"),
+                                      query=target_file, confidence=confidence,
+                                      metadata={"reexport": is_semantic_reexport, "possible_reexport": is_init_py})
+                    edge_item = ImpactEdge(source, None, target_file, None, relation, 1,
+                                           impact_status, confidence, reason, (ev,))
+                    if impact_status is ImpactStatus.POSSIBLE:
+                        dynamic.append(edge_item)
+                    else:
+                        direct.append(edge_item)
 
-            # --- Phase 3: Unresolved/dynamic candidates (budgeted) ---
-            for item in self._query.unresolved_candidates(repository_id, target_file):
-                if not budget.can_inspect_edge():
+                # --- Phase 3: Unresolved/dynamic candidates (budgeted) ---
+                if budget.truncated:
                     break
-                status = str(item.get("status", "unresolved"))
-                impact_status = (ImpactStatus.DYNAMIC if status == "dynamic"
-                                 else ImpactStatus.EXTERNAL if status == "external"
-                                 else ImpactStatus.AMBIGUOUS if status == "ambiguous"
-                                 else ImpactStatus.POSSIBLE)
-                ev = PlanEvidence("resolution-graph", repository_id, target_file,
-                                  query=str(item.get("callee") or item.get("name") or item.get("import_module") or ""),
-                                  confidence=0.3)
-                edge_item = ImpactEdge(target_file, None, "", None, item.get("edge_type", "unknown"),
-                                       1, impact_status, 0.3, status, (ev,))
-                (external if impact_status is ImpactStatus.EXTERNAL else dynamic).append(edge_item)
+                for item in self._query.unresolved_candidates(repository_id, target_file):
+                    if not budget.can_inspect_edge():
+                        break
+                    status = str(item.get("status", "unresolved"))
+                    impact_status = (ImpactStatus.DYNAMIC if status == "dynamic"
+                                     else ImpactStatus.EXTERNAL if status == "external"
+                                     else ImpactStatus.AMBIGUOUS if status == "ambiguous"
+                                     else ImpactStatus.POSSIBLE)
+                    ev = PlanEvidence("resolution-graph", repository_id, target_file,
+                                      query=str(item.get("callee") or item.get("name") or item.get("import_module") or ""),
+                                      confidence=0.3)
+                    edge_item = ImpactEdge(target_file, None, "", None, item.get("edge_type", "unknown"),
+                                           1, impact_status, 0.3, status, (ev,))
+                    (external if impact_status is ImpactStatus.EXTERNAL else dynamic).append(edge_item)
 
         # --- Phase 4: Bounded test association (NO full-repo scan) ---
-        test_result = self._query.associated_tests(
-            repository_id,
-            target_files=tuple(resolved_target_files),
-            target_symbols=target_symbols,
-            max_results=budget.max_test_candidates,
-        )
-        budget.record_sql_rows(test_result.inspected_candidates)
-        for candidate in test_result.candidates:
-            if not budget.can_inspect_test_candidate():
-                break
-            path = candidate.get("path", "")
-            if not budget.add_affected_file(path):
-                break
-            record = self._query.file_evidence(repository_id, path) or {}
-            ev = PlanEvidence("test-layout-rule", repository_id, path,
-                              generation=record.get("generation"),
-                              content_hash=record.get("content_hash"),
-                              query=",".join(resolved_target_files),
-                              confidence=candidate.get("confidence", 0.5),
-                              metadata={"source": candidate.get("source", "heuristic"),
-                                        "edge_type": candidate.get("edge_type", "")})
-            dynamic.append(ImpactEdge(path, None, ",".join(resolved_target_files), None,
-                                      "associated-test", 1, ImpactStatus.POSSIBLE,
-                                      candidate.get("confidence", 0.5),
-                                      candidate.get("reason", "server test-layout heuristic"), (ev,)))
+        # HARD BUDGET: skip test association entirely if an earlier phase truncated.
+        if not budget.truncated:
+            test_result = self._query.associated_tests(
+                repository_id,
+                target_files=tuple(resolved_target_files),
+                target_symbols=target_symbols,
+                max_results=budget.max_test_candidates,
+            )
+            budget.record_sql_query(
+                rows_returned=test_result.sql_rows_returned,
+                indexed_rows=test_result.indexed_edge_rows_fetched,
+            )
+            for candidate in test_result.candidates:
+                if not budget.can_inspect_test_candidate():
+                    break
+                path = candidate.get("path", "")
+                if not budget.add_affected_file(path):
+                    break
+                record = self._query.file_evidence(repository_id, path) or {}
+                ev = PlanEvidence("test-layout-rule", repository_id, path,
+                                  generation=record.get("generation"),
+                                  content_hash=record.get("content_hash"),
+                                  query=",".join(resolved_target_files),
+                                  confidence=candidate.get("confidence", 0.5),
+                                  metadata={"source": candidate.get("source", "heuristic"),
+                                            "edge_type": candidate.get("edge_type", "")})
+                dynamic.append(ImpactEdge(path, None, ",".join(resolved_target_files), None,
+                                          "associated-test", 1, ImpactStatus.POSSIBLE,
+                                          candidate.get("confidence", 0.5),
+                                          candidate.get("reason", "server test-layout heuristic"), (ev,)))
 
         # --- Finalize ---
         if budget.truncated:
@@ -251,7 +268,8 @@ class DeterministicPlanningService:
             budget.truncated, digest,
             budget.visited_nodes_count, budget.affected_files_count, budget.affected_symbols_count,
             budget.inspected_edges, budget.inspected_file_candidates, budget.inspected_test_candidates,
-            budget.inspected_reverse_imports, budget.sql_rows_enumerated, budget.limit_code,
+            budget.inspected_reverse_imports, budget.sql_rows_returned,
+            budget.sql_queries_issued, budget.indexed_edge_rows_fetched, budget.limit_code,
         )
 
     def plan(self, *, repository_id: str, task_id: str, workspace_id: str, user_goal: str, base_sha: str) -> ImplementationPlan:
@@ -305,13 +323,14 @@ class DeterministicPlanningService:
         requirements=self._verification_selector.select(repo_metadata,languages,tuple(evidence),catalog=catalog,security=resolved.action.intent is GoalIntent.SECURITY_CHANGE,schema=resolved.action.intent is GoalIntent.SCHEMA_CHANGE)
         # Include config hash evidence so config file changes invalidate plans.
         config_hash=catalog.combined_config_hash()
-        if config_hash:
-            evidence.append(PlanEvidence("verification-config",repository_id,query="config-hash",confidence=1.0,metadata={"config_hash":config_hash,"config_files":dict(catalog.config_hashes)}))
+        # Always add verification-config evidence (even when empty) so that
+        # adding a new config file is detected as drift.
+        evidence.append(PlanEvidence("verification-config",repository_id,query="config-hash",confidence=1.0,metadata={"config_hash":config_hash,"config_files":dict(catalog.config_hashes)}))
         status = PlanStatus.READY if resolved.status == "resolved" and files and not any(d.severity == "error" for d in diagnostics) else PlanStatus.BLOCKED
         step = self._steps(operation, raw_goal, files, symbols, requirements, risks[0], evidence, status, impact)
         diagnostics.extend(validate_steps(step))
         if any(d.severity == "error" for d in diagnostics): status = PlanStatus.BLOCKED
-        diagnostics.append(PlanDiagnostic("impact-summary","info",f"visited_nodes={impact.visited_nodes};visited_files={impact.visited_files};visited_symbols={impact.visited_symbols};inspected_edges={impact.inspected_edges};inspected_file_candidates={impact.inspected_file_candidates};inspected_test_candidates={impact.inspected_test_candidates};inspected_reverse_imports={impact.inspected_reverse_imports};sql_rows_enumerated={impact.sql_rows_enumerated};truncated={impact.truncated};limit_code={impact.limit_code or 'none'};impact_hash={impact.content_hash}",True))
+        diagnostics.append(PlanDiagnostic("impact-summary","info",f"visited_nodes={impact.visited_nodes};visited_files={impact.visited_files};visited_symbols={impact.visited_symbols};inspected_edges={impact.inspected_edges};inspected_file_candidates={impact.inspected_file_candidates};inspected_test_candidates={impact.inspected_test_candidates};inspected_reverse_imports={impact.inspected_reverse_imports};sql_rows_returned={impact.sql_rows_returned};sql_queries_issued={impact.sql_queries_issued};indexed_edge_rows_fetched={impact.indexed_edge_rows_fetched};truncated={impact.truncated};limit_code={impact.limit_code or 'none'};impact_hash={impact.content_hash}",True))
         return self._build(repository_id, task_id, workspace_id, user_goal, normalized, base_sha, int(repo["generation"]), status, step, files, symbols, impacts, requirements, risks, diagnostics, evidence)
 
     def validate_plan(self, plan: ImplementationPlan, *, current_head: str, current_repository_generation: int) -> PlanValidationResult:
@@ -322,9 +341,11 @@ class DeterministicPlanningService:
         current_catalog = self._get_catalog(plan.repository_id)
         current_config_hash = current_catalog.combined_config_hash()
         for ev in plan.evidence:
-            if ev.source == "verification-config" and ev.metadata.get("config_hash"):
-                if ev.metadata["config_hash"] != current_config_hash:
-                    issues.append(PlanDiagnostic("config-hash-drift", "error", "verification config file changed", False, (ev,)))
+            if ev.source == "verification-config":
+                # Compare config hashes — detects modify, delete, AND add (empty → non-empty)
+                plan_hash = ev.metadata.get("config_hash", "")
+                if plan_hash != current_config_hash:
+                    issues.append(PlanDiagnostic("config-hash-drift", "error", "verification config changed", False, (ev,)))
             if ev.path and ev.content_hash:
                 record = self._query.file_evidence(plan.repository_id, ev.path)
                 if not record or record["content_hash"] != ev.content_hash: issues.append(PlanDiagnostic("evidence-drift", "error", f"evidence changed: {ev.path}", False, (ev,)))

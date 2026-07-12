@@ -303,8 +303,8 @@ async def test_11_config_hash_drift_makes_plan_stale(tmp_path: Path):
     assert plan.status is PlanStatus.READY
     # Modify the config file
     (tmp_path / "pyproject.toml").write_text("[tool.pytest]\ntestpaths = [\"tests\"]\n[tool.mypy]\npython_version = \"3.12\"\n")
-    # Clear the catalog cache so the service re-reads the config
-    service._catalogs.clear()
+    # Catalog freshness is automatic — fingerprint-based cache invalidation
+    # detects the config change without any manual _catalogs.clear()
     result = service.validate_plan(plan, current_head="abc", current_repository_generation=1)
     assert result.status is PlanStatus.STALE
     assert any(d.code == "config-hash-drift" for d in result.diagnostics), "config hash drift must be detected"
@@ -329,7 +329,7 @@ def test_12_planning_service_does_not_access_store_conn():
 
 @pytest.mark.asyncio
 async def test_13_leaf_planning_detects_full_table_scan(tmp_path: Path):
-    """Leaf planning must not enumerate all code_files — proved by sql_rows_enumerated."""
+    """Leaf planning must not enumerate all code_files — proved by sql_rows_returned."""
     for i in range(200):
         if i == 0:
             content = "def PublicRoot(): return 1\n"
@@ -356,9 +356,9 @@ async def test_13_leaf_planning_detects_full_table_scan(tmp_path: Path):
     plan = service.plan(repository_id="large", task_id="leaf", workspace_id="ws", user_goal="modify function leaf_150", base_sha="abc")
     assert plan.status is PlanStatus.READY
     summary = _parse_impact_summary(plan)
-    sql_rows = int(summary["sql_rows_enumerated"])
+    sql_rows = int(summary["sql_rows_returned"])
     test_candidates = int(summary["inspected_test_candidates"])
-    assert sql_rows < 200, f"leaf sql_rows_enumerated={sql_rows} — full table scan detected"
+    assert sql_rows < 200, f"leaf sql_rows_returned={sql_rows} — full table scan detected"
     assert test_candidates < 200, f"leaf inspected_test_candidates={test_candidates} — unbounded test scan"
     assert len(plan.affected_files) < 200
 
