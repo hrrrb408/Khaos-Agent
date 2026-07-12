@@ -55,7 +55,7 @@ class TrustedVerificationSelector:
                 ev = PlanEvidence(
                     "verification-config",
                     repository_id,
-                    path=entry.config_path if entry.config_path.startswith("/") else None,
+                    path=entry.config_path,
                     query=entry.provenance,
                     confidence=1.0 if entry.trust_level == "high" else 0.8,
                     metadata={

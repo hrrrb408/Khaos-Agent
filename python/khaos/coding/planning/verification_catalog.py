@@ -212,12 +212,41 @@ class VerificationCatalog:
         self._scan_server_rules()
 
     def _read_config(self, filename: str) -> tuple[str | None, str]:
-        """Read a config file. Returns (content, content_hash). Empty hash if missing."""
+        """Read a config file. Returns (content, content_hash). Empty hash if missing.
+
+        SYMLINK SAFETY: Before reading, resolves both the repository root and
+        the candidate path. If the resolved candidate escapes the resolved
+        root (via symlink, absolute path, or ``..`` traversal), the read is
+        refused and a diagnostic is recorded. The absolute target path is
+        NEVER exposed in evidence, logs, or exception messages — only the
+        repo-relative ``filename`` appears in diagnostics.
+
+        Internal symlinks (pointing to a file inside the workspace) are allowed.
+        Broken symlinks are rejected (read fails → empty result).
+        """
         if self._root is None:
             return None, ""
-        path = self._root / filename
         try:
-            content = path.read_text(encoding="utf-8")
+            root_resolved = self._root.resolve()
+        except OSError:
+            return None, ""
+        candidate = self._root / filename
+        try:
+            candidate_resolved = candidate.resolve(strict=False)
+        except OSError:
+            return None, ""
+        # Confirm resolved candidate is inside resolved root.
+        try:
+            candidate_resolved.relative_to(root_resolved)
+        except ValueError:
+            self._diagnostics.append((
+                "error",
+                f"config file escapes workspace root: {filename}",
+            ))
+            return None, ""
+        # Read the content via the resolved path (follows internal symlinks safely).
+        try:
+            content = candidate_resolved.read_text(encoding="utf-8")
             return content, hashlib.sha256(content.encode()).hexdigest()
         except (OSError, UnicodeDecodeError):
             return None, ""
