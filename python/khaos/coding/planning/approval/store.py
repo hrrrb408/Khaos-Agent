@@ -228,6 +228,63 @@ CREATE TABLE IF NOT EXISTS workspace_mutation_audit (
     created_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS plan_execution_runs (
+    execution_run_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    plan_content_hash TEXT NOT NULL,
+    approval_request_id TEXT NOT NULL,
+    authorization_id TEXT NOT NULL UNIQUE,
+    execution_context_id TEXT NOT NULL UNIQUE,
+    lease_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    base_sha TEXT NOT NULL,
+    repository_generation INTEGER NOT NULL,
+    binding_digest TEXT NOT NULL,
+    edit_bundle_digest TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    failure_code TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS plan_execution_edit_events (
+    event_id TEXT PRIMARY KEY,
+    execution_run_id TEXT NOT NULL,
+    edit_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    path TEXT NOT NULL,
+    destination_path TEXT,
+    before_hash TEXT,
+    after_hash TEXT,
+    before_mode INTEGER,
+    after_mode INTEGER,
+    status TEXT NOT NULL,
+    error_code TEXT NOT NULL DEFAULT '',
+    recovery_artifact TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    UNIQUE(execution_run_id, edit_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_execution_audit_events (
+    audit_id TEXT PRIMARY KEY,
+    execution_run_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    operation TEXT NOT NULL DEFAULT '',
+    path TEXT NOT NULL DEFAULT '',
+    before_hash TEXT NOT NULL DEFAULT '',
+    after_hash TEXT NOT NULL DEFAULT '',
+    result TEXT NOT NULL,
+    error_code TEXT NOT NULL DEFAULT '',
+    correlation_id TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
 -- Batch 2.2: persisted monotonic server epoch. The gate reads and rotates
 -- this atomically at startup so a restart genuinely invalidates old
 -- authorizations (the in-memory default epoch was not a real safety property).
@@ -2508,6 +2565,214 @@ class PlanApprovalStore:
         except Exception:
             self._conn.rollback()
             raise
+
+    # ------------------------------------------------------------------
+    # Batch 3 execution journal
+    # ------------------------------------------------------------------
+
+    def create_execution_run(self, run: Any) -> Any:
+        """Create one run per authorization/context, or return idempotent run."""
+        existing = self.get_execution_run_by_context(run.execution_context_id)
+        if existing is not None:
+            return existing
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_execution_runs "
+                "(execution_run_id,plan_id,plan_content_hash,approval_request_id,"
+                "authorization_id,execution_context_id,lease_id,task_id,workspace_id,"
+                "repository_id,base_sha,repository_generation,binding_digest,"
+                "edit_bundle_digest,status,started_at,updated_at,completed_at,"
+                "failure_code,metadata_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (run.execution_run_id, run.plan_id, run.plan_content_hash,
+                 run.approval_request_id, run.authorization_id,
+                 run.execution_context_id, run.lease_id, run.task_id,
+                 run.workspace_id, run.repository_id, run.base_sha,
+                 int(run.repository_generation), run.binding_digest,
+                 run.edit_bundle_digest, run.status.value, run.started_at,
+                 run.updated_at, run.completed_at, run.failure_code,
+                 json.dumps(
+                     {"edit_count": int(run.metadata.get("edit_count", 0))},
+                     sort_keys=True, separators=(",", ":"),
+                 )),
+            )
+            self._insert_execution_audit(
+                run.execution_run_id, "run-created", result="created",
+                correlation_id=run.execution_context_id,
+            )
+            self._conn.commit()
+            return run
+        except sqlite3.IntegrityError:
+            self._conn.rollback()
+            existing = self.get_execution_run_by_context(run.execution_context_id)
+            if existing is None:
+                raise
+            return existing
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def transition_execution_run(
+        self, execution_run_id: str, *, expected: tuple[str, ...], target: str,
+        failure_code: str = "", completed: bool = False,
+    ) -> None:
+        allowed = {
+            "created": frozenset({"validating", "cancelled"}),
+            "validating": frozenset({"mutating", "rolling-back", "failed", "poisoned", "cancelled"}),
+            "mutating": frozenset({"mutated", "rolling-back", "poisoned", "cancelled"}),
+            "rolling-back": frozenset({"rolled-back", "poisoned", "cancelled"}),
+            "poisoned": frozenset({"rolling-back", "rolled-back"}),
+        }
+        if not expected or any(target not in allowed.get(source, frozenset()) for source in expected):
+            raise RuntimeError("invalid execution run state transition")
+        now = time.time()
+        placeholders = ",".join("?" for _ in expected)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                f"UPDATE plan_execution_runs SET status=?,updated_at=?,"
+                "completed_at=?,failure_code=? WHERE execution_run_id=? "
+                f"AND status IN ({placeholders})",
+                (target, now, now if completed else None, failure_code,
+                 execution_run_id, *expected),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("invalid execution run transition")
+            self._insert_execution_audit(
+                execution_run_id, "run-transition", result=target,
+                error_code=failure_code, correlation_id=execution_run_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def insert_edit_event(
+        self, *, event_id: str, execution_run_id: str, edit_id: str,
+        ordinal: int, operation: str, path: str, destination_path: str | None,
+        before_hash: str | None, before_mode: int | None,
+        recovery_artifact: str | None, planned_after_hash: str = "",
+    ) -> None:
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_execution_edit_events "
+                "(event_id,execution_run_id,edit_id,ordinal,operation,path,"
+                "destination_path,before_hash,after_hash,before_mode,status,recovery_artifact,"
+                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'journaled',?,?,?)",
+                (event_id, execution_run_id, edit_id, ordinal, operation, path,
+                 destination_path, before_hash, planned_after_hash, before_mode,
+                 recovery_artifact,
+                 now, now),
+            )
+            self._insert_execution_audit(
+                execution_run_id, "edit-journaled", operation=operation, path=path,
+                before_hash=before_hash or "", result="journaled",
+                correlation_id=edit_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def update_edit_event(
+        self, execution_run_id: str, edit_id: str, *, status: str,
+        after_hash: str = "", after_mode: int | None = None,
+        error_code: str = "",
+    ) -> None:
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT operation,path,before_hash FROM plan_execution_edit_events "
+                "WHERE execution_run_id=? AND edit_id=?",
+                (execution_run_id, edit_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("execution edit event not found")
+            self._conn.execute(
+                "UPDATE plan_execution_edit_events SET status=?,after_hash=?,"
+                "after_mode=?,error_code=?,updated_at=? WHERE execution_run_id=? "
+                "AND edit_id=?",
+                (status, after_hash, after_mode, error_code, now,
+                 execution_run_id, edit_id),
+            )
+            self._insert_execution_audit(
+                execution_run_id, "edit-transition", operation=row["operation"],
+                path=row["path"], before_hash=row["before_hash"] or "",
+                after_hash=after_hash, result=status, error_code=error_code,
+                correlation_id=edit_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def _insert_execution_audit(
+        self, execution_run_id: str, event_type: str, *, operation: str = "",
+        path: str = "", before_hash: str = "", after_hash: str = "",
+        result: str, error_code: str = "", correlation_id: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO plan_execution_audit_events "
+            "(audit_id,execution_run_id,event_type,operation,path,before_hash,"
+            "after_hash,result,error_code,correlation_id,created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (uuid.uuid4().hex, execution_run_id, event_type, operation, path,
+             before_hash, after_hash, result, error_code, correlation_id,
+             time.time()),
+        )
+
+    def get_execution_run_by_context(self, execution_context_id: str) -> Any | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_execution_runs WHERE execution_context_id=?",
+            (execution_context_id,),
+        ).fetchone()
+        return self._row_to_execution_run(row) if row is not None else None
+
+    def get_execution_run(self, execution_run_id: str) -> Any | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_execution_runs WHERE execution_run_id=?",
+            (execution_run_id,),
+        ).fetchone()
+        return self._row_to_execution_run(row) if row is not None else None
+
+    def list_incomplete_execution_runs(self) -> tuple[Any, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM plan_execution_runs WHERE status IN "
+            "('validating','mutating','rolling-back','poisoned') "
+            "ORDER BY started_at,execution_run_id"
+        ).fetchall()
+        return tuple(self._row_to_execution_run(row) for row in rows)
+
+    def list_execution_edit_events(self, execution_run_id: str) -> tuple[sqlite3.Row, ...]:
+        return tuple(self._conn.execute(
+            "SELECT * FROM plan_execution_edit_events WHERE execution_run_id=? "
+            "ORDER BY ordinal,event_id", (execution_run_id,),
+        ).fetchall())
+
+    @staticmethod
+    def _row_to_execution_run(row: sqlite3.Row) -> Any:
+        from khaos.coding.planning.execution_models import (
+            ExecutionRunStatus, PlanExecutionRun,
+        )
+        return PlanExecutionRun(
+            execution_run_id=row["execution_run_id"], plan_id=row["plan_id"],
+            plan_content_hash=row["plan_content_hash"],
+            approval_request_id=row["approval_request_id"],
+            authorization_id=row["authorization_id"],
+            execution_context_id=row["execution_context_id"],
+            lease_id=row["lease_id"], task_id=row["task_id"],
+            workspace_id=row["workspace_id"], repository_id=row["repository_id"],
+            base_sha=row["base_sha"],
+            repository_generation=int(row["repository_generation"]),
+            binding_digest=row["binding_digest"],
+            edit_bundle_digest=row["edit_bundle_digest"],
+            status=ExecutionRunStatus(row["status"]), started_at=float(row["started_at"]),
+            updated_at=float(row["updated_at"]), completed_at=row["completed_at"],
+            failure_code=row["failure_code"], metadata=json.loads(row["metadata_json"]),
+        )
 
 
 def new_authorization_id() -> str:
