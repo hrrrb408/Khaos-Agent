@@ -8,6 +8,11 @@ components. Fusion is always opt-in via ``LspFusionConfig.enabled``
 from khaos.coding.intelligence.lsp.cache import EvidenceCache
 from khaos.coding.intelligence.lsp.client import LspClient, LspDiagnostic
 from khaos.coding.intelligence.lsp.config import DEFAULT_CONFIG, LspFusionConfig
+from khaos.coding.intelligence.lsp.documents import (
+    DiskWorkspaceDocumentProvider,
+    WorkspaceDocument,
+    WorkspaceDocumentProvider,
+)
 from khaos.coding.intelligence.lsp.evidence import (
     EvidenceCacheEntry,
     EvidenceCacheKey,
@@ -46,6 +51,10 @@ __all__ = [
     # Config
     "LspFusionConfig",
     "DEFAULT_CONFIG",
+    # Document provider
+    "WorkspaceDocument",
+    "WorkspaceDocumentProvider",
+    "DiskWorkspaceDocumentProvider",
     # Evidence models
     "SemanticEvidence",
     "FusedResolution",

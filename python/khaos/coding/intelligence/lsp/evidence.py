@@ -132,12 +132,20 @@ class EvidenceCacheKey:
 
     An evidence entry is only valid while ALL of these match:
     - repository_id / workspace_id (workspace binding)
-    - file_path (candidate source file)
+    - file_path (candidate source file for definitions; target file for references)
     - content_hash (file bytes)
     - file_generation (IndexStore generation)
     - document_version (LSP document version)
-    - candidate_range (byte range of the call/reference candidate)
+    - candidate_range (byte range of the call/reference candidate; or
+      target definition byte range for references)
     - server_identity (LSP server name + version)
+    - target_symbol_id (for references cache: the target symbol's stable ID.
+      ``None`` for definition cache entries.)
+
+    For references cache entries, ``file_path`` / ``content_hash`` /
+    ``file_generation`` bind the TARGET file's state, and
+    ``target_symbol_id`` binds the specific symbol being queried.
+    Different symbols in the same file produce different cache keys.
     """
 
     repository_id: str
@@ -148,6 +156,7 @@ class EvidenceCacheKey:
     document_version: int
     candidate_range: tuple[int, int]
     server_identity: str
+    target_symbol_id: str | None = None
 
 
 @dataclass(frozen=True)

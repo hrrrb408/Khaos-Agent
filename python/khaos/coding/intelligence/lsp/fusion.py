@@ -19,6 +19,10 @@ Key invariants:
     - Source code text is NEVER persisted (read transiently for position
       conversion, then discarded).
     - No raw ``subprocess`` path — all LSP I/O goes through ``LspClient``.
+    - Cross-file position conversion uses the TARGET file's text, never
+      the source file's text.
+    - other-task-workspace URIs are completely rejected (no external
+      evidence, no fused status, no absolute URI in logs).
 """
 from __future__ import annotations
 
@@ -32,6 +36,11 @@ from typing import Any
 
 from khaos.coding.intelligence.lsp.cache import EvidenceCache
 from khaos.coding.intelligence.lsp.config import LspFusionConfig
+from khaos.coding.intelligence.lsp.documents import (
+    DiskWorkspaceDocumentProvider,
+    WorkspaceDocument,
+    WorkspaceDocumentProvider,
+)
 from khaos.coding.intelligence.lsp.evidence import (
     EvidenceCacheKey,
     EvidenceSource,
@@ -47,6 +56,7 @@ from khaos.coding.intelligence.lsp.positions import (
 )
 from khaos.coding.intelligence.lsp.uri import (
     UriMappingError,
+    WorkspaceEscapeError,
     map_lsp_uri_to_workspace_path,
     path_to_file_uri,
 )
@@ -64,7 +74,11 @@ class FusionContext:
     """Per-request context binding evidence to a specific file state.
 
     ``file_text`` is read transiently for UTF-16 ↔ byte offset conversion
-    and is NEVER persisted. Callers should discard it after fusion.
+    of the SOURCE file (the file containing the call/reference candidate).
+    It is NEVER persisted. Callers should discard it after fusion.
+
+    For cross-file definition conversion, the TARGET file's text is
+    loaded separately via :class:`WorkspaceDocumentProvider`.
     """
 
     repository_id: str
@@ -94,11 +108,13 @@ class LspEvidenceFusionService:
         cache: EvidenceCache,
         conn: sqlite3.Connection,
         lsp_client: Any | None = None,
+        document_provider: WorkspaceDocumentProvider | None = None,
     ) -> None:
         self._config = config
         self._cache = cache
         self._conn = conn
         self._lsp_client = lsp_client
+        self._document_provider = document_provider or DiskWorkspaceDocumentProvider(conn)
         self._closed = False
         # Pending request deduplication: same candidate → merged into one LSP call.
         self._pending: dict[EvidenceCacheKey, asyncio.Future[tuple[SemanticEvidence, ...]]] = {}
@@ -168,31 +184,106 @@ class LspEvidenceFusionService:
         Per spec §7, LSP references are only supplementary evidence. They
         are NOT auto-persisted as repository edges. Results are deduplicated
         and cached with a short TTL.
+
+        The cache key binds to the TARGET symbol's identity and the TARGET
+        file's state (not the source file's state). Different symbols in
+        the same file produce different cache keys.
         """
         if not self.enabled:
             return ()
 
+        # Query repository_symbols for the target symbol's definition position.
+        symbol_info = _lookup_symbol_by_stable_id(
+            self._conn, context.repository_id, target_stable_symbol_id,
+        )
+        if symbol_info is None:
+            # Symbol deleted or not indexed — return empty evidence.
+            logger.debug(
+                "References skipped: symbol %s not found in repository",
+                target_stable_symbol_id,
+            )
+            return ()
+
+        target_file_from_db, def_byte_start, def_byte_end, target_generation = symbol_info
+
+        # Verify the target file path matches.
+        if target_file_from_db != target_file_path:
+            logger.debug(
+                "References skipped: symbol %s file mismatch (db=%s, given=%s)",
+                target_stable_symbol_id, target_file_from_db, target_file_path,
+            )
+            return ()
+
+        # Load the target document for position conversion.
+        target_doc = await self._document_provider.load_document(
+            context.repository_id, context.workspace_root, target_file_path,
+            other_workspace_roots=context.other_workspace_roots,
+        )
+        if target_doc is None:
+            # Target file missing or outside workspace — no evidence.
+            return ()
+
+        # Staleness check: if the target file's generation has changed since
+        # the symbol was indexed, the definition position may be stale.
+        if target_doc.indexed and target_doc.generation != target_generation:
+            logger.debug(
+                "References skipped: target file %s generation mismatch "
+                "(symbol=%d, current=%d)",
+                target_file_path, target_generation, target_doc.generation,
+            )
+            return ()
+
+        # Build cache key binding to the TARGET symbol + TARGET file state.
         cache_key = EvidenceCacheKey(
             repository_id=context.repository_id,
             workspace_id=context.workspace_id,
-            file_path=context.file_path,
-            content_hash=context.content_hash,
-            file_generation=context.file_generation,
+            file_path=target_file_path,
+            content_hash=target_doc.content_hash,
+            file_generation=target_doc.generation,
             document_version=context.document_version,
-            candidate_range=(0, 0),  # references are per-file, not per-candidate
+            candidate_range=(def_byte_start, def_byte_end),
             server_identity=context.server_identity,
+            target_symbol_id=target_stable_symbol_id,
         )
 
         cached = self._cache.get(cache_key)
         if cached is not None:
             return cached
 
-        evidence = await self._collect_lsp_references(
-            target_stable_symbol_id, target_file_path, context,
-        )
+        # Deduplicate concurrent requests.
+        pending = self._pending.get(cache_key)
+        if pending is not None:
+            try:
+                return await asyncio.shield(pending)
+            except (asyncio.CancelledError, RuntimeError, asyncio.TimeoutError):
+                return ()
 
-        self._cache.put(cache_key, evidence)
-        return evidence
+        future: asyncio.Future[tuple[SemanticEvidence, ...]] = asyncio.get_running_loop().create_future()
+        self._pending[cache_key] = future
+        try:
+            evidence = await self._request_references_at_position(
+                target_file_path, target_doc, def_byte_start, context,
+            )
+            self._cache.put(cache_key, evidence)
+            if not future.done():
+                future.set_result(evidence)
+            return evidence
+        except asyncio.TimeoutError:
+            logger.debug("LSP references timeout for symbol %s", target_stable_symbol_id)
+            if not future.done():
+                future.set_result(())
+            return ()
+        except asyncio.CancelledError:
+            if not future.done():
+                future.set_result(())
+            return ()
+        except (RuntimeError, ValueError, ConnectionError) as exc:
+            logger.debug("LSP references failed for symbol %s: %s", target_stable_symbol_id, exc)
+            if not future.done():
+                future.set_result(())
+            return ()
+        finally:
+            self._pending.pop(cache_key, None)
 
     def explain_resolution(
         self,
@@ -278,24 +369,6 @@ class LspEvidenceFusionService:
         finally:
             self._pending.pop(cache_key, None)
 
-    async def _collect_lsp_references(
-        self,
-        target_stable_symbol_id: str,
-        target_file_path: str,
-        context: FusionContext,
-    ) -> tuple[SemanticEvidence, ...]:
-        """Send textDocument/references and convert the response to evidence."""
-        try:
-            return await self._request_references(target_file_path, context)
-        except asyncio.TimeoutError:
-            logger.debug("LSP references timeout for %s", context.file_path)
-            return ()
-        except asyncio.CancelledError:
-            return ()
-        except (RuntimeError, ValueError, ConnectionError) as exc:
-            logger.debug("LSP references failed for %s: %s", context.file_path, exc)
-            return ()
-
     async def _request_definition(
         self,
         candidate_byte_range: tuple[int, int],
@@ -306,6 +379,7 @@ class LspEvidenceFusionService:
             return ()
 
         # Convert byte offset to LSP UTF-16 position for the request.
+        # This uses the SOURCE file's text (the file containing the call).
         byte_start = candidate_byte_range[0]
         try:
             line, character = byte_offset_to_lsp_position(context.file_text, byte_start)
@@ -323,25 +397,36 @@ class LspEvidenceFusionService:
             self._lsp_client.request("textDocument/definition", params),
             timeout=self._config.request_timeout_seconds,
         )
-        return self._convert_definition_result(result, context)
+        return await self._convert_definition_result(result, context)
 
-    async def _request_references(
+    async def _request_references_at_position(
         self,
         target_file_path: str,
+        target_doc: WorkspaceDocument,
+        def_byte_start: int,
         context: FusionContext,
     ) -> tuple[SemanticEvidence, ...]:
-        """Send the actual LSP textDocument/references request."""
+        """Send textDocument/references at the target symbol's definition position.
+
+        Uses the TARGET file's text to convert the definition byte_start
+        to an LSP UTF-16 position. This is the correct position for a
+        references request — it points at the definition, not at 0:0.
+        """
         if self._lsp_client is None:
             return ()
 
-        file_uri = path_to_file_uri(context.workspace_root / target_file_path)
-        # We need a position — use byte 0 of the target file as a fallback.
-        # A real implementation would look up the symbol's definition position.
+        # Convert definition byte_start to LSP UTF-16 position using the
+        # TARGET file's text (not the source file's text).
         try:
-            line, character = byte_offset_to_lsp_position(context.file_text, 0)
-        except PositionConversionError:
-            line, character = 0, 0
+            line, character = byte_offset_to_lsp_position(target_doc.text, def_byte_start)
+        except PositionConversionError as exc:
+            logger.debug(
+                "Position conversion failed for references (target=%s): %s",
+                target_file_path, exc,
+            )
+            return ()
 
+        file_uri = path_to_file_uri(context.workspace_root / target_file_path)
         params = {
             "textDocument": {"uri": file_uri},
             "position": {"line": line, "character": character},
@@ -352,9 +437,9 @@ class LspEvidenceFusionService:
             self._lsp_client.request("textDocument/references", params),
             timeout=self._config.request_timeout_seconds,
         )
-        return self._convert_references_result(result, context)
+        return await self._convert_references_result(result, context, target_doc)
 
-    def _convert_definition_result(
+    async def _convert_definition_result(
         self,
         result: Any,
         context: FusionContext,
@@ -366,17 +451,18 @@ class LspEvidenceFusionService:
 
         evidence_list: list[SemanticEvidence] = []
         for loc in locations:
-            ev = self._convert_location_to_evidence(
+            ev = await self._convert_location_to_evidence(
                 loc, context, EvidenceType.DEFINITION, EvidenceSource.LSP_DEFINITION,
             )
             if ev is not None:
                 evidence_list.append(ev)
         return tuple(evidence_list)
 
-    def _convert_references_result(
+    async def _convert_references_result(
         self,
         result: Any,
         context: FusionContext,
+        target_doc: WorkspaceDocument,
     ) -> tuple[SemanticEvidence, ...]:
         """Convert an LSP references response to a tuple of SemanticEvidence."""
         locations = _normalize_locations(result)
@@ -387,7 +473,7 @@ class LspEvidenceFusionService:
         seen: set[tuple[str, int, int]] = set()
         evidence_list: list[SemanticEvidence] = []
         for loc in locations:
-            ev = self._convert_location_to_evidence(
+            ev = await self._convert_location_to_evidence(
                 loc, context, EvidenceType.REFERENCE, EvidenceSource.LSP_REFERENCES,
             )
             if ev is not None and ev.target_file is not None and ev.target_range is not None:
@@ -398,7 +484,7 @@ class LspEvidenceFusionService:
                 evidence_list.append(ev)
         return tuple(evidence_list)
 
-    def _convert_location_to_evidence(
+    async def _convert_location_to_evidence(
         self,
         location: dict,
         context: FusionContext,
@@ -407,8 +493,15 @@ class LspEvidenceFusionService:
     ) -> SemanticEvidence | None:
         """Convert a single LSP Location to SemanticEvidence.
 
-        Applies strict URI mapping and UTF-16 position conversion. Returns
-        ``None`` if the location is rejected (external URI, invalid position).
+        Applies strict URI mapping and cross-file UTF-16 position
+        conversion. The TARGET file's text is loaded via the document
+        provider — NEVER the source file's text.
+
+        Returns ``None`` if the location is rejected:
+        - other-task-workspace: completely rejected, no evidence.
+        - workspace-external: marked as external evidence.
+        - target file missing/changed/not indexed: no evidence (prevents
+          false promotion to resolved).
         """
         uri = location.get("uri")
         range_info = location.get("range", {})
@@ -425,9 +518,13 @@ class LspEvidenceFusionService:
                 other_workspace_roots=context.other_workspace_roots,
             )
         except UriMappingError as exc:
-            logger.debug("LSP URI rejected: %s (%s)", exc.code, exc.message)
-            # If it's a workspace-external path, mark as external evidence.
-            if exc.code in ("workspace-external", "other-task-workspace"):
+            # other-task-workspace: COMPLETELY reject. No external evidence,
+            # no fused status, no absolute URI in logs.
+            if exc.code == "other-task-workspace":
+                logger.debug("LSP URI rejected (other-task-workspace)")
+                return None
+            # workspace-external: mark as external evidence (per product policy).
+            if exc.code == "workspace-external":
                 return SemanticEvidence(
                     source=source,
                     evidence_type=evidence_type,
@@ -435,19 +532,34 @@ class LspEvidenceFusionService:
                     target_range=None,
                     target_symbol_id=None,
                     confidence=0.1,
-                    metadata={"rejected_uri": uri, "rejection_code": exc.code},
+                    metadata={"rejection_code": exc.code},
                 )
+            # Other rejections (non-file URI, symlink escape, dotdot): drop.
+            logger.debug("LSP URI rejected: %s", exc.code)
             return None
 
-        # Convert UTF-16 positions to byte offsets.
+        # Load the TARGET document for position conversion.
+        # This is the critical fix: we use the target file's text, not
+        # the source file's text, to convert UTF-16 positions.
+        target_doc = await self._document_provider.load_document(
+            context.repository_id, context.workspace_root, target_path,
+            other_workspace_roots=context.other_workspace_roots,
+        )
+        if target_doc is None:
+            # Target file missing, outside workspace, or not readable.
+            # Do NOT produce evidence — this prevents false promotion.
+            logger.debug("LSP target document not loadable: %s", target_path)
+            return None
+
+        # Convert UTF-16 positions to byte offsets using TARGET file text.
         try:
             start_mapping = lsp_position_to_offsets(
-                context.file_text,
+                target_doc.text,
                 start.get("line", 0),
                 start.get("character", 0),
             )
             end_mapping = lsp_position_to_offsets(
-                context.file_text,
+                target_doc.text,
                 end.get("line", 0),
                 end.get("character", 0),
             )
@@ -482,6 +594,8 @@ class LspEvidenceFusionService:
             metadata={
                 "byte_start": byte_start,
                 "byte_end": byte_end,
+                "target_content_hash": target_doc.content_hash,
+                "target_generation": target_doc.generation,
             },
         )
 
@@ -618,6 +732,7 @@ def _apply_definition_fusion_rules(
         )
 
     # Rule 2: Repo unresolved/ambiguous + LSP unique internal → promote.
+    # Only promote if the target symbol_id is known (target file is indexed).
     if (
         original_status in {ResolutionStatus.UNRESOLVED, ResolutionStatus.AMBIGUOUS}
         and lsp_target is not None
@@ -650,22 +765,71 @@ def _apply_definition_fusion_rules(
 
 
 def _normalize_locations(result: Any) -> list[dict]:
-    """Normalize an LSP definition/references response to a list of Location dicts."""
+    """Normalize an LSP definition/references response to a list of Location dicts.
+
+    Handles all four LSP response shapes:
+    - ``Location`` (single dict with ``uri`` + ``range``)
+    - ``Location[]`` (list of Location)
+    - ``LocationLink`` (single dict with ``targetUri`` + ``targetRange`` +
+      ``targetSelectionRange``)
+    - ``LocationLink[]`` (list of LocationLink)
+
+    For ``LocationLink``, ``targetSelectionRange`` is preferred over
+    ``targetRange`` (per LSP 3.17 spec) because it pinpoints the symbol
+    identifier within the full definition range.
+
+    Invalid entries are silently discarded (controlled diagnostic via
+    logger.debug). No unhandled exception is raised.
+    """
     if result is None:
         return []
+
     if isinstance(result, list):
-        return [r for r in result if isinstance(r, dict)]
+        locations: list[dict] = []
+        for item in result:
+            loc = _normalize_single_location(item)
+            if loc is not None:
+                locations.append(loc)
+        return locations
+
     if isinstance(result, dict):
-        # Could be a single Location or a LocationLink[]
-        if "uri" in result:
-            return [result]
-        if "targetUri" in result:
-            # LocationLink → normalize to Location
-            return [{
-                "uri": result["targetUri"],
-                "range": result.get("targetRange", {}),
-            }]
+        loc = _normalize_single_location(result)
+        return [loc] if loc is not None else []
+
     return []
+
+
+def _normalize_single_location(item: Any) -> dict | None:
+    """Normalize a single Location or LocationLink to a Location dict.
+
+    Returns ``None`` for invalid entries (missing URI, missing range).
+    """
+    if not isinstance(item, dict):
+        return None
+
+    # LocationLink: has ``targetUri``, ``targetRange``, ``targetSelectionRange``.
+    if "targetUri" in item:
+        target_uri = item.get("targetUri")
+        if not target_uri:
+            return None
+        # Prefer targetSelectionRange (pinpoints the symbol identifier);
+        # fall back to targetRange (full definition range).
+        selection_range = item.get("targetSelectionRange")
+        target_range = item.get("targetRange")
+        chosen_range = selection_range if selection_range else target_range
+        if not chosen_range:
+            return None
+        return {"uri": target_uri, "range": chosen_range}
+
+    # Location: has ``uri`` and ``range``.
+    if "uri" in item:
+        uri = item.get("uri")
+        range_info = item.get("range")
+        if not uri or not range_info:
+            return None
+        return {"uri": uri, "range": range_info}
+
+    return None
 
 
 def _lookup_symbol_at_byte_range(
@@ -696,6 +860,31 @@ def _lookup_symbol_at_byte_range(
     # Return the most specific symbol (smallest range).
     best = min(rows, key=lambda r: r[2] - r[1])
     return best[0]
+
+
+def _lookup_symbol_by_stable_id(
+    conn: sqlite3.Connection,
+    repository_id: str,
+    stable_symbol_id: str,
+) -> tuple[str, int, int, int] | None:
+    """Look up a symbol by its stable_symbol_id.
+
+    Returns ``(path, byte_start, byte_end, generation)`` or ``None`` if
+    the symbol is not found (deleted or not indexed).
+    """
+    try:
+        row = conn.execute(
+            "SELECT path, byte_start, byte_end, generation FROM repository_symbols "
+            "WHERE repository_id=? AND stable_symbol_id=?",
+            (repository_id, stable_symbol_id),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+    if row is None:
+        return None
+
+    return (row[0], int(row[1]), int(row[2]), int(row[3]))
 
 
 def _file_generation(
