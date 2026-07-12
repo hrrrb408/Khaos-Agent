@@ -45,7 +45,8 @@ def test_store_persists_only_public_verification_material() -> None:
         )
     }
     assert columns == {
-        "key_id", "public_key", "key_version", "boot_epoch", "created_at", "active"
+        "key_id", "public_key", "key_version", "boot_epoch", "boot_id",
+        "created_at", "active"
     }
     assert "receipt_signing_keys" not in {
         row[0] for row in runtime._store._conn.execute(

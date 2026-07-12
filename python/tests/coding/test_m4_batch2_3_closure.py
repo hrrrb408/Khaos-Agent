@@ -234,7 +234,8 @@ def test_20_receipt_outbox_refuses_replace():
     # Batch 2.6: use _insert_signed_receipt with a valid signature.
     from khaos.coding.planning.approval.models import BrokerDecisionReceipt, PlanApprovalStatus
     from khaos.coding.planning.approval.receipt_crypto import _ReceiptSigningAuthority
-    signer = _ReceiptSigningAuthority()
+    epoch, boot_id, _ = store.rotate_epoch(now=1.0)
+    signer = _ReceiptSigningAuthority(boot_epoch=epoch, boot_id=boot_id)
     verifier = signer.verifier
     runtime_token = object()
     store._PlanApprovalStore__runtime_receipt_writer = lambda **fields: None
@@ -248,6 +249,7 @@ def test_20_receipt_outbox_refuses_replace():
         authenticated_source="", session_request_id="", server_capability="",
         binding_digest="bd", decided_at=0.0, expires_at=9999999999.0,
         reason_digest="", one_time_token="", token_hash="th1",
+        signer_epoch=epoch, signer_boot_id=boot_id, issued_at=2.0,
     )
     payload_digest = receipt.compute_canonical_payload_digest()
     signature = signer._sign_payload_digest(payload_digest)
@@ -258,6 +260,7 @@ def test_20_receipt_outbox_refuses_replace():
         expires_at=9999999999.0,
         canonical_payload_digest=payload_digest,
         broker_signature=signature, signer_key_id=verifier.key_id,
+        signer_epoch=epoch, signer_boot_id=boot_id, issued_at=2.0, created_at=2.0,
     )
     # Same receipt_id → IntegrityError (plain INSERT, no REPLACE).
     with pytest.raises(sqlite3.IntegrityError):
@@ -268,6 +271,7 @@ def test_20_receipt_outbox_refuses_replace():
             expires_at=9999999999.0,
             canonical_payload_digest=payload_digest,
             broker_signature=signature, signer_key_id=verifier.key_id,
+            signer_epoch=epoch, signer_boot_id=boot_id, issued_at=2.0, created_at=2.0,
         )
     # Same token_hash → IntegrityError.
     with pytest.raises(sqlite3.IntegrityError):
@@ -278,6 +282,7 @@ def test_20_receipt_outbox_refuses_replace():
             expires_at=9999999999.0,
             canonical_payload_digest=payload_digest,
             broker_signature=signature, signer_key_id=verifier.key_id,
+            signer_epoch=epoch, signer_boot_id=boot_id, issued_at=2.0, created_at=2.0,
         )
 
 

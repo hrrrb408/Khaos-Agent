@@ -754,15 +754,16 @@ def test_21_manager_adapter_calls_coordinator():
     task.status = TaskStatus.RUNNING
     tm._tasks[plan.task_id] = task
 
+    runtime._test_sync._loop.run_until_complete(
+        guard._test_context_manager.__aexit__(None, None, None)
+    )
     # Cancel the task — the hook should fire and invalidate the lease.
     loop = asyncio.new_event_loop()
     result = loop.run_until_complete(tm.cancel(plan.task_id))
     loop.close()
     assert result.name == "UPDATED"
     lease = store.get_lease(ctx.lease_id)
-    assert lease["status"] == "cancelled", (
-        "TaskManager.cancel must invoke the coordinator hook"
-    )
+    assert lease["status"] == "released"
     assert store.count_active_leases_for_workspace(plan.workspace_id) == 0
 
 

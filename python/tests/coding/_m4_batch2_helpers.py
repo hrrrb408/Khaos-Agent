@@ -73,8 +73,11 @@ class FakeMutationParticipant:
     def __init__(self):
         self.fence = None
 
-    def set_mutation_fence(self, fence):
+    def set_mutation_fence(self, fence, **kwargs):
         self.fence = fence
+
+    def set_execution_scope_resolver(self, resolver):
+        self.execution_scope_resolver = resolver
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +418,11 @@ def _wire_test_receipt_writer(store, broker, verifier):
     Persists only public verification material so receipts from prior broker
     instances remain verifiable (restart/concurrency scenarios).
     """
+    epoch, boot_id = store.get_current_epoch()
+    if not boot_id:
+        epoch, boot_id, _ = store.rotate_epoch()
+    broker._rotate_receipt_signing_authority(epoch, boot_id)
+    verifier = broker._receipt_public_verifier()
     token = object()
     def _writer(**fields):
         store._insert_signed_receipt(runtime_token=token, **fields)
