@@ -23,6 +23,14 @@ def _inspection_ancestor(step_id: str, by_id: dict[str, PlanStep]) -> bool:
         pending.extend(sorted(by_id[current].depends_on))
     return False
 
+def _ancestors(step_id: str, by_id: dict[str, PlanStep]) -> tuple[PlanStep, ...]:
+    pending = sorted(by_id[step_id].depends_on); seen: set[str] = set(); result=[]
+    while pending:
+        current = pending.pop(0)
+        if current in seen or current not in by_id: continue
+        seen.add(current); result.append(by_id[current]); pending.extend(sorted(by_id[current].depends_on))
+    return tuple(sorted(result, key=lambda item: item.step_id))
+
 def validate_steps(steps: tuple[PlanStep, ...]) -> tuple[PlanDiagnostic, ...]:
     diagnostics: list[PlanDiagnostic] = []
     counts: dict[str, int] = {}
@@ -43,10 +51,16 @@ def validate_steps(steps: tuple[PlanStep, ...]) -> tuple[PlanDiagnostic, ...]:
         if step.operation in MODIFICATION_OPERATIONS and not _inspection_ancestor(step_id, unique):
             code = "destructive-without-inspection" if step.operation in (PlanOperation.DELETE, PlanOperation.RENAME) else "invalid-operation-order"
             diagnostics.append(PlanDiagnostic(code, "error", step_id, False))
-        if step.operation is PlanOperation.TEST:
-            ancestors = [unique[item].operation for item in valid_edges[step_id] if item in unique]
-            if not any(operation in MODIFICATION_OPERATIONS for operation in ancestors):
+        ancestors = _ancestors(step_id, unique)
+        is_verification = step.step_id.startswith("verify") or bool(step.verification_requirements)
+        if is_verification:
+            modifications = [item for item in ancestors if item.operation in MODIFICATION_OPERATIONS or (item.operation is PlanOperation.TEST and not item.step_id.startswith("verify"))]
+            if not modifications:
                 diagnostics.append(PlanDiagnostic("invalid-operation-order", "error", step_id, False))
+            elif not any(set(step.target_files) & set(item.target_files) or set(step.target_symbols) & set(item.target_symbols) for item in modifications):
+                diagnostics.append(PlanDiagnostic("unrelated-verification-target", "error", step_id, False))
+        if step.operation in MODIFICATION_OPERATIONS and any(item.operation is PlanOperation.TEST and (item.step_id.startswith("verify") or item.verification_requirements) for item in ancestors):
+            diagnostics.append(PlanDiagnostic("invalid-operation-order", "error", step_id, False))
     graph = {key: set(value) for key, value in valid_edges.items()}
     while graph:
         ready = sorted(key for key, value in graph.items() if not value)
