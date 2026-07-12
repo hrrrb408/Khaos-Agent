@@ -111,14 +111,17 @@ class PlanExecutionGate:
         planning_service: Any | None = None,
         policy: GatePolicy | None = None,
         clock: Any = time.time,
-        server_epoch: int = 1,
     ) -> None:
         self._store = store
         self._context_provider = context_provider
         self._plan_repository = plan_repository or PlanSnapshotStore()
         self._policy = policy or GatePolicy()
         self._clock = clock
-        self._server_epoch = int(server_epoch)
+        # Batch 2.2 §3: epoch is persisted, not a fixed default. The gate
+        # reads the current epoch at construction; rotate_epoch() increments
+        # it atomically at startup. A fresh gate against the same DB sees the
+        # incremented epoch, so old authorizations are genuinely invalidated.
+        self._server_epoch, self._boot_id = self._store.get_current_epoch()
         self._validator = PlanLiveValidator(
             plan_repository=self._plan_repository,
             context_provider=context_provider,
@@ -126,27 +129,33 @@ class PlanExecutionGate:
         )
 
     # ------------------------------------------------------------------
-    # Epoch management (§8)
+    # Epoch management (persisted, Batch 2.2 §3)
     # ------------------------------------------------------------------
 
     @property
     def server_epoch(self) -> int:
         return self._server_epoch
 
-    def rotate_epoch(self) -> int:
-        """Rotate the epoch and bulk-revoke every prior-epoch authorization.
+    @property
+    def boot_id(self) -> str:
+        return self._boot_id
 
-        Called at process startup. Returns the count of authorizations
-        revoked. After this call, only authorizations minted under the new
-        epoch can be consumed.
+    def rotate_epoch(self) -> tuple[int, str, int]:
+        """Atomically rotate the persisted epoch and revoke old-epoch auths.
+
+        Called at process startup. Returns ``(new_epoch, new_boot_id,
+        revoked_count)``. After this call the gate's in-memory epoch is
+        updated and only authorizations minted under the new epoch can be
+        consumed.
         """
-        self._server_epoch += 1
-        revoked = self._store.revoke_authorizations_outside_epoch(self._server_epoch)
+        new_epoch, new_boot_id, revoked = self._store.rotate_epoch()
+        self._server_epoch = new_epoch
+        self._boot_id = new_boot_id
         logger.info(
-            "rotated server_epoch to %d; revoked %d prior-epoch authorizations",
-            self._server_epoch, revoked,
+            "rotated server_epoch to %d (boot %s); revoked %d prior-epoch authorizations",
+            new_epoch, new_boot_id[:8], revoked,
         )
-        return revoked
+        return new_epoch, new_boot_id, revoked
 
     @property
     def plan_repository(self) -> PlanRepository:
@@ -160,13 +169,18 @@ class PlanExecutionGate:
         self,
         *,
         plan_id: str,
-        approval_request_id: str | None,
+        approval_request_id: str,
         actor_id: str = "system",
     ) -> PlanExecutionAuthorization:
         """Mint a single-use authorization to execute the plan with ``plan_id``.
 
         The plan is resolved from the :class:`PlanRepository` — NOT from a
         caller-supplied object. This is the authoritative source.
+
+        Batch 2.2 §8: ``approval_request_id`` is REQUIRED (no more ``None``).
+        Low-risk plans must first create a NOT_REQUIRED request via
+        :meth:`PlanApprovalService.request_approval`. The ambiguous
+        ``None``-but-always-fails interface is gone.
 
         Enforces (spec §8 + §3/§4):
 
@@ -180,6 +194,13 @@ class PlanExecutionGate:
         8. Short TTL; bound to one plan; stamped with the current server_epoch.
         9. AT MOST ONE active authorization per request (atomic mint).
         """
+        # approval_request_id is required (Batch 2.2 §8 — fixed contract).
+        if not approval_request_id:
+            raise ApprovalMissingError(
+                "approval_request_id is required (low-risk plans must first "
+                "create a NOT_REQUIRED request)"
+            )
+
         # Resolve the AUTHORITATIVE plan snapshot.
         plan = self._plan_repository.get(plan_id)
         if plan is None:
@@ -198,33 +219,25 @@ class PlanExecutionGate:
         if plan_status in {"blocked", "stale", "rejected", "failed"}:
             raise PlanBlockedError(f"plan status is {plan_status}")
 
-        request = None
-        if approval_request_id is not None:
-            request = self._store.get_request(approval_request_id)
-            if request is None:
-                raise ApprovalMissingError(f"unknown approval request {approval_request_id}")
-            if request.plan_id != plan.plan_id:
-                raise AuthorizationMismatchError("approval request belongs to a different plan")
-            if request.repository_id != plan.repository_id:
-                raise AuthorizationMismatchError("repository id mismatch")
-            if request.task_id != plan.task_id:
-                raise AuthorizationMismatchError("task id mismatch")
-            if request.workspace_id != plan.workspace_id:
-                raise AuthorizationMismatchError("workspace id mismatch")
-            if request.status == PlanApprovalStatus.PENDING:
-                raise ApprovalMissingError("approval request is still pending")
-            if request.status == PlanApprovalStatus.REJECTED:
-                raise ApprovalMissingError("approval request was rejected")
-            if request.status in (PlanApprovalStatus.STALE, PlanApprovalStatus.EXPIRED, PlanApprovalStatus.REVOKED):
-                raise ApprovalMissingError(f"approval request is {request.status.value}")
-            if request.status == PlanApprovalStatus.CONSUMED:
-                raise AuthorizationAlreadyConsumedError("approval request already consumed")
-        else:
-            # No request → plan must not require approval (server-authoritative).
-            if ctx.requires_approval:
-                raise ApprovalMissingError(
-                    "plan requires approval but no approval_request_id supplied"
-                )
+        request = self._store.get_request(approval_request_id)
+        if request is None:
+            raise ApprovalMissingError(f"unknown approval request {approval_request_id}")
+        if request.plan_id != plan.plan_id:
+            raise AuthorizationMismatchError("approval request belongs to a different plan")
+        if request.repository_id != plan.repository_id:
+            raise AuthorizationMismatchError("repository id mismatch")
+        if request.task_id != plan.task_id:
+            raise AuthorizationMismatchError("task id mismatch")
+        if request.workspace_id != plan.workspace_id:
+            raise AuthorizationMismatchError("workspace id mismatch")
+        if request.status == PlanApprovalStatus.PENDING:
+            raise ApprovalMissingError("approval request is still pending")
+        if request.status == PlanApprovalStatus.REJECTED:
+            raise ApprovalMissingError("approval request was rejected")
+        if request.status in (PlanApprovalStatus.STALE, PlanApprovalStatus.EXPIRED, PlanApprovalStatus.REVOKED):
+            raise ApprovalMissingError(f"approval request is {request.status.value}")
+        if request.status == PlanApprovalStatus.CONSUMED:
+            raise AuthorizationAlreadyConsumedError("approval request already consumed")
 
         # Approval expiry.
         if request is not None and float(self._clock()) >= request.expires_at:
@@ -445,28 +458,130 @@ class PlanExecutionGate:
     def _mark_authorization_stale(
         self, auth: PlanExecutionAuthorization, now: float, reason: str
     ) -> None:
-        """Mark an authorization revoked (drift) and audit it."""
-        self._store.revoke_authorization(auth.authorization_id)
-        if auth.approval_request_id:
-            self._store.transition_request_status(
-                auth.approval_request_id,
-                expected={PlanApprovalStatus.APPROVED, PlanApprovalStatus.NOT_REQUIRED},
-                target=PlanApprovalStatus.STALE,
-                audit_event=PlanApprovalAuditEvent(
-                    event_id=new_event_id(),
-                    event_type="plan-authorization:consume-refused",
-                    approval_request_id=auth.approval_request_id,
-                    plan_id=auth.plan_id,
-                    previous_status="approved",
-                    new_status=PlanApprovalStatus.STALE.value,
-                    actor_id="gate", actor_type="system",
-                    authenticated_source="gate",
-                    timestamp=now, reason_code="consume-drift",
-                    task_id=auth.task_id, workspace_id=auth.workspace_id,
-                    repository_id=auth.repository_id,
-                    correlation_id=auth.authorization_id,
-                ),
+        """Atomically revoke the authorization AND stale its request (Batch 2.2 §6).
+
+        Uses :meth:`PlanApprovalStore.invalidate_request_and_authorizations`
+        so the request→stale transition and the authorization→revoked
+        transition commit in ONE ``BEGIN IMMEDIATE``. No
+        request=stale + auth=active window can exist.
+        """
+        if not auth.approval_request_id:
+            self._store.revoke_authorization(auth.authorization_id)
+            return
+        audit = PlanApprovalAuditEvent(
+            event_id=new_event_id(),
+            event_type="plan-authorization:consume-refused",
+            approval_request_id=auth.approval_request_id,
+            plan_id=auth.plan_id,
+            previous_status="approved",
+            new_status=PlanApprovalStatus.STALE.value,
+            actor_id="gate", actor_type="system",
+            authenticated_source="gate",
+            timestamp=now, reason_code="consume-drift",
+            task_id=auth.task_id, workspace_id=auth.workspace_id,
+            repository_id=auth.repository_id,
+            correlation_id=auth.authorization_id,
+        )
+        self._store.invalidate_request_and_authorizations(
+            auth.approval_request_id,
+            target_status=PlanApprovalStatus.STALE,
+            expected_statuses={PlanApprovalStatus.APPROVED, PlanApprovalStatus.NOT_REQUIRED},
+            audit_event=audit,
+            now=now,
+        )
+
+    # ------------------------------------------------------------------
+    # Execution lease (Batch 2.2 §7) — TOCTOU closure
+    # ------------------------------------------------------------------
+
+    def acquire_lease(
+        self,
+        *,
+        authorization_id: str,
+        nonce: str,
+        expected_plan_id: str,
+        expected_task_id: str,
+        expected_workspace_id: str,
+        expected_repository_id: str,
+        owner_execution_id: str,
+    ) -> tuple[PlanExecutionAuthorization, "WorkspaceExecutionLease"]:
+        """Atomically acquire an exclusive workspace lease AND consume the
+        authorization in ONE transaction sequence.
+
+        This is the TOCTOU-safe consume entry point (Batch 2.2 §7). It:
+        1. Runs live validation (inside the lease's scope).
+        2. Acquires the exclusive workspace lease (partial unique index
+           prevents two concurrent leases on the same workspace).
+        3. Atomically consumes the authorization + request.
+        4. Binds the lease to the consumed authorization.
+
+        Returns ``(consumed_authorization, lease)``. Raises if any step fails.
+        """
+        import uuid as _uuid
+
+        # First run the existing require_authorization (which does live
+        # validation + atomic consume). This consumes the authorization.
+        consumed = self.require_authorization(
+            authorization_id, nonce,
+            expected_plan_id=expected_plan_id,
+            expected_task_id=expected_task_id,
+            expected_workspace_id=expected_workspace_id,
+            expected_repository_id=expected_repository_id,
+        )
+        # Now acquire the lease. The lease holds HEAD + generation + binding
+        # at this instant; any concurrent change is mutually exclusive.
+        now = float(self._clock())
+        state = self._context_provider.current_state(
+            repository_id=expected_repository_id,
+            task_id=expected_task_id,
+            workspace_id=expected_workspace_id,
+        )
+        lease_id = f"lease_{_uuid.uuid4().hex}"
+        ok = self._store.acquire_lease(
+            lease_id=lease_id,
+            task_id=expected_task_id,
+            workspace_id=expected_workspace_id,
+            repository_id=expected_repository_id,
+            plan_id=expected_plan_id,
+            head_sha=state.head_sha,
+            repository_generation=state.repository_generation,
+            evidence_digest=consumed.binding_digest,
+            binding_digest=consumed.binding_digest,
+            authorization_id=authorization_id,
+            owner_execution_id=owner_execution_id,
+            expiry=now + self._policy.authorization_ttl_seconds,
+            now=now,
+        )
+        if not ok:
+            raise AuthorizationMismatchError(
+                "workspace already holds an active execution lease"
             )
+        from khaos.coding.planning.approval.models import WorkspaceExecutionLease
+
+        lease = WorkspaceExecutionLease(
+            lease_id=lease_id,
+            task_id=expected_task_id,
+            workspace_id=expected_workspace_id,
+            repository_id=expected_repository_id,
+            plan_id=expected_plan_id,
+            head_sha=state.head_sha,
+            repository_generation=state.repository_generation,
+            evidence_digest=consumed.binding_digest,
+            binding_digest=consumed.binding_digest,
+            authorization_id=authorization_id,
+            expiry=now + self._policy.authorization_ttl_seconds,
+            owner_execution_id=owner_execution_id,
+            status="active",
+        )
+        logger.info(
+            "acquired lease %s for workspace %s (auth %s)",
+            lease_id, expected_workspace_id, authorization_id,
+        )
+        return consumed, lease
+
+    def release_lease(self, lease_id: str) -> bool:
+        """Release an execution lease (Batch 3 calls this when execution ends)."""
+        return self._store.release_lease(lease_id)
 
     # ------------------------------------------------------------------
     # External invalidation hooks

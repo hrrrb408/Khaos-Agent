@@ -35,6 +35,7 @@ from khaos.coding.planning.approval.gate import (
 )
 from khaos.coding.planning.approval.models import (
     ALLOWED_APPROVAL_TRANSITIONS,
+    AuthenticatedApprovalContext,
     AuthorizationStatus,
     BrokerDecisionReceipt,
     Clock,
@@ -45,6 +46,7 @@ from khaos.coding.planning.approval.models import (
     PlanExecutionAuthorization,
     PlanValidationContext,
     compute_plan_binding_digest,
+    compute_reason_digest,
     compute_risk_digest,
     compute_verification_digest,
     generate_nonce,
@@ -55,6 +57,7 @@ from khaos.coding.planning.approval.models import (
     verify_receipt_token,
 )
 from khaos.coding.planning.approval.repository import (
+    PersistedPlanRepository,
     PlanRepository,
     PlanSnapshotStore,
 )
@@ -86,6 +89,7 @@ from khaos.coding.planning.approval.validator import (
 __all__ = [
     "ALLOWED_APPROVAL_TRANSITIONS",
     "APPROVAL_SCHEMA",
+    "AuthenticatedApprovalContext",
     "AuthorizedExecutionContext",
     "AuthorizationAlreadyConsumedError",
     "AuthorizationError",
@@ -102,6 +106,7 @@ __all__ = [
     "ContextProvider",
     "CurrentRepositoryState",
     "GatePolicy",
+    "PersistedPlanRepository",
     "PlanApprovalAuditEvent",
     "PlanApprovalDecision",
     "PlanApprovalError",
@@ -121,6 +126,7 @@ __all__ = [
     "UnauthenticatedReceiptError",
     "UnknownBrokerRequestError",
     "compute_plan_binding_digest",
+    "compute_reason_digest",
     "compute_risk_digest",
     "compute_verification_digest",
     "evaluate_approval_requirement",

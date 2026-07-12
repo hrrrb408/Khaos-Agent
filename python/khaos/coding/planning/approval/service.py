@@ -369,8 +369,6 @@ class PlanApprovalService:
     def apply_broker_decision(
         self,
         receipt: BrokerDecisionReceipt,
-        *,
-        current_plan: "ImplementationPlan | None" = None,
     ) -> PlanApprovalRequest:
         """Apply a broker decision carried by an authenticated receipt.
 
@@ -381,8 +379,11 @@ class PlanApprovalService:
         whose hash must match a row in the ``plan_approval_receipts`` outbox
         that only the broker can create.
 
-        ``current_plan`` is re-validated against live state (§7) BEFORE the
-        atomic decision is applied. Drift → ``stale``.
+        Batch 2.2: the ``current_plan`` parameter is GONE. The authoritative
+        plan is resolved by ``request.plan_id`` from the persisted
+        :class:`PlanRepository`, then validated via
+        :meth:`PlanLiveValidator.validate(plan_id)`. A caller cannot influence
+        validation by passing a forged plan.
         """
         # The receipt must be a real BrokerDecisionReceipt (not a dict / bool).
         if not isinstance(receipt, BrokerDecisionReceipt):
@@ -414,13 +415,10 @@ class PlanApprovalService:
             )
             raise PlanNotRequestableError("request expired before decision")
 
-        # Re-validate the live plan (second validation, §7). Drift → stale.
-        if current_plan is None:
-            raise PlanApprovalError(
-                "apply_broker_decision requires current_plan for re-validation"
-            )
+        # Resolve the AUTHORITATIVE plan snapshot by plan_id (Batch 2.2 §4).
+        # No caller-supplied plan object is accepted.
         try:
-            ctx = self._validator.validate_plan(current_plan)
+            ctx = self._validator.validate(request.plan_id)
         except _ValidatorStale as exc:
             self._transition(
                 request=request, target=PlanApprovalStatus.STALE,
@@ -447,9 +445,12 @@ class PlanApprovalService:
             self._store.revoke_authorizations_for_request(request.approval_request_id)
             raise PlanStaleError("binding digest changed between request and decision")
 
-        # Idempotency: already in the receipt's decision state.
-        if request.status == receipt.decision:
-            return request
+        # NOTE (Batch 2.2 §1.4): there is NO early idempotency return here.
+        # The request-already-approved case is handled INSIDE the store's
+        # apply_authenticated_decision, which verifies the receipt's token +
+        # ALL authoritative fields BEFORE returning UNCHANGED. An early return
+        # here would let a tampered receipt (same decision, different actor)
+        # skip verification.
 
         # Build the decision + audit records.
         decision_record = PlanApprovalDecision(
@@ -464,6 +465,7 @@ class PlanApprovalService:
                 "receipt_id": receipt.receipt_id,
                 "binding_digest": ctx.binding_digest,
                 "authenticated_source": receipt.authenticated_source,
+                "session_request_id": receipt.session_request_id,
             },
         )
         new_expiry = None
@@ -488,11 +490,11 @@ class PlanApprovalService:
         )
 
         # The atomic transaction: status + decision + audit + expiry + receipt
-        # consumption all commit or all roll back (§2).
+        # consumption all commit or all roll back (§2). The full receipt is
+        # passed so every authoritative field is verified (Batch 2.2 §1).
         result = self._store.apply_authenticated_decision(
             approval_request_id=request.approval_request_id,
-            receipt_token=receipt.one_time_token,
-            decision=receipt.decision,
+            receipt=receipt,
             decision_record=decision_record,
             audit_event=audit_event,
             new_expiry=new_expiry,
@@ -624,37 +626,83 @@ class PlanApprovalService:
         actor_type: str = "system",
         reason: str = "",
     ) -> PlanApprovalRequest:
+        """Atomically revoke a request AND all its active authorizations (§6).
+
+        ONE ``BEGIN IMMEDIATE`` via
+        :meth:`PlanApprovalStore.invalidate_request_and_authorizations` — no
+        request=revoked + auth=active window.
+        """
         request = self._store.get_request(approval_request_id)
         if request is None:
             raise PlanApprovalError(f"unknown approval request {approval_request_id}")
-        self._transition(
-            request=request, target=PlanApprovalStatus.REVOKED,
-            expected={PlanApprovalStatus.APPROVED, PlanApprovalStatus.PENDING, PlanApprovalStatus.REGISTERING},
+        now = float(self._clock())
+        audit = PlanApprovalAuditEvent(
+            event_id=new_event_id(),
+            event_type="plan-approval:revoked",
+            approval_request_id=request.approval_request_id,
+            plan_id=request.plan_id,
+            previous_status=request.status.value,
+            new_status=PlanApprovalStatus.REVOKED.value,
             actor_id=actor_id, actor_type=actor_type,
-            reason_code="revoked", reason=reason,
+            authenticated_source=actor_type,
+            timestamp=now, reason_code="revoked",
+            task_id=request.task_id, workspace_id=request.workspace_id,
+            repository_id=request.repository_id,
             correlation_id=approval_request_id,
         )
-        self._store.revoke_authorizations_for_request(approval_request_id)
+        result = self._store.invalidate_request_and_authorizations(
+            approval_request_id,
+            target_status=PlanApprovalStatus.REVOKED,
+            expected_statuses={
+                PlanApprovalStatus.APPROVED, PlanApprovalStatus.PENDING,
+                PlanApprovalStatus.REGISTERING, PlanApprovalStatus.NOT_REQUIRED,
+            },
+            audit_event=audit,
+            now=now,
+        )
+        if result.value in ("conflict", "invalid_transition"):
+            raise ApprovalConflictError(
+                f"cannot revoke request in status {request.status.value}"
+            )
         return self._store.get_request(approval_request_id)  # type: ignore[return-value]
 
     def invalidate_for_task(
         self, *, task_id: str, actor_id: str = "system", reason: str = "task terminal"
     ) -> int:
+        """Atomically stale every active request for a task AND revoke their
+        authorizations (§6). Each request+authorization pair is invalidated
+        in one ``BEGIN IMMEDIATE`` transaction.
+        """
         count = 0
+        now = float(self._clock())
         for request in self._store.list_requests_for_task(task_id):
-            if request.status in (PlanApprovalStatus.PENDING, PlanApprovalStatus.APPROVED, PlanApprovalStatus.REGISTERING):
-                try:
-                    self._transition(
-                        request=request, target=PlanApprovalStatus.STALE,
-                        expected={PlanApprovalStatus.PENDING, PlanApprovalStatus.APPROVED, PlanApprovalStatus.REGISTERING},
-                        actor_id=actor_id, actor_type="system",
-                        reason_code="task-invalidation", reason=reason,
-                        correlation_id=f"task:{task_id}",
-                    )
-                    self._store.revoke_authorizations_for_request(request.approval_request_id)
+            if request.status in (PlanApprovalStatus.PENDING, PlanApprovalStatus.APPROVED, PlanApprovalStatus.REGISTERING, PlanApprovalStatus.NOT_REQUIRED):
+                audit = PlanApprovalAuditEvent(
+                    event_id=new_event_id(),
+                    event_type="plan-approval:stale",
+                    approval_request_id=request.approval_request_id,
+                    plan_id=request.plan_id,
+                    previous_status=request.status.value,
+                    new_status=PlanApprovalStatus.STALE.value,
+                    actor_id=actor_id, actor_type="system",
+                    authenticated_source="system",
+                    timestamp=now, reason_code="task-invalidation",
+                    task_id=request.task_id, workspace_id=request.workspace_id,
+                    repository_id=request.repository_id,
+                    correlation_id=f"task:{task_id}",
+                )
+                result = self._store.invalidate_request_and_authorizations(
+                    request.approval_request_id,
+                    target_status=PlanApprovalStatus.STALE,
+                    expected_statuses={
+                        PlanApprovalStatus.PENDING, PlanApprovalStatus.APPROVED,
+                        PlanApprovalStatus.REGISTERING, PlanApprovalStatus.NOT_REQUIRED,
+                    },
+                    audit_event=audit,
+                    now=now,
+                )
+                if result.value == "updated":
                     count += 1
-                except ApprovalConflictError:
-                    continue
         return count
 
     # ------------------------------------------------------------------
