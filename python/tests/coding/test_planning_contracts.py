@@ -23,6 +23,7 @@ async def planner(tmp_path: Path):
         "javascript_test.js": "import {publicJs} from './javascript_lib.js'; publicJs();\n",
         "typescript_lib.ts": "export function publicTs():number{return 1}; const dyn=(x:string)=>(globalThis as any)[x]()\n",
         "tsx_view.tsx": "import {publicTs} from './typescript_lib'; export const View=()=> <button>{publicTs()}</button>\n",
+        "tsx_view_test.tsx": "import {View} from './tsx_view'; export const TestView=()=> <View/>; const dyn=(x:string)=>(globalThis as any)[x]()\n",
         "go_lib.go": "package fixture\nfunc PublicGo() int { return 1 }\n",
         "go_test.go": "package fixture\nfunc TestPublicGo() { PublicGo() }\n",
         "rust_lib.rs": "pub fn public_rust()->i32 {1}\npub fn dynamic(_: &str)->i32 {1}\n",
@@ -32,7 +33,7 @@ async def planner(tmp_path: Path):
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     store = IndexStore(conn); resolver = ResolutionService(conn)
     await RepositoryIndexer(store, resolution_service=resolver).index("repo", tmp_path, full_reindex=True)
-    return DeterministicPlanningService(CodeQueryService(store), repositories={"repo": {"workspace_id": "ws", "head": "abc", "generation": 1, "verification": (("python", "-m", "pytest", "-q"),)}}), store
+    return DeterministicPlanningService(CodeQueryService(store), repositories={"repo": {"repository_id": "repo", "workspace_id": "ws", "head": "abc", "generation": 1, "root": str(tmp_path), "verification": (("python", "-m", "pytest", "-q"),)}}), store
 
 
 @pytest.mark.asyncio
