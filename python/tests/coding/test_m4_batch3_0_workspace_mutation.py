@@ -38,6 +38,7 @@ from khaos.coding.planning.workspace_mutation import (
     WorkspaceMutationEngine,
     WorkspaceMutationError,
 )
+from khaos.coding.planning.safe_workspace_path import WorkspacePathHandle
 from khaos.coding.workspace.models import TaskWorkspace, WorkspaceState
 
 
@@ -426,15 +427,15 @@ def test_durable_preparation_faults_leave_source_unchanged(tmp_path, monkeypatch
         )
     elif failure == "replace":
         monkeypatch.setattr(
-            "khaos.coding.planning.workspace_mutation.os.replace",
-            lambda *args: (_ for _ in ()).throw(OSError("replace")),
+            WorkspacePathHandle, "_exchange",
+            lambda *args, **kwargs: (_ for _ in ()).throw(OSError("replace")),
         )
     else:
         monkeypatch.setattr(
             engine, "_fsync_directory",
             lambda *args: (_ for _ in ()).throw(OSError("fsync")),
         )
-    with pytest.raises((OSError, sqlite3.Error)):
+    with pytest.raises((OSError, sqlite3.Error, WorkspaceMutationError)):
         _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
     assert (workspace.worktree_path / "a.txt").read_text() == "old"
 
@@ -452,7 +453,7 @@ def test_rollback_failure_poison_quarantines_workspace(tmp_path, monkeypatch):
     )
     runtime, workspace, plan, authorization = _setup(tmp_path, edits)
     monkeypatch.setattr(
-        runtime._mutation_engine, "_restore_backup",
+        runtime._mutation_engine, "_rollback_event",
         lambda *args: (_ for _ in ()).throw(OSError("rollback")),
     )
     with pytest.raises(WorkspaceMutationError, match="rollback failed"):
@@ -621,6 +622,8 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
     runtime._store.create_execution_run(run)
     recovery = workspace.worktree_path.parent / ".khaos-recovery" / run_id
     recovery.mkdir(parents=True)
+    os.chmod(recovery.parent, 0o700)
+    os.chmod(recovery, 0o700)
     backup = recovery / "0000-backup.bak"
     backup.write_text("corrupt" if corrupt else "original", encoding="utf-8")
     runtime._store.insert_edit_event(
