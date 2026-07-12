@@ -38,6 +38,9 @@ def resolve_rust_imports(
         alias: str | None = imp.get("alias")
         metadata: dict[str, Any] = imp.get("metadata", {})
         import_kind = metadata.get("import_kind", "use")
+        # Propagate semantic re-export evidence from the adapter (pub use).
+        is_reexport = bool(metadata.get("reexport") or metadata.get("pub_use"))
+        reexport_meta = {"pub_use": True, "reexport": True} if is_reexport else {}
 
         # Determine if this is a crate-local or external path
         is_external = _is_external_rust_path(module)
@@ -45,7 +48,7 @@ def resolve_rust_imports(
             results.append(ResolvedImport(
                 source_file, module, "", alias, ResolutionStatus.EXTERNAL,
                 None, None, 0.9, "rust-external-crate",
-                (), {"import_kind": import_kind, "external": True},
+                (), {**reexport_meta, "import_kind": import_kind, "external": True},
             ))
             continue
 
@@ -55,7 +58,7 @@ def resolve_rust_imports(
             results.append(ResolvedImport(
                 source_file, module, "", alias, ResolutionStatus.UNRESOLVED,
                 None, None, 0.6, "rust-path-not-found",
-                (), {"import_kind": import_kind},
+                (), {**reexport_meta, "import_kind": import_kind},
             ))
             continue
 
@@ -65,7 +68,7 @@ def resolve_rust_imports(
             results.append(ResolvedImport(
                 source_file, module, "*", alias, ResolutionStatus.AMBIGUOUS,
                 target_file, None, 0.5, "rust-glob-import-ambiguous",
-                (target_file,), {"import_kind": import_kind, "glob": True},
+                (target_file,), {**reexport_meta, "import_kind": import_kind, "glob": True},
             ))
             table.register_reverse_dep(source_file, target_file)
             continue
@@ -76,7 +79,7 @@ def resolve_rust_imports(
             results.append(ResolvedImport(
                 source_file, module, "", alias, ResolutionStatus.RESOLVED,
                 target_file, None, 0.92, "rust-use-path",
-                (target_file,), {"import_kind": import_kind},
+                (target_file,), {**reexport_meta, "import_kind": import_kind},
             ))
             table.register_reverse_dep(source_file, target_file)
             continue
@@ -86,7 +89,7 @@ def resolve_rust_imports(
                 results.append(ResolvedImport(
                     source_file, module, "*", alias, ResolutionStatus.AMBIGUOUS,
                     target_file, None, 0.5, "rust-glob-import-ambiguous",
-                    (target_file,), {"import_kind": import_kind, "glob": True},
+                    (target_file,), {**reexport_meta, "import_kind": import_kind, "glob": True},
                 ))
                 continue
 
@@ -96,19 +99,19 @@ def resolve_rust_imports(
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.RESOLVED,
                     target_file, target_symbols[0].stable_symbol_id, 0.93, "rust-use-named",
-                    (target_file,), {"import_kind": import_kind},
+                    (target_file,), {**reexport_meta, "import_kind": import_kind},
                 ))
             elif len(target_symbols) > 1:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.AMBIGUOUS,
                     target_file, None, 0.4, "rust-use-multiple",
-                    tuple(s.stable_symbol_id for s in target_symbols), {"import_kind": import_kind, "count": len(target_symbols)},
+                    tuple(s.stable_symbol_id for s in target_symbols), {**reexport_meta, "import_kind": import_kind, "count": len(target_symbols)},
                 ))
             else:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.UNRESOLVED,
                     target_file, None, 0.6, "rust-use-name-not-found",
-                    (target_file,), {"import_kind": import_kind},
+                    (target_file,), {**reexport_meta, "import_kind": import_kind},
                 ))
             table.register_reverse_dep(source_file, target_file)
 

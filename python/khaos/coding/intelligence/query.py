@@ -90,12 +90,18 @@ class CodeQueryService:
         return reverse_dependency_files(self.store._conn, project_id, path)
 
     def reverse_imports_to(self, project_id: str, path: str) -> list[dict[str, Any]]:
-        """Return only resolved import edges targeting ``path``."""
+        """Return only resolved import edges targeting ``path``.
+
+        Includes ``metadata_json`` so callers can inspect semantic re-export
+        evidence (``import_kind=reexport``, ``pub_use=True``) rather than
+        guessing from file names.
+        """
         rows = self.store._conn.execute(
-            "SELECT source_file,import_module,imported_name,alias,status,confidence,reason,target_symbol_id FROM resolved_imports WHERE repository_id=? AND target_file=? ORDER BY source_file,import_module,imported_name,alias",
+            "SELECT source_file,import_module,imported_name,alias,status,confidence,reason,target_symbol_id,metadata_json FROM resolved_imports WHERE repository_id=? AND target_file=? ORDER BY source_file,import_module,imported_name,alias",
             (project_id, path),
         ).fetchall()
-        return [dict(row) for row in rows]
+        import json
+        return [dict(row, metadata=json.loads(row[8]) if row[8] else {}) for row in rows]
 
     def symbol_by_stable_id(self, project_id: str, stable_symbol_id: str) -> dict[str, Any] | None:
         row = self.store._conn.execute(
@@ -123,6 +129,145 @@ class CodeQueryService:
             (project_id, path),
         ).fetchone()
         return dict(row) if row else None
+
+    def associated_tests(
+        self,
+        repository_id: str,
+        *,
+        target_files: tuple[str, ...],
+        target_symbols: tuple[str, ...] = (),
+        max_results: int = 50,
+    ) -> "tuple":
+        """Bounded test-file association lookup — never scans the whole repository.
+
+        Evidence priority (each level is bounded by ``max_results``):
+        1. Resolved import/call/reference edges where the source file matches
+           a test pattern (``test``/``spec``) and the target is one of our
+           target files or symbols.
+        2. Explicit test directories (``tests/``, ``test/``, ``spec/``) with
+           bounded LIMIT queries using the primary key index.
+        3. Bounded path-stem heuristics: ``test_{stem}%``, ``{stem}_test%``,
+           ``{stem}_spec%`` — prefix patterns that leverage the PK index.
+
+        Returns a :class:`TestAssociationResult` with ``status=possible`` for
+        heuristic results, ``inspected_candidates`` reporting how many rows
+        were examined, and ``max_candidates`` enforcing the bounded limit.
+        """
+        from khaos.coding.planning.contracts import TestAssociationResult
+
+        max_candidates = max_results
+        inspected = 0
+        candidates: list[dict[str, Any]] = []
+        seen_paths: set[str] = set()
+        evidence_sources: list[str] = []
+        truncated = False
+
+        # --- Priority 1: Resolved graph edges (indexed on target_file/target_symbol_id) ---
+        if target_files:
+            placeholders = ",".join("?" * len(target_files))
+            rows = self.store._conn.execute(
+                f"SELECT DISTINCT source_file,target_file,confidence,reason,'import' AS edge_type "
+                f"FROM resolved_imports WHERE repository_id=? AND target_file IN ({placeholders}) "
+                f"AND (source_file LIKE '%test%' OR source_file LIKE '%spec%') "
+                f"ORDER BY source_file LIMIT ?",
+                (repository_id, *target_files, max_candidates),
+            ).fetchall()
+            inspected += len(rows)
+            for row in rows:
+                path = str(row[0])
+                if path not in seen_paths:
+                    seen_paths.add(path)
+                    candidates.append({"path": path, "target_file": row[1], "confidence": float(row[2]),
+                                       "reason": str(row[3]), "edge_type": "import", "source": "resolution-graph"})
+            if rows:
+                evidence_sources.append("resolved-imports")
+
+        if target_symbols:
+            placeholders = ",".join("?" * len(target_symbols))
+            for table, kind in (("resolved_call_edges", "call"), ("resolved_reference_edges", "reference")):
+                rows = self.store._conn.execute(
+                    f"SELECT DISTINCT source_file,target_file,target_symbol_id,confidence,resolution_rule,'{kind}' AS edge_type "
+                    f"FROM {table} WHERE repository_id=? AND target_symbol_id IN ({placeholders}) "
+                    f"AND (source_file LIKE '%test%' OR source_file LIKE '%spec%') "
+                    f"ORDER BY source_file LIMIT ?",
+                    (repository_id, *target_symbols, max_candidates),
+                ).fetchall()
+                inspected += len(rows)
+                for row in rows:
+                    path = str(row[0])
+                    if path not in seen_paths:
+                        seen_paths.add(path)
+                        candidates.append({"path": path, "target_file": row[1], "confidence": float(row[3]),
+                                           "reason": str(row[4]), "edge_type": kind, "source": "resolution-graph"})
+                if rows:
+                    evidence_sources.append(f"resolved-{kind}-edges")
+
+        # --- Priority 2: Explicit test directories (bounded, indexed) ---
+        if len(candidates) < max_candidates:
+            for pattern in ("tests/%", "test/%", "spec/%", "__tests__/%"):
+                remaining = max_candidates - len(candidates)
+                if remaining <= 0:
+                    break
+                rows = self.store._conn.execute(
+                    "SELECT path,language,content_hash,generation FROM code_files "
+                    "WHERE project_id=? AND path LIKE ? ORDER BY path LIMIT ?",
+                    (repository_id, pattern, remaining),
+                ).fetchall()
+                inspected += len(rows)
+                for row in rows:
+                    path = str(row[0])
+                    if path not in seen_paths:
+                        seen_paths.add(path)
+                        candidates.append({"path": path, "language": row[1], "content_hash": row[2],
+                                           "generation": row[3], "confidence": 0.5,
+                                           "reason": "test-directory-pattern", "edge_type": "directory",
+                                           "source": "test-directory"})
+                if rows:
+                    evidence_sources.append("test-directory")
+
+        # --- Priority 3: Bounded path-stem heuristics (prefix patterns, indexed) ---
+        if len(candidates) < max_candidates:
+            for target_file in target_files:
+                if len(candidates) >= max_candidates:
+                    truncated = True
+                    break
+                stem = target_file.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                for pattern in (f"test_{stem}%", f"{stem}_test%", f"{stem}_spec%", f"test/{stem}%", f"tests/test_{stem}%"):
+                    remaining = max_candidates - len(candidates)
+                    if remaining <= 0:
+                        truncated = True
+                        break
+                    rows = self.store._conn.execute(
+                        "SELECT path,language,content_hash,generation FROM code_files "
+                        "WHERE project_id=? AND path LIKE ? ORDER BY path LIMIT ?",
+                        (repository_id, pattern, remaining),
+                    ).fetchall()
+                    inspected += len(rows)
+                    for row in rows:
+                        path = str(row[0])
+                        if path not in seen_paths:
+                            seen_paths.add(path)
+                            candidates.append({"path": path, "language": row[1], "content_hash": row[2],
+                                               "generation": row[3], "confidence": 0.45,
+                                               "reason": "test-stem-heuristic", "edge_type": "stem",
+                                               "source": "path-heuristic"})
+                    if rows and "path-heuristic" not in evidence_sources:
+                        evidence_sources.append("path-heuristic")
+
+        if len(candidates) >= max_candidates:
+            truncated = True
+
+        # Stable sort by path for deterministic output
+        candidates.sort(key=lambda c: (c.get("path", ""), c.get("edge_type", "")))
+        return TestAssociationResult(
+            candidates=tuple(candidates[:max_candidates]),
+            status="possible",
+            confidence=0.5,
+            inspected_candidates=inspected,
+            max_candidates=max_candidates,
+            evidence_sources=tuple(sorted(set(evidence_sources))),
+            truncated=truncated,
+        )
 
     # ---- Optional LSP evidence fusion queries (Batch 6, additive) ----
     # These methods delegate to an optional LspEvidenceFusionService.

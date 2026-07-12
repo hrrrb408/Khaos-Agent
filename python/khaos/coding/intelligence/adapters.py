@@ -500,8 +500,17 @@ def _rust_imports(statement: Any, content: bytes) -> list[tuple[str, list[str], 
     if statement.type == "extern_crate_declaration":
         name = statement.child_by_field_name("name")
         return [(_text(content, name), [], None, {"import_kind": "extern_crate"})]
+    # Detect ``pub use`` — real semantic re-export evidence.
+    # The tree-sitter Rust grammar exposes ``pub`` as a ``visibility_modifier``
+    # child node (not as a named field), so we check child node types.
+    is_pub_use = any(child.type == "visibility_modifier" for child in statement.children)
     argument = statement.child_by_field_name("argument")
-    return _expand_rust_use(argument, content, "")
+    items = _expand_rust_use(argument, content, "")
+    if is_pub_use:
+        for module, names, alias, metadata in items:
+            metadata["pub_use"] = True
+            metadata["reexport"] = True
+    return items
 
 
 def _expand_rust_use(node: Any, content: bytes, prefix: str) -> list[tuple[str, list[str], str | None, dict[str, Any]]]:

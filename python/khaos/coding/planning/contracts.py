@@ -40,6 +40,165 @@ class ImpactEdge:
 class ImpactAnalysis:
     target_files: tuple[str, ...]; target_symbols: tuple[str, ...]; direct_impacts: tuple[ImpactEdge, ...]; indirect_impacts: tuple[ImpactEdge, ...]; external_impacts: tuple[ImpactEdge, ...]; dynamic_impacts: tuple[ImpactEdge, ...]; excluded_impacts: tuple[ImpactEdge, ...]; diagnostics: tuple[PlanDiagnostic, ...]; traversal_depth: int; truncated: bool; content_hash: str
     visited_nodes: int = 0; visited_files: int = 0; visited_symbols: int = 0
+    inspected_edges: int = 0; inspected_file_candidates: int = 0; inspected_test_candidates: int = 0
+    inspected_reverse_imports: int = 0; sql_rows_enumerated: int = 0; limit_code: str | None = None
+
+
+class ImpactTraversalBudget:
+    """Unified, mutable budget tracker shared across ALL impact sources.
+
+    Every source (callers, references, reverse imports, re-exports, module
+    dependencies, unresolved/dynamic candidates, test associations) must
+    consult this single object before inspecting or adding any edge/file/symbol.
+    Reaching ANY limit stops further expansion, sets ``truncated=True``,
+    records a concrete ``limit_code``, and leaves results in stable sort order.
+    """
+
+    __slots__ = (
+        "max_depth", "max_nodes", "max_edges", "max_files", "max_symbols",
+        "max_reverse_imports", "max_test_candidates",
+        "_visited_nodes", "_inspected_edges", "_inspected_file_candidates",
+        "_inspected_test_candidates", "_inspected_reverse_imports",
+        "_sql_rows_enumerated", "_affected_files", "_affected_symbols",
+        "_truncated", "_limit_code",
+    )
+
+    def __init__(self, *, max_depth: int = 3, max_nodes: int = 200, max_edges: int = 500,
+                 max_files: int = 100, max_symbols: int = 100,
+                 max_reverse_imports: int = 50, max_test_candidates: int = 50) -> None:
+        self.max_depth = max_depth
+        self.max_nodes = max_nodes
+        self.max_edges = max_edges
+        self.max_files = max_files
+        self.max_symbols = max_symbols
+        self.max_reverse_imports = max_reverse_imports
+        self.max_test_candidates = max_test_candidates
+        self._visited_nodes: set[str] = set()
+        self._inspected_edges = 0
+        self._inspected_file_candidates = 0
+        self._inspected_test_candidates = 0
+        self._inspected_reverse_imports = 0
+        self._sql_rows_enumerated = 0
+        self._affected_files: set[str] = set()
+        self._affected_symbols: set[str] = set()
+        self._truncated = False
+        self._limit_code: str | None = None
+
+    @property
+    def truncated(self) -> bool: return self._truncated
+    @property
+    def limit_code(self) -> str | None: return self._limit_code
+    @property
+    def visited_nodes_count(self) -> int: return len(self._visited_nodes)
+    @property
+    def inspected_edges(self) -> int: return self._inspected_edges
+    @property
+    def inspected_file_candidates(self) -> int: return self._inspected_file_candidates
+    @property
+    def inspected_test_candidates(self) -> int: return self._inspected_test_candidates
+    @property
+    def inspected_reverse_imports(self) -> int: return self._inspected_reverse_imports
+    @property
+    def sql_rows_enumerated(self) -> int: return self._sql_rows_enumerated
+    @property
+    def affected_files_count(self) -> int: return len(self._affected_files)
+    @property
+    def affected_symbols_count(self) -> int: return len(self._affected_symbols)
+    @property
+    def affected_files(self) -> tuple[str, ...]: return tuple(sorted(self._affected_files))
+    @property
+    def affected_symbols(self) -> tuple[str, ...]: return tuple(sorted(self._affected_symbols))
+
+    def record_sql_rows(self, count: int) -> None:
+        """Record SQL rows enumerated by a bounded query (for audit)."""
+        self._sql_rows_enumerated += count
+
+    def can_visit_node(self, sid: str, depth: int) -> bool:
+        if sid in self._visited_nodes: return False
+        if len(self._visited_nodes) >= self.max_nodes:
+            self._truncate("max_nodes"); return False
+        if depth > self.max_depth:
+            self._truncate("max_depth"); return False
+        return True
+
+    def mark_visited(self, sid: str) -> None:
+        self._visited_nodes.add(sid)
+
+    def can_inspect_edge(self) -> bool:
+        if self._inspected_edges >= self.max_edges:
+            self._truncate("max_edges"); return False
+        self._inspected_edges += 1
+        return True
+
+    def can_inspect_reverse_import(self) -> bool:
+        if self._inspected_reverse_imports >= self.max_reverse_imports:
+            self._truncate("max_reverse_imports"); return False
+        self._inspected_reverse_imports += 1
+        return True
+
+    def can_inspect_test_candidate(self) -> bool:
+        if self._inspected_test_candidates >= self.max_test_candidates:
+            self._truncate("max_test_candidates"); return False
+        self._inspected_test_candidates += 1
+        return True
+
+    def can_inspect_file_candidate(self) -> bool:
+        if self._inspected_file_candidates >= self.max_files:
+            self._truncate("max_file_candidates"); return False
+        self._inspected_file_candidates += 1
+        return True
+
+    def add_affected_file(self, path: str) -> bool:
+        if path in self._affected_files: return True
+        if len(self._affected_files) >= self.max_files:
+            self._truncate("max_files"); return False
+        self._affected_files.add(path); return True
+
+    def add_affected_symbol(self, sid: str) -> bool:
+        if sid in self._affected_symbols: return True
+        if len(self._affected_symbols) >= self.max_symbols:
+            self._truncate("max_symbols"); return False
+        self._affected_symbols.add(sid); return True
+
+    def _truncate(self, code: str) -> None:
+        if not self._truncated:
+            self._truncated = True
+            self._limit_code = code
+
+
+@dataclass(frozen=True)
+class TestAssociationResult:
+    """Bounded result from test association lookup.
+
+    ``status`` is always ``possible`` for heuristic results — never ``resolved``.
+    ``inspected_candidates`` reports how many candidates were examined;
+    ``max_candidates`` is the bounded limit that was enforced.
+    """
+    candidates: tuple[dict[str, Any], ...]
+    status: str  # "possible" for heuristic, "resolved" for graph-evidenced
+    confidence: float
+    inspected_candidates: int
+    max_candidates: int
+    evidence_sources: tuple[str, ...]  # which priority levels produced candidates
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class VerificationCatalogEntry:
+    """A single trusted verification command from repository configuration.
+
+    Every entry is bound to a specific language and backed by a real config
+    file (provenance + config_path + config_hash). Legacy commands without a
+    language are NOT allowed to propagate across languages.
+    """
+    language: str  # "python","javascript","typescript","go","rust","repository"
+    verification_type: str  # "unit-test","type-check","lint","build"
+    argv: tuple[str, ...]
+    scope: str  # "repository","package","file"
+    provenance: str  # "pyproject.toml","package.json","go.mod","Cargo.toml","server-rule"
+    config_path: str
+    config_hash: str
+    trust_level: str  # "high","medium","low"
 
 
 @dataclass(frozen=True)
