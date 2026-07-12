@@ -59,14 +59,18 @@ class DeepFakePlanningService:
 
 
 def _runtime(store):
-    return ApprovalRuntime(store=store,broker=SyncBroker(),context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=DeepFakePlanningService())
+    # Batch 2.5: runtime requires a real ApprovalBroker with authenticator.
+    sync=SyncBroker()
+    return ApprovalRuntime(store=store,broker=sync.real,context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=DeepFakePlanningService())
 
 
 def test_production_runtime_dependencies_fail_closed():
     store=PlanApprovalStore(sqlite3.connect(":memory:"))
-    with pytest.raises(TypeError): ApprovalRuntime(store=store,broker=SyncBroker(),context_provider=FakeContextProvider(),plan_repository=UnsafeTestPlanRepository(),planning_service=DeepFakePlanningService())
-    with pytest.raises(TypeError): ApprovalRuntime(store=store,broker=SyncBroker(),context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=None)
-    with pytest.raises(TypeError): ApprovalRuntime(store=store,broker=SyncBroker(),context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=ShallowTestPlanValidator())
+    sync=SyncBroker()
+    with pytest.raises(TypeError): ApprovalRuntime(store=store,broker=sync.real,context_provider=FakeContextProvider(),plan_repository=UnsafeTestPlanRepository(),planning_service=DeepFakePlanningService())
+    with pytest.raises(TypeError): ApprovalRuntime(store=store,broker=sync.real,context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=None)
+    with pytest.raises(TypeError): ApprovalRuntime(store=store,broker=sync.real,context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=ShallowTestPlanValidator())
+    with pytest.raises(TypeError): ApprovalRuntime(store=store,broker=SyncBroker(),context_provider=FakeContextProvider(),plan_repository=PersistedPlanRepository(store),planning_service=DeepFakePlanningService())
 
 
 def test_runtime_initialize_rotates_epoch_and_guards_readiness():

@@ -35,7 +35,7 @@ from khaos.coding.planning.approval.models import (
     PlanApprovalStatus,
     PlanValidationContext,
 )
-from khaos.coding.planning.approval.repository import PlanRepository, PlanSnapshotStore
+from khaos.coding.planning.approval.repository import PersistedPlanRepository, PlanRepository, PlanSnapshotStore
 from khaos.coding.planning.approval.validator import (
     PlanLiveValidator,
     PlanNotRequestableError as _ValidatorNotRequestable,
@@ -162,14 +162,27 @@ class PlanApprovalService:
         planning_service: Any | None = None,
         policy: ApprovalPolicy | None = None,
         clock: Any = time.time,
+        boot_context: Any = None,
     ) -> None:
         self._store = store
         self._broker = broker
         self._context_provider = context_provider
-        self._plan_repository = plan_repository or PlanSnapshotStore()
-        self._planning_service = planning_service
         self._policy = policy or ApprovalPolicy()
         self._clock = clock
+        # Batch 2.5 §5: production construction requires a real
+        # PersistedPlanRepository and deep validator. The old defaults
+        # (PlanSnapshotStore / planning_service=None) are only acceptable
+        # when ``boot_context`` is None (test-only construction).
+        if boot_context is not None:
+            if plan_repository is None or not isinstance(plan_repository, PersistedPlanRepository):
+                raise TypeError("production PlanApprovalService requires PersistedPlanRepository")
+            if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
+                raise TypeError("production PlanApprovalService requires deep planning validator")
+            self._boot_context = boot_context
+        else:
+            self._boot_context = None
+        self._plan_repository = plan_repository or PlanSnapshotStore()
+        self._planning_service = planning_service
         self._validator = PlanLiveValidator(
             plan_repository=self._plan_repository,
             context_provider=context_provider,

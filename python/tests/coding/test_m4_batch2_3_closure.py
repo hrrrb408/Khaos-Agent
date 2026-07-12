@@ -231,23 +231,23 @@ def test_20_receipt_outbox_refuses_replace():
     store = PlanApprovalStore(sqlite3.connect(":memory:"))
     from khaos.agent.approval import ApprovalBroker
     broker = ApprovalBroker()
-    store._bind_receipt_broker(broker)
-    writer = broker._receipt_writer
-    writer.write(
+    # Batch 2.5: use the store's receipt sink closure (no public writer).
+    sink = store._create_receipt_sink()
+    sink(
         receipt_id="r1", token_hash="th1", approval_request_id="a",
         broker_request_id="b", binding_digest="bd", decision="approved",
         expires_at=9999999999.0,
     )
     # Same receipt_id → IntegrityError (plain INSERT, no REPLACE).
     with pytest.raises(sqlite3.IntegrityError):
-        writer.write(
+        sink(
             receipt_id="r1", token_hash="th2", approval_request_id="a2",
             broker_request_id="b2", binding_digest="bd2", decision="rejected",
             expires_at=9999999999.0,
         )
     # Same token_hash → IntegrityError.
     with pytest.raises(sqlite3.IntegrityError):
-        writer.write(
+        sink(
             receipt_id="r2", token_hash="th1", approval_request_id="a3",
             broker_request_id="b3", binding_digest="bd3", decision="approved",
             expires_at=9999999999.0,

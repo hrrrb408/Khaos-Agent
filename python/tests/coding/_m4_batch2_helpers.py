@@ -297,7 +297,12 @@ def broker_decide(
     )
     bd = binding_digest if binding_digest is not None else request.binding_digest
     real_broker = broker._real if isinstance(broker, SyncBroker) else broker
-    store._bind_receipt_broker(real_broker)
+    # Batch 2.5: wire the store's receipt sink closure to the broker via
+    # the name-mangled runtime registration. In production,
+    # ApprovalRuntime.initialize() does this automatically.
+    real_broker._register_runtime_receipt_sink(
+        store._create_receipt_sink(), runtime_token=object(),
+    )
 
     if isinstance(broker, SyncBroker):
         return broker.resolve_plan_approval(

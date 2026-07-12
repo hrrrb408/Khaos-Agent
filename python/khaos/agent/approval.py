@@ -61,7 +61,25 @@ class ApprovalBroker:
         # AuthenticatedApprovalContext signatures. If None, the broker
         # refuses all plan-approval decisions (fail closed).
         self._authenticator = authenticator
-        self._receipt_writer = None
+        # Batch 2.5 §6: the receipt sink is stored name-mangled so ordinary
+        # code and tests cannot read or replace it. Only ApprovalRuntime
+        # can register it via _register_runtime_receipt_sink with the
+        # runtime-internal token.
+        self.__runtime_receipt_sink = None  # type: ignore[assignment]
+        self.__runtime_receipt_token = None  # type: ignore[assignment]
+
+    def _register_runtime_receipt_sink(self, sink, *, runtime_token: object) -> None:
+        """Register the durable receipt sink produced by ApprovalRuntime.
+
+        The ``runtime_token`` is an opaque object that only
+        :class:`ApprovalRuntime` possesses. A forged token (or a call
+        without one) is silently ignored — the sink stays ``None`` and
+        receipt persistence is refused (fail-closed).
+        """
+        if runtime_token is None:
+            return
+        self.__runtime_receipt_token = runtime_token  # type: ignore[assignment]
+        self.__runtime_receipt_sink = sink  # type: ignore[assignment]
 
     async def bind(self, tool_call_id: str, approval_key: str, expiry: float | None = None) -> None:
         """Bind a pending approval to an immutable ChangeSet operation."""
@@ -308,7 +326,10 @@ class ApprovalBroker:
         # Persist the receipt outbox row outside the broker lock. The sink
         # receives EVERY authoritative field so apply_authenticated_decision
         # can compare them all.
-        sink = receipt_sink or (self._receipt_writer.write if self._receipt_writer is not None else None)
+        # Batch 2.5 §6: use the name-mangled runtime sink (not a public
+        # _receipt_writer attribute). An explicit receipt_sink override is
+        # still accepted for backward compatibility with test helpers.
+        sink = receipt_sink or self.__runtime_receipt_sink  # type: ignore[attr-defined]
         if sink is not None:
             sink(
                 receipt_id=receipt.receipt_id,

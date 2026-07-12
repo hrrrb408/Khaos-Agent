@@ -295,17 +295,6 @@ class ApprovalTransitionResult(str, Enum):
     STALE = "stale"  # binding digest drifted
 
 
-class _BrokerReceiptWriter:
-    __slots__ = ("__store", "__capability")
-
-    def __init__(self, store: "PlanApprovalStore", capability: object) -> None:
-        self.__store = store
-        self.__capability = capability
-
-    def write(self, **fields: Any) -> None:
-        self.__store._insert_receipt(self.__capability, **fields)
-
-
 class PlanApprovalStore:
     """Atomic, durable store for plan approval + authorization state.
 
@@ -324,11 +313,22 @@ class PlanApprovalStore:
         # store callers cannot create receipt rows.
         self.__receipt_writer_capability = object()
 
-    def _bind_receipt_broker(self, broker: Any) -> None:
-        """Inject the writer into the real broker without returning it."""
-        if broker.__class__.__module__ != "khaos.agent.approval" or broker.__class__.__name__ != "ApprovalBroker":
-            raise TypeError("receipt writer can only be bound to ApprovalBroker")
-        broker._receipt_writer = _BrokerReceiptWriter(self, self.__receipt_writer_capability)
+    def _create_receipt_sink(self) -> Any:
+        """Create a receipt sink closure that captures the store's internal capability.
+
+        Batch 2.5 §6: replaces the old ``_bind_receipt_broker`` which stored
+        a writer on ``broker._receipt_writer``. The sink is a plain callable
+        closure — it has no readable ``write`` attribute and cannot be used
+        to obtain the capability token. Only :class:`ApprovalRuntime` calls
+        this method and registers the sink with the broker.
+        """
+        capability = self.__receipt_writer_capability  # name-mangled
+        store = self
+
+        def _sink(**fields: Any) -> None:
+            store._insert_receipt(capability, **fields)
+
+        return _sink
 
     # ------------------------------------------------------------------
     # Schema bootstrap

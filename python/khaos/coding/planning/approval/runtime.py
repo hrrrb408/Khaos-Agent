@@ -1,6 +1,7 @@
 """Fail-closed production bootstrap for approval and lease runtime."""
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -8,12 +9,24 @@ from khaos.coding.planning.approval.gate import PlanExecutionGate
 from khaos.coding.planning.approval.repository import PersistedPlanRepository
 from khaos.coding.planning.approval.service import PlanApprovalService
 
+logger = logging.getLogger(__name__)
+
 @dataclass(frozen=True)
 class BootContext:
     server_epoch: int
     boot_id: str
 
 class ApprovalRuntime:
+    """Production bootstrap for the approval + lease runtime.
+
+    Batch 2.5 §1: ``initialize()`` self-wires the Broker → durable Receipt
+    outbox channel. Callers and tests must NOT call
+    ``store._bind_receipt_broker`` or set ``broker._receipt_writer`` —
+    those no longer exist. The runtime creates a receipt sink closure from
+    the store's internal capability and registers it with the broker via a
+    name-mangled attribute using a runtime-internal token.
+    """
+
     def __init__(self, *, store: Any, broker: Any, context_provider: Any, plan_repository: PersistedPlanRepository, planning_service: Any) -> None:
         if not isinstance(plan_repository, PersistedPlanRepository):
             raise TypeError("production ApprovalRuntime requires PersistedPlanRepository")
@@ -21,22 +34,75 @@ class ApprovalRuntime:
             raise TypeError("production ApprovalRuntime requires deep planning validator")
         if context_provider is None or not callable(getattr(context_provider, "current_state", None)):
             raise TypeError("production ApprovalRuntime requires ContextProvider")
+        # Batch 2.5 §1: validate broker type and authenticator BEFORE wiring.
+        if broker is None or broker.__class__.__module__ != "khaos.agent.approval" or broker.__class__.__name__ != "ApprovalBroker":
+            raise TypeError("production ApprovalRuntime requires a real ApprovalBroker")
+        if getattr(broker, "_authenticator", None) is None:
+            raise TypeError("production ApprovalRuntime requires broker with ApprovalAuthenticator")
         self._store=store; self._broker=broker; self._context_provider=context_provider
         self._plan_repository=plan_repository; self._planning_service=planning_service
+        # Runtime-internal token — opaque object that only this instance
+        # possesses. Used to register the receipt sink with the broker so
+        # that forged callers cannot replace it.
+        self._runtime_token = object()
         self.service=None; self.gate=None; self.boot_context=None; self.ready=False
 
     def initialize(self) -> BootContext:
-        epoch, boot_id, _ = self._store.rotate_epoch()
-        self.boot_context=BootContext(epoch,boot_id)
-        self.gate=PlanExecutionGate(store=self._store,context_provider=self._context_provider,plan_repository=self._plan_repository,planning_service=self._planning_service)
-        self.service=PlanApprovalService(store=self._store,broker=self._broker,context_provider=self._context_provider,plan_repository=self._plan_repository,planning_service=self._planning_service)
-        self.service.reconcile()
-        self.ready=True
-        return self.boot_context
+        """Initialize the runtime: wire receipts, construct services, reconcile.
+
+        Batch 2.5 §1: this method self-wires the Broker → Receipt outbox
+        channel. On failure, ``ready`` stays False and no half-bound broker
+        state remains.
+        """
+        try:
+            # 1. Rotate epoch (generates fresh boot_id, revokes old auths/leases)
+            epoch, boot_id, _ = self._store.rotate_epoch()
+            self.boot_context = BootContext(epoch, boot_id)
+
+            # 2. Wire Broker → durable Receipt outbox (Batch 2.5 §1 + §6)
+            #    Create a sink closure from the store's internal capability
+            #    and register it with the broker via name-mangled attribute.
+            sink = self._store._create_receipt_sink()
+            self._broker._register_runtime_receipt_sink(sink, runtime_token=self._runtime_token)
+
+            # 3. Construct Gate and Service
+            self.gate = PlanExecutionGate(
+                store=self._store, context_provider=self._context_provider,
+                plan_repository=self._plan_repository, planning_service=self._planning_service,
+                boot_context=self.boot_context,
+            )
+            self.service = PlanApprovalService(
+                store=self._store, broker=self._broker,
+                context_provider=self._context_provider,
+                plan_repository=self._plan_repository, planning_service=self._planning_service,
+                boot_context=self.boot_context,
+            )
+
+            # 4. Reconcile pending approvals
+            self.service.reconcile()
+
+            # 5. Mark ready
+            self.ready = True
+            logger.info("approval runtime initialized: epoch=%d boot=%s", epoch, boot_id[:8])
+            return self.boot_context
+        except Exception:
+            # On failure: not ready, no half-bound broker
+            self.ready = False
+            self.gate = None
+            self.service = None
+            self.boot_context = None
+            raise
 
     def require_ready(self) -> None:
         if not self.ready or self.gate is None:
             raise RuntimeError("approval runtime is not initialized")
+        # Batch 2.5 §7: verify persisted boot context is still current
+        if self.boot_context is not None:
+            persisted_epoch, persisted_boot_id = self._store.get_current_epoch()
+            if (persisted_epoch != self.boot_context.server_epoch
+                    or persisted_boot_id != self.boot_context.boot_id):
+                self.ready = False
+                raise RuntimeError("approval runtime boot context is stale (another runtime initialized)")
 
     def authorize_execution(self, **kwargs: Any):
         self.require_ready(); return self.gate.authorize_execution(**kwargs)
@@ -48,12 +114,27 @@ class ApprovalRuntime:
         self.require_ready(); return self.gate.require_active_lease(*args, **kwargs)
 
     def shutdown(self) -> None:
+        """Atomically invalidate this boot's auth/lease/context.
+
+        Batch 2.5 §7: rotates epoch (revokes all auths/leases from this
+        epoch), sets ready=False. After shutdown, all operations refuse.
+        """
         if self.ready:
             self._store.rotate_epoch()
-            self.ready=False
+            self.ready = False
+            self.gate = None
+            self.service = None
+            self.boot_context = None
+            logger.info("approval runtime shut down")
+
 
 class WorkspaceExecutionLeaseCoordinator:
-    """Coordinates planned mutation preconditions without performing mutation."""
+    """Coordinates planned mutation preconditions without performing mutation.
+
+    Batch 2.5 §3+§4: ``cancel_task`` and ``cleanup_workspace`` use the new
+    ``invalidate_active_execution_scope`` store transaction that correctly
+    handles CONSUMED approval requests (does NOT try CONSUMED → REVOKED).
+    """
     def __init__(self, runtime: ApprovalRuntime) -> None:
         self._runtime=runtime
 
@@ -65,12 +146,27 @@ class WorkspaceExecutionLeaseCoordinator:
     def before_generation_or_head_update(self, ctx: Any) -> None:
         self.require_owner(ctx)
 
-    def cancel_task(self, approval_request_id: str) -> None:
-        self._runtime.require_ready()
-        self._runtime._store.invalidate_request_authorizations_leases_and_receipt(approval_request_id,target_status=__import__("khaos.coding.planning.approval.models",fromlist=["PlanApprovalStatus"]).PlanApprovalStatus.REVOKED,expected_statuses={__import__("khaos.coding.planning.approval.models",fromlist=["PlanApprovalStatus"]).PlanApprovalStatus.APPROVED})
+    def cancel_task(self, *, task_id: str | None = None, workspace_id: str | None = None, owner_execution_id: str | None = None, reason: str = "task-cancelled", now: float | None = None) -> int:
+        """Cancel active execution scope by task and/or workspace.
 
-    def cleanup_workspace(self, approval_request_id: str) -> None:
-        self.cancel_task(approval_request_id)
+        Batch 2.5 §3: uses ``invalidate_active_execution_scope`` which
+        correctly handles CONSUMED approval requests — it revokes the
+        ACTIVE lease and authorization without trying to roll back the
+        CONSUMED approval request status.
+        """
+        self._runtime.require_ready()
+        return self._runtime._store.invalidate_active_execution_scope(
+            task_id=task_id, workspace_id=workspace_id,
+            owner_execution_id=owner_execution_id, reason=reason, now=now,
+        )
+
+    def cleanup_workspace(self, *, task_id: str | None = None, workspace_id: str | None = None, owner_execution_id: str | None = None, reason: str = "workspace-cleanup", now: float | None = None) -> int:
+        """Clean up active execution scope for a workspace."""
+        self._runtime.require_ready()
+        return self._runtime._store.invalidate_active_execution_scope(
+            task_id=task_id, workspace_id=workspace_id,
+            owner_execution_id=owner_execution_id, reason=reason, now=now,
+        )
 
     def shutdown(self) -> None:
         self._runtime.shutdown()
