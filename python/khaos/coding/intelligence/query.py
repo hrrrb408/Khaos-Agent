@@ -44,6 +44,14 @@ class CodeQueryService:
         """Find all repository symbols matching a name."""
         return symbol_targets(self.store._conn, project_id, name)
 
+    def indexed_symbol_candidates(self, project_id: str, name: str) -> list[dict[str, Any]]:
+        """Read-only fallback when resolution has not produced a graph node."""
+        rows = self.store._conn.execute(
+            "SELECT path,name,kind FROM code_symbols WHERE project_id=? AND name=? ORDER BY path,line",
+            (project_id, name),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def resolved_imports(self, project_id: str, path: str) -> list[dict[str, Any]]:
         """Get resolved import edges for a file."""
         return resolved_imports_for_file(self.store._conn, project_id, path)
@@ -75,6 +83,18 @@ class CodeQueryService:
     def reference_edges_for_file(self, project_id: str, path: str) -> list[dict[str, Any]]:
         """Get all reference edges for a file."""
         return reference_edges_for_file(self.store._conn, project_id, path)
+
+    def file_evidence(self, project_id: str, path: str) -> dict[str, Any] | None:
+        """Read indexed file metadata for evidence-bound consumers.
+
+        This is intentionally read-only and keeps planning clients out of the
+        IndexStore connection details.
+        """
+        row = self.store._conn.execute(
+            "SELECT path,language,content_hash,generation FROM code_files WHERE project_id=? AND path=?",
+            (project_id, path),
+        ).fetchone()
+        return dict(row) if row else None
 
     # ---- Optional LSP evidence fusion queries (Batch 6, additive) ----
     # These methods delegate to an optional LspEvidenceFusionService.
