@@ -16,6 +16,8 @@ from khaos.coding.planning.service import DeterministicPlanningService
 async def planner(tmp_path: Path):
     # Offline six-dialect fixture: each source exposes a public symbol, import,
     # caller/test shape, and a deliberately dynamic/ambiguous call form.
+    # Real per-language config files are included so the VerificationCatalog
+    # produces language-scoped trusted verification commands.
     files = {
         "python_lib.py": "def public_api(): return 1\ndef dynamic(name): return globals()[name]()\n",
         "python_test.py": "from python_lib import public_api\ndef test_public_api(): assert public_api() == 1\n",
@@ -28,12 +30,17 @@ async def planner(tmp_path: Path):
         "go_test.go": "package fixture\nfunc TestPublicGo() { PublicGo() }\n",
         "rust_lib.rs": "pub fn public_rust()->i32 {1}\npub fn dynamic(_: &str)->i32 { unknown_rust() }\n",
         "rust_test.rs": "use crate::public_rust; fn test_public_rust(){ public_rust(); }\n",
+        # Real per-language config files for VerificationCatalog
+        "pyproject.toml": "[tool.pytest]\ntestpaths = [\".\"]\n[tool.mypy]\npython_version = \"3.11\"\n[tool.ruff]\nline-length = 120\n",
+        "package.json": '{"name":"fixture","scripts":{"test":"jest","typecheck":"tsc --noEmit","lint":"eslint ."},"devDependencies":{"typescript":"^5.0.0"}}\n',
+        "go.mod": "module fixture\n\ngo 1.21\n",
+        "Cargo.toml": "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n[lints.clippy]\nall = \"warn\"\n",
     }
     for name, content in files.items(): (tmp_path / name).write_text(content)
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     store = IndexStore(conn); resolver = ResolutionService(conn)
     await RepositoryIndexer(store, resolution_service=resolver).index("repo", tmp_path, full_reindex=True)
-    return DeterministicPlanningService(CodeQueryService(store), repositories={"repo": {"repository_id": "repo", "workspace_id": "ws", "head": "abc", "generation": 1, "root": str(tmp_path), "verification": (("python", "-m", "pytest", "-q"),)}}), store
+    return DeterministicPlanningService(CodeQueryService(store), repositories={"repo": {"repository_id": "repo", "workspace_id": "ws", "head": "abc", "generation": 1, "root": str(tmp_path), "trusted_verification": ({"language": "python", "argv": ("python", "-m", "pytest", "-q"), "type": "unit-test", "source": "pyproject"},)}}), store
 
 
 @pytest.mark.asyncio
