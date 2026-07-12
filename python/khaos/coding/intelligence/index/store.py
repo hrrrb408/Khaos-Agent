@@ -19,6 +19,9 @@ CREATE TABLE IF NOT EXISTS code_files (project_id TEXT NOT NULL, path TEXT NOT N
  content_hash TEXT NOT NULL, parser_version TEXT NOT NULL, parser_source TEXT NOT NULL DEFAULT 'legacy',
  metadata_json TEXT NOT NULL DEFAULT '{}', indexed_at REAL NOT NULL DEFAULT 0, generation INTEGER NOT NULL DEFAULT 0,
  path_role TEXT NOT NULL DEFAULT 'source',
+ test_subject_key TEXT NOT NULL DEFAULT '',
+ module_key TEXT NOT NULL DEFAULT '',
+ package_key TEXT NOT NULL DEFAULT '',
  PRIMARY KEY(project_id, path));
 CREATE TABLE IF NOT EXISTS code_symbols (project_id TEXT NOT NULL, path TEXT NOT NULL,
  name TEXT NOT NULL, kind TEXT NOT NULL, line INTEGER NOT NULL, signature TEXT,
@@ -29,7 +32,6 @@ CREATE TABLE IF NOT EXISTS code_calls (project_id TEXT NOT NULL, path TEXT NOT N
 CREATE TABLE IF NOT EXISTS code_references (project_id TEXT NOT NULL, path TEXT NOT NULL, ordinal INTEGER NOT NULL, payload_json NOT NULL, PRIMARY KEY(project_id,path,ordinal));
 CREATE TABLE IF NOT EXISTS code_diagnostics (project_id TEXT NOT NULL, path TEXT NOT NULL, ordinal INTEGER NOT NULL, payload_json NOT NULL, PRIMARY KEY(project_id,path,ordinal));
 CREATE INDEX IF NOT EXISTS idx_code_symbols_name ON code_symbols(project_id, name);
-CREATE INDEX IF NOT EXISTS idx_code_files_role ON code_files(project_id, path_role);
 """
 
 
@@ -45,15 +47,54 @@ class IndexStore:
     def _migrate(self) -> None:
         self._conn.executescript(SCHEMA)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(code_files)")}
-        additions = {"parser_source": "TEXT NOT NULL DEFAULT 'legacy'", "metadata_json": "TEXT NOT NULL DEFAULT '{}'", "indexed_at": "REAL NOT NULL DEFAULT 0", "generation": "INTEGER NOT NULL DEFAULT 0", "path_role": "TEXT NOT NULL DEFAULT 'source'"}
+        additions = {
+            "parser_source": "TEXT NOT NULL DEFAULT 'legacy'",
+            "metadata_json": "TEXT NOT NULL DEFAULT '{}'",
+            "indexed_at": "REAL NOT NULL DEFAULT 0",
+            "generation": "INTEGER NOT NULL DEFAULT 0",
+            "path_role": "TEXT NOT NULL DEFAULT 'source'",
+            "test_subject_key": "TEXT NOT NULL DEFAULT ''",
+            "module_key": "TEXT NOT NULL DEFAULT ''",
+            "package_key": "TEXT NOT NULL DEFAULT ''",
+        }
         for name, declaration in additions.items():
             if name not in columns:
                 self._conn.execute(f"ALTER TABLE code_files ADD COLUMN {name} {declaration}")
-        # Ensure the path_role index exists even on pre-existing databases
+        # Ensure indexes exist even on pre-existing databases
         self._conn.execute("CREATE INDEX IF NOT EXISTS idx_code_files_role ON code_files(project_id, path_role)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_code_files_subject ON code_files(project_id, test_subject_key)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_code_files_module ON code_files(project_id, module_key)")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS idx_code_files_package ON code_files(project_id, package_key)")
         for table, column in (("code_symbols", "payload_json"), ("code_imports", "payload_json")):
             if column not in {row[1] for row in self._conn.execute(f"PRAGMA table_info({table})")}:
                 self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'")
+        # --- Idempotent backfill migration for path_role and key columns ---
+        # Old databases that had rows before path_role/test_subject_key/module_key/
+        # package_key were added need backfill so associated_tests() works
+        # without requiring a full reindex.
+        # PRAGMA user_version tracks whether backfill has run:
+        #   0 = not yet backfilled
+        #   1 = path_role + keys backfilled
+        current_version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if current_version < 1:
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+                rows = self._conn.execute("SELECT path FROM code_files").fetchall()
+                for row in rows:
+                    path = row[0]
+                    role = _classify_path_role(path)
+                    subject = _compute_test_subject_key(path)
+                    module = _compute_module_key(path)
+                    package = _compute_package_key(path)
+                    self._conn.execute(
+                        "UPDATE code_files SET path_role=?, test_subject_key=?, module_key=?, package_key=? WHERE path=?",
+                        (role, subject, module, package, path),
+                    )
+                self._conn.execute("PRAGMA user_version = 1")
+                self._conn.commit()
+            except sqlite3.DatabaseError:
+                self._conn.rollback()
+                raise
         self._conn.commit()
 
     async def close(self) -> None:
@@ -74,6 +115,9 @@ class IndexStore:
         safe = result.to_dict(include_duration=True)
         metadata_json = json.dumps({"parser_source": result.parser_source, "parser_version": result.parser_version, "metadata": safe["metadata"], "diagnostics": safe["diagnostics"]}, ensure_ascii=False, sort_keys=True)
         path_role = _classify_path_role(path)
+        test_subject_key = _compute_test_subject_key(path)
+        module_key = _compute_module_key(path)
+        package_key = _compute_package_key(path)
         async with self._lock:
             if self._closed:
                 raise RuntimeError("IndexStore is closed")
@@ -81,7 +125,7 @@ class IndexStore:
                 self._conn.execute("BEGIN IMMEDIATE")
                 for table in ("code_symbols", "code_imports", "code_calls", "code_references", "code_diagnostics", "code_files"):
                     self._conn.execute(f"DELETE FROM {table} WHERE project_id=? AND path=?", (project_id, path))
-                self._conn.execute("INSERT INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (project_id, path, result.language, size, mtime_ns, result.content_hash, result.parser_version, result.parser_source, metadata_json, time.time(), generation, path_role))
+                self._conn.execute("INSERT INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (project_id, path, result.language, size, mtime_ns, result.content_hash, result.parser_version, result.parser_source, metadata_json, time.time(), generation, path_role, test_subject_key, module_key, package_key))
                 self._conn.executemany("INSERT INTO code_symbols VALUES (?,?,?,?,?,?,?,?)", [(project_id, path, item.name, item.kind, item.location.start_line + 1, item.metadata.get("signature"), item.source, json.dumps(item_to_dict(item), ensure_ascii=False, sort_keys=True)) for item in result.symbols])
                 self._conn.executemany("INSERT INTO code_imports VALUES (?,?,?,?)", [(project_id, path, item.module, json.dumps(item_to_dict(item), ensure_ascii=False, sort_keys=True)) for item in result.imports])
                 for table, items in (("code_calls", result.calls), ("code_references", result.references), ("code_diagnostics", result.diagnostics)):
@@ -172,3 +216,70 @@ def _classify_path_role(path: str) -> str:
         if part in ("fixtures", "__fixtures__", "testdata", "test_data"):
             return "fixture"
     return "source"
+
+
+def _compute_test_subject_key(path: str) -> str:
+    """Compute the subject key of a test file for association matching.
+
+    For a test file like ``test_auth.py``, the subject key is ``auth`` —
+    the stem with test prefixes/suffixes stripped. For non-test files,
+    returns ``""`` (no subject key).
+
+    This key is used by :meth:`CodeQueryService.associated_tests` Priority 2
+    to match test files against target files by subject (not by arbitrary
+    path-role equality).
+    """
+    normalized = path.replace("\\", "/")
+    filename = normalized.split("/")[-1]
+    stem = filename.rsplit(".", 1)[0] if "." in filename else filename
+    # Strip test_ prefix
+    if stem.startswith("test_"):
+        return stem[5:]
+    if stem.startswith("test-"):
+        return stem[5:]
+    # Strip _test suffix
+    if stem.endswith("_test"):
+        return stem[:-5]
+    if stem.endswith("-test"):
+        return stem[:-5]
+    if stem.endswith("_spec"):
+        return stem[:-5]
+    if stem.endswith("-spec"):
+        return stem[:-5]
+    # Go: foo_test.go → foo
+    if filename.endswith("_test.go"):
+        return stem[:-5] if stem.endswith("_test") else stem
+    # Not a test file — no subject key
+    return ""
+
+
+def _compute_module_key(path: str) -> str:
+    """Compute the module key of a file for association matching.
+
+    The module key is the path without extension, using ``/`` separators.
+    For example, ``auth/login.py`` → ``auth/login``.
+
+    This key is used by :meth:`CodeQueryService.associated_tests` Priority 2
+    to match test files against target files by module path.
+    """
+    normalized = path.replace("\\", "/")
+    # Strip extension
+    if "." in normalized.split("/")[-1]:
+        return normalized.rsplit(".", 1)[0]
+    return normalized
+
+
+def _compute_package_key(path: str) -> str:
+    """Compute the package key of a file for association matching.
+
+    The package key is the top-level directory of the file.
+    For example, ``auth/login.py`` → ``auth``, ``tests/test_auth.py`` → ``tests``.
+
+    This key is used by :meth:`CodeQueryService.associated_tests` Priority 2
+    to match test files against target files by package.
+    """
+    normalized = path.replace("\\", "/")
+    parts = [p for p in normalized.split("/") if p]
+    if len(parts) <= 1:
+        return ""
+    return parts[0]
