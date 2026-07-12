@@ -89,6 +89,14 @@ class CodeQueryService:
         """Return stable reverse import/call/reference dependencies."""
         return reverse_dependency_files(self.store._conn, project_id, path)
 
+    def reverse_imports_to(self, project_id: str, path: str) -> list[dict[str, Any]]:
+        """Return only resolved import edges targeting ``path``."""
+        rows = self.store._conn.execute(
+            "SELECT source_file,import_module,imported_name,alias,status,confidence,reason,target_symbol_id FROM resolved_imports WHERE repository_id=? AND target_file=? ORDER BY source_file,import_module,imported_name,alias",
+            (project_id, path),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def symbol_by_stable_id(self, project_id: str, stable_symbol_id: str) -> dict[str, Any] | None:
         row = self.store._conn.execute(
             "SELECT * FROM repository_symbols WHERE repository_id=? AND stable_symbol_id=?",

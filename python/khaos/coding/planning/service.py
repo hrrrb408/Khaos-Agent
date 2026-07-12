@@ -74,7 +74,8 @@ class DeterministicPlanningService:
                 if len(files) > max_files or len(seen) > max_symbols: truncated=True; break
             if truncated: break
         for target_file in sorted(target_files or tuple({item.get("path", "") for sid in target_symbols for item in [self._query.symbol_by_stable_id(repository_id, sid) or {}] if item})):
-            for source in self._query.reverse_dependency_files(repository_id, target_file):
+            for import_edge in self._query.reverse_imports_to(repository_id, target_file):
+                source=str(import_edge["source_file"])
                 if source in files and any(item.source_file == source for item in direct + indirect): continue
                 record=self._query.file_evidence(repository_id, source) or {}; ev=PlanEvidence("resolution-graph",repository_id,source,generation=record.get("generation"),content_hash=record.get("content_hash"),query=target_file,confidence=.9)
                 relation="re-export" if source.endswith(("__init__.py","index.js","index.ts")) else "reverse-import"
