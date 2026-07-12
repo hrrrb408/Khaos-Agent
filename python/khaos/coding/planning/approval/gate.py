@@ -323,136 +323,17 @@ class PlanExecutionGate:
     # Consume (atomic; revalidates live state, single-use, epoch-bound)
     # ------------------------------------------------------------------
 
-    def require_authorization(
-        self,
-        authorization_id: str,
-        nonce: str,
-        *,
-        expected_plan_id: str,
-        expected_task_id: str,
-        expected_workspace_id: str,
-        expected_repository_id: str,
-    ) -> PlanExecutionAuthorization:
-        """Verify + consume a single-use authorization.
-
-        Enforces (spec §6 + §3/§4):
-
-        * Authorization exists, is ACTIVE, scope matches.
-        * Nonce verifies (constant-time).
-        * Not expired; server_epoch matches current boot.
-        * LIVE plan revalidation via :class:`PlanLiveValidator` — any drift
-          (HEAD/generation/file/symbol/config/destination/binding) refuses
-          consumption.
-        * The approval request is still APPROVED/NOT_REQUIRED.
-
-        On success the authorization AND its request flip to CONSUMED in one
-        atomic transaction. Raises on any failure; never returns a context.
+    def require_authorization(self, *args, **kwargs) -> PlanExecutionAuthorization:
+        """DISABLED (Batch 2.3 §2). Public authorization consume without a
+        workspace lease is forbidden — it bypasses workspace exclusivity and
+        the TOCTOU-safe lease-first consume. Use :meth:`acquire_lease` instead,
+        which atomically acquires a lease AND consumes the authorization in
+        one transaction. Batch 3 callers receive an AuthorizedExecutionContext
+        + WorkspaceExecutionLease, never a bare PlanExecutionAuthorization.
         """
-        auth = self._store.get_authorization(authorization_id)
-        if auth is None:
-            raise AuthorizationMismatchError("unknown authorization id")
-        if auth.plan_id != expected_plan_id:
-            raise AuthorizationMismatchError("plan id mismatch")
-        if auth.task_id != expected_task_id:
-            raise AuthorizationMismatchError("task id mismatch")
-        if auth.workspace_id != expected_workspace_id:
-            raise AuthorizationMismatchError("workspace id mismatch")
-        if auth.repository_id != expected_repository_id:
-            raise AuthorizationMismatchError("repository id mismatch")
-        if auth.status == AuthorizationStatus.CONSUMED:
-            raise AuthorizationAlreadyConsumedError("authorization already consumed")
-        if auth.status == AuthorizationStatus.REVOKED:
-            raise AuthorizationRevokedError("authorization revoked")
-        now = float(self._clock())
-        if auth.status == AuthorizationStatus.EXPIRED or now >= auth.expires_at:
-            raise AuthorizationExpiredError("authorization expired")
-
-        # --- LIVE revalidation at consume time (§6) ---
-        # Resolve the authoritative plan and re-validate. Drift → refuse.
-        try:
-            ctx = self._validator.validate(
-                expected_plan_id,
-                expected_repository_id=expected_repository_id,
-                expected_task_id=expected_task_id,
-                expected_workspace_id=expected_workspace_id,
-            )
-        except _ValidatorStale as exc:
-            # Drift since mint — refuse, mark stale, audit.
-            self._mark_authorization_stale(auth, now, str(exc))
-            raise AuthorizationMismatchError(f"live drift at consume: {exc}") from exc
-        except _ValidatorNotRequestable as exc:
-            self._mark_authorization_stale(auth, now, str(exc))
-            raise PlanBlockedError(f"plan no longer executable: {exc}") from exc
-
-        # The plan's current binding digest must equal the authorization's.
-        if ctx.binding_digest != auth.binding_digest:
-            self._mark_authorization_stale(auth, now, "binding drift at consume")
-            raise AuthorizationMismatchError("binding drift since mint")
-
-        # Atomic consume: authorization → CONSUMED AND request → CONSUMED.
-        audit = PlanApprovalAuditEvent(
-            event_id=new_event_id(),
-            event_type="plan-authorization:consumed",
-            approval_request_id=auth.approval_request_id,
-            plan_id=auth.plan_id,
-            previous_status=PlanApprovalStatus.APPROVED.value
-            if auth.approval_request_id
-            else PlanApprovalStatus.NOT_REQUIRED.value,
-            new_status=PlanApprovalStatus.CONSUMED.value,
-            actor_id="gate", actor_type="system",
-            authenticated_source="gate",
-            timestamp=now, reason_code="authorization-consumed",
-            task_id=auth.task_id, workspace_id=auth.workspace_id,
-            repository_id=auth.repository_id,
-            correlation_id=authorization_id,
-        )
-        ok = self._store.consume_authorization_with_request(
-            authorization_id,
-            nonce=nonce,
-            expected_plan_id=expected_plan_id,
-            expected_task_id=expected_task_id,
-            expected_workspace_id=expected_workspace_id,
-            expected_repository_id=expected_repository_id,
-            expected_binding_digest=auth.binding_digest,
-            current_server_epoch=self._server_epoch,
-            audit_event=audit,
-            now=now,
-        )
-        if not ok:
-            refreshed = self._store.get_authorization(authorization_id)
-            if refreshed is None:
-                raise AuthorizationMismatchError("authorization vanished")
-            if refreshed.status == AuthorizationStatus.CONSUMED:
-                raise AuthorizationAlreadyConsumedError("authorization already consumed")
-            if refreshed.status == AuthorizationStatus.REVOKED:
-                raise AuthorizationRevokedError(
-                    "authorization revoked (epoch rotation or task cancel)"
-                )
-            if refreshed.status == AuthorizationStatus.EXPIRED:
-                raise AuthorizationExpiredError("authorization expired")
-            raise AuthorizationMismatchError(
-                "authorization consume failed (nonce/scope/binding/epoch mismatch)"
-            )
-        logger.info(
-            "consumed authorization %s for plan %s (request → consumed)",
-            authorization_id, expected_plan_id,
-        )
-        return PlanExecutionAuthorization(
-            authorization_id=auth.authorization_id,
-            approval_request_id=auth.approval_request_id,
-            plan_id=auth.plan_id,
-            plan_content_hash=auth.plan_content_hash,
-            repository_id=auth.repository_id,
-            task_id=auth.task_id,
-            workspace_id=auth.workspace_id,
-            base_sha=auth.base_sha,
-            repository_generation=auth.repository_generation,
-            issued_at=auth.issued_at,
-            expires_at=auth.expires_at,
-            nonce=nonce,
-            nonce_hash=auth.nonce_hash,
-            status=AuthorizationStatus.CONSUMED,
-            binding_digest=auth.binding_digest,
+        raise PermissionError(
+            "public require_authorization is disabled; "
+            "use PlanExecutionGate.acquire_lease for lease-first atomic consume"
         )
 
     def _mark_authorization_stale(
@@ -505,79 +386,167 @@ class PlanExecutionGate:
         expected_repository_id: str,
         owner_execution_id: str,
     ) -> tuple[PlanExecutionAuthorization, "WorkspaceExecutionLease"]:
-        """Atomically acquire an exclusive workspace lease AND consume the
-        authorization in ONE transaction sequence.
+        """Lease-first atomic consume: the ONLY public execution entry point.
 
-        This is the TOCTOU-safe consume entry point (Batch 2.2 §7). It:
-        1. Runs live validation (inside the lease's scope).
-        2. Acquires the exclusive workspace lease (partial unique index
-           prevents two concurrent leases on the same workspace).
-        3. Atomically consumes the authorization + request.
-        4. Binds the lease to the consumed authorization.
+        Batch 2.3 §1: ONE ``BEGIN IMMEDIATE`` (via
+        :meth:`PlanApprovalStore.acquire_execution_lease_and_consume`) does
+        ALL of: verify authorization (ACTIVE/scope/nonce/epoch/expiry/binding),
+        verify request (APPROVED/NOT_REQUIRED), confirm no existing ACTIVE
+        lease on the workspace, insert the ACTIVE lease, consume the
+        authorization, consume the request, write audit → COMMIT. Any step
+        failing rolls back entirely (auth stays ACTIVE, no lease, no audit).
 
-        Returns ``(consumed_authorization, lease)``. Raises if any step fails.
+        Live validation runs BEFORE the atomic transaction (the plan is
+        resolved from the authoritative repository by plan_id). If drift is
+        detected the authorization is invalidated and no consume happens.
+
+        Returns ``(consumed_authorization, lease)``.
         """
         import uuid as _uuid
 
-        # First run the existing require_authorization (which does live
-        # validation + atomic consume). This consumes the authorization.
-        consumed = self.require_authorization(
-            authorization_id, nonce,
-            expected_plan_id=expected_plan_id,
-            expected_task_id=expected_task_id,
-            expected_workspace_id=expected_workspace_id,
-            expected_repository_id=expected_repository_id,
-        )
-        # Now acquire the lease. The lease holds HEAD + generation + binding
-        # at this instant; any concurrent change is mutually exclusive.
+        # --- LIVE validation (before the atomic transaction) ---
+        auth = self._store.get_authorization(authorization_id)
+        if auth is None:
+            raise AuthorizationMismatchError("unknown authorization id")
+        if auth.plan_id != expected_plan_id or auth.task_id != expected_task_id:
+            raise AuthorizationMismatchError("scope mismatch")
+        if auth.workspace_id != expected_workspace_id or auth.repository_id != expected_repository_id:
+            raise AuthorizationMismatchError("scope mismatch")
+        if auth.status == AuthorizationStatus.CONSUMED:
+            raise AuthorizationAlreadyConsumedError("authorization already consumed")
+        if auth.status == AuthorizationStatus.REVOKED:
+            raise AuthorizationRevokedError("authorization revoked")
         now = float(self._clock())
+        if auth.status == AuthorizationStatus.EXPIRED or now >= auth.expires_at:
+            raise AuthorizationExpiredError("authorization expired")
+
+        # Revalidate the authoritative plan live.
+        try:
+            ctx = self._validator.validate(
+                expected_plan_id,
+                expected_repository_id=expected_repository_id,
+                expected_task_id=expected_task_id,
+                expected_workspace_id=expected_workspace_id,
+            )
+        except _ValidatorStale as exc:
+            self._mark_authorization_stale(auth, now, str(exc))
+            raise AuthorizationMismatchError(f"live drift: {exc}") from exc
+        except _ValidatorNotRequestable as exc:
+            self._mark_authorization_stale(auth, now, str(exc))
+            raise PlanBlockedError(f"plan no longer executable: {exc}") from exc
+        if ctx.binding_digest != auth.binding_digest:
+            self._mark_authorization_stale(auth, now, "binding drift")
+            raise AuthorizationMismatchError("binding drift since mint")
+
+        # --- Reap expired leases so a stale one doesn't block the workspace ---
+        self._store.reap_expired_leases(now=now)
+
+        # --- The single atomic transaction ---
+        lease_id = f"lease_{_uuid.uuid4().hex}"
         state = self._context_provider.current_state(
             repository_id=expected_repository_id,
             task_id=expected_task_id,
             workspace_id=expected_workspace_id,
         )
-        lease_id = f"lease_{_uuid.uuid4().hex}"
-        ok = self._store.acquire_lease(
+        audit = PlanApprovalAuditEvent(
+            event_id=new_event_id(),
+            event_type="plan-authorization:lease-consumed",
+            approval_request_id=auth.approval_request_id,
+            plan_id=auth.plan_id,
+            previous_status=PlanApprovalStatus.APPROVED.value,
+            new_status=PlanApprovalStatus.CONSUMED.value,
+            actor_id="gate", actor_type="system",
+            authenticated_source="gate",
+            timestamp=now, reason_code="lease-acquired",
+            task_id=auth.task_id, workspace_id=auth.workspace_id,
+            repository_id=auth.repository_id,
+            correlation_id=lease_id,
+        )
+        ok = self._store.acquire_execution_lease_and_consume(
+            authorization_id=authorization_id,
+            nonce=nonce,
+            expected_plan_id=expected_plan_id,
+            expected_task_id=expected_task_id,
+            expected_workspace_id=expected_workspace_id,
+            expected_repository_id=expected_repository_id,
+            expected_binding_digest=auth.binding_digest,
+            current_server_epoch=self._server_epoch,
             lease_id=lease_id,
-            task_id=expected_task_id,
-            workspace_id=expected_workspace_id,
-            repository_id=expected_repository_id,
-            plan_id=expected_plan_id,
+            owner_execution_id=owner_execution_id,
             head_sha=state.head_sha,
             repository_generation=state.repository_generation,
-            evidence_digest=consumed.binding_digest,
-            binding_digest=consumed.binding_digest,
-            authorization_id=authorization_id,
-            owner_execution_id=owner_execution_id,
-            expiry=now + self._policy.authorization_ttl_seconds,
+            evidence_digest=auth.binding_digest,
+            audit_event=audit,
             now=now,
         )
         if not ok:
+            # The consume failed. Re-read to classify the cause.
+            refreshed = self._store.get_authorization(authorization_id)
+            if refreshed is not None and refreshed.status == AuthorizationStatus.CONSUMED:
+                raise AuthorizationAlreadyConsumedError("authorization already consumed")
+            # Check if a conflicting lease blocked us.
+            if self._store.count_active_leases_for_workspace(expected_workspace_id) > 0:
+                raise AuthorizationMismatchError(
+                    "workspace already holds an active execution lease"
+                )
             raise AuthorizationMismatchError(
-                "workspace already holds an active execution lease"
+                "lease-first consume failed (nonce/scope/binding/epoch/lease-conflict)"
             )
         from khaos.coding.planning.approval.models import WorkspaceExecutionLease
 
+        consumed = PlanExecutionAuthorization(
+            authorization_id=auth.authorization_id,
+            approval_request_id=auth.approval_request_id,
+            plan_id=auth.plan_id, plan_content_hash=auth.plan_content_hash,
+            repository_id=auth.repository_id, task_id=auth.task_id,
+            workspace_id=auth.workspace_id, base_sha=auth.base_sha,
+            repository_generation=auth.repository_generation,
+            issued_at=auth.issued_at, expires_at=auth.expires_at,
+            nonce=nonce, nonce_hash=auth.nonce_hash,
+            status=AuthorizationStatus.CONSUMED,
+            binding_digest=auth.binding_digest,
+        )
         lease = WorkspaceExecutionLease(
             lease_id=lease_id,
-            task_id=expected_task_id,
-            workspace_id=expected_workspace_id,
-            repository_id=expected_repository_id,
-            plan_id=expected_plan_id,
+            task_id=expected_task_id, workspace_id=expected_workspace_id,
+            repository_id=expected_repository_id, plan_id=expected_plan_id,
             head_sha=state.head_sha,
             repository_generation=state.repository_generation,
-            evidence_digest=consumed.binding_digest,
-            binding_digest=consumed.binding_digest,
+            evidence_digest=auth.binding_digest, binding_digest=auth.binding_digest,
             authorization_id=authorization_id,
-            expiry=now + self._policy.authorization_ttl_seconds,
-            owner_execution_id=owner_execution_id,
+            expiry=auth.expires_at, owner_execution_id=owner_execution_id,
             status="active",
         )
         logger.info(
-            "acquired lease %s for workspace %s (auth %s)",
+            "lease-first consume: lease %s for workspace %s (auth %s)",
             lease_id, expected_workspace_id, authorization_id,
         )
         return consumed, lease
+
+    def require_active_lease(
+        self,
+        lease_id: str,
+        *,
+        owner_execution_id: str,
+        expected_task_id: str,
+        expected_workspace_id: str,
+        expected_repository_id: str,
+        expected_plan_id: str,
+    ) -> bool:
+        """Verify a lease is active and valid before any Batch 3 workspace
+        operation. Every planned edit / tool / verification / ChangeSet entry
+        must call this first."""
+        now = float(self._clock())
+        return self._store.require_active_lease(
+            lease_id,
+            owner_execution_id=owner_execution_id,
+            expected_task_id=expected_task_id,
+            expected_workspace_id=expected_workspace_id,
+            expected_repository_id=expected_repository_id,
+            expected_plan_id=expected_plan_id,
+            current_server_epoch=self._server_epoch,
+            now=now,
+        )
 
     def release_lease(self, lease_id: str) -> bool:
         """Release an execution lease (Batch 3 calls this when execution ends)."""

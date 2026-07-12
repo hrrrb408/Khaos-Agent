@@ -349,6 +349,7 @@ CREATE TABLE IF NOT EXISTS plan_execution_leases (
     expiry                REAL NOT NULL,
     owner_execution_id    TEXT NOT NULL,
     status                TEXT NOT NULL DEFAULT 'active',
+    server_epoch          INTEGER NOT NULL DEFAULT 0,
     created_at            REAL NOT NULL
 );
 

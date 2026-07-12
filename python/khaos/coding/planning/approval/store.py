@@ -225,6 +225,7 @@ CREATE TABLE IF NOT EXISTS plan_execution_leases (
     expiry                REAL NOT NULL,
     owner_execution_id    TEXT NOT NULL,
     status                TEXT NOT NULL DEFAULT 'active',
+    server_epoch          INTEGER NOT NULL DEFAULT 0,
     created_at            REAL NOT NULL
 );
 
@@ -274,6 +275,12 @@ def _post_schema(conn: sqlite3.Connection) -> None:
     ):
         if col not in receipt_cols:
             conn.execute(f"ALTER TABLE plan_approval_receipts ADD COLUMN {col} {decl}")
+    # Batch 2.3: add server_epoch to the leases table for old 2.2 databases.
+    lease_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_execution_leases)")}
+    if "server_epoch" not in lease_cols:
+        conn.execute(
+            "ALTER TABLE plan_execution_leases ADD COLUMN server_epoch INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 class ApprovalTransitionResult(str, Enum):
@@ -1376,6 +1383,13 @@ class PlanApprovalStore:
                 (AuthorizationStatus.REVOKED.value, AuthorizationStatus.ACTIVE.value, new_epoch),
             )
             revoked = int(cur.rowcount or 0)
+            # Batch 2.3: also release all ACTIVE leases from prior epochs so a
+            # restart does not leave stale leases permanently blocking a workspace.
+            self._conn.execute(
+                "UPDATE plan_execution_leases SET status = 'expired' "
+                "WHERE status = 'active' AND server_epoch != ?",
+                (new_epoch,),
+            )
             self._conn.commit()
             return new_epoch, new_boot_id, revoked
         except Exception:
@@ -1455,21 +1469,23 @@ class PlanApprovalStore:
         now: float | None = None,
     ) -> ApprovalTransitionResult:
         """Atomically transition a request AND revoke all its ACTIVE
-        authorizations in ONE ``BEGIN IMMEDIATE``.
+        authorizations AND release all its ACTIVE leases in ONE
+        ``BEGIN IMMEDIATE`` (Batch 2.3 §8).
 
         Replaces the non-atomic compositions in revoke / invalidate_for_task
         / _mark_authorization_stale. Guarantees no request=stale/revoked/
-        expired can coexist with an active authorization.
+        expired can coexist with an active authorization OR an active lease.
         """
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute(
-                "SELECT status FROM plan_approval_requests WHERE approval_request_id = ?",
+                "SELECT status, workspace_id FROM plan_approval_requests WHERE approval_request_id = ?",
                 (request_id,),
             ).fetchone()
             if row is None:
                 self._conn.rollback()
                 return ApprovalTransitionResult.NOT_FOUND
+            workspace_id = row["workspace_id"]
             current = PlanApprovalStatus(row["status"])
             if current == target_status:
                 # Still revoke any stray active authorizations (idempotent).
@@ -1477,6 +1493,12 @@ class PlanApprovalStore:
                     "UPDATE plan_execution_authorizations SET status = ? "
                     "WHERE approval_request_id = ? AND status = ?",
                     (AuthorizationStatus.REVOKED.value, request_id, AuthorizationStatus.ACTIVE.value),
+                )
+                # Batch 2.3: also release any active leases on this workspace.
+                self._conn.execute(
+                    "UPDATE plan_execution_leases SET status = 'expired' "
+                    "WHERE workspace_id = ? AND status = 'active'",
+                    (workspace_id,),
                 )
                 if audit_event is not None:
                     self._conn.execute(
@@ -1515,6 +1537,12 @@ class PlanApprovalStore:
                 "UPDATE plan_execution_authorizations SET status = ? "
                 "WHERE approval_request_id = ? AND status = ?",
                 (AuthorizationStatus.REVOKED.value, request_id, AuthorizationStatus.ACTIVE.value),
+            )
+            # Batch 2.3: release all active leases on this workspace too.
+            self._conn.execute(
+                "UPDATE plan_execution_leases SET status = 'expired' "
+                "WHERE workspace_id = ? AND status = 'active'",
+                (workspace_id,),
             )
             if audit_event is not None:
                 self._conn.execute(
@@ -1561,6 +1589,7 @@ class PlanApprovalStore:
         authorization_id: str,
         owner_execution_id: str,
         expiry: float,
+        server_epoch: int = 0,
         now: float | None = None,
     ) -> bool:
         """Atomically acquire an exclusive workspace execution lease.
@@ -1576,13 +1605,13 @@ class PlanApprovalStore:
                 INSERT INTO plan_execution_leases (
                     lease_id, task_id, workspace_id, repository_id, plan_id,
                     head_sha, repository_generation, evidence_digest, binding_digest,
-                    authorization_id, expiry, owner_execution_id, status, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?)
+                    authorization_id, expiry, owner_execution_id, status, server_epoch, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
                 """,
                 (
                     lease_id, task_id, workspace_id, repository_id, plan_id,
                     head_sha, int(repository_generation), evidence_digest, binding_digest,
-                    authorization_id, float(expiry), owner_execution_id, now,
+                    authorization_id, float(expiry), owner_execution_id, int(server_epoch), now,
                 ),
             )
             self._conn.commit()
@@ -1613,6 +1642,229 @@ class PlanApprovalStore:
             "SELECT * FROM plan_execution_leases WHERE lease_id = ?",
             (lease_id,),
         ).fetchone()
+
+    # ------------------------------------------------------------------
+    # Lease-first atomic consume (Batch 2.3 §1) — the single transaction
+    # ------------------------------------------------------------------
+
+    def acquire_execution_lease_and_consume(
+        self,
+        *,
+        authorization_id: str,
+        nonce: str,
+        expected_plan_id: str,
+        expected_task_id: str,
+        expected_workspace_id: str,
+        expected_repository_id: str,
+        expected_binding_digest: str,
+        current_server_epoch: int,
+        lease_id: str,
+        owner_execution_id: str,
+        head_sha: str,
+        repository_generation: int,
+        evidence_digest: str,
+        audit_event: "PlanApprovalAuditEvent | None",
+        now: float,
+    ) -> bool:
+        """Lease-first atomic consume: ONE ``BEGIN IMMEDIATE`` does ALL of:
+
+        1. Read authorization; verify ACTIVE, scope, nonce, epoch, expiry, binding.
+        2. Read approval request; verify APPROVED/NOT_REQUIRED.
+        3. Confirm workspace has NO existing ACTIVE lease (else rollback).
+        4. Insert ACTIVE lease (stamped with current epoch).
+        5. Authorization → CONSUMED.
+        6. Request → CONSUMED.
+        7. Insert audit event.
+        8. COMMIT.
+
+        Any step failing rolls back the ENTIRE transaction: the authorization
+        stays ACTIVE, the request stays APPROVED/NOT_REQUIRED, no lease row
+        exists, no audit row exists. This closes the TOCTOU between consume
+        and lease-acquire that the old two-step path had.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            # 1. Read + verify the authorization.
+            auth_row = self._conn.execute(
+                "SELECT * FROM plan_execution_authorizations WHERE authorization_id = ?",
+                (authorization_id,),
+            ).fetchone()
+            if auth_row is None:
+                self._conn.rollback()
+                return False
+            if auth_row["status"] != AuthorizationStatus.ACTIVE.value:
+                self._conn.rollback()
+                return False
+            if (
+                auth_row["plan_id"] != expected_plan_id
+                or auth_row["task_id"] != expected_task_id
+                or auth_row["workspace_id"] != expected_workspace_id
+                or auth_row["repository_id"] != expected_repository_id
+            ):
+                self._conn.rollback()
+                return False
+            if int(auth_row["server_epoch"]) != int(current_server_epoch):
+                self._conn.rollback()
+                return False
+            if not verify_nonce(nonce, auth_row["nonce_hash"]):
+                self._conn.rollback()
+                return False
+            if now >= float(auth_row["expires_at"]):
+                self._conn.rollback()
+                return False
+            if auth_row["binding_digest"] != expected_binding_digest:
+                self._conn.rollback()
+                return False
+
+            # 2. Read + verify the approval request.
+            req_row = self._conn.execute(
+                "SELECT status FROM plan_approval_requests WHERE approval_request_id = ?",
+                (auth_row["approval_request_id"],),
+            ).fetchone()
+            if req_row is None:
+                self._conn.rollback()
+                return False
+            req_status = PlanApprovalStatus(req_row["status"])
+            if req_status not in (PlanApprovalStatus.APPROVED, PlanApprovalStatus.NOT_REQUIRED):
+                self._conn.rollback()
+                return False
+
+            # 3 + 4. Insert the ACTIVE lease. The partial unique index
+            # uq_plan_execution_leases_active_workspace makes a conflicting
+            # ACTIVE lease raise IntegrityError → rollback (no consume).
+            self._conn.execute(
+                """
+                INSERT INTO plan_execution_leases (
+                    lease_id, task_id, workspace_id, repository_id, plan_id,
+                    head_sha, repository_generation, evidence_digest, binding_digest,
+                    authorization_id, expiry, owner_execution_id, status, server_epoch, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                """,
+                (
+                    lease_id, expected_task_id, expected_workspace_id, expected_repository_id,
+                    expected_plan_id, head_sha, int(repository_generation),
+                    evidence_digest, expected_binding_digest, authorization_id,
+                    float(auth_row["expires_at"]), owner_execution_id,
+                    int(current_server_epoch), now,
+                ),
+            )
+
+            # 5. Authorization → CONSUMED.
+            self._conn.execute(
+                "UPDATE plan_execution_authorizations SET status = ? WHERE authorization_id = ?",
+                (AuthorizationStatus.CONSUMED.value, authorization_id),
+            )
+            # 6. Request → CONSUMED.
+            self._conn.execute(
+                "UPDATE plan_approval_requests SET status = ? WHERE approval_request_id = ?",
+                (PlanApprovalStatus.CONSUMED.value, auth_row["approval_request_id"]),
+            )
+            # 7. Audit.
+            if audit_event is not None:
+                self._conn.execute(
+                    """
+                    INSERT INTO plan_approval_audit_events (
+                        event_id, event_type, approval_request_id, plan_id, previous_status,
+                        new_status, actor_id, actor_type, authenticated_source, timestamp,
+                        reason_code, task_id, workspace_id, repository_id, correlation_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        audit_event.event_id, audit_event.event_type,
+                        audit_event.approval_request_id, audit_event.plan_id,
+                        audit_event.previous_status, audit_event.new_status,
+                        audit_event.actor_id, audit_event.actor_type,
+                        audit_event.authenticated_source, float(audit_event.timestamp),
+                        audit_event.reason_code, audit_event.task_id,
+                        audit_event.workspace_id, audit_event.repository_id,
+                        audit_event.correlation_id,
+                    ),
+                )
+            # 8. COMMIT.
+            self._conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            # A conflicting ACTIVE lease already holds this workspace.
+            self._conn.rollback()
+            return False
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def require_active_lease(
+        self,
+        lease_id: str,
+        *,
+        owner_execution_id: str,
+        expected_task_id: str,
+        expected_workspace_id: str,
+        expected_repository_id: str,
+        expected_plan_id: str,
+        current_server_epoch: int,
+        now: float,
+    ) -> bool:
+        """Verify a lease is ACTIVE, owned by the caller, scope-correct,
+        unexpired, and bound to the current boot epoch.
+
+        Every Batch 3 execution entry must call this BEFORE touching the
+        workspace. Returns True if the lease is valid; False otherwise.
+        """
+        row = self._conn.execute(
+            "SELECT * FROM plan_execution_leases WHERE lease_id = ?",
+            (lease_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] != "active":
+            return False
+        if now >= float(row["expiry"]):
+            # Auto-expire the stale lease so it doesn't permanently block.
+            self._conn.execute(
+                "UPDATE plan_execution_leases SET status = 'expired' WHERE lease_id = ?",
+                (lease_id,),
+            )
+            self._conn.commit()
+            return False
+        if row["owner_execution_id"] != owner_execution_id:
+            return False
+        if (
+            row["task_id"] != expected_task_id
+            or row["workspace_id"] != expected_workspace_id
+            or row["repository_id"] != expected_repository_id
+            or row["plan_id"] != expected_plan_id
+        ):
+            return False
+        if int(row["server_epoch"]) != int(current_server_epoch):
+            return False
+        return True
+
+    def count_active_leases_for_workspace(self, workspace_id: str) -> int:
+        """Return the count of ACTIVE leases on a workspace (invariant check)."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM plan_execution_leases WHERE workspace_id = ? AND status = 'active'",
+            (workspace_id,),
+        ).fetchone()
+        return int(row["c"]) if row else 0
+
+    def reap_expired_leases(self, *, now: float) -> int:
+        """Expire every ACTIVE lease whose TTL has elapsed (§3 item 6/7).
+
+        Returns the count reaped. Called periodically or before any lease
+        acquire so an expired lease doesn't permanently block a workspace.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_execution_leases SET status = 'expired' "
+                "WHERE status = 'active' AND expiry < ?",
+                (float(now),),
+            )
+            count = int(cur.rowcount or 0)
+            self._conn.commit()
+            return count
+        except Exception:
+            self._conn.rollback()
+            raise
 
 
 def new_authorization_id() -> str:

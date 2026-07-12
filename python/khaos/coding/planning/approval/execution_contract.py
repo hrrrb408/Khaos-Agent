@@ -112,21 +112,26 @@ class PlannedExecutionGuard:
         expected_task_id: str,
         expected_workspace_id: str,
         expected_repository_id: str,
+        owner_execution_id: str = "exec_default",
     ) -> AuthorizedExecutionContext:
-        """Consume an authorization and return the execution context.
+        """Lease-first consume: acquire an execution lease AND consume the
+        authorization, returning the execution context + lease.
 
-        Thin wrapper over :meth:`PlanExecutionGate.require_authorization`.
+        Batch 2.3: delegates to :meth:`PlanExecutionGate.acquire_lease` — the
+        ONLY public consume entry point. A bare PlanExecutionAuthorization is
+        never returned to Batch 3 callers.
         """
-        auth = self._gate.require_authorization(
-            authorization_id,
-            nonce,
+        consumed, lease = self._gate.acquire_lease(
+            authorization_id=authorization_id,
+            nonce=nonce,
             expected_plan_id=expected_plan_id,
             expected_task_id=expected_task_id,
             expected_workspace_id=expected_workspace_id,
             expected_repository_id=expected_repository_id,
+            owner_execution_id=owner_execution_id,
         )
         return AuthorizedExecutionContext(
-            authorization=auth,
+            authorization=consumed,
             plan_id=expected_plan_id,
             task_id=expected_task_id,
             workspace_id=expected_workspace_id,
