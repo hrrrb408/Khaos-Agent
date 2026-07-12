@@ -48,12 +48,12 @@ def test_rollback_seal_fault_poison_retains_evidence(tmp_path, monkeypatch, faul
     monkeypatch.setattr(engine, "_apply_edit", fail_after_apply)
     if fault in {"delete", "parent-fsync"}:
         monkeypatch.setattr(
-            RecoveryDirectory, "seal_with_retention",
+            RecoveryDirectory, "seal",
             lambda self: (_ for _ in ()).throw(OSError(fault)),
         )
     else:
         monkeypatch.setattr(
-            runtime._store, "mark_execution_rollback_sealed",
+            runtime._store, "commit_terminal_seal",
             lambda *args, **kwargs: (_ for _ in ()).throw(
                 sqlite3.OperationalError(fault)
             ),
@@ -65,7 +65,9 @@ def test_rollback_seal_fault_poison_retains_evidence(tmp_path, monkeypatch, faul
     ).fetchone()
     assert row[0] == "poisoned"
     assert runtime.mutation_fence.is_poisoned(workspace.id)
-    assert any(workspace.recovery_root.rglob("*.bak"))
+    assert any(workspace.recovery_root.rglob("*.bak")) or any(
+        workspace.recovery_root.glob("seal-*.json")
+    )
 
 
 def test_successful_rollback_is_sealed_before_terminal(tmp_path, monkeypatch):

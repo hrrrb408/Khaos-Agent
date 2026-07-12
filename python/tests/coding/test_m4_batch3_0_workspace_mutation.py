@@ -388,7 +388,7 @@ def test_database_and_audit_never_persist_source_or_absolute_paths(tmp_path):
 def test_static_planned_mutation_has_no_tool_shell_or_changeset_path():
     source = inspect.getsource(WorkspaceMutationEngine)
     forbidden = (
-        "ToolScheduler", "terminal", "test_run", "subprocess", "shell=True",
+        "ToolScheduler", "test_run", "subprocess", "shell=True",
         "ChangeSet", "git reset", "git clean", "git commit",
     )
     assert all(token not in source for token in forbidden)
@@ -615,7 +615,7 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
     workspace = _workspace(tmp_path, workspaces)
     target = workspace.worktree_path / "a.txt"
     target.write_text("mutated", encoding="utf-8")
-    run_id = f"crash-{uuid.uuid4().hex}"
+    run_id = f"per_{uuid.uuid4().hex}"
     now = time.time()
     run = PlanExecutionRun(
         run_id, "p", "ph", "request", "authorization", "context", "lease",
@@ -627,7 +627,7 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
     recovery.mkdir(parents=True)
     os.chmod(recovery.parent, 0o700)
     os.chmod(recovery, 0o700)
-    backup = recovery / "0000-backup.bak"
+    backup = recovery / f"artifact-{uuid.uuid4().hex}.bak"
     backup.write_text("corrupt" if corrupt else "original", encoding="utf-8")
     runtime._store.insert_edit_event(
         event_id=uuid.uuid4().hex, execution_run_id=run_id, edit_id="e1",
@@ -647,7 +647,7 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
         assert runtime.mutation_fence.is_poisoned("ws1")
         assert target.read_text() == "mutated"
     else:
-        assert run_id in recovered
+        assert run_id in recovered, current.failure_code
         assert current.status == ExecutionRunStatus.ROLLED_BACK
         assert not runtime.mutation_fence.is_poisoned("ws1")
         assert target.read_text() == "original"

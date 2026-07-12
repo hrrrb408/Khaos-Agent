@@ -97,7 +97,7 @@ def test_durable_phase_journal_fault_uses_disk_state_for_rollback(tmp_path, monk
 def test_recovery_seal_crash_boundaries_are_deterministic(tmp_path, boundary):
     runtime, _, manager, _ = _real_runtime(tmp_path)
     workspace = _workspace(tmp_path, manager)
-    run_id = f"seal-{uuid.uuid4().hex}"
+    run_id = f"per_{uuid.uuid4().hex}"
     now = time.time()
     status = ExecutionRunStatus.MUTATING if boundary == "before-sealing" else ExecutionRunStatus.SEALING
     run = PlanExecutionRun(
@@ -308,7 +308,7 @@ def test_scoped_recovery_does_not_clear_unrelated_poison(tmp_path):
     workspace = _workspace(tmp_path, manager)
     runtime.mutation_fence.poison("ws1", "lease-release", owner="lease:l1")
     runtime._store.add_workspace_poison_scope("ws1", owner="lease:l1", reason="lease-release")
-    run_id = f"scope-{uuid.uuid4().hex}"; now = time.time()
+    run_id = f"per_{uuid.uuid4().hex}"; now = time.time()
     runtime._store.create_execution_run(PlanExecutionRun(
         run_id, "p", "h", "r", f"a-{run_id}", f"c-{run_id}", "l", "task1",
         "ws1", "repo", "abc123", 1, "b", "d", ExecutionRunStatus.SEALING,
@@ -325,7 +325,7 @@ def test_scoped_recovery_does_not_clear_unrelated_poison(tmp_path):
 def test_recovery_root_symlink_is_fail_closed(tmp_path):
     runtime, _, manager, _ = _real_runtime(tmp_path)
     workspace = _workspace(tmp_path, manager)
-    run_id = f"symlink-{uuid.uuid4().hex}"; now = time.time()
+    run_id = f"per_{uuid.uuid4().hex}"; now = time.time()
     runtime._store.create_execution_run(PlanExecutionRun(
         run_id, "p", "h", "r", f"a-{run_id}", f"c-{run_id}", "l", "task1",
         "ws1", "repo", "abc123", 1, "b", "d", ExecutionRunStatus.MUTATING,
