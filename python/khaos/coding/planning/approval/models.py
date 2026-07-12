@@ -340,19 +340,23 @@ def compute_reason_digest(reason: str) -> str:
 class AuthenticatedApprovalContext:
     """The ONLY sanctioned carrier of actor identity into the broker.
 
-    This may ONLY be constructed by the authenticated API/session layer (a
-    real login, RPC auth context, or test factory that explicitly simulates
-    one). The broker accepts this object — it does NOT accept bare
-    ``actor_id`` / ``authenticated_source`` strings, so a caller cannot
-    self-assert an authenticated identity.
+    Batch 2.3 §5: a plain dataclass construction does NOT produce a valid
+    context — the ``signature`` field must be a server-owned HMAC computed by
+    :class:`ApprovalAuthenticator.issue_context`. A hand-constructed context
+    has an empty/invalid signature and is rejected by the broker's
+    ``verify_context`` check.
 
-    Fields are intentionally minimal and verifiable:
+    Fields:
     * ``actor_id`` — the authenticated principal.
     * ``actor_type`` — "user" / "admin" / "system-service".
     * ``session_request_id`` — the authenticating session or request id.
     * ``authenticated_source`` — the mechanism ("api", "rpc", "session").
     * ``authentication_time`` — when the session authenticated (epoch seconds).
-    * ``server_capability`` — the capability token granting approval rights.
+    * ``server_capability`` — the capability granting approval rights.
+    * ``context_nonce`` — random nonce unique to this context (anti-replay).
+    * ``issued_at`` / ``expires_at`` — context validity window.
+    * ``signature`` — server-owned HMAC over all the above. Empty by default;
+      only ``ApprovalAuthenticator.issue_context`` can compute a valid one.
     """
 
     actor_id: str
@@ -361,14 +365,120 @@ class AuthenticatedApprovalContext:
     authenticated_source: str
     authentication_time: float
     server_capability: str
+    context_nonce: str
+    issued_at: float
+    expires_at: float
+    signature: str = ""  # empty unless minted by ApprovalAuthenticator
 
     def __post_init__(self) -> None:
-        # Reject empty/placeholder identities — an authenticated context must
-        # carry real values, not blanks a caller could smuggle through.
-        for field_name in ("actor_id", "actor_type", "session_request_id", "authenticated_source", "server_capability"):
+        for field_name in ("actor_id", "actor_type", "session_request_id", "authenticated_source", "server_capability", "context_nonce"):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"AuthenticatedApprovalContext.{field_name} must be a non-empty string")
+
+    def signing_payload(self) -> str:
+        """The canonical payload over which the HMAC signature is computed."""
+        return "|".join([
+            self.actor_id, self.actor_type, self.session_request_id,
+            self.authenticated_source, self.server_capability,
+            self.context_nonce,
+            f"{self.authentication_time:.6f}",
+            f"{self.issued_at:.6f}",
+            f"{self.expires_at:.6f}",
+        ])
+
+
+class ApprovalAuthenticator:
+    """Server-owned HMAC signer for :class:`AuthenticatedApprovalContext`.
+
+    Holds a secret key generated at construction (or supplied for test
+    reproducibility). ``issue_context`` is the ONLY way to produce a context
+    with a valid signature. The broker holds a reference to the authenticator
+    and calls ``verify_context`` before accepting any decision.
+
+    A caller who constructs ``AuthenticatedApprovalContext(actor_id="admin",
+    ...)`` directly gets ``signature=""`` which fails verification — there is
+    no way to compute a valid HMAC without the server's key.
+    """
+
+    CAPABILITY_PLAN_APPROVAL = "plan-execution-approve"
+
+    def __init__(self, secret_key: str | None = None) -> None:
+        self._key = secret_key or secrets.token_hex(32)
+
+    @property
+    def secret_key(self) -> str:
+        return self._key
+
+    def issue_context(
+        self,
+        *,
+        actor_id: str,
+        actor_type: str,
+        session_request_id: str,
+        authenticated_source: str = "api",
+        capability: str = CAPABILITY_PLAN_APPROVAL,
+        ttl_seconds: float = 300.0,
+        now: float | None = None,
+    ) -> AuthenticatedApprovalContext:
+        """Mint a signed AuthenticatedApprovalContext.
+
+        The caller supplies the authenticated session identity (which a real
+        API/session layer has already verified). This method adds the
+        server-owned HMAC signature that prevents forgery.
+        """
+        import time as _time
+
+        now = _time.time() if now is None else now
+        ctx = AuthenticatedApprovalContext(
+            actor_id=actor_id,
+            actor_type=actor_type,
+            session_request_id=session_request_id,
+            authenticated_source=authenticated_source,
+            authentication_time=now,
+            server_capability=capability,
+            context_nonce=secrets.token_hex(16),
+            issued_at=now,
+            expires_at=now + ttl_seconds,
+        )
+        sig = self._sign(ctx.signing_payload())
+        # frozen dataclass — use object.__setattr__ to set the signature.
+        object.__setattr__(ctx, "signature", sig)
+        return ctx
+
+    def verify_context(
+        self,
+        ctx: AuthenticatedApprovalContext,
+        *,
+        expected_capability: str = CAPABILITY_PLAN_APPROVAL,
+        now: float | None = None,
+    ) -> bool:
+        """Verify a context's signature, capability, and expiry.
+
+        Returns True only if:
+        * The HMAC signature matches (constant-time).
+        * The capability matches ``expected_capability``.
+        * The context has not expired.
+        * The signature is non-empty (a hand-constructed context has "").
+        """
+        import time as _time
+
+        if not ctx.signature:
+            return False
+        now = _time.time() if now is None else now
+        if now >= ctx.expires_at:
+            return False
+        if ctx.server_capability != expected_capability:
+            return False
+        expected_sig = self._sign(ctx.signing_payload())
+        return hmac.compare_digest(ctx.signature, expected_sig)
+
+    def _sign(self, payload: str) -> str:
+        import hmac as _hmac
+
+        return _hmac.new(
+            self._key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
+        ).hexdigest()
 
 
 # ---------------------------------------------------------------------------

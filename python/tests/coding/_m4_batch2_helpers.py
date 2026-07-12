@@ -166,14 +166,15 @@ def make_plan(
 class SyncBroker:
     """Synchronous wrapper around the real async ApprovalBroker.
 
-    ``register_plan_approval`` and ``resolve_plan_approval`` drive the real
-    broker via a private event loop so tests exercise genuine broker logic
-    (concurrency serialization, idempotency, conflict) without per-test
-    asyncio boilerplate.
+    Batch 2.3: wired with an ApprovalAuthenticator so plan-approval decisions
+    can be signed and verified. ``register_plan_approval`` and
+    ``resolve_plan_approval`` drive the real broker via a private event loop.
     """
 
-    def __init__(self):
-        self._real = ApprovalBroker()
+    def __init__(self, authenticator=None):
+        from khaos.coding.planning.approval.models import ApprovalAuthenticator
+        self._authenticator = authenticator or ApprovalAuthenticator()
+        self._real = ApprovalBroker(authenticator=self._authenticator)
         self._loop = asyncio.new_event_loop()
 
     @property
@@ -262,31 +263,31 @@ def broker_decide(
     actor_type: str = "user",
     authenticated_source: str = "api",
     session_request_id: str = "sess_test",
-    server_capability: str = "approve-plan-execution",
     binding_digest: str | None = None,
     reason: str = "",
 ) -> BrokerDecisionReceipt | None:
     """Drive the real broker to resolve a decision and persist its receipt.
 
-    Builds an :class:`AuthenticatedApprovalContext` (the ONLY sanctioned
-    carrier of actor identity) and passes it to the broker. Returns the
-    minted :class:`BrokerDecisionReceipt`, or ``None`` if the broker refused.
+    Batch 2.3: uses the broker's wired ApprovalAuthenticator to issue a
+    SIGNED AuthenticatedApprovalContext. A hand-constructed context would be
+    rejected. The receipt sink passes the store's writer_capability so
+    insert_receipt accepts the row.
     """
-    from khaos.coding.planning.approval.models import AuthenticatedApprovalContext
+    from khaos.coding.planning.approval.models import ApprovalAuthenticator
 
-    import time as _time
-
-    ctx = AuthenticatedApprovalContext(
+    # Use the broker's authenticator to issue a signed context.
+    authenticator = broker._authenticator if isinstance(broker, SyncBroker) else broker._authenticator
+    ctx = authenticator.issue_context(
         actor_id=actor_id, actor_type=actor_type,
         session_request_id=session_request_id,
         authenticated_source=authenticated_source,
-        authentication_time=_time.time(),
-        server_capability=server_capability,
+        capability=ApprovalAuthenticator.CAPABILITY_PLAN_APPROVAL,
     )
     bd = binding_digest if binding_digest is not None else request.binding_digest
+    writer_cap = store.receipt_writer_token
 
     def sink(**kw):
-        store.insert_receipt(**kw)
+        store.insert_receipt(writer_capability=writer_cap, **kw)
 
     if isinstance(broker, SyncBroker):
         return broker.resolve_plan_approval(

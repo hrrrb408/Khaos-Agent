@@ -184,9 +184,13 @@ class PlanApprovalService:
     def plan_repository(self) -> PlanRepository:
         return self._plan_repository
 
-    def register_plan(self, plan: "ImplementationPlan") -> None:
-        """Register the authoritative plan snapshot (used by tests / wiring)."""
-        self._plan_repository.register(plan)  # type: ignore[attr-defined]
+    def register_plan(self, plan: "ImplementationPlan") -> bool:
+        """Register the authoritative plan snapshot. Returns False if a
+        snapshot with the same plan_id but different content_hash already
+        exists (refused — use a new plan_id)."""
+        result = self._plan_repository.register(plan)  # type: ignore[attr-defined]
+        # In-memory PlanSnapshotStore.register returns None; treat as success.
+        return True if result is None else bool(result)
 
     # ------------------------------------------------------------------
     # Validation (delegates to the shared PlanLiveValidator)
@@ -230,7 +234,13 @@ class PlanApprovalService:
         """
         ctx = self._validate_for_approval(plan)
         # Register the authoritative snapshot so the gate can resolve it later.
-        self.register_plan(plan)
+        # Batch 2.3 §9: if the plan_id is already registered with DIFFERENT
+        # content, refuse to create the request (no silent overwrite).
+        if not self.register_plan(plan):
+            raise PlanApprovalError(
+                f"plan_id {plan.plan_id} is already registered with different "
+                "content; use a new plan_id or explicit revision"
+            )
 
         existing = self._store.find_request_by_plan_binding(plan.plan_id, ctx.binding_digest)
         if existing is not None and not existing.status.is_terminal:

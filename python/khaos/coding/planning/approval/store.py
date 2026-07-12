@@ -27,6 +27,7 @@ Batch 2.1 hardening:
 from __future__ import annotations
 
 import json
+import secrets
 import sqlite3
 import time
 import uuid
@@ -307,6 +308,15 @@ class PlanApprovalStore:
         self._conn = conn
         self._conn.row_factory = sqlite3.Row
         self.ensure_schema()
+        # Batch 2.3 §6: a server-owned capability token that only the broker
+        # receives. insert_receipt refuses to run without it, so ordinary
+        # store callers cannot create receipt rows.
+        self._receipt_writer_token = secrets.token_hex(16)
+
+    @property
+    def receipt_writer_token(self) -> str:
+        """The capability token the broker needs to write receipt rows."""
+        return self._receipt_writer_token
 
     # ------------------------------------------------------------------
     # Schema bootstrap
@@ -342,17 +352,29 @@ class PlanApprovalStore:
         expires_at: float,
         created_at: float | None = None,
         now: float | None = None,
+        writer_capability: str = "",
     ) -> None:
         """Persist a broker-decision receipt outbox row with ALL authoritative fields.
 
-        Called by the broker's receipt_sink at resolve time. Only the broker
-        produces these rows, so a forged dataclass receipt cannot supply a
-        matching token hash OR matching authoritative fields.
+        Batch 2.3 §6: requires the store's ``receipt_writer_token`` (passed
+        as ``writer_capability``). Direct calls by ordinary store users →
+        PermissionError. Uses plain INSERT (not INSERT OR REPLACE) so a
+        receipt_id or token_hash conflict raises instead of silently
+        overwriting — a persisted decision cannot be rewritten.
         """
+        import hmac as _hmac
+
+        if not _hmac.compare_digest(writer_capability, self._receipt_writer_token):
+            raise PermissionError(
+                "insert_receipt requires the broker's writer_capability; "
+                "direct receipt writes by ordinary callers are forbidden"
+            )
         ts = float(created_at if created_at is not None else (now if now is not None else time.time()))
+        # Plain INSERT — refuses to overwrite an existing receipt_id or
+        # token_hash (both UNIQUE). A replay attempt raises IntegrityError.
         self._conn.execute(
             """
-            INSERT OR REPLACE INTO plan_approval_receipts (
+            INSERT INTO plan_approval_receipts (
                 receipt_id, token_hash, approval_request_id, broker_request_id,
                 binding_digest, decision, namespace, authenticated_actor_id,
                 authenticated_actor_type, authenticated_source, session_request_id,

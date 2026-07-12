@@ -49,7 +49,7 @@ class PlanApprovalOutcome:
 class ApprovalBroker:
     """One await/resolve channel keyed by tool call id."""
 
-    def __init__(self) -> None:
+    def __init__(self, authenticator=None) -> None:
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._decisions: dict[str, ApprovalDecision] = {}
         self._bindings: dict[str, tuple[str, float | None]] = {}
@@ -57,6 +57,10 @@ class ApprovalBroker:
         # Namespaced plan-execution approvals (disjoint key space).
         self._plan_approvals: dict[str, PlanApprovalRecord] = {}
         self._lock = asyncio.Lock()
+        # Batch 2.3 §5: server-owned authenticator for HMAC-verifying
+        # AuthenticatedApprovalContext signatures. If None, the broker
+        # refuses all plan-approval decisions (fail closed).
+        self._authenticator = authenticator
 
     async def bind(self, tool_call_id: str, approval_key: str, expiry: float | None = None) -> None:
         """Bind a pending approval to an immutable ChangeSet operation."""
@@ -242,6 +246,18 @@ class ApprovalBroker:
             raise TypeError(
                 "resolve_plan_approval requires an AuthenticatedApprovalContext; "
                 "bare actor strings are not accepted"
+            )
+        # Batch 2.3 §5: verify the server-owned HMAC signature. A
+        # hand-constructed context has signature="" → rejected. An
+        # authenticator MUST be wired or all decisions fail closed.
+        if self._authenticator is None:
+            raise PermissionError(
+                "broker has no ApprovalAuthenticator; plan-approval decisions are refused"
+            )
+        if not self._authenticator.verify_context(context):
+            raise PermissionError(
+                "AuthenticatedApprovalContext signature verification failed "
+                "(forged, tampered, expired, or wrong capability)"
             )
 
         now = (clock or _time.time)()
