@@ -158,36 +158,56 @@ class PlanApprovalService:
         store: PlanApprovalStore,
         broker: Any,
         context_provider: ContextProvider,
+        *,
+        runtime_capability: Any = None,
         plan_repository: PlanRepository | None = None,
         planning_service: Any | None = None,
         policy: ApprovalPolicy | None = None,
         clock: Any = time.time,
-        boot_context: Any = None,
     ) -> None:
+        # Batch 2.6 §2: production construction requires RuntimeCapability.
+        # No boot_context=None implicit test mode — test code must use the
+        # explicit UnsafeTestPlanApprovalService subclass in test helpers.
+        from khaos.coding.planning.approval.runtime import RuntimeCapability
+        if not isinstance(runtime_capability, RuntimeCapability):
+            raise TypeError(
+                "production PlanApprovalService requires RuntimeCapability "
+                "(obtain from ApprovalRuntime.initialize()); test code must "
+                "use UnsafeTestPlanApprovalService"
+            )
+        if plan_repository is None or not isinstance(plan_repository, PersistedPlanRepository):
+            raise TypeError("production PlanApprovalService requires PersistedPlanRepository")
+        if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
+            raise TypeError("production PlanApprovalService requires deep planning validator")
         self._store = store
         self._broker = broker
         self._context_provider = context_provider
         self._policy = policy or ApprovalPolicy()
         self._clock = clock
-        # Batch 2.5 §5: production construction requires a real
-        # PersistedPlanRepository and deep validator. The old defaults
-        # (PlanSnapshotStore / planning_service=None) are only acceptable
-        # when ``boot_context`` is None (test-only construction).
-        if boot_context is not None:
-            if plan_repository is None or not isinstance(plan_repository, PersistedPlanRepository):
-                raise TypeError("production PlanApprovalService requires PersistedPlanRepository")
-            if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
-                raise TypeError("production PlanApprovalService requires deep planning validator")
-            self._boot_context = boot_context
-        else:
-            self._boot_context = None
-        self._plan_repository = plan_repository or PlanSnapshotStore()
+        self._boot_context = runtime_capability.boot_context
+        self._plan_repository = plan_repository
         self._planning_service = planning_service
         self._validator = PlanLiveValidator(
             plan_repository=self._plan_repository,
             context_provider=context_provider,
             planning_service=planning_service,
         )
+
+    def _verify_boot(self) -> None:
+        """Batch 2.6 §2: verify persisted epoch + boot_id before every operation.
+
+        If another ApprovalRuntime has initialized (rotating the epoch), this
+        service's cached boot context is stale and all operations refuse.
+        """
+        if self._boot_context is None:
+            return  # test mode — no boot fence
+        persisted_epoch, persisted_boot_id = self._store.get_current_epoch()
+        if (persisted_epoch != self._boot_context.server_epoch
+                or persisted_boot_id != self._boot_context.boot_id):
+            raise RuntimeError(
+                "approval service boot context is stale "
+                "(another runtime initialized)"
+            )
 
     # ------------------------------------------------------------------
     # Expose the plan repository so callers can register authoritative snapshots
@@ -245,6 +265,8 @@ class PlanApprovalService:
            atomically flip ``registering → pending`` + attach
            ``broker_request_id``; on failure flip to ``registration-failed``.
         """
+        # Batch 2.6 §2: verify persisted boot before any operation.
+        self._verify_boot()
         ctx = self._validate_for_approval(plan)
         # Register the authoritative snapshot so the gate can resolve it later.
         # Batch 2.3 §9: if the plan_id is already registered with DIFFERENT
@@ -414,6 +436,8 @@ class PlanApprovalService:
                 "apply_broker_decision requires a BrokerDecisionReceipt; "
                 "forged dataclasses or bool inputs are refused"
             )
+        # Batch 2.6 §2: verify persisted boot before any operation.
+        self._verify_boot()
         if receipt.namespace != "plan-execution":
             raise UnauthenticatedReceiptError(
                 f"receipt namespace {receipt.namespace!r} is not plan-execution"
@@ -561,6 +585,8 @@ class PlanApprovalService:
 
         Returns a small summary ``{re-registered, staled, left-pending}``.
         """
+        # Batch 2.6 §2: verify persisted boot before any operation.
+        self._verify_boot()
         now = float(self._clock() if now is None else now)
         counts = {"re_registered": 0, "staled": 0, "left_pending": 0}
         for request in self._store.list_registering_or_pending():

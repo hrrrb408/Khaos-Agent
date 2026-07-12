@@ -40,6 +40,8 @@ from khaos.coding.planning.approval.service import ApprovalPolicy
 from _m4_batch2_helpers import (  # type: ignore[import-not-found]
     FakeContextProvider,
     SyncBroker,
+    UnsafeTestPlanApprovalService,
+    UnsafeTestPlanExecutionGate,
     approve_and_apply,
     broker_decide,
     high_risk,
@@ -291,7 +293,7 @@ def test_13_revoke_mint_race(tmp_path):
     repo = PlanSnapshotStore()
     service0 = type("S", (), {})  # placeholder
     from khaos.coding.planning.approval import PlanApprovalService
-    svc0 = PlanApprovalService(
+    svc0 = UnsafeTestPlanApprovalService(
         store=store0, broker=SyncBroker(), context_provider=FakeContextProvider(),
         plan_repository=repo,
     )
@@ -315,7 +317,7 @@ def test_13_revoke_mint_race(tmp_path):
         barrier.wait()
         conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30.0, isolation_level=None)
         store = PlanApprovalStore(conn)
-        service = PlanApprovalService(
+        service = UnsafeTestPlanApprovalService(
             store=store, broker=SyncBroker(), context_provider=FakeContextProvider(),
             plan_repository=repo,
         )
@@ -328,7 +330,7 @@ def test_13_revoke_mint_race(tmp_path):
         barrier.wait()
         conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30.0, isolation_level=None)
         store = PlanApprovalStore(conn)
-        gate = PlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=repo)
+        gate = UnsafeTestPlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=repo)
         try:
             gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
         except Exception:
@@ -596,7 +598,7 @@ def test_26_restart_recovers_pending_request(tmp_path):
     repo1 = PlanSnapshotStore()
     service1 = service = type("S", (), {})()  # placeholder
     from khaos.coding.planning.approval import PlanApprovalService
-    svc1 = PlanApprovalService(
+    svc1 = UnsafeTestPlanApprovalService(
         store=store1, broker=SyncBroker(), context_provider=FakeContextProvider(),
         plan_repository=repo1,
     )
@@ -608,7 +610,7 @@ def test_26_restart_recovers_pending_request(tmp_path):
     store2 = PlanApprovalStore(conn2)
     repo2 = PlanSnapshotStore()
     repo2.register(plan)
-    svc2 = PlanApprovalService(
+    svc2 = UnsafeTestPlanApprovalService(
         store=store2, broker=SyncBroker(), context_provider=FakeContextProvider(),
         plan_repository=repo2,
     )
@@ -699,7 +701,7 @@ def test_30_real_sqlite_concurrent_approve_mint_consume(tmp_path):
     broker0 = SyncBroker()
     svc0 = type("S", (), {"plan_repository": repo})  # not used directly
     from khaos.coding.planning.approval import PlanApprovalService
-    service0 = PlanApprovalService(
+    service0 = UnsafeTestPlanApprovalService(
         store=store0, broker=broker0, context_provider=FakeContextProvider(),
         plan_repository=repo,
     )
@@ -722,7 +724,7 @@ def test_30_real_sqlite_concurrent_approve_mint_consume(tmp_path):
         store = PlanApprovalStore(conn)
         repo_local = PlanSnapshotStore()
         repo_local.register(plan)
-        service = PlanApprovalService(
+        service = UnsafeTestPlanApprovalService(
             store=store, broker=SyncBroker(), context_provider=FakeContextProvider(),
             plan_repository=repo_local,
         )

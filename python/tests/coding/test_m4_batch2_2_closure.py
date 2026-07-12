@@ -40,6 +40,8 @@ from khaos.coding.planning.approval.models import (
 from _m4_batch2_helpers import (  # type: ignore[import-not-found]
     FakeContextProvider,
     SyncBroker,
+    UnsafeTestPlanApprovalService,
+    UnsafeTestPlanExecutionGate,
     approve_and_apply,
     broker_decide,
     high_risk,
@@ -132,14 +134,14 @@ def test_07_consecutive_restart_epoch_monotonic(tmp_path):
     db = tmp_path / "epoch.db"
     conn1 = sqlite3.connect(str(db))
     store1 = PlanApprovalStore(conn1)
-    gate1 = PlanExecutionGate(store=store1, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store1))
+    gate1 = UnsafeTestPlanExecutionGate(store=store1, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store1))
     gate1.rotate_epoch()
     e1 = gate1.server_epoch
     conn1.close()
 
     conn2 = sqlite3.connect(str(db))
     store2 = PlanApprovalStore(conn2)
-    gate2 = PlanExecutionGate(store=store2, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store2))
+    gate2 = UnsafeTestPlanExecutionGate(store=store2, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store2))
     gate2.rotate_epoch()
     e2 = gate2.server_epoch
     conn2.close()
@@ -178,10 +180,10 @@ def test_09_restart_old_authorization_rejected(tmp_path):
     conn1 = sqlite3.connect(str(db))
     store1 = PlanApprovalStore(conn1)
     repo1 = PersistedPlanRepository(store1)
-    service1 = PlanApprovalService(store=store1, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo1)
+    service1 = UnsafeTestPlanApprovalService(store=store1, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo1)
     plan = make_plan(risks=(low_risk(),), plan_id="p_restart_auth")
     request = service1.request_approval(plan)
-    gate1 = PlanExecutionGate(store=store1, context_provider=FakeContextProvider(), plan_repository=repo1)
+    gate1 = UnsafeTestPlanExecutionGate(store=store1, context_provider=FakeContextProvider(), plan_repository=repo1)
     gate1.rotate_epoch()
     auth = gate1.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     conn1.close()
@@ -189,7 +191,7 @@ def test_09_restart_old_authorization_rejected(tmp_path):
     conn2 = sqlite3.connect(str(db))
     store2 = PlanApprovalStore(conn2)
     repo2 = PersistedPlanRepository(store2)
-    gate2 = PlanExecutionGate(store=store2, context_provider=FakeContextProvider(), plan_repository=repo2)
+    gate2 = UnsafeTestPlanExecutionGate(store=store2, context_provider=FakeContextProvider(), plan_repository=repo2)
     gate2.rotate_epoch()  # new boot → old auth revoked
     from khaos.coding.planning.approval.gate import AuthorizationRevokedError
     with pytest.raises((AuthorizationMismatchError, AuthorizationRevokedError)):
@@ -209,7 +211,7 @@ def test_10_restart_pending_no_manual_plan_register(tmp_path):
     conn1 = sqlite3.connect(str(db))
     store1 = PlanApprovalStore(conn1)
     repo1 = PersistedPlanRepository(store1)
-    service1 = PlanApprovalService(store=store1, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo1)
+    service1 = UnsafeTestPlanApprovalService(store=store1, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo1)
     plan = make_plan(risks=(high_risk(),), plan_id="p_restart_pending")
     request = service1.request_approval(plan)
     conn1.close()
@@ -481,7 +483,7 @@ def test_25_broker_decision_not_invertible_across_restart(tmp_path):
     store1 = PlanApprovalStore(conn1)
     repo1 = PersistedPlanRepository(store1)
     broker1 = SyncBroker()
-    service1 = PlanApprovalService(store=store1, broker=broker1, context_provider=FakeContextProvider(), plan_repository=repo1)
+    service1 = UnsafeTestPlanApprovalService(store=store1, broker=broker1, context_provider=FakeContextProvider(), plan_repository=repo1)
     plan = make_plan(risks=(high_risk(),), plan_id="p_recovery")
     request = service1.request_approval(plan)
     import asyncio
@@ -501,7 +503,7 @@ def test_25_broker_decision_not_invertible_across_restart(tmp_path):
     store2 = PlanApprovalStore(conn2)
     repo2 = PersistedPlanRepository(store2)
     broker2 = SyncBroker()
-    service2 = PlanApprovalService(store=store2, broker=broker2, context_provider=FakeContextProvider(), plan_repository=repo2)
+    service2 = UnsafeTestPlanApprovalService(store=store2, broker=broker2, context_provider=FakeContextProvider(), plan_repository=repo2)
     # Re-register the broker record so a reject attempt can be made.
     asyncio.new_event_loop().run_until_complete(
         broker2.real.register_plan_approval(

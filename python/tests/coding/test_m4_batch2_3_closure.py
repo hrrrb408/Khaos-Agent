@@ -39,6 +39,8 @@ from khaos.coding.planning.approval.gate import (
 from _m4_batch2_helpers import (  # type: ignore[import-not-found]
     FakeContextProvider,
     SyncBroker,
+    UnsafeTestPlanApprovalService,
+    UnsafeTestPlanExecutionGate,
     approve_and_apply,
     broker_decide,
     high_risk,
@@ -279,9 +281,9 @@ def test_20_receipt_outbox_refuses_replace():
 def test_21_runtime_epoch_auto_rotate():
     """21. Gate.rotate_epoch increments the persisted epoch."""
     store = PlanApprovalStore(sqlite3.connect(":memory:"))
-    gate1 = PlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
+    gate1 = UnsafeTestPlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
     e1, _, _ = gate1.rotate_epoch()
-    gate2 = PlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
+    gate2 = UnsafeTestPlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
     e2, _, _ = gate2.rotate_epoch()
     assert e2 == e1 + 1
 
@@ -354,9 +356,9 @@ def test_27_task_cancel_vs_lease_acquire_concurrency(tmp_path):
     conn0 = sqlite3.connect(str(db), isolation_level=None)
     store0 = PlanApprovalStore(conn0)
     repo0 = PersistedPlanRepository(store0)
-    service0 = PlanApprovalService(store=store0, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo0)
+    service0 = UnsafeTestPlanApprovalService(store=store0, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo0)
     request = service0.request_approval(plan)
-    gate0 = PlanExecutionGate(store=store0, context_provider=FakeContextProvider(), plan_repository=repo0)
+    gate0 = UnsafeTestPlanExecutionGate(store=store0, context_provider=FakeContextProvider(), plan_repository=repo0)
     gate0.rotate_epoch()
     auth = gate0.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     conn0.close()
@@ -367,7 +369,7 @@ def test_27_task_cancel_vs_lease_acquire_concurrency(tmp_path):
         barrier.wait()
         conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30.0, isolation_level=None)
         store = PlanApprovalStore(conn)
-        service = PlanApprovalService(store=store, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
+        service = UnsafeTestPlanApprovalService(store=store, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
         try:
             service.invalidate_for_task(task_id=plan.task_id, reason="cancelled")
         finally:
@@ -377,7 +379,7 @@ def test_27_task_cancel_vs_lease_acquire_concurrency(tmp_path):
         barrier.wait()
         conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30.0, isolation_level=None)
         store = PlanApprovalStore(conn)
-        gate = PlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
+        gate = UnsafeTestPlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
         try:
             gate.acquire_lease(
                 authorization_id=auth.authorization_id, nonce=auth.nonce,
@@ -411,9 +413,9 @@ def test_30_concurrent_acquire_only_one_succeeds(tmp_path):
     conn0 = sqlite3.connect(str(db), isolation_level=None)
     store0 = PlanApprovalStore(conn0)
     repo0 = PersistedPlanRepository(store0)
-    service0 = PlanApprovalService(store=store0, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo0)
+    service0 = UnsafeTestPlanApprovalService(store=store0, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo0)
     request = service0.request_approval(plan)
-    gate0 = PlanExecutionGate(store=store0, context_provider=FakeContextProvider(), plan_repository=repo0)
+    gate0 = UnsafeTestPlanExecutionGate(store=store0, context_provider=FakeContextProvider(), plan_repository=repo0)
     gate0.rotate_epoch()
     auth = gate0.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     conn0.close()
@@ -422,10 +424,10 @@ def test_30_concurrent_acquire_only_one_succeeds(tmp_path):
     conn1 = sqlite3.connect(str(db), isolation_level=None)
     store1 = PlanApprovalStore(conn1)
     repo1 = PersistedPlanRepository(store1)
-    service1 = PlanApprovalService(store=store1, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo1)
+    service1 = UnsafeTestPlanApprovalService(store=store1, broker=SyncBroker(), context_provider=FakeContextProvider(), plan_repository=repo1)
     plan2 = make_plan(risks=(low_risk(),), plan_id="p_conc_lease2")
     request2 = service1.request_approval(plan2)
-    gate1 = PlanExecutionGate(store=store1, context_provider=FakeContextProvider(), plan_repository=repo1)
+    gate1 = UnsafeTestPlanExecutionGate(store=store1, context_provider=FakeContextProvider(), plan_repository=repo1)
     auth2 = gate1.authorize_execution(plan_id=plan2.plan_id, approval_request_id=request2.approval_request_id)
     conn1.close()
 
@@ -436,7 +438,7 @@ def test_30_concurrent_acquire_only_one_succeeds(tmp_path):
         barrier.wait()
         conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30.0, isolation_level=None)
         store = PlanApprovalStore(conn)
-        gate = PlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
+        gate = UnsafeTestPlanExecutionGate(store=store, context_provider=FakeContextProvider(), plan_repository=PersistedPlanRepository(store))
         try:
             gate.acquire_lease(
                 authorization_id=auth_obj.authorization_id, nonce=auth_obj.nonce,

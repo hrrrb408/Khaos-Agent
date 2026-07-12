@@ -107,31 +107,33 @@ class PlanExecutionGate:
         self,
         store: PlanApprovalStore,
         context_provider: "ContextProvider",
+        *,
+        runtime_capability: Any = None,
         plan_repository: PlanRepository | None = None,
         planning_service: Any | None = None,
         policy: GatePolicy | None = None,
         clock: Any = time.time,
-        boot_context: Any = None,
     ) -> None:
+        # Batch 2.6 §2: production construction requires RuntimeCapability.
+        # No boot_context=None implicit test mode — test code must use the
+        # explicit UnsafeTestPlanExecutionGate subclass in test helpers.
+        from khaos.coding.planning.approval.runtime import RuntimeCapability
+        if not isinstance(runtime_capability, RuntimeCapability):
+            raise TypeError(
+                "production PlanExecutionGate requires RuntimeCapability "
+                "(obtain from ApprovalRuntime.initialize()); test code must "
+                "use UnsafeTestPlanExecutionGate"
+            )
+        if plan_repository is None or not isinstance(plan_repository, PersistedPlanRepository):
+            raise TypeError("production PlanExecutionGate requires PersistedPlanRepository")
+        if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
+            raise TypeError("production PlanExecutionGate requires deep planning validator")
         self._store = store
         self._context_provider = context_provider
         self._policy = policy or GatePolicy()
         self._clock = clock
-        # Batch 2.5 §5: production construction requires a real
-        # PersistedPlanRepository and deep validator. The old defaults
-        # (PlanSnapshotStore / planning_service=None) are only acceptable
-        # when ``boot_context`` is None (test-only construction).
-        if boot_context is not None:
-            # Production path — fail closed on missing deps.
-            if plan_repository is None or not isinstance(plan_repository, PersistedPlanRepository):
-                raise TypeError("production PlanExecutionGate requires PersistedPlanRepository")
-            if planning_service is None or getattr(planning_service, "_unsafe_test_only", False):
-                raise TypeError("production PlanExecutionGate requires deep planning validator")
-            self._boot_context = boot_context
-        else:
-            # Test-only path — allow legacy defaults.
-            self._boot_context = None
-        self._plan_repository = plan_repository or PlanSnapshotStore()
+        self._boot_context = runtime_capability.boot_context
+        self._plan_repository = plan_repository
         # Batch 2.2 §3: epoch is persisted, not a fixed default. The gate
         # reads the current epoch at construction; rotate_epoch() increments
         # it atomically at startup. A fresh gate against the same DB sees the

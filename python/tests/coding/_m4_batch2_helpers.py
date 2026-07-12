@@ -209,6 +209,87 @@ class SyncBroker:
 # ---------------------------------------------------------------------------
 # Service / gate / broker wiring
 # ---------------------------------------------------------------------------
+# Batch 2.6 §2: production PlanExecutionGate / PlanApprovalService require
+# RuntimeCapability. Test code must use the explicit UnsafeTest* subclasses
+# below. These classes bypass the capability check and set _boot_context=None
+# so _verify_boot() is a no-op (no persisted boot fence in tests).
+
+
+import time as _time
+from khaos.coding.planning.approval.gate import GatePolicy, PlanLiveValidator
+from khaos.coding.planning.approval.repository import PlanSnapshotStore
+
+
+class UnsafeTestPlanExecutionGate(PlanExecutionGate):
+    """Test-only PlanExecutionGate that bypasses RuntimeCapability.
+
+    Lives in the test helper module — NOT exported from the production
+    package. Marks itself with ``_unsafe_test_only = True`` so production
+    constructors reject it.
+    """
+    _unsafe_test_only = True
+
+    def __init__(
+        self,
+        store,
+        context_provider,
+        *,
+        plan_repository=None,
+        planning_service=None,
+        policy=None,
+        clock=None,
+    ) -> None:
+        # Skip the production __init__ (which requires RuntimeCapability).
+        # Replicate the old test-mode construction directly.
+        self._store = store
+        self._context_provider = context_provider
+        self._policy = policy or GatePolicy()
+        self._clock = clock or _time.time
+        self._boot_context = None
+        self._plan_repository = plan_repository or PlanSnapshotStore()
+        self._server_epoch, self._boot_id = self._store.get_current_epoch()
+        self._validator = PlanLiveValidator(
+            plan_repository=self._plan_repository,
+            context_provider=context_provider,
+            planning_service=planning_service,
+        )
+
+
+class UnsafeTestPlanApprovalService(PlanApprovalService):
+    """Test-only PlanApprovalService that bypasses RuntimeCapability.
+
+    Lives in the test helper module — NOT exported from the production
+    package. Marks itself with ``_unsafe_test_only = True`` so production
+    constructors reject it.
+    """
+    _unsafe_test_only = True
+
+    def __init__(
+        self,
+        store,
+        broker,
+        context_provider,
+        *,
+        plan_repository=None,
+        planning_service=None,
+        policy=None,
+        clock=None,
+    ) -> None:
+        # Skip the production __init__ (which requires RuntimeCapability).
+        from khaos.coding.planning.approval.service import ApprovalPolicy
+        self._store = store
+        self._broker = broker
+        self._context_provider = context_provider
+        self._policy = policy or ApprovalPolicy()
+        self._clock = clock or _time.time
+        self._boot_context = None
+        self._plan_repository = plan_repository or PlanSnapshotStore()
+        self._planning_service = planning_service
+        self._validator = PlanLiveValidator(
+            plan_repository=self._plan_repository,
+            context_provider=context_provider,
+            planning_service=planning_service,
+        )
 
 
 def make_service(
@@ -232,7 +313,7 @@ def make_service(
         # Batch 2.2: default to the persisted repository so plan snapshots
         # survive restart and tests don't need manual repo.register(plan).
         plan_repository = PersistedPlanRepository(store)
-    service = PlanApprovalService(
+    service = UnsafeTestPlanApprovalService(
         store=store, broker=broker, context_provider=context,
         plan_repository=plan_repository, planning_service=None,
         policy=policy, clock=clock or __import__("time").time,
@@ -241,7 +322,7 @@ def make_service(
 
 
 def make_gate(*, store, context, plan_repository=None, policy=None, clock=None):
-    return PlanExecutionGate(
+    return UnsafeTestPlanExecutionGate(
         store=store, context_provider=context,
         plan_repository=plan_repository or PlanSnapshotStore(),
         policy=policy, clock=clock or __import__("time").time,

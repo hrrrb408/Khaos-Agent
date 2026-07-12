@@ -16,6 +16,23 @@ class BootContext:
     server_epoch: int
     boot_id: str
 
+
+@dataclass(frozen=True)
+class RuntimeCapability:
+    """Opaque capability token issued by :class:`ApprovalRuntime`.
+
+    Batch 2.6 §2: production :class:`PlanExecutionGate` and
+    :class:`PlanApprovalService` require this token at construction. It
+    carries the boot context so the gate/service can verify the persisted
+    epoch + boot_id on every operation (stale-runtime fence).
+
+    This class is intentionally NOT exported from the production package
+    ``__all__`` — only :class:`ApprovalRuntime` mints instances, and only
+    production Gate/Service consume them. Test code must use the explicit
+    ``UnsafeTest*`` subclasses in ``tests/coding/_m4_batch2_helpers.py``.
+    """
+    boot_context: BootContext
+
 class ApprovalRuntime:
     """Production bootstrap for the approval + lease runtime.
 
@@ -93,17 +110,18 @@ class ApprovalRuntime:
                 _writer, runtime_token=self._runtime_token,
             )
 
-            # 3. Construct Gate and Service
+            # 3. Construct Gate and Service (Batch 2.6 §2: pass RuntimeCapability)
+            capability = RuntimeCapability(boot_context=self.boot_context)
             self.gate = PlanExecutionGate(
                 store=self._store, context_provider=self._context_provider,
                 plan_repository=self._plan_repository, planning_service=self._planning_service,
-                boot_context=self.boot_context,
+                runtime_capability=capability,
             )
             self.service = PlanApprovalService(
                 store=self._store, broker=self._broker,
                 context_provider=self._context_provider,
                 plan_repository=self._plan_repository, planning_service=self._planning_service,
-                boot_context=self.boot_context,
+                runtime_capability=capability,
             )
 
             # 4. Reconcile pending approvals

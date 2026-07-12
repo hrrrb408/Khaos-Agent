@@ -563,61 +563,80 @@ def test_14_cleaned_workspace_has_no_active_lease():
 
 
 def test_15_direct_gate_construction_without_runtime_capability_refuses():
-    """PlanExecutionGate with boot_context but missing deps → TypeError."""
+    """PlanExecutionGate without RuntimeCapability → TypeError (Batch 2.6 §2)."""
+    from khaos.coding.planning.approval.runtime import RuntimeCapability
     store = _store()
-    # boot_context present but plan_repository is PlanSnapshotStore (not persisted).
+    # No runtime_capability at all — the primary §2 fence.
     with pytest.raises(TypeError):
         PlanExecutionGate(
             store=store, context_provider=FakeContextProvider(),
-            plan_repository=PlanSnapshotStore(),
-            boot_context=BootContext(server_epoch=1, boot_id="x"),
+            plan_repository=PersistedPlanRepository(store),
+            planning_service=DeepFakePlanningService(),
         )
-    # boot_context present but planning_service is None.
+    # runtime_capability present but plan_repository is PlanSnapshotStore.
+    cap = RuntimeCapability(boot_context=BootContext(server_epoch=1, boot_id="x"))
     with pytest.raises(TypeError):
         PlanExecutionGate(
             store=store, context_provider=FakeContextProvider(),
+            runtime_capability=cap,
+            plan_repository=PlanSnapshotStore(),
+            planning_service=DeepFakePlanningService(),
+        )
+    # runtime_capability present but planning_service is None.
+    with pytest.raises(TypeError):
+        PlanExecutionGate(
+            store=store, context_provider=FakeContextProvider(),
+            runtime_capability=cap,
             plan_repository=PersistedPlanRepository(store),
             planning_service=None,
-            boot_context=BootContext(server_epoch=1, boot_id="x"),
         )
-    # boot_context present but planning_service is the unsafe test validator.
+    # runtime_capability present but planning_service is the unsafe test validator.
     with pytest.raises(TypeError):
         PlanExecutionGate(
             store=store, context_provider=FakeContextProvider(),
+            runtime_capability=cap,
             plan_repository=PersistedPlanRepository(store),
             planning_service=ShallowTestPlanValidator(),
-            boot_context=BootContext(server_epoch=1, boot_id="x"),
         )
 
 
 def test_16_direct_service_construction_without_deep_validator_refuses():
-    """PlanApprovalService with boot_context but missing deep validator → TypeError."""
+    """PlanApprovalService without RuntimeCapability → TypeError (Batch 2.6 §2)."""
+    from khaos.coding.planning.approval.runtime import RuntimeCapability
     store = _store()
     sync = SyncBroker()
-    # Missing planning_service.
+    # No runtime_capability at all.
     with pytest.raises(TypeError):
         PlanApprovalService(
             store=store, broker=sync.real, context_provider=FakeContextProvider(),
-            plan_repository=PersistedPlanRepository(store), planning_service=None,
-            boot_context=BootContext(server_epoch=1, boot_id="x"),
+            plan_repository=PersistedPlanRepository(store), planning_service=DeepFakePlanningService(),
         )
-    # UnsafeTestPlanRepository.
+    cap = RuntimeCapability(boot_context=BootContext(server_epoch=1, boot_id="x"))
+    # runtime_capability present but planning_service is None.
     with pytest.raises(TypeError):
         PlanApprovalService(
             store=store, broker=sync.real, context_provider=FakeContextProvider(),
+            runtime_capability=cap,
+            plan_repository=PersistedPlanRepository(store), planning_service=None,
+        )
+    # runtime_capability present but plan_repository is UnsafeTestPlanRepository.
+    with pytest.raises(TypeError):
+        PlanApprovalService(
+            store=store, broker=sync.real, context_provider=FakeContextProvider(),
+            runtime_capability=cap,
             plan_repository=UnsafeTestPlanRepository(),
             planning_service=DeepFakePlanningService(),
-            boot_context=BootContext(server_epoch=1, boot_id="x"),
         )
 
 
 def test_17_top_level_api_does_not_expose_unsafe_repository():
-    """The approval package __all__ must not export UnsafeTestPlanRepository
-    or PlanSnapshotStore as production options."""
+    """The approval package __all__ must not export UnsafeTestPlanRepository,
+    PlanSnapshotStore, or RuntimeCapability (Batch 2.6 §2)."""
     from khaos.coding.planning.approval import __all__ as approval_all
 
     assert "UnsafeTestPlanRepository" not in approval_all
     assert "PlanSnapshotStore" not in approval_all
+    assert "RuntimeCapability" not in approval_all
 
 
 # ===========================================================================

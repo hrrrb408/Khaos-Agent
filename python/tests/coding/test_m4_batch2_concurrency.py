@@ -32,6 +32,8 @@ from khaos.coding.planning.approval.service import ApprovalPolicy
 from _m4_batch2_helpers import (  # type: ignore[import-not-found]
     FakeContextProvider,
     SyncBroker,
+    UnsafeTestPlanApprovalService,
+    UnsafeTestPlanExecutionGate,
     broker_decide,
     high_risk,
     low_risk,
@@ -77,7 +79,7 @@ def _seed(db_path, *, plan_id="plan_conc", risks=None):
     conn = sqlite3.connect(str(db_path), check_same_thread=False, isolation_level=None)
     store = PlanApprovalStore(conn)
     repo = PlanSnapshotStore()
-    service = PlanApprovalService(
+    service = UnsafeTestPlanApprovalService(
         store=store, broker=SyncBroker(), context_provider=_Ctx(),
         plan_repository=repo,
         policy=ApprovalPolicy(pending_ttl_seconds=3600, approved_ttl_seconds=3600),
@@ -123,7 +125,7 @@ def test_two_concurrent_approves_only_one_wins(tmp_path):
         store = PlanApprovalStore(conn)
         repo_local = PlanSnapshotStore()
         repo_local.register(plan)
-        service = PlanApprovalService(
+        service = UnsafeTestPlanApprovalService(
             store=store, broker=SyncBroker(), context_provider=_Ctx(),
             plan_repository=repo_local,
             policy=ApprovalPolicy(pending_ttl_seconds=3600, approved_ttl_seconds=3600),
@@ -157,11 +159,11 @@ def test_concurrent_authorization_consumes_only_one_wins(tmp_path):
     store0 = PlanApprovalStore(conn0)
     repo = PlanSnapshotStore()
     plan = make_plan(plan_id="plan_consume_race", risks=(low_risk(),))
-    service0 = PlanApprovalService(
+    service0 = UnsafeTestPlanApprovalService(
         store=store0, broker=SyncBroker(), context_provider=_Ctx(), plan_repository=repo,
     )
     request = service0.request_approval(plan)
-    gate0 = PlanExecutionGate(store=store0, context_provider=_Ctx(), plan_repository=repo)
+    gate0 = UnsafeTestPlanExecutionGate(store=store0, context_provider=_Ctx(), plan_repository=repo)
     auth = gate0.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
     conn0.close()
 
@@ -172,7 +174,7 @@ def test_concurrent_authorization_consumes_only_one_wins(tmp_path):
         barrier.wait()
         conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30.0, isolation_level=None)
         store = PlanApprovalStore(conn)
-        gate = PlanExecutionGate(store=store, context_provider=_Ctx(), plan_repository=repo)
+        gate = UnsafeTestPlanExecutionGate(store=store, context_provider=_Ctx(), plan_repository=repo)
         try:
             gate.acquire_lease(
             authorization_id=auth.authorization_id, nonce=auth.nonce,
@@ -201,11 +203,11 @@ def test_expiration_races_with_consume(tmp_path):
     store0 = PlanApprovalStore(conn0)
     repo = PlanSnapshotStore()
     plan = make_plan(plan_id="plan_exp_race", risks=(low_risk(),))
-    service0 = PlanApprovalService(
+    service0 = UnsafeTestPlanApprovalService(
         store=store0, broker=SyncBroker(), context_provider=_Ctx(), plan_repository=repo,
     )
     request = service0.request_approval(plan)
-    gate0 = PlanExecutionGate(
+    gate0 = UnsafeTestPlanExecutionGate(
         store=store0, context_provider=_Ctx(), plan_repository=repo,
         policy=GatePolicy(authorization_ttl_seconds=0.05),
     )
@@ -215,7 +217,7 @@ def test_expiration_races_with_consume(tmp_path):
     time.sleep(0.15)
     conn1 = sqlite3.connect(str(db), check_same_thread=False, isolation_level=None)
     store1 = PlanApprovalStore(conn1)
-    gate1 = PlanExecutionGate(store=store1, context_provider=_Ctx(), plan_repository=repo)
+    gate1 = UnsafeTestPlanExecutionGate(store=store1, context_provider=_Ctx(), plan_repository=repo)
     from khaos.coding.planning.approval.gate import AuthorizationExpiredError
 
     with pytest.raises(AuthorizationExpiredError):
@@ -244,7 +246,7 @@ def test_task_cancel_races_with_authorize(tmp_path):
             binding={"binding_digest": "x"}, summary={}, expires_at=9999999999.0,
         )
     )
-    service0 = PlanApprovalService(
+    service0 = UnsafeTestPlanApprovalService(
         store=store0, broker=broker0, context_provider=_Ctx(), plan_repository=repo,
         policy=ApprovalPolicy(pending_ttl_seconds=3600, approved_ttl_seconds=3600),
     )
@@ -260,7 +262,7 @@ def test_task_cancel_races_with_authorize(tmp_path):
         barrier.wait()
         conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30.0, isolation_level=None)
         store = PlanApprovalStore(conn)
-        service = PlanApprovalService(
+        service = UnsafeTestPlanApprovalService(
             store=store, broker=SyncBroker(), context_provider=ctx, plan_repository=repo,
             policy=ApprovalPolicy(pending_ttl_seconds=3600, approved_ttl_seconds=3600),
         )
@@ -273,7 +275,7 @@ def test_task_cancel_races_with_authorize(tmp_path):
         barrier.wait()
         conn = sqlite3.connect(str(db), check_same_thread=False, timeout=30.0, isolation_level=None)
         store = PlanApprovalStore(conn)
-        gate = PlanExecutionGate(store=store, context_provider=ctx, plan_repository=repo)
+        gate = UnsafeTestPlanExecutionGate(store=store, context_provider=ctx, plan_repository=repo)
         try:
             gate.authorize_execution(plan_id=plan.plan_id, approval_request_id=request.approval_request_id)
         except Exception:
