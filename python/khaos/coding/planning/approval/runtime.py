@@ -246,6 +246,7 @@ class ApprovalRuntime:
 
     def register_lease_coordinator(
         self, *, task_manager: Any = None, workspace_manager: Any = None,
+        repository_indexer: Any = None,
     ) -> WorkspaceExecutionLeaseCoordinator:
         """Wire the lease coordinator hooks into real Managers.
 
@@ -253,14 +254,38 @@ class ApprovalRuntime:
         to the coordinator's invalidate_active_execution_scope via the
         Managers' lease_invalidation_hook. Returns the coordinator for
         planned-mutation precondition checks (generation/HEAD updates).
+
+        Batch 2.6 §5: also wires the shared per-workspace mutation fence
+        into TaskManager, WorkspaceManager, and RepositoryIndexer so that
+        cleanup / cancel / generation updates are serialized with active
+        lease acquisition and Batch 3 execution.
         """
         self.require_ready()
         coordinator = WorkspaceExecutionLeaseCoordinator(self)
-        if task_manager is not None and hasattr(task_manager, "set_lease_invalidation_hook"):
-            task_manager.set_lease_invalidation_hook(coordinator.cancel_task)
-        if workspace_manager is not None and hasattr(workspace_manager, "set_lease_invalidation_hook"):
-            workspace_manager.set_lease_invalidation_hook(coordinator.cleanup_workspace)
+        # Batch 2.6 §5: create the shared mutation fence and wire it into
+        # all real components that mutate workspace state.
+        from khaos.coding.planning.approval.mutation_fence import (
+            WorkspaceMutationFence,
+        )
+        self._mutation_fence = WorkspaceMutationFence()
+        if task_manager is not None:
+            if hasattr(task_manager, "set_lease_invalidation_hook"):
+                task_manager.set_lease_invalidation_hook(coordinator.cancel_task)
+            if hasattr(task_manager, "set_mutation_fence"):
+                task_manager.set_mutation_fence(self._mutation_fence)
+        if workspace_manager is not None:
+            if hasattr(workspace_manager, "set_lease_invalidation_hook"):
+                workspace_manager.set_lease_invalidation_hook(coordinator.cleanup_workspace)
+            if hasattr(workspace_manager, "set_mutation_fence"):
+                workspace_manager.set_mutation_fence(self._mutation_fence)
+        if repository_indexer is not None and hasattr(repository_indexer, "set_mutation_fence"):
+            repository_indexer.set_mutation_fence(self._mutation_fence)
         return coordinator
+
+    @property
+    def mutation_fence(self) -> Any:
+        """Batch 2.6 §5: the shared per-workspace mutation fence (or None)."""
+        return getattr(self, "_mutation_fence", None)
 
 
 class WorkspaceExecutionLeaseCoordinator:

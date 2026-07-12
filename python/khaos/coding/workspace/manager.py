@@ -47,10 +47,19 @@ class WorkspaceManager:
         # cleanup() calls it BEFORE removing the worktree so the ACTIVE
         # execution lease is released.
         self._lease_invalidation_hook: Any = None
+        # Batch 2.6 §5: optional per-workspace mutation fence. When set,
+        # cleanup() acquires the fence BEFORE lease invalidation so that
+        # cleanup is serialized with active lease acquisition / Batch 3
+        # execution / RepositoryIndexer generation updates.
+        self._mutation_fence: Any = None
 
     def set_lease_invalidation_hook(self, hook: Any) -> None:
         """Register a callable invoked during cleanup to release execution leases."""
         self._lease_invalidation_hook = hook
+
+    def set_mutation_fence(self, fence: Any) -> None:
+        """Batch 2.6 §5: register the shared per-workspace mutation fence."""
+        self._mutation_fence = fence
 
     async def _git(self, repository: Path, *args: str, preserve_output: bool = False) -> str:
         process = await asyncio.create_subprocess_exec(
@@ -129,8 +138,26 @@ class WorkspaceManager:
         CLEANED, and ``WorkspaceTransition.FAILED`` is returned. The
         workspace stays in its current state so cleanup can be retried.
 
+        Batch 2.6 §5: if a mutation fence is registered, acquires it
+        BEFORE the manager lock (fence-first ordering) so cleanup is
+        serialized with active lease acquisition / Batch 3 execution /
+        RepositoryIndexer generation updates. Owner is
+        ``"cleanup:{workspace_id}"``.
+
         Invariant: ``WorkspaceState.CLEANED`` ⇒ ACTIVE lease count = 0.
         """
+        # Batch 2.6 §5: acquire the mutation fence FIRST (outermost lock)
+        # so cleanup is serialized with lease acquisition. If no fence is
+        # configured, fall back to the old behavior.
+        if self._mutation_fence is not None:
+            async with self._mutation_fence.use(
+                workspace_id, owner=f"cleanup:{workspace_id}",
+            ):
+                return await self._cleanup_impl(workspace_id, force=force)
+        return await self._cleanup_impl(workspace_id, force=force)
+
+    async def _cleanup_impl(self, workspace_id: str, *, force: bool) -> WorkspaceTransition:
+        """Internal cleanup — assumes fence (if any) is already held."""
         async with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace is None:

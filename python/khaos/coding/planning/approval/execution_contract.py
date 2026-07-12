@@ -82,9 +82,22 @@ class PlannedExecutionGuard:
     def __init__(self, gate: "PlanExecutionGate") -> None:
         self._gate = gate
         self._contexts: dict[str, AuthorizedExecutionContext] = {}
+        # Batch 2.6 §5: optional per-workspace mutation fence. When set,
+        # every planned_* method verifies the fence is held by
+        # "lease:{ctx.lease_id}" before proceeding.
+        self._mutation_fence: Any = None
+
+    def set_mutation_fence(self, fence: Any) -> None:
+        """Batch 2.6 §5: register the shared per-workspace mutation fence."""
+        self._mutation_fence = fence
 
     def require_active_execution_context(self, ctx: AuthorizedExecutionContext) -> None:
-        """Validate the opaque server-issued capability and its live lease."""
+        """Validate the opaque server-issued capability and its live lease.
+
+        Batch 2.6 §5: if a mutation fence is configured, also verifies the
+        fence is held by ``"lease:{ctx.lease_id}"`` so that non-owner
+        planned mutations are rejected.
+        """
         registered = self._contexts.get(getattr(ctx, "execution_context_id", ""))
         if registered is not ctx:
             raise PermissionError("execution context was not issued by this guard")
@@ -94,6 +107,11 @@ class PlannedExecutionGuard:
             expected_repository_id=ctx.repository_id, expected_plan_id=ctx.plan_id,
         ):
             raise PermissionError("execution context lease is not active")
+        # Batch 2.6 §5: verify the mutation fence is held by this lease.
+        if self._mutation_fence is not None:
+            self._mutation_fence.assert_owner(
+                ctx.workspace_id, f"lease:{ctx.lease_id}"
+            )
 
     def planned_workspace_edit(self, ctx: AuthorizedExecutionContext, *, edit: dict) -> None:
         """Apply a planned workspace file edit. (Batch 3)"""

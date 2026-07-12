@@ -64,6 +64,11 @@ from khaos.coding.planning.approval.models import (
     verify_nonce,
     verify_receipt_token,
 )
+from khaos.coding.planning.approval.mutation_fence import (
+    PlannedHeadMutationAdapter,
+    WorkspaceMutationFence,
+    fenced_acquire_lease,
+)
 from khaos.coding.planning.approval.repository import (
     PersistedPlanRepository,
     PlanRepository,
@@ -134,12 +139,15 @@ __all__ = [
     "PlanStaleError",
     "PlanValidationContext",
     "PlannedExecutionGuard",
+    "PlannedHeadMutationAdapter",
     "ReceiptSigner",
     "RuntimeState",
     "UnauthenticatedReceiptError",
     "WorkspaceExecutionLease",
     "WorkspaceExecutionLeaseCoordinator",
+    "WorkspaceMutationFence",
     "UnknownBrokerRequestError",
+    "fenced_acquire_lease",
     "compute_plan_binding_digest",
     "compute_reason_digest",
     "compute_risk_digest",
