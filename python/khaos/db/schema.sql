@@ -165,3 +165,101 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     created_at,
     tokenize='unicode61'
 );
+
+-- M4 Batch 2: Plan approval state machine + execution authorization gate.
+-- These tables persist the server-authoritative approval lifecycle and the
+-- short-lived, single-use execution authorizations. See
+-- python/khaos/coding/planning/approval/ for the Python implementation.
+CREATE TABLE IF NOT EXISTS plan_approval_requests (
+    approval_request_id   TEXT PRIMARY KEY,
+    plan_id               TEXT NOT NULL,
+    plan_content_hash     TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    base_sha              TEXT NOT NULL,
+    repository_generation INTEGER NOT NULL,
+    risk_level            TEXT NOT NULL,
+    requested_operations  TEXT NOT NULL DEFAULT '[]',
+    affected_files        TEXT NOT NULL DEFAULT '[]',
+    affected_symbols      TEXT NOT NULL DEFAULT '[]',
+    verification_digest   TEXT NOT NULL,
+    binding_digest        TEXT NOT NULL,
+    requested_at          REAL NOT NULL,
+    expires_at            REAL NOT NULL,
+    status                TEXT NOT NULL,
+    broker_request_id     TEXT NOT NULL,
+    reason                TEXT NOT NULL DEFAULT '',
+    metadata              TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_plan
+    ON plan_approval_requests(plan_id, plan_content_hash);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_repo
+    ON plan_approval_requests(repository_id, task_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_broker
+    ON plan_approval_requests(broker_request_id);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_status
+    ON plan_approval_requests(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS plan_approval_decisions (
+    decision_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    approval_request_id    TEXT NOT NULL,
+    decision               TEXT NOT NULL,
+    actor_id               TEXT NOT NULL,
+    actor_type             TEXT NOT NULL,
+    decided_at             REAL NOT NULL,
+    reason                 TEXT NOT NULL DEFAULT '',
+    authenticated_context  TEXT NOT NULL DEFAULT '{}',
+    metadata               TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_approval_decisions_request
+    ON plan_approval_decisions(approval_request_id, decided_at);
+
+CREATE TABLE IF NOT EXISTS plan_execution_authorizations (
+    authorization_id      TEXT PRIMARY KEY,
+    approval_request_id   TEXT NOT NULL,
+    plan_id               TEXT NOT NULL,
+    plan_content_hash     TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    base_sha              TEXT NOT NULL,
+    repository_generation INTEGER NOT NULL,
+    issued_at             REAL NOT NULL,
+    expires_at            REAL NOT NULL,
+    nonce_hash            TEXT NOT NULL UNIQUE,
+    binding_digest        TEXT NOT NULL,
+    status                TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_plan
+    ON plan_execution_authorizations(plan_id, approval_request_id);
+CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_scope
+    ON plan_execution_authorizations(repository_id, task_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_status
+    ON plan_execution_authorizations(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS plan_approval_audit_events (
+    event_id              TEXT PRIMARY KEY,
+    event_type            TEXT NOT NULL,
+    approval_request_id   TEXT NOT NULL,
+    plan_id               TEXT NOT NULL,
+    previous_status       TEXT NOT NULL,
+    new_status            TEXT NOT NULL,
+    actor_id              TEXT NOT NULL,
+    actor_type            TEXT NOT NULL,
+    authenticated_source  TEXT NOT NULL,
+    timestamp             REAL NOT NULL,
+    reason_code           TEXT NOT NULL,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    correlation_id        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_request
+    ON plan_approval_audit_events(approval_request_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_plan
+    ON plan_approval_audit_events(plan_id, timestamp);
