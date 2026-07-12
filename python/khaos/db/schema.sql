@@ -188,7 +188,7 @@ CREATE TABLE IF NOT EXISTS plan_approval_requests (
     requested_at          REAL NOT NULL,
     expires_at            REAL NOT NULL,
     status                TEXT NOT NULL,
-    broker_request_id     TEXT NOT NULL,
+    broker_request_id     TEXT NOT NULL DEFAULT '',
     reason                TEXT NOT NULL DEFAULT '',
     metadata              TEXT NOT NULL DEFAULT '{}'
 );
@@ -231,7 +231,8 @@ CREATE TABLE IF NOT EXISTS plan_execution_authorizations (
     expires_at            REAL NOT NULL,
     nonce_hash            TEXT NOT NULL UNIQUE,
     binding_digest        TEXT NOT NULL,
-    status                TEXT NOT NULL
+    status                TEXT NOT NULL,
+    server_epoch          INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_plan
@@ -263,3 +264,36 @@ CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_request
     ON plan_approval_audit_events(approval_request_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_plan
     ON plan_approval_audit_events(plan_id, timestamp);
+
+-- M4 Batch 2.1: Broker authenticity and atomic authorization closure.
+-- Durable broker-decision receipt outbox. Only ApprovalBroker can create a
+-- row here (via the receipt_sink callback); apply_authenticated_decision
+-- verifies the token hash against this row inside the same transaction that
+-- applies the decision, and marks it consumed.
+CREATE TABLE IF NOT EXISTS plan_approval_receipts (
+    receipt_id            TEXT PRIMARY KEY,
+    token_hash            TEXT NOT NULL UNIQUE,
+    approval_request_id   TEXT NOT NULL,
+    broker_request_id     TEXT NOT NULL,
+    binding_digest        TEXT NOT NULL,
+    decision              TEXT NOT NULL,
+    consumed              INTEGER NOT NULL DEFAULT 0,
+    created_at            REAL NOT NULL,
+    expires_at            REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_token
+    ON plan_approval_receipts(token_hash);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_request
+    ON plan_approval_receipts(approval_request_id);
+
+-- At most one ACTIVE authorization per approval request (defense-in-depth
+-- for the single-execution-per-approval invariant; the service refuses
+-- re-mint anyway). Partial unique index so consumed/revoked rows don't block.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_exec_auth_active_per_request
+    ON plan_execution_authorizations(approval_request_id) WHERE status = 'active';
+
+-- broker_request_id uniqueness for non-empty values (old not-required rows
+-- used '' and many can coexist).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_approval_requests_broker
+    ON plan_approval_requests(broker_request_id) WHERE broker_request_id != '';

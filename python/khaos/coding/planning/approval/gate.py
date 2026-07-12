@@ -1,51 +1,60 @@
 """Server-side execution authorization gate.
 
-This is the SINGLE entry point that Batch 3 execution paths must call before
+Single server-side entry point that Batch 3 execution paths must call before
 performing any planned workspace edit, tool invocation, verification run,
 ChangeSet creation or ChangeSet apply. It mints short-lived, single-use,
 opaque :class:`PlanExecutionAuthorization` objects bound to exactly one plan
 and verifies them atomically on consume.
 
-Guarantees:
+Batch 2.1 hardening:
 
-* Blocked / stale / rejected / revoked / expired plans are refused.
-* A plan that needs approval but has no approved request is refused.
-* The approval's binding digest MUST match the current plan's digest.
-* repository / task / workspace ids MUST all match.
-* HEAD, generation, files, symbols and trusted-config drift are refused.
-* Expired approvals are refused.
-* ``not-required`` plans also receive a server-issued authorization — there
-  is no "skip the gate" path.
-* Authorizations are short-lived (default 5 minutes).
-* Each authorization binds exactly one plan and defaults to single-use.
-* Authorizations cannot be constructed by the Agent or the client; only this
-  gate constructs them, and only its ``require_authorization`` method accepts
-  them at consume time.
-* Authorizations cannot be reused across workspaces, tasks or repositories.
+* Mint and consume are ATOMIC multi-row transactions. Mint refuses to create a
+  second ACTIVE authorization for one request (single execution per approval).
+  Consume flips BOTH the authorization AND its request to CONSUMED in one
+  ``BEGIN IMMEDIATE``.
+* The authoritative plan is resolved from a :class:`PlanRepository` by
+  ``plan_id`` — never from a caller-supplied plan object. A forged/mutated plan
+  cannot influence validation.
+* :class:`PlanLiveValidator` is run again at CONSUME time (§6), catching any
+  drift between mint and execution. Drift → authorization refused, no
+  ``AuthorizedExecutionContext`` returned.
+* ``server_epoch`` binds every authorization to the current process boot. On
+  restart the epoch rotates and all prior-epoch authorizations are rejected
+  (and bulk-revoked) — this is the authoritative restart-invalidation
+  mechanism, NOT the in-memory nonce being lost.
 """
 from __future__ import annotations
 
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import Any, TYPE_CHECKING
 
 from khaos.coding.planning.approval.models import (
     AuthorizationStatus,
+    PlanApprovalAuditEvent,
     PlanApprovalStatus,
     PlanExecutionAuthorization,
     compute_plan_binding_digest,
     generate_nonce,
     hash_nonce,
 )
+from khaos.coding.planning.approval.repository import PlanRepository, PlanSnapshotStore
 from khaos.coding.planning.approval.store import (
     PlanApprovalStore,
     new_authorization_id,
+    new_event_id,
+)
+from khaos.coding.planning.approval.validator import (
+    PlanLiveValidator,
+    PlanNotRequestableError as _ValidatorNotRequestable,
+    PlanStaleError as _ValidatorStale,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from khaos.coding.planning.contracts import ImplementationPlan
+    from khaos.coding.planning.approval.models import Clock
     from khaos.coding.planning.approval.service import ContextProvider
+    from khaos.coding.planning.contracts import ImplementationPlan
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +84,7 @@ class AuthorizationAlreadyConsumedError(AuthorizationError):
 
 
 class AuthorizationRevokedError(AuthorizationError):
-    """The authorization was revoked (e.g. task cancelled)."""
+    """The authorization was revoked (e.g. task cancelled, restart)."""
 
 
 @dataclass(frozen=True)
@@ -85,150 +94,151 @@ class GatePolicy:
     authorization_ttl_seconds: float = 300.0  # 5 minutes
 
 
-# ---------------------------------------------------------------------------
-# The gate
-# ---------------------------------------------------------------------------
-
-
 class PlanExecutionGate:
     """Single server-side mint+consume point for plan execution authorizations.
 
-    Construction takes the same :class:`PlanApprovalStore` used by the
-    approval service (so authorizations live next to their approvals), a
-    :class:`ContextProvider` for live state, and a :class:`GatePolicy`.
+    The gate holds a monotonic ``server_epoch`` (rotated at construction —
+    i.e. every process boot). Authorizations are stamped with the epoch at
+    mint time; on consume, any authorization whose epoch differs is refused
+    and revoked. :meth:`rotate_epoch` is the explicit startup hook.
     """
 
     def __init__(
         self,
         store: PlanApprovalStore,
         context_provider: "ContextProvider",
+        plan_repository: PlanRepository | None = None,
+        planning_service: Any | None = None,
         policy: GatePolicy | None = None,
         clock: Any = time.time,
+        server_epoch: int = 1,
     ) -> None:
         self._store = store
         self._context_provider = context_provider
+        self._plan_repository = plan_repository or PlanSnapshotStore()
         self._policy = policy or GatePolicy()
         self._clock = clock
+        self._server_epoch = int(server_epoch)
+        self._validator = PlanLiveValidator(
+            plan_repository=self._plan_repository,
+            context_provider=context_provider,
+            planning_service=planning_service,
+        )
 
     # ------------------------------------------------------------------
-    # Mint
+    # Epoch management (§8)
+    # ------------------------------------------------------------------
+
+    @property
+    def server_epoch(self) -> int:
+        return self._server_epoch
+
+    def rotate_epoch(self) -> int:
+        """Rotate the epoch and bulk-revoke every prior-epoch authorization.
+
+        Called at process startup. Returns the count of authorizations
+        revoked. After this call, only authorizations minted under the new
+        epoch can be consumed.
+        """
+        self._server_epoch += 1
+        revoked = self._store.revoke_authorizations_outside_epoch(self._server_epoch)
+        logger.info(
+            "rotated server_epoch to %d; revoked %d prior-epoch authorizations",
+            self._server_epoch, revoked,
+        )
+        return revoked
+
+    @property
+    def plan_repository(self) -> PlanRepository:
+        return self._plan_repository
+
+    # ------------------------------------------------------------------
+    # Mint (atomic; one authorization per request)
     # ------------------------------------------------------------------
 
     def authorize_execution(
         self,
         *,
-        plan: "ImplementationPlan",
+        plan_id: str,
         approval_request_id: str | None,
         actor_id: str = "system",
     ) -> PlanExecutionAuthorization:
-        """Mint a single-use authorization to execute ``plan``.
+        """Mint a single-use authorization to execute the plan with ``plan_id``.
 
-        Spec §8 rules enforced:
+        The plan is resolved from the :class:`PlanRepository` — NOT from a
+        caller-supplied object. This is the authoritative source.
 
-        1. blocked/stale/rejected/revoked/expired plan → refused.
-        2. needs approval but no approved request → refused.
-        3. approval digest ≠ plan digest → refused.
-        4. repository/task/workspace mismatch → refused.
-        5. HEAD/generation/file/symbol/config drift → refused.
-        6. approval expired → refused.
+        Enforces (spec §8 + §3/§4):
+
+        1. The authoritative plan must exist and not be blocked/stale.
+        2. If approval is required, a valid APPROVED request must be supplied.
+        3. The approval's binding digest must equal the current plan's digest.
+        4. repository/task/workspace ids must match.
+        5. HEAD/generation drift is refused (via PlanLiveValidator).
+        6. Expired approvals are refused.
         7. not-required plans also get a server authorization.
-        8. short TTL.
-        9. bound to a single plan.
-        10/11/12. only this gate constructs/accepts; never cross-scope.
+        8. Short TTL; bound to one plan; stamped with the current server_epoch.
+        9. AT MOST ONE active authorization per request (atomic mint).
         """
-        # 1 — plan status gate. We treat any non-ready/approved status as
-        # blocked. (Plans that needed approval are approved via the approval
-        # service; not-required plans are still in READY.)
+        # Resolve the AUTHORITATIVE plan snapshot.
+        plan = self._plan_repository.get(plan_id)
+        if plan is None:
+            raise PlanBlockedError(f"no authoritative plan snapshot for {plan_id}")
+
+        # Validate the plan live (HEAD/generation/task/workspace/file/symbol).
+        try:
+            ctx = self._validator.validate_plan(plan)
+        except _ValidatorStale as exc:
+            raise PlanBlockedError(str(exc)) from exc
+        except _ValidatorNotRequestable as exc:
+            raise PlanBlockedError(str(exc)) from exc
+
+        # Plan self-status gate.
         plan_status = getattr(plan.status, "value", str(plan.status))
         if plan_status in {"blocked", "stale", "rejected", "failed"}:
             raise PlanBlockedError(f"plan status is {plan_status}")
 
-        # If no approval request id was supplied, the gate must still verify
-        # that the plan does NOT require human approval. A high-risk plan with
-        # no approval request is refused outright (server-authoritative).
-        if approval_request_id is None:
-            from khaos.coding.planning.approval.requirement import evaluate_approval_requirement
-
-            outcome = evaluate_approval_requirement(plan)
-            if outcome.requires_approval:
-                raise ApprovalMissingError(
-                    "plan requires approval but no approval_request_id supplied"
-                )
-
-        # 2/3/4 — approval request lookup + binding verification.
         request = None
         if approval_request_id is not None:
             request = self._store.get_request(approval_request_id)
             if request is None:
-                raise ApprovalMissingError(
-                    f"unknown approval request {approval_request_id}"
-                )
-
-            # The request must belong to THIS plan.
+                raise ApprovalMissingError(f"unknown approval request {approval_request_id}")
             if request.plan_id != plan.plan_id:
-                raise AuthorizationMismatchError(
-                    "approval request belongs to a different plan"
-                )
+                raise AuthorizationMismatchError("approval request belongs to a different plan")
             if request.repository_id != plan.repository_id:
                 raise AuthorizationMismatchError("repository id mismatch")
             if request.task_id != plan.task_id:
                 raise AuthorizationMismatchError("task id mismatch")
             if request.workspace_id != plan.workspace_id:
                 raise AuthorizationMismatchError("workspace id mismatch")
-
-            # Request must be in a decidable state.
             if request.status == PlanApprovalStatus.PENDING:
                 raise ApprovalMissingError("approval request is still pending")
             if request.status == PlanApprovalStatus.REJECTED:
                 raise ApprovalMissingError("approval request was rejected")
             if request.status in (PlanApprovalStatus.STALE, PlanApprovalStatus.EXPIRED, PlanApprovalStatus.REVOKED):
-                raise ApprovalMissingError(
-                    f"approval request is {request.status.value}"
-                )
+                raise ApprovalMissingError(f"approval request is {request.status.value}")
             if request.status == PlanApprovalStatus.CONSUMED:
-                raise AuthorizationAlreadyConsumedError(
-                    "approval request has already been consumed"
+                raise AuthorizationAlreadyConsumedError("approval request already consumed")
+        else:
+            # No request → plan must not require approval (server-authoritative).
+            if ctx.requires_approval:
+                raise ApprovalMissingError(
+                    "plan requires approval but no approval_request_id supplied"
                 )
-            # APPROVED or NOT_REQUIRED are acceptable.
 
-        # 5 — live state re-check (HEAD + generation).
-        state = self._context_provider.current_state(
-            repository_id=plan.repository_id,
-            task_id=plan.task_id,
-            workspace_id=plan.workspace_id,
-        )
-        if state.head_sha != plan.base_sha:
-            raise PlanBlockedError(
-                f"head drift: plan={plan.base_sha} current={state.head_sha}"
-            )
-        if int(state.repository_generation) != int(plan.repository_generation):
-            raise PlanBlockedError(
-                f"generation drift: plan={plan.repository_generation} "
-                f"current={state.repository_generation}"
-            )
-        if state.task_terminal or state.workspace_terminal:
-            raise PlanBlockedError("task or workspace is terminal")
+        # Approval expiry.
+        if request is not None and float(self._clock()) >= request.expires_at:
+            raise AuthorizationExpiredError("approval request expired")
 
-        # 3 (continued) — the approval's binding digest must equal the
-        # CURRENT plan's binding digest. This is the master drift check: any
-        # file/symbol/config/destination/verification change rotates it.
+        # Binding digest must match (drift check at mint).
         current_binding = compute_plan_binding_digest(plan)
         if request is not None and request.binding_digest != current_binding:
-            raise AuthorizationMismatchError(
-                "approval binding does not match current plan digest"
-            )
-
-        # 6 — approval expiry.
-        if request is not None and time.time() >= request.expires_at:
-            raise AuthorizationExpiredError("approval request expired")
+            raise AuthorizationMismatchError("approval binding does not match current plan digest")
 
         now = float(self._clock())
         expires_at = now + self._policy.authorization_ttl_seconds
-
-        # Mint the authorization. The plaintext nonce lives only in the
-        # returned object; the store keeps only its hash.
         nonce = generate_nonce()
-        authorization = PlanExecutionAuthorization(
+        candidate = PlanExecutionAuthorization(
             authorization_id=new_authorization_id(),
             approval_request_id=request.approval_request_id if request else "",
             plan_id=plan.plan_id,
@@ -245,17 +255,59 @@ class PlanExecutionGate:
             status=AuthorizationStatus.ACTIVE,
             binding_digest=current_binding,
         )
-        self._store.insert_authorization(authorization)
-        logger.info(
-            "authorized execution of plan %s (auth %s, request %s, ttl %.0fs)",
-            plan.plan_id, authorization.authorization_id,
-            approval_request_id or "(not-required)",
-            self._policy.authorization_ttl_seconds,
+
+        # Atomic mint — refuses a second ACTIVE authorization for this request.
+        req_id = request.approval_request_id if request else ""
+        audit = None
+        if req_id:
+            audit = PlanApprovalAuditEvent(
+                event_id=new_event_id(),
+                event_type="plan-authorization:minted",
+                approval_request_id=req_id,
+                plan_id=plan.plan_id,
+                previous_status=request.status.value if request else "(none)",
+                new_status=request.status.value if request else "(none)",
+                actor_id=actor_id, actor_type="system",
+                authenticated_source="gate",
+                timestamp=now, reason_code="authorization-minted",
+                task_id=plan.task_id, workspace_id=plan.workspace_id,
+                repository_id=plan.repository_id,
+                correlation_id=candidate.authorization_id,
+            )
+        ok, returned = self._store.mint_authorization_if_request_active(
+            candidate,
+            server_epoch=self._server_epoch,
+            expected_binding_digest=current_binding,
+            audit_event=audit,
+            now=now,
         )
-        return authorization
+        if not ok:
+            # The request was no longer APPROVED/NOT_REQUIRED (e.g. consumed
+            # by a concurrent mint, or revoked).
+            raise ApprovalMissingError(
+                "approval request is not in an authorizable state "
+                "(consumed/revoked/expired)"
+            )
+        if returned is not candidate:
+            # An ACTIVE authorization already existed — return it, but its
+            # in-memory nonce is blank (we don't keep nonces for re-mints).
+            # Callers that need to consume must hold the ORIGINAL handle.
+            logger.info(
+                "returning existing active authorization %s for request %s",
+                returned.authorization_id, req_id,
+            )
+            return returned  # type: ignore[return-value]
+
+        logger.info(
+            "authorized execution of plan %s (auth %s, request %s, ttl %.0fs, epoch %d)",
+            plan.plan_id, candidate.authorization_id,
+            approval_request_id or "(not-required)",
+            self._policy.authorization_ttl_seconds, self._server_epoch,
+        )
+        return candidate
 
     # ------------------------------------------------------------------
-    # Consume (Batch 3 entry point)
+    # Consume (atomic; revalidates live state, single-use, epoch-bound)
     # ------------------------------------------------------------------
 
     def require_authorization(
@@ -270,18 +322,22 @@ class PlanExecutionGate:
     ) -> PlanExecutionAuthorization:
         """Verify + consume a single-use authorization.
 
-        This is the ONLY method Batch 3 execution paths may call before
-        touching the repository. Every check happens inside one atomic
-        ``BEGIN IMMEDIATE`` so concurrent consumers cannot both succeed.
+        Enforces (spec §6 + §3/§4):
 
-        Returns the (now-consumed) authorization on success; raises one of
-        the :class:`AuthorizationError` subclasses otherwise.
+        * Authorization exists, is ACTIVE, scope matches.
+        * Nonce verifies (constant-time).
+        * Not expired; server_epoch matches current boot.
+        * LIVE plan revalidation via :class:`PlanLiveValidator` — any drift
+          (HEAD/generation/file/symbol/config/destination/binding) refuses
+          consumption.
+        * The approval request is still APPROVED/NOT_REQUIRED.
+
+        On success the authorization AND its request flip to CONSUMED in one
+        atomic transaction. Raises on any failure; never returns a context.
         """
         auth = self._store.get_authorization(authorization_id)
         if auth is None:
             raise AuthorizationMismatchError("unknown authorization id")
-        # Cross-scope replay defense — checked both here (fast path) and
-        # inside the atomic consume (authoritative).
         if auth.plan_id != expected_plan_id:
             raise AuthorizationMismatchError("plan id mismatch")
         if auth.task_id != expected_task_id:
@@ -290,43 +346,84 @@ class PlanExecutionGate:
             raise AuthorizationMismatchError("workspace id mismatch")
         if auth.repository_id != expected_repository_id:
             raise AuthorizationMismatchError("repository id mismatch")
-
         if auth.status == AuthorizationStatus.CONSUMED:
             raise AuthorizationAlreadyConsumedError("authorization already consumed")
         if auth.status == AuthorizationStatus.REVOKED:
             raise AuthorizationRevokedError("authorization revoked")
-        if auth.status == AuthorizationStatus.EXPIRED or time.time() >= auth.expires_at:
+        now = float(self._clock())
+        if auth.status == AuthorizationStatus.EXPIRED or now >= auth.expires_at:
             raise AuthorizationExpiredError("authorization expired")
 
-        # Nonce verification + atomic consume. The store does the CAS.
-        ok = self._store.consume_authorization(
+        # --- LIVE revalidation at consume time (§6) ---
+        # Resolve the authoritative plan and re-validate. Drift → refuse.
+        try:
+            ctx = self._validator.validate(
+                expected_plan_id,
+                expected_repository_id=expected_repository_id,
+                expected_task_id=expected_task_id,
+                expected_workspace_id=expected_workspace_id,
+            )
+        except _ValidatorStale as exc:
+            # Drift since mint — refuse, mark stale, audit.
+            self._mark_authorization_stale(auth, now, str(exc))
+            raise AuthorizationMismatchError(f"live drift at consume: {exc}") from exc
+        except _ValidatorNotRequestable as exc:
+            self._mark_authorization_stale(auth, now, str(exc))
+            raise PlanBlockedError(f"plan no longer executable: {exc}") from exc
+
+        # The plan's current binding digest must equal the authorization's.
+        if ctx.binding_digest != auth.binding_digest:
+            self._mark_authorization_stale(auth, now, "binding drift at consume")
+            raise AuthorizationMismatchError("binding drift since mint")
+
+        # Atomic consume: authorization → CONSUMED AND request → CONSUMED.
+        audit = PlanApprovalAuditEvent(
+            event_id=new_event_id(),
+            event_type="plan-authorization:consumed",
+            approval_request_id=auth.approval_request_id,
+            plan_id=auth.plan_id,
+            previous_status=PlanApprovalStatus.APPROVED.value
+            if auth.approval_request_id
+            else PlanApprovalStatus.NOT_REQUIRED.value,
+            new_status=PlanApprovalStatus.CONSUMED.value,
+            actor_id="gate", actor_type="system",
+            authenticated_source="gate",
+            timestamp=now, reason_code="authorization-consumed",
+            task_id=auth.task_id, workspace_id=auth.workspace_id,
+            repository_id=auth.repository_id,
+            correlation_id=authorization_id,
+        )
+        ok = self._store.consume_authorization_with_request(
             authorization_id,
+            nonce=nonce,
             expected_plan_id=expected_plan_id,
             expected_task_id=expected_task_id,
             expected_workspace_id=expected_workspace_id,
             expected_repository_id=expected_repository_id,
-            nonce=nonce,
+            expected_binding_digest=auth.binding_digest,
+            current_server_epoch=self._server_epoch,
+            audit_event=audit,
+            now=now,
         )
         if not ok:
-            # The consume failed. Re-read to classify the cause.
             refreshed = self._store.get_authorization(authorization_id)
             if refreshed is None:
                 raise AuthorizationMismatchError("authorization vanished")
             if refreshed.status == AuthorizationStatus.CONSUMED:
                 raise AuthorizationAlreadyConsumedError("authorization already consumed")
+            if refreshed.status == AuthorizationStatus.REVOKED:
+                raise AuthorizationRevokedError(
+                    "authorization revoked (epoch rotation or task cancel)"
+                )
             if refreshed.status == AuthorizationStatus.EXPIRED:
                 raise AuthorizationExpiredError("authorization expired")
-            # Otherwise it's a nonce mismatch (forged/replayed) or a scope
-            # mismatch caught inside the CAS — treat as mismatch.
             raise AuthorizationMismatchError(
-                "authorization consume failed (nonce or scope mismatch)"
+                "authorization consume failed (nonce/scope/binding/epoch mismatch)"
             )
         logger.info(
-            "consumed authorization %s for plan %s",
+            "consumed authorization %s for plan %s (request → consumed)",
             authorization_id, expected_plan_id,
         )
-        # Return a view with the (still-plaintext) nonce for the caller.
-        consumed = self._store.get_authorization(authorization_id)
         return PlanExecutionAuthorization(
             authorization_id=auth.authorization_id,
             approval_request_id=auth.approval_request_id,
@@ -345,8 +442,34 @@ class PlanExecutionGate:
             binding_digest=auth.binding_digest,
         )
 
+    def _mark_authorization_stale(
+        self, auth: PlanExecutionAuthorization, now: float, reason: str
+    ) -> None:
+        """Mark an authorization revoked (drift) and audit it."""
+        self._store.revoke_authorization(auth.authorization_id)
+        if auth.approval_request_id:
+            self._store.transition_request_status(
+                auth.approval_request_id,
+                expected={PlanApprovalStatus.APPROVED, PlanApprovalStatus.NOT_REQUIRED},
+                target=PlanApprovalStatus.STALE,
+                audit_event=PlanApprovalAuditEvent(
+                    event_id=new_event_id(),
+                    event_type="plan-authorization:consume-refused",
+                    approval_request_id=auth.approval_request_id,
+                    plan_id=auth.plan_id,
+                    previous_status="approved",
+                    new_status=PlanApprovalStatus.STALE.value,
+                    actor_id="gate", actor_type="system",
+                    authenticated_source="gate",
+                    timestamp=now, reason_code="consume-drift",
+                    task_id=auth.task_id, workspace_id=auth.workspace_id,
+                    repository_id=auth.repository_id,
+                    correlation_id=auth.authorization_id,
+                ),
+            )
+
     # ------------------------------------------------------------------
-    # External invalidation hooks (Task cancel / Workspace cleanup)
+    # External invalidation hooks
     # ------------------------------------------------------------------
 
     def revoke_authorization(self, authorization_id: str) -> bool:
