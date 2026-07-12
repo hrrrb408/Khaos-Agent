@@ -145,8 +145,8 @@ class CodeQueryService:
 
         Uses a SINGLE remaining budget shared across ALL query sources:
         ``remaining_candidates``, ``remaining_sql_queries``, ``remaining_indexed_rows``.
-        Each query's LIMIT is set to ``remaining_candidates`` (not ``max_results``),
-        so imports/calls/references cannot each fetch the full budget.
+        Each query's LIMIT is set to ``min(remaining_candidates, remaining_indexed_rows)``,
+        so neither per-candidate nor per-row budget can be exceeded.
 
         Evidence priority (each level checks remaining budget BEFORE running):
         1. Resolved graph edges (import/call/reference) where the source file
@@ -185,10 +185,15 @@ class CodeQueryService:
             except sqlite3.Error:
                 return "explain-failed"
 
+        def _query_limit() -> int:
+            """Per-query LIMIT = min(remaining_candidates, remaining_indexed_rows)."""
+            return min(remaining_candidates, remaining_indexed_rows)
+
         def _can_continue() -> bool:
             return (remaining_candidates > 0
                     and remaining_sql_queries > 0
-                    and remaining_indexed_rows > 0)
+                    and remaining_indexed_rows > 0
+                    and _query_limit() > 0)
 
         def _set_limit(code: str) -> None:
             nonlocal limit_code
@@ -211,8 +216,9 @@ class CodeQueryService:
                     has_resolved_test_coverage = True
 
         # --- Priority 1: Resolved graph edges where source is a test file ---
-        # Each sub-query uses LIMIT = remaining_candidates (not max_results).
+        # Each sub-query uses LIMIT = min(remaining_candidates, remaining_indexed_rows).
         if _can_continue() and target_files:
+            ql = _query_limit()
             placeholders = ",".join("?" * len(target_files))
             sql = (
                 f"SELECT DISTINCT ri.source_file, ri.target_file, ri.confidence, ri.reason, 'import' AS edge_type "
@@ -221,7 +227,7 @@ class CodeQueryService:
                 f"WHERE ri.repository_id = ? AND ri.target_file IN ({placeholders}) AND cf.path_role = 'test' "
                 f"ORDER BY ri.source_file LIMIT ?"
             )
-            params = (repository_id, *target_files, remaining_candidates)
+            params = (repository_id, *target_files, ql)
             query_plans.append(f"P1-import: {_explain(sql, params)}")
             try:
                 rows = self.store._conn.execute(sql, params).fetchall()
@@ -250,6 +256,7 @@ class CodeQueryService:
             for table, kind in (("resolved_call_edges", "call"), ("resolved_reference_edges", "reference")):
                 if not _can_continue():
                     break
+                ql = _query_limit()
                 sql = (
                     f"SELECT DISTINCT e.source_file, e.target_file, e.target_symbol_id, e.confidence, e.resolution_rule, '{kind}' AS edge_type "
                     f"FROM {table} e "
@@ -257,7 +264,7 @@ class CodeQueryService:
                     f"WHERE e.repository_id = ? AND e.target_symbol_id IN ({placeholders}) AND cf.path_role = 'test' "
                     f"ORDER BY e.source_file LIMIT ?"
                 )
-                params = (repository_id, *target_symbols, remaining_candidates)
+                params = (repository_id, *target_symbols, ql)
                 query_plans.append(f"P1-{kind}: {_explain(sql, params)}")
                 try:
                     rows = self.store._conn.execute(sql, params).fetchall()
@@ -297,6 +304,7 @@ class CodeQueryService:
                 target_modules.add(module_key)
             placeholders_subj = ",".join("?" * len(target_subjects))
             placeholders_mod = ",".join("?" * len(target_modules))
+            ql = _query_limit()
             sql = (
                 f"SELECT path, language, content_hash, generation, test_subject_key, module_key "
                 f"FROM code_files "
@@ -304,7 +312,7 @@ class CodeQueryService:
                 f"AND (test_subject_key IN ({placeholders_subj}) OR module_key IN ({placeholders_mod})) "
                 f"ORDER BY path LIMIT ?"
             )
-            params = (repository_id, *target_subjects, *target_modules, remaining_candidates)
+            params = (repository_id, *target_subjects, *target_modules, ql)
             query_plans.append(f"P2-subject-key: {_explain(sql, params)}")
             try:
                 rows = self.store._conn.execute(sql, params).fetchall()
