@@ -167,3 +167,10 @@ class PlanLiveValidator:
             requires_approval=outcome.requires_approval,
             reason_codes=outcome.reason_codes,
         )
+
+class ShallowTestPlanValidator:
+    """Explicit shallow validator fixture; production runtime rejects it."""
+    _unsafe_test_only = True
+    def validate_plan(self, plan, **kwargs):
+        from khaos.coding.planning.contracts import PlanStatus, PlanValidationResult
+        return PlanValidationResult(plan.status is PlanStatus.READY, plan.status)

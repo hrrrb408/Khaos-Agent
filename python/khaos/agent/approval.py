@@ -254,12 +254,6 @@ class ApprovalBroker:
             raise PermissionError(
                 "broker has no ApprovalAuthenticator; plan-approval decisions are refused"
             )
-        if not self._authenticator.verify_context(context):
-            raise PermissionError(
-                "AuthenticatedApprovalContext signature verification failed "
-                "(forged, tampered, expired, or wrong capability)"
-            )
-
         now = (clock or _time.time)()
         decision_status = PlanApprovalStatus.APPROVED if approved else PlanApprovalStatus.REJECTED
         decision_value = decision_status.value
@@ -270,6 +264,14 @@ class ApprovalBroker:
             record = self._plan_approvals.get(broker_request_id)
             if record is None:
                 return None
+            if not self._authenticator.verify_context(
+                context, expected_approval_request_id=record.approval_request_id,
+                now=now, consume=True,
+            ):
+                raise PermissionError(
+                    "AuthenticatedApprovalContext verification failed "
+                    "(session, request binding, expiry, capability, or replay)"
+                )
             if now >= record.expires_at:
                 return None
             record.decide_count += 1

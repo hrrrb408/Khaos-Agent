@@ -37,6 +37,7 @@ from khaos.coding.planning.approval.models import (
     ALLOWED_APPROVAL_TRANSITIONS,
     ApprovalAuthenticator,
     AuthenticatedApprovalContext,
+    AuthenticatedSession,
     AuthorizationStatus,
     BrokerDecisionReceipt,
     Clock,
@@ -87,12 +88,14 @@ from khaos.coding.planning.approval.store import (
 from khaos.coding.planning.approval.validator import (
     PlanLiveValidator,
 )
+from khaos.coding.planning.approval.runtime import ApprovalRuntime, BootContext, WorkspaceExecutionLeaseCoordinator
 
 __all__ = [
     "ALLOWED_APPROVAL_TRANSITIONS",
     "APPROVAL_SCHEMA",
     "ApprovalAuthenticator",
     "AuthenticatedApprovalContext",
+    "AuthenticatedSession",
     "AuthorizedExecutionContext",
     "AuthorizationAlreadyConsumedError",
     "AuthorizationError",
@@ -103,8 +106,10 @@ __all__ = [
     "ApprovalConflictError",
     "ApprovalPolicy",
     "ApprovalRequirementOutcome",
+    "ApprovalRuntime",
     "ApprovalTransitionResult",
     "BrokerDecisionReceipt",
+    "BootContext",
     "Clock",
     "ContextProvider",
     "CurrentRepositoryState",
@@ -128,6 +133,7 @@ __all__ = [
     "PlannedExecutionGuard",
     "UnauthenticatedReceiptError",
     "WorkspaceExecutionLease",
+    "WorkspaceExecutionLeaseCoordinator",
     "UnknownBrokerRequestError",
     "compute_plan_binding_digest",
     "compute_reason_digest",

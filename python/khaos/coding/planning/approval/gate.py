@@ -363,7 +363,7 @@ class PlanExecutionGate:
             repository_id=auth.repository_id,
             correlation_id=auth.authorization_id,
         )
-        self._store.invalidate_request_and_authorizations(
+        self._store.invalidate_request_authorizations_leases_and_receipt(
             auth.approval_request_id,
             target_status=PlanApprovalStatus.STALE,
             expected_statuses={PlanApprovalStatus.APPROVED, PlanApprovalStatus.NOT_REQUIRED},
@@ -537,7 +537,7 @@ class PlanExecutionGate:
         operation. Every planned edit / tool / verification / ChangeSet entry
         must call this first."""
         now = float(self._clock())
-        return self._store.require_active_lease(
+        active = self._store.require_active_lease(
             lease_id,
             owner_execution_id=owner_execution_id,
             expected_task_id=expected_task_id,
@@ -546,6 +546,20 @@ class PlanExecutionGate:
             expected_plan_id=expected_plan_id,
             current_server_epoch=self._server_epoch,
             now=now,
+        )
+        if not active:
+            return False
+        state = self._context_provider.current_state(
+            repository_id=expected_repository_id,
+            task_id=expected_task_id,
+            workspace_id=expected_workspace_id,
+        )
+        lease = self._store.get_lease(lease_id)
+        return bool(
+            lease is not None and state.task_active and state.workspace_active
+            and not state.task_terminal and not state.workspace_terminal
+            and state.head_sha == lease["head_sha"]
+            and int(state.repository_generation) == int(lease["repository_generation"])
         )
 
     def release_lease(self, lease_id: str) -> bool:

@@ -295,6 +295,17 @@ class ApprovalTransitionResult(str, Enum):
     STALE = "stale"  # binding digest drifted
 
 
+class _BrokerReceiptWriter:
+    __slots__ = ("__store", "__capability")
+
+    def __init__(self, store: "PlanApprovalStore", capability: object) -> None:
+        self.__store = store
+        self.__capability = capability
+
+    def write(self, **fields: Any) -> None:
+        self.__store._insert_receipt(self.__capability, **fields)
+
+
 class PlanApprovalStore:
     """Atomic, durable store for plan approval + authorization state.
 
@@ -311,12 +322,11 @@ class PlanApprovalStore:
         # Batch 2.3 §6: a server-owned capability token that only the broker
         # receives. insert_receipt refuses to run without it, so ordinary
         # store callers cannot create receipt rows.
-        self._receipt_writer_token = secrets.token_hex(16)
+        self.__receipt_writer_capability = object()
 
-    @property
-    def receipt_writer_token(self) -> str:
-        """The capability token the broker needs to write receipt rows."""
-        return self._receipt_writer_token
+    def _broker_receipt_writer(self) -> _BrokerReceiptWriter:
+        """Internal broker wiring hook; never exported from the package."""
+        return _BrokerReceiptWriter(self, self.__receipt_writer_capability)
 
     # ------------------------------------------------------------------
     # Schema bootstrap
@@ -332,8 +342,9 @@ class PlanApprovalStore:
     # Receipt outbox
     # ------------------------------------------------------------------
 
-    def insert_receipt(
+    def _insert_receipt(
         self,
+        capability: object,
         *,
         receipt_id: str,
         token_hash: str,
@@ -352,7 +363,6 @@ class PlanApprovalStore:
         expires_at: float,
         created_at: float | None = None,
         now: float | None = None,
-        writer_capability: str = "",
     ) -> None:
         """Persist a broker-decision receipt outbox row with ALL authoritative fields.
 
@@ -362,9 +372,7 @@ class PlanApprovalStore:
         receipt_id or token_hash conflict raises instead of silently
         overwriting — a persisted decision cannot be rewritten.
         """
-        import hmac as _hmac
-
-        if not _hmac.compare_digest(writer_capability, self._receipt_writer_token):
+        if capability is not self.__receipt_writer_capability:
             raise PermissionError(
                 "insert_receipt requires the broker's writer_capability; "
                 "direct receipt writes by ordinary callers are forbidden"
@@ -507,6 +515,8 @@ class PlanApprovalStore:
         transaction. This method is retained for non-decision transitions
         (revoke, invalidate, stale-on-drift).
         """
+        if self._conn.in_transaction:
+            self._conn.commit()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute(
@@ -1465,23 +1475,23 @@ class PlanApprovalStore:
         self._conn.commit()
         return True
 
-    def load_plan_snapshot(self, plan_id: str) -> tuple[str, str, str] | None:
-        """Return ``(canonical_plan_json, content_hash, binding_digest)`` for
+    def load_plan_snapshot(self, plan_id: str) -> tuple[str, str, str, str] | None:
+        """Return canonical JSON, content hash, binding digest and schema for
         a plan_id, or None."""
         row = self._conn.execute(
-            "SELECT canonical_plan_json, content_hash, binding_digest FROM plan_snapshots "
+            "SELECT canonical_plan_json, content_hash, binding_digest, schema_version FROM plan_snapshots "
             "WHERE plan_id = ? AND status = 'active'",
             (plan_id,),
         ).fetchone()
         if row is None:
             return None
-        return str(row["canonical_plan_json"]), str(row["content_hash"]), str(row["binding_digest"])
+        return str(row["canonical_plan_json"]), str(row["content_hash"]), str(row["binding_digest"]), str(row["schema_version"])
 
     # ------------------------------------------------------------------
     # Atomic request + authorization invalidation (Batch 2.2 §6)
     # ------------------------------------------------------------------
 
-    def invalidate_request_and_authorizations(
+    def invalidate_request_authorizations_leases_and_receipt(
         self,
         request_id: str,
         *,
@@ -1498,6 +1508,8 @@ class PlanApprovalStore:
         / _mark_authorization_stale. Guarantees no request=stale/revoked/
         expired can coexist with an active authorization OR an active lease.
         """
+        if self._conn.in_transaction:
+            self._conn.commit()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute(
@@ -1522,6 +1534,7 @@ class PlanApprovalStore:
                     "WHERE workspace_id = ? AND status = 'active'",
                     (workspace_id,),
                 )
+                self._conn.execute("UPDATE plan_approval_receipts SET consumed=1 WHERE approval_request_id=?", (request_id,))
                 if audit_event is not None:
                     self._conn.execute(
                         """
@@ -1566,6 +1579,7 @@ class PlanApprovalStore:
                 "WHERE workspace_id = ? AND status = 'active'",
                 (workspace_id,),
             )
+            self._conn.execute("UPDATE plan_approval_receipts SET consumed=1 WHERE approval_request_id=?", (request_id,))
             if audit_event is not None:
                 self._conn.execute(
                     """
@@ -1591,6 +1605,10 @@ class PlanApprovalStore:
         except Exception:
             self._conn.rollback()
             raise
+
+    def invalidate_request_and_authorizations(self, *args: Any, **kwargs: Any) -> ApprovalTransitionResult:
+        """Backward-compatible name delegating to the unified transaction."""
+        return self.invalidate_request_authorizations_leases_and_receipt(*args, **kwargs)
 
     # ------------------------------------------------------------------
     # Execution leases (Batch 2.2 §7)
@@ -1857,6 +1875,22 @@ class PlanApprovalStore:
         ):
             return False
         if int(row["server_epoch"]) != int(current_server_epoch):
+            return False
+        auth = self._conn.execute(
+            "SELECT status,binding_digest,approval_request_id FROM plan_execution_authorizations WHERE authorization_id=?",
+            (row["authorization_id"],),
+        ).fetchone()
+        if auth is None or auth["status"] != AuthorizationStatus.CONSUMED.value:
+            return False
+        if auth["binding_digest"] != row["binding_digest"]:
+            return False
+        request = self._conn.execute(
+            "SELECT status,binding_digest FROM plan_approval_requests WHERE approval_request_id=?",
+            (auth["approval_request_id"],),
+        ).fetchone()
+        if request is None or request["status"] != PlanApprovalStatus.CONSUMED.value:
+            return False
+        if request["binding_digest"] != row["binding_digest"]:
             return False
         return True
 

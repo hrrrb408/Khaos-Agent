@@ -368,6 +368,8 @@ class AuthenticatedApprovalContext:
     context_nonce: str
     issued_at: float
     expires_at: float
+    approval_request_id: str = ""
+    session_generation: int = 0
     signature: str = ""  # empty unless minted by ApprovalAuthenticator
 
     def __post_init__(self) -> None:
@@ -385,7 +387,19 @@ class AuthenticatedApprovalContext:
             f"{self.authentication_time:.6f}",
             f"{self.issued_at:.6f}",
             f"{self.expires_at:.6f}",
+            self.approval_request_id, str(self.session_generation),
         ])
+
+@dataclass(frozen=True)
+class AuthenticatedSession:
+    session_id: str
+    principal_id: str
+    principal_type: str
+    authenticated_at: float
+    session_expiry: float
+    granted_capabilities: tuple[str, ...]
+    generation: int = 1
+    revoked: bool = False
 
 
 class ApprovalAuthenticator:
@@ -405,17 +419,26 @@ class ApprovalAuthenticator:
 
     def __init__(self, secret_key: str | None = None) -> None:
         self._key = secret_key or secrets.token_hex(32)
+        self._sessions: dict[str, AuthenticatedSession] = {}
+        self._consumed_context_nonces: set[str] = set()
 
-    @property
-    def secret_key(self) -> str:
-        return self._key
+    def register_session(self, session: AuthenticatedSession) -> None:
+        self._sessions[session.session_id] = session
+
+    def revoke_session(self, session_id: str) -> None:
+        session = self._sessions.get(session_id)
+        if session is not None:
+            self._sessions[session_id] = AuthenticatedSession(
+                session.session_id, session.principal_id, session.principal_type,
+                session.authenticated_at, session.session_expiry,
+                session.granted_capabilities, session.generation + 1, True,
+            )
 
     def issue_context(
         self,
         *,
-        actor_id: str,
-        actor_type: str,
-        session_request_id: str,
+        session: AuthenticatedSession,
+        approval_request_id: str,
         authenticated_source: str = "api",
         capability: str = CAPABILITY_PLAN_APPROVAL,
         ttl_seconds: float = 300.0,
@@ -430,16 +453,25 @@ class ApprovalAuthenticator:
         import time as _time
 
         now = _time.time() if now is None else now
+        current = self._sessions.get(session.session_id)
+        if current != session or session.revoked or now >= session.session_expiry:
+            raise PermissionError("session is not active in the server registry")
+        if capability not in session.granted_capabilities:
+            raise PermissionError("session lacks plan approval capability")
+        if not approval_request_id:
+            raise ValueError("approval_request_id is required")
         ctx = AuthenticatedApprovalContext(
-            actor_id=actor_id,
-            actor_type=actor_type,
-            session_request_id=session_request_id,
+            actor_id=session.principal_id,
+            actor_type=session.principal_type,
+            session_request_id=session.session_id,
             authenticated_source=authenticated_source,
-            authentication_time=now,
+            authentication_time=session.authenticated_at,
             server_capability=capability,
             context_nonce=secrets.token_hex(16),
             issued_at=now,
-            expires_at=now + ttl_seconds,
+            expires_at=min(now + ttl_seconds, session.session_expiry),
+            approval_request_id=approval_request_id,
+            session_generation=session.generation,
         )
         sig = self._sign(ctx.signing_payload())
         # frozen dataclass — use object.__setattr__ to set the signature.
@@ -451,6 +483,8 @@ class ApprovalAuthenticator:
         ctx: AuthenticatedApprovalContext,
         *,
         expected_capability: str = CAPABILITY_PLAN_APPROVAL,
+        expected_approval_request_id: str | None = None,
+        consume: bool = False,
         now: float | None = None,
     ) -> bool:
         """Verify a context's signature, capability, and expiry.
@@ -470,8 +504,20 @@ class ApprovalAuthenticator:
             return False
         if ctx.server_capability != expected_capability:
             return False
+        session = self._sessions.get(ctx.session_request_id)
+        if session is None or session.revoked or session.generation != ctx.session_generation:
+            return False
+        if session.principal_id != ctx.actor_id or session.principal_type != ctx.actor_type or now >= session.session_expiry:
+            return False
+        if expected_approval_request_id is not None and ctx.approval_request_id != expected_approval_request_id:
+            return False
+        if ctx.context_nonce in self._consumed_context_nonces:
+            return False
         expected_sig = self._sign(ctx.signing_payload())
-        return hmac.compare_digest(ctx.signature, expected_sig)
+        valid = hmac.compare_digest(ctx.signature, expected_sig)
+        if valid and consume:
+            self._consumed_context_nonces.add(ctx.context_nonce)
+        return valid
 
     def _sign(self, payload: str) -> str:
         import hmac as _hmac

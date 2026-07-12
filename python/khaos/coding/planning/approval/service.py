@@ -415,13 +415,11 @@ class PlanApprovalService:
         # Expiry check (pre-flight; the atomic method re-checks).
         now = float(self._clock())
         if now >= request.expires_at:
-            self._store.mark_expired(request.approval_request_id, now=now)
-            self._record_audit(
-                request=request, previous_status=request.status.value,
-                new_status=PlanApprovalStatus.EXPIRED.value,
-                actor_id=receipt.authenticated_actor_id,
-                actor_type=receipt.authenticated_actor_type,
-                reason_code="expired", correlation_id=receipt.broker_request_id,
+            self._transition(
+                request=request, target=PlanApprovalStatus.EXPIRED,
+                expected={request.status}, actor_id=receipt.authenticated_actor_id,
+                actor_type=receipt.authenticated_actor_type, reason_code="expired",
+                reason="approval expired", correlation_id=receipt.broker_request_id,
             )
             raise PlanNotRequestableError("request expired before decision")
 
@@ -438,7 +436,6 @@ class PlanApprovalService:
                 reason_code="stale-on-decision", reason=str(exc),
                 correlation_id=receipt.broker_request_id,
             )
-            self._store.revoke_authorizations_for_request(request.approval_request_id)
             raise PlanStaleError(str(exc)) from exc
         except _ValidatorNotRequestable as exc:
             raise PlanNotRequestableError(str(exc)) from exc
@@ -452,7 +449,6 @@ class PlanApprovalService:
                 reason_code="binding-drift-on-decision", reason="binding digest changed",
                 correlation_id=receipt.broker_request_id,
             )
-            self._store.revoke_authorizations_for_request(request.approval_request_id)
             raise PlanStaleError("binding digest changed between request and decision")
 
         # NOTE (Batch 2.2 §1.4): there is NO early idempotency return here.
@@ -518,7 +514,14 @@ class PlanApprovalService:
         elif result == ApprovalTransitionResult.UNCHANGED:
             logger.info("idempotent %s on request %s", receipt.decision.value, request.approval_request_id)
         elif result == ApprovalTransitionResult.STALE:
-            self._store.revoke_authorizations_for_request(request.approval_request_id)
+            self._transition(
+                request=request, target=PlanApprovalStatus.STALE,
+                expected={PlanApprovalStatus.PENDING,PlanApprovalStatus.APPROVED},
+                actor_id=receipt.authenticated_actor_id,
+                actor_type=receipt.authenticated_actor_type,
+                reason_code="stale-while-applying", reason="binding drift",
+                correlation_id=receipt.broker_request_id,
+            )
             raise PlanStaleError("binding drift while applying decision")
         elif result == ApprovalTransitionResult.CONFLICT:
             raise ApprovalConflictError(
@@ -739,8 +742,9 @@ class PlanApprovalService:
             task_id=request.task_id, workspace_id=request.workspace_id,
             repository_id=request.repository_id, correlation_id=correlation_id,
         )
-        result = self._store.transition_request_status(
-            request.approval_request_id, expected=expected, target=target, audit_event=audit,
+        result = self._store.invalidate_request_authorizations_leases_and_receipt(
+            request.approval_request_id, expected_statuses=expected,
+            target_status=target, audit_event=audit, now=float(self._clock()),
         )
         if result == ApprovalTransitionResult.UPDATED:
             return

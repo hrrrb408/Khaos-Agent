@@ -55,6 +55,10 @@ class PlanSnapshotStore:
     def clear(self) -> None:
         self._snapshots.clear()
 
+class UnsafeTestPlanRepository(PlanSnapshotStore):
+    """Explicitly unsafe in-memory repository for isolated tests only."""
+    _unsafe_test_only = True
+
 
 class PersistedPlanRepository:
     """Durable authoritative plan registry backed by ``plan_snapshots``.
@@ -72,8 +76,7 @@ class PersistedPlanRepository:
 
     def __init__(self, store: Any) -> None:
         self._store = store
-        # Cache deserialized plans so repeated lookups don't re-parse JSON.
-        self._cache: dict[str, "ImplementationPlan"] = {}
+        self._cache: dict[str, tuple[str, "ImplementationPlan"]] = {}
 
     def register(self, plan: "ImplementationPlan") -> bool:
         """Persist the authoritative snapshot. Returns False if a snapshot
@@ -94,20 +97,56 @@ class PersistedPlanRepository:
             schema_version=self.SCHEMA_VERSION,
         )
         if ok:
-            self._cache[plan.plan_id] = plan
+            self._cache[plan.plan_id] = (self._snapshot_fingerprint(canonical, plan.content_hash, binding_digest, self.SCHEMA_VERSION), plan)
         return ok
 
     def get(self, plan_id: str) -> "ImplementationPlan | None":
-        if plan_id in self._cache:
-            return self._cache[plan_id]
         row = self._store.load_plan_snapshot(plan_id)
         if row is None:
             return None
-        canonical_json, _content_hash, _binding = row
+        canonical_json, stored_content_hash, stored_binding, schema = row
+        if schema != self.SCHEMA_VERSION:
+            return None
+        fingerprint = self._snapshot_fingerprint(canonical_json, stored_content_hash, stored_binding, schema)
+        cached = self._cache.get(plan_id)
+        if cached is not None and cached[0] == fingerprint:
+            return cached[1]
         plan = self._deserialize(canonical_json)
-        if plan is not None:
-            self._cache[plan.plan_id] = plan
+        if plan is None or plan.plan_id != plan_id:
+            return None
+        if self._canonicalize(plan) != canonical_json:
+            return None
+        if plan.content_hash != stored_content_hash or self._recompute_plan_content_hash(plan) != stored_content_hash:
+            return None
+        from khaos.coding.planning.approval.models import compute_plan_binding_digest
+        if compute_plan_binding_digest(plan) != stored_binding:
+            return None
+        self._cache[plan.plan_id] = (fingerprint, plan)
         return plan
+
+    @staticmethod
+    def _snapshot_fingerprint(canonical: str, content_hash: str, binding: str, schema: str) -> str:
+        import hashlib
+        return hashlib.sha256(f"{schema}|{content_hash}|{binding}|{canonical}".encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _recompute_plan_content_hash(plan: "ImplementationPlan") -> str:
+        from dataclasses import asdict
+        from khaos.coding.planning.contracts import ImplementationPlan
+        body = {
+            "repository_id": plan.repository_id, "task_id": plan.task_id,
+            "workspace_id": plan.workspace_id, "normalized_goal": plan.normalized_goal,
+            "base_sha": plan.base_sha, "repository_generation": plan.repository_generation,
+            "status": plan.status.value, "steps": [asdict(x) for x in plan.steps],
+            "affected_files": [asdict(x) for x in plan.affected_files],
+            "affected_symbols": [asdict(x) for x in plan.affected_symbols],
+            "dependency_impacts": [asdict(x) for x in plan.dependency_impacts],
+            "verification_requirements": [asdict(x) for x in plan.verification_requirements],
+            "risks": [asdict(x) for x in plan.risks],
+            "diagnostics": [asdict(x) for x in plan.diagnostics],
+            "evidence": [asdict(x) for x in plan.evidence],
+        }
+        return ImplementationPlan.digest(body)
 
     def require(self, plan_id: str) -> "ImplementationPlan":
         plan = self.get(plan_id)
