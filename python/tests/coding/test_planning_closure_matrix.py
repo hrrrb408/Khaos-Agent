@@ -57,7 +57,7 @@ def test_exact_stale_evidence(planner,mutation):
     elif mutation == "same-name-other-file":
         sid=plan.affected_symbols[0].stable_symbol_id; store._conn.execute("DELETE FROM repository_symbols WHERE stable_symbol_id=?",(sid,)); store._conn.execute("INSERT INTO repository_symbols VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",("new","new","repo","other.py","python","function","public_api","public_api",0,1,0,1))
     elif mutation == "file-hash": store._conn.execute("UPDATE code_files SET content_hash='changed' WHERE project_id='repo' AND path='python_lib.py'")
-    else: store._conn.execute("INSERT INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",("repo","destination.py","python",0,0,"hash","v","legacy","{}",0,1,"source"))
+    else: store._conn.execute("INSERT INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",("repo","destination.py","python",0,0,"hash","v","legacy","{}",0,1,"source","","",""))
     assert service.validate_plan(plan,current_head="abc",current_repository_generation=1).status is PlanStatus.STALE
 
 
