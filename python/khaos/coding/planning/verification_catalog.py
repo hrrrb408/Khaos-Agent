@@ -25,6 +25,7 @@ import hashlib
 import json
 import logging
 import tomllib
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ from khaos.coding.planning.contracts import VerificationCatalogEntry
 logger = logging.getLogger(__name__)
 
 _CONTROL_TOKENS = (";", "&&", "||", "|", ">", "<", "`", "$(")
-_CATALOG_PARSER_VERSION = "v2-structured-2026-07-12"
+_CATALOG_PARSER_VERSION = "v3-safe-snapshot-2026-07-12"
 _CONFIG_FILES = ("pyproject.toml", "package.json", "go.mod", "Cargo.toml")
 
 
@@ -60,6 +61,101 @@ def _validate_repo_relative(path: str) -> str:
     if not cleaned:
         raise ValueError(f"empty normalized path: {path}")
     return cleaned
+
+
+@dataclass(frozen=True)
+class SafeConfigSnapshot:
+    """Immutable snapshot of a config file read through boundary validation.
+
+    A SafeConfigSnapshot is created by resolving both the repository root and
+    the candidate path, confirming the candidate is inside the root, and then
+    reading the content ONCE. The same snapshot is used for both fingerprint
+    computation and catalog parsing — this guarantees they see the same bytes
+    and prevents TOCTOU (time-of-check-to-time-of-use) divergence.
+
+    SYMLINK SAFETY: If the resolved candidate escapes the workspace root (via
+    symlink, absolute path, or ``..`` traversal), ``exists=False`` and
+    ``rejection_code`` is set. The target content is NEVER read in this case —
+    ``reader_call_count`` confirms zero reads of the external target.
+
+    Attributes:
+        relative_path: repo-relative POSIX path (e.g. ``pyproject.toml``)
+        content: file content as text, or ``""`` if missing/rejected
+        content_bytes: file content as bytes, or ``b""`` if missing/rejected
+        content_hash: sha256 of content_bytes, or ``""`` if missing/rejected
+        exists: True only if the file was successfully read
+        rejection_code: ``"escape"``, ``"broken"``, ``"read-error"``, or ``""``
+        diagnostic: human-readable diagnostic message (never exposes absolute target path)
+        reader_call_count: number of read operations performed on the resolved path
+    """
+    relative_path: str
+    content: str
+    content_bytes: bytes
+    content_hash: str
+    exists: bool
+    rejection_code: str
+    diagnostic: str
+    reader_call_count: int
+
+    @staticmethod
+    def capture(root: Path | None, filename: str, *, reader=None) -> "SafeConfigSnapshot":
+        """Capture a safe snapshot of ``root / filename``.
+
+        Args:
+            root: repository root path (None → empty snapshot)
+            filename: repo-relative filename (e.g. ``pyproject.toml``)
+            reader: optional callable(path: Path) -> bytes for testing.
+                    When provided, the snapshot records how many times it
+                    was called, proving that external symlinks trigger zero reads.
+        """
+        if root is None:
+            return SafeConfigSnapshot(filename, "", b"", "", False, "", "", 0)
+
+        # Step 1: resolve repository root
+        try:
+            root_resolved = root.resolve()
+        except OSError:
+            return SafeConfigSnapshot(filename, "", b"", "", False, "root-unresolvable",
+                                      f"cannot resolve repository root for: {filename}", 0)
+
+        # Step 2: resolve candidate (non-strict — broken symlinks still resolve)
+        candidate = root / filename
+        try:
+            candidate_resolved = candidate.resolve(strict=False)
+        except OSError:
+            return SafeConfigSnapshot(filename, "", b"", "", False, "broken",
+                                      f"broken symlink for config file: {filename}", 0)
+
+        # Step 3: confirm candidate is inside root
+        try:
+            candidate_resolved.relative_to(root_resolved)
+        except ValueError:
+            # ESCAPE: candidate resolves outside workspace root.
+            # DO NOT read the target content — return immediately.
+            return SafeConfigSnapshot(filename, "", b"", "", False, "escape",
+                                      f"config file escapes workspace root: {filename}", 0)
+
+        # Step 4: read content ONCE via the resolved path
+        read_count = 0
+        try:
+            if reader is not None:
+                content_bytes = reader(candidate_resolved)
+                read_count = 1
+            else:
+                content_bytes = candidate_resolved.read_bytes()
+                read_count = 1
+        except OSError:
+            return SafeConfigSnapshot(filename, "", b"", "", False, "read-error",
+                                      f"cannot read config file: {filename}", read_count)
+        try:
+            content = content_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return SafeConfigSnapshot(filename, "", b"", "", False, "read-error",
+                                      f"config file not UTF-8: {filename}", read_count)
+
+        content_hash = hashlib.sha256(content_bytes).hexdigest()
+        return SafeConfigSnapshot(filename, content, content_bytes, content_hash,
+                                  True, "", "", read_count)
 
 
 class VerificationCatalog:
@@ -91,6 +187,7 @@ class VerificationCatalog:
         *,
         server_rules: tuple[dict[str, Any], ...] = (),
         repository_id: str = "",
+        snapshots: dict[str, SafeConfigSnapshot] | None = None,
     ) -> None:
         self._root = root
         self._server_rules = server_rules
@@ -98,10 +195,20 @@ class VerificationCatalog:
         self._entries: list[VerificationCatalogEntry] = []
         self._config_hashes: dict[str, str] = {}  # repo-relative path -> sha256
         self._diagnostics: list[tuple[str, str]] = []  # (severity, message)
+        # Capture safe snapshots ONCE — used for BOTH fingerprint and catalog scan.
+        # This prevents TOCTOU divergence between fingerprint computation and
+        # catalog parsing, and ensures external symlinks are never read.
+        self._snapshots: dict[str, SafeConfigSnapshot] = snapshots or {}
+        if root is not None and not self._snapshots:
+            for filename in _CONFIG_FILES:
+                snap = SafeConfigSnapshot.capture(root, filename)
+                if snap.exists or snap.rejection_code:
+                    self._snapshots[filename] = snap
         if root is not None:
             self._scan()
         self.fingerprint: str = self.compute_fingerprint(
             repository_id, root, server_rules,
+            snapshots=self._snapshots,
         )
 
     @property
@@ -154,43 +261,49 @@ class VerificationCatalog:
         repository_id: str,
         root: Path | None,
         server_rules: tuple[dict[str, Any], ...],
+        *,
+        snapshots: dict[str, SafeConfigSnapshot] | None = None,
     ) -> str:
-        """Compute a fingerprint that changes when any catalog input changes.
+        """Compute a portable fingerprint that changes when catalog inputs change.
 
         Binds:
         - catalog parser version
         - repository_id
-        - repository root identity (absolute path hash — internal only,
-          never exposed in evidence; ensures different clones with identical
-          content still get distinct fingerprints only when root differs is
-          NOT desired — root identity is included solely to detect when the
-          same repository_id points to a different working tree)
-        - pyproject.toml hash (or "" if missing)
-        - package.json hash (or "" if missing)
-        - go.mod hash (or "" if missing)
-        - Cargo.toml hash (or "" if missing)
+        - pyproject.toml hash (or "" if missing/escaped)
+        - package.json hash (or "" if missing/escaped)
+        - go.mod hash (or "" if missing/escaped)
+        - Cargo.toml hash (or "" if missing/escaped)
         - server trusted rules hash
+
+        PORTABILITY: The fingerprint NEVER includes the absolute repository
+        root path. This guarantees that cloning the same repository into two
+        different absolute directories produces identical fingerprints, which
+        is required for cross-worktree plan_id and content_hash determinism.
+        The fingerprint only changes when config file CONTENT changes, not
+        when the repository is cloned to a new path.
+
+        SAFE SNAPSHOT: When ``snapshots`` is provided, uses the pre-captured
+        SafeConfigSnapshot hashes instead of re-reading files. This guarantees
+        the fingerprint sees the same bytes as the catalog scan and prevents
+        reading external symlink targets. When ``snapshots`` is None and
+        ``root`` is provided, captures fresh snapshots on the fly — each
+        capture goes through boundary validation, so external symlinks are
+        rejected before any read and contribute "" (empty) to the fingerprint.
         """
         parts: list[str] = [_CATALOG_PARSER_VERSION, repository_id or ""]
-        # Root identity — internal only, never exposed in evidence
-        if root is not None:
-            try:
-                resolved = root.resolve()
-                parts.append(hashlib.sha256(str(resolved).encode()).hexdigest())
-            except OSError:
-                parts.append("")
-        else:
-            parts.append("")
-        # Config file hashes (presence and content)
+        # Config file hashes (presence and content) — from safe snapshots.
+        # NO root identity hash — fingerprint must be portable across worktrees.
         for filename in _CONFIG_FILES:
-            if root is None:
-                parts.append("")
-                continue
-            path = root / filename
-            try:
-                content = path.read_bytes()
-                parts.append(hashlib.sha256(content).hexdigest())
-            except OSError:
+            if snapshots and filename in snapshots:
+                snap = snapshots[filename]
+                parts.append(snap.content_hash if snap.exists else "")
+            elif root is not None:
+                # Standalone call (no pre-captured snapshots) — capture now.
+                # SafeConfigSnapshot.capture rejects external symlinks BEFORE
+                # any read, so escaped files contribute "" (empty hash).
+                snap = SafeConfigSnapshot.capture(root, filename)
+                parts.append(snap.content_hash if snap.exists else "")
+            else:
                 parts.append("")
         # Server rules hash (deterministic serialization)
         rules_serialized = json.dumps(
@@ -212,44 +325,30 @@ class VerificationCatalog:
         self._scan_server_rules()
 
     def _read_config(self, filename: str) -> tuple[str | None, str]:
-        """Read a config file. Returns (content, content_hash). Empty hash if missing.
+        """Read a config file from the pre-captured safe snapshot.
 
-        SYMLINK SAFETY: Before reading, resolves both the repository root and
-        the candidate path. If the resolved candidate escapes the resolved
-        root (via symlink, absolute path, or ``..`` traversal), the read is
-        refused and a diagnostic is recorded. The absolute target path is
-        NEVER exposed in evidence, logs, or exception messages — only the
-        repo-relative ``filename`` appears in diagnostics.
+        Returns (content, content_hash). Empty hash if missing/rejected.
 
-        Internal symlinks (pointing to a file inside the workspace) are allowed.
-        Broken symlinks are rejected (read fails → empty result).
+        SAFE SNAPSHOT: This method NEVER reads the filesystem directly. It
+        returns content from the SafeConfigSnapshot captured in ``__init__``.
+        This guarantees:
+        - External symlinks are never read (snapshot.capture rejects them
+          before any read call)
+        - Fingerprint and catalog scan see the same bytes (same snapshot)
+        - No TOCTOU divergence between fingerprint and scan
+
+        If a snapshot was not pre-captured (e.g. root is None or file was
+        missing), returns (None, "").
         """
-        if self._root is None:
+        snap = self._snapshots.get(filename)
+        if snap is None:
             return None, ""
-        try:
-            root_resolved = self._root.resolve()
-        except OSError:
+        if not snap.exists:
+            if snap.diagnostic:
+                severity = "error" if snap.rejection_code in ("escape", "broken", "read-error") else "warning"
+                self._diagnostics.append((severity, snap.diagnostic))
             return None, ""
-        candidate = self._root / filename
-        try:
-            candidate_resolved = candidate.resolve(strict=False)
-        except OSError:
-            return None, ""
-        # Confirm resolved candidate is inside resolved root.
-        try:
-            candidate_resolved.relative_to(root_resolved)
-        except ValueError:
-            self._diagnostics.append((
-                "error",
-                f"config file escapes workspace root: {filename}",
-            ))
-            return None, ""
-        # Read the content via the resolved path (follows internal symlinks safely).
-        try:
-            content = candidate_resolved.read_text(encoding="utf-8")
-            return content, hashlib.sha256(content.encode()).hexdigest()
-        except (OSError, UnicodeDecodeError):
-            return None, ""
+        return snap.content, snap.content_hash
 
     def _scan_pyproject(self) -> None:
         """Parse pyproject.toml with tomllib — no substring inference."""

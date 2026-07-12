@@ -229,6 +229,14 @@ class DeterministicPlanningService:
                 rows_returned=test_result.sql_rows_returned,
                 indexed_rows_fetched=test_result.indexed_edge_rows_fetched,
             )
+            # Propagate test association truncation into the global budget.
+            # This ensures ImpactAnalysis.truncated=True when test association
+            # hits any budget limit, generating an impact-truncated diagnostic
+            # and causing RiskEvaluator to raise risk per truncation rules.
+            budget.absorb_external_truncation(
+                truncated=test_result.truncated,
+                limit_code=test_result.limit_code,
+            )
             for candidate in test_result.candidates:
                 if not budget.can_inspect_test_candidate():
                     break
@@ -264,6 +272,7 @@ class DeterministicPlanningService:
             "dynamic": [asdict(x) for x in dynamic],
             "external": [asdict(x) for x in external],
             "truncated": budget.truncated,
+            "limit_code": budget.limit_code,
         })
         return ImpactAnalysis(
             tuple(sorted(target_files)), tuple(sorted(target_symbols)),

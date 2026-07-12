@@ -206,6 +206,25 @@ class ImpactTraversalBudget:
             self._truncated = True
             self._limit_code = code
 
+    def absorb_external_truncation(self, *, truncated: bool, limit_code: str | None) -> None:
+        """Absorb truncation from an external bounded operation (e.g. TestAssociationResult).
+
+        When ``truncated=True``, sets ``self._truncated=True`` while preserving
+        the FIRST ``limit_code`` ever recorded. If an earlier phase already
+        truncated, the original limit_code is NOT overwritten.
+
+        This ensures TestAssociationResult.truncated propagates to
+        ImpactAnalysis.truncated, generating an ``impact-truncated`` diagnostic
+        and causing RiskEvaluator to raise risk per truncation rules.
+        """
+        if not truncated:
+            return
+        if not self._truncated:
+            self._truncated = True
+            # Use the external limit_code if provided, else a generic marker
+            self._limit_code = limit_code or "external-truncation"
+        # If already truncated, preserve the original limit_code (do not overwrite)
+
 
 @dataclass(frozen=True)
 class TestAssociationResult:
