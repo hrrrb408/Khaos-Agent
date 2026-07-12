@@ -1,22 +1,68 @@
-"""Deterministic, read-only validation for implementation-plan step DAGs."""
+"""Deterministic validation and sorting for implementation-plan step DAGs."""
 from __future__ import annotations
+
 from khaos.coding.planning.contracts import PlanDiagnostic, PlanOperation, PlanStep
 
+MODIFICATION_OPERATIONS = {
+    PlanOperation.MODIFY, PlanOperation.CREATE, PlanOperation.DELETE,
+    PlanOperation.RENAME, PlanOperation.CONFIGURE, PlanOperation.DOCUMENT,
+}
+
+class InvalidPlanDagError(ValueError):
+    def __init__(self, diagnostics: tuple[PlanDiagnostic, ...]) -> None:
+        super().__init__("invalid implementation-plan DAG")
+        self.diagnostics = diagnostics
+
+def _inspection_ancestor(step_id: str, by_id: dict[str, PlanStep]) -> bool:
+    pending = sorted(by_id[step_id].depends_on); seen: set[str] = set()
+    while pending:
+        current = pending.pop(0)
+        if current in seen or current not in by_id: continue
+        seen.add(current)
+        if by_id[current].operation is PlanOperation.INSPECT: return True
+        pending.extend(sorted(by_id[current].depends_on))
+    return False
+
 def validate_steps(steps: tuple[PlanStep, ...]) -> tuple[PlanDiagnostic, ...]:
-    seen=set(); diagnostics=[]; ids={step.step_id for step in steps}
-    for step in steps:
-        if step.step_id in seen: diagnostics.append(PlanDiagnostic("duplicate-step-id","error",step.step_id,False))
-        seen.add(step.step_id)
-        for dependency in step.depends_on:
-            if dependency not in ids: diagnostics.append(PlanDiagnostic("missing-step-dependency","error",dependency,False))
-            if dependency == step.step_id: diagnostics.append(PlanDiagnostic("self-step-dependency","error",dependency,False))
-        if step.operation in (PlanOperation.DELETE, PlanOperation.RENAME) and not step.depends_on:
-            diagnostics.append(PlanDiagnostic("destructive-without-inspection","error",step.step_id,False))
-    graph={step.step_id:set(step.depends_on) for step in steps}
+    diagnostics: list[PlanDiagnostic] = []
+    counts: dict[str, int] = {}
+    for step in steps: counts[step.step_id] = counts.get(step.step_id, 0) + 1
+    for step_id in sorted(key for key, count in counts.items() if count > 1):
+        diagnostics.append(PlanDiagnostic("duplicate-step-id", "error", step_id, False))
+    unique = {step.step_id: step for step in sorted(steps, key=lambda item: item.step_id) if counts[step.step_id] == 1}
+    valid_edges: dict[str, set[str]] = {step_id: set() for step_id in unique}
+    for step_id in sorted(unique):
+        step = unique[step_id]
+        for dependency in sorted(set(step.depends_on)):
+            if dependency not in unique:
+                diagnostics.append(PlanDiagnostic("missing-step-dependency", "error", f"{step_id}:{dependency}", False))
+            elif dependency == step_id:
+                diagnostics.append(PlanDiagnostic("self-step-dependency", "error", step_id, False))
+            else:
+                valid_edges[step_id].add(dependency)
+        if step.operation in MODIFICATION_OPERATIONS and not _inspection_ancestor(step_id, unique):
+            code = "destructive-without-inspection" if step.operation in (PlanOperation.DELETE, PlanOperation.RENAME) else "invalid-operation-order"
+            diagnostics.append(PlanDiagnostic(code, "error", step_id, False))
+        if step.operation is PlanOperation.TEST:
+            ancestors = [unique[item].operation for item in valid_edges[step_id] if item in unique]
+            if not any(operation in MODIFICATION_OPERATIONS for operation in ancestors):
+                diagnostics.append(PlanDiagnostic("invalid-operation-order", "error", step_id, False))
+    graph = {key: set(value) for key, value in valid_edges.items()}
     while graph:
-        ready=sorted(key for key,value in graph.items() if not value)
+        ready = sorted(key for key, value in graph.items() if not value)
         if not ready:
-            diagnostics.append(PlanDiagnostic("step-cycle","error","cycle detected",False)); break
+            diagnostics.append(PlanDiagnostic("step-cycle", "error", ",".join(sorted(graph)), False)); break
         for key in ready: graph.pop(key)
         for value in graph.values(): value.difference_update(ready)
-    return tuple(diagnostics)
+    return tuple(sorted(diagnostics, key=lambda item: (item.code, item.message)))
+
+def topologically_sort_steps(steps: tuple[PlanStep, ...]) -> tuple[PlanStep, ...]:
+    diagnostics = validate_steps(steps)
+    if diagnostics: raise InvalidPlanDagError(diagnostics)
+    by_id = {step.step_id: step for step in steps}
+    graph = {key: set(step.depends_on) for key, step in by_id.items()}; result=[]
+    while graph:
+        ready = sorted(key for key, value in graph.items() if not value)
+        for key in ready: result.append(by_id[key]); graph.pop(key)
+        for value in graph.values(): value.difference_update(ready)
+    return tuple(result)

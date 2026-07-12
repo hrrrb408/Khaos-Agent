@@ -2,8 +2,7 @@
 from __future__ import annotations
 
 import re
-import hashlib
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import Any
 
 from khaos.coding.intelligence.query import CodeQueryService
@@ -11,6 +10,15 @@ from khaos.coding.planning.contracts import *  # noqa: F403
 from khaos.coding.planning.dag import validate_steps
 
 MAX_GOAL_LENGTH = 4096
+
+@dataclass(frozen=True)
+class ParsedGoalTarget:
+    raw_token: str
+    explicit_kind: str
+    requested_path: str | None
+    requested_symbol: str | None
+    path_syntax: bool
+    diagnostics: tuple[PlanDiagnostic, ...] = ()
 
 
 class DeterministicPlanningService:
@@ -20,18 +28,29 @@ class DeterministicPlanningService:
 
     def classify_goal(self, *, repository_id: str, user_goal: str) -> GoalIntentResult:
         """Classify only explicit wording; it never guesses a target."""
-        goal = " ".join(user_goal.split()).casefold()
+        raw_goal = " ".join(user_goal.split())
+        classifier_text = raw_goal.casefold()
         rules = (("rename", GoalIntent.RENAME_SYMBOL), ("delete", GoalIntent.DELETE_FILE), ("create", GoalIntent.CREATE_FILE), ("move", GoalIntent.MOVE_FILE), ("import", GoalIntent.UPDATE_IMPORT), ("migration", GoalIntent.SCHEMA_CHANGE), ("schema", GoalIntent.SCHEMA_CHANGE), ("security", GoalIntent.SECURITY_CHANGE), ("credential", GoalIntent.SECURITY_CHANGE), ("config", GoalIntent.UPDATE_CONFIGURATION), ("test", GoalIntent.UPDATE_TEST), ("document", GoalIntent.UPDATE_DOCUMENTATION), ("dependency", GoalIntent.DEPENDENCY_CHANGE), ("modify", GoalIntent.MODIFY_SYMBOL), ("change", GoalIntent.MODIFY_SYMBOL), ("inspect", GoalIntent.INSPECT))
-        intent = next((value for word, value in rules if word in goal), GoalIntent.UNKNOWN)
-        raw = self._target(goal); diagnostics: list[PlanDiagnostic] = []
-        if raw.startswith("/") or ".." in raw.split("/"):
-            diagnostics.append(PlanDiagnostic("unsafe-path", "error", "target path escapes repository", False)); raw = ""
-        files = (raw,) if raw and "." in raw else ()
-        symbols = self._query.find_symbol_targets(repository_id, raw) if raw and not files else []
-        status = "resolved" if len(symbols) == 1 or files else "ambiguous" if len(symbols) > 1 else "unresolved"
+        intent = next((value for word, value in rules if word in classifier_text), GoalIntent.UNKNOWN)
+        parsed = self._parse_target(raw_goal); diagnostics = list(parsed.diagnostics)
+        raw = parsed.raw_token
+        file_record = self._query.file_evidence(repository_id, parsed.requested_path) if parsed.requested_path and not diagnostics else None
+        files = (parsed.requested_path,) if file_record else ()
+        if parsed.requested_symbol:
+            symbols = self._query.find_qualified_symbol_targets(repository_id, parsed.requested_symbol)
+            if not symbols and "." not in parsed.requested_symbol:
+                symbols = self._query.find_symbol_targets(repository_id, parsed.requested_symbol)
+        else:
+            symbols = []
+        if parsed.explicit_kind == "unknown" and raw and not diagnostics:
+            exact_file = self._query.file_evidence(repository_id, raw)
+            if exact_file and not symbols: files = (raw,)
+            elif exact_file and symbols: diagnostics.append(PlanDiagnostic("ambiguous-target", "warning", "token matches file and symbol", True))
+        status = "rejected" if diagnostics and diagnostics[0].code == "unsafe-path" else "resolved" if len(symbols) == 1 or files else "ambiguous" if len(symbols) > 1 else "unresolved"
         if len(symbols) > 1: diagnostics.append(PlanDiagnostic("ambiguous-symbol", "warning", "multiple symbol candidates", True))
         if raw and not files and not symbols: diagnostics.append(PlanDiagnostic("target-not-found", "warning", "no symbol evidence", True))
-        return GoalIntentResult(goal, (intent,), (GoalTarget(raw, "path" if files else "symbol", raw if not files else None, raw if files else None, self._language(raw), self._operation(goal).value, status, files, tuple(x.get("stable_symbol_id", "") for x in symbols), (), tuple(diagnostics)),), 1.0 if status == "resolved" else .0, tuple(diagnostics))
+        evidence = tuple(self._symbol_evidence(repository_id, raw, item) for item in symbols)
+        return GoalIntentResult(raw_goal, (intent,), (GoalTarget(raw, parsed.explicit_kind, parsed.requested_symbol, parsed.requested_path, self._language(parsed.requested_path or ""), self._operation(classifier_text).value, status, files, tuple(x.get("stable_symbol_id", "") for x in symbols), evidence, tuple(diagnostics)),), 1.0 if status == "resolved" else .0, tuple(diagnostics))
 
     def analyze_impacts(self, *, repository_id: str, target_symbols: tuple[str, ...], max_depth: int = 3, max_nodes: int = 200, max_files: int = 100) -> ImpactAnalysis:
         """Cycle-safe reverse call/reference traversal over persisted resolution edges."""
@@ -57,28 +76,35 @@ class DeterministicPlanningService:
 
     def plan(self, *, repository_id: str, task_id: str, workspace_id: str, user_goal: str, base_sha: str) -> ImplementationPlan:
         raw_goal = " ".join(user_goal.split())
-        normalized = raw_goal.casefold()
+        classifier_text = raw_goal.casefold()
+        normalized = raw_goal
         diagnostics: list[PlanDiagnostic] = []
         repo = self._repositories.get(repository_id)
         if not normalized or len(normalized) > MAX_GOAL_LENGTH or repo is None or repo.get("workspace_id") != workspace_id or repo.get("head") != base_sha:
             code = "empty-goal" if not normalized else "goal-too-long" if len(normalized) > MAX_GOAL_LENGTH else "repository-not-found" if repo is None else "workspace-mismatch" if repo.get("workspace_id") != workspace_id else "base-sha-mismatch"
             diagnostics.append(PlanDiagnostic(code, "error", code.replace("-", " "), False))
             return self._build(repository_id, task_id, workspace_id, user_goal, normalized, base_sha, int(repo.get("generation", 0)) if repo else 0, PlanStatus.BLOCKED, (), (), (), (), (), (), diagnostics)
-        operation = self._operation(normalized)
-        token = self._target(raw_goal)
-        candidates = self._query.find_symbol_targets(repository_id, token) if token else []
+        operation = self._operation(classifier_text)
+        parsed = self._parse_target(raw_goal)
+        diagnostics.extend(parsed.diagnostics)
+        token = parsed.raw_token
+        candidates = self._query.find_qualified_symbol_targets(repository_id, parsed.requested_symbol) if parsed.requested_symbol else []
+        if not candidates and parsed.requested_symbol and "." not in parsed.requested_symbol:
+            candidates = self._query.find_symbol_targets(repository_id, parsed.requested_symbol)
         if not candidates and token:
             candidates = self._query.indexed_symbol_candidates(repository_id, token)
         evidence: list[PlanEvidence] = []
         symbols: list[AffectedSymbol] = []
         files: list[AffectedFile] = []
         impacts: list[DependencyImpact] = []
-        file_record = self._query.file_evidence(repository_id, token) if "." in token else None
+        file_record = self._query.file_evidence(repository_id, parsed.requested_path) if parsed.requested_path and not parsed.diagnostics else None
         if operation in (PlanOperation.DELETE, PlanOperation.RENAME) and file_record:
-            ev = PlanEvidence("index-store", repository_id, token, generation=file_record["generation"], content_hash=file_record["content_hash"], query=token, confidence=1.0)
-            evidence.append(ev); files.append(AffectedFile(token, operation, "indexed file target", 1.0, True, file_record["language"], (ev,)))
-        elif operation == PlanOperation.CREATE and token:
-            files.append(AffectedFile(token, operation, "goal names a new file", .5, False, self._language(token), (PlanEvidence("goal", repository_id, path=token, query=normalized, confidence=.5),)))
+            path = parsed.requested_path or token
+            ev = PlanEvidence("index-store", repository_id, path, generation=file_record["generation"], content_hash=file_record["content_hash"], query=token, confidence=1.0)
+            evidence.append(ev); files.append(AffectedFile(path, operation, "indexed file target", 1.0, True, file_record["language"], (ev,)))
+        elif operation == PlanOperation.CREATE and parsed.requested_path and not parsed.diagnostics:
+            ev = PlanEvidence("goal", repository_id, path=parsed.requested_path, query=token, confidence=.5)
+            evidence.append(ev); files.append(AffectedFile(parsed.requested_path, operation, "explicit new file target", .5, False, self._language(parsed.requested_path), (ev,)))
         elif len(candidates) == 1:
             item = candidates[0]; path = item["path"]; sid = item.get("stable_symbol_id")
             record = self._query.file_evidence(repository_id, path) or {}
@@ -93,10 +119,10 @@ class DeterministicPlanningService:
             diagnostics.append(PlanDiagnostic("target-not-found", "warning", f"no evidence for {token or 'target'}", True))
         for item in self._query.unresolved_candidates(repository_id, files[0].path) if files else []:
             diagnostics.append(PlanDiagnostic("dynamic-or-unresolved-call", "warning", item["status"], True))
-        risks = self._risks(operation, files, symbols, normalized)
+        risks = self._risks(operation, files, symbols, classifier_text)
         requirements = self._verification(repo, files, evidence)
         status = PlanStatus.READY if files and not any(d.code == "ambiguous-symbol" for d in diagnostics) else PlanStatus.BLOCKED
-        step = self._steps(operation, normalized, files, symbols, requirements, risks[0], evidence, status)
+        step = self._steps(operation, raw_goal, files, symbols, requirements, risks[0], evidence, status)
         diagnostics.extend(validate_steps(step))
         if any(d.severity == "error" for d in diagnostics): status = PlanStatus.BLOCKED
         return self._build(repository_id, task_id, workspace_id, user_goal, normalized, base_sha, int(repo["generation"]), status, step, files, symbols, impacts, requirements, risks, diagnostics, evidence)
@@ -121,19 +147,36 @@ class DeterministicPlanningService:
     def _operation(goal):
         return next((op for word, op in (("rename", PlanOperation.RENAME), ("delete", PlanOperation.DELETE), ("create", PlanOperation.CREATE), ("add", PlanOperation.CREATE), ("test", PlanOperation.TEST), ("config", PlanOperation.CONFIGURE), ("document", PlanOperation.DOCUMENT), ("modify", PlanOperation.MODIFY), ("change", PlanOperation.MODIFY)) if word in goal), PlanOperation.INSPECT)
     @staticmethod
-    def _target(goal):
-        match = re.search(r"(?:function|symbol|file)\s+[`'\"]?([\w./-]+)", goal)
-        if not match:
-            match = re.search(r"(?:rename|modify|change|delete|create)\s+[`'\"]?([\w./-]+)", goal)
-        value = match.group(1) if match else ""
-        return value if "." in value else value.split("/")[-1]
+    def _parse_target(goal: str) -> ParsedGoalTarget:
+        explicit = re.search(r"\b(file|function|symbol|type|module)\s+[`'\"]?([^\s`'\"]+)", goal, re.IGNORECASE)
+        fallback = re.search(r"\b(?:rename|modify|change|delete|create|inspect)\s+[`'\"]?([^\s`'\"]+)", goal, re.IGNORECASE)
+        kind = explicit.group(1).casefold() if explicit else "unknown"
+        token = explicit.group(2) if explicit else fallback.group(1) if fallback else ""
+        if not token: return ParsedGoalTarget("", kind, None, None, False)
+        if kind == "file" or kind == "unknown":
+            windows_absolute = bool(re.match(r"^[A-Za-z]:[\\/]", token))
+            unc = token.startswith(("\\\\", "//"))
+            normalized = token.replace("\\", "/")
+            parts = normalized.split("/")
+            unsafe = token.startswith("/") or windows_absolute or unc or any(part == ".." for part in parts)
+            if unsafe:
+                diagnostic = PlanDiagnostic("unsafe-path", "error", f"repository-external path rejected: {token}", False)
+                return ParsedGoalTarget(token, kind, None, None, True, (diagnostic,))
+            normalized = "/".join(part for part in parts if part not in ("", "."))
+            if kind == "file": return ParsedGoalTarget(token, kind, normalized, None, True)
+            return ParsedGoalTarget(token, kind, normalized, token, "/" in normalized)
+        return ParsedGoalTarget(token, kind, None, token, False)
+
+    def _symbol_evidence(self, repository_id: str, query: str, item: dict[str, Any]) -> PlanEvidence:
+        record = self._query.file_evidence(repository_id, item["path"]) or {}
+        return PlanEvidence("resolution-graph", repository_id, item["path"], item.get("stable_symbol_id"), record.get("generation", item.get("generation")), record.get("content_hash"), query, 1.0, {"kind": item.get("kind")})
     @staticmethod
     def _steps(operation, goal, files, symbols, requirements, risk, evidence, status):
         if not files: return ()
         targets=tuple(f.path for f in files); symbols=tuple(s.stable_symbol_id for s in symbols if s.stable_symbol_id)
         inspect=PlanStep("inspect-1", "Inspect evidence", "confirm indexed target and assumptions", PlanOperation.INSPECT, targets, symbols, (), "confirmed scope", (), risk, risk.requires_approval, tuple(evidence))
         if status != PlanStatus.READY: return (inspect,)
-        primary=PlanStep("modify-1", "Apply planned source update", goal, operation, targets, symbols, ("inspect-1",) if operation in (PlanOperation.DELETE, PlanOperation.RENAME) else (), "source update prepared", (), risk, risk.requires_approval, tuple(evidence))
+        primary=PlanStep("modify-1", "Apply planned source update", goal, operation, targets, symbols, ("inspect-1",), "source update prepared", (), risk, risk.requires_approval, tuple(evidence))
         tests=PlanStep("verify-1", "Verify affected scope", "run trusted verification later", PlanOperation.TEST, targets, (), ("modify-1",), "verification requirements satisfied", tuple(requirements), risk, risk.requires_approval, tuple(evidence))
         return (inspect, primary, tests)
     @staticmethod

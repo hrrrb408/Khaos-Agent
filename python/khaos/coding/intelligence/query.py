@@ -44,6 +44,14 @@ class CodeQueryService:
         """Find all repository symbols matching a name."""
         return symbol_targets(self.store._conn, project_id, name)
 
+    def find_qualified_symbol_targets(self, project_id: str, qualified_name: str) -> list[dict[str, Any]]:
+        """Find exact qualified-name matches without case folding."""
+        rows = self.store._conn.execute(
+            "SELECT * FROM repository_symbols WHERE repository_id=? AND qualified_name=? ORDER BY path,qualified_name",
+            (project_id, qualified_name),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
     def indexed_symbol_candidates(self, project_id: str, name: str) -> list[dict[str, Any]]:
         """Read-only fallback when resolution has not produced a graph node."""
         rows = self.store._conn.execute(
