@@ -18,6 +18,28 @@ class PlanOperation(str, Enum):
     INSPECT = "inspect"; MODIFY = "modify"; CREATE = "create"; DELETE = "delete"
     RENAME = "rename"; TEST = "test"; DOCUMENT = "document"; CONFIGURE = "configure"; UNKNOWN = "unknown"
 
+class GoalIntent(str, Enum):
+    INSPECT="inspect"; MODIFY_SYMBOL="modify_symbol"; RENAME_SYMBOL="rename_symbol"; CREATE_FILE="create_file"; DELETE_FILE="delete_file"; MOVE_FILE="move_file"; UPDATE_IMPORT="update_import"; UPDATE_CONFIGURATION="update_configuration"; UPDATE_TEST="update_test"; UPDATE_DOCUMENTATION="update_documentation"; SCHEMA_CHANGE="schema_change"; SECURITY_CHANGE="security_change"; DEPENDENCY_CHANGE="dependency_change"; UNKNOWN="unknown"
+
+class ImpactStatus(str, Enum):
+    DIRECT="direct"; INDIRECT="indirect"; POSSIBLE="possible"; AMBIGUOUS="ambiguous"; DYNAMIC="dynamic"; EXTERNAL="external"; EXCLUDED="excluded"
+
+@dataclass(frozen=True)
+class GoalTarget:
+    raw_text: str; target_type: str; requested_name: str | None; requested_path: str | None; requested_language: str | None; requested_operation: str; resolved_status: str; candidate_files: tuple[str, ...]; candidate_symbols: tuple[str, ...]; evidence: tuple[PlanEvidence, ...]; diagnostics: tuple[PlanDiagnostic, ...] = ()
+
+@dataclass(frozen=True)
+class GoalIntentResult:
+    normalized_goal: str; intents: tuple[GoalIntent, ...]; targets: tuple[GoalTarget, ...]; confidence: float; diagnostics: tuple[PlanDiagnostic, ...] = ()
+
+@dataclass(frozen=True)
+class ImpactEdge:
+    source_file: str; source_symbol: str | None; target_file: str; target_symbol: str | None; relation: str; depth: int; status: ImpactStatus; confidence: float; reason: str; evidence: tuple[PlanEvidence, ...]
+
+@dataclass(frozen=True)
+class ImpactAnalysis:
+    target_files: tuple[str, ...]; target_symbols: tuple[str, ...]; direct_impacts: tuple[ImpactEdge, ...]; indirect_impacts: tuple[ImpactEdge, ...]; external_impacts: tuple[ImpactEdge, ...]; dynamic_impacts: tuple[ImpactEdge, ...]; excluded_impacts: tuple[ImpactEdge, ...]; diagnostics: tuple[PlanDiagnostic, ...]; traversal_depth: int; truncated: bool; content_hash: str
+
 
 @dataclass(frozen=True)
 class PlanEvidence:

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from dataclasses import asdict
 from typing import Any
 
@@ -15,6 +16,43 @@ class DeterministicPlanningService:
     """No tools, shell, writes, ChangeSets, or approval transitions are exposed here."""
     def __init__(self, query: CodeQueryService, *, repositories: dict[str, dict[str, Any]]) -> None:
         self._query, self._repositories = query, repositories
+
+    def classify_goal(self, *, repository_id: str, user_goal: str) -> GoalIntentResult:
+        """Classify only explicit wording; it never guesses a target."""
+        goal = " ".join(user_goal.split()).casefold()
+        rules = (("rename", GoalIntent.RENAME_SYMBOL), ("delete", GoalIntent.DELETE_FILE), ("create", GoalIntent.CREATE_FILE), ("move", GoalIntent.MOVE_FILE), ("import", GoalIntent.UPDATE_IMPORT), ("migration", GoalIntent.SCHEMA_CHANGE), ("schema", GoalIntent.SCHEMA_CHANGE), ("security", GoalIntent.SECURITY_CHANGE), ("credential", GoalIntent.SECURITY_CHANGE), ("config", GoalIntent.UPDATE_CONFIGURATION), ("test", GoalIntent.UPDATE_TEST), ("document", GoalIntent.UPDATE_DOCUMENTATION), ("dependency", GoalIntent.DEPENDENCY_CHANGE), ("modify", GoalIntent.MODIFY_SYMBOL), ("change", GoalIntent.MODIFY_SYMBOL), ("inspect", GoalIntent.INSPECT))
+        intent = next((value for word, value in rules if word in goal), GoalIntent.UNKNOWN)
+        raw = self._target(goal); diagnostics: list[PlanDiagnostic] = []
+        if raw.startswith("/") or ".." in raw.split("/"):
+            diagnostics.append(PlanDiagnostic("unsafe-path", "error", "target path escapes repository", False)); raw = ""
+        files = (raw,) if raw and "." in raw else ()
+        symbols = self._query.find_symbol_targets(repository_id, raw) if raw and not files else []
+        status = "resolved" if len(symbols) == 1 or files else "ambiguous" if len(symbols) > 1 else "unresolved"
+        if len(symbols) > 1: diagnostics.append(PlanDiagnostic("ambiguous-symbol", "warning", "multiple symbol candidates", True))
+        if raw and not files and not symbols: diagnostics.append(PlanDiagnostic("target-not-found", "warning", "no symbol evidence", True))
+        return GoalIntentResult(goal, (intent,), (GoalTarget(raw, "path" if files else "symbol", raw if not files else None, raw if files else None, self._language(raw), self._operation(goal).value, status, files, tuple(x.get("stable_symbol_id", "") for x in symbols), (), tuple(diagnostics)),), 1.0 if status == "resolved" else .0, tuple(diagnostics))
+
+    def analyze_impacts(self, *, repository_id: str, target_symbols: tuple[str, ...], max_depth: int = 3, max_nodes: int = 200, max_files: int = 100) -> ImpactAnalysis:
+        """Cycle-safe reverse call/reference traversal over persisted resolution edges."""
+        queue = [(sid, 0) for sid in sorted(target_symbols)]; seen: set[str] = set(); direct=[]; indirect=[]; dynamic=[]; diagnostics=[]; files=set(); truncated=False
+        while queue:
+            sid, depth = queue.pop(0)
+            if sid in seen: continue
+            seen.add(sid)
+            if len(seen) > max_nodes or depth > max_depth: truncated=True; break
+            edges = sorted(self._query.callers_of(repository_id, sid) + self._query.references_to(repository_id, sid), key=lambda e: (e.get("source_file", ""), e.get("edge_id", "")))
+            for edge in edges:
+                path=edge["source_file"]; files.add(path)
+                ev=PlanEvidence("resolution-graph", repository_id, path, sid, query=sid, confidence=float(edge.get("confidence",0)))
+                item=ImpactEdge(path, edge.get("caller_symbol_id"), edge.get("target_file") or "", sid, "calls" if "call_callee" in edge else "references", depth+1, ImpactStatus.DIRECT if depth==0 else ImpactStatus.INDIRECT, float(edge.get("confidence",0)), edge.get("resolution_rule", "resolved"), (ev,))
+                (direct if depth==0 else indirect).append(item)
+                caller=edge.get("caller_symbol_id")
+                if caller: queue.append((caller, depth+1))
+                if len(files) > max_files: truncated=True; break
+            if truncated: break
+        if truncated: diagnostics.append(PlanDiagnostic("impact-truncated", "warning", "fixed graph traversal limit reached", True))
+        digest=ImplementationPlan.digest({"targets":sorted(target_symbols),"direct":[asdict(x) for x in direct],"indirect":[asdict(x) for x in indirect],"truncated":truncated})
+        return ImpactAnalysis((), tuple(sorted(target_symbols)), tuple(direct), tuple(indirect), (), tuple(dynamic), (), tuple(diagnostics), max((x.depth for x in direct+indirect), default=0), truncated, digest)
 
     def plan(self, *, repository_id: str, task_id: str, workspace_id: str, user_goal: str, base_sha: str) -> ImplementationPlan:
         normalized = " ".join(user_goal.split()).casefold()
