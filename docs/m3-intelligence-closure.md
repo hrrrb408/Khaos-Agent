@@ -1,7 +1,8 @@
 # M3 Tree-sitter Intelligence — Closure Document
 
-> Status: closed (M3 Batch 6 complete)
-> Branch: `feature/m3-tree-sitter-intelligence`
+> Status: Completed and merged to main
+> PR: #3 (https://github.com/hrrrb408/Khaos-Agent/pull/3)
+> Merge commit: `0e1d9b42b489ce65476a212f6e2992181d11a896`
 > Last updated: 2026-07-12
 
 This document is the authoritative reference for the M3 coding-intelligence
@@ -9,6 +10,21 @@ subsystem. It captures architecture, supported languages, position encoding,
 ParseState lifecycle, cache limits, resolution guarantees, optional LSP
 evidence fusion, known limitations, performance data, fallback behavior,
 and security boundaries.
+
+M3 has passed final acceptance and was merged to `main` via a normal merge
+commit (no squash, no rebase). The `feature/m3-tree-sitter-intelligence`
+branch has been deleted from the remote after merge.
+
+### Verification (final)
+
+| Suite | Result |
+|---|---|
+| Coding Python | 505 passed, 2 skipped |
+| Python full suite (excluding TUI) | 1370 passed, 2 skipped |
+| Real Tree-sitter | 132 passed |
+| Optional real LSP | skipped — no trusted server installed |
+| Go test / vet | passed |
+| Rust | 23 passed |
 
 ---
 
@@ -239,21 +255,34 @@ target.
 
 ## 8. Known Limitations
 
-1. **No type inference.** `obj.method()` is `dynamic`, never resolved
-   by repository analysis. LSP may promote it via fusion.
-2. **No remote dependency resolution.** `import react` is `external`.
+1. **No complete type inference.** `obj.method()` is `dynamic`, never
+   resolved by repository analysis. LSP may promote it via fusion, but
+   the system itself does not perform type inference.
+2. **No dynamic dispatch resolution.** Virtual dispatch, trait objects,
+   interface method calls, and similar runtime-bound targets are
+   classified as `dynamic` and never silently resolved.
+3. **No overload resolution.** Languages with overloads (e.g. C++,
+   Java, TypeScript overloads) are not disambiguated; all overloads
+   are indexed as separate symbols.
+4. **No external dependency indexing.** `import react` is `external`.
    The system never downloads or reads remote package metadata.
-3. **No LSP server downloads.** Tests skip if no trusted LSP binary is
-   on `PATH`. The system never installs a Language Server.
-4. **No LSP process lifecycle redesign.** LSP I/O goes through the
+5. **No automatic grammar or LSP server download.** Tree-sitter
+   grammars are pinned optional dependencies in `pyproject.toml`.
+   Tests skip if no trusted LSP binary is on `PATH`. The system never
+   installs a Language Server or grammar at runtime.
+6. **No cross-repository resolution.** Symbols defined in other
+   repositories (monorepo siblings, vendored deps, etc.) are not
+   resolved; they are classified as `external`.
+7. **LSP evidence fusion disabled by default.** The feature flag
+   `enable_lsp_evidence_fusion` defaults to `False`. Fusion is
+   server-side only — there is no per-tool-call toggle.
+8. **No LSP process lifecycle redesign.** LSP I/O goes through the
    existing `LspClient` → `ExecutionService.start_managed_process`
    path. No new subprocess path is introduced.
-5. **No cross-workspace LSP leakage.** LSP URIs from other task
+9. **No cross-workspace LSP leakage.** LSP URIs from other task
    workspaces are rejected.
-6. **ParseState is process-local.** A process restart loses the
-   incremental parse cache (but IndexStore data survives on disk).
-7. **LSP fusion is server-side only.** There is no per-tool-call
-   toggle; the feature flag is global.
+10. **ParseState is process-local.** A process restart loses the
+    incremental parse cache (but IndexStore data survives on disk).
 
 ---
 
@@ -334,6 +363,7 @@ flag conflict; it can never silently override repository resolution.
 | Test file | Tests | Purpose |
 |---|---|---|
 | `test_lsp_evidence_fusion.py` | 33 | 30 mandatory Fake LSP scenarios + 3 references tests |
+| `test_lsp_target_documents.py` | 26 | Cross-file Definition, LocationLink, references positioning & cache identity |
 | `test_lsp_uri_mapping.py` | 16 | Workspace boundary, percent decode, symlink escape |
 | `test_lsp_positions.py` | 45 | UTF-16 ↔ byte ↔ code-point conversion |
 | `test_lsp_evidence_cache.py` | 16 | LRU, TTL, server-identity, invalidation |
@@ -343,8 +373,8 @@ flag conflict; it can never silently override repository resolution.
 | `test_tree_sitter_resolution_e2e.py` | 9 | Real Tree-sitter resolution per dialect |
 | `test_resolution_performance.py` | 4 | 1,000-file performance + incremental + exact ground truth |
 
-Total M3 tests: 130+ (across LSP fusion, URI, positions, cache, closure
-matrix, performance, and E2E).
+Total M3 tests: 165+ (across LSP fusion, target documents, URI,
+positions, cache, closure matrix, performance, and E2E).
 
 ---
 
