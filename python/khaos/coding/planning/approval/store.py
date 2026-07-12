@@ -258,6 +258,8 @@ CREATE TABLE IF NOT EXISTS plan_execution_runs (
     failure_code TEXT NOT NULL DEFAULT '',
     recovery_sealed_at REAL,
     recovery_seal_digest TEXT NOT NULL DEFAULT '',
+    rollback_sealed_at REAL,
+    rollback_seal_digest TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -293,6 +295,14 @@ CREATE TABLE IF NOT EXISTS plan_execution_audit_events (
     error_code TEXT NOT NULL DEFAULT '',
     correlation_id TEXT NOT NULL,
     created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_execution_final_attestations (
+    execution_run_id TEXT PRIMARY KEY,
+    bundle_digest TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    attestation_digest TEXT NOT NULL,
+    attested_at REAL NOT NULL
 );
 
 -- Batch 2.2: persisted monotonic server epoch. The gate reads and rotates
@@ -439,6 +449,13 @@ def _post_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE plan_execution_runs ADD COLUMN "
                 "recovery_seal_digest TEXT NOT NULL DEFAULT ''"
+            )
+        if "rollback_sealed_at" not in run_cols:
+            conn.execute("ALTER TABLE plan_execution_runs ADD COLUMN rollback_sealed_at REAL")
+        if "rollback_seal_digest" not in run_cols:
+            conn.execute(
+                "ALTER TABLE plan_execution_runs ADD COLUMN "
+                "rollback_seal_digest TEXT NOT NULL DEFAULT ''"
             )
 
 
@@ -2679,8 +2696,9 @@ class PlanApprovalStore:
             "validating": frozenset({"mutating", "rolling-back", "failed", "poisoned", "cancelled"}),
             "mutating": frozenset({"sealing", "rolling-back", "poisoned", "cancelled"}),
             "sealing": frozenset({"mutated", "poisoned"}),
-            "rolling-back": frozenset({"rolled-back", "poisoned", "cancelled"}),
-            "poisoned": frozenset({"rolling-back", "rolled-back"}),
+            "rolling-back": frozenset({"rollback-sealing", "poisoned"}),
+            "rollback-sealing": frozenset({"rolled-back", "poisoned", "cancelled"}),
+            "poisoned": frozenset({"rolling-back"}),
         }
         if not expected or any(target not in allowed.get(source, frozenset()) for source in expected):
             raise RuntimeError("invalid execution run state transition")
@@ -2711,6 +2729,7 @@ class PlanApprovalStore:
         ordinal: int, operation: str, path: str, destination_path: str | None,
         before_hash: str | None, before_mode: int | None,
         recovery_artifact: str | None, planned_after_hash: str = "",
+        planned_after_mode: int | None = None,
     ) -> None:
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
@@ -2718,10 +2737,11 @@ class PlanApprovalStore:
             self._conn.execute(
                 "INSERT INTO plan_execution_edit_events "
                 "(event_id,execution_run_id,edit_id,ordinal,operation,path,"
-                "destination_path,before_hash,after_hash,before_mode,status,recovery_artifact,"
-                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,'journaled',?,?,?)",
+                "destination_path,before_hash,after_hash,before_mode,after_mode,status,recovery_artifact,"
+                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'journaled',?,?,?)",
                 (event_id, execution_run_id, edit_id, ordinal, operation, path,
                  destination_path, before_hash, planned_after_hash, before_mode,
+                 planned_after_mode,
                  recovery_artifact,
                  now, now),
             )
@@ -2794,6 +2814,87 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
+    def mark_execution_rollback_sealed(
+        self, execution_run_id: str, *, seal_digest: str
+    ) -> None:
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET rollback_sealed_at=?,"
+                "rollback_seal_digest=?,updated_at=? WHERE execution_run_id=? "
+                "AND status='rollback-sealing'",
+                (now, seal_digest, now, execution_run_id),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("execution run is not rollback-sealing")
+            self._insert_execution_audit(
+                execution_run_id, "rollback-recovery-sealed", result="sealed",
+                correlation_id=execution_run_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def save_final_mutation_attestation(self, attestation: Any) -> None:
+        normalized = attestation.normalized()
+        payload = json.dumps(
+            normalized.canonical(), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_execution_final_attestations "
+                "(execution_run_id,bundle_digest,canonical_json,attestation_digest,attested_at) "
+                "VALUES (?,?,?,?,?)",
+                (normalized.execution_run_id, normalized.bundle_digest, payload,
+                 normalized.attestation_digest, normalized.attested_at),
+            )
+            self._insert_execution_audit(
+                normalized.execution_run_id, "final-mutation-attested",
+                result="attested", correlation_id=normalized.attestation_digest,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_final_mutation_attestation(self, execution_run_id: str) -> Any | None:
+        row = self._conn.execute(
+            "SELECT * FROM plan_execution_final_attestations WHERE execution_run_id=?",
+            (execution_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        from khaos.coding.planning.execution_models import (
+            AttestedPathState, FinalMutationAttestation,
+        )
+        try:
+            payload = json.loads(row["canonical_json"])
+            value = FinalMutationAttestation(
+                execution_run_id=payload["execution_run_id"],
+                bundle_digest=payload["bundle_digest"],
+                ordered_states=tuple(AttestedPathState(**item) for item in payload["ordered_states"]),
+                path_state_digest=payload["path_state_digest"], head=payload["head"],
+                generation=int(payload["generation"]), index_digest=payload["index_digest"],
+                worktree_admin_digest=payload["worktree_admin_digest"],
+                workspace_state_digest=payload["workspace_state_digest"],
+                execution_context_id=payload["execution_context_id"],
+                lease_id=payload["lease_id"], binding_digest=payload["binding_digest"],
+                attested_at=float(payload["attested_at"]),
+                attestation_digest=row["attestation_digest"],
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("final mutation attestation is corrupt") from exc
+        normalized = value.normalized()
+        if (normalized.attestation_digest != row["attestation_digest"]
+                or normalized.bundle_digest != row["bundle_digest"]
+                or normalized.canonical() != value.canonical()):
+            raise RuntimeError("final mutation attestation digest mismatch")
+        return normalized
+
     def _insert_execution_audit(
         self, execution_run_id: str, event_type: str, *, operation: str = "",
         path: str = "", before_hash: str = "", after_hash: str = "",
@@ -2826,7 +2927,7 @@ class PlanApprovalStore:
     def list_incomplete_execution_runs(self) -> tuple[Any, ...]:
         rows = self._conn.execute(
             "SELECT * FROM plan_execution_runs WHERE status IN "
-            "('validating','mutating','sealing','rolling-back','poisoned') "
+            "('validating','mutating','sealing','rolling-back','rollback-sealing','poisoned') "
             "ORDER BY started_at,execution_run_id"
         ).fetchall()
         return tuple(self._row_to_execution_run(row) for row in rows)

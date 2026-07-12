@@ -44,6 +44,7 @@ class TaskWorkspace:
     state: WorkspaceState = WorkspaceState.CREATING
     writable_roots: tuple[Path, ...] = ()
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    recovery_root: Path | None = None
 
 
 @dataclass(frozen=True)

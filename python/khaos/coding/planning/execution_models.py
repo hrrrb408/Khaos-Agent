@@ -16,6 +16,7 @@ class ExecutionRunStatus(str, Enum):
     SEALING = "sealing"
     MUTATED = "mutated"
     ROLLING_BACK = "rolling-back"
+    ROLLBACK_SEALING = "rollback-sealing"
     ROLLED_BACK = "rolled-back"
     FAILED = "failed"
     POISONED = "poisoned"
@@ -146,3 +147,74 @@ class WorkspaceMutationResult:
     changed_paths: tuple[str, ...]
     failure_code: str = ""
     idempotent: bool = False
+
+
+@dataclass(frozen=True)
+class AttestedPathState:
+    """Canonical final state for one declared relative path."""
+
+    path: str
+    exists: bool
+    content_hash: str = ""
+    mode: int | None = None
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "path": unicodedata.normalize("NFC", self.path),
+            "exists": self.exists,
+            "content_hash": self.content_hash,
+            "mode": self.mode,
+        }
+
+
+@dataclass(frozen=True)
+class FinalMutationAttestation:
+    """Immutable proof of declared and repository state before sealing."""
+
+    execution_run_id: str
+    bundle_digest: str
+    ordered_states: tuple[AttestedPathState, ...]
+    path_state_digest: str
+    head: str
+    generation: int
+    index_digest: str
+    worktree_admin_digest: str
+    workspace_state_digest: str
+    execution_context_id: str
+    lease_id: str
+    binding_digest: str
+    attested_at: float
+    attestation_digest: str = ""
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "execution_run_id": self.execution_run_id,
+            "bundle_digest": self.bundle_digest,
+            "ordered_states": [state.canonical() for state in self.ordered_states],
+            "path_state_digest": self.path_state_digest,
+            "head": self.head,
+            "generation": self.generation,
+            "index_digest": self.index_digest,
+            "worktree_admin_digest": self.worktree_admin_digest,
+            "workspace_state_digest": self.workspace_state_digest,
+            "execution_context_id": self.execution_context_id,
+            "lease_id": self.lease_id,
+            "binding_digest": self.binding_digest,
+            "attested_at": self.attested_at,
+        }
+
+    def normalized(self) -> "FinalMutationAttestation":
+        ordered = tuple(sorted(self.ordered_states, key=lambda state: state.path))
+        path_payload = [state.canonical() for state in ordered]
+        path_digest = hashlib.sha256(json.dumps(
+            path_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        candidate = replace(
+            self, ordered_states=ordered, path_state_digest=path_digest,
+            attestation_digest="",
+        )
+        digest = hashlib.sha256(json.dumps(
+            candidate.canonical(), ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return replace(candidate, attestation_digest=digest)

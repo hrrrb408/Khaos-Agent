@@ -87,7 +87,11 @@ class WorkspaceManager:
             path = (self.root / workspace_id).resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
             await self._git(repository, "worktree", "add", "-b", branch, str(path), base_sha)
-            workspace = TaskWorkspace(workspace_id, task_id, repository, path, base_ref, base_sha, branch, WorkspaceState.READY, (path,))
+            recovery_root = (self.root.parent / ".khaos-recovery").resolve()
+            workspace = TaskWorkspace(
+                workspace_id, task_id, repository, path, base_ref, base_sha,
+                branch, WorkspaceState.READY, (path,), recovery_root=recovery_root,
+            )
             self._workspaces[workspace_id] = workspace
             self._task_ids.add(task_id)
             return workspace

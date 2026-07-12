@@ -4,9 +4,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import shutil
 import stat
-import tempfile
 import threading
 import time
 import unicodedata
@@ -18,7 +16,9 @@ from typing import Any
 from khaos.coding.planning.approval.models import compute_plan_binding_digest
 from khaos.coding.planning.contracts import PlanOperation, PlanStatus
 from khaos.coding.planning.execution_models import (
+    AttestedPathState,
     ExecutionRunStatus,
+    FinalMutationAttestation,
     PlanExecutionRun,
     PlannedEditBundle,
     PlannedEditOperation,
@@ -31,6 +31,10 @@ from khaos.coding.planning.safe_workspace_path import (
     WorkspacePathHandle,
 )
 from khaos.coding.planning.git_state import GitStateInspector
+from khaos.coding.planning.recovery_directory import (
+    RecoveryDirectory,
+    RecoveryDirectoryError,
+)
 
 MAX_BUNDLE_FILES = 64
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
@@ -74,6 +78,7 @@ class WorkspaceMutationEngine:
         self._session_lock = threading.Lock()
         self._active_path_handle: WorkspacePathHandle | None = None
         self._active_phase: Any = None
+        self._active_recovery: RecoveryDirectory | None = None
         self._git_inspector = GitStateInspector()
 
     def apply_bundle(
@@ -143,12 +148,13 @@ class WorkspaceMutationEngine:
         before_git = self._git_inspector.snapshot(
             workspace, repository_generation=plan.repository_generation
         )
-        recovery: Path | None = None
+        recovery: RecoveryDirectory | None = None
         changed: list[str] = []
         path_handle = WorkspacePathHandle(root)
         self._active_path_handle = path_handle
         try:
             recovery = self._prepare_recovery(workspace, run.execution_run_id)
+            self._active_recovery = recovery
             self._store.transition_execution_run(
                 run.execution_run_id, expected=("validating",), target="mutating"
             )
@@ -230,6 +236,10 @@ class WorkspaceMutationEngine:
                     "unexpected-workspace-mutation",
                     "workspace changed outside the declared bundle",
                 )
+            attestation = self._build_final_attestation(
+                run, context, normalized, workspace, path_handle, after_git,
+            )
+            self._store.save_final_mutation_attestation(attestation)
             self._store.transition_execution_run(
                 run.execution_run_id, expected=("mutating",), target="sealing",
             )
@@ -271,6 +281,9 @@ class WorkspaceMutationEngine:
         finally:
             self._active_phase = None
             self._active_path_handle = None
+            self._active_recovery = None
+            if recovery is not None:
+                recovery.close()
             path_handle.close()
 
     def _validate_scope(self, context: Any, bundle: PlannedEditBundle) -> tuple[Any, Any]:
@@ -424,8 +437,8 @@ class WorkspaceMutationEngine:
 
     def _journal_edit(
         self, run_id: str, ordinal: int, edit: PlannedFileEdit,
-        root: Path, recovery: Path,
-    ) -> tuple[Path | None, int | None]:
+        root: Path, recovery: RecoveryDirectory,
+    ) -> tuple[str | None, int | None]:
         if self._active_path_handle is None:
             raise WorkspaceMutationError("path-handle-missing", "mutation path handle missing")
         parent = self._active_path_handle.parent(edit.path)
@@ -436,27 +449,36 @@ class WorkspaceMutationEngine:
             source_bytes = parent.read_file()[0] if info is not None else None
         finally:
             parent.close()
-        backup = None
         artifact = None
         if source_bytes is not None:
-            backup = recovery / f"{ordinal:04d}-{uuid.uuid4().hex}.bak"
-            self._copy_durable(source_bytes, backup, before_mode or 0o600)
-            if self._hash_file(backup) != before_hash:
+            artifact, backup_hash = recovery.create_backup(
+                source_bytes, before_mode or 0o600
+            )
+            if backup_hash != before_hash:
                 raise WorkspaceMutationError("backup-hash-mismatch", "backup verification failed")
-            artifact = backup.name
-        self._store.insert_edit_event(
-            event_id=uuid.uuid4().hex, execution_run_id=run_id,
-            edit_id=edit.edit_id, ordinal=ordinal,
-            operation=edit.operation.value, path=edit.path,
-            destination_path=edit.destination_path, before_hash=before_hash,
-            before_mode=before_mode, recovery_artifact=artifact,
-            planned_after_hash=(
-                "" if edit.operation == PlannedEditOperation.DELETE
-                else edit.new_content_hash or before_hash or ""
-            ),
-        )
-        self._fsync_directory(recovery)
-        return backup, before_mode
+        try:
+            self._store.insert_edit_event(
+                event_id=uuid.uuid4().hex, execution_run_id=run_id,
+                edit_id=edit.edit_id, ordinal=ordinal,
+                operation=edit.operation.value, path=edit.path,
+                destination_path=edit.destination_path, before_hash=before_hash,
+                before_mode=before_mode, recovery_artifact=artifact,
+                planned_after_hash=(
+                    "" if edit.operation == PlannedEditOperation.DELETE
+                    else edit.new_content_hash or before_hash or ""
+                ),
+                planned_after_mode=(
+                    None if edit.operation == PlannedEditOperation.DELETE
+                    else (edit.new_mode if edit.new_mode is not None else
+                          (0o600 if edit.operation == PlannedEditOperation.CREATE
+                           else before_mode))
+                ),
+            )
+        except Exception:
+            if artifact is not None:
+                recovery.discard_unreferenced(artifact)
+            raise
+        return artifact, before_mode
 
     def _apply_edit(self, edit: PlannedFileEdit, root: Path) -> None:
         handle = self._active_path_handle
@@ -525,7 +547,7 @@ class WorkspaceMutationEngine:
                 raise WorkspaceMutationError("rename-race", str(exc)) from exc
 
     def _rollback(
-        self, run_id: str, root: Path, recovery: Path, workspace_id: str, *, failure_code: str,
+        self, run_id: str, root: Path, recovery: RecoveryDirectory, workspace_id: str, *, failure_code: str,
         poison_after: bool = False,
     ) -> None:
         try:
@@ -546,32 +568,43 @@ class WorkspaceMutationEngine:
                 )
             if owns_handle:
                 handle.close()
-            target = (
-                "poisoned" if poison_after else
-                "cancelled" if failure_code == "execution-context-invalid" else
-                "rolled-back"
-            )
-            self._store.transition_execution_run(
-                run_id, expected=("rolling-back",), target=target,
-                failure_code=failure_code, completed=True,
-            )
+            target = "cancelled" if failure_code == "execution-context-invalid" else "rolled-back"
             if poison_after:
                 self._poison_run(workspace_id, run_id, failure_code)
-            else:
-                self._seal_recovery(recovery, workspace_id, run_id)
+                self._store.transition_execution_run(
+                    run_id, expected=("rolling-back",), target="poisoned",
+                    failure_code=failure_code, completed=True,
+                )
+                return
+            self._store.transition_execution_run(
+                run_id, expected=("rolling-back",), target="rollback-sealing",
+                failure_code=failure_code,
+            )
+            retained = recovery.seal_with_retention()
+            self._store.mark_execution_rollback_sealed(
+                run_id, seal_digest=self._recovery_seal_digest(run_id),
+            )
+            recovery.discard_retention(retained)
+            self._store.transition_execution_run(
+                run_id, expected=("rollback-sealing",), target=target,
+                failure_code=failure_code, completed=True,
+            )
         except Exception as rollback_error:
             reason = f"rollback-failed:{type(rollback_error).__name__}"
             self._poison_run(workspace_id, run_id, reason)
             try:
                 self._store.transition_execution_run(
-                    run_id, expected=("rolling-back",),
+                    run_id, expected=("rolling-back", "rollback-sealing"),
                     target="poisoned", failure_code=reason, completed=True,
                 )
             except Exception:
                 pass
             raise WorkspaceMutationError(reason, "rollback failed") from rollback_error
 
-    def _rollback_event(self, handle: WorkspacePathHandle, event: Any, recovery: Path) -> None:
+    def _rollback_event(
+        self, handle: WorkspacePathHandle, event: Any,
+        recovery: RecoveryDirectory,
+    ) -> None:
         operation = event["operation"]
         before_hash = event["before_hash"] or None
         after_hash = event["after_hash"] or None
@@ -580,34 +613,41 @@ class WorkspaceMutationEngine:
         if operation == "create":
             if current_hash is None:
                 return
-            if current_hash != after_hash:
+            if current_hash != after_hash or current_mode != event["after_mode"]:
                 raise WorkspaceMutationError("rollback-third-party", "create target has third-party content")
             handle.delete(event["path"], current_inode, no_phase)
             return
         if operation == "rename":
             destination = event["destination_path"]
-            dest_hash, _, dest_inode = self._current_target(handle, destination)
+            dest_hash, dest_mode, dest_inode = self._current_target(handle, destination)
             if current_hash == before_hash and dest_hash is None:
                 return
-            if current_hash is None and dest_hash == after_hash:
+            if (current_hash is None and dest_hash == after_hash
+                    and dest_mode == event["after_mode"]):
                 handle.rename_no_replace(destination, event["path"], dest_inode, no_phase)
                 return
-            if current_hash == before_hash and dest_hash == after_hash:
+            if (current_hash == before_hash and dest_hash == after_hash
+                    and dest_mode == event["after_mode"]):
                 handle.delete(destination, dest_inode, no_phase)
                 return
             raise WorkspaceMutationError("rollback-third-party", "rename state is not known")
         artifact = event["recovery_artifact"]
         if not artifact:
             raise WorkspaceMutationError("rollback-evidence-missing", "backup artifact missing")
-        backup = recovery / artifact
-        if not backup.is_file() or self._hash_file(backup) != before_hash:
+        try:
+            data = recovery.read(artifact)
+        except RecoveryDirectoryError as exc:
+            raise WorkspaceMutationError(
+                "rollback-evidence-invalid", "backup artifact invalid"
+            ) from exc
+        if hashlib.sha256(data).hexdigest() != before_hash:
             raise WorkspaceMutationError("rollback-evidence-invalid", "backup artifact invalid")
         if current_hash == before_hash:
             return
-        data = backup.read_bytes()
         mode = int(event["before_mode"] or 0o600)
         if operation == "update":
-            if current_hash != after_hash or current_inode is None:
+            if (current_hash != after_hash or current_mode != event["after_mode"]
+                    or current_inode is None):
                 raise WorkspaceMutationError("rollback-third-party", "updated target has third-party content")
             handle.update(event["path"], data, mode, current_inode, no_phase)
         elif operation == "delete":
@@ -630,6 +670,126 @@ class WorkspaceMutationEngine:
         finally:
             parent.close()
 
+    @staticmethod
+    def _workspace_state_digest(file_hashes: tuple[tuple[str, str], ...]) -> str:
+        payload = "|".join(f"{path}:{digest}" for path, digest in sorted(file_hashes))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _attested_states(
+        self, handle: WorkspacePathHandle, events: tuple[Any, ...],
+    ) -> tuple[AttestedPathState, ...]:
+        states: list[AttestedPathState] = []
+        for event in events:
+            operation = event["operation"]
+            expected_hash = event["after_hash"] or ""
+            expected_mode = event["after_mode"]
+            if operation == "delete":
+                content_hash, mode, _ = self._current_target(handle, event["path"])
+                if content_hash is not None:
+                    raise WorkspaceMutationError(
+                        "declared-state-drift", "deleted path reappeared"
+                    )
+                states.append(AttestedPathState(event["path"], False))
+                continue
+            if operation == "rename":
+                source_hash, _, _ = self._current_target(handle, event["path"])
+                if source_hash is not None:
+                    raise WorkspaceMutationError(
+                        "declared-state-drift", "rename source still exists"
+                    )
+                states.append(AttestedPathState(event["path"], False))
+                target_path = event["destination_path"]
+            else:
+                target_path = event["path"]
+            content_hash, mode, _ = self._current_target(handle, target_path)
+            if content_hash != expected_hash or mode != expected_mode:
+                raise WorkspaceMutationError(
+                    "declared-state-drift", "declared path hash or mode drifted"
+                )
+            states.append(AttestedPathState(target_path, True, content_hash, mode))
+        return tuple(sorted(states, key=lambda state: state.path))
+
+    def _build_final_attestation(
+        self, run: PlanExecutionRun, context: Any, bundle: PlannedEditBundle,
+        workspace: Any, handle: WorkspacePathHandle, git_state: Any,
+    ) -> FinalMutationAttestation:
+        events = self._store.list_execution_edit_events(run.execution_run_id)
+        if len(events) != len(bundle.ordered_edits):
+            raise WorkspaceMutationError(
+                "attestation-journal-missing", "final journal is incomplete"
+            )
+        states = self._attested_states(handle, events)
+        final_git = self._git_inspector.snapshot(
+            workspace, repository_generation=git_state.repository_generation,
+        )
+        if final_git != git_state:
+            raise WorkspaceMutationError(
+                "final-attestation-drift", "repository changed during final attestation"
+            )
+        return FinalMutationAttestation(
+            execution_run_id=run.execution_run_id,
+            bundle_digest=bundle.content_digest,
+            ordered_states=states, path_state_digest="",
+            head=final_git.head_commit, generation=final_git.repository_generation,
+            index_digest=final_git.index_digest,
+            worktree_admin_digest=final_git.worktree_admin_identity,
+            workspace_state_digest=self._workspace_state_digest(final_git.file_hashes),
+            execution_context_id=context.execution_context_id,
+            lease_id=context.lease_id, binding_digest=context.binding_digest,
+            attested_at=time.time(),
+        ).normalized()
+
+    def _validate_sealing_recovery(
+        self, run: PlanExecutionRun, workspace: Any, events: tuple[Any, ...],
+    ) -> None:
+        try:
+            attestation = self._store.get_final_mutation_attestation(
+                run.execution_run_id
+            )
+        except RuntimeError as exc:
+            raise WorkspaceMutationError(
+                "attestation-invalid", "final attestation failed integrity validation"
+            ) from exc
+        if attestation is None:
+            raise WorkspaceMutationError(
+                "attestation-missing", "sealing run has no final attestation"
+            )
+        if (attestation.execution_run_id != run.execution_run_id
+                or attestation.bundle_digest != run.edit_bundle_digest
+                or attestation.execution_context_id != run.execution_context_id
+                or attestation.lease_id != run.lease_id
+                or attestation.binding_digest != run.binding_digest):
+            raise WorkspaceMutationError(
+                "attestation-binding-mismatch", "attestation binding drifted"
+            )
+        handle = WorkspacePathHandle(workspace.worktree_path.resolve(strict=True))
+        try:
+            states = self._attested_states(handle, events)
+        finally:
+            handle.close()
+        if tuple(state.canonical() for state in states) != tuple(
+            state.canonical() for state in attestation.ordered_states
+        ):
+            raise WorkspaceMutationError(
+                "attestation-state-drift", "declared final state drifted"
+            )
+        state = self._context_provider.current_state(
+            repository_id=run.repository_id, task_id=run.task_id,
+            workspace_id=run.workspace_id,
+        )
+        git_state = self._git_inspector.snapshot(
+            workspace, repository_generation=state.repository_generation,
+        )
+        if (git_state.head_commit != attestation.head
+                or git_state.repository_generation != attestation.generation
+                or git_state.index_digest != attestation.index_digest
+                or git_state.worktree_admin_identity != attestation.worktree_admin_digest
+                or self._workspace_state_digest(git_state.file_hashes)
+                != attestation.workspace_state_digest):
+            raise WorkspaceMutationError(
+                "attestation-repository-drift", "repository state drifted after attestation"
+            )
+
     def _poison_run(self, workspace_id: str, run_id: str, reason: str) -> None:
         owner = f"run:{run_id}"
         self._fence.poison(workspace_id, reason, owner=owner)
@@ -647,16 +807,22 @@ class WorkspaceMutationEngine:
             workspace = self._workspaces.get(run.workspace_id)
             if workspace is None:
                 continue
-            recovery = self._recovery_root(workspace, run.execution_run_id)
+            recovery: RecoveryDirectory | None = None
             with self._fence.use_sync(
                 run.workspace_id, owner=f"recovery:{run.execution_run_id}"
             ):
                 try:
-                    self._validate_recovery_root(workspace, recovery, allow_missing=(run.status == ExecutionRunStatus.SEALING))
+                    events = self._store.list_execution_edit_events(run.execution_run_id)
+                    if not events:
+                        raise WorkspaceMutationError(
+                            "recovery-journal-missing", "execution journal is missing"
+                        )
+                    recovery = self._open_recovery(workspace, run.execution_run_id, events)
+                    self._active_recovery = recovery
                     if run.status == ExecutionRunStatus.SEALING:
+                        self._validate_sealing_recovery(run, workspace, events)
                         self._seal_recovery(
                             recovery, run.workspace_id, run.execution_run_id,
-                            allow_missing=True,
                         )
                         self._store.mark_execution_recovery_sealed(
                             run.execution_run_id,
@@ -666,11 +832,22 @@ class WorkspaceMutationEngine:
                             run.execution_run_id, expected=("sealing",),
                             target="mutated", completed=True,
                         )
+                    elif run.status == ExecutionRunStatus.ROLLBACK_SEALING:
+                        retained = recovery.seal_with_retention()
+                        self._store.mark_execution_rollback_sealed(
+                            run.execution_run_id,
+                            seal_digest=self._recovery_seal_digest(run.execution_run_id),
+                        )
+                        recovery.discard_retention(retained)
+                        final_status = (
+                            "cancelled" if run.failure_code == "execution-context-invalid"
+                            else "rolled-back"
+                        )
+                        self._store.transition_execution_run(
+                            run.execution_run_id, expected=("rollback-sealing",),
+                            target=final_status, failure_code=run.failure_code, completed=True,
+                        )
                     else:
-                        if not self._store.list_execution_edit_events(run.execution_run_id):
-                            raise WorkspaceMutationError(
-                                "recovery-journal-missing", "execution journal is missing"
-                            )
                         self._rollback(
                             run.execution_run_id,
                             workspace.worktree_path.resolve(strict=True), recovery,
@@ -695,73 +872,82 @@ class WorkspaceMutationEngine:
                             )
                         except Exception:
                             pass
+                finally:
+                    self._active_recovery = None
+                    if recovery is not None:
+                        recovery.close()
         return tuple(recovered)
 
-    @staticmethod
-    def _prepare_recovery(workspace: Any, run_id: str) -> Path:
-        recovery = WorkspaceMutationEngine._recovery_root(workspace, run_id)
-        parent = recovery.parent
-        if workspace.worktree_path.parent.is_symlink():
-            raise WorkspaceMutationError("recovery-parent-symlink", "recovery parent is symlinked")
-        parent.mkdir(mode=0o700, exist_ok=True)
-        if parent.is_symlink():
-            raise WorkspaceMutationError("recovery-root-symlink", "recovery container is symlinked")
-        os.chmod(parent, 0o700)
-        recovery.mkdir(mode=0o700, exist_ok=False)
-        os.chmod(recovery, 0o700)
-        WorkspaceMutationEngine._fsync_directory(recovery.parent)
-        return recovery
+    def _prepare_recovery(self, workspace: Any, run_id: str) -> RecoveryDirectory:
+        container = self._validate_recovery_container(workspace)
+        try:
+            return RecoveryDirectory(container, run_id, create=True)
+        except (OSError, RecoveryDirectoryError) as exc:
+            raise WorkspaceMutationError(
+                "recovery-root-invalid", "recovery directory cannot be created safely"
+            ) from exc
 
-    @staticmethod
-    def _recovery_root(workspace: Any, run_id: str) -> Path:
-        return workspace.worktree_path.parent / ".khaos-recovery" / run_id
+    def _open_recovery(
+        self, workspace: Any, run_id: str, events: tuple[Any, ...],
+    ) -> RecoveryDirectory:
+        container = self._validate_recovery_container(workspace)
+        allowed = frozenset(
+            row["recovery_artifact"] for row in events if row["recovery_artifact"]
+        )
+        try:
+            return RecoveryDirectory(
+                container, run_id, create=False, allowed_artifacts=allowed,
+            )
+        except (OSError, RecoveryDirectoryError) as exc:
+            raise WorkspaceMutationError(
+                "recovery-root-invalid", "recovery directory cannot be opened safely"
+            ) from exc
 
     def _seal_recovery(
-        self, recovery: Path, workspace_id: str, run_id: str, *,
-        allow_missing: bool = False,
+        self, recovery: RecoveryDirectory, workspace_id: str, run_id: str,
     ) -> None:
         try:
-            if recovery.exists():
-                if recovery.is_symlink() or not recovery.is_dir():
-                    raise WorkspaceMutationError(
-                        "recovery-root-invalid", "recovery root is not a directory"
-                    )
-                shutil.rmtree(recovery)
-            elif not allow_missing:
-                raise WorkspaceMutationError(
-                    "recovery-root-missing", "recovery root disappeared"
-                )
-            sync_parent = recovery.parent if recovery.parent.is_dir() else recovery.parent.parent
-            self._fsync_directory(sync_parent)
-            if recovery.parent.is_dir() and not any(recovery.parent.iterdir()):
-                recovery.parent.rmdir()
-                self._fsync_directory(recovery.parent.parent)
+            recovery.seal()
         except Exception as exc:
             reason = f"recovery-cleanup-failed:{type(exc).__name__}"
             self._poison_run(workspace_id, run_id, reason)
             raise WorkspaceMutationError(reason, "recovery cleanup failed") from exc
 
     @staticmethod
-    def _validate_recovery_root(
-        workspace: Any, recovery: Path, *, allow_missing: bool = False
-    ) -> None:
+    def _validate_recovery_container(workspace: Any) -> Path:
+        configured = getattr(workspace, "recovery_root", None)
+        if configured is None:
+            raise WorkspaceMutationError(
+                "recovery-root-unconfigured", "workspace recovery root is not configured"
+            )
         worktree = workspace.worktree_path.resolve(strict=True)
         repository = workspace.repository_root.resolve(strict=True)
-        container = recovery.parent
-        if container.is_symlink() or recovery.is_symlink():
-            raise WorkspaceMutationError("recovery-root-symlink", "recovery path is symlinked")
-        if not recovery.exists():
-            if allow_missing:
-                return
-            raise WorkspaceMutationError("recovery-root-missing", "recovery root missing")
-        resolved = recovery.resolve(strict=True)
-        if worktree == resolved or worktree in resolved.parents:
+        container = Path(configured)
+        if not container.is_absolute():
+            raise WorkspaceMutationError("recovery-root-symlink", "recovery container parent is unsafe")
+        current = Path(container.anchor)
+        for part in container.parent.parts[1:]:
+            current /= part
+            if current.is_symlink():
+                raise WorkspaceMutationError(
+                    "recovery-root-symlink", "recovery container ancestor is symlinked"
+                )
+        resolved_parent = container.parent.resolve(strict=True)
+        resolved = resolved_parent / container.name
+        if worktree == resolved or worktree in resolved.parents or resolved in worktree.parents:
             raise WorkspaceMutationError("recovery-inside-worktree", "recovery is inside worktree")
-        if repository == resolved or repository in resolved.parents:
+        if repository == resolved or repository in resolved.parents or resolved in repository.parents:
             raise WorkspaceMutationError("recovery-inside-repository", "recovery is inside repository")
-        info = recovery.stat()
-        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
-            raise WorkspaceMutationError("recovery-permissions", "recovery ownership/mode invalid")
+        git_marker = worktree / ".git"
+        if git_marker.is_file():
+            text = git_marker.read_text(encoding="utf-8", errors="strict").strip()
+            if text.startswith("gitdir:"):
+                admin = (worktree / text.split(":", 1)[1].strip()).resolve(strict=False)
+                if admin == resolved or admin in resolved.parents or resolved in admin.parents:
+                    raise WorkspaceMutationError(
+                        "recovery-inside-git-admin", "recovery intersects Git admin root"
+                    )
+        return resolved
 
     def _recovery_seal_digest(self, run_id: str) -> str:
         events = self._store.list_execution_edit_events(run_id)
@@ -770,56 +956,6 @@ class WorkspaceMutationEngine:
             f"{row['after_hash'] or ''}" for row in events
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _copy_durable(source: Path | bytes, destination: Path, mode: int) -> None:
-        descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        try:
-            with os.fdopen(descriptor, "wb") as writer:
-                if isinstance(source, bytes):
-                    writer.write(source)
-                else:
-                    with source.open("rb") as reader:
-                        shutil.copyfileobj(reader, writer)
-                writer.flush()
-                os.fsync(writer.fileno())
-            os.chmod(destination, mode & 0o777)
-        except Exception:
-            if destination.exists():
-                destination.unlink()
-            raise
-
-    def _restore_backup(self, backup: Path, target: Path, mode: int) -> None:
-        data = backup.read_bytes()
-        descriptor, temp_name = tempfile.mkstemp(prefix=".khaos-restore-", dir=target.parent)
-        temporary = Path(temp_name)
-        try:
-            os.fchmod(descriptor, mode & 0o777)
-            with os.fdopen(descriptor, "wb") as writer:
-                writer.write(data)
-                writer.flush()
-                os.fsync(writer.fileno())
-            os.replace(temporary, target)
-            self._fsync_directory(target.parent)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-
-    @staticmethod
-    def _snapshot_workspace(root: Path) -> dict[str, str]:
-        snapshot: dict[str, str] = {}
-        for path in sorted(root.rglob("*")):
-            relative = path.relative_to(root).as_posix()
-            if relative == ".git" or relative.startswith(".git/"):
-                continue
-            if path.is_symlink():
-                snapshot[relative] = f"symlink:{os.readlink(path)}"
-            elif path.is_file():
-                snapshot[relative] = WorkspaceMutationEngine._hash_file(path)
-        git_marker = root / ".git"
-        if git_marker.is_file():
-            snapshot["@git-admin"] = WorkspaceMutationEngine._hash_file(git_marker)
-        return snapshot
 
     @staticmethod
     def _unexpected_changes(
