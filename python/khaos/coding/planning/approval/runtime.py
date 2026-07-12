@@ -1,6 +1,7 @@
 """Fail-closed production bootstrap for approval and lease runtime."""
 from __future__ import annotations
 
+import enum
 import logging
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,22 @@ logger = logging.getLogger(__name__)
 class BootContext:
     server_epoch: int
     boot_id: str
+
+
+class RuntimeState(enum.Enum):
+    """Batch 2.6 §3: initialization state machine.
+
+    UNINITIALIZED → ROTATING → RECEIPT_BOUND → RECONCILING → READY
+
+    Failure at any step triggers ``_rollback()`` which reverts to
+    UNINITIALIZED, clears the broker writer, and invalidates all
+    auth/leases minted under the failed boot_id.
+    """
+    UNINITIALIZED = 0
+    ROTATING = 1
+    RECEIPT_BOUND = 2
+    RECONCILING = 3
+    READY = 4
 
 
 @dataclass(frozen=True)
@@ -36,12 +53,11 @@ class RuntimeCapability:
 class ApprovalRuntime:
     """Production bootstrap for the approval + lease runtime.
 
-    Batch 2.5 §1: ``initialize()`` self-wires the Broker → durable Receipt
-    outbox channel. Callers and tests must NOT call
-    ``store._bind_receipt_broker`` or set ``broker._receipt_writer`` —
-    those no longer exist. The runtime creates a receipt sink closure from
-    the store's internal capability and registers it with the broker via a
-    name-mangled attribute using a runtime-internal token.
+    Batch 2.6 §3: initialization follows an explicit state machine
+    (UNINITIALIZED → ROTATING → RECEIPT_BOUND → RECONCILING → READY).
+    On failure at any step, ``_rollback()`` reverts to UNINITIALIZED,
+    clears the broker's receipt writer, invalidates all auth/leases for
+    the failed boot_id, and ensures the runtime is safe to retry.
     """
 
     def __init__(self, *, store: Any, broker: Any, context_provider: Any, plan_repository: PersistedPlanRepository, planning_service: Any) -> None:
@@ -63,34 +79,31 @@ class ApprovalRuntime:
         # that forged callers cannot replace it.
         self._runtime_token = object()
         self.service=None; self.gate=None; self.boot_context=None; self.ready=False
+        self._state = RuntimeState.UNINITIALIZED
+
+    @property
+    def state(self) -> RuntimeState:
+        """Current initialization state (Batch 2.6 §3)."""
+        return self._state
 
     def initialize(self) -> BootContext:
         """Initialize the runtime: wire receipts, construct services, reconcile.
 
-        Batch 2.6 §1: self-wires the Broker → durable Receipt outbox via the
-        broker's internal ``ReceiptSigner``. The runtime installs a
-        name-mangled writer closure on the broker AND registers the broker's
-        signer with the store's verification registry. On failure, ``ready``
-        stays False, the broker's writer is cleared, and the store's signer
-        registry is cleared — no half-bound state remains.
-
-        Batch 2.5 §7: ``initialize()`` can only succeed once per instance.
-        A second call on an already-ready runtime is explicitly refused.
+        Batch 2.6 §3: explicit state machine with rollback on failure.
+        UNINITIALIZED → ROTATING → RECEIPT_BOUND → RECONCILING → READY.
+        On failure, ``_rollback()`` reverts to UNINITIALIZED and clears
+        all partial state. The runtime is safe to retry after a failure.
         """
         if self.ready:
             raise RuntimeError("approval runtime is already initialized — call shutdown() first")
+        self._state = RuntimeState.ROTATING
         try:
             # 1. Rotate epoch (generates fresh boot_id, revokes old auths/leases)
             epoch, boot_id, _ = self._store.rotate_epoch()
             self.boot_context = BootContext(epoch, boot_id)
 
             # 2. Wire Broker → durable Receipt outbox (Batch 2.6 §1)
-            #    Install a writer closure on the broker that calls the
-            #    store's _insert_signed_receipt. Register the broker's
-            #    ReceiptSigner with the store's verification registry so
-            #    apply_authenticated_decision can re-verify the signature.
-            #    Also persist the signer's key and load old signers so
-            #    receipts from prior boots remain verifiable across restart.
+            self._state = RuntimeState.RECEIPT_BOUND
             signer = self._broker.receipt_signer
             store = self._store
             # Load old signers (for verifying receipts from prior boots).
@@ -110,7 +123,8 @@ class ApprovalRuntime:
                 _writer, runtime_token=self._runtime_token,
             )
 
-            # 3. Construct Gate and Service (Batch 2.6 §2: pass RuntimeCapability)
+            # 3. Construct Gate and Service + reconcile (Batch 2.6 §2)
+            self._state = RuntimeState.RECONCILING
             capability = RuntimeCapability(boot_context=self.boot_context)
             self.gate = PlanExecutionGate(
                 store=self._store, context_provider=self._context_provider,
@@ -123,20 +137,36 @@ class ApprovalRuntime:
                 plan_repository=self._plan_repository, planning_service=self._planning_service,
                 runtime_capability=capability,
             )
-
-            # 4. Reconcile pending approvals
             self.service.reconcile()
 
-            # 5. Mark ready
+            # 4. Mark ready
+            self._state = RuntimeState.READY
             self.ready = True
             logger.info("approval runtime initialized: epoch=%d boot=%s", epoch, boot_id[:8])
             return self.boot_context
         except Exception:
-            # On failure: not ready, no half-bound broker, no registered signer.
-            self.ready = False
-            self.gate = None
-            self.service = None
-            self.boot_context = None
+            self._rollback()
+            raise
+
+    def _rollback(self) -> None:
+        """Batch 2.6 §3: roll back partial initialization.
+
+        Reverts the runtime to UNINITIALIZED and ensures:
+        * ``ready`` is False — no operations can proceed.
+        * Broker does not retain the receipt writer — no receipts can be
+          minted under the failed boot.
+        * All auth/leases minted under the failed boot_id are invalidated.
+        * ``boot_context`` is cleared — the old boot cannot be reused.
+        * State is UNINITIALIZED — safe to retry ``initialize()``.
+        """
+        failed_state = self._state
+        self._state = RuntimeState.UNINITIALIZED
+        self.ready = False
+        self.gate = None
+        self.service = None
+
+        # Clear the broker writer + store writer (if receipt wiring happened).
+        if failed_state.value >= RuntimeState.RECEIPT_BOUND.value:
             try:
                 self._broker._reset_runtime_receipt_writer()
             except Exception:
@@ -145,7 +175,19 @@ class ApprovalRuntime:
                 self._store._reset_runtime_receipt_writer()
             except Exception:
                 pass
-            raise
+
+        # Invalidate all auth/leases for the failed boot_id (if epoch was rotated).
+        if failed_state.value >= RuntimeState.ROTATING.value and self.boot_context is not None:
+            try:
+                self._store.invalidate_active_execution_scope(
+                    boot_id=self.boot_context.boot_id,
+                    reason="runtime-init-failed",
+                )
+            except Exception:
+                pass
+
+        self.boot_context = None
+        logger.warning("approval runtime initialization failed at %s; rolled back", failed_state.name)
 
     def require_ready(self) -> None:
         if not self.ready or self.gate is None:
@@ -156,6 +198,7 @@ class ApprovalRuntime:
             if (persisted_epoch != self.boot_context.server_epoch
                     or persisted_boot_id != self.boot_context.boot_id):
                 self.ready = False
+                self._state = RuntimeState.UNINITIALIZED
                 raise RuntimeError("approval runtime boot context is stale (another runtime initialized)")
 
     def authorize_execution(self, **kwargs: Any):
@@ -198,6 +241,7 @@ class ApprovalRuntime:
             self.gate = None
             self.service = None
             self.boot_context = None
+            self._state = RuntimeState.UNINITIALIZED
             logger.info("approval runtime shut down")
 
     def register_lease_coordinator(

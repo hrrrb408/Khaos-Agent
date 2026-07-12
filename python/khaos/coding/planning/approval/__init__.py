@@ -92,7 +92,7 @@ from khaos.coding.planning.approval.store import (
 from khaos.coding.planning.approval.validator import (
     PlanLiveValidator,
 )
-from khaos.coding.planning.approval.runtime import ApprovalRuntime, BootContext, WorkspaceExecutionLeaseCoordinator
+from khaos.coding.planning.approval.runtime import ApprovalRuntime, BootContext, RuntimeState, WorkspaceExecutionLeaseCoordinator
 
 __all__ = [
     "ALLOWED_APPROVAL_TRANSITIONS",
@@ -135,6 +135,7 @@ __all__ = [
     "PlanValidationContext",
     "PlannedExecutionGuard",
     "ReceiptSigner",
+    "RuntimeState",
     "UnauthenticatedReceiptError",
     "WorkspaceExecutionLease",
     "WorkspaceExecutionLeaseCoordinator",
