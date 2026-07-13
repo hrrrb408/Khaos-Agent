@@ -9,6 +9,15 @@ from khaos.coding.planning.execution_models import (
     PlannedFileEdit,
     WorkspaceMutationResult,
 )
+from khaos.coding.planning.verification_execution_models import (
+    TrustedVerificationCommand,
+    VerificationExecutionRun,
+    VerificationPhaseContext,
+    VerificationResult,
+    VerificationRunStatus,
+    VerificationStepRun,
+    VerificationStepStatus,
+)
 
 __all__ = [
     "DeterministicPlanningService",
@@ -18,4 +27,11 @@ __all__ = [
     "PlannedEditOperation",
     "PlannedFileEdit",
     "WorkspaceMutationResult",
+    "TrustedVerificationCommand",
+    "VerificationExecutionRun",
+    "VerificationPhaseContext",
+    "VerificationResult",
+    "VerificationRunStatus",
+    "VerificationStepRun",
+    "VerificationStepStatus",
 ]

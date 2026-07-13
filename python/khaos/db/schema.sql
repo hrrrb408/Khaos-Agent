@@ -358,3 +358,97 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_execution_leases_active_workspace
     ON plan_execution_leases(workspace_id) WHERE status = 'active';
 CREATE INDEX IF NOT EXISTS idx_plan_execution_leases_task
     ON plan_execution_leases(task_id, status);
+
+-- M4 Batch 3.1: trusted verification execution.  Output bodies remain in a
+-- private artifact root; SQLite stores only identities, digests and status.
+CREATE TABLE IF NOT EXISTS plan_verification_runs (
+    verification_run_id TEXT PRIMARY KEY,
+    execution_run_id TEXT NOT NULL UNIQUE,
+    plan_id TEXT NOT NULL,
+    plan_content_hash TEXT NOT NULL,
+    approval_request_id TEXT NOT NULL,
+    execution_context_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    bundle_digest TEXT NOT NULL,
+    final_mutation_attestation_digest TEXT NOT NULL,
+    verification_plan_digest TEXT NOT NULL,
+    trusted_catalog_fingerprint TEXT NOT NULL,
+    sandbox_profile_digest TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    failure_code TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS plan_verification_steps (
+    step_run_id TEXT PRIMARY KEY,
+    verification_run_id TEXT NOT NULL,
+    requirement_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    command_digest TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    signal INTEGER,
+    started_at REAL,
+    completed_at REAL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    timeout_ms INTEGER NOT NULL,
+    stdout_digest TEXT NOT NULL DEFAULT '',
+    stderr_digest TEXT NOT NULL DEFAULT '',
+    output_artifact_id TEXT NOT NULL DEFAULT '',
+    output_truncated INTEGER NOT NULL DEFAULT 0,
+    sandbox_instance_id TEXT NOT NULL DEFAULT '',
+    sandbox_image_digest TEXT NOT NULL DEFAULT '',
+    resource_usage_json TEXT NOT NULL DEFAULT '{}',
+    failure_code TEXT NOT NULL DEFAULT '',
+    UNIQUE(verification_run_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS plan_verification_audit_events (
+    audit_id TEXT PRIMARY KEY,
+    verification_run_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL,
+    error_code TEXT NOT NULL DEFAULT '',
+    correlation_id TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_verification_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    verification_run_id TEXT NOT NULL,
+    relative_name TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    byte_length INTEGER NOT NULL,
+    expires_at REAL NOT NULL,
+    quarantined INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_execution_phase_leases (
+    phase_lease_id TEXT PRIMARY KEY,
+    execution_run_id TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    owner_execution_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    bundle_digest TEXT NOT NULL,
+    attestation_digest TEXT NOT NULL,
+    binding_digest TEXT NOT NULL,
+    server_epoch INTEGER NOT NULL,
+    boot_id TEXT NOT NULL,
+    expiry REAL NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    released_at REAL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_verification_phase_lease
+    ON plan_execution_phase_leases(execution_run_id) WHERE status = 'active';
