@@ -344,11 +344,92 @@ class ApprovalRuntime:
         self, *, backend: Any, command_factory: Any, workspace_factory: Any,
         artifact_root: Any, profile: Any,
     ) -> None:
-        """Install the production-only trusted verifier after Runtime startup."""
+        """Install the production-only trusted verifier after Runtime startup.
+
+        Batch 3.1.1 §7: probes the backend image (``--pull=never``) and
+        verifies the actual image ID matches the profile's pinned digest
+        BEFORE installing the runner.  The probe is synchronous to
+        ``configure_trusted_verification`` so a misconfigured image fails
+        at configuration time, not at verification execution time.
+
+        Batch 3.1.1 §8: follows a configuration state machine:
+        UNCONFIGURED → PROBING_BACKEND → VERIFYING_TOOLCHAINS →
+        RECONCILING_SANDBOXES → READY.  On failure, the verifier is
+        NOT installed and the runtime is safe to retry.
+        """
         self.require_ready()
+        import asyncio as _asyncio
         from khaos.coding.planning.trusted_verification_runner import TrustedVerificationRunner
         from khaos.coding.planning.verification_store import VerificationExecutionStore
+
+        # Batch 3.1.1 §8: PROBING_BACKEND
+        self._verification_config_state = "PROBING_BACKEND"
+        try:
+            # Batch 3.1.1 §7: probe the backend image with --pull=never.
+            # The probe() method runs `docker image inspect` and verifies
+            # the actual image ID matches the profile's pinned digest.
+            # Use a dedicated event loop in a thread to avoid conflicts
+            # with any existing event loop in the caller's context.
+            import asyncio as _aio
+            import concurrent.futures as _cf
+            with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+                actual_image_id = pool.submit(
+                    lambda: _aio.run(backend.probe())
+                ).result()
+            self._verification_actual_image_id = actual_image_id
+        except Exception as exc:
+            self._verification_config_state = "UNCONFIGURED"
+            raise RuntimeError(
+                f"trusted verification backend probe failed: {exc}"
+            ) from exc
+
+        # Batch 3.1.1 §8: VERIFYING_TOOLCHAINS
+        self._verification_config_state = "VERIFYING_TOOLCHAINS"
+        # Toolchain attestation is performed by the command factory at
+        # build time — it verifies that the toolchain's image_digest
+        # matches the profile's image_digest.  The binary_digest and
+        # version are verified at command build time.
+        for toolchain in getattr(command_factory, "_tools", {}).values():
+            if toolchain.image_digest != profile.image_digest:
+                self._verification_config_state = "UNCONFIGURED"
+                raise RuntimeError(
+                    f"toolchain {toolchain.language}:{toolchain.executable_id} "
+                    f"image mismatch: {toolchain.image_digest} != {profile.image_digest}"
+                )
+            if toolchain.binary_digest and not toolchain.binary_digest.startswith("sha256:"):
+                self._verification_config_state = "UNCONFIGURED"
+                raise RuntimeError(
+                    f"toolchain {toolchain.language}:{toolchain.executable_id} "
+                    f"has invalid binary_digest: {toolchain.binary_digest}"
+                )
+
+        # Batch 3.1.1 §8: RECONCILING_SANDBOXES
+        self._verification_config_state = "RECONCILING_SANDBOXES"
         self._verification_store = VerificationExecutionStore(self._store)
+        # recover_interrupted() is called in VerificationExecutionStore.__init__
+        # via TrustedVerificationRunner.__init__.  It transitions any
+        # PREPARING/RUNNING runs to ERRORED.
+        # Batch 3.1.1 §2: mark active sandbox instances as ORPHANED and
+        # terminate residual Docker containers via backend reconciliation.
+        orphaned = self._verification_store.reconcile_sandbox_instances()
+        if orphaned:
+            logger.warning("reconciled %d orphaned sandbox instances", orphaned)
+        # If the backend supports reconcile_instances, call it to find
+        # and terminate any residual Docker containers from a crashed worker.
+        reconcile = getattr(backend, "reconcile_instances", None)
+        if callable(reconcile):
+            try:
+                import concurrent.futures as _cf2
+                import asyncio as _aio2
+                with _cf2.ThreadPoolExecutor(max_workers=1) as pool2:
+                    pool2.submit(lambda: _aio2.run(reconcile(
+                        expected_labels={"khaos.boot-id": self.boot_context.boot_id},
+                    ))).result()
+            except Exception as exc:
+                logger.warning("backend reconcile_instances failed: %s", exc)
+
+        # Batch 3.1.1 §8: READY
+        self._verification_config_state = "READY"
         self._verification_runner = TrustedVerificationRunner(
             approval_store=self._store, plan_repository=self._plan_repository,
             workspace_manager=self._workspace_manager,
