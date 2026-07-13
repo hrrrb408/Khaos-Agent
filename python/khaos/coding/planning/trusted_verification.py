@@ -310,7 +310,13 @@ class ArtifactRootCapability:
             0o600, dir_fd=self._root_fd,
         )
         try:
-            os.write(temp_fd, payload)
+            # Batch 3.1.3 §7: loop to handle short writes.
+            written = 0
+            while written < len(payload):
+                n = os.write(temp_fd, payload[written:])
+                if n == 0:
+                    raise OSError("short write returned 0 bytes")
+                written += n
             os.fsync(temp_fd)
         finally:
             os.close(temp_fd)
@@ -344,6 +350,8 @@ class ArtifactRootCapability:
             os.unlink(temp_name, dir_fd=self._root_fd)
         except OSError:
             pass
+        # Batch 3.1.3 §7: fsync root again after unlink temp.
+        os.fsync(self._root_fd)
         return digest_hex, byte_length
 
     def read_artifact(self, artifact_id: str) -> bytes:
@@ -388,7 +396,11 @@ class ArtifactRootCapability:
         """List all files in the artifact root with their sizes.
 
         Returns a tuple of ``(name, byte_length)`` pairs.  Only regular
-        files are included (symlinks and directories are rejected).
+        files are included.
+
+        Batch 3.1.3 §7: unknown non-regular files (symlinks, FIFOs,
+        sockets, devices) are NOT silently ignored — they raise
+        ``PermissionError`` so the caller can fail-closed before READY.
         """
         results: list[tuple[str, int]] = []
         for name in os.listdir(self._root_fd):
@@ -397,8 +409,11 @@ class ArtifactRootCapability:
             except OSError:
                 continue
             if not stat.S_ISREG(st.st_mode):
-                # Reject non-regular files (symlinks, FIFOs, etc.)
-                continue
+                # Batch 3.1.3 §7: reject non-regular files, don't skip.
+                raise PermissionError(
+                    f"artifact root contains non-regular file: {name} "
+                    f"(mode={st.st_mode:o})"
+                )
             results.append((name, st.st_size))
         return tuple(results)
 
@@ -464,6 +479,38 @@ class ArtifactRootCapability:
             return True
         except OSError:
             return False
+
+    def verify_sealed_artifact(
+        self, artifact_id: str, *, expected_digest: str, expected_size: int,
+    ) -> bool:
+        """Batch 3.1.3 §7: verify a sealed artifact's digest and size.
+
+        Re-reads the final file and computes its SHA-256, then compares
+        against the expected digest and byte length from the DB.
+        Returns True if both match, False otherwise.
+        """
+        final_name = f"{artifact_id}.log"
+        try:
+            fd = os.open(
+                final_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._root_fd,
+            )
+        except FileNotFoundError:
+            return False
+        try:
+            st = os.fstat(fd)
+            if st.st_size != expected_size:
+                return False
+            digest = hashlib.sha256()
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.hexdigest() == expected_digest
+        except OSError:
+            return False
+        finally:
+            os.close(fd)
 
 
 class VerificationWorkspaceFactory:

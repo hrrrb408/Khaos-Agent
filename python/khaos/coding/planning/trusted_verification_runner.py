@@ -119,6 +119,8 @@ class TrustedVerificationRunner:
         self._store.recover_interrupted()
         # Batch 3.1.2 §8: reconcile disposable workspaces from previous boots.
         self._reconcile_disposable_workspaces()
+        # Batch 3.1.3 §7: reconcile artifact root orphans before runtime readiness.
+        self._reconcile_artifacts()
 
     # ------------------------------------------------------------------
     # Batch 3.1.3 §2: Real cleanup states for sandbox instances
@@ -264,6 +266,145 @@ class TrustedVerificationRunner:
                     pass
             else:
                 self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.3 §7: Artifact root orphan recovery
+    # ------------------------------------------------------------------
+
+    def _reconcile_artifacts(self) -> None:
+        """Reconcile artifact root files against DB rows before runtime readiness.
+
+        Batch 3.1.3 §7: the artifact root may contain orphan files,
+        incomplete writes, or sealed artifacts whose final file was
+        deleted or corrupted after a crash.  This method:
+
+        1. Reads all RESERVED and SEALED rows from the DB.
+        2. Calls ``ArtifactRootCapability.reconcile()`` to compare the
+           expected artifacts against the actual files on disk.
+        3. For each category returned by the reconcile report:
+           - ``reserved_no_file`` → quarantine (incomplete reserve).
+           - ``reserved_temp``    → cleanup_orphan temp + quarantine.
+           - ``reserved_final``   → quarantine (cannot verify without digest).
+           - ``sealed_missing``   → quarantine (file deleted after sealing).
+           - ``unknown_files``    → cleanup_orphan (orphan file).
+           - ``cleanup_failed``   → poison the owning verification run.
+        4. For SEALED artifacts with a final file present, re-verify the
+           content digest and byte length.  Any mismatch → quarantine.
+        5. If any artifact could not be cleaned up, poison the owning
+           verification run so it cannot reach a terminal success state.
+        """
+        all_rows = self._store.list_all_artifacts()
+        expected = tuple(
+            (row["artifact_id"], row["status"], int(row["byte_length"]))
+            for row in all_rows
+        )
+        try:
+            report = self._artifact_capability.reconcile(
+                expected_artifacts=expected,
+            )
+        except PermissionError:
+            # Non-regular file in the artifact root — fail-closed by
+            # poisoning every active verification run.  The root is not
+            # safe to use until an operator inspects it.
+            for row in all_rows:
+                try:
+                    self._approval_store.add_workspace_poison_scope(
+                        row["verification_run_id"],
+                        owner="verification-cleanup:artifact-root",
+                        reason="artifact-root-non-regular-file",
+                    )
+                except Exception:
+                    pass
+            raise
+        # Index rows by artifact_id for digest verification.
+        rows_by_id = {row["artifact_id"]: row for row in all_rows}
+        cleanup_failures: list[str] = []
+        # RESERVED artifacts with no file — incomplete reserve.
+        for artifact_id in report["reserved_no_file"]:
+            try:
+                self._store.quarantine_artifact(
+                    artifact_id, reason="reserved-no-file",
+                )
+            except Exception:
+                cleanup_failures.append(artifact_id)
+        # RESERVED artifacts with only a temp file — partial write.
+        for artifact_id in report["reserved_temp"]:
+            temp_name = f".{artifact_id}.tmp"
+            if not self._artifact_capability.cleanup_orphan(temp_name):
+                cleanup_failures.append(artifact_id)
+            try:
+                self._store.quarantine_artifact(
+                    artifact_id, reason="reserved-temp-only",
+                )
+            except Exception:
+                cleanup_failures.append(artifact_id)
+        # RESERVED artifacts with a final file — link succeeded but seal
+        # faulted.  Cannot verify without a digest, so quarantine.
+        for artifact_id in report["reserved_final"]:
+            try:
+                self._store.quarantine_artifact(
+                    artifact_id, reason="reserved-final-without-seal",
+                )
+            except Exception:
+                cleanup_failures.append(artifact_id)
+        # SEALED artifacts whose final file is missing — deleted after sealing.
+        for artifact_id in report["sealed_missing"]:
+            try:
+                self._store.quarantine_artifact(
+                    artifact_id, reason="sealed-file-missing",
+                )
+            except Exception:
+                cleanup_failures.append(artifact_id)
+        # Unknown files in the root — orphan files with no DB row.
+        for name in report["unknown_files"]:
+            if not self._artifact_capability.cleanup_orphan(name):
+                cleanup_failures.append(name)
+        # Re-verify SEALED artifacts with a final file present.
+        for row in all_rows:
+            if row["status"] != "sealed":
+                continue
+            artifact_id = row["artifact_id"]
+            # Skip if the file is missing (already handled above).
+            if artifact_id in report["sealed_missing"]:
+                continue
+            content_digest = row["content_digest"]
+            byte_length = int(row["byte_length"])
+            if not content_digest:
+                # No digest recorded — cannot verify, quarantine.
+                try:
+                    self._store.quarantine_artifact(
+                        artifact_id, reason="sealed-no-digest",
+                    )
+                except Exception:
+                    cleanup_failures.append(artifact_id)
+                continue
+            if not self._artifact_capability.verify_sealed_artifact(
+                artifact_id, expected_digest=content_digest,
+                expected_size=byte_length,
+            ):
+                # Digest or size mismatch — corruption, quarantine.
+                try:
+                    self._store.quarantine_artifact(
+                        artifact_id, reason="sealed-digest-mismatch",
+                    )
+                except Exception:
+                    cleanup_failures.append(artifact_id)
+        # Poison verification runs that own artifacts we could not clean up.
+        if cleanup_failures:
+            failed_runs: set[str] = set()
+            for artifact_id in cleanup_failures:
+                row = rows_by_id.get(artifact_id)
+                if row is not None:
+                    failed_runs.add(row["verification_run_id"])
+            for verification_run_id in failed_runs:
+                try:
+                    self._approval_store.add_workspace_poison_scope(
+                        verification_run_id,
+                        owner="verification-cleanup:artifact-root",
+                        reason="artifact-reconcile-cleanup-failed",
+                    )
+                except Exception:
+                    pass
 
     async def run(
         self,

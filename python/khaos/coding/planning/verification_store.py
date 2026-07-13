@@ -1114,6 +1114,18 @@ class VerificationExecutionStore:
                 missing.append(row)
         return tuple(missing)
 
+    def list_all_artifacts(self) -> tuple[sqlite3.Row, ...]:
+        """Batch 3.1.3 §7: return all non-quarantined artifacts for reconciliation.
+
+        Returns both RESERVED and SEALED rows so the runner can detect
+        orphan files, incomplete writes, and sealed artifacts whose final
+        file was deleted or corrupted after a crash.
+        """
+        return tuple(self._conn.execute(
+            "SELECT * FROM plan_verification_artifacts "
+            "WHERE status IN ('reserved','sealed') ORDER BY created_at"
+        ).fetchall())
+
     # ------------------------------------------------------------------
     # Batch 3.1.2 §5: Toolchain attestation persistence
     # ------------------------------------------------------------------

@@ -2215,3 +2215,203 @@ def test_real_docker_crash_after_create_before_id_commit(tmp_path):
     report = asyncio.run(scenario())
     assert report["status"] in ("terminated", "missing"), report
     factory.destroy(disposable)
+
+
+# ---------------------------------------------------------------------------
+# Batch 3.1.3 §7: Artifact root orphan recovery
+# ---------------------------------------------------------------------------
+
+
+def _artifact_runtime(tmp_path, *, backend=None):
+    """Wire a runtime with an artifact root for §7 reconciliation tests."""
+    if backend is None:
+        backend = _FaultMatrixBackend(_profile())
+    return _fault_matrix_runtime(tmp_path, backend=backend)
+
+
+def _insert_artifact_row(store, *, artifact_id, verification_run_id="verify1",
+                         status="reserved", content_digest="", byte_length=0,
+                         relative_name=None):
+    """Insert an artifact row directly into the DB."""
+    if relative_name is None:
+        relative_name = f"{verification_run_id}/{artifact_id}.log"
+    store._conn.execute(
+        "INSERT INTO plan_verification_artifacts "
+        "(artifact_id, verification_run_id, relative_name, content_digest, "
+        " byte_length, expires_at, quarantined, created_at, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        (artifact_id, verification_run_id, relative_name,
+         content_digest, byte_length, time.time() + 3600, 0, time.time(), status),
+    )
+    store._conn.commit()
+
+
+def _artifact_status(store, artifact_id):
+    """Return the status of an artifact by ID."""
+    row = store._conn.execute(
+        "SELECT status, quarantined FROM plan_verification_artifacts WHERE artifact_id=?",
+        (artifact_id,),
+    ).fetchone()
+    return row
+
+
+def test_reconcile_artifacts_reserved_no_file_quarantines(tmp_path):
+    """§7: RESERVED artifact with no file → quarantined."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    vstore = runtime._verification_store
+    _insert_artifact_row(vstore, artifact_id="art-rnf", status="reserved")
+    runner._reconcile_artifacts()
+    row = _artifact_status(vstore, "art-rnf")
+    assert row["status"] == "quarantined"
+    assert row["quarantined"] == 1
+
+
+def test_reconcile_artifacts_reserved_temp_cleaned_and_quarantined(tmp_path):
+    """§7: RESERVED artifact with only a temp file → temp cleaned + quarantined."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    vstore = runtime._verification_store
+    _insert_artifact_row(vstore, artifact_id="art-rt", status="reserved")
+    # Create a temp file in the artifact root.
+    cap = runner._artifact_capability
+    temp_name = ".art-rt.tmp"
+    fd = os.open(temp_name, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=cap._root_fd)
+    os.close(fd)
+    runner._reconcile_artifacts()
+    row = _artifact_status(vstore, "art-rt")
+    assert row["status"] == "quarantined"
+    # Temp file must be removed.
+    try:
+        os.stat(temp_name, dir_fd=cap._root_fd)
+        temp_exists = True
+    except FileNotFoundError:
+        temp_exists = False
+    assert not temp_exists
+
+
+def test_reconcile_artifacts_reserved_final_quarantined(tmp_path):
+    """§7: RESERVED artifact with a final file → quarantined (no digest to verify)."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    vstore = runtime._verification_store
+    _insert_artifact_row(vstore, artifact_id="art-rf", status="reserved")
+    # Create a final file in the artifact root.
+    cap = runner._artifact_capability
+    final_name = "art-rf.log"
+    fd = os.open(final_name, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=cap._root_fd)
+    os.close(fd)
+    runner._reconcile_artifacts()
+    row = _artifact_status(vstore, "art-rf")
+    assert row["status"] == "quarantined"
+
+
+def test_reconcile_artifacts_sealed_missing_quarantined(tmp_path):
+    """§7: SEALED artifact whose final file is missing → quarantined."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    vstore = runtime._verification_store
+    _insert_artifact_row(
+        vstore, artifact_id="art-sm", status="sealed",
+        content_digest=hashlib.sha256(b"data").hexdigest(), byte_length=4,
+    )
+    runner._reconcile_artifacts()
+    row = _artifact_status(vstore, "art-sm")
+    assert row["status"] == "quarantined"
+
+
+def test_reconcile_artifacts_sealed_digest_mismatch_quarantined(tmp_path):
+    """§7: SEALED artifact with a digest mismatch → quarantined."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    vstore = runtime._verification_store
+    _insert_artifact_row(
+        vstore, artifact_id="art-dm", status="sealed",
+        content_digest=hashlib.sha256(b"expected").hexdigest(), byte_length=7,
+    )
+    # Write a final file with different content.
+    cap = runner._artifact_capability
+    final_name = "art-dm.log"
+    fd = os.open(final_name, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=cap._root_fd)
+    os.write(fd, b"actual!")
+    os.close(fd)
+    runner._reconcile_artifacts()
+    row = _artifact_status(vstore, "art-dm")
+    assert row["status"] == "quarantined"
+
+
+def test_reconcile_artifacts_sealed_valid_not_quarantined(tmp_path):
+    """§7: SEALED artifact with matching digest and size → stays sealed."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    vstore = runtime._verification_store
+    payload = b"valid artifact content"
+    _insert_artifact_row(
+        vstore, artifact_id="art-ok", status="sealed",
+        content_digest=hashlib.sha256(payload).hexdigest(),
+        byte_length=len(payload),
+    )
+    # Write the final file with matching content.
+    cap = runner._artifact_capability
+    final_name = "art-ok.log"
+    fd = os.open(final_name, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=cap._root_fd)
+    os.write(fd, payload)
+    os.close(fd)
+    runner._reconcile_artifacts()
+    row = _artifact_status(vstore, "art-ok")
+    assert row["status"] == "sealed"
+    assert row["quarantined"] == 0
+
+
+def test_reconcile_artifacts_unknown_orphan_file_cleaned(tmp_path):
+    """§7: unknown orphan file in artifact root → cleaned up."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    cap = runner._artifact_capability
+    orphan_name = "orphan-file.log"
+    fd = os.open(orphan_name, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=cap._root_fd)
+    os.close(fd)
+    runner._reconcile_artifacts()
+    try:
+        os.stat(orphan_name, dir_fd=cap._root_fd)
+        exists = True
+    except FileNotFoundError:
+        exists = False
+    assert not exists
+
+
+def test_reconcile_artifacts_non_regular_file_raises_and_poisons(tmp_path):
+    """§7: non-regular file in artifact root → PermissionError + poison scopes."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    vstore = runtime._verification_store
+    # Insert an artifact row so there's a verification_run_id to poison.
+    _insert_artifact_row(vstore, artifact_id="art-sym", status="sealed",
+                         content_digest="x", byte_length=1)
+    cap = runner._artifact_capability
+    # Create a symlink inside the artifact root (non-regular).
+    os.symlink("/etc/passwd", "evil-symlink", dir_fd=cap._root_fd)
+    with pytest.raises(PermissionError, match="non-regular file"):
+        runner._reconcile_artifacts()
+    # The verification run must be poisoned.
+    scopes = runtime._store.list_workspace_poison_scopes("verify1")
+    assert any("artifact-root-non-regular-file" in s[2] for s in scopes)
+
+
+def test_reconcile_artifacts_sealed_no_digest_quarantined(tmp_path):
+    """§7: SEALED artifact with empty content_digest → quarantined."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    vstore = runtime._verification_store
+    _insert_artifact_row(
+        vstore, artifact_id="art-nd", status="sealed",
+        content_digest="", byte_length=0,
+    )
+    # Write a final file.
+    cap = runner._artifact_capability
+    final_name = "art-nd.log"
+    fd = os.open(final_name, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=cap._root_fd)
+    os.close(fd)
+    runner._reconcile_artifacts()
+    row = _artifact_status(vstore, "art-nd")
+    assert row["status"] == "quarantined"
