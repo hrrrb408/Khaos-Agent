@@ -36,6 +36,9 @@ from khaos.coding.planning.verification_execution_models import (
 from khaos.coding.planning.verification_sandbox import (
     DockerVerificationSandboxBackend, SandboxStepResult,
 )
+from khaos.coding.planning.verification_sandbox_instance import (
+    SandboxInstanceState, VerificationSandboxInstance,
+)
 from khaos.coding.planning.verification_store import VerificationExecutionStore
 
 
@@ -304,11 +307,16 @@ def test_verification_store_rejects_invalid_transition(tmp_path, bad):
 
 class UnsafeTestSandboxBackend:
     """Does not create host processes; records server-owned command only."""
+    BACKEND_ID = "unsafe-test-v1"
+
     def __init__(self, profile):
         self.profile = profile
         self.calls = []
 
-    async def execute(self, command, workspace, *, cancellation=None):
+    async def probe(self):
+        return self.profile.image_digest
+
+    async def execute(self, command, workspace, *, cancellation=None, **kwargs):
         self.calls.append((command, workspace))
         data = b"trusted fake output"
         return SandboxStepResult(
@@ -471,3 +479,197 @@ def test_static_planned_verification_has_no_agent_tool_or_shell_route():
     assert "ChangeSet" not in source
     assert "git commit" not in source
     assert "git push" not in source
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.1 §2/§3/§5: crash reconciliation, atomic termination,
+# artifact RESERVED→SEALED protocol, sandbox instance lifecycle.
+# ----------------------------------------------------------------------
+
+def _sandbox_instance(
+    *, sandbox_instance_id="vsi-1", verification_run_id="verify1",
+    step_run_id="step-1", state=SandboxInstanceState.PREPARED,
+    boot_id="boot-1",
+):
+    return VerificationSandboxInstance(
+        sandbox_instance_id=sandbox_instance_id,
+        verification_run_id=verification_run_id,
+        step_run_id=step_run_id,
+        backend_id="docker-verification-v1",
+        backend_instance_name="khaos-verify-test",
+        runtime_epoch=1,
+        boot_id=boot_id,
+        image_reference=IMAGE,
+        expected_image_digest=IMAGE,
+        actual_image_digest=IMAGE,
+        workspace_manifest_digest="manifest-hash",
+        container_id="container-abc",
+        state=state,
+    )
+
+
+def _step_run(
+    *, step_run_id="step-1", verification_run_id="verify1",
+    status=VerificationStepStatus.RUNNING, ordinal=0,
+):
+    return VerificationStepRun(
+        step_run_id=step_run_id, verification_run_id=verification_run_id,
+        requirement_id="requirement-1", command_id="verify-1",
+        command_digest="digest", ordinal=ordinal, status=status,
+        started_at=time.time(), timeout_ms=10_000,
+    )
+
+
+def _running_store(tmp_path):
+    """Create a store with a run in RUNNING state and one RUNNING step."""
+    approval, store = _mutated_store(tmp_path)
+    store.create_run(_verification_run())
+    store.transition_run(
+        "verify1", expected=(VerificationRunStatus.CREATED,),
+        target=VerificationRunStatus.VALIDATING,
+    )
+    store.transition_run(
+        "verify1", expected=(VerificationRunStatus.VALIDATING,),
+        target=VerificationRunStatus.PREPARING_SANDBOX,
+    )
+    store.transition_run(
+        "verify1", expected=(VerificationRunStatus.PREPARING_SANDBOX,),
+        target=VerificationRunStatus.RUNNING,
+    )
+    store.create_steps((_step_run(),))
+    return approval, store
+
+
+@pytest.mark.parametrize("active_state", [
+    SandboxInstanceState.PREPARED, SandboxInstanceState.STARTING,
+    SandboxInstanceState.RUNNING, SandboxInstanceState.TERMINATING,
+])
+def test_reconcile_sandbox_instances_marks_active_orphaned(tmp_path, active_state):
+    """Batch 3.1.1 §2: active sandbox instances are ORPHANED on restart."""
+    _, store = _running_store(tmp_path)
+    store.create_sandbox_instance(_sandbox_instance(state=active_state))
+    count = store.reconcile_sandbox_instances()
+    assert count == 1
+    instance = store.get_sandbox_instance("vsi-1")
+    assert instance.state == SandboxInstanceState.ORPHANED
+    assert instance.failure_code == "runtime-restart-orphaned"
+
+
+def test_reconcile_sandbox_instances_skips_terminal(tmp_path):
+    """Batch 3.1.1 §2: terminal sandbox instances are NOT re-orphaned."""
+    _, store = _running_store(tmp_path)
+    store.create_sandbox_instance(_sandbox_instance(state=SandboxInstanceState.TERMINATED))
+    count = store.reconcile_sandbox_instances()
+    assert count == 0
+    instance = store.get_sandbox_instance("vsi-1")
+    assert instance.state == SandboxInstanceState.TERMINATED
+
+
+def test_finish_step_and_run_is_atomic(tmp_path):
+    """Batch 3.1.1 §3: finish_step_and_run transitions step+run+execution."""
+    approval, store = _running_store(tmp_path)
+    step = store.list_steps("verify1")[0]
+    finished = replace(step, status=VerificationStepStatus.PASSED, exit_code=0)
+    store.finish_step_and_run(finished)
+    assert store.list_steps("verify1")[0].status == VerificationStepStatus.PASSED
+    assert store.get_run_by_execution("run1").status == VerificationRunStatus.PASSED
+    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFIED
+    assert store.assert_no_running_steps_in_terminal_run() == 0
+
+
+def test_fail_step_and_run_is_atomic(tmp_path):
+    """Batch 3.1.1 §3: fail_step_and_run transitions step+run+execution."""
+    approval, store = _running_store(tmp_path)
+    step = store.list_steps("verify1")[0]
+    failed = replace(step, status=VerificationStepStatus.FAILED, exit_code=1)
+    store.fail_step_and_run(failed)
+    assert store.list_steps("verify1")[0].status == VerificationStepStatus.FAILED
+    assert store.get_run_by_execution("run1").status == VerificationRunStatus.FAILED
+    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_FAILED
+
+
+def test_timeout_step_and_run_is_atomic(tmp_path):
+    """Batch 3.1.1 §3: timeout_step_and_run transitions step+run+execution."""
+    approval, store = _running_store(tmp_path)
+    step = store.list_steps("verify1")[0]
+    timed = replace(step, status=VerificationStepStatus.TIMED_OUT)
+    store.timeout_step_and_run(timed)
+    assert store.list_steps("verify1")[0].status == VerificationStepStatus.TIMED_OUT
+    assert store.get_run_by_execution("run1").status == VerificationRunStatus.TIMED_OUT
+    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
+
+
+def test_abort_step_and_run_is_atomic(tmp_path):
+    """Batch 3.1.1 §3: abort_step_and_run transitions step+run+execution."""
+    approval, store = _running_store(tmp_path)
+    store.abort_step_and_run("step-1", verification_run_id="verify1", failure_code="backend-crash")
+    assert store.list_steps("verify1")[0].status == VerificationStepStatus.ABORTED
+    assert store.get_run_by_execution("run1").status == VerificationRunStatus.ERRORED
+    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
+    assert store.assert_no_running_steps_in_terminal_run() == 0
+
+
+def test_assert_no_running_steps_in_terminal_run_detects_violation(tmp_path):
+    """Batch 3.1.1 §3 invariant: terminal run with RUNNING step is detected."""
+    approval, store = _running_store(tmp_path)
+    # Force the run to PASSED without transitioning the step.
+    approval._conn.execute(
+        "UPDATE plan_verification_runs SET status='passed' WHERE verification_run_id='verify1'"
+    )
+    approval._conn.commit()
+    # Step is still RUNNING, run is PASSED — invariant violated.
+    assert store.assert_no_running_steps_in_terminal_run() == 1
+
+
+def test_artifact_reserved_to_sealed_protocol(tmp_path):
+    """Batch 3.1.1 §5: artifact transitions RESERVED → SEALED atomically."""
+    _, store = _running_store(tmp_path)
+    store.reserve_artifact(
+        artifact_id="art-1", verification_run_id="verify1",
+        relative_name="verify1/output.txt", expires_at=time.time() + 3600,
+    )
+    # Artifact is RESERVED, not yet SEALED.
+    unsealed = store.list_unsealed_artifacts()
+    assert len(unsealed) == 1
+    assert unsealed[0]["artifact_id"] == "art-1"
+    # Seal it.
+    store.seal_artifact(artifact_id="art-1", content_digest="sha256:abc", byte_length=42)
+    assert len(store.list_unsealed_artifacts()) == 0
+    # Sealing again fails (CAS).
+    with pytest.raises(RuntimeError, match="CAS failed"):
+        store.seal_artifact(artifact_id="art-1", content_digest="sha256:abc", byte_length=42)
+
+
+def test_artifact_quarantine(tmp_path):
+    """Batch 3.1.1 §5: quarantine marks artifact as quarantined."""
+    _, store = _running_store(tmp_path)
+    store.reserve_artifact(
+        artifact_id="art-2", verification_run_id="verify1",
+        relative_name="verify1/bad.txt", expires_at=time.time() + 3600,
+    )
+    store.quarantine_artifact("art-2", reason="suspected-tamper")
+    row = store._conn.execute(
+        "SELECT quarantined, status FROM plan_verification_artifacts WHERE artifact_id='art-2'"
+    ).fetchone()
+    assert row[0] == 1
+    assert row[1] == "quarantined"
+
+
+def test_artifact_seal_cas_rejects_unreserved(tmp_path):
+    """Batch 3.1.1 §5: sealing a non-RESERVED artifact fails."""
+    _, store = _running_store(tmp_path)
+    with pytest.raises(RuntimeError, match="CAS failed"):
+        store.seal_artifact(artifact_id="nonexistent", content_digest="sha256:x", byte_length=1)
+
+
+def test_list_artifacts_without_files(tmp_path):
+    """Batch 3.1.1 §5: SEALED artifacts missing files are detected."""
+    _, store = _running_store(tmp_path)
+    store.reserve_artifact(
+        artifact_id="art-3", verification_run_id="verify1",
+        relative_name="missing/output.txt", expires_at=time.time() + 3600,
+    )
+    store.seal_artifact(artifact_id="art-3", content_digest="sha256:abc", byte_length=10)
+    missing = store.list_artifacts_without_files(tmp_path / "artifacts")
+    assert len(missing) == 1
+    assert missing[0]["artifact_id"] == "art-3"
