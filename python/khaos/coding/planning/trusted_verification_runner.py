@@ -25,6 +25,9 @@ from khaos.coding.planning.verification_execution_models import (
     verification_plan_digest,
 )
 from khaos.coding.planning.verification_sandbox import VerificationSandboxBackend
+from khaos.coding.planning.verification_sandbox_instance import (
+    SandboxInstanceState, VerificationSandboxInstance,
+)
 from khaos.coding.planning.verification_store import VerificationExecutionStore
 
 
@@ -184,12 +187,75 @@ class TrustedVerificationRunner:
                     break
                 self._store.mark_step_running(step.step_run_id)
                 started = time.time()
-                result = await self._backend.execute(
-                    command, disposable, cancellation=cancellation,
+                # Batch 3.1.1 §1: persist a PREPARED sandbox instance BEFORE
+                # creating the container, so a crash leaves a durable trail.
+                sandbox_instance_id = f"vsi_{secrets.token_hex(12)}"
+                instance_name = getattr(self._backend, "generate_instance_name", lambda: f"khaos-verify-{secrets.token_hex(12)}")()
+                instance = VerificationSandboxInstance(
+                    sandbox_instance_id=sandbox_instance_id,
+                    verification_run_id=run.verification_run_id,
+                    step_run_id=step.step_run_id,
+                    backend_id=getattr(self._backend, "BACKEND_ID", "unknown"),
+                    backend_instance_name=instance_name,
+                    runtime_epoch=self._boot.server_epoch,
+                    boot_id=self._boot.boot_id,
+                    image_reference=self._profile.image_digest,
+                    expected_image_digest=self._profile.image_digest,
+                    workspace_manifest_digest=disposable.manifest_digest,
+                    state=SandboxInstanceState.PREPARED,
                 )
-                artifact_id = self._write_artifact(
-                    run.verification_run_id, result.stdout, result.stderr,
+                self._store.create_sandbox_instance(instance)
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id, state=SandboxInstanceState.STARTING,
                 )
+                try:
+                    result = await self._backend.execute(
+                        command, disposable, cancellation=cancellation,
+                        sandbox_instance_id=sandbox_instance_id,
+                        verification_run_id=run.verification_run_id,
+                        step_run_id=step.step_run_id,
+                        boot_id=self._boot.boot_id,
+                    )
+                    # Batch 3.1.1 §1: persist actual container ID + state.
+                    self._store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.RUNNING,
+                        container_id=result.sandbox_instance_id,
+                        started_at=time.time(),
+                    )
+                except Exception:
+                    # Backend launch failed — abort step+run atomically.
+                    self._store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.TERMINATED,
+                        terminated_at=time.time(),
+                        failure_code="backend-launch-failed",
+                    )
+                    self._store.abort_step_and_run(
+                        step.step_run_id,
+                        verification_run_id=run.verification_run_id,
+                        failure_code="backend-launch-failed",
+                    )
+                    raise
+                # Batch 3.1.1 §1: mark instance TERMINATED after execute returns.
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.TERMINATED,
+                    terminated_at=time.time(),
+                )
+                # Batch 3.1.1 §3: write artifact with RESERVED→SEALED protocol.
+                try:
+                    artifact_id = self._write_artifact(
+                        run.verification_run_id, result.stdout, result.stderr,
+                    )
+                except Exception:
+                    # Artifact write failed — abort step+run atomically.
+                    self._store.abort_step_and_run(
+                        step.step_run_id,
+                        verification_run_id=run.verification_run_id,
+                        failure_code="artifact-write-failed",
+                    )
+                    raise
                 if result.cancelled:
                     step_status = VerificationStepStatus.CANCELLED
                     terminal = VerificationRunStatus.CANCELLED
@@ -214,7 +280,25 @@ class TrustedVerificationRunner:
                     sandbox_instance_id=result.sandbox_instance_id,
                     sandbox_image_digest=result.image_digest, failure_code=failure_code,
                 )
-                self._store.finish_step(finished)
+                # Batch 3.1.1 §3: atomic step+run+execution terminal transition.
+                if step_status == VerificationStepStatus.PASSED and terminal == VerificationRunStatus.PASSED:
+                    # Non-terminal step pass — use legacy finish_step.
+                    self._store.finish_step(finished)
+                else:
+                    # Terminal step — use atomic fail/timeout/abort.
+                    if step_status == VerificationStepStatus.TIMED_OUT:
+                        self._store.timeout_step_and_run(finished)
+                    elif step_status == VerificationStepStatus.FAILED:
+                        self._store.fail_step_and_run(finished, run_failure_code=failure_code)
+                    else:
+                        # Cancelled — transition run to CANCELLED.
+                        self._store.finish_step(finished)
+                        self._store.transition_run(
+                            run.verification_run_id,
+                            expected=(VerificationRunStatus.RUNNING,),
+                            target=VerificationRunStatus.CANCELLED,
+                            failure_code="cancelled",
+                        )
                 completed.append(finished)
                 if terminal != VerificationRunStatus.PASSED:
                     break
@@ -392,20 +476,55 @@ class TrustedVerificationRunner:
             raise PermissionError("verification runtime boot is stale")
 
     def _write_artifact(self, run_id: str, stdout: bytes, stderr: bytes) -> str:
+        """Batch 3.1.1 §3: RESERVED → write file → fsync → SEALED protocol.
+
+        1. Insert a RESERVED artifact row (BEFORE writing the file).
+        2. Write the artifact file to a temporary path.
+        3. fsync the file.
+        4. Atomically install (rename) to the final path.
+        5. fsync the artifact root directory.
+        6. Atomically transition RESERVED → SEALED in the DB.
+        """
         self._artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         artifact_id = f"pvo_{secrets.token_hex(20)}"
         relative = f"{artifact_id}.log"
-        path = self._artifact_root / relative
-        payload = b"stdout:\n" + stdout + b"\nstderr:\n" + stderr
-        with path.open("xb") as stream:
-            os.chmod(path, 0o600)
-            stream.write(payload)
-            stream.flush()
-            os.fsync(stream.fileno())
-        digest = hashlib.sha256(payload).hexdigest()
-        self._store.save_artifact_record(
+        expires_at = time.time() + self._artifact_ttl
+        # Step 1: RESERVED row BEFORE writing the file.
+        self._store.reserve_artifact(
             artifact_id=artifact_id, verification_run_id=run_id,
-            relative_name=relative, content_digest=digest, byte_length=len(payload),
-            expires_at=time.time() + self._artifact_ttl,
+            relative_name=relative, expires_at=expires_at,
         )
+        payload = b"stdout:\n" + stdout + b"\nstderr:\n" + stderr
+        digest = hashlib.sha256(payload).hexdigest()
+        # Step 2-3: write to temporary path + fsync.
+        tmp_relative = f".{artifact_id}.tmp"
+        tmp_path = self._artifact_root / tmp_relative
+        try:
+            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, payload)
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            # Step 4: atomic install (no-replace).
+            final_path = self._artifact_root / relative
+            os.rename(str(tmp_path), str(final_path))
+            # Step 5: fsync the artifact root directory.
+            dir_fd = os.open(str(self._artifact_root), os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+            # Step 6: SEALED.
+            self._store.seal_artifact(
+                artifact_id=artifact_id,
+                content_digest=digest, byte_length=len(payload),
+            )
+        except Exception:
+            # Cleanup temp file if it exists.
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            raise
         return artifact_id
