@@ -34,7 +34,7 @@ from khaos.coding.planning.verification_execution_models import (
     VerificationStepRun, VerificationStepStatus, verification_plan_digest,
 )
 from khaos.coding.planning.verification_sandbox import (
-    DockerVerificationSandboxBackend, SandboxStepResult,
+    ContainerAttestation, DockerVerificationSandboxBackend, SandboxStepResult,
 )
 from khaos.coding.planning.verification_sandbox_instance import (
     SandboxInstanceState, VerificationSandboxInstance,
@@ -315,6 +315,46 @@ class UnsafeTestSandboxBackend:
 
     async def probe(self):
         return self.profile.image_digest
+
+    def generate_instance_name(self):
+        import secrets as _s
+        return f"khaos-verify-test-{_s.token_hex(12)}"
+
+    def build_labels(self, *, run_id, step_id, instance_id, boot_id, manifest_digest):
+        return {
+            "khaos.run-id": run_id,
+            "khaos.step-id": step_id,
+            "khaos.sandbox-instance-id": instance_id,
+            "khaos.boot-id": boot_id,
+            "khaos.manifest-digest": manifest_digest[:63],
+        }
+
+    async def launch_instance(self, *, instance_name, image_digest, command,
+                              workspace_root, labels, expected_manifest_digest):
+        self.calls.append((command, workspace_root))
+        fake_container_id = f"fake-container-{hashlib.sha256(instance_name.encode()).hexdigest()[:12]}"
+        attestation = ContainerAttestation(
+            container_id=fake_container_id,
+            container_image_id=image_digest,
+            local_image_id=image_digest,
+            expected_image_digest=image_digest,
+            labels=dict(labels),
+            manifest_digest=expected_manifest_digest,
+            attestation_digest=hashlib.sha256(
+                f"{fake_container_id}:{image_digest}".encode(),
+            ).hexdigest(),
+        )
+        return fake_container_id, attestation, None, None, None
+
+    async def collect_result(self, *, container_id, attach_proc, stdout_stream,
+                             stderr_stream, command, cancellation, started,
+                             sandbox_instance_id, attestation_digest):
+        data = b"trusted fake output"
+        return SandboxStepResult(
+            sandbox_instance_id, self.profile.image_digest, 0, None, 1, data, b"",
+            hashlib.sha256(data).hexdigest(), hashlib.sha256(b"").hexdigest(), False,
+            False, False, container_id, attestation_digest,
+        )
 
     async def execute(self, command, workspace, *, cancellation=None, **kwargs):
         self.calls.append((command, workspace))

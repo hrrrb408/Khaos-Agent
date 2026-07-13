@@ -4,11 +4,11 @@ This module is deliberately independent from Agent ExecutionService and its
 terminal/test_run backends.  It accepts only an already canonical, server-owned
 command and a disposable verification workspace.
 
-Batch 3.1.1 §1: refactored to a durable instance lifecycle API:
-``prepare_instance`` → ``launch_instance`` → ``terminate_instance`` →
-``inspect_instance`` / ``reconcile_instances``.  Every container carries
-high-entropy Khaos labels that bind it to a persisted
-``VerificationSandboxInstance`` row.
+Batch 3.1.2 §1: refactored to an explicit container lifecycle:
+``prepare_instance`` → ``create_instance`` → ``inspect_and_attest_instance``
+→ ``start_instance`` → ``wait_instance`` → ``terminate_instance`` →
+``remove_instance``.  The container ID is persisted BEFORE project code
+executes, using ``docker create --pull=never`` instead of ``docker run --rm``.
 """
 from __future__ import annotations
 
@@ -34,6 +34,18 @@ from khaos.coding.planning.verification_sandbox_instance import (
 
 
 @dataclass(frozen=True)
+class ContainerAttestation:
+    """Batch 3.1.2 §4: image identity attestation for a created container."""
+    container_id: str
+    container_image_id: str          # from docker inspect .Image
+    local_image_id: str              # from docker image inspect .Id
+    expected_image_digest: str       # from profile (manifest digest)
+    labels: dict[str, str]
+    manifest_digest: str
+    attestation_digest: str
+
+
+@dataclass(frozen=True)
 class SandboxStepResult:
     sandbox_instance_id: str
     image_digest: str
@@ -47,6 +59,8 @@ class SandboxStepResult:
     output_truncated: bool
     timed_out: bool = False
     cancelled: bool = False
+    container_id: str = ""
+    attestation_digest: str = ""
 
 
 class VerificationSandboxBackend(Protocol):
@@ -64,7 +78,8 @@ class VerificationSandboxBackend(Protocol):
 class DockerVerificationSandboxBackend:
     """Hardened production backend using one digest-pinned disposable container.
 
-    Batch 3.1.1 §1: refactored to durable instance lifecycle.
+    Batch 3.1.2 §1: explicit create/start/wait/terminate/remove lifecycle.
+    Container identity is persisted BEFORE project code executes.
     """
 
     BACKEND_ID = "docker-verification-v1"
@@ -89,7 +104,7 @@ class DockerVerificationSandboxBackend:
         self._grace = kill_grace_seconds
 
     # ------------------------------------------------------------------
-    # §1: Durable instance lifecycle API
+    # §1: Explicit container lifecycle API
     # ------------------------------------------------------------------
 
     def generate_instance_name(self) -> str:
@@ -109,27 +124,12 @@ class DockerVerificationSandboxBackend:
             "khaos.manifest-digest": manifest_digest[:63],
         }
 
-    async def prepare_instance(
-        self, *, sandbox_instance_id: str, instance_name: str,
-        image_digest: str, labels: dict[str, str],
-    ) -> str:
-        """Prepare the container (no-op for Docker — name is the handle).
-
-        Returns the instance_name which serves as the container name.
-        """
-        return instance_name
-
-    async def launch_instance(
+    def _build_create_args(
         self, *, instance_name: str, image_digest: str,
         command: TrustedVerificationCommand,
         workspace_root: Path, labels: dict[str, str],
-    ) -> asyncio.subprocess.Process:
-        """Launch the Docker container with ``--pull=never`` and Khaos labels.
-
-        Batch 3.1.1 §7: uses ``--pull=never`` to prevent automatic image
-        pulling.  The image must already exist locally and match the
-        digest pinned in the profile.
-        """
+    ) -> list[str]:
+        """Build the ``docker create`` argument list (no --rm, no --pull)."""
         cwd = self._safe_cwd(command.cwd)
         environment = (
             "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
@@ -137,7 +137,7 @@ class DockerVerificationSandboxBackend:
             "TZ=UTC", "SOURCE_DATE_EPOCH=0", "PYTHONHASHSEED=0",
         )
         args = [
-            str(self._docker), "run", "--pull=never", "--rm", "--name", instance_name,
+            str(self._docker), "create", "--pull=never", "--name", instance_name,
             "--network", "none", "--read-only", "--user", self.profile.run_as_user,
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
             "--pids-limit", str(self.profile.pids_limit),
@@ -153,15 +153,155 @@ class DockerVerificationSandboxBackend:
         for value in environment:
             args.extend(("--env", value))
         args.extend((image_digest, *command.argv))
-        return await asyncio.create_subprocess_exec(
+        return args
+
+    async def create_instance(
+        self, *, instance_name: str, image_digest: str,
+        command: TrustedVerificationCommand,
+        workspace_root: Path, labels: dict[str, str],
+    ) -> str:
+        """Batch 3.1.2 §1: ``docker create --pull=never`` — no project code runs.
+
+        Returns the container ID printed by ``docker create`` on stdout.
+        """
+        args = self._build_create_args(
+            instance_name=instance_name, image_digest=image_digest,
+            command=command, workspace_root=workspace_root, labels=labels,
+        )
+        process = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"docker create failed (exit {process.returncode}): "
+                f"{stderr.decode('utf-8', 'replace')}"
+            )
+        container_id = stdout.decode("utf-8", "replace").strip()
+        if not container_id:
+            raise RuntimeError("docker create produced no container ID")
+        return container_id
+
+    async def inspect_and_attest_instance(
+        self, *, container_id_or_name: str, expected_labels: dict[str, str],
+        expected_image_digest: str, expected_manifest_digest: str,
+    ) -> ContainerAttestation:
+        """Batch 3.1.2 §4: inspect the created container and verify identity.
+
+        Verifies:
+        - All expected Khaos labels are present and match.
+        - The container's Image ID matches the local image inspect ID.
+        - The local image ID matches the profile's expected digest.
+        - The workspace manifest digest label matches.
+
+        Returns a ``ContainerAttestation`` with all identity fields.
+        """
+        info = await self.inspect_instance(container_id_or_name)
+        if info is None:
+            raise RuntimeError(
+                f"container {container_id_or_name} not found after create"
+            )
+        container_id = info.get("Id", "")
+        container_image_id = info.get("Image", "")
+        # Verify labels.
+        container_labels: dict[str, str] = {}
+        for key, value in info.get("Config", {}).get("Labels", {}).items():
+            container_labels[key] = value
+        for key, expected_value in expected_labels.items():
+            actual_value = container_labels.get(key)
+            if actual_value != expected_value:
+                raise RuntimeError(
+                    f"container label mismatch: {key} expected={expected_value} "
+                    f"actual={actual_value}"
+                )
+        # Verify image identity.
+        local_image_id = await self.inspect_image(expected_image_digest)
+        if local_image_id is None:
+            raise RuntimeError(
+                f"local image not found: {expected_image_digest}"
+            )
+        if local_image_id != expected_image_digest:
+            raise RuntimeError(
+                f"local image ID mismatch: expected={expected_image_digest} "
+                f"actual={local_image_id}"
+            )
+        if container_image_id and container_image_id != local_image_id:
+            raise RuntimeError(
+                f"container image ID mismatch: container={container_image_id} "
+                f"local={local_image_id}"
+            )
+        # Verify manifest digest label.
+        actual_manifest = container_labels.get("khaos.manifest-digest", "")
+        if expected_manifest_digest and actual_manifest:
+            if actual_manifest != expected_manifest_digest[:63]:
+                raise RuntimeError(
+                    f"manifest digest label mismatch: expected="
+                    f"{expected_manifest_digest[:63]} actual={actual_manifest}"
+                )
+        attestation_digest = hashlib.sha256(json.dumps({
+            "container_id": container_id,
+            "container_image_id": container_image_id,
+            "local_image_id": local_image_id,
+            "expected_image_digest": expected_image_digest,
+            "labels": expected_labels,
+            "manifest_digest": expected_manifest_digest,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return ContainerAttestation(
+            container_id=container_id,
+            container_image_id=container_image_id,
+            local_image_id=local_image_id,
+            expected_image_digest=expected_image_digest,
+            labels=dict(expected_labels),
+            manifest_digest=expected_manifest_digest,
+            attestation_digest=attestation_digest,
         )
 
-    async def inspect_instance(self, instance_name: str) -> dict[str, Any] | None:
-        """Inspect a container by name. Returns None if not found."""
+    async def start_instance(self, container_id_or_name: str) -> None:
+        """Batch 3.1.2 §1: ``docker start`` the created container."""
         process = await asyncio.create_subprocess_exec(
-            str(self._docker), "inspect", instance_name,
+            str(self._docker), "start", container_id_or_name,
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"docker start failed (exit {process.returncode}): "
+                f"{stderr.decode('utf-8', 'replace')}"
+            )
+
+    async def attach_instance(
+        self, container_id_or_name: str,
+    ) -> tuple[asyncio.subprocess.Process, Any, Any]:
+        """Batch 3.1.2 §1: ``docker attach`` to capture stdout/stderr.
+
+        Returns (process, stdout_reader, stderr_reader).  The process
+        completes when the container exits and the streams are drained.
+        """
+        process = await asyncio.create_subprocess_exec(
+            str(self._docker), "attach", "--no-stdin",
+            container_id_or_name,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        return process, process.stdout, process.stderr
+
+    async def wait_instance(self, container_id_or_name: str) -> int:
+        """Batch 3.1.2 §1: ``docker wait`` — returns the exit code."""
+        process = await asyncio.create_subprocess_exec(
+            str(self._docker), "wait", container_id_or_name,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(f"docker wait failed for {container_id_or_name}")
+        try:
+            return int(stdout.decode("utf-8", "replace").strip())
+        except ValueError:
+            raise RuntimeError(f"docker wait returned non-integer: {stdout!r}")
+
+    async def inspect_instance(self, container_id_or_name: str) -> dict[str, Any] | None:
+        """Inspect a container by name or ID. Returns None if not found."""
+        process = await asyncio.create_subprocess_exec(
+            str(self._docker), "inspect", container_id_or_name,
             "--format", "{{json .}}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
@@ -185,41 +325,44 @@ class DockerVerificationSandboxBackend:
             return None
         return stdout.decode("utf-8", "replace").strip() or None
 
-    async def terminate_instance(self, instance_name: str) -> bool:
-        """Terminate a container by name. Returns True if terminated."""
+    async def terminate_instance(self, container_id_or_name: str) -> bool:
+        """Terminate a container by name or ID. Returns True if terminated."""
         for sig in ("TERM", "KILL"):
             killer = await asyncio.create_subprocess_exec(
-                str(self._docker), "kill", "--signal", sig, instance_name,
+                str(self._docker), "kill", "--signal", sig, container_id_or_name,
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
             )
             await killer.wait()
-            # Brief wait for container to exit.
             await asyncio.sleep(0.1)
-            info = await self.inspect_instance(instance_name)
+            info = await self.inspect_instance(container_id_or_name)
             if info is None:
                 return True
-        # Force remove if still present.
+            # Check if container is in exited state.
+            state = info.get("State", {})
+            if state.get("Status") == "exited" or state.get("Running") is False:
+                return True
+        return False
+
+    async def remove_instance(self, container_id_or_name: str) -> bool:
+        """Remove a stopped container. Returns True if removed."""
         remover = await asyncio.create_subprocess_exec(
-            str(self._docker), "rm", "-f", instance_name,
+            str(self._docker), "rm", "-f", container_id_or_name,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
         )
         await remover.wait()
-        return self.inspect_instance(instance_name) is None
+        return await self.inspect_instance(container_id_or_name) is None
 
     async def reconcile_instances(
         self, *, expected_labels: dict[str, str],
     ) -> dict[str, Any]:
-        """Find and optionally terminate containers matching Khaos labels.
-
-        Batch 3.1.1 §2: used during Runtime initialization to discover
-        and clean up residual containers from a crashed worker.
+        """Batch 3.1.2 §2: find and terminate containers matching Khaos labels.
 
         Returns a report dict with:
-        - ``found``: list of container names matching labels.
-        - ``terminated``: list of container names that were terminated.
-        - ``unknown``: list of containers with partial label matches (NOT terminated).
+        - ``found``: list of container names matching ALL expected labels.
+        - ``terminated``: list of container names that were terminated+removed.
+        - ``unknown``: list of containers with partial Khaos label matches (NOT terminated).
+        - ``mismatches``: list of (name, mismatch_reason) for label/image mismatches.
         """
-        # List all containers with the khaos.run-id label.
         process = await asyncio.create_subprocess_exec(
             str(self._docker), "ps", "-a",
             "--filter", "label=khaos.run-id",
@@ -230,20 +373,19 @@ class DockerVerificationSandboxBackend:
         found: list[str] = []
         terminated: list[str] = []
         unknown: list[str] = []
+        mismatches: list[tuple[str, str]] = []
         for line in stdout.decode("utf-8", "replace").splitlines():
             parts = line.split("\t", 1)
             if len(parts) < 2:
                 continue
             name = parts[0].strip()
             label_str = parts[1].strip()
-            # Parse comma-separated key=value labels.
             container_labels: dict[str, str] = {}
             for pair in label_str.split(","):
                 pair = pair.strip()
                 if "=" in pair:
                     k, v = pair.split("=", 1)
                     container_labels[k.strip()] = v.strip()
-            # Check if ALL expected labels match.
             matches = all(
                 container_labels.get(k) == v
                 for k, v in expected_labels.items()
@@ -252,11 +394,82 @@ class DockerVerificationSandboxBackend:
                 found.append(name)
                 ok = await self.terminate_instance(name)
                 if ok:
-                    terminated.append(name)
+                    removed = await self.remove_instance(name)
+                    if removed:
+                        terminated.append(name)
+                    else:
+                        mismatches.append((name, "terminate-ok-remove-failed"))
+                else:
+                    mismatches.append((name, "terminate-failed"))
             elif any(k.startswith("khaos.") for k in container_labels):
-                # Partial Khaos label match — label tampering suspected.
                 unknown.append(name)
-        return {"found": found, "terminated": terminated, "unknown": unknown}
+        return {
+            "found": found, "terminated": terminated,
+            "unknown": unknown, "mismatches": mismatches,
+        }
+
+    async def reconcile_instance_by_record(
+        self, *, container_id: str, instance_name: str,
+        expected_labels: dict[str, str],
+        expected_image_digest: str, expected_manifest_digest: str,
+    ) -> dict[str, Any]:
+        """Batch 3.1.2 §2: reconcile one specific instance by DB record.
+
+        Uses the persisted container_id (or instance_name as fallback) to
+        inspect and verify the container.  Returns a report dict:
+        - ``status``: "missing" | "terminated" | "mismatch" | "cleanup-failed"
+        - ``container_id``: the container ID inspected (or "").
+        - ``reason``: mismatch reason if status is "mismatch".
+        """
+        target = container_id or instance_name
+        if not target:
+            return {"status": "missing", "container_id": "", "reason": "no-container-id"}
+        info = await self.inspect_instance(target)
+        if info is None:
+            # Try by name if we used container_id.
+            if container_id and instance_name and container_id != instance_name:
+                info = await self.inspect_instance(instance_name)
+            if info is None:
+                return {"status": "missing", "container_id": "", "reason": "container-not-found"}
+        actual_id = info.get("Id", "")
+        # Verify labels.
+        container_labels: dict[str, str] = {}
+        for key, value in info.get("Config", {}).get("Labels", {}).items():
+            container_labels[key] = value
+        for key, expected_value in expected_labels.items():
+            actual_value = container_labels.get(key)
+            if actual_value != expected_value:
+                ok = await self.terminate_instance(actual_id or target)
+                if ok:
+                    await self.remove_instance(actual_id or target)
+                return {
+                    "status": "mismatch", "container_id": actual_id,
+                    "reason": f"label-mismatch:{key}",
+                }
+        # Verify image.
+        container_image = info.get("Image", "")
+        if container_image and expected_image_digest and container_image != expected_image_digest:
+            ok = await self.terminate_instance(actual_id or target)
+            if ok:
+                await self.remove_instance(actual_id or target)
+            return {
+                "status": "mismatch", "container_id": actual_id,
+                "reason": f"image-mismatch:{container_image}!={expected_image_digest}",
+            }
+        # Full match — terminate and remove.
+        ok = await self.terminate_instance(actual_id or target)
+        if not ok:
+            return {
+                "status": "cleanup-failed", "container_id": actual_id,
+                "reason": "terminate-failed",
+            }
+        removed = await self.remove_instance(actual_id or target)
+        if not removed:
+            return {
+                "status": "cleanup-failed", "container_id": actual_id,
+                "reason": "remove-failed",
+            }
+        return {"status": "terminated", "container_id": actual_id, "reason": ""}
 
     # ------------------------------------------------------------------
     # §7: Production image attestation
@@ -281,64 +494,71 @@ class DockerVerificationSandboxBackend:
             )
         return actual
 
-    async def verify_container_image(self, instance_name: str) -> str:
-        """Re-inspect the running container's image ID after start.
-
-        Batch 3.1.1 §7: the container's actual image ID must match
-        the profile's pinned digest.
-        """
-        info = await self.inspect_instance(instance_name)
-        if info is None:
-            raise RuntimeError(f"container {instance_name} not found after launch")
-        # Docker inspect returns the image ID in .Image.
-        actual = info.get("Image", "")
-        if actual and actual != self.profile.image_digest:
-            raise RuntimeError(
-                f"container image mismatch after launch: expected "
-                f"{self.profile.image_digest}, got {actual}"
-            )
-        return actual
-
     # ------------------------------------------------------------------
-    # Original execute() API (now wraps the durable lifecycle)
+    # §1: Explicit launch + collect API (production path)
     # ------------------------------------------------------------------
 
-    async def execute(
-        self,
+    async def launch_instance(
+        self, *, instance_name: str, image_digest: str,
         command: TrustedVerificationCommand,
-        workspace: DisposableVerificationWorkspace,
-        *,
-        cancellation: asyncio.Event | None = None,
-        sandbox_instance_id: str = "",
-        verification_run_id: str = "",
-        step_run_id: str = "",
-        boot_id: str = "",
-    ) -> SandboxStepResult:
-        """Execute one command in a disposable Docker container.
+        workspace_root: Path, labels: dict[str, str],
+        expected_manifest_digest: str,
+    ) -> tuple[str, ContainerAttestation, asyncio.subprocess.Process, Any, Any]:
+        """Batch 3.1.2 §1: create + inspect_and_attest + start + attach.
 
-        Batch 3.1.1 §1: now accepts sandbox_instance_id / run_id / step_id /
-        boot_id for durable instance tracking.  When these are provided,
-        the container is labeled with unforgeable Khaos labels.
+        Returns ``(container_id, attestation, attach_proc, stdout_stream,
+        stderr_stream)``.  The caller MUST persist ``container_id`` and
+        ``attestation`` BEFORE calling :meth:`collect_result`, so that a
+        crash between launch and collect leaves a durable trail.
+
+        No project code runs during ``docker create``.  ``docker start``
+        begins the entrypoint, but the caller persists RUNNING before
+        awaiting output via :meth:`collect_result`.
         """
         normalized = command.normalized()
         if normalized.command_digest != command.command_digest:
             raise PermissionError("trusted command digest mismatch")
         if command.sandbox_profile_id != self.profile.profile_id:
             raise PermissionError("sandbox profile mismatch")
-        name = self.generate_instance_name()
-        labels = self.build_labels(
-            run_id=verification_run_id, step_id=step_run_id,
-            instance_id=sandbox_instance_id or name, boot_id=boot_id,
-            manifest_digest=getattr(workspace, "manifest_digest", ""),
+        # 1. docker create --pull=never (no project code runs)
+        container_id = await self.create_instance(
+            instance_name=instance_name, image_digest=image_digest,
+            command=command, workspace_root=workspace_root, labels=labels,
         )
-        started = time.monotonic()
-        process = await self.launch_instance(
-            instance_name=name, image_digest=self.profile.image_digest,
-            command=command, workspace_root=workspace.root, labels=labels,
+        # 2. inspect and attest (before start — no project code has run)
+        attestation = await self.inspect_and_attest_instance(
+            container_id_or_name=container_id, expected_labels=labels,
+            expected_image_digest=image_digest,
+            expected_manifest_digest=expected_manifest_digest,
         )
-        stdout_task = asyncio.create_task(self._read_bounded(process.stdout, command.output_limit_bytes))
-        stderr_task = asyncio.create_task(self._read_bounded(process.stderr, command.output_limit_bytes))
-        wait_task = asyncio.create_task(process.wait())
+        # 3. docker start
+        await self.start_instance(container_id)
+        # 4. docker attach to capture output
+        attach_proc, stdout_stream, stderr_stream = await self.attach_instance(container_id)
+        return container_id, attestation, attach_proc, stdout_stream, stderr_stream
+
+    async def collect_result(
+        self, *, container_id: str,
+        attach_proc: asyncio.subprocess.Process,
+        stdout_stream: Any, stderr_stream: Any,
+        command: TrustedVerificationCommand,
+        cancellation: asyncio.Event | None,
+        started: float, sandbox_instance_id: str,
+        attestation_digest: str,
+    ) -> SandboxStepResult:
+        """Batch 3.1.2 §1: wait for completion, read streams, terminate, remove.
+
+        Called AFTER the caller has persisted ``container_id`` and
+        ``attestation_digest``.  Handles timeout, cancellation, stream
+        reading, container termination and removal.
+        """
+        stdout_task = asyncio.create_task(
+            self._read_bounded(stdout_stream, command.output_limit_bytes),
+        )
+        stderr_task = asyncio.create_task(
+            self._read_bounded(stderr_stream, command.output_limit_bytes),
+        )
+        wait_task = asyncio.create_task(self.wait_instance(container_id))
         cancel_task = asyncio.create_task(cancellation.wait()) if cancellation else None
         timed_out = False
         cancelled = False
@@ -353,43 +573,71 @@ class DockerVerificationSandboxBackend:
             if wait_task not in done:
                 timed_out = cancel_task not in done
                 cancelled = cancel_task in done
-                await self._terminate_container(name, process)
-            await wait_task
+                await self.terminate_instance(container_id)
+            exit_code = await wait_task
         finally:
             if cancel_task:
                 cancel_task.cancel()
+            try:
+                attach_proc.kill()
+            except ProcessLookupError:
+                pass
         stdout, stdout_truncated = await stdout_task
         stderr, stderr_truncated = await stderr_task
         stdout = self._redact(stdout)
         stderr = self._redact(stderr)
-        code = process.returncode
+        # docker rm -f (cleanup)
+        await self.remove_instance(container_id)
         return SandboxStepResult(
-            name, self.profile.image_digest,
-            None if code is not None and code < 0 else code,
-            -code if code is not None and code < 0 else None,
+            sandbox_instance_id, self.profile.image_digest,
+            None if exit_code is not None and exit_code < 0 else exit_code,
+            -exit_code if exit_code is not None and exit_code < 0 else None,
             int((time.monotonic() - started) * 1000), stdout, stderr,
             hashlib.sha256(stdout).hexdigest(), hashlib.sha256(stderr).hexdigest(),
             stdout_truncated or stderr_truncated, timed_out, cancelled,
+            container_id, attestation_digest,
         )
 
-    async def _terminate_container(self, name: str, process: asyncio.subprocess.Process) -> None:
-        killer = await asyncio.create_subprocess_exec(
-            str(self._docker), "kill", "--signal", "TERM", name,
-            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+    # ------------------------------------------------------------------
+    # Legacy execute() API — wraps launch_instance + collect_result for
+    # backward compatibility with tests.  Production code uses the
+    # explicit API so container_id is persisted before project code runs.
+    # ------------------------------------------------------------------
+
+    async def execute(
+        self,
+        command: TrustedVerificationCommand,
+        workspace: DisposableVerificationWorkspace,
+        *,
+        cancellation: asyncio.Event | None = None,
+        sandbox_instance_id: str = "",
+        verification_run_id: str = "",
+        step_run_id: str = "",
+        boot_id: str = "",
+        instance_name: str = "",
+    ) -> SandboxStepResult:
+        """Backward-compatible wrapper: launch_instance + collect_result."""
+        name = instance_name or self.generate_instance_name()
+        labels = self.build_labels(
+            run_id=verification_run_id, step_id=step_run_id,
+            instance_id=sandbox_instance_id or name, boot_id=boot_id,
+            manifest_digest=getattr(workspace, "manifest_digest", ""),
         )
-        await killer.wait()
-        try:
-            await asyncio.wait_for(process.wait(), timeout=self._grace)
-        except asyncio.TimeoutError:
-            killer = await asyncio.create_subprocess_exec(
-                str(self._docker), "kill", "--signal", "KILL", name,
-                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        started = time.monotonic()
+        container_id, attestation, attach_proc, stdout_stream, stderr_stream = (
+            await self.launch_instance(
+                instance_name=name, image_digest=self.profile.image_digest,
+                command=command, workspace_root=workspace.root, labels=labels,
+                expected_manifest_digest=getattr(workspace, "manifest_digest", ""),
             )
-            await killer.wait()
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+        )
+        return await self.collect_result(
+            container_id=container_id, attach_proc=attach_proc,
+            stdout_stream=stdout_stream, stderr_stream=stderr_stream,
+            command=command, cancellation=cancellation,
+            started=started, sandbox_instance_id=sandbox_instance_id or name,
+            attestation_digest=attestation.attestation_digest,
+        )
 
     async def _read_bounded(
         self, stream: asyncio.StreamReader | None, limit: int,

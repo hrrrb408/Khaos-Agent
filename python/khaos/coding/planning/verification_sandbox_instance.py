@@ -1,4 +1,4 @@
-"""Batch 3.1.1 §1: Durable sandbox instance lifecycle records.
+"""Batch 3.1.1 §1 / Batch 3.1.2 §1: Durable sandbox instance lifecycle records.
 
 A ``VerificationSandboxInstance`` is an immutable persistence record that
 tracks a Docker container from PREPARED through TERMINATED.  The record
@@ -24,6 +24,7 @@ class SandboxInstanceState(str, enum.Enum):
     TERMINATED = "terminated"
     CLEANUP_FAILED = "cleanup-failed"
     ORPHANED = "orphaned"
+    ORPHANED_CLEANED = "orphaned-cleaned"
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class VerificationSandboxInstance:
     image_reference: str
     expected_image_digest: str
     actual_image_digest: str = ""
+    actual_container_image_id: str = ""
     workspace_manifest_digest: str = ""
     container_id: str = ""
     state: SandboxInstanceState = SandboxInstanceState.PREPARED

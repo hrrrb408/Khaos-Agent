@@ -187,10 +187,10 @@ class TrustedVerificationRunner:
                     break
                 self._store.mark_step_running(step.step_run_id)
                 started = time.time()
-                # Batch 3.1.1 §1: persist a PREPARED sandbox instance BEFORE
+                # §1 steps 1-2: persist PREPARED sandbox instance BEFORE
                 # creating the container, so a crash leaves a durable trail.
                 sandbox_instance_id = f"vsi_{secrets.token_hex(12)}"
-                instance_name = getattr(self._backend, "generate_instance_name", lambda: f"khaos-verify-{secrets.token_hex(12)}")()
+                instance_name = self._backend.generate_instance_name()
                 instance = VerificationSandboxInstance(
                     sandbox_instance_id=sandbox_instance_id,
                     verification_run_id=run.verification_run_id,
@@ -205,23 +205,24 @@ class TrustedVerificationRunner:
                     state=SandboxInstanceState.PREPARED,
                 )
                 self._store.create_sandbox_instance(instance)
-                self._store.update_sandbox_instance(
-                    sandbox_instance_id, state=SandboxInstanceState.STARTING,
+                # §1 steps 3-5: docker create + inspect_and_attest + start + attach.
+                # No project code runs during create.  Start begins the
+                # entrypoint; we persist RUNNING before awaiting output.
+                labels = self._backend.build_labels(
+                    run_id=run.verification_run_id, step_id=step.step_run_id,
+                    instance_id=sandbox_instance_id, boot_id=self._boot.boot_id,
+                    manifest_digest=disposable.manifest_digest,
                 )
+                started_monotonic = time.monotonic()
                 try:
-                    result = await self._backend.execute(
-                        command, disposable, cancellation=cancellation,
-                        sandbox_instance_id=sandbox_instance_id,
-                        verification_run_id=run.verification_run_id,
-                        step_run_id=step.step_run_id,
-                        boot_id=self._boot.boot_id,
-                    )
-                    # Batch 3.1.1 §1: persist actual container ID + state.
-                    self._store.update_sandbox_instance(
-                        sandbox_instance_id,
-                        state=SandboxInstanceState.RUNNING,
-                        container_id=result.sandbox_instance_id,
-                        started_at=time.time(),
+                    container_id, attestation, attach_proc, stdout_stream, stderr_stream = (
+                        await self._backend.launch_instance(
+                            instance_name=instance_name,
+                            image_digest=self._profile.image_digest,
+                            command=command, workspace_root=disposable.root,
+                            labels=labels,
+                            expected_manifest_digest=disposable.manifest_digest,
+                        )
                     )
                 except Exception:
                     # Backend launch failed — abort step+run atomically.
@@ -237,13 +238,55 @@ class TrustedVerificationRunner:
                         failure_code="backend-launch-failed",
                     )
                     raise
-                # Batch 3.1.1 §1: mark instance TERMINATED after execute returns.
+                # §1 step 6: persist container_id, actual image, STARTING
+                # BEFORE project code output is collected.  This is the
+                # critical durability point: container identity is durable
+                # before any project code runs.
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.STARTING,
+                    container_id=container_id,
+                    actual_container_image_id=attestation.container_image_id,
+                    actual_image_digest=attestation.local_image_id,
+                )
+                # §1 steps 7-8: docker start already done in launch_instance;
+                # immediately persist RUNNING.
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.RUNNING,
+                    started_at=time.time(),
+                )
+                # §1 steps 9-11: wait for output or cancellation, then
+                # terminate and remove.
+                try:
+                    result = await self._backend.collect_result(
+                        container_id=container_id, attach_proc=attach_proc,
+                        stdout_stream=stdout_stream, stderr_stream=stderr_stream,
+                        command=command, cancellation=cancellation,
+                        started=started_monotonic,
+                        sandbox_instance_id=sandbox_instance_id,
+                        attestation_digest=attestation.attestation_digest,
+                    )
+                except Exception:
+                    self._store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.TERMINATED,
+                        terminated_at=time.time(),
+                        failure_code="backend-collect-failed",
+                    )
+                    self._store.abort_step_and_run(
+                        step.step_run_id,
+                        verification_run_id=run.verification_run_id,
+                        failure_code="backend-collect-failed",
+                    )
+                    raise
+                # §1 step 12: confirm container removed, persist TERMINATED.
                 self._store.update_sandbox_instance(
                     sandbox_instance_id,
                     state=SandboxInstanceState.TERMINATED,
                     terminated_at=time.time(),
                 )
-                # Batch 3.1.1 §3: write artifact with RESERVED→SEALED protocol.
+                # §3: write artifact with RESERVED→SEALED protocol.
                 try:
                     artifact_id = self._write_artifact(
                         run.verification_run_id, result.stdout, result.stderr,
@@ -277,28 +320,27 @@ class TrustedVerificationRunner:
                     duration_ms=result.duration_ms, stdout_digest=result.stdout_digest,
                     stderr_digest=result.stderr_digest, output_artifact_id=artifact_id,
                     output_truncated=result.output_truncated,
-                    sandbox_instance_id=result.sandbox_instance_id,
+                    sandbox_instance_id=sandbox_instance_id,
                     sandbox_image_digest=result.image_digest, failure_code=failure_code,
                 )
-                # Batch 3.1.1 §3: atomic step+run+execution terminal transition.
+                # §9: atomic step+run+execution terminal transition.
+                # Cancellation uses cancel_step_and_run (not the prohibited
+                # finish_step() → transition_run() split).
                 if step_status == VerificationStepStatus.PASSED and terminal == VerificationRunStatus.PASSED:
                     # Non-terminal step pass — use legacy finish_step.
                     self._store.finish_step(finished)
+                elif step_status == VerificationStepStatus.TIMED_OUT:
+                    self._store.timeout_step_and_run(finished)
+                elif step_status == VerificationStepStatus.FAILED:
+                    self._store.fail_step_and_run(finished, run_failure_code=failure_code)
                 else:
-                    # Terminal step — use atomic fail/timeout/abort.
-                    if step_status == VerificationStepStatus.TIMED_OUT:
-                        self._store.timeout_step_and_run(finished)
-                    elif step_status == VerificationStepStatus.FAILED:
-                        self._store.fail_step_and_run(finished, run_failure_code=failure_code)
-                    else:
-                        # Cancelled — transition run to CANCELLED.
-                        self._store.finish_step(finished)
-                        self._store.transition_run(
-                            run.verification_run_id,
-                            expected=(VerificationRunStatus.RUNNING,),
-                            target=VerificationRunStatus.CANCELLED,
-                            failure_code="cancelled",
-                        )
+                    # Cancelled — atomic cancel_step_and_run with full step (§9).
+                    self._store.cancel_step_and_run(
+                        step.step_run_id,
+                        verification_run_id=run.verification_run_id,
+                        failure_code="cancelled",
+                        step=finished,
+                    )
                 completed.append(finished)
                 if terminal != VerificationRunStatus.PASSED:
                     break

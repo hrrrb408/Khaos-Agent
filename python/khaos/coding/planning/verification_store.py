@@ -72,6 +72,7 @@ CREATE TABLE IF NOT EXISTS verification_sandbox_instances (
  image_reference TEXT NOT NULL,
  expected_image_digest TEXT NOT NULL,
  actual_image_digest TEXT NOT NULL DEFAULT '',
+ actual_container_image_id TEXT NOT NULL DEFAULT '',
  workspace_manifest_digest TEXT NOT NULL DEFAULT '',
  container_id TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL DEFAULT 'prepared',
@@ -432,12 +433,13 @@ class VerificationExecutionStore:
         try:
             self._conn.execute(
                 "INSERT INTO verification_sandbox_instances VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (instance.sandbox_instance_id, instance.verification_run_id,
                  instance.step_run_id, instance.backend_id,
                  instance.backend_instance_name, instance.runtime_epoch,
                  instance.boot_id, instance.image_reference,
                  instance.expected_image_digest, instance.actual_image_digest,
+                 instance.actual_container_image_id,
                  instance.workspace_manifest_digest, instance.container_id,
                  instance.state.value, instance.created_at, instance.started_at,
                  instance.terminated_at, instance.cleanup_status,
@@ -454,6 +456,7 @@ class VerificationExecutionStore:
         state: SandboxInstanceState | None = None,
         container_id: str | None = None,
         actual_image_digest: str | None = None,
+        actual_container_image_id: str | None = None,
         started_at: float | None = None,
         terminated_at: float | None = None,
         cleanup_status: str | None = None,
@@ -471,6 +474,9 @@ class VerificationExecutionStore:
         if actual_image_digest is not None:
             sets.append("actual_image_digest=?")
             params.append(actual_image_digest)
+        if actual_container_image_id is not None:
+            sets.append("actual_container_image_id=?")
+            params.append(actual_container_image_id)
         if started_at is not None:
             sets.append("started_at=?")
             params.append(started_at)
@@ -575,6 +581,7 @@ class VerificationExecutionStore:
             image_reference=row["image_reference"],
             expected_image_digest=row["expected_image_digest"],
             actual_image_digest=row["actual_image_digest"],
+            actual_container_image_id=row["actual_container_image_id"],
             workspace_manifest_digest=row["workspace_manifest_digest"],
             container_id=row["container_id"],
             state=SandboxInstanceState(row["state"]),
@@ -723,10 +730,214 @@ class VerificationExecutionStore:
             "FROM plan_verification_runs r "
             "JOIN plan_verification_steps s ON s.verification_run_id = r.verification_run_id "
             "WHERE r.status IN ('passed','failed','errored','timed-out','cancelled','stale','poisoned') "
-            "AND s.status = 'running' "
+            "AND s.status IN ('created','running') "
             "GROUP BY r.verification_run_id",
         ).fetchall()
         return len(rows)
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.2 §9: Additional atomic terminal transitions
+    # ------------------------------------------------------------------
+
+    def cancel_step_and_run(
+        self, step_run_id: str, *, verification_run_id: str,
+        failure_code: str = "cancelled",
+        step: VerificationStepRun | None = None,
+    ) -> None:
+        """Batch 3.1.2 §9: Step CANCELLED + Run CANCELLED + Execution cancelled — single transaction.
+
+        If ``step`` is provided, all step execution details (exit_code,
+        signal, duration, digests) are persisted atomically with the
+        terminal transition.  Otherwise only status + failure_code are set.
+        """
+        if step is not None:
+            self._finish_step_and_run_impl(
+                step, run_target=VerificationRunStatus.CANCELLED,
+                execution_target="cancelled",
+                run_failure_code=failure_code,
+            )
+            return
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_verification_steps SET status='cancelled',completed_at=?,"
+                "failure_code=? WHERE step_run_id=? AND status IN ('created','running')",
+                (now, failure_code, step_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification step cancel CAS failed")
+            run_row = self._conn.execute(
+                "SELECT execution_run_id FROM plan_verification_runs WHERE verification_run_id=?",
+                (verification_run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeError("verification run not found in cancel_step_and_run")
+            cur = self._conn.execute(
+                "UPDATE plan_verification_runs SET status='cancelled',updated_at=?,completed_at=?,"
+                "failure_code=? WHERE verification_run_id=? AND status='running'",
+                (now, now, failure_code, verification_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification run cancel CAS failed")
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET status='cancelled',updated_at=?,"
+                "completed_at=?,failure_code=? WHERE execution_run_id=? AND status='verifying'",
+                (now, now, failure_code, run_row[0]),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("execution run cancel CAS failed")
+            self._audit(verification_run_id, "step-and-run-cancelled",
+                        "cancelled", failure_code, step_run_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def poison_step_and_run(
+        self, step_run_id: str, *, verification_run_id: str,
+        failure_code: str = "poisoned",
+    ) -> None:
+        """Batch 3.1.2 §9: Step ERRORED + Run POISONED + Execution poisoned — single transaction."""
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_verification_steps SET status='errored',completed_at=?,"
+                "failure_code=? WHERE step_run_id=? AND status IN ('created','running')",
+                (now, failure_code, step_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification step poison CAS failed")
+            run_row = self._conn.execute(
+                "SELECT execution_run_id FROM plan_verification_runs WHERE verification_run_id=?",
+                (verification_run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeError("verification run not found in poison_step_and_run")
+            cur = self._conn.execute(
+                "UPDATE plan_verification_runs SET status='poisoned',updated_at=?,completed_at=?,"
+                "failure_code=? WHERE verification_run_id=? AND status='running'",
+                (now, now, failure_code, verification_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification run poison CAS failed")
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET status='poisoned',updated_at=?,"
+                "completed_at=?,failure_code=? WHERE execution_run_id=? AND status='verifying'",
+                (now, now, failure_code, run_row[0]),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("execution run poison CAS failed")
+            self._audit(verification_run_id, "step-and-run-poisoned",
+                        "poisoned", failure_code, step_run_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def cleanup_fail_step_and_run(
+        self, step_run_id: str, *, verification_run_id: str,
+        failure_code: str = "cleanup-failed",
+    ) -> None:
+        """Batch 3.1.2 §9: Step ERRORED + Run ERRORED + Execution verification-error — single transaction.
+
+        Used when disposable workspace cleanup fails.  The run must NOT
+        be marked PASSED even if all steps passed.
+        """
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_verification_steps SET status='errored',completed_at=?,"
+                "failure_code=? WHERE step_run_id=? AND status IN ('created','running','passed')",
+                (now, failure_code, step_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification step cleanup-fail CAS failed")
+            run_row = self._conn.execute(
+                "SELECT execution_run_id FROM plan_verification_runs WHERE verification_run_id=?",
+                (verification_run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeError("verification run not found in cleanup_fail_step_and_run")
+            cur = self._conn.execute(
+                "UPDATE plan_verification_runs SET status='errored',updated_at=?,completed_at=?,"
+                "failure_code=? WHERE verification_run_id=? AND status IN ('running','passed')",
+                (now, now, failure_code, verification_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification run cleanup-fail CAS failed")
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET status='verification-error',updated_at=?,"
+                "completed_at=?,failure_code=? WHERE execution_run_id=? AND status='verifying'",
+                (now, now, failure_code, run_row[0]),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("execution run cleanup-fail CAS failed")
+            self._audit(verification_run_id, "step-and-run-cleanup-failed",
+                        "errored", failure_code, step_run_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.2 §3: Atomic crash terminalization with sandbox instance
+    # ------------------------------------------------------------------
+
+    def reconcile_sandbox_instance_atomic(
+        self, *, sandbox_instance_id: str, step_run_id: str,
+        verification_run_id: str, execution_run_id: str,
+        instance_state: SandboxInstanceState, failure_code: str,
+    ) -> None:
+        """Batch 3.1.2 §3: single BEGIN IMMEDIATE for crash terminalization.
+
+        After residual instance cleanup succeeds:
+        - Instance → TERMINATED/ORPHANED_CLEANED
+        - Step → ABORTED
+        - Verification Run → ERRORED
+        - Execution Run → VERIFICATION_ERROR
+        - Audit
+        - COMMIT
+        """
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE verification_sandbox_instances SET state=?,terminated_at=?,"
+                "failure_code=? WHERE sandbox_instance_id=?",
+                (instance_state.value, now, failure_code, sandbox_instance_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("sandbox instance reconcile CAS failed")
+            cur = self._conn.execute(
+                "UPDATE plan_verification_steps SET status='aborted',completed_at=?,"
+                "failure_code=? WHERE step_run_id=? AND status IN ('created','running')",
+                (now, failure_code, step_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification step reconcile CAS failed")
+            cur = self._conn.execute(
+                "UPDATE plan_verification_runs SET status='errored',updated_at=?,completed_at=?,"
+                "failure_code=? WHERE verification_run_id=? AND status IN ('running','preparing-sandbox')",
+                (now, now, failure_code, verification_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification run reconcile CAS failed")
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET status='verification-error',updated_at=?,"
+                "completed_at=?,failure_code=? WHERE execution_run_id=? AND status='verifying'",
+                (now, now, failure_code, execution_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("execution run reconcile CAS failed")
+            self._audit(verification_run_id, "crash-reconciled",
+                        instance_state.value, failure_code, sandbox_instance_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # Batch 3.1.1 §3: Artifact RESERVED→SEALED protocol
