@@ -50,4 +50,5 @@ testpaths = ["python/tests"]
 markers = [
     "tree_sitter_real: requires locked Tree-sitter optional dependencies",
     "lsp_real: requires a trusted pre-installed Language Server (never downloaded at test time)",
+    "production_sandbox_real: requires a supported production sandbox daemon and pinned image",
 ]
