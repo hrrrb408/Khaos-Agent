@@ -5,6 +5,9 @@ import enum
 import logging
 import secrets
 import threading
+import time
+import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -128,6 +131,10 @@ class ApprovalRuntime:
         self.service=None; self.gate=None; self.boot_context=None; self.ready=False
         self._state = RuntimeState.UNINITIALIZED
         self._runtime_authority_id: str | None = None
+        self._verification_contexts: dict[str, Any] = {}
+        self._verification_cancel_events: dict[str, Any] = {}
+        self._verification_runner: Any = None
+        self._verification_store: Any = None
 
     @property
     def state(self) -> RuntimeState:
@@ -333,6 +340,95 @@ class ApprovalRuntime:
         self.require_ready()
         return self.guard.planned_workspace_edit(context, bundle=bundle)
 
+    def configure_trusted_verification(
+        self, *, backend: Any, command_factory: Any, workspace_factory: Any,
+        artifact_root: Any, profile: Any,
+    ) -> None:
+        """Install the production-only trusted verifier after Runtime startup."""
+        self.require_ready()
+        from khaos.coding.planning.trusted_verification_runner import TrustedVerificationRunner
+        from khaos.coding.planning.verification_store import VerificationExecutionStore
+        self._verification_store = VerificationExecutionStore(self._store)
+        self._verification_runner = TrustedVerificationRunner(
+            approval_store=self._store, plan_repository=self._plan_repository,
+            workspace_manager=self._workspace_manager,
+            context_provider=self._context_provider, backend=backend,
+            command_factory=command_factory, workspace_factory=workspace_factory,
+            artifact_root=artifact_root, profile=profile,
+            runtime_boot=self.boot_context,
+            context_registry=self._verification_contexts,
+            mutation_fence=self._mutation_fence,
+        )
+        self.guard.set_verification_runner(self._verification_runner)
+
+    @asynccontextmanager
+    async def acquire_verification_context(
+        self, *, execution_run_id: str, owner_execution_id: str = "verify_default",
+        ttl_seconds: float = 900.0,
+    ):
+        """Mint one boot-scoped verification continuation lease under the fence."""
+        self.require_ready()
+        if self._verification_store is None:
+            raise PermissionError("trusted verification is not configured")
+        run = self._store.get_execution_run(execution_run_id)
+        if run is None:
+            raise KeyError(execution_run_id)
+        attestation = self._store.get_final_mutation_attestation(execution_run_id)
+        if attestation is None:
+            raise PermissionError("verification continuation requires final attestation")
+        pending_owner = f"verification-pending:{execution_run_id}"
+        async with self._mutation_fence.use(run.workspace_id, owner=pending_owner):
+            self.require_ready()
+            lease_id = self._verification_store.acquire_phase_lease(
+                execution_run_id=execution_run_id, owner_execution_id=owner_execution_id,
+                task_id=run.task_id, workspace_id=run.workspace_id,
+                repository_id=run.repository_id, plan_id=run.plan_id,
+                bundle_digest=run.edit_bundle_digest,
+                attestation_digest=attestation.attestation_digest,
+                binding_digest=run.binding_digest,
+                server_epoch=self.boot_context.server_epoch,
+                boot_id=self.boot_context.boot_id,
+                expiry=time.time() + ttl_seconds,
+            )
+            self._mutation_fence.transfer_owner(
+                run.workspace_id, f"verification-lease:{lease_id}",
+            )
+            from khaos.coding.planning.verification_execution_models import VerificationPhaseContext
+            context = VerificationPhaseContext(
+                verification_context_id=f"vctx_{uuid.uuid4().hex}",
+                phase_lease_id=lease_id, execution_run_id=execution_run_id,
+                plan_id=run.plan_id, task_id=run.task_id,
+                workspace_id=run.workspace_id, repository_id=run.repository_id,
+                bundle_digest=run.edit_bundle_digest,
+                attestation_digest=attestation.attestation_digest,
+                binding_digest=run.binding_digest,
+                owner_execution_id=owner_execution_id,
+                server_epoch=self.boot_context.server_epoch,
+                boot_id=self.boot_context.boot_id, expiry=time.time() + ttl_seconds,
+            )
+            self._verification_contexts[context.verification_context_id] = context
+            try:
+                yield context
+            finally:
+                self._verification_contexts.pop(context.verification_context_id, None)
+                self._verification_store.release_phase_lease(lease_id)
+
+    async def run_trusted_verification(
+        self, *, context: Any, cancellation: Any = None,
+    ) -> Any:
+        self.require_ready()
+        import asyncio
+        event = cancellation or asyncio.Event()
+        self._verification_cancel_events[context.verification_context_id] = event
+        try:
+            return await self.guard.trusted_verification_execution(
+                context, cancellation=event,
+            )
+        finally:
+            self._verification_cancel_events.pop(
+                context.verification_context_id, None,
+            )
+
     def require_active_lease(self, *args: Any, **kwargs: Any):
         self.require_ready(); return self.gate.require_active_lease(*args, **kwargs)
 
@@ -360,10 +456,16 @@ class ApprovalRuntime:
         can be minted under this boot. Persisted public keys remain usable.
         """
         if self.ready:
+            for event in tuple(self._verification_cancel_events.values()):
+                event.set()
             # Cancel all ACTIVE leases for this boot before rotating the epoch.
             self._store.invalidate_active_execution_scope(
                 boot_id=self.boot_context.boot_id, reason="runtime-shutdown",
             )
+            if self._verification_store is not None:
+                self._verification_store.invalidate_phase_leases(
+                    boot_id=self.boot_context.boot_id,
+                )
             self._store.rotate_epoch()
             # Clear runtime writer bindings; public verifiers are durable.
             try:

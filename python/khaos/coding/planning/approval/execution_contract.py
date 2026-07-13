@@ -88,6 +88,7 @@ class PlannedExecutionGuard:
         # "lease:{ctx.lease_id}" before proceeding.
         self._mutation_fence: Any = None
         self._mutation_engine: Any = None
+        self._verification_runner: Any = None
         self.__mutation_call_authority: object | None = None
 
     def set_mutation_fence(self, fence: Any) -> None:
@@ -98,6 +99,18 @@ class PlannedExecutionGuard:
         """Runtime-only wiring for the capability-constructed mutation engine."""
         self._mutation_engine = engine
         self.__mutation_call_authority = call_authority
+
+    def set_verification_runner(self, runner: Any) -> None:
+        """Runtime-only wiring for the dedicated trusted verifier."""
+        self._verification_runner = runner
+
+    async def trusted_verification_execution(
+        self, ctx: Any, *, cancellation: Any = None,
+    ) -> Any:
+        """Run only a server-issued verification phase context."""
+        if self._verification_runner is None:
+            raise PermissionError("trusted verification runner is not configured")
+        return await self._verification_runner.run(ctx, cancellation=cancellation)
 
     def require_active_execution_context(self, ctx: AuthorizedExecutionContext) -> None:
         """Validate the opaque server-issued capability and its live lease.
