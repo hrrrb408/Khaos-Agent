@@ -184,21 +184,49 @@ class TrustedVerificationRunner:
     def _reconcile_disposable_workspaces(self) -> None:
         """Reconcile non-terminal disposable workspaces from previous boots.
 
+        Batch 3.1.3 §6: handles PREPARED rows (crash during copy) by
+        using the PREPARED row to locate and safely clean up the partial
+        directory.  PREPARED rows have an empty manifest — the directory
+        may contain partially-copied files that are not in any manifest.
+
         For each active workspace:
         - Reconstruct root_path from factory root + instance_id.
         - If root_path no longer exists → mark CLEANED (already gone).
-        - If root_path exists → attempt destroy:
-          - Success → mark CLEANED.
+        - If root_path exists:
+          - PREPARED state → force-remove the partial directory (the
+            PREPARED row proves we own this directory).
+          - SEALED/MOUNTED state → attempt destroy with manifest.
           - Failure → mark CLEANUP_FAILED + poison workspace scope.
         """
         from khaos.coding.planning.trusted_verification import (
             DisposableVerificationWorkspace, ManifestEntry,
         )
+        import shutil as _shutil
         factory_root = self._workspace_factory._root
         for record in self._store.list_active_disposable_workspaces():
             root = factory_root / record.instance_id
             if not root.exists():
                 self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+                continue
+            # Batch 3.1.3 §6: PREPARED rows have an empty manifest.
+            # The directory was partially created — we own it (the row
+            # proves it) and can force-remove it safely.
+            if record.state == DisposableWorkspaceState.PREPARED:
+                try:
+                    _shutil.rmtree(root)
+                    self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+                except Exception:
+                    self._store.mark_disposable_workspace_cleanup_failed(
+                        record.workspace_id, failure_code="prepared-cleanup-failed",
+                    )
+                    try:
+                        self._approval_store.add_workspace_poison_scope(
+                            record.verification_run_id,
+                            owner=f"verification-cleanup:{record.workspace_id}",
+                            reason="disposable-workspace-cleanup-failed",
+                        )
+                    except Exception:
+                        pass
                 continue
             # Reconstruct the workspace object from the persisted record.
             try:
@@ -324,6 +352,25 @@ class TrustedVerificationRunner:
                 run.verification_run_id, expected=(VerificationRunStatus.VALIDATING,),
                 target=VerificationRunStatus.PREPARING_SANDBOX,
             )
+            # Batch 3.1.3 §6: persist PREPARED row BEFORE filesystem creation.
+            # The workspace_id and instance_id are generated here so the DB
+            # row exists before any directory is created.  If a crash occurs
+            # during mkdir/copy/seal, reconciliation can use the PREPARED row
+            # to find and safely clean up the partial directory.
+            workspace_id = f"dvw_{uuid.uuid4().hex}"
+            instance_id = f"verify_{secrets.token_hex(16)}"
+            self._store.create_disposable_workspace(DisposableWorkspaceRecord(
+                workspace_id=workspace_id,
+                verification_run_id=run.verification_run_id,
+                step_run_id="",
+                instance_id=instance_id,
+                manifest_digest="",  # filled after copy
+                manifest_json="[]",  # filled after copy
+                allowed_generated_output=_DEFAULT_ALLOWED_GENERATED_OUTPUT,
+                state=DisposableWorkspaceState.PREPARED,
+                boot_id=self._boot.boot_id,
+                created_at=time.time(),
+            ))
             disposable = self._workspace_factory.create(
                 workspace.worktree_path,
                 forbidden_roots=(workspace.repository_root, workspace.worktree_path,
@@ -332,29 +379,17 @@ class TrustedVerificationRunner:
                                  if getattr(self._approval_store, "_db_path", None)
                                  else workspace.repository_root),
                 allowed_generated_output=_DEFAULT_ALLOWED_GENERATED_OUTPUT,
+                instance_id=instance_id,
             )
-            # Batch 3.1.2 §8: persist disposable workspace row for crash recovery.
-            workspace_id = f"dvw_{uuid.uuid4().hex}"
+            # Batch 3.1.3 §6: update the PREPARED row with the sealed manifest.
             manifest_json = json.dumps(
                 [entry.__dict__ for entry in disposable.manifest],
                 sort_keys=True, separators=(",", ":"),
             )
-            self._store.create_disposable_workspace(DisposableWorkspaceRecord(
-                workspace_id=workspace_id,
-                verification_run_id=run.verification_run_id,
-                step_run_id="",
-                instance_id=disposable.instance_id,
+            self._store.seal_disposable_workspace(
+                workspace_id,
                 manifest_digest=disposable.manifest_digest,
                 manifest_json=manifest_json,
-                allowed_generated_output=disposable.allowed_generated_output,
-                state=DisposableWorkspaceState.PREPARED,
-                boot_id=self._boot.boot_id,
-                created_at=time.time(),
-            ))
-            self._store.transition_disposable_workspace(
-                workspace_id,
-                expected=(DisposableWorkspaceState.PREPARED,),
-                target=DisposableWorkspaceState.SEALED,
             )
             self._store.transition_disposable_workspace(
                 workspace_id,

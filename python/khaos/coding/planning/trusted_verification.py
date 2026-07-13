@@ -486,13 +486,24 @@ class VerificationWorkspaceFactory:
         *,
         forbidden_roots: Iterable[Path],
         allowed_generated_output: Iterable[str] = (),
+        instance_id: str = "",
     ) -> DisposableVerificationWorkspace:
+        """Batch 3.1.3 §6: persist PREPARED row before filesystem creation.
+
+        The caller generates the workspace ID and instance_id, persists a
+        PREPARED row, then calls this method.  If a crash occurs during
+        mkdir/copy/seal, the reconciliation can use the PREPARED row to
+        find and safely clean up the partial directory.
+        """
         source = source.resolve(strict=True)
         forbidden = tuple(path.resolve() for path in forbidden_roots)
         if any(self._root == path or self._root in path.parents or path in self._root.parents for path in forbidden):
             raise PermissionError("verification root overlaps a protected root")
         self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        instance_id = f"verify_{secrets.token_hex(16)}"
+        # Batch 3.1.3 §6: use caller-provided instance_id so the PREPARED
+        # row can be persisted before the filesystem is created.
+        if not instance_id:
+            instance_id = f"verify_{secrets.token_hex(16)}"
         destination = self._root / instance_id
         destination.mkdir(mode=0o700)
         entries: list[ManifestEntry] = []
@@ -517,10 +528,14 @@ class VerificationWorkspaceFactory:
                         src_root_fd, dst_root_fd, source, destination,
                         entries, "",
                     )
+                    # Batch 3.1.3 §6: fsync the destination root after copy.
+                    os.fsync(dst_root_fd)
                 finally:
                     os.close(dst_root_fd)
             finally:
                 os.close(src_root_fd)
+            # Batch 3.1.3 §6: re-read target and verify hash/mode/type.
+            self._verify_copy_integrity(destination, entries)
             payload = [entry.__dict__ for entry in entries]
             manifest_digest = hashlib.sha256(json.dumps(
                 payload, sort_keys=True, separators=(",", ":"),
@@ -533,6 +548,44 @@ class VerificationWorkspaceFactory:
         except Exception:
             self._safe_destroy(destination)
             raise
+
+    @staticmethod
+    def _verify_copy_integrity(destination: Path, entries: list[ManifestEntry]) -> None:
+        """Batch 3.1.3 §6: re-read each target file and verify hash/mode/type.
+
+        After the recursive copy completes, re-open each destination file
+        and verify its content hash, mode, and type match the manifest
+        entry.  This catches silent corruption (short writes, disk errors).
+        """
+        for entry in entries:
+            target = destination / entry.path
+            try:
+                st = os.stat(target, follow_symlinks=False)
+            except OSError as exc:
+                raise PermissionError(
+                    f"verification target vanished after copy: {entry.path}"
+                ) from exc
+            if not stat.S_ISREG(st.st_mode):
+                raise PermissionError(
+                    f"verification target is not a regular file: {entry.path}"
+                )
+            if stat.S_IMODE(st.st_mode) != entry.mode:
+                raise PermissionError(
+                    f"verification target mode mismatch: {entry.path} "
+                    f"expected={entry.mode:o} actual={stat.S_IMODE(st.st_mode):o}"
+                )
+            # Re-read and verify content hash.
+            digest = hashlib.sha256()
+            with open(target, "rb") as f:
+                while True:
+                    chunk = f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            if digest.hexdigest() != entry.content_hash:
+                raise PermissionError(
+                    f"verification target content hash mismatch: {entry.path}"
+                )
 
     def _copy_tree(
         self, src_fd: int, dst_fd: int, src_root: Path, dst_root: Path,
@@ -590,6 +643,8 @@ class VerificationWorkspaceFactory:
                             child_src_fd, child_dst_fd, src_root, dst_root,
                             entries, child_prefix,
                         )
+                        # Batch 3.1.3 §6: fsync the directory after copy.
+                        os.fsync(child_dst_fd)
                     finally:
                         os.close(child_dst_fd)
                 elif stat.S_ISREG(st.st_mode):
@@ -679,7 +734,13 @@ class VerificationWorkspaceFactory:
                 chunk = os.read(src_fd, 1024 * 1024)
                 if not chunk:
                     break
-                os.write(dst_fd, chunk)
+                # Batch 3.1.3 §6: loop to handle short writes.
+                written = 0
+                while written < len(chunk):
+                    n = os.write(dst_fd, chunk[written:])
+                    if n == 0:
+                        raise OSError("short write returned 0 bytes")
+                    written += n
                 digest.update(chunk)
                 byte_length += len(chunk)
             os.fsync(dst_fd)

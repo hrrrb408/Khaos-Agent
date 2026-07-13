@@ -1289,6 +1289,36 @@ class VerificationExecutionStore:
             self._conn.rollback()
             raise
 
+    def seal_disposable_workspace(
+        self, workspace_id: str, *,
+        manifest_digest: str, manifest_json: str,
+    ) -> None:
+        """Batch 3.1.3 §6: seal the PREPARED row with the manifest.
+
+        Atomically updates the manifest fields and transitions
+        PREPARED → SEALED in a single BEGIN IMMEDIATE transaction.
+        This is called after the filesystem copy completes successfully.
+        """
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE disposable_verification_workspaces "
+                "SET manifest_digest=?, manifest_json=?, state='sealed', "
+                "sealed_at=? WHERE workspace_id=? AND state='prepared'",
+                (manifest_digest, manifest_json, now, workspace_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("seal_disposable_workspace CAS failed")
+            self._audit(
+                workspace_id, "disposable-workspace-sealed",
+                "sealed", "", workspace_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def get_disposable_workspace(
         self, workspace_id: str,
     ) -> DisposableWorkspaceRecord | None:
