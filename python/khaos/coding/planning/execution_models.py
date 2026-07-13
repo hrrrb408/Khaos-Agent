@@ -33,6 +33,18 @@ class PlannedEditOperation(str, Enum):
     RENAME = "rename"
 
 
+class DurableEditPhase(str, Enum):
+    """Persisted edit phases accepted by the mutation journal CAS."""
+
+    JOURNALED = "journaled"
+    MUTATION_STARTED = "mutation-started"
+    FILESYSTEM_APPLIED = "filesystem-applied"
+    DIRECTORY_SYNCED = "directory-synced"
+    APPLIED = "applied"
+    ROLLBACK_STARTED = "rollback-started"
+    ROLLED_BACK = "rolled-back"
+
+
 @dataclass(frozen=True)
 class PlanExecutionRun:
     execution_run_id: str
@@ -291,6 +303,28 @@ class InitialPathState:
 
 
 @dataclass(frozen=True)
+class InitialApprovedEdit:
+    """Canonical server-approved edit contract bound into the initial proof."""
+
+    edit_id: str
+    operation: PlannedEditOperation
+    path: str
+    destination_path: str | None
+    after_hash: str
+    after_mode: int | None
+
+    def canonical(self) -> dict[str, Any]:
+        return {
+            "edit_id": self.edit_id,
+            "operation": self.operation.value,
+            "path": self.path,
+            "destination_path": self.destination_path,
+            "after_hash": self.after_hash,
+            "after_mode": self.after_mode,
+        }
+
+
+@dataclass(frozen=True)
 class InitialWorkspaceAttestation:
     execution_run_id: str
     plan_id: str
@@ -310,18 +344,29 @@ class InitialWorkspaceAttestation:
     workspace_states: tuple[InitialPathState, ...]
     attested_at: float
     attestation_digest: str = ""
+    approved_edits: tuple[InitialApprovedEdit, ...] = ()
 
     def normalized(self) -> "InitialWorkspaceAttestation":
         states = tuple(sorted(self.declared_states, key=lambda item: item.path))
         workspace_states = tuple(sorted(self.workspace_states, key=lambda item: item.path))
-        payload = {**self.__dict__, "declared_states": [item.__dict__ for item in states],
-                   "workspace_states": [item.__dict__ for item in workspace_states],
-                   "attestation_digest": ""}
+        approved_edits = tuple(sorted(
+            self.approved_edits,
+            key=lambda item: (item.path, item.destination_path or "", item.edit_id),
+        ))
+        payload = {
+            **self.__dict__,
+            "declared_states": [item.__dict__ for item in states],
+            "workspace_states": [item.__dict__ for item in workspace_states],
+            "approved_edits": [item.canonical() for item in approved_edits],
+            "attestation_digest": "",
+        }
         digest = hashlib.sha256(json.dumps(
             payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
-        return replace(self, declared_states=states, workspace_states=workspace_states,
-                       attestation_digest=digest)
+        return replace(
+            self, declared_states=states, workspace_states=workspace_states,
+            approved_edits=approved_edits, attestation_digest=digest,
+        )
 
 
 @dataclass(frozen=True)
@@ -337,6 +382,7 @@ class ValidatedRecoveryEvent:
     after_mode: int | None
     artifact: SafeRecoveryArtifactName | None
     durable_phase: str
+    phase_version: int
 
     def __getitem__(self, key: str) -> Any:
         aliases = {

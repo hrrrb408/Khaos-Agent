@@ -262,6 +262,7 @@ CREATE TABLE IF NOT EXISTS plan_execution_runs (
     rollback_seal_digest TEXT NOT NULL DEFAULT '',
     terminal_tombstone_digest TEXT NOT NULL DEFAULT '',
     initial_attestation_digest TEXT NOT NULL DEFAULT '',
+    journaled_edit_count INTEGER NOT NULL DEFAULT 0,
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -278,6 +279,7 @@ CREATE TABLE IF NOT EXISTS plan_execution_edit_events (
     before_mode INTEGER,
     after_mode INTEGER,
     status TEXT NOT NULL,
+    phase_version INTEGER NOT NULL DEFAULT 0,
     error_code TEXT NOT NULL DEFAULT '',
     recovery_artifact TEXT,
     created_at REAL NOT NULL,
@@ -483,6 +485,19 @@ def _post_schema(conn: sqlite3.Connection) -> None:
                 "ALTER TABLE plan_execution_runs ADD COLUMN "
                 "initial_attestation_digest TEXT NOT NULL DEFAULT ''"
             )
+        if "journaled_edit_count" not in run_cols:
+            conn.execute(
+                "ALTER TABLE plan_execution_runs ADD COLUMN "
+                "journaled_edit_count INTEGER NOT NULL DEFAULT 0"
+            )
+    event_cols = {
+        r[1] for r in conn.execute("PRAGMA table_info(plan_execution_edit_events)")
+    }
+    if event_cols and "phase_version" not in event_cols:
+        conn.execute(
+            "ALTER TABLE plan_execution_edit_events ADD COLUMN "
+            "phase_version INTEGER NOT NULL DEFAULT 0"
+        )
 
 
 class ApprovalTransitionResult(str, Enum):
@@ -2791,9 +2806,119 @@ class PlanApprovalStore:
                  recovery_artifact,
                  now, now),
             )
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET journaled_edit_count="
+                "journaled_edit_count+1 WHERE execution_run_id=? AND status='mutating'",
+                (execution_run_id,),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("run cannot accept journal event")
             self._insert_execution_audit(
                 execution_run_id, "edit-journaled", operation=operation, path=path,
                 before_hash=before_hash or "", result="journaled",
+                correlation_id=edit_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def transition_edit_event(
+        self, execution_run_id: str, edit_id: str, *, expected_phase: str,
+        target_phase: str,
+        after_hash: str | None = None, after_mode: int | None = None,
+        error_code: str = "",
+    ) -> None:
+        """Advance one edit phase using a transactionally checked CAS."""
+        from khaos.coding.planning.execution_models import DurableEditPhase
+
+        transitions = {
+            DurableEditPhase.JOURNALED.value: frozenset({
+                DurableEditPhase.MUTATION_STARTED.value,
+                DurableEditPhase.ROLLED_BACK.value,
+            }),
+            DurableEditPhase.MUTATION_STARTED.value: frozenset({
+                DurableEditPhase.FILESYSTEM_APPLIED.value,
+                DurableEditPhase.ROLLED_BACK.value,
+            }),
+            DurableEditPhase.FILESYSTEM_APPLIED.value: frozenset({
+                DurableEditPhase.DIRECTORY_SYNCED.value,
+                DurableEditPhase.ROLLBACK_STARTED.value,
+            }),
+            DurableEditPhase.DIRECTORY_SYNCED.value: frozenset({
+                DurableEditPhase.APPLIED.value,
+                DurableEditPhase.ROLLBACK_STARTED.value,
+            }),
+            DurableEditPhase.APPLIED.value: frozenset({
+                DurableEditPhase.ROLLBACK_STARTED.value,
+            }),
+            DurableEditPhase.ROLLBACK_STARTED.value: frozenset({
+                DurableEditPhase.ROLLED_BACK.value,
+            }),
+        }
+        if target_phase != expected_phase and target_phase not in transitions.get(
+            expected_phase, frozenset()
+        ):
+            raise RuntimeError("invalid execution edit phase transition")
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT e.operation,e.path,e.before_hash,e.after_hash,e.after_mode,"
+                "e.status,e.phase_version,r.status AS run_status "
+                "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
+                "ON r.execution_run_id=e.execution_run_id "
+                "WHERE e.execution_run_id=? AND e.edit_id=?",
+                (execution_run_id, edit_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("execution edit event not found")
+            if row["status"] != expected_phase:
+                raise RuntimeError("execution edit phase CAS conflict")
+            stored_after_hash = row["after_hash"] if after_hash is None else after_hash
+            stored_after_mode = row["after_mode"] if after_mode is None else after_mode
+            if target_phase == expected_phase:
+                if (stored_after_hash != row["after_hash"]
+                        or stored_after_mode != row["after_mode"]
+                        or error_code):
+                    raise RuntimeError("idempotent edit phase retry changed state")
+                self._conn.commit()
+                return
+            if row["status"] in {
+                DurableEditPhase.APPLIED.value,
+                DurableEditPhase.ROLLBACK_STARTED.value,
+                DurableEditPhase.ROLLED_BACK.value,
+            } and (stored_after_hash != row["after_hash"]
+                   or stored_after_mode != row["after_mode"]):
+                raise RuntimeError("sealed edit after state cannot change")
+            if target_phase in {
+                DurableEditPhase.MUTATION_STARTED.value,
+                DurableEditPhase.FILESYSTEM_APPLIED.value,
+                DurableEditPhase.DIRECTORY_SYNCED.value,
+                DurableEditPhase.APPLIED.value,
+            } and row["run_status"] != "mutating":
+                raise RuntimeError("forward edit phase requires mutating run")
+            if target_phase in {
+                DurableEditPhase.ROLLBACK_STARTED.value,
+                DurableEditPhase.ROLLED_BACK.value,
+            } and row["run_status"] not in {"rolling-back", "rollback-sealing"}:
+                raise RuntimeError("rollback phase requires rollback run")
+            next_version = int(row["phase_version"]) + (target_phase != expected_phase)
+            cur = self._conn.execute(
+                "UPDATE plan_execution_edit_events SET status=?,after_hash=?,"
+                "after_mode=?,error_code=?,updated_at=?,phase_version=? "
+                "WHERE execution_run_id=? AND edit_id=? AND status=? AND phase_version=?",
+                (target_phase, stored_after_hash, stored_after_mode, error_code, now,
+                 next_version, execution_run_id, edit_id, expected_phase,
+                 int(row["phase_version"])),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("execution edit phase CAS conflict")
+            self._insert_execution_audit(
+                execution_run_id, "edit-transition", operation=row["operation"],
+                path=row["path"], before_hash=row["before_hash"] or "",
+                after_hash=stored_after_hash or "", result=target_phase,
+                error_code=error_code,
                 correlation_id=edit_id,
             )
             self._conn.commit()
@@ -2806,36 +2931,19 @@ class PlanApprovalStore:
         after_hash: str | None = None, after_mode: int | None = None,
         error_code: str = "",
     ) -> None:
-        now = time.time()
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            row = self._conn.execute(
-                "SELECT operation,path,before_hash,after_hash,after_mode "
-                "FROM plan_execution_edit_events "
-                "WHERE execution_run_id=? AND edit_id=?",
-                (execution_run_id, edit_id),
-            ).fetchone()
-            if row is None:
-                raise RuntimeError("execution edit event not found")
-            stored_after_hash = row["after_hash"] if after_hash is None else after_hash
-            stored_after_mode = row["after_mode"] if after_mode is None else after_mode
-            self._conn.execute(
-                "UPDATE plan_execution_edit_events SET status=?,after_hash=?,"
-                "after_mode=?,error_code=?,updated_at=? WHERE execution_run_id=? "
-                "AND edit_id=?",
-                (status, stored_after_hash, stored_after_mode, error_code, now,
-                 execution_run_id, edit_id),
-            )
-            self._insert_execution_audit(
-                execution_run_id, "edit-transition", operation=row["operation"],
-                path=row["path"], before_hash=row["before_hash"] or "",
-                after_hash=stored_after_hash or "", result=status, error_code=error_code,
-                correlation_id=edit_id,
-            )
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+        """Compatibility facade; it no longer accepts arbitrary phase writes."""
+        row = self._conn.execute(
+            "SELECT status FROM plan_execution_edit_events "
+            "WHERE execution_run_id=? AND edit_id=?",
+            (execution_run_id, edit_id),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("execution edit event not found")
+        self.transition_edit_event(
+            execution_run_id, edit_id, expected_phase=str(row["status"]),
+            target_phase=status, after_hash=after_hash, after_mode=after_mode,
+            error_code=error_code,
+        )
 
     def mark_execution_recovery_sealed(
         self, execution_run_id: str, *, seal_digest: str
@@ -2913,6 +3021,7 @@ class PlanApprovalStore:
             **value.__dict__,
             "declared_states": [item.__dict__ for item in value.declared_states],
             "workspace_states": [item.__dict__ for item in value.workspace_states],
+            "approved_edits": [item.canonical() for item in value.approved_edits],
         }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -2943,13 +3052,21 @@ class PlanApprovalStore:
         ).fetchone()
         if row is None:
             return None
-        from khaos.coding.planning.execution_models import InitialPathState, InitialWorkspaceAttestation
+        from khaos.coding.planning.execution_models import (
+            InitialApprovedEdit, InitialPathState, InitialWorkspaceAttestation,
+            PlannedEditOperation,
+        )
         try:
             payload = json.loads(row["canonical_json"])
             value = InitialWorkspaceAttestation(
-                **{key: val for key, val in payload.items() if key not in {"declared_states", "workspace_states"}},
+                **{key: val for key, val in payload.items() if key not in {
+                    "declared_states", "workspace_states", "approved_edits",
+                }},
                 declared_states=tuple(InitialPathState(**item) for item in payload["declared_states"]),
                 workspace_states=tuple(InitialPathState(**item) for item in payload["workspace_states"]),
+                approved_edits=tuple(InitialApprovedEdit(
+                    **{**item, "operation": PlannedEditOperation(item["operation"])}
+                ) for item in payload.get("approved_edits", ())),
             )
         except Exception as exc:
             raise RuntimeError("initial attestation corrupt") from exc
@@ -3087,6 +3204,13 @@ class PlanApprovalStore:
         seal_column = "rollback_seal_digest" if rollback else "recovery_seal_digest"
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            proof = (
+                self.get_rollback_final_attestation(execution_run_id)
+                if rollback else self.get_final_mutation_attestation(execution_run_id)
+            )
+            if (proof is None or proof.attestation_digest
+                    != kwargs["attestation_digest"]):
+                raise RuntimeError("recovered terminal attestation mismatch")
             cur = self._conn.execute(
                 f"UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,"
                 f"failure_code=?,{seal_time}=?,{seal_column}=?,terminal_tombstone_digest=? "
@@ -3104,6 +3228,57 @@ class PlanApprovalStore:
             self._insert_execution_audit(
                 execution_run_id, "recovered-terminal-committed",
                 result=kwargs["terminal_status"], correlation_id=kwargs["tombstone_digest"],
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def commit_recovered_no_mutation(
+        self, *, execution_run_id: str, workspace_id: str,
+        poison_owner: str, expected_status: str, terminal_status: str,
+        baseline_digest: str, failure_code: str = "no-mutation-crash",
+    ) -> None:
+        """Atomically terminalize a proven zero-journal startup crash."""
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            proof = self.get_initial_workspace_attestation(execution_run_id)
+            run_digest = self._conn.execute(
+                "SELECT initial_attestation_digest FROM plan_execution_runs "
+                "WHERE execution_run_id=?", (execution_run_id,),
+            ).fetchone()
+            if (proof is None or proof.attestation_digest != baseline_digest
+                    or run_digest is None
+                    or run_digest["initial_attestation_digest"] != baseline_digest):
+                raise RuntimeError("zero-journal baseline mismatch")
+            count = self._conn.execute(
+                "SELECT COUNT(e.event_id) AS event_count,r.journaled_edit_count "
+                "FROM plan_execution_runs r LEFT JOIN plan_execution_edit_events e "
+                "ON e.execution_run_id=r.execution_run_id "
+                "WHERE r.execution_run_id=? GROUP BY r.execution_run_id",
+                (execution_run_id,),
+            ).fetchone()
+            if count is None or int(count["event_count"]) != 0 or int(
+                count["journaled_edit_count"]
+            ) != 0:
+                raise RuntimeError("zero-journal recovery found edit events")
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,"
+                "failure_code=? WHERE execution_run_id=? AND status=?",
+                (terminal_status, now, now, failure_code, execution_run_id,
+                 expected_status),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("invalid zero-journal terminal transition")
+            self._insert_execution_audit(
+                execution_run_id, "recovered-no-mutation-committed",
+                result=terminal_status, error_code=failure_code,
+                correlation_id=baseline_digest,
+            )
+            self._conn.execute(
+                "DELETE FROM workspace_mutation_poison_scopes WHERE workspace_id=? "
+                "AND poison_owner=?", (workspace_id, poison_owner),
             )
             self._conn.commit()
         except Exception:
@@ -3152,6 +3327,17 @@ class PlanApprovalStore:
             "SELECT * FROM plan_execution_edit_events WHERE execution_run_id=? "
             "ORDER BY ordinal,event_id", (execution_run_id,),
         ).fetchall())
+
+    def execution_journal_progress(self, execution_run_id: str) -> tuple[int, int]:
+        row = self._conn.execute(
+            "SELECT journaled_edit_count,(SELECT COUNT(*) FROM "
+            "plan_execution_edit_events e WHERE e.execution_run_id=r.execution_run_id) "
+            "AS actual_count FROM plan_execution_runs r WHERE execution_run_id=?",
+            (execution_run_id,),
+        ).fetchone()
+        if row is None:
+            raise RuntimeError("execution run not found")
+        return int(row["journaled_edit_count"]), int(row["actual_count"])
 
     @staticmethod
     def _row_to_execution_run(row: sqlite3.Row) -> Any:

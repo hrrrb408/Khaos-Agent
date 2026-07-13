@@ -123,6 +123,23 @@ class RecoveryDirectory:
     def run_exists(self) -> bool:
         return self._run_fd >= 0
 
+    def run_entries(self) -> tuple[str, ...]:
+        """Return canonical run entries without following any entry."""
+        if self._run_fd < 0:
+            return ()
+        self._assert_identity()
+        return tuple(sorted(os.listdir(self._run_fd)))
+
+    def tombstone_exists(self, name: str) -> bool:
+        safe = SafeSealTombstoneName.parse(name).value
+        try:
+            info = os.stat(safe, dir_fd=self._container_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(info.st_mode):
+            raise RecoveryDirectoryError("seal tombstone type invalid")
+        return True
+
     def _assert_identity(self) -> None:
         if self._run_fd < 0:
             raise RecoveryDirectoryError("recovery run directory is absent")

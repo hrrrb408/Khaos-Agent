@@ -20,6 +20,7 @@ from khaos.coding.planning.execution_models import (
     AttestedPathState,
     ExecutionRunStatus,
     FinalMutationAttestation,
+    InitialApprovedEdit,
     InitialPathState,
     InitialWorkspaceAttestation,
     MutationSealTombstone,
@@ -595,7 +596,7 @@ class WorkspaceMutationEngine:
 
     def _rollback(
         self, run_id: str, root: Path, recovery: RecoveryDirectory, workspace_id: str, *, failure_code: str,
-        poison_after: bool = False,
+        poison_after: bool = False, recovered: bool = False,
     ) -> None:
         try:
             current_run = self._store.get_execution_run(run_id)
@@ -605,14 +606,24 @@ class WorkspaceMutationEngine:
             )
             baseline = self._require_initial_attestation(current_run)
             journal = self._validated_journal(current_run, allow_partial=True)
+            self._validate_recovery_artifacts(journal, baseline, recovery)
             handle = self._active_path_handle or WorkspacePathHandle(root)
             owns_handle = self._active_path_handle is None
+            baseline_paths = {item.path: item for item in baseline.declared_states}
             for event in reversed(journal.events):
-                self._rollback_event(handle, event, recovery)
-                current_hash, current_mode, _ = self._current_target(handle, event["path"])
-                self._store.update_edit_event(
-                    run_id, event["edit_id"], status="rolled-back",
-                    error_code=failure_code,
+                self._rollback_event(
+                    handle, event, recovery, baseline_paths[event["path"]],
+                )
+                phase = event.durable_phase
+                if phase in {"filesystem-applied", "directory-synced", "applied"}:
+                    self._store.transition_edit_event(
+                        run_id, event.edit_id, expected_phase=phase,
+                        target_phase="rollback-started", error_code=failure_code,
+                    )
+                    phase = "rollback-started"
+                self._store.transition_edit_event(
+                    run_id, event.edit_id, expected_phase=phase,
+                    target_phase="rolled-back", error_code=failure_code,
                 )
             target = "cancelled" if failure_code == "execution-context-invalid" else "rolled-back"
             if poison_after:
@@ -645,13 +656,23 @@ class WorkspaceMutationEngine:
                 recovery, current_run, target,
                 rollback_attestation.attestation_digest, journal_digest,
             )
-            self._store.commit_terminal_seal(
-                run_id, expected_status="rollback-sealing",
-                terminal_status=target,
-                seal_digest=self._recovery_seal_digest(run_id),
-                tombstone_digest=tombstone.tombstone_digest, rollback=True,
-                failure_code=failure_code,
-            )
+            terminal_args = {
+                "execution_run_id": run_id,
+                "expected_status": "rollback-sealing",
+                "terminal_status": target,
+                "seal_digest": self._recovery_seal_digest(run_id),
+                "tombstone_digest": tombstone.tombstone_digest,
+                "rollback": True,
+                "failure_code": failure_code,
+            }
+            if recovered:
+                self._store.commit_recovered_terminal_state(
+                    workspace_id=workspace_id, poison_owner=f"run:{run_id}",
+                    attestation_digest=rollback_attestation.attestation_digest,
+                    **terminal_args,
+                )
+            else:
+                self._store.commit_terminal_seal(**terminal_args)
             try:
                 recovery.delete_tombstone(tombstone_name)
             except OSError:
@@ -677,10 +698,10 @@ class WorkspaceMutationEngine:
 
     def _rollback_event(
         self, handle: WorkspacePathHandle, event: Any,
-        recovery: RecoveryDirectory,
+        recovery: RecoveryDirectory, baseline: InitialPathState,
     ) -> None:
         operation = event["operation"]
-        before_hash = event["before_hash"] or None
+        before_hash = baseline.content_hash or None
         after_hash = event["after_hash"] or None
         current_hash, current_mode, current_inode = self._current_target(handle, event["path"])
         no_phase = lambda phase: None
@@ -718,7 +739,7 @@ class WorkspaceMutationEngine:
             raise WorkspaceMutationError("rollback-evidence-invalid", "backup artifact invalid")
         if current_hash == before_hash:
             return
-        mode = int(event["before_mode"] or 0o600)
+        mode = int(baseline.mode if baseline.mode is not None else 0o600)
         if operation == "update":
             if (current_hash != after_hash or current_mode != event["after_mode"]
                     or current_inode is None):
@@ -728,6 +749,35 @@ class WorkspaceMutationEngine:
             if current_hash is not None:
                 raise WorkspaceMutationError("rollback-third-party", "deleted target was replaced")
             handle.create(event["path"], data, mode, no_phase)
+
+    @staticmethod
+    def _validate_recovery_artifacts(
+        journal: ValidatedRecoveryJournal,
+        baseline: InitialWorkspaceAttestation,
+        recovery: RecoveryDirectory,
+    ) -> None:
+        """Validate every backup against the persisted baseline before rollback."""
+        baseline_paths = {item.path: item for item in baseline.declared_states}
+        seen: set[str] = set()
+        for event in journal.events:
+            if event.operation == PlannedEditOperation.CREATE:
+                continue
+            if event.artifact is None or event.artifact.value in seen:
+                raise WorkspaceMutationError(
+                    "rollback-evidence-invalid", "backup artifact binding is invalid"
+                )
+            seen.add(event.artifact.value)
+            expected = baseline_paths[event.path.value]
+            try:
+                data = recovery.read(event.artifact.value)
+            except RecoveryDirectoryError as exc:
+                raise WorkspaceMutationError(
+                    "rollback-evidence-invalid", "backup artifact cannot be read"
+                ) from exc
+            if hashlib.sha256(data).hexdigest() != expected.content_hash:
+                raise WorkspaceMutationError(
+                    "rollback-evidence-invalid", "backup differs from initial baseline"
+                )
 
     @staticmethod
     def _current_target(
@@ -837,6 +887,26 @@ class WorkspaceMutationEngine:
             item.relative_path, True, item.content_hash, item.mode,
             item.file_type, item.identity_digest,
         ) for item in git_state.file_states)
+        approved_edits = []
+        for edit in bundle.ordered_edits:
+            source = by_path.get(edit.path)
+            after_hash = ""
+            after_mode = None
+            if edit.operation == PlannedEditOperation.CREATE:
+                after_hash = edit.new_content_hash or ""
+                after_mode = edit.new_mode if edit.new_mode is not None else 0o600
+            elif edit.operation == PlannedEditOperation.UPDATE:
+                after_hash = edit.new_content_hash or ""
+                after_mode = edit.new_mode if edit.new_mode is not None else (
+                    source.mode if source else None
+                )
+            elif edit.operation == PlannedEditOperation.RENAME:
+                after_hash = source.content_hash if source else ""
+                after_mode = source.mode if source else None
+            approved_edits.append(InitialApprovedEdit(
+                edit.edit_id, edit.operation, edit.path, edit.destination_path,
+                after_hash, after_mode,
+            ))
         return InitialWorkspaceAttestation(
             run.execution_run_id, run.plan_id, run.edit_bundle_digest,
             context.execution_context_id, context.lease_id, context.binding_digest,
@@ -844,7 +914,7 @@ class WorkspaceMutationEngine:
             git_state.repository_generation, git_state.index_digest,
             git_state.worktree_admin_identity,
             self._workspace_state_digest(git_state.file_states), tuple(states),
-            workspace_states, time.time(),
+            workspace_states, time.time(), approved_edits=tuple(approved_edits),
         ).normalized()
 
     def _require_initial_attestation(self, run: PlanExecutionRun) -> InitialWorkspaceAttestation:
@@ -865,23 +935,6 @@ class WorkspaceMutationEngine:
         events: tuple[Any, ...], journal_digest: str, reason: str,
         baseline: InitialWorkspaceAttestation,
     ) -> RollbackFinalAttestation:
-        states: list[AttestedPathState] = []
-        for event in events:
-            operation = event["operation"]
-            source_hash, source_mode, _ = self._current_target(handle, event["path"])
-            if operation == "create":
-                if source_hash is not None:
-                    raise WorkspaceMutationError("rollback-attestation-drift", "created path remains")
-                states.append(AttestedPathState(event["path"], False))
-                continue
-            if source_hash != (event["before_hash"] or "") or source_mode != event["before_mode"]:
-                raise WorkspaceMutationError("rollback-attestation-drift", "before state mismatch")
-            states.append(AttestedPathState(event["path"], True, source_hash, source_mode))
-            if operation == "rename":
-                dest_hash, _, _ = self._current_target(handle, event["destination_path"])
-                if dest_hash is not None:
-                    raise WorkspaceMutationError("rollback-attestation-drift", "rename destination remains")
-                states.append(AttestedPathState(event["destination_path"], False))
         state = self._context_provider.current_state(
             repository_id=run.repository_id, task_id=run.task_id,
             workspace_id=run.workspace_id,
@@ -890,6 +943,27 @@ class WorkspaceMutationEngine:
             workspace, repository_generation=state.repository_generation,
         )
         current_states = {item.relative_path: item for item in git_state.file_states}
+        states: list[AttestedPathState] = []
+        for expected in baseline.declared_states:
+            current = current_states.get(expected.path)
+            if not expected.exists:
+                if current is not None:
+                    raise WorkspaceMutationError(
+                        "rollback-attestation-drift",
+                        "baseline-missing declared path now exists",
+                    )
+                states.append(AttestedPathState(expected.path, False))
+                continue
+            if (current is None or current.file_type != expected.file_type
+                    or current.content_hash != expected.content_hash
+                    or current.mode != expected.mode):
+                raise WorkspaceMutationError(
+                    "rollback-attestation-drift",
+                    "declared path differs from initial baseline",
+                )
+            states.append(AttestedPathState(
+                expected.path, True, expected.content_hash, expected.mode,
+            ))
         declared_paths = {item.path for item in baseline.declared_states}
         baseline_undeclared = {
             item.path: item for item in baseline.workspace_states
@@ -1003,6 +1077,20 @@ class WorkspaceMutationEngine:
             raise WorkspaceMutationError(
                 "rollback-attestation-binding", "rollback proof binding drifted"
             )
+        baseline = self._require_initial_attestation(run)
+        baseline_states = tuple(sorted((
+            AttestedPathState(
+                item.path, item.exists, item.content_hash if item.exists else "",
+                item.mode if item.exists else None,
+            ) for item in baseline.declared_states
+        ), key=lambda item: item.path))
+        if tuple(item.canonical() for item in attestation.ordered_states) != tuple(
+            item.canonical() for item in baseline_states
+        ):
+            raise WorkspaceMutationError(
+                "rollback-attestation-baseline",
+                "rollback proof differs from initial baseline",
+            )
         handle = WorkspacePathHandle(workspace.worktree_path.resolve(strict=True))
         try:
             actual: list[AttestedPathState] = []
@@ -1050,6 +1138,11 @@ class WorkspaceMutationEngine:
             rows = self._store.list_execution_edit_events(run.execution_run_id)
             if not rows:
                 raise UnsafePersistedIdentifier("execution journal is missing")
+            persisted_count, actual_count = self._store.execution_journal_progress(
+                run.execution_run_id
+            )
+            if persisted_count != actual_count or actual_count != len(rows):
+                raise UnsafePersistedIdentifier("journal progress mismatch")
             if not isinstance(run.metadata.get("edit_count"), int) or isinstance(run.metadata.get("edit_count"), bool):
                 raise UnsafePersistedIdentifier("edit count missing")
             expected_count = run.metadata["edit_count"]
@@ -1063,10 +1156,18 @@ class WorkspaceMutationEngine:
                 raise UnsafePersistedIdentifier("journal edit ids are not unique")
             baseline = self._require_initial_attestation(run)
             baseline_paths = {item.path: item for item in baseline.declared_states}
+            approved_edits = {item.edit_id: item for item in baseline.approved_edits}
+            if len(approved_edits) != expected_count:
+                raise UnsafePersistedIdentifier("approved edit baseline is incomplete")
             events: list[ValidatedRecoveryEvent] = []
             seen_paths: set[str] = set()
+            seen_artifacts: set[str] = set()
             hash_re = re.compile(r"^[0-9a-f]{64}$")
-            phases = {"journaled", "mutation-started", "filesystem-applied", "directory-synced", "applied", "rolled-back"}
+            phases = {
+                "journaled", "mutation-started", "filesystem-applied",
+                "directory-synced", "applied", "rollback-started",
+                "rolled-back",
+            }
             for row in rows:
                 try: operation = PlannedEditOperation(row["operation"])
                 except ValueError:
@@ -1090,6 +1191,19 @@ class WorkspaceMutationEngine:
                     if mode is not None and (type(mode) is not int or mode < 0 or mode > 0o777):
                         raise UnsafePersistedIdentifier("journal mode invalid")
                 if row["status"] not in phases: raise UnsafePersistedIdentifier("durable phase invalid")
+                phase_version = row["phase_version"]
+                phase_versions = {
+                    "journaled": frozenset({0}),
+                    "mutation-started": frozenset({1}),
+                    "filesystem-applied": frozenset({2}),
+                    "directory-synced": frozenset({3}),
+                    "applied": frozenset({4}),
+                    "rollback-started": frozenset({3, 4, 5}),
+                    "rolled-back": frozenset({1, 2, 4, 5, 6}),
+                }
+                if (type(phase_version) is not int
+                        or phase_version not in phase_versions[row["status"]]):
+                    raise UnsafePersistedIdentifier("durable phase version invalid")
                 if operation == PlannedEditOperation.CREATE:
                     valid = not before_hash and before_mode is None and artifact is None and destination is None and after_hash and after_mode is not None
                 elif operation == PlannedEditOperation.UPDATE:
@@ -1099,15 +1213,42 @@ class WorkspaceMutationEngine:
                 else:
                     valid = bool(before_hash and before_mode is not None and after_hash and after_mode is not None and artifact and destination and destination.value != path.value)
                 if not valid: raise UnsafePersistedIdentifier("operation journal fields invalid")
-                baseline_mode = baseline_paths.get(path.value).mode if path.value in baseline_paths else None
-                if before_mode is not None and before_mode & 0o111 and not (baseline_mode and baseline_mode & 0o111):
-                    raise UnsafePersistedIdentifier("journal executable mode exceeds baseline")
+                before = baseline_paths.get(path.value)
+                approved = approved_edits.get(row["edit_id"])
+                if approved is None or (
+                    approved.operation != operation
+                    or approved.path != path.value
+                    or approved.destination_path
+                    != (destination.value if destination else None)
+                    or approved.after_hash != after_hash
+                    or approved.after_mode != after_mode
+                ):
+                    raise UnsafePersistedIdentifier("journal edit exceeds approved baseline")
+                if operation == PlannedEditOperation.CREATE:
+                    if before is None or before.exists or before.file_type != "missing":
+                        raise UnsafePersistedIdentifier("create source existed in baseline")
+                else:
+                    if (before is None or not before.exists
+                            or before.file_type != "regular"
+                            or before_hash != before.content_hash
+                            or before_mode != before.mode):
+                        raise UnsafePersistedIdentifier("journal before state differs from baseline")
+                if operation == PlannedEditOperation.RENAME:
+                    destination_before = baseline_paths.get(destination.value)
+                    if (destination_before is None or destination_before.exists
+                            or destination_before.file_type != "missing"):
+                        raise UnsafePersistedIdentifier("rename destination existed in baseline")
+                if artifact is not None:
+                    if artifact.value in seen_artifacts:
+                        raise UnsafePersistedIdentifier("recovery artifact is reused")
+                    seen_artifacts.add(artifact.value)
                 keys = [path.value.casefold()] + ([destination.value.casefold()] if destination else [])
                 if any(key in seen_paths for key in keys): raise UnsafePersistedIdentifier("journal path conflict")
                 seen_paths.update(keys)
                 events.append(ValidatedRecoveryEvent(
                     row["ordinal"], row["edit_id"], operation, path, destination,
-                    before_hash, after_hash, before_mode, after_mode, artifact, row["status"],
+                    before_hash, after_hash, before_mode, after_mode, artifact,
+                    row["status"], phase_version,
                 ))
         except (UnsafePersistedIdentifier, TypeError, ValueError) as exc:
             raise WorkspaceMutationError(
@@ -1122,6 +1263,77 @@ class WorkspaceMutationEngine:
             canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
         ).encode("utf-8")).hexdigest()
         return ValidatedRecoveryJournal(safe_run, tuple(events), digest)
+
+    def _recover_zero_journal_run(
+        self, run: PlanExecutionRun, workspace: Any, owner: str,
+    ) -> RecoveryDirectory:
+        """Terminalize only a proven crash before the first durable edit."""
+        baseline = self._require_initial_attestation(run)
+        persisted_count, actual_count = self._store.execution_journal_progress(
+            run.execution_run_id
+        )
+        if persisted_count != 0 or actual_count != 0:
+            raise WorkspaceMutationError(
+                "zero-journal-progress-mismatch", "journal progress is not zero"
+            )
+        recovery = self._open_recovery(
+            workspace, run.execution_run_id, (), allow_missing_run=True,
+        )
+        if recovery.run_entries():
+            raise WorkspaceMutationError(
+                "zero-journal-recovery-evidence",
+                "unknown recovery evidence exists without a journal",
+            )
+        for kind in ("mutation", "rolled-back", "cancelled", "failed"):
+            if recovery.tombstone_exists(self._tombstone_name(
+                run.execution_run_id, kind
+            )):
+                raise WorkspaceMutationError(
+                    "zero-journal-tombstone", "terminal evidence already exists"
+                )
+        state = self._context_provider.current_state(
+            repository_id=run.repository_id, task_id=run.task_id,
+            workspace_id=run.workspace_id,
+        )
+        first = self._git_inspector.snapshot(
+            workspace, repository_generation=state.repository_generation,
+        )
+        second = self._git_inspector.snapshot(
+            workspace, repository_generation=state.repository_generation,
+        )
+        if first != second:
+            raise WorkspaceMutationError(
+                "zero-journal-state-unstable", "workspace state is unstable"
+            )
+        current_states = tuple(InitialPathState(
+            item.relative_path, True, item.content_hash, item.mode,
+            item.file_type, item.identity_digest,
+        ) for item in first.file_states)
+        if (first.head_commit != baseline.head
+                or first.repository_generation != baseline.generation
+                or first.index_digest != baseline.index_digest
+                or first.worktree_admin_identity
+                != baseline.worktree_admin_identity
+                or self._workspace_state_digest(first.file_states)
+                != baseline.workspace_state_digest
+                or current_states != baseline.workspace_states):
+            raise WorkspaceMutationError(
+                "zero-journal-workspace-drift",
+                "workspace differs from initial baseline",
+            )
+        if recovery.run_exists:
+            recovery.seal()
+        terminal = (
+            "cancelled" if run.failure_code == "execution-context-invalid"
+            else "failed"
+        )
+        self._store.commit_recovered_no_mutation(
+            execution_run_id=run.execution_run_id,
+            workspace_id=run.workspace_id, poison_owner=owner,
+            expected_status=run.status.value, terminal_status=terminal,
+            baseline_digest=baseline.attestation_digest,
+        )
+        return recovery
 
     def recover_incomplete_runs(self) -> tuple[str, ...]:
         """Startup scan: quarantine incomplete runs; recover only intact journals."""
@@ -1138,6 +1350,15 @@ class WorkspaceMutationEngine:
                 run.workspace_id, owner=f"recovery:{run.execution_run_id}"
             ):
                 try:
+                    if not self._store.list_execution_edit_events(
+                        run.execution_run_id
+                    ):
+                        recovery = self._recover_zero_journal_run(
+                            run, workspace, owner,
+                        )
+                        self._fence.clear_poison(run.workspace_id, owner=owner)
+                        recovered.append(run.execution_run_id)
+                        continue
                     journal = self._validated_journal(run)
                     events, journal_digest = journal.events, journal.canonical_digest
                     for event in events:
@@ -1179,6 +1400,7 @@ class WorkspaceMutationEngine:
                             seal_digest=self._recovery_seal_digest(run.execution_run_id),
                             tombstone_digest=tombstone.tombstone_digest,
                             rollback=False,
+                            attestation_digest=attestation.attestation_digest,
                         )
                         try:
                             recovery.delete_tombstone(tombstone_name)
@@ -1211,6 +1433,7 @@ class WorkspaceMutationEngine:
                             seal_digest=self._recovery_seal_digest(run.execution_run_id),
                             tombstone_digest=tombstone.tombstone_digest,
                             rollback=True, failure_code=run.failure_code,
+                            attestation_digest=attestation.attestation_digest,
                         )
                         try:
                             recovery.delete_tombstone(tombstone_name)
@@ -1221,11 +1444,9 @@ class WorkspaceMutationEngine:
                             run.execution_run_id,
                             workspace.worktree_path.resolve(strict=True), recovery,
                             run.workspace_id, failure_code="startup-recovery",
+                            recovered=True,
                         )
                     self._fence.clear_poison(run.workspace_id, owner=owner)
-                    self._store.clear_workspace_poison_scope(
-                        run.workspace_id, owner=owner
-                    )
                     recovered.append(run.execution_run_id)
                 except Exception as exc:
                     current = self._store.get_execution_run(run.execution_run_id)
