@@ -26,6 +26,7 @@ Batch 2.1 hardening:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import secrets
 import sqlite3
@@ -287,6 +288,11 @@ CREATE TABLE IF NOT EXISTS plan_execution_edit_events (
     applied_parent_identity_digest TEXT NOT NULL DEFAULT '',
     applied_destination_identity_digest TEXT NOT NULL DEFAULT '',
     rollback_identity_digest TEXT NOT NULL DEFAULT '',
+    rollback_parent_identity_digest TEXT NOT NULL DEFAULT '',
+    rollback_destination_parent_identity_digest TEXT NOT NULL DEFAULT '',
+    rollback_sync_mask INTEGER NOT NULL DEFAULT 0,
+    rollback_directory_sync_digest TEXT NOT NULL DEFAULT '',
+    rollback_synced_at REAL,
     identity_version INTEGER NOT NULL DEFAULT 0,
     error_code TEXT NOT NULL DEFAULT '',
     recovery_artifact TEXT,
@@ -510,6 +516,11 @@ def _post_schema(conn: sqlite3.Connection) -> None:
         ("applied_parent_identity_digest", "TEXT NOT NULL DEFAULT ''"),
         ("applied_destination_identity_digest", "TEXT NOT NULL DEFAULT ''"),
         ("rollback_identity_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("rollback_parent_identity_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("rollback_destination_parent_identity_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("rollback_sync_mask", "INTEGER NOT NULL DEFAULT 0"),
+        ("rollback_directory_sync_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("rollback_synced_at", "REAL"),
         ("identity_version", "INTEGER NOT NULL DEFAULT 0"),
     ):
         if event_cols and column not in event_cols:
@@ -639,8 +650,13 @@ class PlanApprovalStore:
     def ensure_schema(self) -> None:
         """Create the approval tables if missing. Idempotent."""
         self._conn.executescript(APPROVAL_SCHEMA)
-        _post_schema(self._conn)
-        self._conn.commit()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            _post_schema(self._conn)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     # ------------------------------------------------------------------
     # Receipt outbox
@@ -2948,7 +2964,9 @@ class PlanApprovalStore:
             DurableEditPhase.APPLIED.value: frozenset({
                 DurableEditPhase.ROLLBACK_STARTED.value,
             }),
-            DurableEditPhase.ROLLBACK_STARTED.value: frozenset({
+            DurableEditPhase.ROLLBACK_STARTED.value: frozenset(),
+            DurableEditPhase.ROLLBACK_FILESYSTEM_APPLIED.value: frozenset(),
+            DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value: frozenset({
                 DurableEditPhase.ROLLED_BACK.value,
             }),
         }
@@ -2964,7 +2982,10 @@ class PlanApprovalStore:
                 "e.status,e.phase_version,e.error_code,"
                 "e.applied_identity_digest,e.applied_parent_identity_digest,"
                 "e.applied_destination_identity_digest,e.rollback_identity_digest,"
-                "e.identity_version,r.status AS run_status "
+                "e.rollback_parent_identity_digest,"
+                "e.rollback_destination_parent_identity_digest,"
+                "e.rollback_sync_mask,e.rollback_directory_sync_digest,"
+                "e.rollback_synced_at,e.identity_version,r.status AS run_status "
                 "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
                 "ON r.execution_run_id=e.execution_run_id "
                 "WHERE e.execution_run_id=? AND e.edit_id=?",
@@ -3005,6 +3026,8 @@ class PlanApprovalStore:
             if row["status"] in {
                 DurableEditPhase.APPLIED.value,
                 DurableEditPhase.ROLLBACK_STARTED.value,
+                DurableEditPhase.ROLLBACK_FILESYSTEM_APPLIED.value,
+                DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value,
                 DurableEditPhase.ROLLED_BACK.value,
             } and (stored_after_hash != row["after_hash"]
                    or stored_after_mode != row["after_mode"]):
@@ -3018,6 +3041,8 @@ class PlanApprovalStore:
                 raise RuntimeError("forward edit phase requires mutating run")
             if target_phase in {
                 DurableEditPhase.ROLLBACK_STARTED.value,
+                DurableEditPhase.ROLLBACK_FILESYSTEM_APPLIED.value,
+                DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value,
                 DurableEditPhase.ROLLED_BACK.value,
             } and row["run_status"] not in {"rolling-back", "rollback-sealing"}:
                 raise RuntimeError("rollback phase requires rollback run")
@@ -3029,9 +3054,14 @@ class PlanApprovalStore:
                 if row["operation"] == "rename" and not stored_destination_identity:
                     raise RuntimeError("rename destination identity evidence missing")
             if target_phase == DurableEditPhase.ROLLED_BACK.value:
-                if (expected_phase == DurableEditPhase.ROLLBACK_STARTED.value
-                        and not row["rollback_identity_digest"]):
-                    raise RuntimeError("rollback identity evidence missing")
+                if expected_phase == DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value:
+                    if (int(row["identity_version"]) != 3
+                            or not row["rollback_identity_digest"]
+                            or not row["rollback_parent_identity_digest"]
+                            or int(row["rollback_sync_mask"]) not in {1, 3}
+                            or not row["rollback_directory_sync_digest"]
+                            or row["rollback_synced_at"] is None):
+                        raise RuntimeError("rollback directory sync evidence missing")
             next_version = int(row["phase_version"]) + (target_phase != expected_phase)
             next_identity_version = int(row["identity_version"])
             if target_phase == DurableEditPhase.FILESYSTEM_APPLIED.value:
@@ -3064,53 +3094,191 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
-    def record_rollback_identity(
+    def record_rollback_filesystem_applied(
         self, execution_run_id: str, edit_id: str, *,
-        rollback_identity_digest: str, error_code: str,
+        rollback_identity_digest: str,
+        rollback_parent_identity_digest: str,
+        rollback_destination_parent_identity_digest: str,
+        rollback_sync_mask: int,
+        error_code: str,
+        expected_phase: str = "rollback-started",
     ) -> None:
-        """Persist rollback object ownership before the ROLLED_BACK CAS."""
-        if not rollback_identity_digest:
+        """Persist rollback syscall ownership before any directory fsync."""
+        if not rollback_identity_digest or not rollback_parent_identity_digest:
             raise RuntimeError("rollback identity evidence missing")
+        if rollback_sync_mask not in {1, 3}:
+            raise RuntimeError("rollback sync mask invalid")
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             row = self._conn.execute(
                 "SELECT e.operation,e.path,e.status,e.error_code,"
-                "e.rollback_identity_digest,e.identity_version,r.status AS run_status "
+                "e.phase_version,e.rollback_identity_digest,"
+                "e.rollback_parent_identity_digest,"
+                "e.rollback_destination_parent_identity_digest,"
+                "e.rollback_sync_mask,e.rollback_directory_sync_digest,"
+                "e.identity_version,r.status AS run_status "
                 "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
                 "ON r.execution_run_id=e.execution_run_id "
                 "WHERE e.execution_run_id=? AND e.edit_id=?",
                 (execution_run_id, edit_id),
             ).fetchone()
-            if row is None or row["status"] != "rollback-started":
-                raise RuntimeError("edit is not rollback-started")
+            if row is None:
+                raise RuntimeError("execution edit event not found")
             if row["run_status"] not in {"rolling-back", "rollback-sealing"}:
                 raise RuntimeError("rollback identity requires rollback run")
+            if row["operation"] != "rename" and (
+                rollback_sync_mask != 1
+                or rollback_destination_parent_identity_digest
+            ):
+                raise RuntimeError("non-rename rollback sync scope invalid")
+            if row["operation"] == "rename":
+                if not rollback_destination_parent_identity_digest:
+                    raise RuntimeError("rename rollback parent identity missing")
+                if rollback_sync_mask not in {1, 3}:
+                    raise RuntimeError("rename rollback sync mask invalid")
             existing = str(row["rollback_identity_digest"] or "")
             existing_error = str(row["error_code"] or "")
-            if existing:
-                if existing != rollback_identity_digest or existing_error != error_code:
-                    raise RuntimeError("rollback identity CAS conflict")
+            if row["status"] == "rollback-filesystem-applied":
+                if (
+                    existing != rollback_identity_digest
+                    or str(row["rollback_parent_identity_digest"] or "")
+                    != rollback_parent_identity_digest
+                    or str(row["rollback_destination_parent_identity_digest"] or "")
+                    != rollback_destination_parent_identity_digest
+                    or int(row["rollback_sync_mask"]) != rollback_sync_mask
+                    or existing_error != error_code
+                    or int(row["identity_version"]) != 2
+                    or row["rollback_directory_sync_digest"]
+                ):
+                    raise RuntimeError("rollback filesystem identity CAS conflict")
                 self._conn.commit()
                 return
-            if int(row["identity_version"]) != 1:
+            if row["status"] != expected_phase:
+                raise RuntimeError("rollback filesystem phase CAS conflict")
+            if int(row["identity_version"]) not in {1, 2}:
                 raise RuntimeError("applied identity evidence missing")
+            if existing and existing != rollback_identity_digest:
+                raise RuntimeError("rollback identity CAS conflict")
+            if existing_error and existing_error != error_code:
+                raise RuntimeError("rollback reason CAS conflict")
             cur = self._conn.execute(
-                "UPDATE plan_execution_edit_events SET rollback_identity_digest=?,"
-                "identity_version=2,error_code=?,updated_at=? "
-                "WHERE execution_run_id=? AND edit_id=? AND status='rollback-started' "
-                "AND identity_version=1 AND rollback_identity_digest=''",
-                (rollback_identity_digest, error_code, now, execution_run_id, edit_id),
+                "UPDATE plan_execution_edit_events SET status='rollback-filesystem-applied',"
+                "rollback_identity_digest=?,rollback_parent_identity_digest=?,"
+                "rollback_destination_parent_identity_digest=?,rollback_sync_mask=?,"
+                "identity_version=2,error_code=?,updated_at=?,phase_version=phase_version+1 "
+                "WHERE execution_run_id=? AND edit_id=? AND status=? "
+                "AND phase_version=? AND identity_version IN (1,2)",
+                (rollback_identity_digest, rollback_parent_identity_digest,
+                 rollback_destination_parent_identity_digest, rollback_sync_mask,
+                 error_code, now, execution_run_id, edit_id, expected_phase,
+                 int(row["phase_version"])),
             )
             if int(cur.rowcount or 0) != 1:
-                raise RuntimeError("rollback identity CAS conflict")
+                raise RuntimeError("rollback filesystem phase CAS conflict")
             self._insert_execution_audit(
-                execution_run_id, "rollback-identity-recorded",
+                execution_run_id, "rollback-filesystem-applied",
                 operation=row["operation"], path=row["path"],
-                result="rollback-started", error_code=error_code,
+                result="rollback-filesystem-applied", error_code=error_code,
                 correlation_id=edit_id,
             )
             self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @staticmethod
+    def _rollback_directory_sync_digest(
+        *, execution_run_id: str, edit_id: str,
+        parent_identity_digest: str,
+        destination_parent_identity_digest: str,
+        sync_mask: int,
+    ) -> str:
+        payload = {
+            "execution_run_id": execution_run_id,
+            "edit_id": edit_id,
+            "parent_identity_digest": parent_identity_digest,
+            "destination_parent_identity_digest": (
+                destination_parent_identity_digest
+            ),
+            "sync_mask": sync_mask,
+            "phase": "rollback-directory-synced",
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    def record_rollback_directory_synced(
+        self, execution_run_id: str, edit_id: str, *, error_code: str,
+    ) -> str:
+        """Commit proof that every persisted rollback parent was fsynced."""
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT e.operation,e.path,e.status,e.phase_version,e.error_code,"
+                "e.rollback_identity_digest,"
+                "e.rollback_parent_identity_digest,"
+                "e.rollback_destination_parent_identity_digest,"
+                "e.rollback_sync_mask,e.rollback_directory_sync_digest,"
+                "e.rollback_synced_at,e.identity_version,r.status AS run_status "
+                "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
+                "ON r.execution_run_id=e.execution_run_id "
+                "WHERE e.execution_run_id=? AND e.edit_id=?",
+                (execution_run_id, edit_id),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("execution edit event not found")
+            if row["run_status"] not in {"rolling-back", "rollback-sealing"}:
+                raise RuntimeError("rollback directory sync requires rollback run")
+            if str(row["error_code"] or "") != error_code:
+                raise RuntimeError("rollback directory sync reason conflict")
+            digest = self._rollback_directory_sync_digest(
+                execution_run_id=execution_run_id, edit_id=edit_id,
+                parent_identity_digest=str(
+                    row["rollback_parent_identity_digest"] or ""
+                ),
+                destination_parent_identity_digest=str(
+                    row["rollback_destination_parent_identity_digest"] or ""
+                ),
+                sync_mask=int(row["rollback_sync_mask"]),
+            )
+            if row["status"] == "rollback-directory-synced":
+                if (str(row["rollback_directory_sync_digest"] or "") != digest
+                        or row["rollback_synced_at"] is None
+                        or int(row["identity_version"]) != 3):
+                    raise RuntimeError("rollback directory sync CAS conflict")
+                self._conn.commit()
+                return digest
+            if (row["status"] != "rollback-filesystem-applied"
+                    or int(row["identity_version"]) != 2
+                    or not row["rollback_identity_digest"]
+                    or not row["rollback_parent_identity_digest"]
+                    or int(row["rollback_sync_mask"]) not in {1, 3}
+                    or (int(row["rollback_sync_mask"]) == 3
+                        and not row["rollback_destination_parent_identity_digest"])):
+                raise RuntimeError("rollback filesystem evidence missing")
+            cur = self._conn.execute(
+                "UPDATE plan_execution_edit_events "
+                "SET status='rollback-directory-synced',"
+                "rollback_directory_sync_digest=?,rollback_synced_at=?,"
+                "identity_version=3,updated_at=?,phase_version=phase_version+1 "
+                "WHERE execution_run_id=? AND edit_id=? "
+                "AND status='rollback-filesystem-applied' AND phase_version=? "
+                "AND identity_version=2 AND rollback_directory_sync_digest=''",
+                (digest, now, now, execution_run_id, edit_id,
+                 int(row["phase_version"])),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("rollback directory sync CAS conflict")
+            self._insert_execution_audit(
+                execution_run_id, "rollback-directory-synced",
+                operation=row["operation"], path=row["path"],
+                result="rollback-directory-synced", error_code=error_code,
+                correlation_id=edit_id,
+            )
+            self._conn.commit()
+            return digest
         except Exception:
             self._conn.rollback()
             raise

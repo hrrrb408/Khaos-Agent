@@ -42,6 +42,8 @@ class DurableEditPhase(str, Enum):
     DIRECTORY_SYNCED = "directory-synced"
     APPLIED = "applied"
     ROLLBACK_STARTED = "rollback-started"
+    ROLLBACK_FILESYSTEM_APPLIED = "rollback-filesystem-applied"
+    ROLLBACK_DIRECTORY_SYNCED = "rollback-directory-synced"
     ROLLED_BACK = "rolled-back"
 
 
@@ -415,6 +417,11 @@ class ValidatedRecoveryEvent:
     rollback_identity_digest: str = ""
     identity_version: int = 0
     execution_run_id: str = ""
+    rollback_parent_identity_digest: str = ""
+    rollback_destination_parent_identity_digest: str = ""
+    rollback_sync_mask: int = 0
+    rollback_directory_sync_digest: str = ""
+    rollback_synced_at: float | None = None
 
     def __getitem__(self, key: str) -> Any:
         aliases = {

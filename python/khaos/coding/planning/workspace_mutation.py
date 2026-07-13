@@ -702,7 +702,18 @@ class WorkspaceMutationEngine:
             baseline_paths = {item.path: item for item in baseline.declared_states}
             for event in reversed(journal.events):
                 phase = event.durable_phase
-                if phase == "rolled-back":
+                if (phase == "rolled-back"
+                        and event.rollback_identity_digest
+                        and not event.rollback_directory_sync_digest):
+                    self._verify_rollback_identity(
+                        handle, event, baseline_paths,
+                    )
+                    event = self._persist_legacy_rollback_filesystem_state(
+                        handle, event, expected_phase="rolled-back",
+                        failure_code=failure_code,
+                    )
+                    phase = event.durable_phase
+                elif phase == "rolled-back":
                     self._verify_rolled_back_event(
                         handle, event, baseline_paths,
                     )
@@ -734,11 +745,18 @@ class WorkspaceMutationEngine:
                         event, durable_phase="rollback-started",
                         phase_version=event.phase_version + 1,
                     )
-                if event.rollback_identity_digest:
+                    phase = event.durable_phase
+                if (phase == "rollback-started"
+                        and event.rollback_identity_digest):
                     self._verify_rollback_identity(
                         handle, event, baseline_paths,
                     )
-                else:
+                    event = self._persist_legacy_rollback_filesystem_state(
+                        handle, event, expected_phase="rollback-started",
+                        failure_code=failure_code,
+                    )
+                    phase = event.durable_phase
+                elif phase == "rollback-started":
                     if self._event_has_baseline_values(
                         handle, event, baseline_paths,
                     ):
@@ -751,8 +769,26 @@ class WorkspaceMutationEngine:
                         handle, event, recovery, baseline_paths[event["path"]],
                         run_id=run_id, failure_code=failure_code,
                     )
+                    event = self._reload_recovery_event(run_id, event.edit_id)
+                    phase = event.durable_phase
+                if phase == "rollback-filesystem-applied":
+                    self._verify_rollback_identity(
+                        handle, event, baseline_paths,
+                    )
+                    self._sync_rollback_directories(handle, event)
+                    self._store.record_rollback_directory_synced(
+                        run_id, event.edit_id, error_code=failure_code,
+                    )
+                    event = self._reload_recovery_event(run_id, event.edit_id)
+                    phase = event.durable_phase
+                if phase == "rollback-directory-synced":
+                    self._verify_rollback_identity(
+                        handle, event, baseline_paths,
+                    )
+                    self._verify_rollback_parent_identities(handle, event)
                 self._store.transition_edit_event(
-                    run_id, event.edit_id, expected_phase="rollback-started",
+                    run_id, event.edit_id,
+                    expected_phase="rollback-directory-synced",
                     target_phase="rolled-back", error_code=failure_code,
                 )
             target = "cancelled" if failure_code == "execution-context-invalid" else "rolled-back"
@@ -852,6 +888,9 @@ class WorkspaceMutationEngine:
             phase: str, identity: MutationObjectIdentity | None = None,
         ) -> None:
             if phase == "directory-synced":
+                self._store.record_rollback_directory_synced(
+                    run_id, event.edit_id, error_code=failure_code,
+                )
                 return
             if phase != "filesystem-applied" or identity is None:
                 raise WorkspaceMutationError(
@@ -861,8 +900,17 @@ class WorkspaceMutationEngine:
                 identity, run_id=run_id, edit_id=event.edit_id,
                 operation=event.operation.value, role="rollback-object",
             )
-            self._store.record_rollback_identity(
-                run_id, event.edit_id, rollback_identity_digest=digest,
+            parent_digest, destination_parent_digest, sync_mask = (
+                self._rollback_parent_evidence(identity, event)
+            )
+            self._store.record_rollback_filesystem_applied(
+                run_id, event.edit_id,
+                rollback_identity_digest=digest,
+                rollback_parent_identity_digest=parent_digest,
+                rollback_destination_parent_identity_digest=(
+                    destination_parent_digest
+                ),
+                rollback_sync_mask=sync_mask,
                 error_code=failure_code,
             )
         if operation == "create":
@@ -1063,6 +1111,159 @@ class WorkspaceMutationEngine:
             )
         finally:
             destination_parent.close()
+            source_parent.close()
+
+    def _rollback_parent_evidence(
+        self, identity: MutationObjectIdentity, event: ValidatedRecoveryEvent,
+    ) -> tuple[str, str, int]:
+        operation = event.operation.value
+        source_digest = self._parent_identity_digest(
+            identity, run_id=event.execution_run_id, edit_id=event.edit_id,
+            operation=operation,
+        )
+        if not source_digest:
+            raise WorkspaceMutationError(
+                "rollback-parent-identity-missing",
+                "rollback source parent identity was not observed",
+            )
+        if event.operation != PlannedEditOperation.RENAME:
+            return source_digest, "", 1
+        destination_digest = self._parent_identity_digest(
+            identity, run_id=event.execution_run_id, edit_id=event.edit_id,
+            operation=operation, destination=True,
+        )
+        if not destination_digest:
+            raise WorkspaceMutationError(
+                "rollback-parent-identity-missing",
+                "rollback destination parent identity was not observed",
+            )
+        source_identity = (
+            identity.source_parent_dev, identity.source_parent_ino,
+        )
+        destination_identity = (
+            identity.destination_parent_dev, identity.destination_parent_ino,
+        )
+        return (
+            source_digest, destination_digest,
+            1 if source_identity == destination_identity else 3,
+        )
+
+    def _persist_legacy_rollback_filesystem_state(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent, *,
+        expected_phase: str, failure_code: str,
+    ) -> ValidatedRecoveryEvent:
+        """Upgrade old ownership-only rollback rows to the sync-required phase."""
+        identity = self._observe_rollback_identity(handle, event)
+        parent_digest, destination_digest, sync_mask = (
+            self._rollback_parent_evidence(identity, event)
+        )
+        self._store.record_rollback_filesystem_applied(
+            event.execution_run_id, event.edit_id,
+            rollback_identity_digest=event.rollback_identity_digest,
+            rollback_parent_identity_digest=parent_digest,
+            rollback_destination_parent_identity_digest=destination_digest,
+            rollback_sync_mask=sync_mask, error_code=failure_code,
+            expected_phase=expected_phase,
+        )
+        return self._reload_recovery_event(
+            event.execution_run_id, event.edit_id,
+        )
+
+    def _reload_recovery_event(
+        self, execution_run_id: str, edit_id: str,
+    ) -> ValidatedRecoveryEvent:
+        run = self._store.get_execution_run(execution_run_id)
+        journal = self._validated_journal(run, allow_partial=True)
+        for event in journal.events:
+            if event.edit_id == edit_id:
+                return event
+        raise WorkspaceMutationError(
+            "recovery-journal-missing", "rollback edit disappeared from journal",
+        )
+
+    def _verify_rollback_parent_identities(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent,
+    ) -> MutationObjectIdentity:
+        identity = self._observe_rollback_identity(handle, event)
+        source_digest, destination_digest, sync_mask = (
+            self._rollback_parent_evidence(identity, event)
+        )
+        if (
+            source_digest != event.rollback_parent_identity_digest
+            or destination_digest
+            != event.rollback_destination_parent_identity_digest
+            or sync_mask != event.rollback_sync_mask
+        ):
+            raise WorkspaceMutationError(
+                "rollback-parent-identity-drift",
+                "rollback parent directory identity changed",
+            )
+        return identity
+
+    def _sync_rollback_directories(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent,
+    ) -> None:
+        """Idempotently fsync persisted rollback parents via fixed dirfds."""
+        self._verify_rollback_parent_identities(handle, event)
+        source_path = (
+            event.destination.value
+            if event.operation == PlannedEditOperation.RENAME
+            else event.path.value
+        )
+        source_parent = handle.parent(source_path)
+        destination_parent = None
+        try:
+            source_parent.revalidate()
+            observed = MutationObjectIdentity(
+                False,
+                source_parent_dev=source_parent.identity[0],
+                source_parent_ino=source_parent.identity[1],
+            )
+            if event.operation == PlannedEditOperation.RENAME:
+                destination_parent = handle.parent(event.path.value)
+                observed = MutationObjectIdentity(
+                    False,
+                    source_parent_dev=source_parent.identity[0],
+                    source_parent_ino=source_parent.identity[1],
+                    destination_parent_dev=destination_parent.identity[0],
+                    destination_parent_ino=destination_parent.identity[1],
+                )
+            source_digest, destination_digest, mask = (
+                self._rollback_parent_evidence(observed, event)
+            )
+            if (
+                source_digest != event.rollback_parent_identity_digest
+                or destination_digest
+                != event.rollback_destination_parent_identity_digest
+                or mask != event.rollback_sync_mask
+            ):
+                raise WorkspaceMutationError(
+                    "rollback-parent-identity-drift",
+                    "rollback parent changed before directory sync",
+                )
+            source_parent.fsync()
+            if event.rollback_sync_mask & 2:
+                if destination_parent is None:
+                    raise WorkspaceMutationError(
+                        "rollback-sync-scope-invalid",
+                        "destination parent sync capability is missing",
+                    )
+                destination_parent.revalidate()
+                destination_parent.fsync()
+            self._verify_rollback_identity(
+                handle, event,
+                {event.path.value: InitialPathState(
+                    event.path.value,
+                    event.operation != PlannedEditOperation.CREATE,
+                    event.before_hash, event.before_mode,
+                    "regular" if event.operation != PlannedEditOperation.CREATE
+                    else "missing",
+                )},
+            )
+            self._verify_rollback_parent_identities(handle, event)
+        finally:
+            if destination_parent is not None:
+                destination_parent.close()
             source_parent.close()
 
     def _event_matches_unchanged_baseline(
@@ -1543,6 +1744,7 @@ class WorkspaceMutationEngine:
             phases = {
                 "journaled", "mutation-started", "filesystem-applied",
                 "directory-synced", "applied", "rollback-started",
+                "rollback-filesystem-applied", "rollback-directory-synced",
                 "rolled-back",
             }
             for row in rows:
@@ -1576,8 +1778,26 @@ class WorkspaceMutationEngine:
                     "applied_destination_identity_digest",
                     "rollback_identity_digest",
                 ))
-                if any(value and not hash_re.fullmatch(value) for value in identity_fields):
+                rollback_parent_fields = tuple(str(row[name] or "") for name in (
+                    "rollback_parent_identity_digest",
+                    "rollback_destination_parent_identity_digest",
+                    "rollback_directory_sync_digest",
+                ))
+                if any(
+                    value and not hash_re.fullmatch(value)
+                    for value in identity_fields + rollback_parent_fields
+                ):
                     raise UnsafePersistedIdentifier("identity digest invalid")
+                rollback_sync_mask = row["rollback_sync_mask"]
+                rollback_synced_at = row["rollback_synced_at"]
+                if (type(rollback_sync_mask) is not int
+                        or rollback_sync_mask not in {0, 1, 3}):
+                    raise UnsafePersistedIdentifier("rollback sync mask invalid")
+                if (rollback_synced_at is not None
+                        and (not isinstance(rollback_synced_at, (int, float))
+                             or isinstance(rollback_synced_at, bool)
+                             or rollback_synced_at <= 0)):
+                    raise UnsafePersistedIdentifier("rollback sync time invalid")
                 phase_versions = {
                     "journaled": frozenset({0}),
                     "mutation-started": frozenset({1}),
@@ -1585,16 +1805,20 @@ class WorkspaceMutationEngine:
                     "directory-synced": frozenset({3}),
                     "applied": frozenset({4}),
                     "rollback-started": frozenset({3, 4, 5}),
-                    "rolled-back": frozenset({1, 2, 4, 5, 6}),
+                    "rollback-filesystem-applied": frozenset({4, 5, 6, 7}),
+                    "rollback-directory-synced": frozenset({5, 6, 7, 8}),
+                    "rolled-back": frozenset({1, 2, 4, 5, 6, 7, 8}),
                 }
                 if (type(phase_version) is not int
                         or phase_version not in phase_versions[row["status"]]):
                     raise UnsafePersistedIdentifier("durable phase version invalid")
-                if type(identity_version) is not int or identity_version not in {0, 1, 2}:
+                if (type(identity_version) is not int
+                        or identity_version not in {0, 1, 2, 3}):
                     raise UnsafePersistedIdentifier("identity version invalid")
                 applied_phases = {
                     "filesystem-applied", "directory-synced", "applied",
-                    "rollback-started",
+                    "rollback-started", "rollback-filesystem-applied",
+                    "rollback-directory-synced",
                 }
                 requires_applied_identity = (
                     row["status"] in applied_phases
@@ -1610,14 +1834,98 @@ class WorkspaceMutationEngine:
                         raise UnsafePersistedIdentifier("rename identity evidence missing")
                 elif identity_version != 0 or any(identity_fields):
                     raise UnsafePersistedIdentifier("premature identity evidence")
-                if row["status"] == "rolled-back":
-                    if phase_version > 2 and (
-                        identity_version != 2 or not identity_fields[3]
-                    ):
-                        raise UnsafePersistedIdentifier("rollback identity evidence missing")
-                elif identity_fields[3] or identity_version == 2:
-                    if row["status"] != "rollback-started":
-                        raise UnsafePersistedIdentifier("rollback identity phase mismatch")
+                rollback_phase = row["status"]
+                has_rollback_identity = bool(identity_fields[3])
+                has_parent_evidence = bool(rollback_parent_fields[0])
+                has_sync_evidence = bool(rollback_parent_fields[2])
+                if has_sync_evidence:
+                    expected_sync_digest = (
+                        self._store._rollback_directory_sync_digest(
+                            execution_run_id=run.execution_run_id,
+                            edit_id=row["edit_id"],
+                            parent_identity_digest=rollback_parent_fields[0],
+                            destination_parent_identity_digest=(
+                                rollback_parent_fields[1]
+                            ),
+                            sync_mask=rollback_sync_mask,
+                        )
+                    )
+                    if rollback_parent_fields[2] != expected_sync_digest:
+                        raise UnsafePersistedIdentifier(
+                            "rollback directory sync digest mismatch"
+                        )
+                if rollback_phase in {
+                    "rollback-filesystem-applied", "rollback-directory-synced",
+                }:
+                    if (identity_version < 2 or not has_rollback_identity
+                            or not has_parent_evidence
+                            or rollback_sync_mask not in {1, 3}):
+                        raise UnsafePersistedIdentifier(
+                            "rollback filesystem evidence missing"
+                        )
+                    if (operation == PlannedEditOperation.RENAME
+                            and not rollback_parent_fields[1]):
+                        raise UnsafePersistedIdentifier(
+                            "rename rollback parent evidence missing"
+                        )
+                    if (operation != PlannedEditOperation.RENAME
+                            and (rollback_parent_fields[1]
+                                 or rollback_sync_mask != 1)):
+                        raise UnsafePersistedIdentifier(
+                            "rollback parent scope invalid"
+                        )
+                if rollback_phase == "rollback-filesystem-applied":
+                    if (has_sync_evidence or rollback_synced_at is not None
+                            or identity_version != 2):
+                        raise UnsafePersistedIdentifier(
+                            "premature rollback sync evidence"
+                        )
+                elif rollback_phase == "rollback-directory-synced":
+                    if (not has_sync_evidence or rollback_synced_at is None
+                            or identity_version != 3):
+                        raise UnsafePersistedIdentifier(
+                            "rollback directory sync evidence missing"
+                        )
+                elif rollback_phase == "rolled-back" and phase_version > 2:
+                    if not has_rollback_identity:
+                        raise UnsafePersistedIdentifier(
+                            "rollback identity evidence missing"
+                        )
+                    # Batch 3.0.6 terminal rows remain readable.  Incomplete
+                    # runs are upgraded and fsynced before terminalization.
+                    if identity_version == 3:
+                        if (not has_parent_evidence or not has_sync_evidence
+                                or rollback_synced_at is None
+                                or rollback_sync_mask not in {1, 3}
+                                or (operation == PlannedEditOperation.RENAME
+                                    and not rollback_parent_fields[1])
+                                or (operation != PlannedEditOperation.RENAME
+                                    and (rollback_parent_fields[1]
+                                         or rollback_sync_mask != 1))):
+                            raise UnsafePersistedIdentifier(
+                                "rollback directory sync evidence missing"
+                            )
+                    elif identity_version != 2:
+                        raise UnsafePersistedIdentifier(
+                            "rollback identity version invalid"
+                        )
+                elif has_rollback_identity or identity_version == 2:
+                    if rollback_phase != "rollback-started":
+                        raise UnsafePersistedIdentifier(
+                            "rollback identity phase mismatch"
+                        )
+                    if (has_parent_evidence or rollback_parent_fields[1]
+                            or has_sync_evidence or rollback_sync_mask
+                            or rollback_synced_at is not None):
+                        raise UnsafePersistedIdentifier(
+                            "legacy rollback evidence is inconsistent"
+                        )
+                elif (has_parent_evidence or rollback_parent_fields[1]
+                      or has_sync_evidence or rollback_sync_mask
+                      or rollback_synced_at is not None):
+                    raise UnsafePersistedIdentifier(
+                        "rollback evidence appears before rollback syscall"
+                    )
                 if operation == PlannedEditOperation.CREATE:
                     valid = not before_hash and before_mode is None and artifact is None and destination is None and after_hash and after_mode is not None
                 elif operation == PlannedEditOperation.UPDATE:
@@ -1664,6 +1972,8 @@ class WorkspaceMutationEngine:
                     before_hash, after_hash, before_mode, after_mode, artifact,
                     row["status"], phase_version, *identity_fields,
                     identity_version, run.execution_run_id,
+                    *rollback_parent_fields[:2], rollback_sync_mask,
+                    rollback_parent_fields[2], rollback_synced_at,
                 ))
         except (UnsafePersistedIdentifier, TypeError, ValueError) as exc:
             raise WorkspaceMutationError(
