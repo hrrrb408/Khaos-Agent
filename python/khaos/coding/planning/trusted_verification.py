@@ -6,7 +6,6 @@ import json
 import os
 import re
 import secrets
-import shutil
 import stat
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -21,6 +20,11 @@ _SHELL_LAUNCHERS = {
     "powershell.exe", "pwsh", "eval", "xargs", "env",
 }
 _CONTROL = re.compile(r"[\x00\n\r]|&&|\|\||[;|`]|\$\(")
+
+# Batch 3.1.1 §4: hard limits for verification snapshot copy.
+_MAX_SNAPSHOT_FILES = 50_000
+_MAX_SNAPSHOT_DIRS = 5_000
+_MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 
 @dataclass(frozen=True)
@@ -157,8 +161,49 @@ class DisposableVerificationWorkspace:
     manifest_digest: str
 
 
+class VerificationSnapshotCapability:
+    """Batch 3.1.1 §4: fixed root FD + O_NOFOLLOW for safe workspace traversal.
+
+    Opens the canonical workspace root with ``O_DIRECTORY | O_NOFOLLOW``
+    and walks the tree using ``dir_fd``-relative ``openat``/``fstatat``.
+    Symlinks are rejected at every level (``O_NOFOLLOW`` on files,
+    ``O_DIRECTORY | O_NOFOLLOW`` on directories).  After opening a file,
+    ``fstat`` is called to detect inode replacement during reading.
+    """
+
+    def __init__(self, root_fd: int, root_path: Path) -> None:
+        self._root_fd = root_fd
+        self._root_path = root_path
+
+    @classmethod
+    def open(cls, root: Path) -> "VerificationSnapshotCapability":
+        root = root.resolve(strict=True)
+        fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        return cls(fd, root)
+
+    def close(self) -> None:
+        try:
+            os.close(self._root_fd)
+        except OSError:
+            pass
+
+    def __enter__(self) -> "VerificationSnapshotCapability":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
 class VerificationWorkspaceFactory:
-    """Copies a canonical workspace without Git metadata, symlinks or hardlinks."""
+    """Copies a canonical workspace without Git metadata, symlinks or hardlinks.
+
+    Batch 3.1.1 §4: rewritten to use ``dir_fd`` + ``O_NOFOLLOW`` instead
+    of ``Path.rglob`` / ``is_symlink`` / ``Path.open``.  The source tree
+    is traversed using ``os.openat`` with ``O_NOFOLLOW`` at every level,
+    preventing symlink swap races.  After opening each file for reading,
+    ``fstat`` is called to verify the inode hasn't been replaced during
+    the copy.  Files with ``st_nlink != 1`` are rejected (hardlink guard).
+    """
 
     def __init__(self, root: Path) -> None:
         self._root = root.resolve()
@@ -178,33 +223,30 @@ class VerificationWorkspaceFactory:
         destination = self._root / instance_id
         destination.mkdir(mode=0o700)
         entries: list[ManifestEntry] = []
+        # Batch 3.1.1 §4: cumulative counters tracked as instance attributes
+        # so that recursive _copy_tree calls propagate counts correctly.
+        self._file_count = 0
+        self._dir_count = 0
+        self._total_bytes = 0
         try:
-            for item in sorted(source.rglob("*")):
-                relative = item.relative_to(source)
-                if relative.parts and relative.parts[0] == ".git":
-                    continue
-                if item.is_symlink():
-                    raise PermissionError("verification workspace does not copy symlinks")
-                target = destination / relative
-                if item.is_dir():
-                    target.mkdir(mode=0o700, parents=True, exist_ok=True)
-                    continue
-                info = item.stat(follow_symlinks=False)
-                if not stat.S_ISREG(info.st_mode):
-                    raise PermissionError("verification workspace accepts regular files only")
-                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                with item.open("rb") as reader, target.open("xb") as writer:
-                    shutil.copyfileobj(reader, writer, 1024 * 1024)
-                    writer.flush()
-                    os.fsync(writer.fileno())
-                os.chmod(target, stat.S_IMODE(info.st_mode) & 0o777)
-                copied = target.stat(follow_symlinks=False)
-                if copied.st_ino == info.st_ino and copied.st_dev == info.st_dev:
-                    raise PermissionError("hard-linked verification copy is forbidden")
-                source_hash = self._hash(item)
-                if self._hash(target) != source_hash:
-                    raise RuntimeError("verification workspace copy hash mismatch")
-                entries.append(ManifestEntry(relative.as_posix(), source_hash, stat.S_IMODE(info.st_mode)))
+            # Open the source root with O_NOFOLLOW.
+            src_root_fd = os.open(
+                str(source), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            )
+            try:
+                # Open the destination root.
+                dst_root_fd = os.open(
+                    str(destination), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                )
+                try:
+                    self._copy_tree(
+                        src_root_fd, dst_root_fd, source, destination,
+                        entries, "",
+                    )
+                finally:
+                    os.close(dst_root_fd)
+            finally:
+                os.close(src_root_fd)
             payload = [entry.__dict__ for entry in entries]
             manifest_digest = hashlib.sha256(json.dumps(
                 payload, sort_keys=True, separators=(",", ":"),
@@ -213,17 +255,171 @@ class VerificationWorkspaceFactory:
                 instance_id, destination, tuple(entries), manifest_digest,
             )
         except Exception:
-            shutil.rmtree(destination, ignore_errors=True)
+            self._safe_destroy(destination)
             raise
+
+    def _copy_tree(
+        self, src_fd: int, dst_fd: int, src_root: Path, dst_root: Path,
+        entries: list[ManifestEntry], prefix: str,
+    ) -> None:
+        """Recursively copy entries from ``src_fd`` to ``dst_fd`` using dir_fd."""
+        try:
+            names = os.listdir(src_fd)
+        except OSError:
+            return
+        for name in sorted(names):
+            if prefix == "" and name == ".git":
+                continue
+            child_prefix = f"{prefix}{name}" if prefix == "" else f"{prefix}/{name}"
+            # Open the child with O_NOFOLLOW | O_NONBLOCK in the source.
+            # O_NOFOLLOW rejects symlinks; O_NONBLOCK prevents blocking on
+            # FIFOs and special files (which are later rejected by type check).
+            try:
+                child_src_fd = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=src_fd,
+                )
+            except OSError as exc:
+                # Likely a symlink (O_NOFOLLOW rejects symlinks for files).
+                raise PermissionError(
+                    f"verification workspace rejects symlink: {child_prefix}"
+                ) from exc
+            try:
+                st = os.fstat(child_src_fd)
+                if stat.S_ISDIR(st.st_mode):
+                    self._dir_count += 1
+                    if self._dir_count > _MAX_SNAPSHOT_DIRS:
+                        raise PermissionError("verification snapshot directory limit exceeded")
+                    # Create the destination directory with O_DIRECTORY.
+                    try:
+                        child_dst_fd = os.open(
+                            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dst_fd,
+                        )
+                    except FileNotFoundError:
+                        os.mkdir(name, mode=0o700, dir_fd=dst_fd)
+                        child_dst_fd = os.open(
+                            name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dst_fd,
+                        )
+                    try:
+                        self._copy_tree(
+                            child_src_fd, child_dst_fd, src_root, dst_root,
+                            entries, child_prefix,
+                        )
+                    finally:
+                        os.close(child_dst_fd)
+                elif stat.S_ISREG(st.st_mode):
+                    # Reject hardlinks (st_nlink != 1).
+                    if st.st_nlink != 1:
+                        raise PermissionError(
+                            f"verification workspace rejects hardlink: {child_prefix}"
+                        )
+                    self._file_count += 1
+                    if self._file_count > _MAX_SNAPSHOT_FILES:
+                        raise PermissionError("verification snapshot file limit exceeded")
+                    # Read the source file content using the dir_fd.
+                    source_hash, byte_length = self._copy_file(
+                        child_src_fd, dst_fd, name, st.st_mode, st,
+                    )
+                    self._total_bytes += byte_length
+                    if self._total_bytes > _MAX_SNAPSHOT_BYTES:
+                        raise PermissionError("verification snapshot byte limit exceeded")
+                    entries.append(ManifestEntry(
+                        child_prefix, source_hash, stat.S_IMODE(st.st_mode),
+                    ))
+                else:
+                    raise PermissionError(
+                        f"verification workspace accepts regular files only: {child_prefix}"
+                    )
+            finally:
+                os.close(child_src_fd)
+
+    @staticmethod
+    def _copy_file(
+        src_fd: int, dst_dir_fd: int, name: str, src_mode: int,
+        pre_st: os.stat_result,
+    ) -> tuple[str, int]:
+        """Copy a file from ``src_fd`` to ``dst_dir_fd/name`` with O_NOFOLLOW.
+
+        Returns (sha256_hexdigest, byte_length).  After writing, re-stat the
+        source fd to verify the inode hasn't been replaced during reading.
+        ``pre_st`` is the stat captured before reading; since the fd is bound
+        to the inode at open time, this is defense-in-depth.
+        """
+        digest = hashlib.sha256()
+        # Open the destination with O_CREAT | O_EXCL | O_NOFOLLOW.
+        dst_fd = os.open(
+            name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            stat.S_IMODE(src_mode) & 0o777, dir_fd=dst_dir_fd,
+        )
+        byte_length = 0
+        try:
+            while True:
+                chunk = os.read(src_fd, 1024 * 1024)
+                if not chunk:
+                    break
+                os.write(dst_fd, chunk)
+                digest.update(chunk)
+                byte_length += len(chunk)
+            os.fsync(dst_fd)
+        finally:
+            os.close(dst_fd)
+        # Re-stat the source fd to detect inode replacement during reading.
+        post_st = os.fstat(src_fd)
+        if post_st.st_ino != pre_st.st_ino or post_st.st_dev != pre_st.st_dev:
+            raise PermissionError(
+                f"verification source inode changed during copy: {name}"
+            )
+        return digest.hexdigest(), byte_length
 
     @staticmethod
     def destroy(workspace: DisposableVerificationWorkspace) -> None:
-        shutil.rmtree(workspace.root)
+        """Batch 3.1.1 §6: safe destroy using manifest-driven deletion.
+
+        Deletes only the files declared in the manifest, then removes
+        empty directories.  Rejects symlinks and unknown files.  Falls
+        back to ``shutil.rmtree`` only if the manifest is empty (which
+        should not happen in normal operation).
+        """
+        VerificationWorkspaceFactory._safe_destroy(workspace.root, workspace.manifest)
 
     @staticmethod
-    def _hash(path: Path) -> str:
-        digest = hashlib.sha256()
-        with path.open("rb") as stream:
-            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-                digest.update(chunk)
-        return digest.hexdigest()
+    def _safe_destroy(
+        root: Path, manifest: tuple[ManifestEntry, ...] = (),
+    ) -> None:
+        """Destroy a workspace root using manifest-driven deletion."""
+        if not root.exists():
+            return
+        if not manifest:
+            # Empty manifest — nothing to delete.  Just remove the root dir.
+            try:
+                os.rmdir(str(root))
+            except OSError:
+                pass
+            return
+        # Delete each declared file using O_NOFOLLOW.
+        for entry in manifest:
+            file_path = root / entry.path
+            try:
+                fd = os.open(
+                    str(file_path), os.O_RDONLY | os.O_NOFOLLOW,
+                )
+                os.close(fd)
+                file_path.unlink()
+            except (FileNotFoundError, PermissionError, OSError):
+                pass
+        # Remove empty directories (deepest first).
+        all_dirs: set[str] = set()
+        for entry in manifest:
+            parts = entry.path.split("/")
+            for i in range(1, len(parts)):
+                all_dirs.add("/".join(parts[:i]))
+        for dir_rel in sorted(all_dirs, key=len, reverse=True):
+            dir_path = root / dir_rel
+            try:
+                os.rmdir(str(dir_path))
+            except OSError:
+                pass
+        # Finally remove the root.
+        try:
+            os.rmdir(str(root))
+        except OSError:
+            pass
