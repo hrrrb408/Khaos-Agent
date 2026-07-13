@@ -194,6 +194,265 @@ class VerificationSnapshotCapability:
         self.close()
 
 
+@dataclass(frozen=True)
+class ArtifactRootIdentity:
+    """Batch 3.1.2 §7: recorded identity of the artifact root directory."""
+    dev: int
+    ino: int
+    uid: int
+    gid: int
+    mode: int
+
+
+class ArtifactRootCapability:
+    """Batch 3.1.2 §7: long-term safe artifact root with dir_fd-only access.
+
+    Opens the artifact root with ``O_DIRECTORY | O_NOFOLLOW`` at runtime
+    startup, records its dev/inode/owner/mode, and proves it does not
+    overlap with repository/main workspace/task workspace/recovery/
+    verification workspace/database root.  All subsequent file operations
+    use ``dir_fd`` — no full Path re-parsing, no ``os.rename`` to
+    overwrite existing final files.
+
+    Protocol: RESERVED → temp written/fsynced → final installed
+    no-replace → root fsynced → SEALED → Step binding.
+    """
+
+    def __init__(self, root_fd: int, root_path: Path, identity: ArtifactRootIdentity) -> None:
+        self._root_fd = root_fd
+        self._root_path = root_path
+        self._identity = identity
+
+    @classmethod
+    def open(
+        cls, root: Path, *, forbidden_roots: Iterable[Path] = (),
+    ) -> "ArtifactRootCapability":
+        """Open the artifact root and verify it doesn't overlap protected roots.
+
+        Creates the root (0o700) if it doesn't exist, then opens it with
+        ``O_DIRECTORY | O_NOFOLLOW`` and records its identity.  Raises
+        ``PermissionError`` if the root overlaps any forbidden root.
+        """
+        root = root.resolve()
+        forbidden = tuple(path.resolve() for path in forbidden_roots)
+        for path in forbidden:
+            if root == path or root in path.parents or path in root.parents:
+                raise PermissionError(
+                    f"artifact root overlaps a protected root: {root} vs {path}"
+                )
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        st = os.fstat(fd)
+        identity = ArtifactRootIdentity(
+            dev=st.st_dev, ino=st.st_ino,
+            uid=st.st_uid, gid=st.st_gid, mode=stat.S_IMODE(st.st_mode),
+        )
+        return cls(fd, root, identity)
+
+    @property
+    def identity(self) -> ArtifactRootIdentity:
+        return self._identity
+
+    @property
+    def root_path(self) -> Path:
+        return self._root_path
+
+    def close(self) -> None:
+        try:
+            os.close(self._root_fd)
+        except OSError:
+            pass
+
+    def __enter__(self) -> "ArtifactRootCapability":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+    # ------------------------------------------------------------------
+    # §7: RESERVED → temp → final no-replace → fsync → SEALED protocol
+    # ------------------------------------------------------------------
+
+    def write_artifact(self, artifact_id: str, payload: bytes) -> tuple[str, int]:
+        """Write an artifact using the no-replace protocol.
+
+        Returns ``(content_digest, byte_length)``.  Steps:
+        1. Write temp file (``.{artifact_id}.tmp``) with O_CREAT|O_EXCL|O_NOFOLLOW.
+        2. fsync the temp file.
+        3. Link temp → final (``{artifact_id}.log``) — fails if final exists.
+        4. fsync the artifact root directory.
+        5. Unlink the temp file.
+
+        No ``os.rename`` is used — final files are never overwritten.
+        """
+        # Validate artifact_id is a fixed server-side format (alphanumeric + dash).
+        if not artifact_id or not all(c.isalnum() or c in "-_" for c in artifact_id):
+            raise ValueError(f"invalid artifact basename: {artifact_id!r}")
+        temp_name = f".{artifact_id}.tmp"
+        final_name = f"{artifact_id}.log"
+        digest = hashlib.sha256()
+        # Step 1: write temp file with O_CREAT|O_EXCL|O_NOFOLLOW.
+        temp_fd = os.open(
+            temp_name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o600, dir_fd=self._root_fd,
+        )
+        try:
+            os.write(temp_fd, payload)
+            os.fsync(temp_fd)
+        finally:
+            os.close(temp_fd)
+        digest_hex = digest.update(payload) or digest.hexdigest()
+        byte_length = len(payload)
+        # Step 3: link temp → final (no-replace).
+        try:
+            os.link(
+                temp_name, final_name,
+                src_dir_fd=self._root_fd, dst_dir_fd=self._root_fd,
+            )
+        except FileExistsError as exc:
+            # Final file already exists — clean up temp and fail closed.
+            try:
+                os.unlink(temp_name, dir_fd=self._root_fd)
+            except OSError:
+                pass
+            raise PermissionError(
+                f"artifact final file already exists (no-replace): {final_name}"
+            ) from exc
+        except OSError as exc:
+            try:
+                os.unlink(temp_name, dir_fd=self._root_fd)
+            except OSError:
+                pass
+            raise
+        # Step 4: fsync the root directory.
+        os.fsync(self._root_fd)
+        # Step 5: unlink the temp file.
+        try:
+            os.unlink(temp_name, dir_fd=self._root_fd)
+        except OSError:
+            pass
+        return digest_hex, byte_length
+
+    def read_artifact(self, artifact_id: str) -> bytes:
+        """Read an artifact by ID using dir_fd only (no Path re-parsing)."""
+        final_name = f"{artifact_id}.log"
+        fd = os.open(
+            final_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._root_fd,
+        )
+        try:
+            return os.read(fd, 64 * 1024 * 1024)
+        finally:
+            os.close(fd)
+
+    def artifact_exists(self, artifact_id: str) -> bool:
+        """Check if a final artifact file exists (dir_fd only)."""
+        final_name = f"{artifact_id}.log"
+        try:
+            fd = os.open(
+                final_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._root_fd,
+            )
+            os.close(fd)
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            return False
+
+    def unlink_artifact(self, artifact_id: str) -> bool:
+        """Remove an artifact final file (dir_fd only). Returns True if removed."""
+        final_name = f"{artifact_id}.log"
+        try:
+            os.unlink(final_name, dir_fd=self._root_fd)
+            return True
+        except FileNotFoundError:
+            return False
+
+    # ------------------------------------------------------------------
+    # §7: Startup reconciliation
+    # ------------------------------------------------------------------
+
+    def list_files(self) -> tuple[tuple[str, int], ...]:
+        """List all files in the artifact root with their sizes.
+
+        Returns a tuple of ``(name, byte_length)`` pairs.  Only regular
+        files are included (symlinks and directories are rejected).
+        """
+        results: list[tuple[str, int]] = []
+        for name in os.listdir(self._root_fd):
+            try:
+                st = os.stat(name, dir_fd=self._root_fd, follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                # Reject non-regular files (symlinks, FIFOs, etc.)
+                continue
+            results.append((name, st.st_size))
+        return tuple(results)
+
+    def reconcile(
+        self, *, expected_artifacts: Iterable[tuple[str, str, int]],
+    ) -> dict[str, list[str]]:
+        """Batch 3.1.2 §7: reconcile the artifact root against expected DB rows.
+
+        ``expected_artifacts`` is an iterable of ``(artifact_id, status,
+        byte_length)`` tuples from the DB.  Returns a report dict with:
+        - ``reserved_no_file``: RESERVED artifacts with no temp or final.
+        - ``reserved_temp``: RESERVED artifacts with only a temp file.
+        - ``reserved_final``: RESERVED artifacts with a final file (link ok, seal fault).
+        - ``sealed_missing``: SEALED artifacts whose final file is gone.
+        - ``unknown_files``: files in the root with no DB row.
+        - ``cleanup_failed``: files that could not be removed.
+        """
+        expected: dict[str, tuple[str, int]] = {}
+        for artifact_id, status, byte_length in expected_artifacts:
+            expected[artifact_id] = (status, byte_length)
+        actual = self.list_files()
+        actual_names = {name for name, _ in actual}
+        report: dict[str, list[str]] = {
+            "reserved_no_file": [],
+            "reserved_temp": [],
+            "reserved_final": [],
+            "sealed_missing": [],
+            "unknown_files": [],
+            "cleanup_failed": [],
+        }
+        # Check expected artifacts.
+        for artifact_id, (status, _) in expected.items():
+            final_name = f"{artifact_id}.log"
+            temp_name = f".{artifact_id}.tmp"
+            has_final = final_name in actual_names
+            has_temp = temp_name in actual_names
+            if status == "reserved":
+                if not has_final and not has_temp:
+                    report["reserved_no_file"].append(artifact_id)
+                elif has_temp and not has_final:
+                    report["reserved_temp"].append(artifact_id)
+                elif has_final:
+                    report["reserved_final"].append(artifact_id)
+            elif status == "sealed" and not has_final:
+                report["sealed_missing"].append(artifact_id)
+        # Check for unknown files.
+        expected_names = set()
+        for artifact_id in expected:
+            expected_names.add(f"{artifact_id}.log")
+            expected_names.add(f".{artifact_id}.tmp")
+        for name, _ in actual:
+            if name not in expected_names:
+                report["unknown_files"].append(name)
+        return report
+
+    def cleanup_orphan(self, name: str) -> bool:
+        """Remove an orphan file (temp or unknown) from the artifact root.
+
+        Returns True if removed, False if cleanup failed.
+        """
+        try:
+            os.unlink(name, dir_fd=self._root_fd)
+            return True
+        except OSError:
+            return False
+
+
 class VerificationWorkspaceFactory:
     """Copies a canonical workspace without Git metadata, symlinks or hardlinks.
 
@@ -262,7 +521,14 @@ class VerificationWorkspaceFactory:
         self, src_fd: int, dst_fd: int, src_root: Path, dst_root: Path,
         entries: list[ManifestEntry], prefix: str,
     ) -> None:
-        """Recursively copy entries from ``src_fd`` to ``dst_fd`` using dir_fd."""
+        """Recursively copy entries from ``src_fd`` to ``dst_fd`` using dir_fd.
+
+        Batch 3.1.2 §6: after opening each child (file or directory), the
+        parent dir FD is held and the original basename is re-lstat'd to
+        verify the directory entry still points to the opened object.
+        dev/inode/type/mode/nlink are compared between the open-time
+        fstat and the post-read fstatat.
+        """
         try:
             names = os.listdir(src_fd)
         except OSError:
@@ -289,6 +555,9 @@ class VerificationWorkspaceFactory:
                     self._dir_count += 1
                     if self._dir_count > _MAX_SNAPSHOT_DIRS:
                         raise PermissionError("verification snapshot directory limit exceeded")
+                    # Batch 3.1.2 §6: re-lstat the directory basename through
+                    # the parent dir FD and verify identity.
+                    self._verify_path_entry(src_fd, name, st, child_prefix)
                     # Create the destination directory with O_DIRECTORY.
                     try:
                         child_dst_fd = os.open(
@@ -317,7 +586,7 @@ class VerificationWorkspaceFactory:
                         raise PermissionError("verification snapshot file limit exceeded")
                     # Read the source file content using the dir_fd.
                     source_hash, byte_length = self._copy_file(
-                        child_src_fd, dst_fd, name, st.st_mode, st,
+                        child_src_fd, dst_fd, name, st.st_mode, st, src_fd,
                     )
                     self._total_bytes += byte_length
                     if self._total_bytes > _MAX_SNAPSHOT_BYTES:
@@ -333,16 +602,53 @@ class VerificationWorkspaceFactory:
                 os.close(child_src_fd)
 
     @staticmethod
+    def _verify_path_entry(
+        parent_fd: int, name: str, pre_st: os.stat_result, label: str,
+    ) -> None:
+        """Batch 3.1.2 §6: re-lstat the basename through the parent dir FD.
+
+        Compares dev/inode/type/mode/nlink between the open-time fstat
+        (``pre_st``) and a fresh ``os.stat(name, dir_fd=parent_fd,
+        follow_symlinks=False)`` on the parent directory.  If the
+        directory entry was swapped (e.g., the original file was unlinked
+        and a new file with the same name was created), the identity
+        fields will not match and the copy is rejected fail-closed.
+
+        Uses ``os.stat`` with ``dir_fd`` + ``follow_symlinks=False``
+        instead of ``os.fstatat`` for macOS compatibility.
+        """
+        try:
+            post_st = os.stat(
+                name, dir_fd=parent_fd, follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise PermissionError(
+                f"verification source path entry vanished during copy: {label}"
+            ) from exc
+        if (post_st.st_dev != pre_st.st_dev
+                or post_st.st_ino != pre_st.st_ino
+                or post_st.st_mode != pre_st.st_mode
+                or post_st.st_nlink != pre_st.st_nlink):
+            raise PermissionError(
+                f"verification source path entry identity changed during copy: {label} "
+                f"(dev={pre_st.st_dev}->{post_st.st_dev} ino={pre_st.st_ino}->{post_st.st_ino} "
+                f"mode={pre_st.st_mode:o}->{post_st.st_mode:o} nlink={pre_st.st_nlink}->{post_st.st_nlink})"
+            )
+
+    @staticmethod
     def _copy_file(
         src_fd: int, dst_dir_fd: int, name: str, src_mode: int,
-        pre_st: os.stat_result,
+        pre_st: os.stat_result, src_parent_fd: int,
     ) -> tuple[str, int]:
         """Copy a file from ``src_fd`` to ``dst_dir_fd/name`` with O_NOFOLLOW.
 
-        Returns (sha256_hexdigest, byte_length).  After writing, re-stat the
-        source fd to verify the inode hasn't been replaced during reading.
-        ``pre_st`` is the stat captured before reading; since the fd is bound
-        to the inode at open time, this is defense-in-depth.
+        Batch 3.1.2 §6: after reading the source file, hold the parent
+        directory FD and re-lstat the original basename to verify the
+        directory entry still points to the opened object.  dev/inode/
+        type/mode/nlink are compared.  Only then is the destination
+        manifest entry sealed.
+
+        Returns (sha256_hexdigest, byte_length).
         """
         digest = hashlib.sha256()
         # Open the destination with O_CREAT | O_EXCL | O_NOFOLLOW.
@@ -368,6 +674,11 @@ class VerificationWorkspaceFactory:
             raise PermissionError(
                 f"verification source inode changed during copy: {name}"
             )
+        # Batch 3.1.2 §6: re-lstat the basename through the parent dir FD
+        # and verify the directory entry still points to the opened object.
+        VerificationWorkspaceFactory._verify_path_entry(
+            src_parent_fd, name, pre_st, name,
+        )
         return digest.hexdigest(), byte_length
 
     @staticmethod

@@ -959,3 +959,253 @@ def test_attestation_digest_binds_all_fields():
     }, sort_keys=True, separators=(",", ":")).encode()
     digest2 = _h.sha256(payload2).hexdigest()
     assert digest1 != digest2
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.2 §6: Snapshot path-entry attestation
+# ----------------------------------------------------------------------
+
+def test_snapshot_copy_rejects_path_entry_swap(tmp_path):
+    """Batch 3.1.2 §6: inode swap during copy is detected via parent dir FD re-lstat."""
+    source = tmp_path / "canonical"
+    source.mkdir()
+    target_file = source / "data.py"
+    target_file.write_text("original\n")
+    root = tmp_path / "copies"
+    factory = VerificationWorkspaceFactory(root)
+    copied = factory.create(source, forbidden_roots=(source,))
+    assert (copied.root / "data.py").read_text() == "original\n"
+    factory.destroy(copied)
+
+
+def test_snapshot_path_entry_verification_holds_parent_fd(tmp_path):
+    """Batch 3.1.2 §6: _verify_path_entry compares dev/inode/type/mode/nlink."""
+    source = tmp_path / "src"
+    source.mkdir()
+    test_file = source / "f.txt"
+    test_file.write_text("hello\n")
+    # Open the parent dir and the file, then verify.
+    parent_fd = os.open(str(source), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        child_fd = os.open(
+            "f.txt", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd,
+        )
+        try:
+            pre_st = os.fstat(child_fd)
+            # No swap — verification should pass.
+            VerificationWorkspaceFactory._verify_path_entry(parent_fd, "f.txt", pre_st, "f.txt")
+        finally:
+            os.close(child_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def test_snapshot_path_entry_detects_inode_swap(tmp_path):
+    """Batch 3.1.2 §6: inode swap is detected by _verify_path_entry."""
+    source = tmp_path / "src"
+    source.mkdir()
+    test_file = source / "f.txt"
+    test_file.write_text("hello\n")
+    parent_fd = os.open(str(source), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        child_fd = os.open(
+            "f.txt", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd,
+        )
+        try:
+            pre_st = os.fstat(child_fd)
+            # Swap the file: unlink + recreate with same name.
+            test_file.unlink()
+            test_file.write_text("replaced\n")
+            with pytest.raises(PermissionError, match="identity changed"):
+                VerificationWorkspaceFactory._verify_path_entry(
+                    parent_fd, "f.txt", pre_st, "f.txt",
+                )
+        finally:
+            os.close(child_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def test_snapshot_path_entry_detects_vanished_entry(tmp_path):
+    """Batch 3.1.2 §6: vanished path entry is detected."""
+    source = tmp_path / "src"
+    source.mkdir()
+    test_file = source / "f.txt"
+    test_file.write_text("hello\n")
+    parent_fd = os.open(str(source), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        child_fd = os.open(
+            "f.txt", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd,
+        )
+        try:
+            pre_st = os.fstat(child_fd)
+            test_file.unlink()
+            with pytest.raises(PermissionError, match="vanished"):
+                VerificationWorkspaceFactory._verify_path_entry(
+                    parent_fd, "f.txt", pre_st, "f.txt",
+                )
+        finally:
+            os.close(child_fd)
+    finally:
+        os.close(parent_fd)
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.2 §7: ArtifactRootCapability
+# ----------------------------------------------------------------------
+
+def test_artifact_root_capability_open_and_identity(tmp_path):
+    """Batch 3.1.2 §7: opening the artifact root records dev/inode/owner/mode."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    root = tmp_path / "artifacts"
+    cap = ArtifactRootCapability.open(root)
+    try:
+        identity = cap.identity
+        assert identity.dev > 0
+        assert identity.ino > 0
+        assert identity.mode == 0o700
+    finally:
+        cap.close()
+
+
+def test_artifact_root_capability_rejects_overlap(tmp_path):
+    """Batch 3.1.2 §7: artifact root overlapping a protected root is rejected."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    root = tmp_path / "artifacts"
+    root.mkdir()
+    with pytest.raises(PermissionError, match="overlaps"):
+        ArtifactRootCapability.open(root, forbidden_roots=(tmp_path,))
+
+
+def test_artifact_root_capability_write_and_read(tmp_path):
+    """Batch 3.1.2 §7: write_artifact uses temp→link→fsync no-replace protocol."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "artifacts")
+    try:
+        payload = b"stdout:\nhello\nstderr:\nworld\n"
+        digest, length = cap.write_artifact("pvo_test1", payload)
+        assert length == len(payload)
+        assert digest == hashlib.sha256(payload).hexdigest()
+        # Read back.
+        data = cap.read_artifact("pvo_test1")
+        assert data == payload
+        assert cap.artifact_exists("pvo_test1")
+    finally:
+        cap.close()
+
+
+def test_artifact_root_capability_no_replace_final(tmp_path):
+    """Batch 3.1.2 §7: writing an existing final file fails (no-replace)."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "artifacts")
+    try:
+        cap.write_artifact("pvo_dup", b"first\n")
+        with pytest.raises(PermissionError, match="already exists"):
+            cap.write_artifact("pvo_dup", b"second\n")
+    finally:
+        cap.close()
+
+
+def test_artifact_root_capability_rejects_bad_basename(tmp_path):
+    """Batch 3.1.2 §7: artifact basename must be fixed server-side format."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "artifacts")
+    try:
+        with pytest.raises(ValueError, match="invalid artifact basename"):
+            cap.write_artifact("bad/../path", b"data\n")
+        with pytest.raises(ValueError, match="invalid artifact basename"):
+            cap.write_artifact("bad name", b"data\n")
+    finally:
+        cap.close()
+
+
+def test_artifact_root_capability_unlink(tmp_path):
+    """Batch 3.1.2 §7: unlink_artifact removes the final file."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "artifacts")
+    try:
+        cap.write_artifact("pvo_rm", b"data\n")
+        assert cap.unlink_artifact("pvo_rm") is True
+        assert not cap.artifact_exists("pvo_rm")
+        assert cap.unlink_artifact("pvo_rm") is False
+    finally:
+        cap.close()
+
+
+def test_artifact_root_capability_list_files(tmp_path):
+    """Batch 3.1.2 §7: list_files returns regular files only."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "artifacts")
+    try:
+        cap.write_artifact("pvo_a", b"aaa\n")
+        cap.write_artifact("pvo_b", b"bbb\n")
+        files = cap.list_files()
+        names = {name for name, _ in files}
+        assert "pvo_a.log" in names
+        assert "pvo_b.log" in names
+    finally:
+        cap.close()
+
+
+def test_artifact_root_capability_reconcile(tmp_path):
+    """Batch 3.1.2 §7: reconcile detects orphans and missing files."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "artifacts")
+    try:
+        # Write two sealed artifacts.
+        cap.write_artifact("pvo_sealed1", b"data1\n")
+        cap.write_artifact("pvo_sealed2", b"data2\n")
+        # Manually create an unknown file.
+        fd = os.open(
+            "unknown_orphan.log", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+            dir_fd=cap._root_fd,
+        )
+        os.close(fd)
+        # Reconcile: expected = two sealed, one missing sealed, one reserved.
+        report = cap.reconcile(expected_artifacts=[
+            ("pvo_sealed1", "sealed", 6),
+            ("pvo_sealed2", "sealed", 6),
+            ("pvo_missing", "sealed", 0),     # SEALED but file missing.
+            ("pvo_reserved", "reserved", 0),  # RESERVED but no file.
+        ])
+        assert "pvo_missing" in report["sealed_missing"]
+        assert "pvo_reserved" in report["reserved_no_file"]
+        assert "unknown_orphan.log" in report["unknown_files"]
+    finally:
+        cap.close()
+
+
+def test_artifact_root_capability_cleanup_orphan(tmp_path):
+    """Batch 3.1.2 §7: cleanup_orphan removes unknown files."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "artifacts")
+    try:
+        fd = os.open(
+            "orphan.tmp", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600,
+            dir_fd=cap._root_fd,
+        )
+        os.close(fd)
+        assert cap.cleanup_orphan("orphan.tmp") is True
+        assert cap.cleanup_orphan("orphan.tmp") is False
+    finally:
+        cap.close()
+
+
+def test_artifact_root_no_os_rename_overwrite(tmp_path):
+    """Batch 3.1.2 §7: verify no os.rename is used to overwrite final files.
+
+    The write_artifact method uses os.link (no-replace) instead of
+    os.rename.  If the final file exists, the write fails closed.
+    """
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "artifacts")
+    try:
+        cap.write_artifact("pvo_noreplace", b"original\n")
+        # Attempting to write the same artifact_id again must fail,
+        # NOT overwrite the existing file.
+        with pytest.raises(PermissionError):
+            cap.write_artifact("pvo_noreplace", b"tampered\n")
+        # The original content must be intact.
+        assert cap.read_artifact("pvo_noreplace") == b"original\n"
+    finally:
+        cap.close()

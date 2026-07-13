@@ -16,7 +16,8 @@ from khaos.coding.planning.approval.models import compute_verification_digest
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.git_state import GitStateInspector
 from khaos.coding.planning.trusted_verification import (
-    SandboxProfile, TrustedCommandFactory, VerificationWorkspaceFactory,
+    ArtifactRootCapability, SandboxProfile, TrustedCommandFactory,
+    VerificationWorkspaceFactory,
 )
 from khaos.coding.planning.verification_catalog import VerificationCatalog
 from khaos.coding.planning.verification_execution_models import (
@@ -63,6 +64,16 @@ class TrustedVerificationRunner:
         self._commands = command_factory
         self._workspace_factory = workspace_factory
         self._artifact_root = artifact_root.resolve()
+        # Batch 3.1.2 §7: open the artifact root as a capability with
+        # O_DIRECTORY|O_NOFOLLOW and dir_fd-only access.  All artifact
+        # writes use the no-replace protocol (temp → link → fsync).
+        _forbidden: list[Path] = []
+        _db_path = getattr(self._approval_store, "_db_path", None)
+        if _db_path:
+            _forbidden.append(Path(_db_path))
+        self._artifact_capability = ArtifactRootCapability.open(
+            self._artifact_root, forbidden_roots=tuple(_forbidden),
+        )
         self._profile = profile
         self._boot = runtime_boot
         self._contexts = context_registry
@@ -552,16 +563,18 @@ class TrustedVerificationRunner:
             raise PermissionError("verification runtime boot is stale")
 
     def _write_artifact(self, run_id: str, stdout: bytes, stderr: bytes) -> str:
-        """Batch 3.1.1 §3: RESERVED → write file → fsync → SEALED protocol.
+        """Batch 3.1.2 §7: RESERVED → temp → final no-replace → fsync → SEALED.
 
+        Uses :class:`ArtifactRootCapability` for all file operations:
+        dir_fd-only access, no Path re-parsing, no ``os.rename`` to
+        overwrite existing final files.  The protocol is:
         1. Insert a RESERVED artifact row (BEFORE writing the file).
-        2. Write the artifact file to a temporary path.
-        3. fsync the file.
-        4. Atomically install (rename) to the final path.
-        5. fsync the artifact root directory.
+        2. Write temp file (O_CREAT|O_EXCL|O_NOFOLLOW) + fsync.
+        3. Link temp → final (no-replace, fails if final exists).
+        4. fsync the artifact root directory.
+        5. Unlink the temp file.
         6. Atomically transition RESERVED → SEALED in the DB.
         """
-        self._artifact_root.mkdir(mode=0o700, parents=True, exist_ok=True)
         artifact_id = f"pvo_{secrets.token_hex(20)}"
         relative = f"{artifact_id}.log"
         expires_at = time.time() + self._artifact_ttl
@@ -571,36 +584,20 @@ class TrustedVerificationRunner:
             relative_name=relative, expires_at=expires_at,
         )
         payload = b"stdout:\n" + stdout + b"\nstderr:\n" + stderr
-        digest = hashlib.sha256(payload).hexdigest()
-        # Step 2-3: write to temporary path + fsync.
-        tmp_relative = f".{artifact_id}.tmp"
-        tmp_path = self._artifact_root / tmp_relative
+        # Steps 2-5: write via capability (temp + fsync + link + root fsync + unlink temp).
         try:
-            fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            try:
-                os.write(fd, payload)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-            # Step 4: atomic install (no-replace).
-            final_path = self._artifact_root / relative
-            os.rename(str(tmp_path), str(final_path))
-            # Step 5: fsync the artifact root directory.
-            dir_fd = os.open(str(self._artifact_root), os.O_RDONLY | os.O_DIRECTORY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-            # Step 6: SEALED.
-            self._store.seal_artifact(
-                artifact_id=artifact_id,
-                content_digest=digest, byte_length=len(payload),
+            content_digest, byte_length = self._artifact_capability.write_artifact(
+                artifact_id, payload,
             )
         except Exception:
-            # Cleanup temp file if it exists.
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+            # Cleanup: if the temp file was created but link failed, the
+            # capability already cleaned it up.  Mark the artifact row
+            # as quarantined so reconciliation can handle it.
+            self._store.quarantine_artifact(artifact_id, reason="write-failed")
             raise
+        # Step 6: SEALED.
+        self._store.seal_artifact(
+            artifact_id=artifact_id,
+            content_digest=content_digest, byte_length=byte_length,
+        )
         return artifact_id
