@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any, Iterable, Protocol
 
 from khaos.coding.planning.trusted_verification import (
-    DisposableVerificationWorkspace, SandboxProfile,
+    DisposableVerificationWorkspace, SandboxProfile, TrustedToolchain,
 )
 from khaos.coding.planning.verification_execution_models import TrustedVerificationCommand
 from khaos.coding.planning.verification_sandbox_instance import (
@@ -43,6 +43,28 @@ class ContainerAttestation:
     labels: dict[str, str]
     manifest_digest: str
     attestation_digest: str
+
+
+@dataclass(frozen=True)
+class ToolchainAttestation:
+    """Batch 3.1.2 §5: real toolchain attestation from an attestation container.
+
+    Built inside a trusted, no-Workspace-mount attestation container by:
+    opening the absolute executable path, confirming it is a regular file,
+    computing its SHA-256, running the fixed version argv, parsing the
+    output, and verifying the parsed version matches the approved version.
+
+    The ``attestation_digest`` binds the toolchain identity to the actual
+    image attestation and is re-verified before each verification launch.
+    """
+    toolchain_id: str                # "{language}:{executable_id}"
+    executable_path: str             # absolute path inside the container
+    binary_digest: str               # sha256:<hex> of the executable file
+    version_output_digest: str       # sha256:<hex> of the raw version output
+    parsed_version: str              # parsed version string
+    actual_image_attestation: str    # profile.image_digest used for attestation
+    attested_at: float               # time.time() at attestation
+    attestation_digest: str          # canonical digest binding all fields above
 
 
 @dataclass(frozen=True)
@@ -493,6 +515,214 @@ class DockerVerificationSandboxBackend:
                 f"{self.profile.image_digest}, got {actual}"
             )
         return actual
+
+    # ------------------------------------------------------------------
+    # §5: Real toolchain attestation
+    # ------------------------------------------------------------------
+
+    # Fixed version argv per executable_id — never trust catalog argv for
+    # attestation.  The argv and output format are part of the trusted
+    # toolchain contract, not the verification catalog.
+    _VERSION_ARGV: dict[str, tuple[str, ...]] = {
+        "python": ("--version",),
+        "npm": ("--version",),
+        "go": ("version",),
+        "cargo": ("--version",),
+    }
+
+    @classmethod
+    def _parse_version(cls, executable_id: str, output: str) -> str:
+        """Parse the version output using a fixed format per executable_id.
+
+        Falls back to the first whitespace-separated token if no parser is
+        registered.  Never raises — an empty/unparseable result will fail
+        the caller's version-match check.
+        """
+        text = output.strip()
+        if executable_id == "python":
+            # "Python 3.13.0" → "3.13.0"
+            parts = text.split()
+            return parts[-1] if parts else ""
+        if executable_id == "npm":
+            # "11.0.0" → "11.0.0"
+            return text.split()[0] if text.split() else ""
+        if executable_id == "go":
+            # "go version go1.25.0 darwin/amd64" → "1.25.0"
+            match = re.search(r"go(\d+\.\d+(?:\.\d+)?)", text)
+            return match.group(1) if match else ""
+        if executable_id == "cargo":
+            # "cargo 1.90.0" → "1.90.0"
+            parts = text.split()
+            return parts[1] if len(parts) >= 2 else ""
+        parts = text.split()
+        return parts[-1] if parts else ""
+
+    async def _run_attestation_command(
+        self, *, image_digest: str, argv: tuple[str, ...],
+        timeout_seconds: float = 30.0,
+    ) -> tuple[int, bytes, bytes]:
+        """Run a no-Workspace-mount attestation container and capture output.
+
+        Uses ``docker run --rm --pull=never --network none --read-only``
+        with the pinned image digest.  No workspace is mounted — the
+        container can only read the image's own filesystem.
+        """
+        args = [
+            str(self._docker), "run", "--rm", "--pull=never",
+            "--network", "none", "--read-only",
+            "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+            "--pids-limit", str(self.profile.pids_limit),
+            "--memory", str(self.profile.memory_bytes),
+            "--cpus", str(self.profile.cpu_count),
+            "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777",
+            image_digest, *argv,
+        ]
+        process = await asyncio.create_subprocess_exec(
+            *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                process.communicate(), timeout=timeout_seconds,
+            )
+        except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+            raise RuntimeError(
+                f"attestation container timed out: argv={argv}"
+            )
+        return process.returncode, stdout, stderr
+
+    async def attest_toolchain(
+        self, *, toolchain: TrustedToolchain, image_digest: str,
+    ) -> ToolchainAttestation:
+        """Batch 3.1.2 §5: attest one toolchain inside an attestation container.
+
+        Runs a no-Workspace-mount container with the pinned image, opens
+        the absolute executable path, confirms it is a regular file,
+        computes its SHA-256, runs the fixed version argv, parses the
+        output, and returns a :class:`ToolchainAttestation`.
+
+        Does NOT trust the workspace executable — only the image's own
+        filesystem is visible to the attestation container.
+        """
+        version_argv = self._VERSION_ARGV.get(toolchain.executable_id)
+        if version_argv is None:
+            raise RuntimeError(
+                f"toolchain {toolchain.executable_id} has no fixed version argv"
+            )
+        # 1. Compute binary SHA-256 using sha256sum inside the container.
+        #    sha256sum is part of coreutils and present in most images;
+        #    if absent, attestation fails closed.
+        digest_rc, digest_out, digest_err = await self._run_attestation_command(
+            image_digest=image_digest,
+            argv=("sha256sum", toolchain.absolute_path),
+        )
+        if digest_rc != 0:
+            raise RuntimeError(
+                f"toolchain binary digest failed for "
+                f"{toolchain.absolute_path}: exit={digest_rc} "
+                f"stderr={digest_err.decode('utf-8', 'replace')}"
+            )
+        digest_line = digest_out.decode("utf-8", "replace").strip()
+        # sha256sum output: "<hex>  <path>"
+        digest_parts = digest_line.split(None, 1)
+        if len(digest_parts) < 1 or not re.fullmatch(r"[0-9a-f]{64}", digest_parts[0]):
+            raise RuntimeError(
+                f"toolchain binary digest unparseable for "
+                f"{toolchain.absolute_path}: {digest_line!r}"
+            )
+        binary_digest = f"sha256:{digest_parts[0]}"
+        # 2. Confirm the path is a regular file using test -f inside the
+        #    container.  This is defense-in-depth — sha256sum would also
+        #    fail on a non-regular file, but we want an explicit check.
+        test_rc, _, _ = await self._run_attestation_command(
+            image_digest=image_digest,
+            argv=("test", "-f", toolchain.absolute_path),
+        )
+        if test_rc != 0:
+            raise RuntimeError(
+                f"toolchain executable is not a regular file: "
+                f"{toolchain.absolute_path}"
+            )
+        # 3. Run the fixed version argv and capture output.
+        version_rc, version_out, version_err = await self._run_attestation_command(
+            image_digest=image_digest,
+            argv=(toolchain.absolute_path, *version_argv),
+        )
+        if version_rc != 0:
+            raise RuntimeError(
+                f"toolchain version command failed for "
+                f"{toolchain.executable_id}: exit={version_rc} "
+                f"stderr={version_err.decode('utf-8', 'replace')}"
+            )
+        version_output = version_out.decode("utf-8", "replace")
+        parsed_version = self._parse_version(toolchain.executable_id, version_output)
+        if not parsed_version:
+            raise RuntimeError(
+                f"toolchain version output unparseable for "
+                f"{toolchain.executable_id}: {version_output!r}"
+            )
+        version_output_digest = f"sha256:{hashlib.sha256(version_out).hexdigest()}"
+        attested_at = time.time()
+        toolchain_id = f"{toolchain.language}:{toolchain.executable_id}"
+        attestation_digest = hashlib.sha256(json.dumps({
+            "toolchain_id": toolchain_id,
+            "executable_path": toolchain.absolute_path,
+            "binary_digest": binary_digest,
+            "version_output_digest": version_output_digest,
+            "parsed_version": parsed_version,
+            "actual_image_attestation": image_digest,
+            "attested_at": attested_at,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return ToolchainAttestation(
+            toolchain_id=toolchain_id,
+            executable_path=toolchain.absolute_path,
+            binary_digest=binary_digest,
+            version_output_digest=version_output_digest,
+            parsed_version=parsed_version,
+            actual_image_attestation=image_digest,
+            attested_at=attested_at,
+            attestation_digest=attestation_digest,
+        )
+
+    async def attest_toolchains(
+        self, *, toolchains: tuple[TrustedToolchain, ...],
+        image_digest: str,
+    ) -> tuple[ToolchainAttestation, ...]:
+        """Batch 3.1.2 §5: attest all toolchains for the pinned image.
+
+        Returns a tuple of :class:`ToolchainAttestation` in the same order
+        as the input toolchains.  Any failure raises and the caller must
+        NOT install the verifier (fail-closed).
+        """
+        attestations: list[ToolchainAttestation] = []
+        for toolchain in toolchains:
+            if toolchain.image_digest != image_digest:
+                raise RuntimeError(
+                    f"toolchain {toolchain.language}:{toolchain.executable_id} "
+                    f"image mismatch: {toolchain.image_digest} != {image_digest}"
+                )
+            attestation = await self.attest_toolchain(
+                toolchain=toolchain, image_digest=image_digest,
+            )
+            # Verify parsed version matches the approved version.
+            if attestation.parsed_version != toolchain.version:
+                raise RuntimeError(
+                    f"toolchain {toolchain.executable_id} version mismatch: "
+                    f"approved={toolchain.version} "
+                    f"actual={attestation.parsed_version}"
+                )
+            # If the toolchain declared a binary_digest, verify it matches.
+            if toolchain.binary_digest and attestation.binary_digest != toolchain.binary_digest:
+                raise RuntimeError(
+                    f"toolchain {toolchain.executable_id} binary digest mismatch: "
+                    f"declared={toolchain.binary_digest} "
+                    f"actual={attestation.binary_digest}"
+                )
+            attestations.append(attestation)
+        return tuple(attestations)
 
     # ------------------------------------------------------------------
     # §1: Explicit launch + collect API (production path)

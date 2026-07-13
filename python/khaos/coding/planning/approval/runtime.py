@@ -135,6 +135,8 @@ class ApprovalRuntime:
         self._verification_cancel_events: dict[str, Any] = {}
         self._verification_runner: Any = None
         self._verification_store: Any = None
+        self._verification_toolchain_attestations: tuple = ()
+        self._verification_config_state: str = "UNCONFIGURED"
 
     @property
     def state(self) -> RuntimeState:
@@ -384,28 +386,67 @@ class ApprovalRuntime:
             ) from exc
 
         # Batch 3.1.1 §8: VERIFYING_TOOLCHAINS
+        # Batch 3.1.2 §5: real toolchain attestation — run attestation
+        # containers (no Workspace mount) to compute the actual binary
+        # SHA-256, run the fixed version argv, parse the output, and
+        # verify the parsed version matches the approved version.  The
+        # old string-format-only check (``binary_digest.startswith``) is
+        # no longer sufficient.
         self._verification_config_state = "VERIFYING_TOOLCHAINS"
-        # Toolchain attestation is performed by the command factory at
-        # build time — it verifies that the toolchain's image_digest
-        # matches the profile's image_digest.  The binary_digest and
-        # version are verified at command build time.
-        for toolchain in getattr(command_factory, "_tools", {}).values():
-            if toolchain.image_digest != profile.image_digest:
+        # Initialize the verification store early so attestation rows can
+        # be persisted before sandbox reconciliation runs.
+        self._verification_store = VerificationExecutionStore(self._store)
+        toolchains = tuple(getattr(command_factory, "_tools", {}).values())
+        # If the backend supports real attestation, run it.  Otherwise
+        # fall back to the declaration-only check (test backends).
+        attest_toolchains = getattr(backend, "attest_toolchains", None)
+        if callable(attest_toolchains) and toolchains:
+            try:
+                import concurrent.futures as _cf_tc
+                import asyncio as _aio_tc
+                with _cf_tc.ThreadPoolExecutor(max_workers=1) as pool_tc:
+                    attestations = pool_tc.submit(lambda: _aio_tc.run(
+                        attest_toolchains(
+                            toolchains=toolchains,
+                            image_digest=profile.image_digest,
+                        )
+                    )).result()
+            except Exception as exc:
                 self._verification_config_state = "UNCONFIGURED"
                 raise RuntimeError(
-                    f"toolchain {toolchain.language}:{toolchain.executable_id} "
-                    f"image mismatch: {toolchain.image_digest} != {profile.image_digest}"
+                    f"trusted verification toolchain attestation failed: {exc}"
+                ) from exc
+            # Persist each attestation, bound to the current boot.
+            for attestation in attestations:
+                self._verification_store.persist_toolchain_attestation(
+                    attestation,
+                    boot_id=self.boot_context.boot_id,
+                    server_epoch=self.boot_context.server_epoch,
                 )
-            if toolchain.binary_digest and not toolchain.binary_digest.startswith("sha256:"):
-                self._verification_config_state = "UNCONFIGURED"
-                raise RuntimeError(
-                    f"toolchain {toolchain.language}:{toolchain.executable_id} "
-                    f"has invalid binary_digest: {toolchain.binary_digest}"
-                )
+            # Clear stale attestations from previous boots.
+            self._verification_store.clear_toolchain_attestations_for_boot(
+                boot_id=self.boot_context.boot_id,
+            )
+            self._verification_toolchain_attestations = tuple(attestations)
+        else:
+            # Declaration-only fallback (test backends without Docker).
+            for toolchain in toolchains:
+                if toolchain.image_digest != profile.image_digest:
+                    self._verification_config_state = "UNCONFIGURED"
+                    raise RuntimeError(
+                        f"toolchain {toolchain.language}:{toolchain.executable_id} "
+                        f"image mismatch: {toolchain.image_digest} != {profile.image_digest}"
+                    )
+                if toolchain.binary_digest and not toolchain.binary_digest.startswith("sha256:"):
+                    self._verification_config_state = "UNCONFIGURED"
+                    raise RuntimeError(
+                        f"toolchain {toolchain.language}:{toolchain.executable_id} "
+                        f"has invalid binary_digest: {toolchain.binary_digest}"
+                    )
+            self._verification_toolchain_attestations = ()
 
         # Batch 3.1.2 §2: Boot-agnostic crash reconciliation
         self._verification_config_state = "RECONCILING_SANDBOXES"
-        self._verification_store = VerificationExecutionStore(self._store)
         # recover_interrupted() is called in VerificationExecutionStore.__init__
         # via TrustedVerificationRunner.__init__.  It transitions any
         # PREPARING/RUNNING runs to ERRORED.
@@ -535,6 +576,7 @@ class ApprovalRuntime:
             runtime_boot=self.boot_context,
             context_registry=self._verification_contexts,
             mutation_fence=self._mutation_fence,
+            toolchain_attestations=self._verification_toolchain_attestations,
         )
         self.guard.set_verification_runner(self._verification_runner)
 

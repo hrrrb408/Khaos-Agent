@@ -721,3 +721,241 @@ def test_list_artifacts_without_files(tmp_path):
     missing = store.list_artifacts_without_files(tmp_path / "artifacts")
     assert len(missing) == 1
     assert missing[0]["artifact_id"] == "art-3"
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.2 §5: Real toolchain attestation
+# ----------------------------------------------------------------------
+
+def _toolchain_attestation(
+    *, toolchain_id="python:python", executable_path="/usr/local/bin/python3",
+    binary_digest="sha256:abc", version_output_digest="sha256:def",
+    parsed_version="3.13", actual_image_attestation=IMAGE,
+    attested_at=1_700_000_000.0, attestation_digest="sha256:att",
+):
+    from khaos.coding.planning.verification_sandbox import ToolchainAttestation
+    return ToolchainAttestation(
+        toolchain_id=toolchain_id, executable_path=executable_path,
+        binary_digest=binary_digest, version_output_digest=version_output_digest,
+        parsed_version=parsed_version,
+        actual_image_attestation=actual_image_attestation,
+        attested_at=attested_at, attestation_digest=attestation_digest,
+    )
+
+
+@pytest.mark.parametrize("executable_id,output,expected", [
+    ("python", "Python 3.13.0\n", "3.13.0"),
+    ("python", "Python 3.13.1rc1\n", "3.13.1rc1"),
+    ("npm", "11.0.0\n", "11.0.0"),
+    ("go", "go version go1.25.0 darwin/amd64\n", "1.25.0"),
+    ("go", "go version go1.25 linux/arm64\n", "1.25"),
+    ("cargo", "cargo 1.90.0\n", "1.90.0"),
+    ("unknown", "something 1.2.3\n", "1.2.3"),
+    ("python", "", ""),
+    ("python", "garbage", "garbage"),
+])
+def test_toolchain_version_parser_is_fixed(executable_id, output, expected):
+    """Batch 3.1.2 §5: version output is parsed using a fixed format."""
+    from khaos.coding.planning.verification_sandbox import (
+        DockerVerificationSandboxBackend,
+    )
+    assert DockerVerificationSandboxBackend._parse_version(executable_id, output) == expected
+
+
+def test_toolchain_attestation_dataclass_is_canonical():
+    """Batch 3.1.2 §5: ToolchainAttestation carries all required fields."""
+    att = _toolchain_attestation()
+    assert att.toolchain_id == "python:python"
+    assert att.executable_path == "/usr/local/bin/python3"
+    assert att.binary_digest == "sha256:abc"
+    assert att.version_output_digest == "sha256:def"
+    assert att.parsed_version == "3.13"
+    assert att.actual_image_attestation == IMAGE
+    assert att.attested_at == 1_700_000_000.0
+    assert att.attestation_digest == "sha256:att"
+
+
+def test_persist_and_get_toolchain_attestation(tmp_path):
+    """Batch 3.1.2 §5: attestations are persisted and retrievable."""
+    _, store = _mutated_store(tmp_path)
+    att = _toolchain_attestation(attestation_digest="sha256:original")
+    store.persist_toolchain_attestation(
+        att, boot_id="boot-1", server_epoch=1,
+    )
+    fetched = store.get_toolchain_attestation("python:python")
+    assert fetched is not None
+    assert fetched.attestation_digest == "sha256:original"
+    assert fetched.parsed_version == "3.13"
+
+
+def test_persist_toolchain_attestation_upsert(tmp_path):
+    """Batch 3.1.2 §5: re-attesting the same toolchain updates the row."""
+    _, store = _mutated_store(tmp_path)
+    att1 = _toolchain_attestation(attestation_digest="sha256:v1")
+    att2 = _toolchain_attestation(attestation_digest="sha256:v2")
+    store.persist_toolchain_attestation(att1, boot_id="boot-1", server_epoch=1)
+    store.persist_toolchain_attestation(att2, boot_id="boot-1", server_epoch=1)
+    fetched = store.get_toolchain_attestation("python:python")
+    assert fetched.attestation_digest == "sha256:v2"
+
+
+def test_clear_toolchain_attestations_for_other_boots(tmp_path):
+    """Batch 3.1.2 §5: stale attestations from old boots are cleared."""
+    _, store = _mutated_store(tmp_path)
+    att1 = _toolchain_attestation(toolchain_id="python:python", attestation_digest="sha256:old")
+    att2 = _toolchain_attestation(toolchain_id="npm:npm", attestation_digest="sha256:new")
+    store.persist_toolchain_attestation(att1, boot_id="boot-old", server_epoch=1)
+    store.persist_toolchain_attestation(att2, boot_id="boot-new", server_epoch=2)
+    removed = store.clear_toolchain_attestations_for_boot(boot_id="boot-new")
+    assert removed == 1
+    all_atts = store.list_toolchain_attestations()
+    assert len(all_atts) == 1
+    assert all_atts[0].toolchain_id == "npm:npm"
+
+
+def test_list_toolchain_attestations_ordered(tmp_path):
+    """Batch 3.1.2 §5: list returns all attestations ordered by toolchain_id."""
+    _, store = _mutated_store(tmp_path)
+    store.persist_toolchain_attestation(
+        _toolchain_attestation(toolchain_id="python:python"),
+        boot_id="b1", server_epoch=1,
+    )
+    store.persist_toolchain_attestation(
+        _toolchain_attestation(toolchain_id="cargo:cargo"),
+        boot_id="b1", server_epoch=1,
+    )
+    store.persist_toolchain_attestation(
+        _toolchain_attestation(toolchain_id="go:go"),
+        boot_id="b1", server_epoch=1,
+    )
+    all_atts = store.list_toolchain_attestations()
+    ids = [a.toolchain_id for a in all_atts]
+    assert ids == ["cargo:cargo", "go:go", "python:python"]
+
+
+class _AttestationTestBackend:
+    """Test backend that simulates attestation without real Docker."""
+
+    def __init__(self, profile, *, attestations=None, fail_attest=False):
+        self.profile = profile
+        self._attestations = attestations or ()
+        self._fail_attest = fail_attest
+
+    async def probe(self):
+        return self.profile.image_digest
+
+    async def attest_toolchains(self, *, toolchains, image_digest):
+        if self._fail_attest:
+            raise RuntimeError("attestation container failed")
+        return self._attestations
+
+    def generate_instance_name(self):
+        import secrets as _s
+        return f"khaos-verify-test-{_s.token_hex(12)}"
+
+    def build_labels(self, **kwargs):
+        return {
+            "khaos.run-id": kwargs["run_id"],
+            "khaos.step-id": kwargs["step_id"],
+            "khaos.sandbox-instance-id": kwargs["instance_id"],
+            "khaos.boot-id": kwargs["boot_id"],
+            "khaos.manifest-digest": kwargs["manifest_digest"][:63],
+        }
+
+    async def launch_instance(self, **kwargs):
+        image_digest = kwargs["image_digest"]
+        return "fake-container", ContainerAttestation(
+            container_id="fake-container",
+            container_image_id=image_digest,
+            local_image_id=image_digest,
+            expected_image_digest=image_digest,
+            labels=dict(kwargs["labels"]),
+            manifest_digest=kwargs["expected_manifest_digest"],
+            attestation_digest="sha256:fake",
+        ), None, None, None
+
+    async def collect_result(self, **kwargs):
+        data = b"trusted fake output"
+        return SandboxStepResult(
+            kwargs["sandbox_instance_id"], self.profile.image_digest,
+            0, None, 1, data, b"",
+            hashlib.sha256(data).hexdigest(), hashlib.sha256(b"").hexdigest(),
+            False, False, False, kwargs["container_id"], kwargs["attestation_digest"],
+        )
+
+    async def reconcile_instance_by_record(self, **kwargs):
+        return {"status": "missing", "container_id": "", "reason": "test"}
+
+    async def reconcile_instances(self, **kwargs):
+        return {"found": [], "terminated": [], "unknown": [], "mismatches": []}
+
+
+def test_attest_toolchains_rejects_image_mismatch():
+    """Batch 3.1.2 §5: toolchain with wrong image_digest is rejected."""
+    from khaos.coding.planning.trusted_verification import TrustedToolchain
+    toolchains = (TrustedToolchain(
+        "python", "python", "/usr/local/bin/python3", "3.13",
+        "sha256:wrong",
+    ),)
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    import asyncio as _aio
+    with pytest.raises(RuntimeError, match="image mismatch"):
+        _aio.run(backend.attest_toolchains(
+            toolchains=toolchains, image_digest=IMAGE,
+        ))
+
+
+def test_attest_toolchain_rejects_unknown_executable():
+    """Batch 3.1.2 §5: unknown executable_id (no version argv) is rejected."""
+    from khaos.coding.planning.trusted_verification import TrustedToolchain
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    toolchain = TrustedToolchain(
+        "ruby", "ruby", "/usr/local/bin/ruby", "3.3", IMAGE,
+    )
+    import asyncio as _aio
+    with pytest.raises(RuntimeError, match="no fixed version argv"):
+        _aio.run(backend.attest_toolchain(
+            toolchain=toolchain, image_digest=IMAGE,
+        ))
+
+
+def test_version_argv_is_fixed_per_toolchain():
+    """Batch 3.1.2 §5: version argv is fixed, not from catalog."""
+    from khaos.coding.planning.verification_sandbox import (
+        DockerVerificationSandboxBackend,
+    )
+    assert DockerVerificationSandboxBackend._VERSION_ARGV["python"] == ("--version",)
+    assert DockerVerificationSandboxBackend._VERSION_ARGV["npm"] == ("--version",)
+    assert DockerVerificationSandboxBackend._VERSION_ARGV["go"] == ("version",)
+    assert DockerVerificationSandboxBackend._VERSION_ARGV["cargo"] == ("--version",)
+
+
+def test_attestation_digest_binds_all_fields():
+    """Batch 3.1.2 §5: attestation_digest changes if any field changes."""
+    att1 = _toolchain_attestation(attestation_digest="")
+    # Recompute digest to verify binding.
+    import hashlib as _h
+    import json as _j
+    payload = _j.dumps({
+        "toolchain_id": att1.toolchain_id,
+        "executable_path": att1.executable_path,
+        "binary_digest": att1.binary_digest,
+        "version_output_digest": att1.version_output_digest,
+        "parsed_version": att1.parsed_version,
+        "actual_image_attestation": att1.actual_image_attestation,
+        "attested_at": att1.attested_at,
+    }, sort_keys=True, separators=(",", ":")).encode()
+    digest1 = _h.sha256(payload).hexdigest()
+    # Change one field — digest must differ.
+    att2 = _toolchain_attestation(parsed_version="3.14", attestation_digest="")
+    payload2 = _j.dumps({
+        "toolchain_id": att2.toolchain_id,
+        "executable_path": att2.executable_path,
+        "binary_digest": att2.binary_digest,
+        "version_output_digest": att2.version_output_digest,
+        "parsed_version": att2.parsed_version,
+        "actual_image_attestation": att2.actual_image_attestation,
+        "attested_at": att2.attested_at,
+    }, sort_keys=True, separators=(",", ":")).encode()
+    digest2 = _h.sha256(payload2).hexdigest()
+    assert digest1 != digest2

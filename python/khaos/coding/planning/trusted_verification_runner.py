@@ -50,6 +50,7 @@ class TrustedVerificationRunner:
         context_registry: dict[str, VerificationPhaseContext],
         mutation_fence: Any,
         artifact_ttl_seconds: float = 24 * 3600,
+        toolchain_attestations: tuple = (),
     ) -> None:
         if backend.__class__.__module__.endswith("tests"):
             raise TypeError("test sandbox backend cannot be used in production runner")
@@ -68,6 +69,13 @@ class TrustedVerificationRunner:
         self._fence = mutation_fence
         self._git = GitStateInspector()
         self._artifact_ttl = artifact_ttl_seconds
+        # Batch 3.1.2 §5: toolchain attestations from configure_trusted_verification.
+        # Re-verified before each launch_instance to detect binary replacement
+        # after configuration (re-bind attestation digest at execution time).
+        self._toolchain_attestations: dict[str, Any] = {
+            attestation.toolchain_id: attestation
+            for attestation in toolchain_attestations
+        }
         self._store.recover_interrupted()
 
     async def run(
@@ -187,6 +195,32 @@ class TrustedVerificationRunner:
                     break
                 self._store.mark_step_running(step.step_run_id)
                 started = time.time()
+                # §5: re-bind toolchain attestation digest before execution.
+                # If the binary was replaced after configuration, the
+                # attestation_digest no longer matches the persisted record
+                # and execution is rejected (fail-closed).
+                toolchain_id = command.toolchain_id
+                if self._toolchain_attestations:
+                    attestation = self._toolchain_attestations.get(toolchain_id)
+                    if attestation is None:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="toolchain-attestation-missing",
+                        )
+                        raise PermissionError(
+                            f"toolchain attestation not found for {toolchain_id}"
+                        )
+                    persisted = self._store.get_toolchain_attestation(toolchain_id)
+                    if persisted is None or persisted.attestation_digest != attestation.attestation_digest:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="toolchain-attestation-stale",
+                        )
+                        raise PermissionError(
+                            f"toolchain attestation stale or missing for {toolchain_id}"
+                        )
                 # §1 steps 1-2: persist PREPARED sandbox instance BEFORE
                 # creating the container, so a crash leaves a durable trail.
                 sandbox_instance_id = f"vsi_{secrets.token_hex(12)}"

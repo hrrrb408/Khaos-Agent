@@ -87,6 +87,20 @@ CREATE INDEX IF NOT EXISTS ix_vsi_boot_state
 ON verification_sandbox_instances(boot_id, state);
 CREATE INDEX IF NOT EXISTS ix_vsi_run
 ON verification_sandbox_instances(verification_run_id);
+CREATE TABLE IF NOT EXISTS toolchain_attestations (
+ toolchain_id TEXT PRIMARY KEY,
+ executable_path TEXT NOT NULL,
+ binary_digest TEXT NOT NULL,
+ version_output_digest TEXT NOT NULL,
+ parsed_version TEXT NOT NULL,
+ actual_image_attestation TEXT NOT NULL,
+ attested_at REAL NOT NULL,
+ attestation_digest TEXT NOT NULL,
+ boot_id TEXT NOT NULL,
+ server_epoch INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_ta_boot
+ON toolchain_attestations(boot_id);
 """
 
 
@@ -1022,3 +1036,103 @@ class VerificationExecutionStore:
             if not path.exists():
                 missing.append(row)
         return tuple(missing)
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.2 §5: Toolchain attestation persistence
+    # ------------------------------------------------------------------
+
+    def persist_toolchain_attestation(
+        self, attestation: Any, *, boot_id: str, server_epoch: int,
+    ) -> None:
+        """Persist a :class:`ToolchainAttestation` row (UPSERT by toolchain_id).
+
+        The attestation is bound to the current boot context so a new boot
+        can detect stale attestations and re-attest.  The
+        ``attestation_digest`` is the canonical binding used at execution
+        time to re-verify the toolchain before launch.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO toolchain_attestations "
+                "(toolchain_id, executable_path, binary_digest, "
+                " version_output_digest, parsed_version, "
+                " actual_image_attestation, attested_at, attestation_digest, "
+                " boot_id, server_epoch) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(toolchain_id) DO UPDATE SET "
+                " executable_path=excluded.executable_path, "
+                " binary_digest=excluded.binary_digest, "
+                " version_output_digest=excluded.version_output_digest, "
+                " parsed_version=excluded.parsed_version, "
+                " actual_image_attestation=excluded.actual_image_attestation, "
+                " attested_at=excluded.attested_at, "
+                " attestation_digest=excluded.attestation_digest, "
+                " boot_id=excluded.boot_id, "
+                " server_epoch=excluded.server_epoch",
+                (attestation.toolchain_id, attestation.executable_path,
+                 attestation.binary_digest, attestation.version_output_digest,
+                 attestation.parsed_version, attestation.actual_image_attestation,
+                 attestation.attested_at, attestation.attestation_digest,
+                 boot_id, server_epoch),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_toolchain_attestation(self, toolchain_id: str) -> Any | None:
+        """Return the persisted :class:`ToolchainAttestation` or None.
+
+        Imports :class:`ToolchainAttestation` lazily to avoid a circular
+        import (``verification_sandbox`` imports from this module's
+        sibling ``verification_sandbox_instance``).
+        """
+        row = self._conn.execute(
+            "SELECT * FROM toolchain_attestations WHERE toolchain_id=?",
+            (toolchain_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        from khaos.coding.planning.verification_sandbox import ToolchainAttestation
+        return ToolchainAttestation(
+            toolchain_id=row["toolchain_id"],
+            executable_path=row["executable_path"],
+            binary_digest=row["binary_digest"],
+            version_output_digest=row["version_output_digest"],
+            parsed_version=row["parsed_version"],
+            actual_image_attestation=row["actual_image_attestation"],
+            attested_at=row["attested_at"],
+            attestation_digest=row["attestation_digest"],
+        )
+
+    def list_toolchain_attestations(self) -> tuple[Any, ...]:
+        """Return all persisted toolchain attestations (any boot)."""
+        rows = self._conn.execute(
+            "SELECT * FROM toolchain_attestations ORDER BY toolchain_id"
+        ).fetchall()
+        from khaos.coding.planning.verification_sandbox import ToolchainAttestation
+        return tuple(ToolchainAttestation(
+            toolchain_id=row["toolchain_id"],
+            executable_path=row["executable_path"],
+            binary_digest=row["binary_digest"],
+            version_output_digest=row["version_output_digest"],
+            parsed_version=row["parsed_version"],
+            actual_image_attestation=row["actual_image_attestation"],
+            attested_at=row["attested_at"],
+            attestation_digest=row["attestation_digest"],
+        ) for row in rows)
+
+    def clear_toolchain_attestations_for_boot(self, *, boot_id: str) -> int:
+        """Remove toolchain attestations from a previous boot.
+
+        Called during ``configure_trusted_verification`` after new
+        attestations have been persisted, so stale attestations from a
+        crashed boot don't linger.  Returns the number of rows removed.
+        """
+        cur = self._conn.execute(
+            "DELETE FROM toolchain_attestations WHERE boot_id != ?",
+            (boot_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount
