@@ -55,6 +55,9 @@ def test_legacy_edit_event_schema_migrates_before_recovery_index(tmp_path):
     assert {
         "applied_identity_digest", "applied_parent_identity_digest",
         "applied_destination_identity_digest", "rollback_identity_digest",
+        "rollback_parent_identity_digest",
+        "rollback_destination_parent_identity_digest", "rollback_sync_mask",
+        "rollback_directory_sync_digest", "rollback_synced_at",
         "identity_version",
     } <= columns
     assert "idx_plan_execution_edit_events_recovery" in indexes
@@ -295,7 +298,9 @@ def test_filesystem_applied_identity_survives_phase_return_crash(tmp_path):
     assert (workspace.worktree_path / "a.txt").read_text() == "old"
 
 
-@pytest.mark.parametrize("completed_phase", ["rollback-started", "rolled-back"])
+@pytest.mark.parametrize(
+    "completed_phase", ["rollback-directory-synced", "rolled-back"],
+)
 def test_restart_resumes_after_rollback_syscall_without_replaying(tmp_path, completed_phase):
     runtime, workspace, run = _crash_after_applied(
         tmp_path, PlannedEditOperation.UPDATE,
@@ -331,7 +336,8 @@ def test_restart_resumes_after_rollback_syscall_without_replaying(tmp_path, comp
         if completed_phase == "rolled-back":
             runtime._store.transition_edit_event(
                 run.execution_run_id, event.edit_id,
-                expected_phase="rollback-started", target_phase="rolled-back",
+                expected_phase="rollback-directory-synced",
+                target_phase="rolled-back",
                 error_code="rollback-syscall-crash",
             )
     finally:
@@ -374,7 +380,8 @@ def test_rolled_back_object_replaced_before_restart_is_not_accepted(tmp_path):
         )
         runtime._store.transition_edit_event(
             run.execution_run_id, event.edit_id,
-            expected_phase="rollback-started", target_phase="rolled-back",
+            expected_phase="rollback-directory-synced",
+            target_phase="rolled-back",
             error_code="rolled-back-replacement",
         )
     finally:
@@ -452,7 +459,8 @@ def test_restart_completes_mixed_applied_rollback_started_and_rolled_back_events
                 )
                 runtime._store.transition_edit_event(
                     run.execution_run_id, event.edit_id,
-                    expected_phase="rollback-started", target_phase="rolled-back",
+                    expected_phase="rollback-directory-synced",
+                    target_phase="rolled-back",
                     error_code="mixed-phase-crash",
                 )
     finally:
