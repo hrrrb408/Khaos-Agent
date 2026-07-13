@@ -521,14 +521,15 @@ class ApprovalRuntime:
                         instance_state=SandboxInstanceState.TERMINATED,
                         failure_code="container-missing",
                     )
-                elif status == "mismatch":
-                    # Label/image/manifest mismatch — cleanup-failed, fail closed.
+                elif status == "ownership-mismatch":
+                    # Batch 3.1.3 §3: any label/image/manifest mismatch is
+                    # OWNERSHIP_MISMATCH — never terminate, fail closed.
                     mismatches.append(
-                        f"{instance.sandbox_instance_id}: {report.get('reason', 'mismatch')}"
+                        f"{instance.sandbox_instance_id}: {report.get('reason', 'ownership-mismatch')}"
                     )
                     self._verification_store.mark_sandbox_instance_cleanup_failed(
                         instance.sandbox_instance_id,
-                        failure_code=report.get("reason", "label-mismatch"),
+                        failure_code=report.get("reason", "ownership-mismatch"),
                     )
                 elif status == "cleanup-failed":
                     cleanup_failures.append(
@@ -545,16 +546,18 @@ class ApprovalRuntime:
                     f"{len(mismatches)} label/image mismatches, "
                     f"{len(cleanup_failures)} cleanup failures"
                 )
-        # §2: Also check for unknown Khaos containers (partial label matches
-        # that don't belong to any record).  These must be 0 for READY.
-        reconcile_all = getattr(backend, "reconcile_instances", None)
-        if callable(reconcile_all):
+        # Batch 3.1.3 §3: unknown Khaos containers (partial label matches
+        # that don't belong to any record) are listed read-only.  These must
+        # be 0 for READY.  list_unknown_khaos_containers() NEVER terminates
+        # or removes — two different Khaos Runtimes must not delete each
+        # other's containers.
+        list_unknown = getattr(backend, "list_unknown_khaos_containers", None)
+        if callable(list_unknown):
             try:
                 with _cf2.ThreadPoolExecutor(max_workers=1) as pool3:
-                    unknown_report = pool3.submit(lambda: _aio2.run(
-                        reconcile_all(expected_labels={})
+                    unknown = pool3.submit(lambda: _aio2.run(
+                        list_unknown()
                     )).result()
-                unknown = unknown_report.get("unknown", [])
                 if unknown:
                     raise RuntimeError(
                         f"verification runtime cannot be READY: "
@@ -562,7 +565,7 @@ class ApprovalRuntime:
                     )
             except Exception as exc:
                 raise RuntimeError(
-                    f"backend reconcile_instances failed: {exc}"
+                    f"backend list_unknown_khaos_containers failed: {exc}"
                 ) from exc
 
         # Batch 3.1.1 §8: READY

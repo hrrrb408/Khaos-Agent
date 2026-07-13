@@ -404,14 +404,16 @@ class DockerVerificationSandboxBackend:
     async def reconcile_instances(
         self, *, expected_labels: dict[str, str],
     ) -> dict[str, Any]:
-        """Batch 3.1.2 §2: find and terminate containers matching Khaos labels.
+        """Batch 3.1.3 §3: non-destructive reconciliation.
 
-        Returns a report dict with:
-        - ``found``: list of container names matching ALL expected labels.
-        - ``terminated``: list of container names that were terminated+removed.
-        - ``unknown``: list of containers with partial Khaos label matches (NOT terminated).
-        - ``mismatches``: list of (name, mismatch_reason) for label/image mismatches.
+        Only containers matching ALL expected labels are terminated+removed.
+        Partial matches (khaos.* labels but not all expected) are reported
+        as ``unknown`` and NEVER terminated.  Empty expected_labels is
+        explicitly rejected — two different Khaos Runtimes must not delete
+        each other's containers.
         """
+        if not expected_labels:
+            raise ValueError("reconcile_instances requires non-empty expected_labels")
         process = await asyncio.create_subprocess_exec(
             str(self._docker), "ps", "-a",
             "--filter", "label=khaos.run-id",
@@ -457,18 +459,52 @@ class DockerVerificationSandboxBackend:
             "unknown": unknown, "mismatches": mismatches,
         }
 
+    async def list_unknown_khaos_containers(self) -> list[dict[str, Any]]:
+        """Batch 3.1.3 §3: list containers with khaos.* labels.
+
+        This API ONLY lists — it never terminates or removes.  The caller
+        must decide what to do with each container.  Unknown containers
+        from a different Khaos Runtime must not be affected.
+        """
+        process = await asyncio.create_subprocess_exec(
+            str(self._docker), "ps", "-a",
+            "--filter", "label=khaos.run-id",
+            "--format", "{{.Names}}\t{{.Labels}}",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await process.communicate()
+        results: list[dict[str, Any]] = []
+        for line in stdout.decode("utf-8", "replace").splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) < 2:
+                continue
+            name = parts[0].strip()
+            label_str = parts[1].strip()
+            labels: dict[str, str] = {}
+            for pair in label_str.split(","):
+                pair = pair.strip()
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    labels[k.strip()] = v.strip()
+            results.append({"name": name, "labels": labels})
+        return results
+
     async def reconcile_instance_by_record(
         self, *, container_id: str, instance_name: str,
         expected_labels: dict[str, str],
         expected_image_digest: str, expected_manifest_digest: str,
     ) -> dict[str, Any]:
-        """Batch 3.1.2 §2: reconcile one specific instance by DB record.
+        """Batch 3.1.3 §3: non-destructive reconciliation by DB record.
 
-        Uses the persisted container_id (or instance_name as fallback) to
-        inspect and verify the container.  Returns a report dict:
-        - ``status``: "missing" | "terminated" | "mismatch" | "cleanup-failed"
-        - ``container_id``: the container ID inspected (or "").
-        - ``reason``: mismatch reason if status is "mismatch".
+        Only when ALL ownership evidence matches (container ID/name, run
+        ID, step ID, instance ID, boot ID, manifest digest, image) is the
+        container terminated and removed.
+
+        On ANY mismatch (label, image, manifest, name, or ID):
+        - NEVER terminate
+        - NEVER remove
+        - Return ``OWNERSHIP_MISMATCH``
+        - The caller must mark Runtime not-ready and record Audit/quarantine.
         """
         target = container_id or instance_name
         if not target:
@@ -481,31 +517,34 @@ class DockerVerificationSandboxBackend:
             if info is None:
                 return {"status": "missing", "container_id": "", "reason": "container-not-found"}
         actual_id = info.get("Id", "")
-        # Verify labels.
+        # §3: verify ALL labels — any mismatch → OWNERSHIP_MISMATCH (no terminate).
         container_labels: dict[str, str] = {}
         for key, value in info.get("Config", {}).get("Labels", {}).items():
             container_labels[key] = value
         for key, expected_value in expected_labels.items():
             actual_value = container_labels.get(key)
             if actual_value != expected_value:
-                ok = await self.terminate_instance(actual_id or target)
-                if ok:
-                    await self.remove_instance(actual_id or target)
                 return {
-                    "status": "mismatch", "container_id": actual_id,
+                    "status": "ownership-mismatch", "container_id": actual_id,
                     "reason": f"label-mismatch:{key}",
                 }
-        # Verify image.
+        # §3: verify image — mismatch → OWNERSHIP_MISMATCH (no terminate).
         container_image = info.get("Image", "")
         if container_image and expected_image_digest and container_image != expected_image_digest:
-            ok = await self.terminate_instance(actual_id or target)
-            if ok:
-                await self.remove_instance(actual_id or target)
             return {
-                "status": "mismatch", "container_id": actual_id,
+                "status": "ownership-mismatch", "container_id": actual_id,
                 "reason": f"image-mismatch:{container_image}!={expected_image_digest}",
             }
-        # Full match — terminate and remove.
+        # §3: verify manifest digest label.
+        actual_manifest = container_labels.get("khaos.manifest-digest", "")
+        if expected_manifest_digest and actual_manifest:
+            expected_truncated = expected_manifest_digest[:63]
+            if actual_manifest != expected_truncated:
+                return {
+                    "status": "ownership-mismatch", "container_id": actual_id,
+                    "reason": f"manifest-mismatch:{actual_manifest}!={expected_truncated}",
+                }
+        # Full ownership proof — terminate and remove.
         ok = await self.terminate_instance(actual_id or target)
         if not ok:
             return {

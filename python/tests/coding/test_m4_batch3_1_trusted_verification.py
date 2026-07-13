@@ -423,7 +423,12 @@ class UnsafeTestSandboxBackend:
         return {"status": "missing", "container_id": "", "reason": "test-backend-no-real-container"}
 
     async def reconcile_instances(self, *, expected_labels):
+        if not expected_labels:
+            raise ValueError("reconcile_instances requires non-empty expected_labels")
         return {"found": [], "terminated": [], "unknown": [], "mismatches": []}
+
+    async def list_unknown_khaos_containers(self):
+        return []
 
 
 def _verification_plan(plan, workspace):
@@ -1726,16 +1731,19 @@ class _FaultMatrixBackend:
         return None
 
     async def terminate_instance(self, container_id_or_name):
+        self.calls.append(("terminate_instance", container_id_or_name))
         self._container_exists.discard(container_id_or_name)
         return True
 
     async def remove_instance(self, container_id_or_name):
+        self.calls.append(("remove_instance", container_id_or_name))
         if self.remove_error:
             raise self.remove_error
         self._container_exists.discard(container_id_or_name)
         return not self.remove_returns_false
 
     async def terminate_and_remove_instance(self, container_id_or_name):
+        self.calls.append(("terminate_and_remove_instance", container_id_or_name))
         if self.remove_error:
             raise self.remove_error
         self._container_exists.discard(container_id_or_name)
@@ -1767,7 +1775,12 @@ class _FaultMatrixBackend:
         return self.reconcile_report
 
     async def reconcile_instances(self, *, expected_labels):
+        if not expected_labels:
+            raise ValueError("reconcile_instances requires non-empty expected_labels")
         return {"found": [], "terminated": [], "unknown": [], "mismatches": []}
+
+    async def list_unknown_khaos_containers(self):
+        return []
 
 
 def _fault_matrix_runtime(tmp_path, *, backend):
@@ -1839,7 +1852,7 @@ def test_fault_matrix_label_mismatch_on_reconcile(tmp_path):
     backend = _FaultMatrixBackend(
         _profile(),
         reconcile_report={
-            "status": "mismatch", "container_id": "bad",
+            "status": "ownership-mismatch", "container_id": "bad",
             "reason": "label-mismatch:khaos.run-id",
         },
     )
@@ -1873,7 +1886,7 @@ def test_fault_matrix_label_mismatch_on_reconcile(tmp_path):
             expected_manifest_digest="manifest",
         )
     )
-    assert report["status"] == "mismatch"
+    assert report["status"] == "ownership-mismatch"
     assert "label-mismatch" in report["reason"]
 
 
@@ -1882,7 +1895,7 @@ def test_fault_matrix_image_mismatch_on_reconcile(tmp_path):
     backend = _FaultMatrixBackend(
         _profile(),
         reconcile_report={
-            "status": "mismatch", "container_id": "bad",
+            "status": "ownership-mismatch", "container_id": "bad",
             "reason": "image-mismatch:sha256:wrong!=sha256:expected",
         },
     )
@@ -1894,8 +1907,50 @@ def test_fault_matrix_image_mismatch_on_reconcile(tmp_path):
         expected_image_digest="sha256:expected",
         expected_manifest_digest="manifest",
     ))
-    assert report["status"] == "mismatch"
+    assert report["status"] == "ownership-mismatch"
     assert "image-mismatch" in report["reason"]
+
+
+def test_fault_matrix_reconcile_rejects_empty_expected_labels(tmp_path):
+    """§3: reconcile_instances with empty expected_labels is rejected."""
+    backend = _FaultMatrixBackend(_profile())
+    import asyncio
+    with pytest.raises(ValueError, match="non-empty expected_labels"):
+        asyncio.run(backend.reconcile_instances(expected_labels={}))
+
+
+def test_fault_matrix_list_unknown_khaos_containers_is_non_destructive(tmp_path):
+    """§3: list_unknown_khaos_containers only lists, never deletes."""
+    backend = _FaultMatrixBackend(_profile())
+    import asyncio
+    result = asyncio.run(backend.list_unknown_khaos_containers())
+    assert isinstance(result, list)
+    # No terminate/remove calls were issued — list-only.
+    assert not any(
+        call[0] in {"terminate_instance", "remove_instance",
+                     "terminate_and_remove_instance"}
+        for call in backend.calls
+    )
+
+
+def test_fault_matrix_manifest_mismatch_returns_ownership_mismatch(tmp_path):
+    """§3: manifest digest mismatch → OWNERSHIP_MISMATCH, no terminate."""
+    backend = _FaultMatrixBackend(
+        _profile(),
+        reconcile_report={
+            "status": "ownership-mismatch", "container_id": "bad",
+            "reason": "manifest-mismatch:abc!=xyz",
+        },
+    )
+    import asyncio
+    report = asyncio.run(backend.reconcile_instance_by_record(
+        container_id="bad", instance_name="",
+        expected_labels={"khaos.manifest-digest": "xyz"},
+        expected_image_digest=IMAGE,
+        expected_manifest_digest="xyz",
+    ))
+    assert report["status"] == "ownership-mismatch"
+    assert "manifest-mismatch" in report["reason"]
 
 
 def test_fault_matrix_reconcile_backend_exception(tmp_path):
@@ -1914,15 +1969,23 @@ def test_fault_matrix_reconcile_backend_exception(tmp_path):
 
 
 def test_fault_matrix_unknown_khaos_container(tmp_path):
-    """§10: unknown Khaos container (no matching DB record) is not deleted."""
+    """§10: unknown Khaos container (no matching DB record) is not deleted.
+
+    Batch 3.1.3 §3: the read-only list_unknown_khaos_containers() API is
+    used instead of reconcile_instances({}), which is now rejected.
+    Unknown containers from a different Khaos Runtime must not be deleted.
+    """
     backend = _FaultMatrixBackend(_profile())
-    # reconcile_instances returns unknown containers — they must not be
-    # silently deleted by the store-level reconciliation.
     import asyncio
-    report = asyncio.run(backend.reconcile_instances(expected_labels={}))
-    # Unknown list is empty by default — no false positives.
-    assert report["unknown"] == []
-    assert report["found"] == []
+    # list_unknown_khaos_containers returns a list — never terminates.
+    unknown = asyncio.run(backend.list_unknown_khaos_containers())
+    # Empty by default — no false positives, no deletions.
+    assert unknown == []
+    assert not any(
+        call[0] in {"terminate_instance", "remove_instance",
+                     "terminate_and_remove_instance"}
+        for call in backend.calls
+    )
 
 
 def test_fault_matrix_actual_binary_digest_mismatch(tmp_path):
