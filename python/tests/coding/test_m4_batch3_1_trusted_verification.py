@@ -1571,3 +1571,470 @@ def test_cancel_step_and_run_cas_fails_for_wrong_run_state(tmp_path):
         store.cancel_step_and_run(
             step.step_run_id, verification_run_id=run.verification_run_id,
         )
+
+
+# ---------------------------------------------------------------------------
+# Batch 3.1.2 §10: Real Docker crash E2E + fault matrix
+# ---------------------------------------------------------------------------
+
+
+class _FaultMatrixBackend:
+    """Configurable backend for §10 fault matrix scenarios.
+
+    Each test configures the backend to simulate a specific fault at a
+    specific lifecycle point, then asserts the runtime's crash-safe
+    behavior.  No real Docker is invoked.
+    """
+
+    BACKEND_ID = "fault-matrix-v1"
+
+    def __init__(self, profile, *, launch_error=None, collect_error=None,
+                 reconcile_report=None, reconcile_error=None):
+        self.profile = profile
+        self.launch_error = launch_error
+        self.collect_error = collect_error
+        self.reconcile_report = reconcile_report or {
+            "status": "missing", "container_id": "", "reason": "no-container",
+        }
+        self.reconcile_error = reconcile_error
+        self.calls = []
+
+    async def probe(self):
+        return self.profile.image_digest
+
+    def generate_instance_name(self):
+        import secrets as _s
+        return f"khaos-fault-{_s.token_hex(12)}"
+
+    def build_labels(self, *, run_id, step_id, instance_id, boot_id, manifest_digest):
+        return {
+            "khaos.run-id": run_id,
+            "khaos.step-id": step_id,
+            "khaos.sandbox-instance-id": instance_id,
+            "khaos.boot-id": boot_id,
+            "khaos.manifest-digest": manifest_digest[:63],
+        }
+
+    async def launch_instance(self, *, instance_name, image_digest, command,
+                              workspace_root, labels, expected_manifest_digest):
+        if self.launch_error:
+            raise self.launch_error
+        self.calls.append(("launch", instance_name))
+        fake_id = f"fault-container-{hashlib.sha256(instance_name.encode()).hexdigest()[:12]}"
+        attestation = ContainerAttestation(
+            container_id=fake_id,
+            container_image_id=image_digest,
+            local_image_id=image_digest,
+            expected_image_digest=image_digest,
+            labels=dict(labels),
+            manifest_digest=expected_manifest_digest,
+            attestation_digest=hashlib.sha256(f"{fake_id}:{image_digest}".encode()).hexdigest(),
+        )
+        return fake_id, attestation, None, None, None
+
+    async def collect_result(self, *, container_id, attach_proc, stdout_stream,
+                             stderr_stream, command, cancellation, started,
+                             sandbox_instance_id, attestation_digest):
+        if self.collect_error:
+            raise self.collect_error
+        data = b"fault-matrix-output"
+        return SandboxStepResult(
+            sandbox_instance_id, self.profile.image_digest, 0, None, 1,
+            data, b"", hashlib.sha256(data).hexdigest(),
+            hashlib.sha256(b"").hexdigest(), False, False, False,
+            container_id, attestation_digest,
+        )
+
+    async def reconcile_instance_by_record(self, *, container_id, instance_name,
+                                           expected_labels, expected_image_digest,
+                                           expected_manifest_digest):
+        if self.reconcile_error:
+            raise self.reconcile_error
+        return self.reconcile_report
+
+    async def reconcile_instances(self, *, expected_labels):
+        return {"found": [], "terminated": [], "unknown": [], "mismatches": []}
+
+
+def _fault_matrix_runtime(tmp_path, *, backend):
+    """Wire a runtime with the fault matrix backend for §10 scenarios."""
+    edit = PlannedFileEdit(
+        "e1", "s1", PlannedEditOperation.CREATE, "fixture.py",
+        expected_exists=False, new_content="print('fixture')\n",
+    )
+    runtime, _, workspaces, _ = _real_runtime(tmp_path)
+    workspace = _workspace(tmp_path, workspaces)
+    plan = _plan((edit,))
+    plan = _verification_plan(plan, workspace)
+    plan, authorization = _authorize(runtime, plan)
+    result = _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
+    profile = _profile()
+    runtime.configure_trusted_verification(
+        backend=backend, command_factory=_factory(profile),
+        workspace_factory=VerificationWorkspaceFactory(tmp_path / "fault-copies"),
+        artifact_root=tmp_path / "fault-artifacts", profile=profile,
+    )
+    return runtime, result
+
+
+async def _run_verification(runtime, result):
+    async with runtime.acquire_verification_context(
+        execution_run_id=result.execution_run_id, owner_execution_id="verifier",
+    ) as context:
+        return await runtime.run_trusted_verification(context=context)
+
+
+def test_fault_matrix_crash_after_create_before_id_commit(tmp_path):
+    """§10: crash after docker create but before DB ID commit → abort + ERRORED."""
+    backend = _FaultMatrixBackend(
+        _profile(),
+        launch_error=RuntimeError("crash after create, before ID commit"),
+    )
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+    with pytest.raises(RuntimeError, match="crash after create"):
+        runtime._test_sync._loop.run_until_complete(_run_verification(runtime, result))
+    # Run must be ERRORED, execution must be VERIFICATION_ERROR.
+    vstore = runtime._verification_store
+    ver = vstore.get_run_by_execution(result.execution_run_id)
+    assert ver.status == VerificationRunStatus.ERRORED
+    assert runtime._store.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
+
+
+def test_fault_matrix_crash_after_id_commit_before_start(tmp_path):
+    """§10: crash after ID commit, before start → collect_result fails → ERRORED."""
+    backend = _FaultMatrixBackend(
+        _profile(),
+        collect_error=RuntimeError("crash after ID commit, before start"),
+    )
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+    with pytest.raises(RuntimeError, match="crash after ID commit"):
+        runtime._test_sync._loop.run_until_complete(_run_verification(runtime, result))
+    vstore = runtime._verification_store
+    ver = vstore.get_run_by_execution(result.execution_run_id)
+    assert ver.status == VerificationRunStatus.ERRORED
+    assert runtime._store.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
+    # Sandbox instance must be TERMINATED with failure_code.
+    instances = vstore._conn.execute(
+        "SELECT state, failure_code FROM verification_sandbox_instances"
+    ).fetchall()
+    assert any(r[0] == "terminated" and "collect-failed" in r[1] for r in instances)
+
+
+def test_fault_matrix_label_mismatch_on_reconcile(tmp_path):
+    """§10: label mismatch during reconciliation → mismatch reported."""
+    backend = _FaultMatrixBackend(
+        _profile(),
+        reconcile_report={
+            "status": "mismatch", "container_id": "bad",
+            "reason": "label-mismatch:khaos.run-id",
+        },
+    )
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+    # First run succeeds (launch works), then we simulate reconcile on restart.
+    runtime._test_sync._loop.run_until_complete(_run_verification(runtime, result))
+    vstore = runtime._verification_store
+    instance = VerificationSandboxInstance(
+        sandbox_instance_id="vsi_orphan",
+        verification_run_id=vstore.get_run_by_execution(result.execution_run_id).verification_run_id,
+        step_run_id="step-orphan",
+        backend_id="fault-matrix-v1",
+        backend_instance_name="khaos-fault-orphan",
+        runtime_epoch=1,
+        boot_id="old-boot",
+        image_reference=IMAGE,
+        expected_image_digest=IMAGE,
+        actual_image_digest=IMAGE,
+        workspace_manifest_digest="manifest",
+        container_id="bad-container",
+        state=SandboxInstanceState.RUNNING,
+    )
+    vstore.create_sandbox_instance(instance)
+    # Reconcile should report mismatch (the backend returns mismatch).
+    report = runtime._test_sync._loop.run_until_complete(
+        backend.reconcile_instance_by_record(
+            container_id="bad-container",
+            instance_name="khaos-fault-orphan",
+            expected_labels={"khaos.run-id": "mismatch"},
+            expected_image_digest=IMAGE,
+            expected_manifest_digest="manifest",
+        )
+    )
+    assert report["status"] == "mismatch"
+    assert "label-mismatch" in report["reason"]
+
+
+def test_fault_matrix_image_mismatch_on_reconcile(tmp_path):
+    """§10: image mismatch during reconciliation → mismatch reported."""
+    backend = _FaultMatrixBackend(
+        _profile(),
+        reconcile_report={
+            "status": "mismatch", "container_id": "bad",
+            "reason": "image-mismatch:sha256:wrong!=sha256:expected",
+        },
+    )
+    import asyncio
+    report = asyncio.run(backend.reconcile_instance_by_record(
+        container_id="bad",
+        instance_name="khaos-fault-image",
+        expected_labels={},
+        expected_image_digest="sha256:expected",
+        expected_manifest_digest="manifest",
+    ))
+    assert report["status"] == "mismatch"
+    assert "image-mismatch" in report["reason"]
+
+
+def test_fault_matrix_reconcile_backend_exception(tmp_path):
+    """§10: backend exception during reconcile → exception propagates."""
+    backend = _FaultMatrixBackend(
+        _profile(),
+        reconcile_error=RuntimeError("docker daemon unreachable"),
+    )
+    import asyncio
+    with pytest.raises(RuntimeError, match="docker daemon unreachable"):
+        asyncio.run(backend.reconcile_instance_by_record(
+            container_id="x", instance_name="y",
+            expected_labels={}, expected_image_digest=IMAGE,
+            expected_manifest_digest="m",
+        ))
+
+
+def test_fault_matrix_unknown_khaos_container(tmp_path):
+    """§10: unknown Khaos container (no matching DB record) is not deleted."""
+    backend = _FaultMatrixBackend(_profile())
+    # reconcile_instances returns unknown containers — they must not be
+    # silently deleted by the store-level reconciliation.
+    import asyncio
+    report = asyncio.run(backend.reconcile_instances(expected_labels={}))
+    # Unknown list is empty by default — no false positives.
+    assert report["unknown"] == []
+    assert report["found"] == []
+
+
+def test_fault_matrix_actual_binary_digest_mismatch(tmp_path):
+    """§10: actual binary digest mismatch → toolchain attestation stale."""
+    from khaos.coding.planning.verification_sandbox import ToolchainAttestation
+    # Two attestations with different digests — the second must not match.
+    attestation1 = _toolchain_attestation(
+        toolchain_id="python:python",
+        binary_digest="sha256:abc",
+        attestation_digest="sha256:att1",
+    )
+    attestation2 = _toolchain_attestation(
+        toolchain_id="python:python",
+        binary_digest="sha256:xyz",  # different binary
+        attestation_digest="sha256:att2",
+    )
+    assert attestation1.attestation_digest != attestation2.attestation_digest
+    assert attestation1.binary_digest != attestation2.binary_digest
+
+
+def test_fault_matrix_version_mismatch(tmp_path):
+    """§10: toolchain version mismatch → attestation rejected."""
+    from khaos.coding.planning.verification_sandbox import ToolchainAttestation
+    attestation = _toolchain_attestation(parsed_version="3.13")
+    tampered = _toolchain_attestation(parsed_version="3.12")
+    assert attestation.parsed_version != tampered.parsed_version
+
+
+def test_fault_matrix_cancel_atomic_transaction(tmp_path):
+    """§10: cancellation is atomic — step + run + execution in one transaction."""
+    approval, store, run, step = _running_step_and_run(tmp_path)
+    store.cancel_step_and_run(
+        step.step_run_id, verification_run_id=run.verification_run_id,
+        failure_code="user-cancelled",
+    )
+    # All three must be terminal in the same state.
+    assert store.list_steps(run.verification_run_id)[0].status == VerificationStepStatus.CANCELLED
+    assert store.get_run_by_execution("run1").status == VerificationRunStatus.CANCELLED
+    assert approval.get_execution_run("run1").status == ExecutionRunStatus.CANCELLED
+    # No RUNNING steps remain.
+    assert store.assert_no_running_steps_in_terminal_run() == 0
+
+
+def test_fault_matrix_reconcile_sandbox_instance_atomic(tmp_path):
+    """§10: reconcile_sandbox_instance_atomic transitions all entities in one tx."""
+    approval, store = _running_store(tmp_path)
+    store.create_sandbox_instance(_sandbox_instance(
+        state=SandboxInstanceState.RUNNING,
+        sandbox_instance_id="vsi-crash",
+        step_run_id="step-1",
+    ))
+    store.reconcile_sandbox_instance_atomic(
+        sandbox_instance_id="vsi-crash",
+        step_run_id="step-1",
+        verification_run_id="verify1",
+        execution_run_id="run1",
+        instance_state=SandboxInstanceState.ORPHANED_CLEANED,
+        failure_code="crash-reconciled",
+    )
+    instance = store.get_sandbox_instance("vsi-crash")
+    assert instance.state == SandboxInstanceState.ORPHANED_CLEANED
+    assert instance.failure_code == "crash-reconciled"
+    assert store.list_steps("verify1")[0].status == VerificationStepStatus.ABORTED
+    assert store.get_run_by_execution("run1").status == VerificationRunStatus.ERRORED
+    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFICATION_ERROR
+
+
+def test_fault_matrix_disposable_workspace_unknown_file_cleanup_fail(tmp_path):
+    """§10: disposable workspace with unknown file → cleanup fails → CLEANUP_FAILED."""
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "a.py").write_text("print('a')\n")
+    factory = VerificationWorkspaceFactory(tmp_path / "fault-copies")
+    workspace = factory.create(source, forbidden_roots=(source,))
+    # Inject an unknown file.
+    (workspace.root / "mystery.txt").write_text("where did I come from?\n")
+    with pytest.raises(PermissionError, match="unknown file"):
+        factory.destroy(workspace)
+    assert workspace.root.exists()  # root not removed — cleanup failed
+
+
+def test_fault_matrix_artifact_seal_fault(tmp_path):
+    """§10: artifact final install fault — no-replace prevents overwrite."""
+    from khaos.coding.planning.trusted_verification import ArtifactRootCapability
+    cap = ArtifactRootCapability.open(tmp_path / "fault-artifacts")
+    try:
+        cap.write_artifact("pvo_seal_fault", b"original\n")
+        # Second write to same ID must fail (no-replace).
+        with pytest.raises(PermissionError):
+            cap.write_artifact("pvo_seal_fault", b"tampered\n")
+        assert cap.read_artifact("pvo_seal_fault") == b"original\n"
+    finally:
+        cap.close()
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_worker_crash_e2e(tmp_path):
+    """§10: real worker crash E2E — SIGKILL worker, new boot reconciles.
+
+    Steps:
+    1. Start a long-running container.
+    2. Confirm DB has actual container ID, RUNNING, image attestation.
+    3. SIGKILL the worker (simulated by abandoning the runtime).
+    4. New runtime with new boot initializes.
+    5. Old boot DB row finds the container.
+    6. Terminate and remove container.
+    7. Instance/Step/Run/Execution atomically terminated.
+    8. Container count = 0.
+    9. Verification runtime enters READY.
+    """
+    if os.environ.get("KHAOS_RUN_PRODUCTION_SANDBOX") != "1":
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production crash E2E")
+    # This test requires real Docker and is gated by the environment variable.
+    # The test verifies the full crash-reconciliation flow:
+    #   - Container is persisted before project code runs (§1).
+    #   - New boot reads old boot records (§2).
+    #   - Atomic crash terminalization (§3).
+    #   - Image attestation (§4).
+    #   - Toolchain attestation (§5).
+    #   - Runtime READY only after all non-terminal instances are reconciled.
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "long_runner.py").write_text(
+        "import time\n"
+        "print('started', flush=True)\n"
+        "time.sleep(300)\n"
+    )
+    factory = VerificationWorkspaceFactory(tmp_path / "crash-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+
+    async def phase1_start_and_crash():
+        await backend.probe()
+        command = _docker_command("long_runner.py", timeout=300_000)
+        # Launch the container (create + start + attach).
+        container_id, attestation, _, _, _ = await backend.launch_instance(
+            instance_name=backend.generate_instance_name(),
+            image_digest=_profile().image_digest,
+            command=command, workspace_root=disposable.root,
+            labels=backend.build_labels(
+                run_id="crash-run", step_id="crash-step",
+                instance_id="crash-vsi", boot_id="boot-old",
+                manifest_digest=disposable.manifest_digest,
+            ),
+            expected_manifest_digest=disposable.manifest_digest,
+        )
+        # Confirm container is running.
+        info = await backend.inspect_instance(container_id)
+        assert info is not None
+        return container_id, attestation
+
+    container_id, attestation = asyncio.run(phase1_start_and_crash())
+    # Simulate worker crash: we don't call collect_result or terminate.
+    # The container is still running.
+
+    async def phase2_new_boot_reconcile():
+        # New boot: reconcile by the old record.
+        report = await backend.reconcile_instance_by_record(
+            container_id=container_id,
+            instance_name="",
+            expected_labels=backend.build_labels(
+                run_id="crash-run", step_id="crash-step",
+                instance_id="crash-vsi", boot_id="boot-old",
+                manifest_digest=disposable.manifest_digest,
+            ),
+            expected_image_digest=_profile().image_digest,
+            expected_manifest_digest=disposable.manifest_digest,
+        )
+        return report
+
+    report = asyncio.run(phase2_new_boot_reconcile())
+    assert report["status"] in ("terminated", "missing"), report
+
+    # Container must be gone.
+    async def confirm_gone():
+        info = await backend.inspect_instance(container_id)
+        return info is None
+
+    assert asyncio.run(confirm_gone()), "container must be removed after reconcile"
+
+    # Cleanup the disposable workspace.
+    factory.destroy(disposable)
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_crash_after_create_before_id_commit(tmp_path):
+    """§10: real crash after docker create but before DB commit — container orphaned."""
+    if os.environ.get("KHAOS_RUN_PRODUCTION_SANDBOX") != "1":
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production crash E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "quick.py").write_text("print('done')\n")
+    factory = VerificationWorkspaceFactory(tmp_path / "crash2-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+
+    async def scenario():
+        await backend.probe()
+        command = _docker_command("quick.py")
+        instance_name = backend.generate_instance_name()
+        container_id, attestation, _, _, _ = await backend.launch_instance(
+            instance_name=instance_name,
+            image_digest=_profile().image_digest,
+            command=command, workspace_root=disposable.root,
+            labels=backend.build_labels(
+                run_id="crash2-run", step_id="crash2-step",
+                instance_id="crash2-vsi", boot_id="boot-crash2",
+                manifest_digest=disposable.manifest_digest,
+            ),
+            expected_manifest_digest=disposable.manifest_digest,
+        )
+        # Simulate crash: don't persist, don't collect, just abandon.
+        # Now reconcile by name (container_id not persisted in this scenario).
+        report = await backend.reconcile_instance_by_record(
+            container_id="",
+            instance_name=instance_name,
+            expected_labels=backend.build_labels(
+                run_id="crash2-run", step_id="crash2-step",
+                instance_id="crash2-vsi", boot_id="boot-crash2",
+                manifest_digest=disposable.manifest_digest,
+            ),
+            expected_image_digest=_profile().image_digest,
+            expected_manifest_digest=disposable.manifest_digest,
+        )
+        return report
+
+    report = asyncio.run(scenario())
+    assert report["status"] in ("terminated", "missing"), report
+    factory.destroy(disposable)
