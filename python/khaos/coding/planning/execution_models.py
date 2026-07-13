@@ -45,6 +45,20 @@ class DurableEditPhase(str, Enum):
     ROLLED_BACK = "rolled-back"
 
 
+class RollbackResumeDisposition(str, Enum):
+    STARTED = "started"
+    RESUMED = "resumed"
+    SEALING = "sealing"
+    TERMINAL = "terminal"
+
+
+@dataclass(frozen=True)
+class RollbackResumeState:
+    disposition: RollbackResumeDisposition
+    run_status: ExecutionRunStatus
+    failure_code: str
+
+
 @dataclass(frozen=True)
 class PlanExecutionRun:
     execution_run_id: str
@@ -172,14 +186,26 @@ class AttestedPathState:
     exists: bool
     content_hash: str = ""
     mode: int | None = None
+    file_type: str = ""
+    identity_digest: str = ""
+    parent_identity_digest: str = ""
 
     def canonical(self) -> dict[str, Any]:
-        return {
+        value = {
             "path": unicodedata.normalize("NFC", self.path),
             "exists": self.exists,
             "content_hash": self.content_hash,
             "mode": self.mode,
         }
+        # Preserve canonical compatibility for terminal attestations written
+        # before Batch 3.0.6; new ownership fields are present only when bound.
+        if self.file_type:
+            value["file_type"] = self.file_type
+        if self.identity_digest:
+            value["identity_digest"] = self.identity_digest
+        if self.parent_identity_digest:
+            value["parent_identity_digest"] = self.parent_identity_digest
+        return value
 
 
 @dataclass(frozen=True)
@@ -383,6 +409,12 @@ class ValidatedRecoveryEvent:
     artifact: SafeRecoveryArtifactName | None
     durable_phase: str
     phase_version: int
+    applied_identity_digest: str = ""
+    applied_parent_identity_digest: str = ""
+    applied_destination_identity_digest: str = ""
+    rollback_identity_digest: str = ""
+    identity_version: int = 0
+    execution_run_id: str = ""
 
     def __getitem__(self, key: str) -> Any:
         aliases = {

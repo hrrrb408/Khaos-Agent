@@ -19,6 +19,20 @@ class SafePathError(RuntimeError):
     pass
 
 
+@dataclass(frozen=True)
+class MutationObjectIdentity:
+    """Path-free object and parent identity observed through fixed dirfds."""
+
+    exists: bool
+    object_dev: int = 0
+    object_ino: int = 0
+    file_type: str = "missing"
+    source_parent_dev: int = 0
+    source_parent_ino: int = 0
+    destination_parent_dev: int = 0
+    destination_parent_ino: int = 0
+
+
 @dataclass
 class SafeParentDirectory:
     root_fd: int
@@ -190,7 +204,7 @@ class WorkspacePathHandle:
 
     def create(
         self, relative: str, content: bytes, mode: int,
-        phase: Callable[[str], None],
+        phase: Callable[..., None],
     ) -> None:
         parent = self.parent(relative)
         temp = ""
@@ -206,7 +220,13 @@ class WorkspacePathHandle:
             )
             os.unlink(temp, dir_fd=parent.parent_fd)
             temp = ""
-            phase("filesystem-applied")
+            installed = parent.lstat()
+            if installed is None or not stat.S_ISREG(installed.st_mode):
+                raise SafePathError("created object identity missing")
+            phase("filesystem-applied", MutationObjectIdentity(
+                True, installed.st_dev, installed.st_ino, "regular",
+                parent.identity[0], parent.identity[1],
+            ))
             parent.revalidate()
             parent.fsync()
             phase("directory-synced")
@@ -220,7 +240,7 @@ class WorkspacePathHandle:
 
     def update(
         self, relative: str, content: bytes, mode: int, expected_inode: int,
-        phase: Callable[[str], None],
+        phase: Callable[..., None],
     ) -> None:
         parent = self.parent(relative)
         temp = ""
@@ -242,7 +262,13 @@ class WorkspacePathHandle:
                 raise SafePathError("update target was replaced by another actor")
             os.unlink(temp, dir_fd=parent.parent_fd)
             temp = ""
-            phase("filesystem-applied")
+            installed = parent.lstat()
+            if installed is None or not stat.S_ISREG(installed.st_mode):
+                raise SafePathError("updated object identity missing")
+            phase("filesystem-applied", MutationObjectIdentity(
+                True, installed.st_dev, installed.st_ino, "regular",
+                parent.identity[0], parent.identity[1],
+            ))
             parent.revalidate()
             parent.fsync()
             phase("directory-synced")
@@ -254,7 +280,7 @@ class WorkspacePathHandle:
                     pass
             parent.close()
 
-    def delete(self, relative: str, expected_inode: int, phase: Callable[[str], None]) -> None:
+    def delete(self, relative: str, expected_inode: int, phase: Callable[..., None]) -> None:
         parent = self.parent(relative)
         try:
             current = parent.lstat()
@@ -262,7 +288,12 @@ class WorkspacePathHandle:
                 raise SafePathError("delete target identity changed")
             parent.revalidate()
             os.unlink(parent.leaf, dir_fd=parent.parent_fd)
-            phase("filesystem-applied")
+            if parent.lstat() is not None:
+                raise SafePathError("deleted object reappeared")
+            phase("filesystem-applied", MutationObjectIdentity(
+                False, source_parent_dev=parent.identity[0],
+                source_parent_ino=parent.identity[1],
+            ))
             parent.revalidate()
             parent.fsync()
             phase("directory-synced")
@@ -271,7 +302,7 @@ class WorkspacePathHandle:
 
     def rename_no_replace(
         self, source: str, destination: str, expected_inode: int,
-        phase: Callable[[str], None],
+        phase: Callable[..., None],
     ) -> None:
         source_parent = self.parent(source)
         destination_parent = self.parent(destination)
@@ -299,7 +330,15 @@ class WorkspacePathHandle:
             except Exception:
                 os.unlink(destination_parent.leaf, dir_fd=destination_parent.parent_fd)
                 raise
-            phase("filesystem-applied")
+            installed = destination_parent.lstat()
+            if (source_parent.lstat() is not None or installed is None
+                    or not stat.S_ISREG(installed.st_mode)):
+                raise SafePathError("renamed object identity missing")
+            phase("filesystem-applied", MutationObjectIdentity(
+                True, installed.st_dev, installed.st_ino, "regular",
+                source_parent.identity[0], source_parent.identity[1],
+                destination_parent.identity[0], destination_parent.identity[1],
+            ))
             source_parent.revalidate()
             destination_parent.revalidate()
             source_parent.fsync()

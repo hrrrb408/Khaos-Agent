@@ -33,7 +33,10 @@ import time
 import uuid
 from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from khaos.coding.planning.execution_models import RollbackResumeState
 
 from khaos.coding.planning.approval.models import (
     ALLOWED_APPROVAL_TRANSITIONS,
@@ -280,13 +283,17 @@ CREATE TABLE IF NOT EXISTS plan_execution_edit_events (
     after_mode INTEGER,
     status TEXT NOT NULL,
     phase_version INTEGER NOT NULL DEFAULT 0,
+    applied_identity_digest TEXT NOT NULL DEFAULT '',
+    applied_parent_identity_digest TEXT NOT NULL DEFAULT '',
+    applied_destination_identity_digest TEXT NOT NULL DEFAULT '',
+    rollback_identity_digest TEXT NOT NULL DEFAULT '',
+    identity_version INTEGER NOT NULL DEFAULT 0,
     error_code TEXT NOT NULL DEFAULT '',
     recovery_artifact TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE(execution_run_id, edit_id)
 );
-
 CREATE TABLE IF NOT EXISTS plan_execution_audit_events (
     audit_id TEXT PRIMARY KEY,
     execution_run_id TEXT NOT NULL,
@@ -497,6 +504,27 @@ def _post_schema(conn: sqlite3.Connection) -> None:
         conn.execute(
             "ALTER TABLE plan_execution_edit_events ADD COLUMN "
             "phase_version INTEGER NOT NULL DEFAULT 0"
+        )
+    for column, declaration in (
+        ("applied_identity_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("applied_parent_identity_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("applied_destination_identity_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("rollback_identity_digest", "TEXT NOT NULL DEFAULT ''"),
+        ("identity_version", "INTEGER NOT NULL DEFAULT 0"),
+    ):
+        if event_cols and column not in event_cols:
+            conn.execute(
+                f"ALTER TABLE plan_execution_edit_events ADD COLUMN "
+                f"{column} {declaration}"
+            )
+    if event_cols:
+        # This index must be created only after legacy Batch 3 databases have
+        # received the ownership columns above.  Putting it in APPROVAL_SCHEMA
+        # makes SQLite evaluate it before _post_schema can migrate the table.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_plan_execution_edit_events_recovery "
+            "ON plan_execution_edit_events("
+            "execution_run_id,status,identity_version,ordinal)"
         )
 
 
@@ -2785,6 +2813,71 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
+    def begin_or_resume_rollback(
+        self, execution_run_id: str, *, failure_code: str,
+        now: float | None = None,
+    ) -> "RollbackResumeState":
+        """Atomically begin or resume rollback without overwriting its reason."""
+        from khaos.coding.planning.execution_models import (
+            ExecutionRunStatus, RollbackResumeDisposition, RollbackResumeState,
+        )
+
+        timestamp = time.time() if now is None else float(now)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT status,failure_code FROM plan_execution_runs "
+                "WHERE execution_run_id=?", (execution_run_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("execution run not found")
+            status = ExecutionRunStatus(row["status"])
+            stored_reason = str(row["failure_code"] or "")
+            effective_reason = stored_reason or failure_code
+            if status in {
+                ExecutionRunStatus.VALIDATING,
+                ExecutionRunStatus.MUTATING,
+                ExecutionRunStatus.POISONED,
+            }:
+                cur = self._conn.execute(
+                    "UPDATE plan_execution_runs SET status='rolling-back',"
+                    "failure_code=?,updated_at=? WHERE execution_run_id=? AND status=?",
+                    (effective_reason, timestamp, execution_run_id, status.value),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise RuntimeError("rollback run CAS conflict")
+                self._insert_execution_audit(
+                    execution_run_id, "rollback-started", result="rolling-back",
+                    error_code=effective_reason, correlation_id=execution_run_id,
+                )
+                disposition = RollbackResumeDisposition.STARTED
+                status = ExecutionRunStatus.ROLLING_BACK
+            elif status == ExecutionRunStatus.ROLLING_BACK:
+                if not stored_reason:
+                    cur = self._conn.execute(
+                        "UPDATE plan_execution_runs SET failure_code=?,updated_at=? "
+                        "WHERE execution_run_id=? AND status='rolling-back' "
+                        "AND failure_code=''",
+                        (effective_reason, timestamp, execution_run_id),
+                    )
+                    if int(cur.rowcount or 0) != 1:
+                        raise RuntimeError("rollback reason CAS conflict")
+                disposition = RollbackResumeDisposition.RESUMED
+            elif status == ExecutionRunStatus.ROLLBACK_SEALING:
+                disposition = RollbackResumeDisposition.SEALING
+            elif status in {
+                ExecutionRunStatus.ROLLED_BACK,
+                ExecutionRunStatus.CANCELLED,
+            }:
+                disposition = RollbackResumeDisposition.TERMINAL
+            else:
+                raise RuntimeError("execution run cannot enter rollback")
+            self._conn.commit()
+            return RollbackResumeState(disposition, status, effective_reason)
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def insert_edit_event(
         self, *, event_id: str, execution_run_id: str, edit_id: str,
         ordinal: int, operation: str, path: str, destination_path: str | None,
@@ -2828,6 +2921,9 @@ class PlanApprovalStore:
         target_phase: str,
         after_hash: str | None = None, after_mode: int | None = None,
         error_code: str = "",
+        applied_identity_digest: str | None = None,
+        applied_parent_identity_digest: str | None = None,
+        applied_destination_identity_digest: str | None = None,
     ) -> None:
         """Advance one edit phase using a transactionally checked CAS."""
         from khaos.coding.planning.execution_models import DurableEditPhase
@@ -2865,7 +2961,10 @@ class PlanApprovalStore:
         try:
             row = self._conn.execute(
                 "SELECT e.operation,e.path,e.before_hash,e.after_hash,e.after_mode,"
-                "e.status,e.phase_version,r.status AS run_status "
+                "e.status,e.phase_version,e.error_code,"
+                "e.applied_identity_digest,e.applied_parent_identity_digest,"
+                "e.applied_destination_identity_digest,e.rollback_identity_digest,"
+                "e.identity_version,r.status AS run_status "
                 "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
                 "ON r.execution_run_id=e.execution_run_id "
                 "WHERE e.execution_run_id=? AND e.edit_id=?",
@@ -2877,10 +2976,29 @@ class PlanApprovalStore:
                 raise RuntimeError("execution edit phase CAS conflict")
             stored_after_hash = row["after_hash"] if after_hash is None else after_hash
             stored_after_mode = row["after_mode"] if after_mode is None else after_mode
+            stored_identity = (
+                row["applied_identity_digest"]
+                if applied_identity_digest is None else applied_identity_digest
+            )
+            stored_parent_identity = (
+                row["applied_parent_identity_digest"]
+                if applied_parent_identity_digest is None
+                else applied_parent_identity_digest
+            )
+            stored_destination_identity = (
+                row["applied_destination_identity_digest"]
+                if applied_destination_identity_digest is None
+                else applied_destination_identity_digest
+            )
             if target_phase == expected_phase:
                 if (stored_after_hash != row["after_hash"]
                         or stored_after_mode != row["after_mode"]
-                        or error_code):
+                        or error_code != str(row["error_code"] or "")
+                        or stored_identity != row["applied_identity_digest"]
+                        or stored_parent_identity
+                        != row["applied_parent_identity_digest"]
+                        or stored_destination_identity
+                        != row["applied_destination_identity_digest"]):
                     raise RuntimeError("idempotent edit phase retry changed state")
                 self._conn.commit()
                 return
@@ -2903,13 +3021,33 @@ class PlanApprovalStore:
                 DurableEditPhase.ROLLED_BACK.value,
             } and row["run_status"] not in {"rolling-back", "rollback-sealing"}:
                 raise RuntimeError("rollback phase requires rollback run")
+            if target_phase == DurableEditPhase.FILESYSTEM_APPLIED.value:
+                if not stored_parent_identity:
+                    raise RuntimeError("filesystem identity evidence missing")
+                if row["operation"] != "delete" and not stored_identity:
+                    raise RuntimeError("applied object identity evidence missing")
+                if row["operation"] == "rename" and not stored_destination_identity:
+                    raise RuntimeError("rename destination identity evidence missing")
+            if target_phase == DurableEditPhase.ROLLED_BACK.value:
+                if (expected_phase == DurableEditPhase.ROLLBACK_STARTED.value
+                        and not row["rollback_identity_digest"]):
+                    raise RuntimeError("rollback identity evidence missing")
             next_version = int(row["phase_version"]) + (target_phase != expected_phase)
+            next_identity_version = int(row["identity_version"])
+            if target_phase == DurableEditPhase.FILESYSTEM_APPLIED.value:
+                if next_identity_version not in {0, 1}:
+                    raise RuntimeError("applied identity version conflict")
+                next_identity_version = 1
             cur = self._conn.execute(
                 "UPDATE plan_execution_edit_events SET status=?,after_hash=?,"
-                "after_mode=?,error_code=?,updated_at=?,phase_version=? "
+                "after_mode=?,error_code=?,updated_at=?,phase_version=?,"
+                "applied_identity_digest=?,applied_parent_identity_digest=?,"
+                "applied_destination_identity_digest=?,identity_version=? "
                 "WHERE execution_run_id=? AND edit_id=? AND status=? AND phase_version=?",
                 (target_phase, stored_after_hash, stored_after_mode, error_code, now,
-                 next_version, execution_run_id, edit_id, expected_phase,
+                 next_version, stored_identity, stored_parent_identity,
+                 stored_destination_identity, next_identity_version,
+                 execution_run_id, edit_id, expected_phase,
                  int(row["phase_version"])),
             )
             if int(cur.rowcount or 0) != 1:
@@ -2926,10 +3064,64 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
+    def record_rollback_identity(
+        self, execution_run_id: str, edit_id: str, *,
+        rollback_identity_digest: str, error_code: str,
+    ) -> None:
+        """Persist rollback object ownership before the ROLLED_BACK CAS."""
+        if not rollback_identity_digest:
+            raise RuntimeError("rollback identity evidence missing")
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self._conn.execute(
+                "SELECT e.operation,e.path,e.status,e.error_code,"
+                "e.rollback_identity_digest,e.identity_version,r.status AS run_status "
+                "FROM plan_execution_edit_events e JOIN plan_execution_runs r "
+                "ON r.execution_run_id=e.execution_run_id "
+                "WHERE e.execution_run_id=? AND e.edit_id=?",
+                (execution_run_id, edit_id),
+            ).fetchone()
+            if row is None or row["status"] != "rollback-started":
+                raise RuntimeError("edit is not rollback-started")
+            if row["run_status"] not in {"rolling-back", "rollback-sealing"}:
+                raise RuntimeError("rollback identity requires rollback run")
+            existing = str(row["rollback_identity_digest"] or "")
+            existing_error = str(row["error_code"] or "")
+            if existing:
+                if existing != rollback_identity_digest or existing_error != error_code:
+                    raise RuntimeError("rollback identity CAS conflict")
+                self._conn.commit()
+                return
+            if int(row["identity_version"]) != 1:
+                raise RuntimeError("applied identity evidence missing")
+            cur = self._conn.execute(
+                "UPDATE plan_execution_edit_events SET rollback_identity_digest=?,"
+                "identity_version=2,error_code=?,updated_at=? "
+                "WHERE execution_run_id=? AND edit_id=? AND status='rollback-started' "
+                "AND identity_version=1 AND rollback_identity_digest=''",
+                (rollback_identity_digest, error_code, now, execution_run_id, edit_id),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("rollback identity CAS conflict")
+            self._insert_execution_audit(
+                execution_run_id, "rollback-identity-recorded",
+                operation=row["operation"], path=row["path"],
+                result="rollback-started", error_code=error_code,
+                correlation_id=edit_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
     def update_edit_event(
         self, execution_run_id: str, edit_id: str, *, status: str,
         after_hash: str | None = None, after_mode: int | None = None,
         error_code: str = "",
+        applied_identity_digest: str | None = None,
+        applied_parent_identity_digest: str | None = None,
+        applied_destination_identity_digest: str | None = None,
     ) -> None:
         """Compatibility facade; it no longer accepts arbitrary phase writes."""
         row = self._conn.execute(
@@ -2943,6 +3135,9 @@ class PlanApprovalStore:
             execution_run_id, edit_id, expected_phase=str(row["status"]),
             target_phase=status, after_hash=after_hash, after_mode=after_mode,
             error_code=error_code,
+            applied_identity_digest=applied_identity_digest,
+            applied_parent_identity_digest=applied_parent_identity_digest,
+            applied_destination_identity_digest=applied_destination_identity_digest,
         )
 
     def mark_execution_recovery_sealed(

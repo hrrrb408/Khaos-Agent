@@ -36,6 +36,7 @@ from khaos.coding.planning.execution_models import (
 from khaos.coding.workspace.models import WorkspaceState
 from khaos.coding.planning.safe_workspace_path import (
     SafePathError,
+    MutationObjectIdentity,
     WorkspacePathHandle,
 )
 from khaos.coding.planning.git_state import GitStateInspector
@@ -208,8 +209,11 @@ class WorkspaceMutationEngine:
                     run.execution_run_id, edit.edit_id,
                     status="mutation-started",
                 )
-                self._active_phase = lambda phase, run_id=run.execution_run_id, edit_id=edit.edit_id: self._store.update_edit_event(
-                    run_id, edit_id, status=phase,
+                self._active_phase = (
+                    lambda phase, identity=None, run_id=run.execution_run_id,
+                    current_edit=edit: self._record_mutation_phase(
+                        run_id, current_edit, phase, identity,
+                    )
                 )
                 self._apply_edit(edit, root)
                 changed.extend(
@@ -594,16 +598,102 @@ class WorkspaceMutationEngine:
             except SafePathError as exc:
                 raise WorkspaceMutationError("rename-race", str(exc)) from exc
 
+    @staticmethod
+    def _object_identity_digest(
+        identity: MutationObjectIdentity, *, run_id: str, edit_id: str,
+        operation: str, role: str,
+    ) -> str:
+        payload = {
+            "run_id": run_id,
+            "edit_id": edit_id,
+            "operation": operation,
+            "role": role,
+            "exists": identity.exists,
+            "object_dev": identity.object_dev,
+            "object_ino": identity.object_ino,
+            "file_type": identity.file_type,
+            "source_parent_dev": identity.source_parent_dev,
+            "source_parent_ino": identity.source_parent_ino,
+            "destination_parent_dev": identity.destination_parent_dev,
+            "destination_parent_ino": identity.destination_parent_ino,
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _parent_identity_digest(
+        identity: MutationObjectIdentity, *, run_id: str, edit_id: str,
+        operation: str, destination: bool = False,
+    ) -> str:
+        dev = (
+            identity.destination_parent_dev if destination
+            else identity.source_parent_dev
+        )
+        ino = (
+            identity.destination_parent_ino if destination
+            else identity.source_parent_ino
+        )
+        if not dev or not ino:
+            return ""
+        payload = {
+            "run_id": run_id, "edit_id": edit_id,
+            "operation": operation,
+            "role": "destination-parent" if destination else "source-parent",
+            "dev": dev, "ino": ino,
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    def _record_mutation_phase(
+        self, run_id: str, edit: PlannedFileEdit, phase: str,
+        identity: MutationObjectIdentity | None,
+    ) -> None:
+        kwargs: dict[str, Any] = {}
+        if phase == "filesystem-applied":
+            if identity is None:
+                raise WorkspaceMutationError(
+                    "identity-evidence-missing",
+                    "filesystem mutation has no object identity",
+                )
+            kwargs = {
+                "applied_identity_digest": (
+                    "" if not identity.exists else self._object_identity_digest(
+                        identity, run_id=run_id, edit_id=edit.edit_id,
+                        operation=edit.operation.value, role="applied-object",
+                    )
+                ),
+                "applied_parent_identity_digest": self._parent_identity_digest(
+                    identity, run_id=run_id, edit_id=edit.edit_id,
+                    operation=edit.operation.value,
+                ),
+                "applied_destination_identity_digest": (
+                    self._object_identity_digest(
+                        identity, run_id=run_id, edit_id=edit.edit_id,
+                        operation=edit.operation.value,
+                        role="applied-destination-object",
+                    ) if edit.operation == PlannedEditOperation.RENAME else ""
+                ),
+            }
+        self._store.update_edit_event(
+            run_id, edit.edit_id, status=phase, **kwargs,
+        )
+
     def _rollback(
         self, run_id: str, root: Path, recovery: RecoveryDirectory, workspace_id: str, *, failure_code: str,
         poison_after: bool = False, recovered: bool = False,
     ) -> None:
         try:
-            current_run = self._store.get_execution_run(run_id)
-            self._store.transition_execution_run(
-                run_id, expected=(current_run.status.value,), target="rolling-back",
-                failure_code=failure_code,
+            resume = self._store.begin_or_resume_rollback(
+                run_id, failure_code=failure_code,
             )
+            if resume.disposition.value == "terminal":
+                return
+            if resume.disposition.value == "sealing":
+                return
+            failure_code = resume.failure_code
+            current_run = self._store.get_execution_run(run_id)
             baseline = self._require_initial_attestation(current_run)
             journal = self._validated_journal(current_run, allow_partial=True)
             self._validate_recovery_artifacts(journal, baseline, recovery)
@@ -611,18 +701,58 @@ class WorkspaceMutationEngine:
             owns_handle = self._active_path_handle is None
             baseline_paths = {item.path: item for item in baseline.declared_states}
             for event in reversed(journal.events):
-                self._rollback_event(
-                    handle, event, recovery, baseline_paths[event["path"]],
-                )
                 phase = event.durable_phase
+                if phase == "rolled-back":
+                    self._verify_rolled_back_event(
+                        handle, event, baseline_paths,
+                    )
+                    self._store.transition_edit_event(
+                        run_id, event.edit_id, expected_phase="rolled-back",
+                        target_phase="rolled-back", error_code=failure_code,
+                    )
+                    continue
+                if phase in {"journaled", "mutation-started"}:
+                    if not self._event_matches_unchanged_baseline(
+                        handle, event, baseline_paths,
+                    ):
+                        raise WorkspaceMutationError(
+                            "identity-evidence-missing",
+                            "mutation may have occurred before identity persistence",
+                        )
+                    self._store.transition_edit_event(
+                        run_id, event.edit_id, expected_phase=phase,
+                        target_phase="rolled-back", error_code=failure_code,
+                    )
+                    continue
                 if phase in {"filesystem-applied", "directory-synced", "applied"}:
+                    self._assert_applied_identity(handle, event)
                     self._store.transition_edit_event(
                         run_id, event.edit_id, expected_phase=phase,
                         target_phase="rollback-started", error_code=failure_code,
                     )
-                    phase = "rollback-started"
+                    event = replace(
+                        event, durable_phase="rollback-started",
+                        phase_version=event.phase_version + 1,
+                    )
+                if event.rollback_identity_digest:
+                    self._verify_rollback_identity(
+                        handle, event, baseline_paths,
+                    )
+                else:
+                    if self._event_has_baseline_values(
+                        handle, event, baseline_paths,
+                    ):
+                        raise WorkspaceMutationError(
+                            "identity-evidence-missing",
+                            "rollback syscall may have completed before identity commit",
+                        )
+                    self._assert_applied_identity(handle, event)
+                    self._rollback_event(
+                        handle, event, recovery, baseline_paths[event["path"]],
+                        run_id=run_id, failure_code=failure_code,
+                    )
                 self._store.transition_edit_event(
-                    run_id, event.edit_id, expected_phase=phase,
+                    run_id, event.edit_id, expected_phase="rollback-started",
                     target_phase="rolled-back", error_code=failure_code,
                 )
             target = "cancelled" if failure_code == "execution-context-invalid" else "rolled-back"
@@ -639,11 +769,21 @@ class WorkspaceMutationEngine:
             journal = self._validated_journal(current_run, allow_partial=True)
             events, journal_digest = journal.events, journal.canonical_digest
             workspace = self._workspaces.get(workspace_id)
-            rollback_attestation = self._build_rollback_attestation(
-                current_run, workspace, handle, events, journal_digest,
-                failure_code, baseline,
+            rollback_attestation = self._store.get_rollback_final_attestation(
+                run_id
             )
-            self._store.save_rollback_final_attestation(rollback_attestation)
+            if rollback_attestation is None:
+                rollback_attestation = self._build_rollback_attestation(
+                    current_run, workspace, handle, events, journal_digest,
+                    failure_code, baseline,
+                )
+                self._store.save_rollback_final_attestation(
+                    rollback_attestation
+                )
+            else:
+                self._validate_rollback_sealing_recovery(
+                    current_run, workspace, events, journal_digest,
+                )
             self._store.transition_execution_run(
                 run_id, expected=("rolling-back",), target="rollback-sealing",
                 failure_code=failure_code,
@@ -688,9 +828,12 @@ class WorkspaceMutationEngine:
             reason = f"rollback-failed:{type(rollback_error).__name__}"
             self._poison_run(workspace_id, run_id, reason)
             try:
+                current = self._store.get_execution_run(run_id)
                 self._store.transition_execution_run(
                     run_id, expected=("rolling-back", "rollback-sealing"),
-                    target="poisoned", failure_code=reason, completed=True,
+                    target="poisoned",
+                    failure_code=current.failure_code if current else failure_code,
+                    completed=True,
                 )
             except Exception:
                 pass
@@ -698,19 +841,34 @@ class WorkspaceMutationEngine:
 
     def _rollback_event(
         self, handle: WorkspacePathHandle, event: Any,
-        recovery: RecoveryDirectory, baseline: InitialPathState,
+        recovery: RecoveryDirectory, baseline: InitialPathState, *,
+        run_id: str, failure_code: str,
     ) -> None:
         operation = event["operation"]
         before_hash = baseline.content_hash or None
         after_hash = event["after_hash"] or None
         current_hash, current_mode, current_inode = self._current_target(handle, event["path"])
-        no_phase = lambda phase: None
-        if operation == "create":
-            if current_hash is None:
+        def record_identity(
+            phase: str, identity: MutationObjectIdentity | None = None,
+        ) -> None:
+            if phase == "directory-synced":
                 return
+            if phase != "filesystem-applied" or identity is None:
+                raise WorkspaceMutationError(
+                    "rollback-identity-missing", "rollback identity was not observed"
+                )
+            digest = self._object_identity_digest(
+                identity, run_id=run_id, edit_id=event.edit_id,
+                operation=event.operation.value, role="rollback-object",
+            )
+            self._store.record_rollback_identity(
+                run_id, event.edit_id, rollback_identity_digest=digest,
+                error_code=failure_code,
+            )
+        if operation == "create":
             if current_hash != after_hash or current_mode != event["after_mode"]:
                 raise WorkspaceMutationError("rollback-third-party", "create target has third-party content")
-            handle.delete(event["path"], current_inode, no_phase)
+            handle.delete(event["path"], current_inode, record_identity)
             return
         if operation == "rename":
             destination = event["destination_path"]
@@ -719,11 +877,9 @@ class WorkspaceMutationEngine:
                 return
             if (current_hash is None and dest_hash == after_hash
                     and dest_mode == event["after_mode"]):
-                handle.rename_no_replace(destination, event["path"], dest_inode, no_phase)
-                return
-            if (current_hash == before_hash and dest_hash == after_hash
-                    and dest_mode == event["after_mode"]):
-                handle.delete(destination, dest_inode, no_phase)
+                handle.rename_no_replace(
+                    destination, event["path"], dest_inode, record_identity,
+                )
                 return
             raise WorkspaceMutationError("rollback-third-party", "rename state is not known")
         artifact = event["recovery_artifact"]
@@ -737,18 +893,16 @@ class WorkspaceMutationEngine:
             ) from exc
         if hashlib.sha256(data).hexdigest() != before_hash:
             raise WorkspaceMutationError("rollback-evidence-invalid", "backup artifact invalid")
-        if current_hash == before_hash:
-            return
         mode = int(baseline.mode if baseline.mode is not None else 0o600)
         if operation == "update":
             if (current_hash != after_hash or current_mode != event["after_mode"]
                     or current_inode is None):
                 raise WorkspaceMutationError("rollback-third-party", "updated target has third-party content")
-            handle.update(event["path"], data, mode, current_inode, no_phase)
+            handle.update(event["path"], data, mode, current_inode, record_identity)
         elif operation == "delete":
             if current_hash is not None:
                 raise WorkspaceMutationError("rollback-third-party", "deleted target was replaced")
-            handle.create(event["path"], data, mode, no_phase)
+            handle.create(event["path"], data, mode, record_identity)
 
     @staticmethod
     def _validate_recovery_artifacts(
@@ -795,6 +949,211 @@ class WorkspaceMutationEngine:
             parent.close()
 
     @staticmethod
+    def _observe_event_identity(
+        handle: WorkspacePathHandle, event: Any,
+    ) -> MutationObjectIdentity:
+        operation = (
+            event.operation.value if isinstance(event, ValidatedRecoveryEvent)
+            else str(event["operation"])
+        )
+        source_path = event["path"]
+        destination_path = event["destination_path"]
+        source_parent = handle.parent(source_path)
+        destination_parent = None
+        try:
+            target_parent = source_parent
+            if operation == "rename":
+                destination_parent = handle.parent(destination_path)
+                target_parent = destination_parent
+                if source_parent.lstat() is not None:
+                    raise WorkspaceMutationError(
+                        "ownership-state-drift", "rename source reappeared"
+                    )
+            info = target_parent.lstat()
+            if info is None:
+                return MutationObjectIdentity(
+                    False,
+                    source_parent_dev=source_parent.identity[0],
+                    source_parent_ino=source_parent.identity[1],
+                    destination_parent_dev=(
+                        destination_parent.identity[0] if destination_parent else 0
+                    ),
+                    destination_parent_ino=(
+                        destination_parent.identity[1] if destination_parent else 0
+                    ),
+                )
+            if not stat.S_ISREG(info.st_mode):
+                raise WorkspaceMutationError(
+                    "ownership-state-drift", "mutation object is not regular"
+                )
+            return MutationObjectIdentity(
+                True, info.st_dev, info.st_ino, "regular",
+                source_parent.identity[0], source_parent.identity[1],
+                destination_parent.identity[0] if destination_parent else 0,
+                destination_parent.identity[1] if destination_parent else 0,
+            )
+        finally:
+            if destination_parent is not None:
+                destination_parent.close()
+            source_parent.close()
+
+    def _assert_applied_identity(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent,
+    ) -> MutationObjectIdentity:
+        observed = self._observe_event_identity(handle, event)
+        operation = event.operation.value
+        object_digest = (
+            "" if not observed.exists else self._object_identity_digest(
+                observed, run_id=event.execution_run_id,
+                edit_id=event.edit_id, operation=operation,
+                role="applied-object",
+            )
+        )
+        parent_digest = self._parent_identity_digest(
+            observed, run_id=event.execution_run_id, edit_id=event.edit_id,
+            operation=operation,
+        )
+        destination_digest = (
+            self._object_identity_digest(
+                observed, run_id=event.execution_run_id,
+                edit_id=event.edit_id, operation=operation,
+                role="applied-destination-object",
+            ) if operation == "rename" and observed.exists else ""
+        )
+        if (object_digest != event.applied_identity_digest
+                or parent_digest != event.applied_parent_identity_digest
+                or destination_digest
+                != event.applied_destination_identity_digest):
+            raise WorkspaceMutationError(
+                "mutation-object-replaced",
+                "current object is not the Khaos-owned mutation object",
+            )
+        return observed
+
+    @staticmethod
+    def _inode_identity_digest(identity: MutationObjectIdentity) -> str:
+        if not identity.exists:
+            return ""
+        return hashlib.sha256(
+            f"{identity.object_dev}:{identity.object_ino}".encode("utf-8")
+        ).hexdigest()
+
+    def _observe_rollback_identity(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent,
+    ) -> MutationObjectIdentity:
+        if event.operation != PlannedEditOperation.RENAME:
+            return self._observe_event_identity(handle, event)
+        source_parent = handle.parent(event.path.value)
+        destination_parent = handle.parent(event.destination.value)
+        try:
+            info = source_parent.lstat()
+            if destination_parent.lstat() is not None:
+                raise WorkspaceMutationError(
+                    "rollback-third-party", "rename destination reappeared"
+                )
+            if info is None or not stat.S_ISREG(info.st_mode):
+                raise WorkspaceMutationError(
+                    "rollback-state-drift", "rename source was not restored"
+                )
+            # Match the raw parent roles observed by rename_no_replace(b -> a).
+            return MutationObjectIdentity(
+                True, info.st_dev, info.st_ino, "regular",
+                destination_parent.identity[0], destination_parent.identity[1],
+                source_parent.identity[0], source_parent.identity[1],
+            )
+        finally:
+            destination_parent.close()
+            source_parent.close()
+
+    def _event_matches_unchanged_baseline(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent,
+        baseline_paths: dict[str, InitialPathState],
+    ) -> bool:
+        expected = baseline_paths[event.path.value]
+        try:
+            if event.operation == PlannedEditOperation.RENAME:
+                identity = self._observe_rollback_identity(handle, event)
+                destination_hash, _, _ = self._current_target(
+                    handle, event.destination.value,
+                )
+                if destination_hash is not None:
+                    return False
+            else:
+                identity = self._observe_event_identity(handle, event)
+        except WorkspaceMutationError:
+            return False
+        if not expected.exists:
+            return not identity.exists
+        if not identity.exists:
+            return False
+        content_hash, mode, _ = self._current_target(handle, expected.path)
+        return (
+            content_hash == expected.content_hash
+            and mode == expected.mode
+            and self._inode_identity_digest(identity) == expected.identity_digest
+        )
+
+    def _event_has_baseline_values(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent,
+        baseline_paths: dict[str, InitialPathState],
+    ) -> bool:
+        expected = baseline_paths[event.path.value]
+        content_hash, mode, _ = self._current_target(handle, event.path.value)
+        if expected.exists:
+            if content_hash != expected.content_hash or mode != expected.mode:
+                return False
+        elif content_hash is not None:
+            return False
+        if event.operation == PlannedEditOperation.RENAME:
+            destination_hash, _, _ = self._current_target(
+                handle, event.destination.value,
+            )
+            return destination_hash is None
+        return True
+
+    def _verify_rollback_identity(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent,
+        baseline_paths: dict[str, InitialPathState],
+    ) -> None:
+        identity = self._observe_rollback_identity(handle, event)
+        expected = baseline_paths[event.path.value]
+        if expected.exists:
+            content_hash, mode, _ = self._current_target(handle, expected.path)
+            if (not identity.exists or content_hash != expected.content_hash
+                    or mode != expected.mode):
+                raise WorkspaceMutationError(
+                    "rollback-state-drift", "restored object differs from baseline"
+                )
+        elif identity.exists:
+            raise WorkspaceMutationError(
+                "rollback-state-drift", "created object remains after rollback"
+            )
+        digest = self._object_identity_digest(
+            identity, run_id=event.execution_run_id, edit_id=event.edit_id,
+            operation=event.operation.value, role="rollback-object",
+        )
+        if digest != event.rollback_identity_digest:
+            raise WorkspaceMutationError(
+                "rollback-object-replaced",
+                "rollback result is not the persisted Khaos-owned object",
+            )
+
+    def _verify_rolled_back_event(
+        self, handle: WorkspacePathHandle, event: ValidatedRecoveryEvent,
+        baseline_paths: dict[str, InitialPathState],
+    ) -> None:
+        if event.rollback_identity_digest:
+            self._verify_rollback_identity(handle, event, baseline_paths)
+            return
+        if not self._event_matches_unchanged_baseline(
+            handle, event, baseline_paths,
+        ):
+            raise WorkspaceMutationError(
+                "rolled-back-state-drift",
+                "rolled-back event no longer matches its initial baseline",
+            )
+
+    @staticmethod
     def _workspace_state_digest(file_states: tuple[Any, ...]) -> str:
         payload = "|".join(
             f"{state.relative_path}:{state.state_digest}"
@@ -811,16 +1170,25 @@ class WorkspaceMutationEngine:
     ) -> tuple[AttestedPathState, ...]:
         states: list[AttestedPathState] = []
         for event in events:
+            if not isinstance(event, ValidatedRecoveryEvent):
+                raise WorkspaceMutationError(
+                    "attestation-journal-invalid",
+                    "final attestation requires validated ownership evidence",
+                )
             operation = event["operation"]
             expected_hash = event["after_hash"] or ""
             expected_mode = event["after_mode"]
             if operation == "delete":
+                self._assert_applied_identity(handle, event)
                 content_hash, mode, _ = self._current_target(handle, event["path"])
                 if content_hash is not None:
                     raise WorkspaceMutationError(
                         "declared-state-drift", "deleted path reappeared"
                     )
-                states.append(AttestedPathState(event["path"], False))
+                states.append(AttestedPathState(
+                    event["path"], False, parent_identity_digest=
+                    event.applied_parent_identity_digest,
+                ))
                 continue
             if operation == "rename":
                 source_hash, _, _ = self._current_target(handle, event["path"])
@@ -837,14 +1205,23 @@ class WorkspaceMutationEngine:
                 raise WorkspaceMutationError(
                     "declared-state-drift", "declared path hash or mode drifted"
                 )
-            states.append(AttestedPathState(target_path, True, content_hash, mode))
+            self._assert_applied_identity(handle, event)
+            identity_digest = (
+                event.applied_destination_identity_digest
+                if operation == "rename" else event.applied_identity_digest
+            )
+            states.append(AttestedPathState(
+                target_path, True, content_hash, mode, "regular",
+                identity_digest, event.applied_parent_identity_digest,
+            ))
         return tuple(sorted(states, key=lambda state: state.path))
 
     def _build_final_attestation(
         self, run: PlanExecutionRun, context: Any, bundle: PlannedEditBundle,
         workspace: Any, handle: WorkspacePathHandle, git_state: Any,
     ) -> FinalMutationAttestation:
-        events = self._store.list_execution_edit_events(run.execution_run_id)
+        journal = self._validated_journal(run)
+        events = journal.events
         if len(events) != len(bundle.ordered_edits):
             raise WorkspaceMutationError(
                 "attestation-journal-missing", "final journal is incomplete"
@@ -1192,6 +1569,15 @@ class WorkspaceMutationEngine:
                         raise UnsafePersistedIdentifier("journal mode invalid")
                 if row["status"] not in phases: raise UnsafePersistedIdentifier("durable phase invalid")
                 phase_version = row["phase_version"]
+                identity_version = row["identity_version"]
+                identity_fields = tuple(str(row[name] or "") for name in (
+                    "applied_identity_digest",
+                    "applied_parent_identity_digest",
+                    "applied_destination_identity_digest",
+                    "rollback_identity_digest",
+                ))
+                if any(value and not hash_re.fullmatch(value) for value in identity_fields):
+                    raise UnsafePersistedIdentifier("identity digest invalid")
                 phase_versions = {
                     "journaled": frozenset({0}),
                     "mutation-started": frozenset({1}),
@@ -1204,6 +1590,34 @@ class WorkspaceMutationEngine:
                 if (type(phase_version) is not int
                         or phase_version not in phase_versions[row["status"]]):
                     raise UnsafePersistedIdentifier("durable phase version invalid")
+                if type(identity_version) is not int or identity_version not in {0, 1, 2}:
+                    raise UnsafePersistedIdentifier("identity version invalid")
+                applied_phases = {
+                    "filesystem-applied", "directory-synced", "applied",
+                    "rollback-started",
+                }
+                requires_applied_identity = (
+                    row["status"] in applied_phases
+                    or (row["status"] == "rolled-back" and phase_version > 2)
+                )
+                if requires_applied_identity:
+                    if identity_version < 1 or not identity_fields[1]:
+                        raise UnsafePersistedIdentifier("applied identity evidence missing")
+                    if operation != PlannedEditOperation.DELETE and not identity_fields[0]:
+                        raise UnsafePersistedIdentifier("applied object identity missing")
+                    if (operation == PlannedEditOperation.RENAME
+                            and not identity_fields[2]):
+                        raise UnsafePersistedIdentifier("rename identity evidence missing")
+                elif identity_version != 0 or any(identity_fields):
+                    raise UnsafePersistedIdentifier("premature identity evidence")
+                if row["status"] == "rolled-back":
+                    if phase_version > 2 and (
+                        identity_version != 2 or not identity_fields[3]
+                    ):
+                        raise UnsafePersistedIdentifier("rollback identity evidence missing")
+                elif identity_fields[3] or identity_version == 2:
+                    if row["status"] != "rollback-started":
+                        raise UnsafePersistedIdentifier("rollback identity phase mismatch")
                 if operation == PlannedEditOperation.CREATE:
                     valid = not before_hash and before_mode is None and artifact is None and destination is None and after_hash and after_mode is not None
                 elif operation == PlannedEditOperation.UPDATE:
@@ -1248,7 +1662,8 @@ class WorkspaceMutationEngine:
                 events.append(ValidatedRecoveryEvent(
                     row["ordinal"], row["edit_id"], operation, path, destination,
                     before_hash, after_hash, before_mode, after_mode, artifact,
-                    row["status"], phase_version,
+                    row["status"], phase_version, *identity_fields,
+                    identity_version, run.execution_run_id,
                 ))
         except (UnsafePersistedIdentifier, TypeError, ValueError) as exc:
             raise WorkspaceMutationError(
