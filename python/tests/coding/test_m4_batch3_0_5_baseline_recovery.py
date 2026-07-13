@@ -22,6 +22,7 @@ from khaos.coding.planning.execution_models import (
     PlannedEditOperation,
     PlannedFileEdit,
 )
+from khaos.coding.planning.safe_workspace_path import MutationObjectIdentity
 from test_m4_batch2_8_boot_scope_closure import _real_runtime
 from test_m4_batch3_0_workspace_mutation import _hash, _workspace
 
@@ -109,8 +110,29 @@ def _baseline_runtime(tmp_path, *, operation=PlannedEditOperation.UPDATE,
     else:
         if not destination_exists:
             source.rename(workspace.worktree_path / "b.txt")
-    phase = "mutation-started"
-    for target in ("filesystem-applied", "directory-synced", "applied"):
+    source_parent = source.parent.stat()
+    destination_parent = (
+        (workspace.worktree_path / "b.txt").parent.stat()
+        if operation == PlannedEditOperation.RENAME else None
+    )
+    target = workspace.worktree_path / (
+        "b.txt" if operation == PlannedEditOperation.RENAME else "a.txt"
+    )
+    target_info = target.stat() if target.exists() else None
+    identity = MutationObjectIdentity(
+        target_info is not None,
+        target_info.st_dev if target_info else 0,
+        target_info.st_ino if target_info else 0,
+        "regular" if target_info else "missing",
+        source_parent.st_dev, source_parent.st_ino,
+        destination_parent.st_dev if destination_parent else 0,
+        destination_parent.st_ino if destination_parent else 0,
+    )
+    runtime._mutation_engine._record_mutation_phase(
+        run.execution_run_id, edit, "filesystem-applied", identity,
+    )
+    phase = "filesystem-applied"
+    for target in ("directory-synced", "applied"):
         runtime._store.transition_edit_event(
             run.execution_run_id, "e1", expected_phase=phase,
             target_phase=target,
@@ -334,9 +356,15 @@ def test_applied_phase_cannot_rewrite_after_state(tmp_path):
     _, store, run = _phase_store(tmp_path)
     phase = "journaled"
     for target in ("mutation-started", "filesystem-applied", "directory-synced", "applied"):
+        identity = {}
+        if target == "filesystem-applied":
+            identity = {
+                "applied_identity_digest": "1" * 64,
+                "applied_parent_identity_digest": "2" * 64,
+            }
         store.transition_edit_event(
             run.execution_run_id, "e1", expected_phase=phase,
-            target_phase=target,
+            target_phase=target, **identity,
         )
         phase = target
     with pytest.raises(RuntimeError, match="changed state"):

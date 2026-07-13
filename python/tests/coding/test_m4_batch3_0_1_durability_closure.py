@@ -83,12 +83,18 @@ def test_durable_phase_journal_fault_uses_disk_state_for_rollback(tmp_path, monk
         return original(run_id, edit_id, **kwargs)
 
     monkeypatch.setattr(runtime._store, "update_edit_event", fault)
-    with pytest.raises(sqlite3.OperationalError, match=phase):
+    expected_error = (
+        WorkspaceMutationError if phase == "filesystem-applied"
+        else sqlite3.OperationalError
+    )
+    with pytest.raises(expected_error):
         _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
-    assert (workspace.worktree_path / "a.txt").read_text() == "old"
+    expected_content = "new" if phase == "filesystem-applied" else "old"
+    expected_status = "poisoned" if phase == "filesystem-applied" else "rolled-back"
+    assert (workspace.worktree_path / "a.txt").read_text() == expected_content
     assert runtime._store._conn.execute(
         "SELECT status FROM plan_execution_runs"
-    ).fetchone()[0] == "rolled-back"
+    ).fetchone()[0] == expected_status
 
 
 @pytest.mark.parametrize("boundary", [

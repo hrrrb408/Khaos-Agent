@@ -635,15 +635,12 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
         before_hash=_hash("original"), before_mode=0o644,
         recovery_artifact=backup.name, planned_after_hash=_hash("mutated"),
     )
-    phase = "journaled"
-    for target_phase in (
-        "mutation-started", "filesystem-applied", "directory-synced", "applied",
-    ):
-        runtime._store.transition_edit_event(
-            run_id, "e1", expected_phase=phase, target_phase=target_phase,
-            after_hash=_hash("mutated"), after_mode=0o644,
-        )
-        phase = target_phase
+    runtime._store._conn.execute(
+        "UPDATE plan_execution_edit_events SET status='applied',phase_version=4,"
+        "after_hash=?,after_mode=? WHERE execution_run_id=?",
+        (_hash("mutated"), 0o644, run_id),
+    )
+    runtime._store._conn.commit()
     recovered = runtime._mutation_engine.recover_incomplete_runs()
     current = runtime._store.get_execution_run(run_id)
     assert run_id not in recovered
