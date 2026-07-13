@@ -20,12 +20,16 @@ from khaos.coding.planning.execution_models import (
     AttestedPathState,
     ExecutionRunStatus,
     FinalMutationAttestation,
+    InitialPathState,
+    InitialWorkspaceAttestation,
     MutationSealTombstone,
     PlanExecutionRun,
     PlannedEditBundle,
     PlannedEditOperation,
     PlannedFileEdit,
     RollbackFinalAttestation,
+    ValidatedRecoveryEvent,
+    ValidatedRecoveryJournal,
     WorkspaceMutationResult,
 )
 from khaos.coding.workspace.models import WorkspaceState
@@ -37,6 +41,7 @@ from khaos.coding.planning.git_state import GitStateInspector
 from khaos.coding.planning.recovery_directory import (
     RecoveryDirectory,
     RecoveryDirectoryError,
+    RecoveryRootCapability,
 )
 from khaos.coding.planning.safe_identifiers import (
     SafeRecoveryArtifactName, SafeRecoveryRunId, SafeWorkspaceRelativePath,
@@ -87,6 +92,7 @@ class WorkspaceMutationEngine:
         self._active_phase: Any = None
         self._active_recovery: RecoveryDirectory | None = None
         self._git_inspector = GitStateInspector()
+        self._recovery_capabilities: dict[str, RecoveryRootCapability] = {}
 
     def apply_bundle(
         self, *, context: Any, bundle: PlannedEditBundle,
@@ -155,6 +161,15 @@ class WorkspaceMutationEngine:
         before_git = self._git_inspector.snapshot(
             workspace, repository_generation=plan.repository_generation
         )
+        stable_git = self._git_inspector.snapshot(
+            workspace, repository_generation=plan.repository_generation
+        )
+        if stable_git != before_git:
+            raise WorkspaceMutationError("initial-state-unstable", "initial workspace snapshot drifted")
+        initial = self._build_initial_attestation(
+            run, context, normalized, before_git,
+        )
+        self._store.save_initial_workspace_attestation(initial)
         recovery: RecoveryDirectory | None = None
         changed: list[str] = []
         path_handle = WorkspacePathHandle(root)
@@ -250,9 +265,10 @@ class WorkspaceMutationEngine:
             self._store.transition_execution_run(
                 run.execution_run_id, expected=("mutating",), target="sealing",
             )
-            _, journal_digest = self._validated_journal(run)
+            journal = self._validated_journal(run)
+            journal_digest = journal.canonical_digest
             self._validate_sealing_recovery(
-                run, workspace, self._store.list_execution_edit_events(run.execution_run_id),
+                run, workspace, journal.events,
                 journal_digest,
             )
             self._seal_recovery(recovery, workspace.id, run.execution_run_id)
@@ -290,11 +306,17 @@ class WorkspaceMutationEngine:
                     failure_code=code, completed=True,
                 )
                 raise
+            if not self._store.list_execution_edit_events(run.execution_run_id):
+                self._seal_recovery(recovery, workspace.id, run.execution_run_id)
+                self._store.transition_execution_run(
+                    run.execution_run_id, expected=(current_run.status.value,),
+                    target="failed", failure_code=code, completed=True,
+                )
+                raise
             self._rollback(
                 run.execution_run_id, root, recovery,
                 workspace.id, failure_code=code,
                 poison_after=(code == "unexpected-workspace-mutation"),
-                baseline_git=before_git,
             )
             raise
         finally:
@@ -468,6 +490,12 @@ class WorkspaceMutationEngine:
             source_bytes = parent.read_file()[0] if info is not None else None
         finally:
             parent.close()
+        if edit.operation == PlannedEditOperation.CREATE and (edit.new_mode or 0o600) & ~0o666:
+            raise WorkspaceMutationError("mode-escalation", "create mode is unsafe")
+        if edit.operation == PlannedEditOperation.UPDATE and edit.new_mode is not None:
+            if (edit.new_mode & ~0o777 or edit.new_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+                    or (edit.new_mode & 0o111) > ((before_mode or 0) & 0o111)):
+                raise WorkspaceMutationError("mode-escalation", "update mode is unsafe")
         artifact = None
         if source_bytes is not None:
             artifact, backup_hash = recovery.create_backup(
@@ -567,7 +595,7 @@ class WorkspaceMutationEngine:
 
     def _rollback(
         self, run_id: str, root: Path, recovery: RecoveryDirectory, workspace_id: str, *, failure_code: str,
-        poison_after: bool = False, baseline_git: Any | None = None,
+        poison_after: bool = False,
     ) -> None:
         try:
             current_run = self._store.get_execution_run(run_id)
@@ -575,14 +603,15 @@ class WorkspaceMutationEngine:
                 run_id, expected=(current_run.status.value,), target="rolling-back",
                 failure_code=failure_code,
             )
+            baseline = self._require_initial_attestation(current_run)
+            journal = self._validated_journal(current_run, allow_partial=True)
             handle = self._active_path_handle or WorkspacePathHandle(root)
             owns_handle = self._active_path_handle is None
-            for event in reversed(self._store.list_execution_edit_events(run_id)):
+            for event in reversed(journal.events):
                 self._rollback_event(handle, event, recovery)
                 current_hash, current_mode, _ = self._current_target(handle, event["path"])
                 self._store.update_edit_event(
                     run_id, event["edit_id"], status="rolled-back",
-                    after_hash=current_hash or "", after_mode=current_mode,
                     error_code=failure_code,
                 )
             target = "cancelled" if failure_code == "execution-context-invalid" else "rolled-back"
@@ -596,11 +625,12 @@ class WorkspaceMutationEngine:
                     handle.close()
                 return
             current_run = self._store.get_execution_run(run_id)
-            events, journal_digest = self._validated_journal(current_run)
+            journal = self._validated_journal(current_run, allow_partial=True)
+            events, journal_digest = journal.events, journal.canonical_digest
             workspace = self._workspaces.get(workspace_id)
             rollback_attestation = self._build_rollback_attestation(
                 current_run, workspace, handle, events, journal_digest,
-                failure_code, baseline_git,
+                failure_code, baseline,
             )
             self._store.save_rollback_final_attestation(rollback_attestation)
             self._store.transition_execution_run(
@@ -790,10 +820,50 @@ class WorkspaceMutationEngine:
             attested_at=time.time(),
         ).normalized()
 
+    def _build_initial_attestation(self, run: PlanExecutionRun, context: Any,
+                                   bundle: PlannedEditBundle, git_state: Any) -> InitialWorkspaceAttestation:
+        by_path = {item.relative_path: item for item in git_state.file_states}
+        paths = sorted({path for edit in bundle.ordered_edits
+                        for path in (edit.path, edit.destination_path) if path})
+        states = []
+        for path in paths:
+            item = by_path.get(path)
+            states.append(InitialPathState(
+                path, item is not None, item.content_hash if item else "",
+                item.mode if item else None, item.file_type if item else "missing",
+                item.identity_digest if item else "",
+            ))
+        workspace_states = tuple(InitialPathState(
+            item.relative_path, True, item.content_hash, item.mode,
+            item.file_type, item.identity_digest,
+        ) for item in git_state.file_states)
+        return InitialWorkspaceAttestation(
+            run.execution_run_id, run.plan_id, run.edit_bundle_digest,
+            context.execution_context_id, context.lease_id, context.binding_digest,
+            run.task_id, run.workspace_id, run.repository_id, git_state.head_commit,
+            git_state.repository_generation, git_state.index_digest,
+            git_state.worktree_admin_identity,
+            self._workspace_state_digest(git_state.file_states), tuple(states),
+            workspace_states, time.time(),
+        ).normalized()
+
+    def _require_initial_attestation(self, run: PlanExecutionRun) -> InitialWorkspaceAttestation:
+        try:
+            value = self._store.get_initial_workspace_attestation(run.execution_run_id)
+        except RuntimeError as exc:
+            raise WorkspaceMutationError("initial-attestation-invalid", "initial baseline invalid") from exc
+        if value is None or (value.plan_id, value.bundle_digest, value.context_id,
+                             value.lease_id, value.binding_digest) != (
+            run.plan_id, run.edit_bundle_digest, run.execution_context_id,
+            run.lease_id, run.binding_digest,
+        ):
+            raise WorkspaceMutationError("initial-attestation-missing", "initial baseline missing")
+        return value
+
     def _build_rollback_attestation(
         self, run: PlanExecutionRun, workspace: Any, handle: WorkspacePathHandle,
         events: tuple[Any, ...], journal_digest: str, reason: str,
-        baseline_git: Any | None,
+        baseline: InitialWorkspaceAttestation,
     ) -> RollbackFinalAttestation:
         states: list[AttestedPathState] = []
         for event in events:
@@ -819,22 +889,30 @@ class WorkspaceMutationEngine:
         git_state = self._git_inspector.snapshot(
             workspace, repository_generation=state.repository_generation,
         )
-        if baseline_git is not None:
-            declared = frozenset(
-                path for event in events
-                for path in (event["path"], event["destination_path"]) if path
+        current_states = {item.relative_path: item for item in git_state.file_states}
+        declared_paths = {item.path for item in baseline.declared_states}
+        baseline_undeclared = {
+            item.path: item for item in baseline.workspace_states
+            if item.path not in declared_paths
+        }
+        current_undeclared = {
+            path: item for path, item in current_states.items()
+            if path not in declared_paths
+        }
+        undeclared_equal = set(baseline_undeclared) == set(current_undeclared) and all(
+            (before.content_hash, before.mode, before.file_type, before.identity_digest) ==
+            (current_undeclared[path].content_hash, current_undeclared[path].mode,
+             current_undeclared[path].file_type, current_undeclared[path].identity_digest)
+            for path, before in baseline_undeclared.items()
+        )
+        if (git_state.head_commit != baseline.head
+                or git_state.repository_generation != baseline.generation
+                or git_state.index_digest != baseline.index_digest
+                or git_state.worktree_admin_identity != baseline.worktree_admin_identity
+                or not undeclared_equal):
+            raise WorkspaceMutationError(
+                "rollback-workspace-drift", "workspace did not return to persisted baseline"
             )
-            if (git_state.head_commit != baseline_git.head_commit
-                    or git_state.repository_generation != baseline_git.repository_generation
-                    or git_state.index_digest != baseline_git.index_digest
-                    or git_state.worktree_admin_identity != baseline_git.worktree_admin_identity
-                    or self._unexpected_changes(
-                        self._git_state_map(baseline_git),
-                        self._git_state_map(git_state), declared,
-                    )):
-                raise WorkspaceMutationError(
-                    "rollback-workspace-drift", "workspace did not return to its initial state"
-                )
         return RollbackFinalAttestation(
             execution_run_id=run.execution_run_id,
             bundle_digest=run.edit_bundle_digest,
@@ -966,52 +1044,84 @@ class WorkspaceMutationEngine:
             workspace_id, owner=owner, reason=reason
         )
 
-    def _validated_journal(
-        self, run: PlanExecutionRun,
-    ) -> tuple[tuple[Any, ...], str]:
+    def _validated_journal(self, run: PlanExecutionRun, *, allow_partial: bool = False) -> ValidatedRecoveryJournal:
         try:
-            SafeRecoveryRunId.parse(run.execution_run_id)
-            events = self._store.list_execution_edit_events(run.execution_run_id)
-            if not events:
+            safe_run = SafeRecoveryRunId.parse(run.execution_run_id)
+            rows = self._store.list_execution_edit_events(run.execution_run_id)
+            if not rows:
                 raise UnsafePersistedIdentifier("execution journal is missing")
-            ordinals = [int(row["ordinal"]) for row in events]
-            if ordinals != list(range(len(events))):
-                raise UnsafePersistedIdentifier("journal ordinals are not contiguous")
-            if len({row["edit_id"] for row in events}) != len(events):
-                raise UnsafePersistedIdentifier("journal edit ids are not unique")
-            expected_count = int(run.metadata.get("edit_count", 0))
-            if expected_count and expected_count != len(events):
+            if not isinstance(run.metadata.get("edit_count"), int) or isinstance(run.metadata.get("edit_count"), bool):
+                raise UnsafePersistedIdentifier("edit count missing")
+            expected_count = run.metadata["edit_count"]
+            if expected_count <= 0 or (len(rows) > expected_count
+                    or (not allow_partial and expected_count != len(rows))):
                 raise UnsafePersistedIdentifier("journal event count mismatch")
-            canonical: list[dict[str, Any]] = []
-            for row in events:
-                operation = str(row["operation"])
-                if operation not in {item.value for item in PlannedEditOperation}:
+            ordinals = [row["ordinal"] for row in rows]
+            if any(not isinstance(item, int) for item in ordinals) or ordinals != list(range(len(rows))):
+                raise UnsafePersistedIdentifier("journal ordinals are not contiguous")
+            if len({row["edit_id"] for row in rows}) != len(rows):
+                raise UnsafePersistedIdentifier("journal edit ids are not unique")
+            baseline = self._require_initial_attestation(run)
+            baseline_paths = {item.path: item for item in baseline.declared_states}
+            events: list[ValidatedRecoveryEvent] = []
+            seen_paths: set[str] = set()
+            hash_re = re.compile(r"^[0-9a-f]{64}$")
+            phases = {"journaled", "mutation-started", "filesystem-applied", "directory-synced", "applied", "rolled-back"}
+            for row in rows:
+                try: operation = PlannedEditOperation(row["operation"])
+                except ValueError:
                     raise UnsafePersistedIdentifier("journal operation invalid")
-                path = SafeWorkspaceRelativePath.parse(row["path"]).value
+                if row["path"] != unicodedata.normalize("NFC", row["path"]):
+                    raise UnsafePersistedIdentifier("journal path is not NFC")
+                path = SafeWorkspaceRelativePath.parse(row["path"])
                 destination = row["destination_path"]
                 if destination is not None:
-                    destination = SafeWorkspaceRelativePath.parse(destination).value
-                if operation == "rename" and destination is None:
-                    raise UnsafePersistedIdentifier("rename destination missing")
+                    if destination != unicodedata.normalize("NFC", destination):
+                        raise UnsafePersistedIdentifier("journal destination is not NFC")
+                    destination = SafeWorkspaceRelativePath.parse(destination)
                 artifact = row["recovery_artifact"]
                 if artifact is not None:
-                    artifact = SafeRecoveryArtifactName.parse(artifact).value
-                canonical.append({
-                    "ordinal": int(row["ordinal"]), "edit_id": row["edit_id"],
-                    "operation": operation, "path": path,
-                    "destination": destination, "before_hash": row["before_hash"] or "",
-                    "after_hash": row["after_hash"] or "",
-                    "before_mode": row["before_mode"], "after_mode": row["after_mode"],
-                    "artifact": artifact,
-                })
+                    artifact = SafeRecoveryArtifactName.parse(artifact)
+                before_hash, after_hash = row["before_hash"] or "", row["after_hash"] or ""
+                before_mode, after_mode = row["before_mode"], row["after_mode"]
+                for digest in (before_hash, after_hash):
+                    if digest and not hash_re.fullmatch(digest): raise UnsafePersistedIdentifier("journal hash invalid")
+                for mode in (before_mode, after_mode):
+                    if mode is not None and (type(mode) is not int or mode < 0 or mode > 0o777):
+                        raise UnsafePersistedIdentifier("journal mode invalid")
+                if row["status"] not in phases: raise UnsafePersistedIdentifier("durable phase invalid")
+                if operation == PlannedEditOperation.CREATE:
+                    valid = not before_hash and before_mode is None and artifact is None and destination is None and after_hash and after_mode is not None
+                elif operation == PlannedEditOperation.UPDATE:
+                    valid = bool(before_hash and after_hash and before_mode is not None and after_mode is not None and artifact and destination is None)
+                elif operation == PlannedEditOperation.DELETE:
+                    valid = bool(before_hash and before_mode is not None and artifact and not after_hash and after_mode is None and destination is None)
+                else:
+                    valid = bool(before_hash and before_mode is not None and after_hash and after_mode is not None and artifact and destination and destination.value != path.value)
+                if not valid: raise UnsafePersistedIdentifier("operation journal fields invalid")
+                baseline_mode = baseline_paths.get(path.value).mode if path.value in baseline_paths else None
+                if before_mode is not None and before_mode & 0o111 and not (baseline_mode and baseline_mode & 0o111):
+                    raise UnsafePersistedIdentifier("journal executable mode exceeds baseline")
+                keys = [path.value.casefold()] + ([destination.value.casefold()] if destination else [])
+                if any(key in seen_paths for key in keys): raise UnsafePersistedIdentifier("journal path conflict")
+                seen_paths.update(keys)
+                events.append(ValidatedRecoveryEvent(
+                    row["ordinal"], row["edit_id"], operation, path, destination,
+                    before_hash, after_hash, before_mode, after_mode, artifact, row["status"],
+                ))
         except (UnsafePersistedIdentifier, TypeError, ValueError) as exc:
             raise WorkspaceMutationError(
                 "recovery-journal-invalid", "persisted recovery journal is invalid"
             ) from exc
+        canonical = [event.__dict__ | {
+            "operation": event.operation.value, "path": event.path.value,
+            "destination": event.destination.value if event.destination else None,
+            "artifact": event.artifact.value if event.artifact else None,
+        } for event in events]
         digest = hashlib.sha256(json.dumps(
-            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str,
         ).encode("utf-8")).hexdigest()
-        return events, digest
+        return ValidatedRecoveryJournal(safe_run, tuple(events), digest)
 
     def recover_incomplete_runs(self) -> tuple[str, ...]:
         """Startup scan: quarantine incomplete runs; recover only intact journals."""
@@ -1028,7 +1138,8 @@ class WorkspaceMutationEngine:
                 run.workspace_id, owner=f"recovery:{run.execution_run_id}"
             ):
                 try:
-                    events, journal_digest = self._validated_journal(run)
+                    journal = self._validated_journal(run)
+                    events, journal_digest = journal.events, journal.canonical_digest
                     for event in events:
                         self._resolve_safe_path(workspace, event["path"])
                         if event["destination_path"]:
@@ -1060,8 +1171,10 @@ class WorkspaceMutationEngine:
                                 recovery, run, "mutation",
                                 attestation.attestation_digest, journal_digest,
                             )
-                        self._store.commit_terminal_seal(
-                            run.execution_run_id, expected_status="sealing",
+                        self._store.commit_recovered_terminal_state(
+                            execution_run_id=run.execution_run_id,
+                            workspace_id=run.workspace_id, poison_owner=owner,
+                            expected_status="sealing",
                             terminal_status="mutated",
                             seal_digest=self._recovery_seal_digest(run.execution_run_id),
                             tombstone_digest=tombstone.tombstone_digest,
@@ -1090,8 +1203,10 @@ class WorkspaceMutationEngine:
                                 recovery, run, final_status,
                                 attestation.attestation_digest, journal_digest,
                             )
-                        self._store.commit_terminal_seal(
-                            run.execution_run_id, expected_status="rollback-sealing",
+                        self._store.commit_recovered_terminal_state(
+                            execution_run_id=run.execution_run_id,
+                            workspace_id=run.workspace_id, poison_owner=owner,
+                            expected_status="rollback-sealing",
                             terminal_status=final_status,
                             seal_digest=self._recovery_seal_digest(run.execution_run_id),
                             tombstone_digest=tombstone.tombstone_digest,
@@ -1134,8 +1249,12 @@ class WorkspaceMutationEngine:
 
     def _prepare_recovery(self, workspace: Any, run_id: str) -> RecoveryDirectory:
         container = self._validate_recovery_container(workspace)
+        capability = self._recovery_capabilities.get(workspace.id)
+        if capability is None:
+            capability = RecoveryRootCapability(container)
+            self._recovery_capabilities[workspace.id] = capability
         try:
-            return RecoveryDirectory(container, run_id, create=True)
+            return RecoveryDirectory(container, run_id, create=True, root_capability=capability)
         except (OSError, RecoveryDirectoryError) as exc:
             raise WorkspaceMutationError(
                 "recovery-root-invalid", "recovery directory cannot be created safely"
@@ -1146,6 +1265,10 @@ class WorkspaceMutationEngine:
         *, allow_missing_run: bool = False,
     ) -> RecoveryDirectory:
         container = self._validate_recovery_container(workspace)
+        capability = self._recovery_capabilities.get(workspace.id)
+        if capability is None:
+            capability = RecoveryRootCapability(container)
+            self._recovery_capabilities[workspace.id] = capability
         allowed = frozenset(
             row["recovery_artifact"] for row in events if row["recovery_artifact"]
         )
@@ -1153,6 +1276,7 @@ class WorkspaceMutationEngine:
             return RecoveryDirectory(
                 container, run_id, create=False, allowed_artifacts=allowed,
                 allow_missing_run=allow_missing_run,
+                root_capability=capability,
             )
         except (OSError, RecoveryDirectoryError) as exc:
             raise WorkspaceMutationError(

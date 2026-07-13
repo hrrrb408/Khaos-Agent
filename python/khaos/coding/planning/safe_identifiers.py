@@ -17,9 +17,11 @@ class SafeWorkspaceRelativePath:
 
     @classmethod
     def parse(cls, raw: str) -> "SafeWorkspaceRelativePath":
-        if not isinstance(raw, str) or not raw or "\x00" in raw or "\\" in raw:
+        if not isinstance(raw, str) or not raw or raw in {".", ".."} or "\x00" in raw or "\\" in raw:
             raise UnsafePersistedIdentifier("invalid workspace path")
         normalized = unicodedata.normalize("NFC", raw)
+        if raw != normalized:
+            raise UnsafePersistedIdentifier("workspace path is not NFC")
         pure = PurePosixPath(normalized)
         if (pure.is_absolute() or normalized != pure.as_posix()
                 or any(part in {"", ".", ".."} for part in pure.parts)

@@ -159,6 +159,7 @@ class ApprovalRuntime:
             from khaos.coding.planning.approval.mutation_fence import WorkspaceMutationFence, PlannedHeadMutationAdapter
             from khaos.coding.planning.approval.execution_contract import PlannedExecutionGuard
             self._mutation_fence=WorkspaceMutationFence()
+            self._store.reconcile_terminal_run_poison_scopes()
             for poisoned_workspace, poison_reason in self._store.list_poisoned_workspaces():
                 self._mutation_fence.poison(poisoned_workspace, poison_reason)
             for poisoned_workspace, poison_owner, poison_reason in self._store.list_workspace_poison_scopes():

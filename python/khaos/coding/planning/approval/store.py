@@ -261,6 +261,7 @@ CREATE TABLE IF NOT EXISTS plan_execution_runs (
     rollback_sealed_at REAL,
     rollback_seal_digest TEXT NOT NULL DEFAULT '',
     terminal_tombstone_digest TEXT NOT NULL DEFAULT '',
+    initial_attestation_digest TEXT NOT NULL DEFAULT '',
     metadata_json TEXT NOT NULL DEFAULT '{}'
 );
 
@@ -309,6 +310,12 @@ CREATE TABLE IF NOT EXISTS plan_execution_final_attestations (
 CREATE TABLE IF NOT EXISTS plan_execution_rollback_attestations (
     execution_run_id TEXT PRIMARY KEY,
     bundle_digest TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    attestation_digest TEXT NOT NULL,
+    attested_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS plan_execution_initial_attestations (
+    execution_run_id TEXT PRIMARY KEY,
     canonical_json TEXT NOT NULL,
     attestation_digest TEXT NOT NULL,
     attested_at REAL NOT NULL
@@ -470,6 +477,11 @@ def _post_schema(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE plan_execution_runs ADD COLUMN "
                 "terminal_tombstone_digest TEXT NOT NULL DEFAULT ''"
+            )
+        if "initial_attestation_digest" not in run_cols:
+            conn.execute(
+                "ALTER TABLE plan_execution_runs ADD COLUMN "
+                "initial_attestation_digest TEXT NOT NULL DEFAULT ''"
             )
 
 
@@ -2222,6 +2234,26 @@ class PlanApprovalStore:
             for row in rows
         )
 
+    def reconcile_terminal_run_poison_scopes(self) -> tuple[tuple[str, str], ...]:
+        rows = self._conn.execute(
+            "SELECT p.workspace_id,p.poison_owner FROM workspace_mutation_poison_scopes p "
+            "JOIN plan_execution_runs r ON p.poison_owner='run:' || r.execution_run_id "
+            "WHERE r.status IN ('mutated','rolled-back','cancelled') "
+            "AND r.terminal_tombstone_digest != ''"
+        ).fetchall()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            for row in rows:
+                self._conn.execute(
+                    "DELETE FROM workspace_mutation_poison_scopes WHERE workspace_id=? AND poison_owner=?",
+                    (row["workspace_id"], row["poison_owner"]),
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return tuple((str(row["workspace_id"]), str(row["poison_owner"])) for row in rows)
+
     def recover_poisoned_workspace(
         self, workspace_id: str, *, force: bool = False, now: float | None = None
     ) -> bool:
@@ -2708,7 +2740,7 @@ class PlanApprovalStore:
         allowed = {
             "created": frozenset({"validating", "cancelled"}),
             "validating": frozenset({"mutating", "rolling-back", "failed", "poisoned", "cancelled"}),
-            "mutating": frozenset({"sealing", "rolling-back", "poisoned", "cancelled"}),
+            "mutating": frozenset({"sealing", "rolling-back", "poisoned", "cancelled", "failed"}),
             "sealing": frozenset({"mutated", "poisoned"}),
             "rolling-back": frozenset({"rollback-sealing", "poisoned"}),
             "rollback-sealing": frozenset({"rolled-back", "poisoned", "cancelled"}),
@@ -2875,6 +2907,57 @@ class PlanApprovalStore:
             self._conn.rollback()
             raise
 
+    def save_initial_workspace_attestation(self, attestation: Any) -> None:
+        value = attestation.normalized()
+        payload = json.dumps({
+            **value.__dict__,
+            "declared_states": [item.__dict__ for item in value.declared_states],
+            "workspace_states": [item.__dict__ for item in value.workspace_states],
+        }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_execution_initial_attestations VALUES (?,?,?,?)",
+                (value.execution_run_id, payload, value.attestation_digest, value.attested_at),
+            )
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET initial_attestation_digest=? "
+                "WHERE execution_run_id=? AND status='validating'",
+                (value.attestation_digest, value.execution_run_id),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("run cannot accept initial attestation")
+            self._insert_execution_audit(
+                value.execution_run_id, "initial-workspace-attested", result="attested",
+                correlation_id=value.attestation_digest,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_initial_workspace_attestation(self, run_id: str) -> Any | None:
+        row = self._conn.execute(
+            "SELECT canonical_json,attestation_digest FROM plan_execution_initial_attestations "
+            "WHERE execution_run_id=?", (run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        from khaos.coding.planning.execution_models import InitialPathState, InitialWorkspaceAttestation
+        try:
+            payload = json.loads(row["canonical_json"])
+            value = InitialWorkspaceAttestation(
+                **{key: val for key, val in payload.items() if key not in {"declared_states", "workspace_states"}},
+                declared_states=tuple(InitialPathState(**item) for item in payload["declared_states"]),
+                workspace_states=tuple(InitialPathState(**item) for item in payload["workspace_states"]),
+            )
+        except Exception as exc:
+            raise RuntimeError("initial attestation corrupt") from exc
+        normalized = value.normalized()
+        if normalized.attestation_digest != row["attestation_digest"]:
+            raise RuntimeError("initial attestation digest mismatch")
+        return normalized
+
     def get_final_mutation_attestation(self, execution_run_id: str) -> Any | None:
         row = self._conn.execute(
             "SELECT * FROM plan_execution_final_attestations WHERE execution_run_id=?",
@@ -2989,6 +3072,38 @@ class PlanApprovalStore:
             self._insert_execution_audit(
                 execution_run_id, "terminal-seal-committed", result=terminal_status,
                 error_code=failure_code, correlation_id=tombstone_digest,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def commit_recovered_terminal_state(self, *, workspace_id: str, poison_owner: str,
+                                        **kwargs: Any) -> None:
+        execution_run_id = kwargs["execution_run_id"]
+        now = time.time()
+        rollback = bool(kwargs["rollback"])
+        seal_time = "rollback_sealed_at" if rollback else "recovery_sealed_at"
+        seal_column = "rollback_seal_digest" if rollback else "recovery_seal_digest"
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                f"UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,"
+                f"failure_code=?,{seal_time}=?,{seal_column}=?,terminal_tombstone_digest=? "
+                "WHERE execution_run_id=? AND status=?",
+                (kwargs["terminal_status"], now, now, kwargs.get("failure_code", ""),
+                 now, kwargs["seal_digest"], kwargs["tombstone_digest"],
+                 execution_run_id, kwargs["expected_status"]),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise RuntimeError("invalid recovered terminal transition")
+            self._conn.execute(
+                "DELETE FROM workspace_mutation_poison_scopes WHERE workspace_id=? "
+                "AND poison_owner=?", (workspace_id, poison_owner),
+            )
+            self._insert_execution_audit(
+                execution_run_id, "recovered-terminal-committed",
+                result=kwargs["terminal_status"], correlation_id=kwargs["tombstone_digest"],
             )
             self._conn.commit()
         except Exception:

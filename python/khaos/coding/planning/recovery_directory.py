@@ -17,13 +17,40 @@ class RecoveryDirectoryError(RuntimeError):
     """Recovery storage cannot satisfy its fail-closed boundary."""
 
 
+class RecoveryRootCapability:
+    """Long-lived no-follow anchor for one trusted recovery container."""
+    def __init__(self, container: Path) -> None:
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        fd = os.open(container.anchor, flags)
+        try:
+            for part in container.parent.parts[1:]:
+                child = os.open(part, flags, dir_fd=fd)
+                os.close(fd); fd = child
+            self.parent_fd = fd
+            try: os.mkdir(container.name, 0o700, dir_fd=fd)
+            except FileExistsError: pass
+            os.fsync(fd)
+            self.container_fd = os.open(container.name, flags, dir_fd=fd)
+            info = os.fstat(self.container_fd)
+            self.identity = (info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode))
+            self.path = container
+        except Exception:
+            os.close(fd); raise
+
+    def duplicate(self) -> tuple[int, int]:
+        info = os.fstat(self.container_fd)
+        if (info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode)) != self.identity:
+            raise RecoveryDirectoryError("recovery root capability identity drifted")
+        return os.dup(self.parent_fd), os.dup(self.container_fd)
+
+
 class RecoveryDirectory:
     """Capability bound to one configured container and execution run."""
 
     def __init__(
         self, container: Path, run_id: str, *, create: bool,
         allowed_artifacts: frozenset[str] = frozenset(),
-        allow_missing_run: bool = False,
+        allow_missing_run: bool = False, root_capability: RecoveryRootCapability | None = None,
     ) -> None:
         self.container_path = container
         try:
@@ -35,19 +62,26 @@ class RecoveryDirectory:
             raise RecoveryDirectoryError(str(exc)) from exc
         flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         parent = container.parent
-        self._parent_fd = os.open(parent, flags)
+        if root_capability is None:
+            self._parent_fd = os.open(parent, flags)
+            anchored_container_fd = None
+        else:
+            self._parent_fd, anchored_container_fd = root_capability.duplicate()
         try:
             parent_info = os.fstat(self._parent_fd)
             if (not stat.S_ISDIR(parent_info.st_mode)
                     or parent_info.st_uid != os.getuid()
                     or stat.S_IMODE(parent_info.st_mode) & 0o022):
                 raise RecoveryDirectoryError("recovery parent permissions invalid")
-            try:
-                os.mkdir(container.name, 0o700, dir_fd=self._parent_fd)
-                os.fsync(self._parent_fd)
-            except FileExistsError:
-                pass
-            self._container_fd = os.open(container.name, flags, dir_fd=self._parent_fd)
+            if root_capability is None:
+                try:
+                    os.mkdir(container.name, 0o700, dir_fd=self._parent_fd)
+                    os.fsync(self._parent_fd)
+                except FileExistsError:
+                    pass
+                self._container_fd = os.open(container.name, flags, dir_fd=self._parent_fd)
+            else:
+                self._container_fd = anchored_container_fd
             self._validate_fd(self._container_fd)
             container_info = os.fstat(self._container_fd)
             self.container_identity = f"{container_info.st_dev}:{container_info.st_ino}"

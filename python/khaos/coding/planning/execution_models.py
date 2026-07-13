@@ -7,6 +7,9 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
+from khaos.coding.planning.safe_identifiers import (
+    SafeRecoveryArtifactName, SafeRecoveryRunId, SafeWorkspaceRelativePath,
+)
 
 
 class ExecutionRunStatus(str, Enum):
@@ -275,3 +278,77 @@ class MutationSealTombstone:
             payload, sort_keys=True, separators=(",", ":"),
         ).encode("utf-8")).hexdigest()
         return replace(self, tombstone_digest=digest)
+
+
+@dataclass(frozen=True)
+class InitialPathState:
+    path: str
+    exists: bool
+    content_hash: str = ""
+    mode: int | None = None
+    file_type: str = "missing"
+    identity_digest: str = ""
+
+
+@dataclass(frozen=True)
+class InitialWorkspaceAttestation:
+    execution_run_id: str
+    plan_id: str
+    bundle_digest: str
+    context_id: str
+    lease_id: str
+    binding_digest: str
+    task_id: str
+    workspace_id: str
+    repository_id: str
+    head: str
+    generation: int
+    index_digest: str
+    worktree_admin_identity: str
+    workspace_state_digest: str
+    declared_states: tuple[InitialPathState, ...]
+    workspace_states: tuple[InitialPathState, ...]
+    attested_at: float
+    attestation_digest: str = ""
+
+    def normalized(self) -> "InitialWorkspaceAttestation":
+        states = tuple(sorted(self.declared_states, key=lambda item: item.path))
+        workspace_states = tuple(sorted(self.workspace_states, key=lambda item: item.path))
+        payload = {**self.__dict__, "declared_states": [item.__dict__ for item in states],
+                   "workspace_states": [item.__dict__ for item in workspace_states],
+                   "attestation_digest": ""}
+        digest = hashlib.sha256(json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+        return replace(self, declared_states=states, workspace_states=workspace_states,
+                       attestation_digest=digest)
+
+
+@dataclass(frozen=True)
+class ValidatedRecoveryEvent:
+    ordinal: int
+    edit_id: str
+    operation: PlannedEditOperation
+    path: SafeWorkspaceRelativePath
+    destination: SafeWorkspaceRelativePath | None
+    before_hash: str
+    after_hash: str
+    before_mode: int | None
+    after_mode: int | None
+    artifact: SafeRecoveryArtifactName | None
+    durable_phase: str
+
+    def __getitem__(self, key: str) -> Any:
+        aliases = {
+            "path": self.path.value, "destination_path": self.destination.value if self.destination else None,
+            "recovery_artifact": self.artifact.value if self.artifact else None,
+            "operation": self.operation.value, "status": self.durable_phase,
+        }
+        return aliases[key] if key in aliases else getattr(self, key)
+
+
+@dataclass(frozen=True)
+class ValidatedRecoveryJournal:
+    run_id: SafeRecoveryRunId
+    events: tuple[ValidatedRecoveryEvent, ...]
+    canonical_digest: str
