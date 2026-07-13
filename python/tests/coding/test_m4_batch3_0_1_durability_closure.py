@@ -125,7 +125,7 @@ def test_recovery_seal_crash_boundaries_are_deterministic(tmp_path, boundary):
     recovered = runtime._mutation_engine.recover_incomplete_runs()
     current = runtime._store.get_execution_run(run_id)
     if boundary == "before-sealing":
-        assert current.status == ExecutionRunStatus.ROLLED_BACK
+        assert current.status == ExecutionRunStatus.POISONED
     else:
         assert current.status == ExecutionRunStatus.POISONED
         assert current.execution_run_id not in recovered

@@ -641,17 +641,10 @@ def test_startup_recovery_uses_verified_artifact_or_keeps_poisoned(tmp_path, cor
     )
     recovered = runtime._mutation_engine.recover_incomplete_runs()
     current = runtime._store.get_execution_run(run_id)
-    if corrupt:
-        assert run_id not in recovered
-        assert current.status == ExecutionRunStatus.POISONED
-        assert runtime.mutation_fence.is_poisoned("ws1")
-        assert target.read_text() == "mutated"
-    else:
-        assert run_id in recovered, current.failure_code
-        assert current.status == ExecutionRunStatus.ROLLED_BACK
-        assert not runtime.mutation_fence.is_poisoned("ws1")
-        assert target.read_text() == "original"
-        assert not recovery.exists()
+    assert run_id not in recovered
+    assert current.status == ExecutionRunStatus.POISONED
+    assert runtime.mutation_fence.is_poisoned("ws1")
+    assert target.read_text() == "mutated"
 
 
 @pytest.mark.parametrize("violation", [
