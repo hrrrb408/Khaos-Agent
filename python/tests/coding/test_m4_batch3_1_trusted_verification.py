@@ -364,6 +364,14 @@ class UnsafeTestSandboxBackend:
             hashlib.sha256(data).hexdigest(), hashlib.sha256(b"").hexdigest(), False,
         )
 
+    async def reconcile_instance_by_record(self, *, container_id, instance_name,
+                                           expected_labels, expected_image_digest,
+                                           expected_manifest_digest):
+        return {"status": "missing", "container_id": "", "reason": "test-backend-no-real-container"}
+
+    async def reconcile_instances(self, *, expected_labels):
+        return {"found": [], "terminated": [], "unknown": [], "mismatches": []}
+
 
 def _verification_plan(plan, workspace):
     (workspace.worktree_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")

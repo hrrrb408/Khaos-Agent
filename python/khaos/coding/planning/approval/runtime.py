@@ -403,30 +403,126 @@ class ApprovalRuntime:
                     f"has invalid binary_digest: {toolchain.binary_digest}"
                 )
 
-        # Batch 3.1.1 §8: RECONCILING_SANDBOXES
+        # Batch 3.1.2 §2: Boot-agnostic crash reconciliation
         self._verification_config_state = "RECONCILING_SANDBOXES"
         self._verification_store = VerificationExecutionStore(self._store)
         # recover_interrupted() is called in VerificationExecutionStore.__init__
         # via TrustedVerificationRunner.__init__.  It transitions any
         # PREPARING/RUNNING runs to ERRORED.
-        # Batch 3.1.1 §2: mark active sandbox instances as ORPHANED and
-        # terminate residual Docker containers via backend reconciliation.
-        orphaned = self._verification_store.reconcile_sandbox_instances()
-        if orphaned:
-            logger.warning("reconciled %d orphaned sandbox instances", orphaned)
-        # If the backend supports reconcile_instances, call it to find
-        # and terminate any residual Docker containers from a crashed worker.
-        reconcile = getattr(backend, "reconcile_instances", None)
-        if callable(reconcile):
+        #
+        # §2: Read ALL non-terminal sandbox instances (including old boots).
+        # DO NOT mark all as ORPHANED first — reconcile each record
+        # individually, then update state + run + execution atomically.
+        # Current Boot ID is NOT a filter — old boot records must be cleaned.
+        from khaos.coding.planning.verification_sandbox_instance import (
+            SandboxInstanceState,
+        )
+        import concurrent.futures as _cf2
+        import asyncio as _aio2
+        non_terminal = self._verification_store.list_active_sandbox_instances()
+        reconcile_by_record = getattr(backend, "reconcile_instance_by_record", None)
+        if non_terminal:
+            if not callable(reconcile_by_record):
+                raise RuntimeError(
+                    f"backend does not support reconcile_instance_by_record; "
+                    f"cannot reconcile {len(non_terminal)} residual sandbox instances"
+                )
+            mismatches: list[str] = []
+            cleanup_failures: list[str] = []
+            for instance in non_terminal:
+                # Construct full expected labels from the persisted record.
+                expected_labels = {
+                    "khaos.run-id": instance.verification_run_id,
+                    "khaos.step-id": instance.step_run_id,
+                    "khaos.sandbox-instance-id": instance.sandbox_instance_id,
+                    "khaos.boot-id": instance.boot_id,
+                    "khaos.manifest-digest": instance.workspace_manifest_digest[:63],
+                }
+                try:
+                    with _cf2.ThreadPoolExecutor(max_workers=1) as pool2:
+                        report = pool2.submit(lambda: _aio2.run(
+                            reconcile_by_record(
+                                container_id=instance.container_id,
+                                instance_name=instance.backend_instance_name,
+                                expected_labels=expected_labels,
+                                expected_image_digest=instance.expected_image_digest,
+                                expected_manifest_digest=instance.workspace_manifest_digest,
+                            )
+                        )).result()
+                except Exception as exc:
+                    # §2: backend reconciliation exception → fail-closed.
+                    raise RuntimeError(
+                        f"backend reconciliation exception for instance "
+                        f"{instance.sandbox_instance_id}: {exc}"
+                    ) from exc
+                status = report.get("status", "")
+                # Look up execution_run_id for atomic terminalization.
+                run = self._verification_store.get_run(instance.verification_run_id)
+                execution_run_id = run.execution_run_id if run else ""
+                if status == "terminated":
+                    # Full match — container was terminated and removed.
+                    # §3: atomic crash terminalization.
+                    self._verification_store.reconcile_sandbox_instance_atomic(
+                        sandbox_instance_id=instance.sandbox_instance_id,
+                        step_run_id=instance.step_run_id,
+                        verification_run_id=instance.verification_run_id,
+                        execution_run_id=execution_run_id,
+                        instance_state=SandboxInstanceState.ORPHANED_CLEANED,
+                        failure_code="crash-reconciled",
+                    )
+                elif status == "missing":
+                    # Container ID not found — deterministic missing.
+                    self._verification_store.reconcile_sandbox_instance_atomic(
+                        sandbox_instance_id=instance.sandbox_instance_id,
+                        step_run_id=instance.step_run_id,
+                        verification_run_id=instance.verification_run_id,
+                        execution_run_id=execution_run_id,
+                        instance_state=SandboxInstanceState.TERMINATED,
+                        failure_code="container-missing",
+                    )
+                elif status == "mismatch":
+                    # Label/image/manifest mismatch — cleanup-failed, fail closed.
+                    mismatches.append(
+                        f"{instance.sandbox_instance_id}: {report.get('reason', 'mismatch')}"
+                    )
+                    self._verification_store.mark_sandbox_instance_cleanup_failed(
+                        instance.sandbox_instance_id,
+                        failure_code=report.get("reason", "label-mismatch"),
+                    )
+                elif status == "cleanup-failed":
+                    cleanup_failures.append(
+                        f"{instance.sandbox_instance_id}: {report.get('reason', 'cleanup-failed')}"
+                    )
+                    self._verification_store.mark_sandbox_instance_cleanup_failed(
+                        instance.sandbox_instance_id,
+                        failure_code=report.get("reason", "cleanup-failed"),
+                    )
+            # §2: Fail-closed — don't continue to READY if any issues.
+            if mismatches or cleanup_failures:
+                raise RuntimeError(
+                    f"verification runtime cannot be READY: "
+                    f"{len(mismatches)} label/image mismatches, "
+                    f"{len(cleanup_failures)} cleanup failures"
+                )
+        # §2: Also check for unknown Khaos containers (partial label matches
+        # that don't belong to any record).  These must be 0 for READY.
+        reconcile_all = getattr(backend, "reconcile_instances", None)
+        if callable(reconcile_all):
             try:
-                import concurrent.futures as _cf2
-                import asyncio as _aio2
-                with _cf2.ThreadPoolExecutor(max_workers=1) as pool2:
-                    pool2.submit(lambda: _aio2.run(reconcile(
-                        expected_labels={"khaos.boot-id": self.boot_context.boot_id},
-                    ))).result()
+                with _cf2.ThreadPoolExecutor(max_workers=1) as pool3:
+                    unknown_report = pool3.submit(lambda: _aio2.run(
+                        reconcile_all(expected_labels={})
+                    )).result()
+                unknown = unknown_report.get("unknown", [])
+                if unknown:
+                    raise RuntimeError(
+                        f"verification runtime cannot be READY: "
+                        f"{len(unknown)} unknown Khaos containers found: {unknown}"
+                    )
             except Exception as exc:
-                logger.warning("backend reconcile_instances failed: %s", exc)
+                raise RuntimeError(
+                    f"backend reconcile_instances failed: {exc}"
+                ) from exc
 
         # Batch 3.1.1 §8: READY
         self._verification_config_state = "READY"

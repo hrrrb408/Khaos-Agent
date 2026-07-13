@@ -313,6 +313,14 @@ class VerificationExecutionStore:
         ).fetchone()
         return self._row_to_run(row) if row else None
 
+    def get_run(self, verification_run_id: str) -> VerificationExecutionRun | None:
+        """Batch 3.1.2 §2: look up a verification run by verification_run_id."""
+        row = self._conn.execute(
+            "SELECT * FROM plan_verification_runs WHERE verification_run_id=?",
+            (verification_run_id,),
+        ).fetchone()
+        return self._row_to_run(row) if row else None
+
     def list_steps(self, verification_run_id: str) -> tuple[VerificationStepRun, ...]:
         rows = self._conn.execute(
             "SELECT * FROM plan_verification_steps WHERE verification_run_id=? ORDER BY ordinal",
