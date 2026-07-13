@@ -11,6 +11,9 @@ from khaos.coding.planning.verification_execution_models import (
     VerificationExecutionRun, VerificationRunStatus, VerificationStepRun,
     VerificationStepStatus,
 )
+from khaos.coding.planning.verification_sandbox_instance import (
+    SandboxInstanceState, VerificationSandboxInstance,
+)
 
 
 _SCHEMA = """
@@ -45,7 +48,8 @@ CREATE TABLE IF NOT EXISTS plan_verification_audit_events (
 CREATE TABLE IF NOT EXISTS plan_verification_artifacts (
  artifact_id TEXT PRIMARY KEY, verification_run_id TEXT NOT NULL,
  relative_name TEXT NOT NULL, content_digest TEXT NOT NULL, byte_length INTEGER NOT NULL,
- expires_at REAL NOT NULL, quarantined INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL
+ expires_at REAL NOT NULL, quarantined INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+ status TEXT NOT NULL DEFAULT 'sealed'
 );
 CREATE TABLE IF NOT EXISTS plan_execution_phase_leases (
  phase_lease_id TEXT PRIMARY KEY, execution_run_id TEXT NOT NULL,
@@ -57,6 +61,31 @@ CREATE TABLE IF NOT EXISTS plan_execution_phase_leases (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_active_verification_phase_lease
 ON plan_execution_phase_leases(execution_run_id) WHERE status='active';
+CREATE TABLE IF NOT EXISTS verification_sandbox_instances (
+ sandbox_instance_id TEXT PRIMARY KEY,
+ verification_run_id TEXT NOT NULL,
+ step_run_id TEXT NOT NULL,
+ backend_id TEXT NOT NULL,
+ backend_instance_name TEXT NOT NULL,
+ runtime_epoch INTEGER NOT NULL,
+ boot_id TEXT NOT NULL,
+ image_reference TEXT NOT NULL,
+ expected_image_digest TEXT NOT NULL,
+ actual_image_digest TEXT NOT NULL DEFAULT '',
+ workspace_manifest_digest TEXT NOT NULL DEFAULT '',
+ container_id TEXT NOT NULL DEFAULT '',
+ state TEXT NOT NULL DEFAULT 'prepared',
+ created_at REAL NOT NULL,
+ started_at REAL,
+ terminated_at REAL,
+ cleanup_status TEXT NOT NULL DEFAULT '',
+ failure_code TEXT NOT NULL DEFAULT '',
+ metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS ix_vsi_boot_state
+ON verification_sandbox_instances(boot_id, state);
+CREATE INDEX IF NOT EXISTS ix_vsi_run
+ON verification_sandbox_instances(verification_run_id);
 """
 
 
@@ -392,3 +421,385 @@ class VerificationExecutionStore:
             sandbox_image_digest=row["sandbox_image_digest"],
             resource_usage=json.loads(row["resource_usage_json"]), failure_code=row["failure_code"],
         )
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.1 §1: VerificationSandboxInstance lifecycle
+    # ------------------------------------------------------------------
+
+    def create_sandbox_instance(self, instance: VerificationSandboxInstance) -> None:
+        """Persist a PREPARED/STARTING instance BEFORE creating the container."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO verification_sandbox_instances VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (instance.sandbox_instance_id, instance.verification_run_id,
+                 instance.step_run_id, instance.backend_id,
+                 instance.backend_instance_name, instance.runtime_epoch,
+                 instance.boot_id, instance.image_reference,
+                 instance.expected_image_digest, instance.actual_image_digest,
+                 instance.workspace_manifest_digest, instance.container_id,
+                 instance.state.value, instance.created_at, instance.started_at,
+                 instance.terminated_at, instance.cleanup_status,
+                 instance.failure_code,
+                 json.dumps(instance.metadata, sort_keys=True, separators=(",", ":"))),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def update_sandbox_instance(
+        self, sandbox_instance_id: str, *,
+        state: SandboxInstanceState | None = None,
+        container_id: str | None = None,
+        actual_image_digest: str | None = None,
+        started_at: float | None = None,
+        terminated_at: float | None = None,
+        cleanup_status: str | None = None,
+        failure_code: str | None = None,
+    ) -> None:
+        """Update mutable fields of a sandbox instance (state + metadata)."""
+        sets: list[str] = []
+        params: list[Any] = []
+        if state is not None:
+            sets.append("state=?")
+            params.append(state.value)
+        if container_id is not None:
+            sets.append("container_id=?")
+            params.append(container_id)
+        if actual_image_digest is not None:
+            sets.append("actual_image_digest=?")
+            params.append(actual_image_digest)
+        if started_at is not None:
+            sets.append("started_at=?")
+            params.append(started_at)
+        if terminated_at is not None:
+            sets.append("terminated_at=?")
+            params.append(terminated_at)
+        if cleanup_status is not None:
+            sets.append("cleanup_status=?")
+            params.append(cleanup_status)
+        if failure_code is not None:
+            sets.append("failure_code=?")
+            params.append(failure_code)
+        if not sets:
+            return
+        params.append(sandbox_instance_id)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                f"UPDATE verification_sandbox_instances SET {','.join(sets)} "
+                f"WHERE sandbox_instance_id=?",
+                params,
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("sandbox instance update failed (not found)")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_sandbox_instance(self, sandbox_instance_id: str) -> VerificationSandboxInstance | None:
+        row = self._conn.execute(
+            "SELECT * FROM verification_sandbox_instances WHERE sandbox_instance_id=?",
+            (sandbox_instance_id,),
+        ).fetchone()
+        return self._row_to_instance(row) if row else None
+
+    def list_active_sandbox_instances(self) -> tuple[VerificationSandboxInstance, ...]:
+        """Return all instances in PREPARED/STARTING/RUNNING/TERMINATING state."""
+        rows = self._conn.execute(
+            "SELECT * FROM verification_sandbox_instances "
+            "WHERE state IN ('prepared','starting','running','terminating') "
+            "ORDER BY created_at",
+        ).fetchall()
+        return tuple(self._row_to_instance(row) for row in rows)
+
+    def list_sandbox_instances_for_boot(self, boot_id: str) -> tuple[VerificationSandboxInstance, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM verification_sandbox_instances WHERE boot_id=? ORDER BY created_at",
+            (boot_id,),
+        ).fetchall()
+        return tuple(self._row_to_instance(row) for row in rows)
+
+    def list_sandbox_instances_for_run(self, verification_run_id: str) -> tuple[VerificationSandboxInstance, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM verification_sandbox_instances WHERE verification_run_id=? ORDER BY created_at",
+            (verification_run_id,),
+        ).fetchall()
+        return tuple(self._row_to_instance(row) for row in rows)
+
+    def mark_sandbox_instance_orphaned(self, sandbox_instance_id: str, *, failure_code: str = "") -> None:
+        self.update_sandbox_instance(
+            sandbox_instance_id,
+            state=SandboxInstanceState.ORPHANED,
+            failure_code=failure_code,
+        )
+
+    def mark_sandbox_instance_cleanup_failed(self, sandbox_instance_id: str, *, failure_code: str = "") -> None:
+        self.update_sandbox_instance(
+            sandbox_instance_id,
+            state=SandboxInstanceState.CLEANUP_FAILED,
+            cleanup_status="failed",
+            failure_code=failure_code,
+        )
+
+    def reconcile_sandbox_instances(self) -> int:
+        """Batch 3.1.1 §2: mark all active sandbox instances as ORPHANED.
+
+        Called during ``configure_trusted_verification`` after
+        ``recover_interrupted`` has transitioned runs to ERRORED.  Any
+        sandbox instance still in PREPARED/STARTING/RUNNING/TERMINATING
+        state is marked ORPHANED — the corresponding Docker container
+        (if any) is terminated separately via ``backend.reconcile_instances``.
+        """
+        active = self.list_active_sandbox_instances()
+        for instance in active:
+            self.mark_sandbox_instance_orphaned(
+                instance.sandbox_instance_id,
+                failure_code="runtime-restart-orphaned",
+            )
+        return len(active)
+
+    @staticmethod
+    def _row_to_instance(row: sqlite3.Row) -> VerificationSandboxInstance:
+        return VerificationSandboxInstance(
+            sandbox_instance_id=row["sandbox_instance_id"],
+            verification_run_id=row["verification_run_id"],
+            step_run_id=row["step_run_id"],
+            backend_id=row["backend_id"],
+            backend_instance_name=row["backend_instance_name"],
+            runtime_epoch=int(row["runtime_epoch"]),
+            boot_id=row["boot_id"],
+            image_reference=row["image_reference"],
+            expected_image_digest=row["expected_image_digest"],
+            actual_image_digest=row["actual_image_digest"],
+            workspace_manifest_digest=row["workspace_manifest_digest"],
+            container_id=row["container_id"],
+            state=SandboxInstanceState(row["state"]),
+            created_at=float(row["created_at"]),
+            started_at=row["started_at"],
+            terminated_at=row["terminated_at"],
+            cleanup_status=row["cleanup_status"],
+            failure_code=row["failure_code"],
+            metadata=json.loads(row["metadata_json"]),
+        )
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.1 §3: Atomic step+run+execution terminal transitions
+    # ------------------------------------------------------------------
+
+    def _finish_step_and_run_impl(
+        self, step: VerificationStepRun, *,
+        run_target: VerificationRunStatus, execution_target: str,
+        run_failure_code: str = "",
+    ) -> None:
+        """Single BEGIN IMMEDIATE: Step → terminal + Run → terminal + Execution → terminal + Audit."""
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            # 1. Step → terminal
+            cur = self._conn.execute(
+                "UPDATE plan_verification_steps SET status=?,exit_code=?,signal=?,started_at=?,"
+                "completed_at=?,duration_ms=?,stdout_digest=?,stderr_digest=?,output_artifact_id=?,"
+                "output_truncated=?,sandbox_instance_id=?,sandbox_image_digest=?,resource_usage_json=?,"
+                "failure_code=? WHERE step_run_id=? AND status IN ('created','running')",
+                (step.status.value, step.exit_code, step.signal, step.started_at,
+                 step.completed_at, step.duration_ms, step.stdout_digest, step.stderr_digest,
+                 step.output_artifact_id, int(step.output_truncated), step.sandbox_instance_id,
+                 step.sandbox_image_digest, json.dumps(step.resource_usage, sort_keys=True),
+                 step.failure_code, step.step_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification step CAS failed in finish_step_and_run")
+            # 2. Run → terminal
+            run_row = self._conn.execute(
+                "SELECT execution_run_id FROM plan_verification_runs WHERE verification_run_id=?",
+                (step.verification_run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeError("verification run not found in finish_step_and_run")
+            cur = self._conn.execute(
+                "UPDATE plan_verification_runs SET status=?,updated_at=?,completed_at=?,failure_code=? "
+                "WHERE verification_run_id=? AND status='running'",
+                (run_target.value, now, now, run_failure_code,
+                 step.verification_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification run CAS failed in finish_step_and_run")
+            # 3. Execution → terminal
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,failure_code=? "
+                "WHERE execution_run_id=? AND status='verifying'",
+                (execution_target, now, now, run_failure_code, run_row[0]),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("execution run CAS failed in finish_step_and_run")
+            # 4. Audit
+            self._audit(step.verification_run_id, "step-and-run-finished",
+                        step.status.value, step.failure_code, step.step_run_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def finish_step_and_run(self, step: VerificationStepRun) -> None:
+        """Step PASSED + Run PASSED + Execution verified — single transaction."""
+        self._finish_step_and_run_impl(
+            step, run_target=VerificationRunStatus.PASSED,
+            execution_target="verified",
+        )
+
+    def fail_step_and_run(self, step: VerificationStepRun, *, run_failure_code: str = "required-step-failed") -> None:
+        """Step FAILED + Run FAILED + Execution verification-failed — single transaction."""
+        self._finish_step_and_run_impl(
+            step, run_target=VerificationRunStatus.FAILED,
+            execution_target="verification-failed",
+            run_failure_code=run_failure_code,
+        )
+
+    def timeout_step_and_run(self, step: VerificationStepRun) -> None:
+        """Step TIMED_OUT + Run TIMED_OUT + Execution verification-error — single transaction."""
+        self._finish_step_and_run_impl(
+            step, run_target=VerificationRunStatus.TIMED_OUT,
+            execution_target="verification-error",
+            run_failure_code="timeout",
+        )
+
+    def abort_step_and_run(
+        self, step_run_id: str, *, verification_run_id: str,
+        failure_code: str = "aborted",
+    ) -> None:
+        """Step ABORTED + Run ERRORED + Execution verification-error — single transaction.
+
+        Used when a backend exception, artifact failure, or cleanup failure
+        prevents normal step completion.  The step must NOT remain RUNNING.
+        """
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_verification_steps SET status='aborted',completed_at=?,"
+                "failure_code=? WHERE step_run_id=? AND status IN ('created','running')",
+                (now, failure_code, step_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification step abort CAS failed")
+            run_row = self._conn.execute(
+                "SELECT execution_run_id FROM plan_verification_runs WHERE verification_run_id=?",
+                (verification_run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise RuntimeError("verification run not found in abort_step_and_run")
+            cur = self._conn.execute(
+                "UPDATE plan_verification_runs SET status='errored',updated_at=?,completed_at=?,"
+                "failure_code=? WHERE verification_run_id=? AND status='running'",
+                (now, now, failure_code, verification_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification run abort CAS failed")
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET status='verification-error',updated_at=?,"
+                "completed_at=?,failure_code=? WHERE execution_run_id=? AND status='verifying'",
+                (now, now, failure_code, run_row[0]),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("execution run abort CAS failed")
+            self._audit(verification_run_id, "step-and-run-aborted",
+                        "aborted", failure_code, step_run_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def assert_no_running_steps_in_terminal_run(self) -> int:
+        """Batch 3.1.1 §3 invariant: terminal Run → RUNNING step count = 0.
+
+        Returns the number of violations (0 = healthy).
+        """
+        rows = self._conn.execute(
+            "SELECT r.verification_run_id, COUNT(s.step_run_id) as running_count "
+            "FROM plan_verification_runs r "
+            "JOIN plan_verification_steps s ON s.verification_run_id = r.verification_run_id "
+            "WHERE r.status IN ('passed','failed','errored','timed-out','cancelled','stale','poisoned') "
+            "AND s.status = 'running' "
+            "GROUP BY r.verification_run_id",
+        ).fetchall()
+        return len(rows)
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.1 §3: Artifact RESERVED→SEALED protocol
+    # ------------------------------------------------------------------
+
+    def reserve_artifact(
+        self, *, artifact_id: str, verification_run_id: str,
+        relative_name: str, expires_at: float,
+    ) -> None:
+        """Batch 3.1.1 §3: insert a RESERVED artifact row BEFORE writing the file."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO plan_verification_artifacts "
+                "(artifact_id, verification_run_id, relative_name, content_digest, "
+                " byte_length, expires_at, quarantined, created_at, status) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (artifact_id, verification_run_id, relative_name,
+                 "", 0, expires_at, 0, time.time(), "reserved"),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def seal_artifact(
+        self, *, artifact_id: str, content_digest: str, byte_length: int,
+    ) -> None:
+        """Batch 3.1.1 §3: atomically transition RESERVED → SEALED after fsync."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_verification_artifacts SET content_digest=?, byte_length=?, "
+                "status='sealed' WHERE artifact_id=? AND status='reserved'",
+                (content_digest, byte_length, artifact_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("artifact seal CAS failed (not reserved or not found)")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def quarantine_artifact(self, artifact_id: str, *, reason: str = "") -> None:
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_verification_artifacts SET quarantined=1, status='quarantined' "
+                "WHERE artifact_id=?",
+                (artifact_id,),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("artifact quarantine failed")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def list_unsealed_artifacts(self) -> tuple[sqlite3.Row, ...]:
+        """Return artifacts in RESERVED state (crash recovery)."""
+        return tuple(self._conn.execute(
+            "SELECT * FROM plan_verification_artifacts WHERE status='reserved'"
+        ).fetchall())
+
+    def list_artifacts_without_files(self, artifact_root: Any) -> tuple[sqlite3.Row, ...]:
+        """Return SEALED artifacts whose file is missing (crash recovery)."""
+        rows = self._conn.execute(
+            "SELECT * FROM plan_verification_artifacts WHERE status='sealed'"
+        ).fetchall()
+        missing: list[sqlite3.Row] = []
+        for row in rows:
+            from pathlib import Path
+            path = Path(artifact_root) / row["relative_name"]
+            if not path.exists():
+                missing.append(row)
+        return tuple(missing)
