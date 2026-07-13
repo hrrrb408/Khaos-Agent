@@ -136,6 +136,9 @@ class ApprovalRuntime:
         self._verification_runner: Any = None
         self._verification_store: Any = None
         self._verification_toolchain_attestations: tuple = ()
+        self._verification_actual_image_id: str = ""
+        # Batch 3.1.3 §4: full image attestation (RepoDigests, config ID, platform)
+        self._verification_image_attestation: Any = None
         self._verification_config_state: str = "UNCONFIGURED"
 
     @property
@@ -362,7 +365,16 @@ class ApprovalRuntime:
         self.require_ready()
         import asyncio as _asyncio
         from khaos.coding.planning.trusted_verification_runner import TrustedVerificationRunner
+        from khaos.coding.planning.verification_sandbox import (
+            DockerVerificationSandboxBackend, ProductionVerificationAuthority,
+        )
         from khaos.coding.planning.verification_store import VerificationExecutionStore
+
+        # Batch 3.1.3 §5: sign the backend with ProductionVerificationAuthority.
+        # This replaces the module-name ``endswith("tests")`` heuristic.
+        # The runner will reject any backend that was not signed.
+        authority = ProductionVerificationAuthority()
+        authority.sign(backend)
 
         # Batch 3.1.1 §8: PROBING_BACKEND
         self._verification_config_state = "PROBING_BACKEND"
@@ -379,6 +391,16 @@ class ApprovalRuntime:
                     lambda: _aio.run(backend.probe())
                 ).result()
             self._verification_actual_image_id = actual_image_id
+            # Batch 3.1.3 §4: probe the full image attestation.
+            probe_attestation = getattr(backend, "probe_image_attestation", None)
+            if callable(probe_attestation):
+                with _cf.ThreadPoolExecutor(max_workers=1) as pool_img:
+                    image_attestation = pool_img.submit(
+                        lambda: _aio.run(probe_attestation())
+                    ).result()
+                self._verification_image_attestation = image_attestation
+            else:
+                self._verification_image_attestation = None
         except Exception as exc:
             self._verification_config_state = "UNCONFIGURED"
             raise RuntimeError(
@@ -397,10 +419,24 @@ class ApprovalRuntime:
         # be persisted before sandbox reconciliation runs.
         self._verification_store = VerificationExecutionStore(self._store)
         toolchains = tuple(getattr(command_factory, "_tools", {}).values())
-        # If the backend supports real attestation, run it.  Otherwise
-        # fall back to the declaration-only check (test backends).
+        # Batch 3.1.3 §5: production declaration-only fallback is forbidden.
+        # DockerVerificationSandboxBackend must have attest_toolchains.
+        is_production_docker = isinstance(backend, DockerVerificationSandboxBackend)
         attest_toolchains = getattr(backend, "attest_toolchains", None)
+        if is_production_docker and not callable(attest_toolchains):
+            self._verification_config_state = "UNCONFIGURED"
+            raise RuntimeError(
+                "production DockerVerificationSandboxBackend must provide "
+                "attest_toolchains — declaration-only fallback is forbidden"
+            )
+        # If the backend supports real attestation, run it.  Otherwise
+        # fall back to the declaration-only check (test backends only).
         if callable(attest_toolchains) and toolchains:
+            # Batch 3.1.3 §5: bind the image attestation digest to each
+            # toolchain attestation.  This enters the Approval binding.
+            image_attestation_digest = ""
+            if self._verification_image_attestation is not None:
+                image_attestation_digest = self._verification_image_attestation.attestation_digest
             try:
                 import concurrent.futures as _cf_tc
                 import asyncio as _aio_tc
@@ -409,6 +445,7 @@ class ApprovalRuntime:
                         attest_toolchains(
                             toolchains=toolchains,
                             image_digest=profile.image_digest,
+                            image_attestation_digest=image_attestation_digest,
                         )
                     )).result()
             except Exception as exc:

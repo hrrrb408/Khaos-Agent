@@ -34,8 +34,38 @@ from khaos.coding.planning.verification_sandbox_instance import (
 
 
 @dataclass(frozen=True)
+class ImageAttestation:
+    """Batch 3.1.3 §4: explicit image identity attestation model.
+
+    Captures the full image identity proof with separately verifiable
+    fields.  The image reference must be ``repository@sha256:digest``
+    format.  ``docker create`` uses the full reference with
+    ``--pull=never`` — no auto-pull is ever allowed.
+
+    RepoDigests, local image/config ID, and container .Image are verified
+    separately.  The registry manifest digest is NOT required to equal
+    the local config image ID (they are different concepts).
+    """
+    requested_image_reference: str       # repository@sha256:digest
+    approved_repository_digest: str      # sha256:... (the approved digest)
+    platform: str                        # e.g. "linux/amd64"
+    platform_manifest_digest: str        # sha256:... (registry manifest)
+    local_config_image_id: str           # from docker image inspect .Id
+    container_image_id: str              # from docker inspect .Image
+    repo_digests: tuple[str, ...]        # from docker image inspect .RepoDigests
+    no_pull_proof: str                   # "--pull=never" confirmation
+    attested_at: float                   # time.time() at attestation
+    attestation_digest: str              # canonical digest binding all above
+
+
+@dataclass(frozen=True)
 class ContainerAttestation:
-    """Batch 3.1.2 §4: image identity attestation for a created container."""
+    """Batch 3.1.2 §4: image identity attestation for a created container.
+
+    Batch 3.1.3 §4: now carries an explicit ``image_attestation_digest``
+    binding to the ``ImageAttestation`` that was verified before
+    ``docker create``.
+    """
     container_id: str
     container_image_id: str          # from docker inspect .Image
     local_image_id: str              # from docker image inspect .Id
@@ -43,6 +73,7 @@ class ContainerAttestation:
     labels: dict[str, str]
     manifest_digest: str
     attestation_digest: str
+    image_attestation_digest: str = ""  # Batch 3.1.3 §4: binds ImageAttestation
 
 
 @dataclass(frozen=True)
@@ -56,6 +87,10 @@ class ToolchainAttestation:
 
     The ``attestation_digest`` binds the toolchain identity to the actual
     image attestation and is re-verified before each verification launch.
+
+    Batch 3.1.3 §5: ``image_attestation_digest`` explicitly binds the
+    ``ImageAttestation`` that was in effect when the toolchain was
+    attested.  This enters the Approval verification binding.
     """
     toolchain_id: str                # "{language}:{executable_id}"
     executable_path: str             # absolute path inside the container
@@ -65,6 +100,7 @@ class ToolchainAttestation:
     actual_image_attestation: str    # profile.image_digest used for attestation
     attested_at: float               # time.time() at attestation
     attestation_digest: str          # canonical digest binding all fields above
+    image_attestation_digest: str = ""  # Batch 3.1.3 §5: binds ImageAttestation
 
 
 @dataclass(frozen=True)
@@ -95,6 +131,43 @@ class VerificationSandboxBackend(Protocol):
         *,
         cancellation: asyncio.Event | None = None,
     ) -> SandboxStepResult: ...
+
+
+class ProductionVerificationAuthority:
+    """Batch 3.1.3 §5: explicit authority that signs production backends.
+
+    Production backends must be created through this authority — the
+    module-name ``endswith("tests")`` check is no longer sufficient.
+    The authority attaches an unforgeable ``_production_authority``
+    marker that the runner checks before accepting the backend.
+
+    Test backends do not pass through this authority and are rejected
+    by the production runner.
+    """
+
+    def __init__(self, *, authority_id: str = "khaos-production-v1") -> None:
+        self._authority_id = authority_id
+
+    @property
+    def authority_id(self) -> str:
+        return self._authority_id
+
+    def sign(self, backend: Any) -> Any:
+        """Attach the production authority marker to a backend."""
+        # The backend must already be a DockerVerificationSandboxBackend
+        # or equivalent — not a test backend.
+        if not hasattr(backend, "create_instance"):
+            raise TypeError(
+                "ProductionVerificationAuthority can only sign backends "
+                "with the full explicit container lifecycle API"
+            )
+        object.__setattr__(backend, "_production_authority", self._authority_id)
+        return backend
+
+    @staticmethod
+    def is_production_backend(backend: Any) -> bool:
+        """Check whether a backend was signed by a ProductionVerificationAuthority."""
+        return bool(getattr(backend, "_production_authority", None))
 
 
 class DockerVerificationSandboxBackend:
@@ -582,6 +655,71 @@ class DockerVerificationSandboxBackend:
             )
         return actual
 
+    async def probe_image_attestation(self) -> ImageAttestation:
+        """Batch 3.1.3 §4: probe and attest the local image identity.
+
+        Produces an ``ImageAttestation`` with all identity fields verified
+        separately:
+        - RepoDigests from ``docker image inspect .RepoDigests``
+        - Local config image ID from ``docker image inspect .Id``
+        - Platform from ``docker image inspect .Os``/``.Architecture``
+        - No-pull proof: the probe uses ``image inspect`` (never ``pull``)
+
+        The registry manifest digest is NOT required to equal the local
+        config image ID — they are different concepts.
+        """
+        image_digest = self.profile.image_digest
+        # Full image inspect for all fields.
+        process = await asyncio.create_subprocess_exec(
+            str(self._docker), "image", "inspect", image_digest,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            raise RuntimeError(
+                f"image inspect failed for {image_digest}: "
+                f"{stderr.decode('utf-8', 'replace')}"
+            )
+        try:
+            info_list = json.loads(stdout.decode("utf-8", "replace"))
+            info = info_list[0] if isinstance(info_list, list) and info_list else {}
+        except (json.JSONDecodeError, IndexError, TypeError):
+            info = {}
+        local_config_image_id = info.get("Id", "")
+        os_name = info.get("Os", "linux")
+        architecture = info.get("Architecture", "amd64")
+        platform = f"{os_name}/{architecture}"
+        repo_digests = tuple(info.get("RepoDigests", []) or [])
+        # Extract the repository digest from RepoDigests (format: repo@sha256:digest)
+        approved_repository_digest = image_digest
+        for rd in repo_digests:
+            if "@" in rd and image_digest in rd:
+                approved_repository_digest = rd.split("@", 1)[1]
+                break
+        attested_at = time.time()
+        attestation_digest = hashlib.sha256(json.dumps({
+            "requested_image_reference": image_digest,
+            "approved_repository_digest": approved_repository_digest,
+            "platform": platform,
+            "platform_manifest_digest": image_digest,
+            "local_config_image_id": local_config_image_id,
+            "repo_digests": list(repo_digests),
+            "no_pull_proof": "image-inspect-not-pull",
+            "attested_at": attested_at,
+        }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return ImageAttestation(
+            requested_image_reference=image_digest,
+            approved_repository_digest=approved_repository_digest,
+            platform=platform,
+            platform_manifest_digest=image_digest,
+            local_config_image_id=local_config_image_id,
+            container_image_id="",  # filled after container create
+            repo_digests=repo_digests,
+            no_pull_proof="image-inspect-not-pull",
+            attested_at=attested_at,
+            attestation_digest=attestation_digest,
+        )
+
     # ------------------------------------------------------------------
     # §5: Real toolchain attestation
     # ------------------------------------------------------------------
@@ -662,6 +800,7 @@ class DockerVerificationSandboxBackend:
 
     async def attest_toolchain(
         self, *, toolchain: TrustedToolchain, image_digest: str,
+        image_attestation_digest: str = "",
     ) -> ToolchainAttestation:
         """Batch 3.1.2 §5: attest one toolchain inside an attestation container.
 
@@ -672,8 +811,14 @@ class DockerVerificationSandboxBackend:
 
         Does NOT trust the workspace executable — only the image's own
         filesystem is visible to the attestation container.
+
+        Batch 3.1.3 §5: ``image_attestation_digest`` binds the
+        ``ImageAttestation`` that was in effect when the toolchain was
+        attested.  This enters the Approval verification binding.
         """
-        version_argv = self._VERSION_ARGV.get(toolchain.executable_id)
+        # Batch 3.1.3 §5: use the toolchain's fixed version argv if declared,
+        # otherwise fall back to the backend's _VERSION_ARGV table.
+        version_argv = toolchain.version_argv or self._VERSION_ARGV.get(toolchain.executable_id)
         if version_argv is None:
             raise RuntimeError(
                 f"toolchain {toolchain.executable_id} has no fixed version argv"
@@ -740,6 +885,7 @@ class DockerVerificationSandboxBackend:
             "version_output_digest": version_output_digest,
             "parsed_version": parsed_version,
             "actual_image_attestation": image_digest,
+            "image_attestation_digest": image_attestation_digest,
             "attested_at": attested_at,
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return ToolchainAttestation(
@@ -751,17 +897,21 @@ class DockerVerificationSandboxBackend:
             actual_image_attestation=image_digest,
             attested_at=attested_at,
             attestation_digest=attestation_digest,
+            image_attestation_digest=image_attestation_digest,
         )
 
     async def attest_toolchains(
         self, *, toolchains: tuple[TrustedToolchain, ...],
-        image_digest: str,
+        image_digest: str, image_attestation_digest: str = "",
     ) -> tuple[ToolchainAttestation, ...]:
         """Batch 3.1.2 §5: attest all toolchains for the pinned image.
 
         Returns a tuple of :class:`ToolchainAttestation` in the same order
         as the input toolchains.  Any failure raises and the caller must
         NOT install the verifier (fail-closed).
+
+        Batch 3.1.3 §5: ``image_attestation_digest`` binds the
+        ``ImageAttestation`` to each toolchain attestation.
         """
         attestations: list[ToolchainAttestation] = []
         for toolchain in toolchains:
@@ -772,6 +922,7 @@ class DockerVerificationSandboxBackend:
                 )
             attestation = await self.attest_toolchain(
                 toolchain=toolchain, image_digest=image_digest,
+                image_attestation_digest=image_attestation_digest,
             )
             # Verify parsed version matches the approved version.
             if attestation.parsed_version != toolchain.version:

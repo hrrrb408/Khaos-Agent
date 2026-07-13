@@ -74,8 +74,16 @@ class TrustedVerificationRunner:
         artifact_ttl_seconds: float = 24 * 3600,
         toolchain_attestations: tuple = (),
     ) -> None:
-        if backend.__class__.__module__.endswith("tests"):
-            raise TypeError("test sandbox backend cannot be used in production runner")
+        # Batch 3.1.3 §5: production backends must be signed by an explicit
+        # ProductionVerificationAuthority — not by module-name heuristics.
+        from khaos.coding.planning.verification_sandbox import (
+            ProductionVerificationAuthority,
+        )
+        if not ProductionVerificationAuthority.is_production_backend(backend):
+            raise TypeError(
+                "backend was not signed by a ProductionVerificationAuthority; "
+                "test or unsigned backends cannot be used in the production runner"
+            )
         self._store = VerificationExecutionStore(approval_store)
         self._approval_store = approval_store
         self._plans = plan_repository
@@ -382,6 +390,11 @@ class TrustedVerificationRunner:
                 # If the binary was replaced after configuration, the
                 # attestation_digest no longer matches the persisted record
                 # and execution is rejected (fail-closed).
+                #
+                # Batch 3.1.3 §5: also verify the binary_digest and
+                # image_attestation_digest match the persisted record.
+                # If they differ, the Run goes STALE — no new proof is
+                # regenerated to continue using the old approval.
                 toolchain_id = command.toolchain_id
                 if self._toolchain_attestations:
                     attestation = self._toolchain_attestations.get(toolchain_id)
@@ -403,6 +416,25 @@ class TrustedVerificationRunner:
                         )
                         raise PermissionError(
                             f"toolchain attestation stale or missing for {toolchain_id}"
+                        )
+                    # Batch 3.1.3 §5: verify binary_digest and image_attestation_digest.
+                    if persisted.binary_digest != attestation.binary_digest:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="toolchain-binary-digest-mismatch",
+                        )
+                        raise PermissionError(
+                            f"toolchain binary digest mismatch for {toolchain_id}"
+                        )
+                    if persisted.image_attestation_digest != attestation.image_attestation_digest:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="image-attestation-digest-mismatch",
+                        )
+                        raise PermissionError(
+                            f"image attestation digest mismatch for {toolchain_id}"
                         )
                 # §1 steps 1-2: persist PREPARED sandbox instance BEFORE
                 # creating the container, so a crash leaves a durable trail.

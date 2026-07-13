@@ -36,6 +36,10 @@ class TrustedToolchain:
     version: str
     image_digest: str
     binary_digest: str = ""
+    # Batch 3.1.3 §5: fixed version argv for attestation (e.g. ("--version",))
+    version_argv: tuple[str, ...] = ()
+    # Batch 3.1.3 §5: binds the ImageAttestation digest at declaration time
+    image_attestation_digest: str = ""
 
 
 @dataclass(frozen=True)
@@ -129,6 +133,11 @@ class TrustedCommandFactory:
                 output_limit_bytes=self._output_limit,
                 expected_exit_codes=(0,), executes_project_code=True,
                 metadata={"required": requirement.required},
+                # Batch 3.1.3 §5: bind toolchain attestation fields from
+                # the declaration.  These flow into the command canonical
+                # digest and verification plan digest.
+                binary_digest=tool.binary_digest,
+                image_attestation_digest=tool.image_attestation_digest,
             ).normalized()
             commands.append(command)
         return tuple(commands)

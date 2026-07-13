@@ -70,6 +70,15 @@ class TrustedVerificationCommand:
     executes_project_code: bool
     command_digest: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Batch 3.1.3 §5: toolchain attestation binding fields.
+    # These enter the command canonical digest, verification plan digest,
+    # Approval verification binding, Verification Step, and crash recovery
+    # validation.  Empty by default for backward compatibility; production
+    # paths require them to be non-empty.
+    toolchain_attestation_digest: str = ""
+    binary_digest: str = ""
+    version_output_digest: str = ""
+    image_attestation_digest: str = ""
 
     def canonical(self) -> dict[str, Any]:
         return {
@@ -90,6 +99,11 @@ class TrustedVerificationCommand:
             "expected_exit_codes": list(self.expected_exit_codes),
             "executes_project_code": self.executes_project_code,
             "metadata": self.metadata,
+            # Batch 3.1.3 §5: attestation binding fields in canonical digest.
+            "toolchain_attestation_digest": self.toolchain_attestation_digest,
+            "binary_digest": self.binary_digest,
+            "version_output_digest": self.version_output_digest,
+            "image_attestation_digest": self.image_attestation_digest,
         }
 
     def normalized(self) -> "TrustedVerificationCommand":

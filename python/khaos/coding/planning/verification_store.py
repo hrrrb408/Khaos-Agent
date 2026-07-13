@@ -99,7 +99,8 @@ CREATE TABLE IF NOT EXISTS toolchain_attestations (
  attested_at REAL NOT NULL,
  attestation_digest TEXT NOT NULL,
  boot_id TEXT NOT NULL,
- server_epoch INTEGER NOT NULL
+ server_epoch INTEGER NOT NULL,
+ image_attestation_digest TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_ta_boot
 ON toolchain_attestations(boot_id);
@@ -134,6 +135,22 @@ class VerificationExecutionStore:
         self._conn: sqlite3.Connection = approval_store._conn
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        # Batch 3.1.3 §5: add image_attestation_digest column to existing
+        # databases (CREATE TABLE IF NOT EXISTS won't add columns).
+        self._migrate_image_attestation_digest()
+
+    def _migrate_image_attestation_digest(self) -> None:
+        """Add image_attestation_digest column if absent (Batch 3.1.3 §5)."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(toolchain_attestations)")
+        }
+        if "image_attestation_digest" not in cols:
+            self._conn.execute(
+                "ALTER TABLE toolchain_attestations "
+                "ADD COLUMN image_attestation_digest TEXT NOT NULL DEFAULT ''"
+            )
+            self._conn.commit()
 
     def create_run(self, run: VerificationExecutionRun) -> tuple[VerificationExecutionRun, bool]:
         existing = self.get_run_by_execution(run.execution_run_id)
@@ -1118,8 +1135,8 @@ class VerificationExecutionStore:
                 "(toolchain_id, executable_path, binary_digest, "
                 " version_output_digest, parsed_version, "
                 " actual_image_attestation, attested_at, attestation_digest, "
-                " boot_id, server_epoch) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?) "
+                " boot_id, server_epoch, image_attestation_digest) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(toolchain_id) DO UPDATE SET "
                 " executable_path=excluded.executable_path, "
                 " binary_digest=excluded.binary_digest, "
@@ -1129,12 +1146,14 @@ class VerificationExecutionStore:
                 " attested_at=excluded.attested_at, "
                 " attestation_digest=excluded.attestation_digest, "
                 " boot_id=excluded.boot_id, "
-                " server_epoch=excluded.server_epoch",
+                " server_epoch=excluded.server_epoch, "
+                " image_attestation_digest=excluded.image_attestation_digest",
                 (attestation.toolchain_id, attestation.executable_path,
                  attestation.binary_digest, attestation.version_output_digest,
                  attestation.parsed_version, attestation.actual_image_attestation,
                  attestation.attested_at, attestation.attestation_digest,
-                 boot_id, server_epoch),
+                 boot_id, server_epoch,
+                 getattr(attestation, "image_attestation_digest", "")),
             )
             self._conn.commit()
         except Exception:
@@ -1164,6 +1183,7 @@ class VerificationExecutionStore:
             actual_image_attestation=row["actual_image_attestation"],
             attested_at=row["attested_at"],
             attestation_digest=row["attestation_digest"],
+            image_attestation_digest=row["image_attestation_digest"],
         )
 
     def list_toolchain_attestations(self) -> tuple[Any, ...]:
@@ -1181,6 +1201,7 @@ class VerificationExecutionStore:
             actual_image_attestation=row["actual_image_attestation"],
             attested_at=row["attested_at"],
             attestation_digest=row["attestation_digest"],
+            image_attestation_digest=row["image_attestation_digest"],
         ) for row in rows)
 
     def clear_toolchain_attestations_for_boot(self, *, boot_id: str) -> int:
