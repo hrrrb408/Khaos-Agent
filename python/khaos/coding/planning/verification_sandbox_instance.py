@@ -15,13 +15,26 @@ from typing import Any
 
 
 class SandboxInstanceState(str, enum.Enum):
-    """Lifecycle states for a durable sandbox instance."""
+    """Lifecycle states for a durable sandbox instance.
+
+    Batch 3.1.3 §2: the full state machine is::
+
+        PREPARED → CREATED_ATTESTED → STARTING → RUNNING
+                → TERMINATING → REMOVED → TERMINATED
+
+    Exception path::
+
+        any → CLEANUP_PENDING → CLEANUP_FAILED
+    """
 
     PREPARED = "prepared"
+    CREATED_ATTESTED = "created-attested"
     STARTING = "starting"
     RUNNING = "running"
     TERMINATING = "terminating"
+    REMOVED = "removed"
     TERMINATED = "terminated"
+    CLEANUP_PENDING = "cleanup-pending"
     CLEANUP_FAILED = "cleanup-failed"
     ORPHANED = "orphaned"
     ORPHANED_CLEANED = "orphaned-cleaned"
@@ -44,6 +57,7 @@ class VerificationSandboxInstance:
     actual_container_image_id: str = ""
     workspace_manifest_digest: str = ""
     container_id: str = ""
+    attestation_digest: str = ""
     state: SandboxInstanceState = SandboxInstanceState.PREPARED
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None

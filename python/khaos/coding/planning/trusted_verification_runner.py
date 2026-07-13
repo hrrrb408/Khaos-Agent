@@ -113,6 +113,63 @@ class TrustedVerificationRunner:
         self._reconcile_disposable_workspaces()
 
     # ------------------------------------------------------------------
+    # Batch 3.1.3 §2: Real cleanup states for sandbox instances
+    # ------------------------------------------------------------------
+
+    async def _cleanup_sandbox_instance(
+        self, sandbox_instance_id: str, container_id_or_name: str,
+    ) -> None:
+        """Batch 3.1.3 §2: attempt cleanup after a lifecycle failure.
+
+        Marks CLEANUP_PENDING, attempts terminate_and_remove, and only
+        marks TERMINATED if the container is confirmed gone.  On failure,
+        marks CLEANUP_FAILED — never guesses the container is gone.
+        """
+        self._store.update_sandbox_instance(
+            sandbox_instance_id,
+            state=SandboxInstanceState.CLEANUP_PENDING,
+            failure_code="cleanup-after-lifecycle-failure",
+        )
+        if not container_id_or_name:
+            # No container was created — nothing to clean up.
+            self._store.update_sandbox_instance(
+                sandbox_instance_id,
+                state=SandboxInstanceState.TERMINATED,
+                terminated_at=time.time(),
+            )
+            return
+        try:
+            terminated_ok, removed_ok = (
+                await self._backend.terminate_and_remove_instance(container_id_or_name)
+            )
+        except Exception:
+            removed_ok = False
+        if removed_ok:
+            self._store.update_sandbox_instance(
+                sandbox_instance_id,
+                state=SandboxInstanceState.TERMINATED,
+                terminated_at=time.time(),
+            )
+        else:
+            # Best-effort: try to confirm gone via inspect.
+            try:
+                gone = await self._backend.confirm_instance_gone(container_id_or_name)
+            except Exception:
+                gone = False
+            if gone:
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.TERMINATED,
+                    terminated_at=time.time(),
+                )
+            else:
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.CLEANUP_FAILED,
+                    failure_code="cleanup-failed-after-lifecycle-failure",
+                )
+
+    # ------------------------------------------------------------------
     # Batch 3.1.2 §8: Disposable workspace reconciliation
     # ------------------------------------------------------------------
 
@@ -365,60 +422,59 @@ class TrustedVerificationRunner:
                     state=SandboxInstanceState.PREPARED,
                 )
                 self._store.create_sandbox_instance(instance)
-                # §1 steps 3-5: docker create + inspect_and_attest + start + attach.
-                # No project code runs during create.  Start begins the
-                # entrypoint; we persist RUNNING before awaiting output.
                 labels = self._backend.build_labels(
                     run_id=run.verification_run_id, step_id=step.step_run_id,
                     instance_id=sandbox_instance_id, boot_id=self._boot.boot_id,
                     manifest_digest=disposable.manifest_digest,
                 )
                 started_monotonic = time.monotonic()
+                container_id = ""
+                attestation = None
+                attach_proc = None
+                stdout_stream = None
+                stderr_stream = None
                 try:
-                    container_id, attestation, attach_proc, stdout_stream, stderr_stream = (
-                        await self._backend.launch_instance(
-                            instance_name=instance_name,
-                            image_digest=self._profile.image_digest,
-                            command=command, workspace_root=disposable.root,
-                            labels=labels,
-                            expected_manifest_digest=disposable.manifest_digest,
-                        )
+                    # Batch 3.1.3 §1: explicit lifecycle — create, inspect,
+                    # persist, start, persist, attach, collect.  Container
+                    # identity is persisted BEFORE docker start, so a crash
+                    # after create leaves a durable trail.
+                    self._backend.validate_command(command)
+                    # Step 2: docker create --pull=never (no project code)
+                    container_id = await self._backend.create_instance(
+                        instance_name=instance_name,
+                        image_digest=self._profile.image_digest,
+                        command=command, workspace_root=disposable.root,
+                        labels=labels,
                     )
-                except Exception:
-                    # Backend launch failed — abort step+run atomically.
+                    # Step 3: inspect and attest (before start)
+                    attestation = await self._backend.inspect_and_attest_instance(
+                        container_id_or_name=container_id,
+                        expected_labels=labels,
+                        expected_image_digest=self._profile.image_digest,
+                        expected_manifest_digest=disposable.manifest_digest,
+                    )
+                    # Step 4: persist container_id + attestation + CREATED_ATTESTED
+                    # in one atomic transaction BEFORE docker start.
+                    self._store.persist_created_instance(
+                        sandbox_instance_id,
+                        container_id=container_id,
+                        attestation_digest=attestation.attestation_digest,
+                        actual_image_digest=attestation.local_image_id,
+                        actual_container_image_id=attestation.container_image_id,
+                    )
+                    # Step 5: docker start (project code begins)
+                    await self._backend.start_instance(container_id)
+                    # Step 6: persist RUNNING
                     self._store.update_sandbox_instance(
                         sandbox_instance_id,
-                        state=SandboxInstanceState.TERMINATED,
-                        terminated_at=time.time(),
-                        failure_code="backend-launch-failed",
+                        state=SandboxInstanceState.RUNNING,
+                        started_at=time.time(),
                     )
-                    self._store.abort_step_and_run(
-                        step.step_run_id,
-                        verification_run_id=run.verification_run_id,
-                        failure_code="backend-launch-failed",
+                    # Step 7: attach to capture output
+                    attach_proc, stdout_stream, stderr_stream = (
+                        await self._backend.attach_instance(container_id)
                     )
-                    raise
-                # §1 step 6: persist container_id, actual image, STARTING
-                # BEFORE project code output is collected.  This is the
-                # critical durability point: container identity is durable
-                # before any project code runs.
-                self._store.update_sandbox_instance(
-                    sandbox_instance_id,
-                    state=SandboxInstanceState.STARTING,
-                    container_id=container_id,
-                    actual_container_image_id=attestation.container_image_id,
-                    actual_image_digest=attestation.local_image_id,
-                )
-                # §1 steps 7-8: docker start already done in launch_instance;
-                # immediately persist RUNNING.
-                self._store.update_sandbox_instance(
-                    sandbox_instance_id,
-                    state=SandboxInstanceState.RUNNING,
-                    started_at=time.time(),
-                )
-                # §1 steps 9-11: wait for output or cancellation, then
-                # terminate and remove.
-                try:
+                    # Step 8: collect result (remove=False — runner controls cleanup)
                     result = await self._backend.collect_result(
                         container_id=container_id, attach_proc=attach_proc,
                         stdout_stream=stdout_stream, stderr_stream=stderr_stream,
@@ -426,26 +482,69 @@ class TrustedVerificationRunner:
                         started=started_monotonic,
                         sandbox_instance_id=sandbox_instance_id,
                         attestation_digest=attestation.attestation_digest,
+                        remove=False,
                     )
                 except Exception:
-                    self._store.update_sandbox_instance(
-                        sandbox_instance_id,
-                        state=SandboxInstanceState.TERMINATED,
-                        terminated_at=time.time(),
-                        failure_code="backend-collect-failed",
+                    # Batch 3.1.3 §2: real cleanup states.  Do NOT mark
+                    # TERMINATED unless we confirm the container is gone.
+                    await self._cleanup_sandbox_instance(
+                        sandbox_instance_id, container_id or instance_name,
                     )
                     self._store.abort_step_and_run(
                         step.step_run_id,
                         verification_run_id=run.verification_run_id,
-                        failure_code="backend-collect-failed",
+                        failure_code="backend-lifecycle-failed",
                     )
                     raise
-                # §1 step 12: confirm container removed, persist TERMINATED.
+                # Batch 3.1.3 §2: terminate, remove, and CONFIRM container
+                # is gone before persisting TERMINATED.
                 self._store.update_sandbox_instance(
                     sandbox_instance_id,
-                    state=SandboxInstanceState.TERMINATED,
+                    state=SandboxInstanceState.TERMINATING,
                     terminated_at=time.time(),
                 )
+                try:
+                    terminated_ok, removed_ok = (
+                        await self._backend.terminate_and_remove_instance(container_id)
+                    )
+                except Exception:
+                    # Cleanup failed — mark CLEANUP_PENDING, attempt best-effort.
+                    self._store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.CLEANUP_PENDING,
+                        failure_code="terminate-remove-exception",
+                    )
+                    try:
+                        await self._backend.terminate_and_remove_instance(container_id)
+                        gone = await self._backend.confirm_instance_gone(container_id)
+                    except Exception:
+                        gone = False
+                    if gone:
+                        self._store.update_sandbox_instance(
+                            sandbox_instance_id,
+                            state=SandboxInstanceState.TERMINATED,
+                            terminated_at=time.time(),
+                        )
+                    else:
+                        self._store.update_sandbox_instance(
+                            sandbox_instance_id,
+                            state=SandboxInstanceState.CLEANUP_FAILED,
+                            failure_code="cleanup-failed-after-collect",
+                        )
+                else:
+                    if removed_ok:
+                        self._store.update_sandbox_instance(
+                            sandbox_instance_id,
+                            state=SandboxInstanceState.TERMINATED,
+                            terminated_at=time.time(),
+                        )
+                    else:
+                        # Container still exists — cleanup failed.
+                        self._store.update_sandbox_instance(
+                            sandbox_instance_id,
+                            state=SandboxInstanceState.CLEANUP_FAILED,
+                            failure_code="remove-returned-false",
+                        )
                 # §3: write artifact with RESERVED→SEALED protocol.
                 try:
                     artifact_id = self._write_artifact(

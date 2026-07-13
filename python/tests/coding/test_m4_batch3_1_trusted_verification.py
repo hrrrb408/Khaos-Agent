@@ -313,6 +313,7 @@ class UnsafeTestSandboxBackend:
     def __init__(self, profile):
         self.profile = profile
         self.calls = []
+        self._container_exists: set[str] = set()
 
     async def probe(self):
         return self.profile.image_digest
@@ -329,6 +330,57 @@ class UnsafeTestSandboxBackend:
             "khaos.boot-id": boot_id,
             "khaos.manifest-digest": manifest_digest[:63],
         }
+
+    def validate_command(self, command):
+        pass
+
+    async def create_instance(self, *, instance_name, image_digest, command,
+                              workspace_root, labels):
+        self.calls.append((command, workspace_root))
+        fake_container_id = f"fake-container-{hashlib.sha256(instance_name.encode()).hexdigest()[:12]}"
+        self._container_exists.add(fake_container_id)
+        return fake_container_id
+
+    async def inspect_and_attest_instance(self, *, container_id_or_name,
+                                          expected_labels, expected_image_digest,
+                                          expected_manifest_digest):
+        return ContainerAttestation(
+            container_id=container_id_or_name,
+            container_image_id=expected_image_digest,
+            local_image_id=expected_image_digest,
+            expected_image_digest=expected_image_digest,
+            labels=dict(expected_labels),
+            manifest_digest=expected_manifest_digest,
+            attestation_digest=hashlib.sha256(
+                f"{container_id_or_name}:{expected_image_digest}".encode(),
+            ).hexdigest(),
+        )
+
+    async def start_instance(self, container_id_or_name):
+        pass
+
+    async def attach_instance(self, container_id_or_name):
+        return None, None, None
+
+    async def inspect_instance(self, container_id_or_name):
+        if container_id_or_name in self._container_exists:
+            return {"Id": container_id_or_name, "State": {"Running": True}}
+        return None
+
+    async def terminate_instance(self, container_id_or_name):
+        self._container_exists.discard(container_id_or_name)
+        return True
+
+    async def remove_instance(self, container_id_or_name):
+        self._container_exists.discard(container_id_or_name)
+        return True
+
+    async def terminate_and_remove_instance(self, container_id_or_name):
+        self._container_exists.discard(container_id_or_name)
+        return True, True
+
+    async def confirm_instance_gone(self, container_id_or_name):
+        return container_id_or_name not in self._container_exists
 
     async def launch_instance(self, *, instance_name, image_digest, command,
                               workspace_root, labels, expected_manifest_digest):
@@ -349,7 +401,7 @@ class UnsafeTestSandboxBackend:
 
     async def collect_result(self, *, container_id, attach_proc, stdout_stream,
                              stderr_stream, command, cancellation, started,
-                             sandbox_instance_id, attestation_digest):
+                             sandbox_instance_id, attestation_digest, remove=True):
         data = b"trusted fake output"
         return SandboxStepResult(
             sandbox_instance_id, self.profile.image_digest, 0, None, 1, data, b"",
@@ -1584,20 +1636,33 @@ class _FaultMatrixBackend:
     Each test configures the backend to simulate a specific fault at a
     specific lifecycle point, then asserts the runtime's crash-safe
     behavior.  No real Docker is invoked.
+
+    Batch 3.1.3 §1: the runner now calls individual lifecycle methods
+    (create_instance, inspect_and_attest_instance, start_instance,
+    attach_instance, collect_result, terminate_and_remove_instance)
+    instead of the composite launch_instance.  Errors are injected at
+    the appropriate lifecycle point.
     """
 
     BACKEND_ID = "fault-matrix-v1"
 
-    def __init__(self, profile, *, launch_error=None, collect_error=None,
+    def __init__(self, profile, *, create_error=None, inspect_error=None,
+                 start_error=None, collect_error=None,
+                 remove_error=None, remove_returns_false=False,
                  reconcile_report=None, reconcile_error=None):
         self.profile = profile
-        self.launch_error = launch_error
+        self.create_error = create_error
+        self.inspect_error = inspect_error
+        self.start_error = start_error
         self.collect_error = collect_error
+        self.remove_error = remove_error
+        self.remove_returns_false = remove_returns_false
         self.reconcile_report = reconcile_report or {
             "status": "missing", "container_id": "", "reason": "no-container",
         }
         self.reconcile_error = reconcile_error
         self.calls = []
+        self._container_exists: set[str] = set()
 
     async def probe(self):
         return self.profile.image_digest
@@ -1615,26 +1680,75 @@ class _FaultMatrixBackend:
             "khaos.manifest-digest": manifest_digest[:63],
         }
 
-    async def launch_instance(self, *, instance_name, image_digest, command,
-                              workspace_root, labels, expected_manifest_digest):
-        if self.launch_error:
-            raise self.launch_error
-        self.calls.append(("launch", instance_name))
+    def validate_command(self, command):
+        pass
+
+    async def create_instance(self, *, instance_name, image_digest, command,
+                              workspace_root, labels):
+        if self.create_error:
+            raise self.create_error
+        self.calls.append(("create", instance_name))
         fake_id = f"fault-container-{hashlib.sha256(instance_name.encode()).hexdigest()[:12]}"
-        attestation = ContainerAttestation(
-            container_id=fake_id,
-            container_image_id=image_digest,
-            local_image_id=image_digest,
-            expected_image_digest=image_digest,
-            labels=dict(labels),
+        self._container_exists.add(fake_id)
+        return fake_id
+
+    async def inspect_and_attest_instance(self, *, container_id_or_name,
+                                          expected_labels, expected_image_digest,
+                                          expected_manifest_digest):
+        if self.inspect_error:
+            raise self.inspect_error
+        return ContainerAttestation(
+            container_id=container_id_or_name,
+            container_image_id=expected_image_digest,
+            local_image_id=expected_image_digest,
+            expected_image_digest=expected_image_digest,
+            labels=dict(expected_labels),
             manifest_digest=expected_manifest_digest,
-            attestation_digest=hashlib.sha256(f"{fake_id}:{image_digest}".encode()).hexdigest(),
+            attestation_digest=hashlib.sha256(
+                f"{container_id_or_name}:{expected_image_digest}".encode()
+            ).hexdigest(),
         )
-        return fake_id, attestation, None, None, None
+
+    async def start_instance(self, container_id_or_name):
+        if self.start_error:
+            raise self.start_error
+
+    async def attach_instance(self, container_id_or_name):
+        return None, None, None
+
+    async def wait_instance(self, container_id_or_name):
+        return 0
+
+    async def inspect_instance(self, container_id_or_name):
+        if container_id_or_name in self._container_exists:
+            return {"Id": container_id_or_name, "Image": self.profile.image_digest,
+                    "State": {"Status": "running", "Running": True}}
+        return None
+
+    async def terminate_instance(self, container_id_or_name):
+        self._container_exists.discard(container_id_or_name)
+        return True
+
+    async def remove_instance(self, container_id_or_name):
+        if self.remove_error:
+            raise self.remove_error
+        self._container_exists.discard(container_id_or_name)
+        return not self.remove_returns_false
+
+    async def terminate_and_remove_instance(self, container_id_or_name):
+        if self.remove_error:
+            raise self.remove_error
+        self._container_exists.discard(container_id_or_name)
+        if self.remove_returns_false:
+            return True, False
+        return True, True
+
+    async def confirm_instance_gone(self, container_id_or_name):
+        return container_id_or_name not in self._container_exists
 
     async def collect_result(self, *, container_id, attach_proc, stdout_stream,
                              stderr_stream, command, cancellation, started,
-                             sandbox_instance_id, attestation_digest):
+                             sandbox_instance_id, attestation_digest, remove=True):
         if self.collect_error:
             raise self.collect_error
         data = b"fault-matrix-output"
@@ -1688,7 +1802,7 @@ def test_fault_matrix_crash_after_create_before_id_commit(tmp_path):
     """§10: crash after docker create but before DB ID commit → abort + ERRORED."""
     backend = _FaultMatrixBackend(
         _profile(),
-        launch_error=RuntimeError("crash after create, before ID commit"),
+        create_error=RuntimeError("crash after create, before ID commit"),
     )
     runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
     with pytest.raises(RuntimeError, match="crash after create"):
@@ -1713,11 +1827,11 @@ def test_fault_matrix_crash_after_id_commit_before_start(tmp_path):
     ver = vstore.get_run_by_execution(result.execution_run_id)
     assert ver.status == VerificationRunStatus.ERRORED
     assert runtime._store.get_execution_run(result.execution_run_id).status == ExecutionRunStatus.VERIFICATION_ERROR
-    # Sandbox instance must be TERMINATED with failure_code.
+    # Sandbox instance must be TERMINATED with lifecycle failure_code.
     instances = vstore._conn.execute(
         "SELECT state, failure_code FROM verification_sandbox_instances"
     ).fetchall()
-    assert any(r[0] == "terminated" and "collect-failed" in r[1] for r in instances)
+    assert any(r[0] == "terminated" and "lifecycle" in r[1] for r in instances)
 
 
 def test_fault_matrix_label_mismatch_on_reconcile(tmp_path):

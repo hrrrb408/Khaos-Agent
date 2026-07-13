@@ -374,6 +374,33 @@ class DockerVerificationSandboxBackend:
         await remover.wait()
         return await self.inspect_instance(container_id_or_name) is None
 
+    async def terminate_and_remove_instance(
+        self, container_id_or_name: str,
+    ) -> tuple[bool, bool]:
+        """Batch 3.1.3 §2: terminate, remove, and verify container is gone.
+
+        Returns ``(terminated_ok, removed_ok)``:
+        - ``terminated_ok``: True if terminate_instance succeeded.
+        - ``removed_ok``: True if inspect confirms container is gone.
+
+        Only when ``removed_ok is True`` may the caller persist TERMINATED.
+        """
+        terminated_ok = await self.terminate_instance(container_id_or_name)
+        removed_ok = await self.remove_instance(container_id_or_name)
+        # Double-check: inspect must return None.
+        final_check = await self.inspect_instance(container_id_or_name)
+        return terminated_ok, removed_ok and final_check is None
+
+    async def confirm_instance_gone(
+        self, container_id_or_name: str,
+    ) -> bool:
+        """Batch 3.1.3 §2: confirm a container does not exist.
+
+        Returns True only if inspect returns None.  Never raises — the
+        caller must check the return value before marking TERMINATED.
+        """
+        return await self.inspect_instance(container_id_or_name) is None
+
     async def reconcile_instances(
         self, *, expected_labels: dict[str, str],
     ) -> dict[str, Any]:
@@ -728,6 +755,18 @@ class DockerVerificationSandboxBackend:
     # §1: Explicit launch + collect API (production path)
     # ------------------------------------------------------------------
 
+    def validate_command(self, command: TrustedVerificationCommand) -> None:
+        """Batch 3.1.3 §1: pre-launch command validation (extracted from launch_instance).
+
+        Verifies command digest and sandbox profile binding before any
+        docker operation.  Raises PermissionError on mismatch.
+        """
+        normalized = command.normalized()
+        if normalized.command_digest != command.command_digest:
+            raise PermissionError("trusted command digest mismatch")
+        if command.sandbox_profile_id != self.profile.profile_id:
+            raise PermissionError("sandbox profile mismatch")
+
     async def launch_instance(
         self, *, instance_name: str, image_digest: str,
         command: TrustedVerificationCommand,
@@ -775,12 +814,16 @@ class DockerVerificationSandboxBackend:
         cancellation: asyncio.Event | None,
         started: float, sandbox_instance_id: str,
         attestation_digest: str,
+        remove: bool = True,
     ) -> SandboxStepResult:
-        """Batch 3.1.2 §1: wait for completion, read streams, terminate, remove.
+        """Batch 3.1.3 §1: wait for completion, read streams, optionally remove.
 
         Called AFTER the caller has persisted ``container_id`` and
         ``attestation_digest``.  Handles timeout, cancellation, stream
-        reading, container termination and removal.
+        reading.  When ``remove=True`` (default, backward compat), also
+        terminates and removes the container.  When ``remove=False``, the
+        caller is responsible for calling ``terminate_and_remove_instance``
+        and confirming the container is gone before persisting TERMINATED.
         """
         stdout_task = asyncio.create_task(
             self._read_bounded(stdout_stream, command.output_limit_bytes),
@@ -816,8 +859,8 @@ class DockerVerificationSandboxBackend:
         stderr, stderr_truncated = await stderr_task
         stdout = self._redact(stdout)
         stderr = self._redact(stderr)
-        # docker rm -f (cleanup)
-        await self.remove_instance(container_id)
+        if remove:
+            await self.remove_instance(container_id)
         return SandboxStepResult(
             sandbox_instance_id, self.profile.image_digest,
             None if exit_code is not None and exit_code < 0 else exit_code,

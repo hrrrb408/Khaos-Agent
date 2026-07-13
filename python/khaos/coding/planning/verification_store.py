@@ -76,6 +76,7 @@ CREATE TABLE IF NOT EXISTS verification_sandbox_instances (
  actual_container_image_id TEXT NOT NULL DEFAULT '',
  workspace_manifest_digest TEXT NOT NULL DEFAULT '',
  container_id TEXT NOT NULL DEFAULT '',
+ attestation_digest TEXT NOT NULL DEFAULT '',
  state TEXT NOT NULL DEFAULT 'prepared',
  created_at REAL NOT NULL,
  started_at REAL,
@@ -478,7 +479,7 @@ class VerificationExecutionStore:
         try:
             self._conn.execute(
                 "INSERT INTO verification_sandbox_instances VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (instance.sandbox_instance_id, instance.verification_run_id,
                  instance.step_run_id, instance.backend_id,
                  instance.backend_instance_name, instance.runtime_epoch,
@@ -486,11 +487,41 @@ class VerificationExecutionStore:
                  instance.expected_image_digest, instance.actual_image_digest,
                  instance.actual_container_image_id,
                  instance.workspace_manifest_digest, instance.container_id,
+                 instance.attestation_digest,
                  instance.state.value, instance.created_at, instance.started_at,
                  instance.terminated_at, instance.cleanup_status,
                  instance.failure_code,
                  json.dumps(instance.metadata, sort_keys=True, separators=(",", ":"))),
             )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def persist_created_instance(
+        self, sandbox_instance_id: str, *,
+        container_id: str, attestation_digest: str,
+        actual_image_digest: str, actual_container_image_id: str,
+    ) -> None:
+        """Batch 3.1.3 §1: atomically persist container identity + CREATED_ATTESTED.
+
+        This is the critical durability point — container_id and attestation
+        are persisted in a single BEGIN IMMEDIATE BEFORE docker start is
+        called, so a crash after create but before start leaves a durable
+        trail.
+        """
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE verification_sandbox_instances SET container_id=?, "
+                "attestation_digest=?, actual_image_digest=?, "
+                "actual_container_image_id=?, state='created-attested' "
+                "WHERE sandbox_instance_id=? AND state='prepared'",
+                (container_id, attestation_digest, actual_image_digest,
+                 actual_container_image_id, sandbox_instance_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("persist_created_instance CAS failed")
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -502,6 +533,7 @@ class VerificationExecutionStore:
         container_id: str | None = None,
         actual_image_digest: str | None = None,
         actual_container_image_id: str | None = None,
+        attestation_digest: str | None = None,
         started_at: float | None = None,
         terminated_at: float | None = None,
         cleanup_status: str | None = None,
@@ -522,6 +554,9 @@ class VerificationExecutionStore:
         if actual_container_image_id is not None:
             sets.append("actual_container_image_id=?")
             params.append(actual_container_image_id)
+        if attestation_digest is not None:
+            sets.append("attestation_digest=?")
+            params.append(attestation_digest)
         if started_at is not None:
             sets.append("started_at=?")
             params.append(started_at)
@@ -559,10 +594,11 @@ class VerificationExecutionStore:
         return self._row_to_instance(row) if row else None
 
     def list_active_sandbox_instances(self) -> tuple[VerificationSandboxInstance, ...]:
-        """Return all instances in PREPARED/STARTING/RUNNING/TERMINATING state."""
+        """Return all non-terminal instances (need crash reconciliation)."""
         rows = self._conn.execute(
             "SELECT * FROM verification_sandbox_instances "
-            "WHERE state IN ('prepared','starting','running','terminating') "
+            "WHERE state IN ('prepared','created-attested','starting','running',"
+            "'terminating','cleanup-pending') "
             "ORDER BY created_at",
         ).fetchall()
         return tuple(self._row_to_instance(row) for row in rows)
@@ -629,6 +665,7 @@ class VerificationExecutionStore:
             actual_container_image_id=row["actual_container_image_id"],
             workspace_manifest_digest=row["workspace_manifest_digest"],
             container_id=row["container_id"],
+            attestation_digest=row["attestation_digest"] if "attestation_digest" in row.keys() else "",
             state=SandboxInstanceState(row["state"]),
             created_at=float(row["created_at"]),
             started_at=row["started_at"],
