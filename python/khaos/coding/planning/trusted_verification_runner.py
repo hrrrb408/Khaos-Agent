@@ -21,6 +21,7 @@ from khaos.coding.planning.trusted_verification import (
 )
 from khaos.coding.planning.verification_catalog import VerificationCatalog
 from khaos.coding.planning.verification_execution_models import (
+    DisposableWorkspaceRecord, DisposableWorkspaceState,
     VerificationExecutionRun, VerificationPhaseContext, VerificationResult,
     VerificationRunStatus, VerificationStepRun, VerificationStepStatus,
     verification_plan_digest,
@@ -30,6 +31,26 @@ from khaos.coding.planning.verification_sandbox_instance import (
     SandboxInstanceState, VerificationSandboxInstance,
 )
 from khaos.coding.planning.verification_store import VerificationExecutionStore
+
+
+# Batch 3.1.2 §8: conservative default for files verification may generate.
+# These are cache/build byproducts that don't affect verification integrity.
+_DEFAULT_ALLOWED_GENERATED_OUTPUT = (
+    "__pycache__/*",
+    "*.pyc",
+    ".pytest_cache/*",
+    ".coverage",
+    ".mypy_cache/*",
+    ".ruff_cache/*",
+    "node_modules/*",
+    ".tox/*",
+    "build/*",
+    "dist/*",
+    "*.egg-info/*",
+    "target/*",
+    ".next/*",
+    ".nuxt/*",
+)
 
 
 class TrustedVerificationRunner:
@@ -88,6 +109,68 @@ class TrustedVerificationRunner:
             for attestation in toolchain_attestations
         }
         self._store.recover_interrupted()
+        # Batch 3.1.2 §8: reconcile disposable workspaces from previous boots.
+        self._reconcile_disposable_workspaces()
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.2 §8: Disposable workspace reconciliation
+    # ------------------------------------------------------------------
+
+    def _reconcile_disposable_workspaces(self) -> None:
+        """Reconcile non-terminal disposable workspaces from previous boots.
+
+        For each active workspace:
+        - Reconstruct root_path from factory root + instance_id.
+        - If root_path no longer exists → mark CLEANED (already gone).
+        - If root_path exists → attempt destroy:
+          - Success → mark CLEANED.
+          - Failure → mark CLEANUP_FAILED + poison workspace scope.
+        """
+        from khaos.coding.planning.trusted_verification import (
+            DisposableVerificationWorkspace, ManifestEntry,
+        )
+        factory_root = self._workspace_factory._root
+        for record in self._store.list_active_disposable_workspaces():
+            root = factory_root / record.instance_id
+            if not root.exists():
+                self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+                continue
+            # Reconstruct the workspace object from the persisted record.
+            try:
+                manifest_entries = tuple(
+                    ManifestEntry(
+                        path=entry["path"],
+                        content_hash=entry["content_hash"],
+                        mode=entry["mode"],
+                    )
+                    for entry in json.loads(record.manifest_json)
+                )
+            except (json.JSONDecodeError, KeyError, TypeError):
+                manifest_entries = ()
+            workspace = DisposableVerificationWorkspace(
+                instance_id=record.instance_id,
+                root=root,
+                manifest=manifest_entries,
+                manifest_digest=record.manifest_digest,
+                source_root="",
+                allowed_generated_output=record.allowed_generated_output,
+            )
+            try:
+                self._workspace_factory.destroy(workspace)
+            except Exception:
+                self._store.mark_disposable_workspace_cleanup_failed(
+                    record.workspace_id, failure_code="reconcile-cleanup-failed",
+                )
+                try:
+                    self._approval_store.add_workspace_poison_scope(
+                        record.verification_run_id,
+                        owner=f"verification-cleanup:{record.workspace_id}",
+                        reason="disposable-workspace-cleanup-failed",
+                    )
+                except Exception:
+                    pass
+            else:
+                self._store.mark_disposable_workspace_cleaned(record.workspace_id)
 
     async def run(
         self,
@@ -166,6 +249,8 @@ class TrustedVerificationRunner:
             target=VerificationRunStatus.VALIDATING,
         )
         disposable = None
+        workspace_id = ""
+        last_step: VerificationStepRun | None = None
         try:
             # Revalidate immediately before creating any process or copy.
             self._validate_live(context, expected_catalog=catalog.fingerprint,
@@ -181,6 +266,35 @@ class TrustedVerificationRunner:
                                  Path(self._approval_store._db_path)
                                  if getattr(self._approval_store, "_db_path", None)
                                  else workspace.repository_root),
+                allowed_generated_output=_DEFAULT_ALLOWED_GENERATED_OUTPUT,
+            )
+            # Batch 3.1.2 §8: persist disposable workspace row for crash recovery.
+            workspace_id = f"dvw_{uuid.uuid4().hex}"
+            manifest_json = json.dumps(
+                [entry.__dict__ for entry in disposable.manifest],
+                sort_keys=True, separators=(",", ":"),
+            )
+            self._store.create_disposable_workspace(DisposableWorkspaceRecord(
+                workspace_id=workspace_id,
+                verification_run_id=run.verification_run_id,
+                step_run_id="",
+                instance_id=disposable.instance_id,
+                manifest_digest=disposable.manifest_digest,
+                manifest_json=manifest_json,
+                allowed_generated_output=disposable.allowed_generated_output,
+                state=DisposableWorkspaceState.PREPARED,
+                boot_id=self._boot.boot_id,
+                created_at=time.time(),
+            ))
+            self._store.transition_disposable_workspace(
+                workspace_id,
+                expected=(DisposableWorkspaceState.PREPARED,),
+                target=DisposableWorkspaceState.SEALED,
+            )
+            self._store.transition_disposable_workspace(
+                workspace_id,
+                expected=(DisposableWorkspaceState.SEALED,),
+                target=DisposableWorkspaceState.MOUNTED,
             )
             steps = tuple(VerificationStepRun(
                 step_run_id=f"pvs_{uuid.uuid4().hex}",
@@ -205,6 +319,7 @@ class TrustedVerificationRunner:
                     failure_code = "cancelled"
                     break
                 self._store.mark_step_running(step.step_run_id)
+                last_step = step
                 started = time.time()
                 # §5: re-bind toolchain attestation digest before execution.
                 # If the binary was replaced after configuration, the
@@ -425,7 +540,56 @@ class TrustedVerificationRunner:
             raise
         finally:
             if disposable is not None:
-                self._workspace_factory.destroy(disposable)
+                # Batch 3.1.2 §8: transition to CLEANUP_PENDING before destroy.
+                if workspace_id:
+                    try:
+                        self._store.transition_disposable_workspace(
+                            workspace_id,
+                            expected=(DisposableWorkspaceState.MOUNTED,
+                                      DisposableWorkspaceState.SEALED,
+                                      DisposableWorkspaceState.PREPARED),
+                            target=DisposableWorkspaceState.CLEANUP_PENDING,
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self._workspace_factory.destroy(disposable)
+                except Exception:
+                    # §8: cleanup failed — mark workspace, poison scope,
+                    # and transition run/step to ERRORED if still PASSED.
+                    if workspace_id:
+                        try:
+                            self._store.mark_disposable_workspace_cleanup_failed(
+                                workspace_id, failure_code="cleanup-failed",
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        self._approval_store.add_workspace_poison_scope(
+                            run.verification_run_id,
+                            owner=f"verification-cleanup:{workspace_id or 'unknown'}",
+                            reason="disposable-workspace-cleanup-failed",
+                        )
+                    except Exception:
+                        pass
+                    # §9: atomic cleanup_fail_step_and_run if the run is
+                    # still in a state that allows the transition.
+                    if last_step is not None:
+                        try:
+                            self._store.cleanup_fail_step_and_run(
+                                last_step.step_run_id,
+                                verification_run_id=run.verification_run_id,
+                                failure_code="disposable-workspace-cleanup-failed",
+                            )
+                        except Exception:
+                            pass
+                else:
+                    # Cleanup succeeded — mark workspace CLEANED.
+                    if workspace_id:
+                        try:
+                            self._store.mark_disposable_workspace_cleaned(workspace_id)
+                        except Exception:
+                            pass
 
     def _new_run(
         self, *, context: VerificationPhaseContext, execution: Any,

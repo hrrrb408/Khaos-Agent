@@ -8,6 +8,7 @@ import uuid
 from typing import Any
 
 from khaos.coding.planning.verification_execution_models import (
+    DisposableWorkspaceRecord, DisposableWorkspaceState,
     VerificationExecutionRun, VerificationRunStatus, VerificationStepRun,
     VerificationStepStatus,
 )
@@ -101,6 +102,28 @@ CREATE TABLE IF NOT EXISTS toolchain_attestations (
 );
 CREATE INDEX IF NOT EXISTS ix_ta_boot
 ON toolchain_attestations(boot_id);
+CREATE TABLE IF NOT EXISTS disposable_verification_workspaces (
+ workspace_id TEXT PRIMARY KEY,
+ verification_run_id TEXT NOT NULL,
+ step_run_id TEXT NOT NULL DEFAULT '',
+ instance_id TEXT NOT NULL,
+ manifest_digest TEXT NOT NULL,
+ manifest_json TEXT NOT NULL DEFAULT '[]',
+ allowed_generated_output TEXT NOT NULL DEFAULT '[]',
+ state TEXT NOT NULL DEFAULT 'prepared',
+ boot_id TEXT NOT NULL DEFAULT '',
+ created_at REAL NOT NULL,
+ sealed_at REAL,
+ mounted_at REAL,
+ cleanup_started_at REAL,
+ cleaned_at REAL,
+ failure_code TEXT NOT NULL DEFAULT '',
+ metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS ix_dvw_boot_state
+ON disposable_verification_workspaces(boot_id, state);
+CREATE INDEX IF NOT EXISTS ix_dvw_run
+ON disposable_verification_workspaces(verification_run_id);
 """
 
 
@@ -1136,3 +1159,183 @@ class VerificationExecutionStore:
         )
         self._conn.commit()
         return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.2 §8: Disposable verification workspace persistence
+    # ------------------------------------------------------------------
+
+    def create_disposable_workspace(
+        self, record: DisposableWorkspaceRecord,
+    ) -> None:
+        """Persist a new disposable workspace row in PREPARED state."""
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO disposable_verification_workspaces VALUES ("
+                "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (record.workspace_id, record.verification_run_id,
+                 record.step_run_id, record.instance_id,
+                 record.manifest_digest, record.manifest_json,
+                 json.dumps(list(record.allowed_generated_output)),
+                 record.state.value, record.boot_id, record.created_at,
+                 record.sealed_at, record.mounted_at, record.cleanup_started_at,
+                 record.cleaned_at, record.failure_code, "{}"),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def transition_disposable_workspace(
+        self, workspace_id: str, *,
+        expected: tuple[DisposableWorkspaceState, ...],
+        target: DisposableWorkspaceState,
+        failure_code: str = "",
+    ) -> None:
+        """CAS transition for disposable workspace state."""
+        now = time.time()
+        expected_str = tuple(e.value for e in expected)
+        placeholders = ",".join("?" * len(expected_str))
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if target == DisposableWorkspaceState.SEALED:
+                col, val = "sealed_at", now
+            elif target == DisposableWorkspaceState.MOUNTED:
+                col, val = "mounted_at", now
+            elif target == DisposableWorkspaceState.CLEANUP_PENDING:
+                col, val = "cleanup_started_at", now
+            elif target == DisposableWorkspaceState.CLEANED:
+                col, val = "cleaned_at", now
+            else:
+                col, val = None, None
+            if col is not None:
+                cur = self._conn.execute(
+                    f"UPDATE disposable_verification_workspaces SET state=?,{col}=?,"
+                    f"failure_code=? WHERE workspace_id=? AND state IN ({placeholders})",
+                    (target.value, val, failure_code, workspace_id, *expected_str),
+                )
+            else:
+                cur = self._conn.execute(
+                    f"UPDATE disposable_verification_workspaces SET state=?,"
+                    f"failure_code=? WHERE workspace_id=? AND state IN ({placeholders})",
+                    (target.value, failure_code, workspace_id, *expected_str),
+                )
+            if cur.rowcount != 1:
+                raise RuntimeError("disposable workspace CAS failed")
+            self._audit(
+                workspace_id, "disposable-workspace-transition",
+                target.value, failure_code, workspace_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def get_disposable_workspace(
+        self, workspace_id: str,
+    ) -> DisposableWorkspaceRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM disposable_verification_workspaces WHERE workspace_id=?",
+            (workspace_id,),
+        ).fetchone()
+        return self._row_to_disposable_workspace(row) if row else None
+
+    def get_disposable_workspace_by_instance(
+        self, instance_id: str,
+    ) -> DisposableWorkspaceRecord | None:
+        row = self._conn.execute(
+            "SELECT * FROM disposable_verification_workspaces WHERE instance_id=?",
+            (instance_id,),
+        ).fetchone()
+        return self._row_to_disposable_workspace(row) if row else None
+
+    def list_active_disposable_workspaces(
+        self,
+    ) -> tuple[DisposableWorkspaceRecord, ...]:
+        """Return all workspaces not in a terminal state (cleaned/cleanup-failed/quarantined)."""
+        rows = self._conn.execute(
+            "SELECT * FROM disposable_verification_workspaces "
+            "WHERE state NOT IN ('cleaned','cleanup-failed','quarantined') "
+            "ORDER BY created_at",
+        ).fetchall()
+        return tuple(self._row_to_disposable_workspace(row) for row in rows)
+
+    def list_disposable_workspaces_for_boot(
+        self, boot_id: str,
+    ) -> tuple[DisposableWorkspaceRecord, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM disposable_verification_workspaces WHERE boot_id=? "
+            "ORDER BY created_at", (boot_id,),
+        ).fetchall()
+        return tuple(self._row_to_disposable_workspace(row) for row in rows)
+
+    def list_disposable_workspaces_for_run(
+        self, verification_run_id: str,
+    ) -> tuple[DisposableWorkspaceRecord, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM disposable_verification_workspaces WHERE verification_run_id=? "
+            "ORDER BY created_at", (verification_run_id,),
+        ).fetchall()
+        return tuple(self._row_to_disposable_workspace(row) for row in rows)
+
+    def mark_disposable_workspace_cleanup_failed(
+        self, workspace_id: str, *, failure_code: str = "cleanup-failed",
+    ) -> None:
+        """Mark a workspace as cleanup-failed (fail-closed, not cleaned)."""
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "UPDATE disposable_verification_workspaces SET state='cleanup-failed',"
+                "failure_code=?,cleaned_at=? WHERE workspace_id=?",
+                (failure_code, now, workspace_id),
+            )
+            self._audit(
+                workspace_id, "disposable-workspace-cleanup-failed",
+                "cleanup-failed", failure_code, workspace_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def mark_disposable_workspace_cleaned(
+        self, workspace_id: str,
+    ) -> None:
+        """Mark a workspace as cleaned (cleanup succeeded)."""
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "UPDATE disposable_verification_workspaces SET state='cleaned',"
+                "cleaned_at=? WHERE workspace_id=?",
+                (now, workspace_id),
+            )
+            self._audit(
+                workspace_id, "disposable-workspace-cleaned",
+                "cleaned", "", workspace_id,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    @staticmethod
+    def _row_to_disposable_workspace(row: sqlite3.Row) -> DisposableWorkspaceRecord:
+        return DisposableWorkspaceRecord(
+            workspace_id=row["workspace_id"],
+            verification_run_id=row["verification_run_id"],
+            step_run_id=row["step_run_id"],
+            instance_id=row["instance_id"],
+            manifest_digest=row["manifest_digest"],
+            manifest_json=row["manifest_json"],
+            allowed_generated_output=tuple(json.loads(row["allowed_generated_output"])),
+            state=DisposableWorkspaceState(row["state"]),
+            boot_id=row["boot_id"],
+            created_at=row["created_at"],
+            sealed_at=row["sealed_at"],
+            mounted_at=row["mounted_at"],
+            cleanup_started_at=row["cleanup_started_at"],
+            cleaned_at=row["cleaned_at"],
+            failure_code=row["failure_code"],
+        )

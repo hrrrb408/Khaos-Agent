@@ -39,6 +39,17 @@ class VerificationStepStatus(str, Enum):
     ABORTED = "aborted"
 
 
+class DisposableWorkspaceState(str, Enum):
+    """Batch 3.1.2 §8: lifecycle states for disposable verification workspaces."""
+    PREPARED = "prepared"
+    SEALED = "sealed"
+    MOUNTED = "mounted"
+    CLEANUP_PENDING = "cleanup-pending"
+    CLEANED = "cleaned"
+    CLEANUP_FAILED = "cleanup-failed"
+    QUARANTINED = "quarantined"
+
+
 @dataclass(frozen=True)
 class TrustedVerificationCommand:
     command_id: str
@@ -175,3 +186,23 @@ def verification_plan_digest(
         "catalog_fingerprint": catalog_fingerprint,
         "sandbox_profile_digest": sandbox_profile_digest,
     })
+
+
+@dataclass(frozen=True)
+class DisposableWorkspaceRecord:
+    """Batch 3.1.2 §8: persistence row for a disposable verification workspace."""
+    workspace_id: str
+    verification_run_id: str
+    step_run_id: str
+    instance_id: str
+    manifest_digest: str
+    manifest_json: str = "[]"
+    allowed_generated_output: tuple[str, ...] = ()
+    state: DisposableWorkspaceState = DisposableWorkspaceState.PREPARED
+    boot_id: str = ""
+    created_at: float = 0.0
+    sealed_at: float | None = None
+    mounted_at: float | None = None
+    cleanup_started_at: float | None = None
+    cleaned_at: float | None = None
+    failure_code: str = ""

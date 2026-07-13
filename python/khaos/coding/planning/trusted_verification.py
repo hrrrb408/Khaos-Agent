@@ -1,6 +1,7 @@
 """Server-owned trusted verification command and disposable workspace policy."""
 from __future__ import annotations
 
+import fnmatch
 import hashlib
 import json
 import os
@@ -159,6 +160,9 @@ class DisposableVerificationWorkspace:
     root: Path
     manifest: tuple[ManifestEntry, ...]
     manifest_digest: str
+    # Batch 3.1.2 §8: source root path and allowed generated output policy.
+    source_root: str = ""
+    allowed_generated_output: tuple[str, ...] = ()
 
 
 class VerificationSnapshotCapability:
@@ -472,6 +476,7 @@ class VerificationWorkspaceFactory:
         source: Path,
         *,
         forbidden_roots: Iterable[Path],
+        allowed_generated_output: Iterable[str] = (),
     ) -> DisposableVerificationWorkspace:
         source = source.resolve(strict=True)
         forbidden = tuple(path.resolve() for path in forbidden_roots)
@@ -487,6 +492,7 @@ class VerificationWorkspaceFactory:
         self._file_count = 0
         self._dir_count = 0
         self._total_bytes = 0
+        allowed = tuple(allowed_generated_output)
         try:
             # Open the source root with O_NOFOLLOW.
             src_root_fd = os.open(
@@ -512,6 +518,8 @@ class VerificationWorkspaceFactory:
             ).encode()).hexdigest()
             return DisposableVerificationWorkspace(
                 instance_id, destination, tuple(entries), manifest_digest,
+                source_root=str(source),
+                allowed_generated_output=allowed,
             )
         except Exception:
             self._safe_destroy(destination)
@@ -683,54 +691,173 @@ class VerificationWorkspaceFactory:
 
     @staticmethod
     def destroy(workspace: DisposableVerificationWorkspace) -> None:
-        """Batch 3.1.1 §6: safe destroy using manifest-driven deletion.
+        """Batch 3.1.2 §8: crash-safe destroy with manifest + policy attestation.
 
-        Deletes only the files declared in the manifest, then removes
-        empty directories.  Rejects symlinks and unknown files.  Falls
-        back to ``shutil.rmtree`` only if the manifest is empty (which
-        should not happen in normal operation).
+        Walks the actual directory tree (not just manifest entries) using
+        ``dir_fd``-relative operations with ``O_NOFOLLOW`` at every level.
+        For each file found:
+        - If in the source manifest → delete (we copied it).
+        - If matches an allowed_generated_output pattern → delete (expected byproduct).
+        - Otherwise → raise ``PermissionError`` (unknown file, fail-closed).
+
+        Directories are ``fsync``'d after their children are removed.
+        The instance root is ``rmdir``'d last, and its absence is confirmed
+        via ``os.stat`` (must raise ``FileNotFoundError``) before returning.
+
+        ``unlink``/``rmdir`` errors are NEVER swallowed — they propagate
+        to the caller so the run can be marked cleanup-failed.
         """
-        VerificationWorkspaceFactory._safe_destroy(workspace.root, workspace.manifest)
+        root = workspace.root
+        if not root.exists():
+            # Already gone — confirm absence and return.
+            try:
+                os.stat(str(root))
+            except FileNotFoundError:
+                return
+            raise PermissionError(
+                f"disposable workspace root exists but is not a directory: {root}"
+            )
+        # Build manifest paths set for fast lookup.
+        manifest_paths = {entry.path for entry in workspace.manifest}
+        allowed = workspace.allowed_generated_output
+        # Open the instance root with O_DIRECTORY|O_NOFOLLOW (fix root FD).
+        root_fd = os.open(
+            str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            VerificationWorkspaceFactory._destroy_tree(
+                root_fd, "", manifest_paths, allowed, str(root),
+            )
+        finally:
+            os.close(root_fd)
+        # rmdir the instance root itself.
+        os.rmdir(str(root))
+        # fsync the parent directory so the rmdir is durable.
+        parent_fd = os.open(
+            str(root.parent), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+        # Confirm the instance root no longer exists.
+        try:
+            os.stat(str(root))
+        except FileNotFoundError:
+            return
+        raise PermissionError(
+            f"disposable workspace root still exists after rmdir: {root}"
+        )
+
+    @staticmethod
+    def _destroy_tree(
+        dir_fd: int, prefix: str,
+        manifest_paths: set[str],
+        allowed_generated_output: tuple[str, ...],
+        root_label: str,
+    ) -> None:
+        """Recursively destroy all entries in ``dir_fd`` with manifest attestation.
+
+        For each child:
+        - Directory → recurse, then rmdir + fsync parent.
+        - Regular file → check manifest or allowed_generated_output, then unlink.
+        - Symlink/special → raise PermissionError (reject).
+        Unknown files (not in manifest, not matching policy) raise PermissionError.
+        """
+        names = os.listdir(dir_fd)
+        for name in sorted(names):
+            child_path = f"{prefix}{name}" if prefix == "" else f"{prefix}/{name}"
+            # Open the child with O_NOFOLLOW (rejects symlinks).
+            try:
+                child_fd = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd,
+                )
+            except OSError as exc:
+                raise PermissionError(
+                    f"disposable workspace destroy rejects symlink or special: {child_path}"
+                ) from exc
+            try:
+                st = os.fstat(child_fd)
+                if stat.S_ISDIR(st.st_mode):
+                    # Recurse into the directory.
+                    VerificationWorkspaceFactory._destroy_tree(
+                        child_fd, child_path, manifest_paths,
+                        allowed_generated_output, root_label,
+                    )
+                    # rmdir the now-empty directory.
+                    os.rmdir(name, dir_fd=dir_fd)
+                elif stat.S_ISREG(st.st_mode):
+                    # Check if the file is known (manifest) or allowed (policy).
+                    in_manifest = child_path in manifest_paths
+                    in_policy = any(
+                        fnmatch.fnmatch(child_path, pattern)
+                        for pattern in allowed_generated_output
+                    )
+                    if not in_manifest and not in_policy:
+                        raise PermissionError(
+                            f"disposable workspace destroy rejects unknown file: {child_path}"
+                        )
+                    # Unlink the file.
+                    os.unlink(name, dir_fd=dir_fd)
+                else:
+                    raise PermissionError(
+                        f"disposable workspace destroy rejects special file: {child_path}"
+                    )
+            finally:
+                os.close(child_fd)
+        # fsync the directory after all children are removed.
+        os.fsync(dir_fd)
 
     @staticmethod
     def _safe_destroy(
         root: Path, manifest: tuple[ManifestEntry, ...] = (),
     ) -> None:
-        """Destroy a workspace root using manifest-driven deletion."""
+        """Best-effort destroy for failed ``create()`` — no policy attestation.
+
+        Used only when ``create()`` raises mid-copy and the workspace is
+        in an inconsistent state.  Walks the actual tree and removes
+        everything (manifest may be incomplete).  Errors are still
+        propagated, not swallowed.
+        """
         if not root.exists():
             return
-        if not manifest:
-            # Empty manifest — nothing to delete.  Just remove the root dir.
-            try:
-                os.rmdir(str(root))
-            except OSError:
-                pass
-            return
-        # Delete each declared file using O_NOFOLLOW.
-        for entry in manifest:
-            file_path = root / entry.path
-            try:
-                fd = os.open(
-                    str(file_path), os.O_RDONLY | os.O_NOFOLLOW,
-                )
-                os.close(fd)
-                file_path.unlink()
-            except (FileNotFoundError, PermissionError, OSError):
-                pass
-        # Remove empty directories (deepest first).
-        all_dirs: set[str] = set()
-        for entry in manifest:
-            parts = entry.path.split("/")
-            for i in range(1, len(parts)):
-                all_dirs.add("/".join(parts[:i]))
-        for dir_rel in sorted(all_dirs, key=len, reverse=True):
-            dir_path = root / dir_rel
-            try:
-                os.rmdir(str(dir_path))
-            except OSError:
-                pass
-        # Finally remove the root.
+        root_fd = os.open(
+            str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
         try:
-            os.rmdir(str(root))
-        except OSError:
-            pass
+            VerificationWorkspaceFactory._destroy_tree_unchecked(root_fd)
+        finally:
+            os.close(root_fd)
+        os.rmdir(str(root))
+
+    @staticmethod
+    def _destroy_tree_unchecked(dir_fd: int) -> None:
+        """Recursively remove all entries without manifest/policy checks."""
+        names = os.listdir(dir_fd)
+        for name in sorted(names):
+            try:
+                child_fd = os.open(
+                    name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd,
+                )
+            except OSError:
+                # Symlink — unlink directly.
+                try:
+                    os.unlink(name, dir_fd=dir_fd)
+                except OSError:
+                    pass
+                continue
+            try:
+                st = os.fstat(child_fd)
+                if stat.S_ISDIR(st.st_mode):
+                    VerificationWorkspaceFactory._destroy_tree_unchecked(child_fd)
+                    try:
+                        os.rmdir(name, dir_fd=dir_fd)
+                    except OSError:
+                        pass
+                else:
+                    try:
+                        os.unlink(name, dir_fd=dir_fd)
+                    except OSError:
+                        pass
+            finally:
+                os.close(child_fd)
