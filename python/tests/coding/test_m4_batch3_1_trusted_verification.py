@@ -265,9 +265,17 @@ def test_verification_store_cas_and_atomic_execution_status(tmp_path, target):
     if target == VerificationRunStatus.RUNNING:
         assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
         return
+    if target == VerificationRunStatus.PASSED:
+        with pytest.raises(RuntimeError, match="finalize_success"):
+            store.transition_run(
+                "verify1", expected=(VerificationRunStatus.RUNNING,),
+                target=target,
+            )
+        assert store.get_run("verify1").status == VerificationRunStatus.RUNNING
+        assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
+        return
     store.transition_run("verify1", expected=(VerificationRunStatus.RUNNING,), target=target)
     expected = {
-        VerificationRunStatus.PASSED: ExecutionRunStatus.VERIFIED,
         VerificationRunStatus.FAILED: ExecutionRunStatus.VERIFICATION_FAILED,
         VerificationRunStatus.ERRORED: ExecutionRunStatus.VERIFICATION_ERROR,
         VerificationRunStatus.TIMED_OUT: ExecutionRunStatus.VERIFICATION_ERROR,
@@ -1197,16 +1205,16 @@ def test_reconcile_sandbox_instances_skips_terminal(tmp_path):
     assert instance.state == SandboxInstanceState.TERMINATED
 
 
-def test_finish_step_and_run_is_atomic(tmp_path):
-    """Batch 3.1.1 §3: finish_step_and_run transitions step+run+execution."""
+def test_finish_step_and_run_rejects_weak_success_path(tmp_path):
+    """Batch 3.1.6.1: compatibility API cannot bypass final proof."""
     approval, store = _running_store(tmp_path)
     step = store.list_steps("verify1")[0]
     finished = replace(step, status=VerificationStepStatus.PASSED, exit_code=0)
-    store.finish_step_and_run(finished)
-    assert store.list_steps("verify1")[0].status == VerificationStepStatus.PASSED
-    assert store.get_run_by_execution("run1").status == VerificationRunStatus.PASSED
-    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFIED
-    assert store.assert_no_running_steps_in_terminal_run() == 0
+    with pytest.raises(RuntimeError, match="finalize_success"):
+        store.finish_step_and_run(finished)
+    assert store.list_steps("verify1")[0].status == VerificationStepStatus.RUNNING
+    assert store.get_run_by_execution("run1").status == VerificationRunStatus.RUNNING
+    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
 
 
 def test_fail_step_and_run_is_atomic(tmp_path):
@@ -1241,16 +1249,17 @@ def test_abort_step_and_run_is_atomic(tmp_path):
     assert store.assert_no_running_steps_in_terminal_run() == 0
 
 
-def test_assert_no_running_steps_in_terminal_run_detects_violation(tmp_path):
-    """Batch 3.1.1 §3 invariant: terminal run with RUNNING step is detected."""
+def test_direct_sql_cannot_force_verification_passed(tmp_path):
+    """SQLite trigger rejects a PASSED write without finalization guard."""
     approval, store = _running_store(tmp_path)
-    # Force the run to PASSED without transitioning the step.
-    approval._conn.execute(
-        "UPDATE plan_verification_runs SET status='passed' WHERE verification_run_id='verify1'"
-    )
-    approval._conn.commit()
-    # Step is still RUNNING, run is PASSED — invariant violated.
-    assert store.assert_no_running_steps_in_terminal_run() == 1
+    with pytest.raises(sqlite3.IntegrityError, match="guarded finalization"):
+        approval._conn.execute(
+            "UPDATE plan_verification_runs SET status='passed' "
+            "WHERE verification_run_id='verify1'"
+        )
+    approval._conn.rollback()
+    assert store.get_run("verify1").status == VerificationRunStatus.RUNNING
+    assert approval.get_execution_run("run1").status == ExecutionRunStatus.VERIFYING
 
 
 def test_artifact_reserved_to_sealed_protocol(tmp_path):
@@ -3214,6 +3223,15 @@ def test_reconcile_artifacts_sealed_valid_not_quarantined(tmp_path):
     fd = os.open(final_name, os.O_WRONLY | os.O_CREAT, 0o600, dir_fd=cap._root_fd)
     os.write(fd, payload)
     os.close(fd)
+    identity = cap.attest_sealed_artifact("art-ok")
+    vstore._conn.execute(
+        "UPDATE plan_verification_artifacts SET artifact_dev=?,artifact_ino=?,"
+        "artifact_uid=?,artifact_gid=?,artifact_mode=?,artifact_nlink=? "
+        "WHERE artifact_id='art-ok'",
+        (identity.dev, identity.ino, identity.uid, identity.gid,
+         identity.mode, identity.nlink),
+    )
+    vstore._conn.commit()
     runner._reconcile_artifacts()
     row = _artifact_status(vstore, "art-ok")
     assert row["status"] == "sealed"
@@ -4709,11 +4727,8 @@ def test_get_cleanup_proof_for_run_returns_none_when_absent(tmp_path):
     conn.close()
 
 
-def test_get_cleanup_proof_for_run_returns_latest(tmp_path):
-    """§4: when multiple proofs exist, the latest is returned."""
-    from khaos.coding.planning.verification_execution_models import (
-        VerificationCleanupProof,
-    )
+def test_cleanup_proof_reader_is_not_created_at_latest_wins(tmp_path):
+    """A run has one immutable proof; later content cannot replace it."""
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     approval_store = PlanApprovalStore(conn)
     store = VerificationExecutionStore(approval_store)
@@ -4742,10 +4757,12 @@ def test_get_cleanup_proof_for_run_returns_latest(tmp_path):
         created_at=2000.0,
     )
     store.persist_cleanup_proof(proof1)
-    store.persist_cleanup_proof(proof2)
+    with pytest.raises(RuntimeError, match="immutable conflict"):
+        store.persist_cleanup_proof(proof2)
     loaded = store.get_cleanup_proof_for_run("run-latest")
     assert loaded is not None
-    assert loaded.cleanup_digest == proof2.cleanup_digest  # latest
+    assert loaded.cleanup_digest == proof1.cleanup_digest
+    assert loaded.created_at == proof1.created_at
     conn.close()
 
 
