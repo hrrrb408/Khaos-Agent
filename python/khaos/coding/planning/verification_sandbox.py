@@ -985,38 +985,77 @@ class DockerVerificationSandboxBackend:
         self, *, image_digest: str, argv: tuple[str, ...],
         timeout_seconds: float = 30.0,
     ) -> tuple[int, bytes, bytes]:
-        """Run a no-Workspace-mount attestation container and capture output.
+        """Batch 3.1.4 §5: run a persistent attestation container and capture output.
 
-        Uses ``docker run --rm --pull=never --network none --read-only``
-        with the pinned image digest.  No workspace is mounted — the
-        container can only read the image's own filesystem.
+        Replaces the previous ``docker run --rm`` with the same persistent
+        lifecycle as verification containers:
+        create → start --attach → collect → terminate → remove.
+
+        The container has:
+        - No Workspace mount (can only read the image's own filesystem)
+        - network=none
+        - read-only root
+        - No host credentials
+        - kind=toolchain-attestation label for crash-recovery identification
+
+        The container is always terminated and removed after output is
+        captured, even on timeout.  This ensures no ``--rm`` containers
+        linger if the runtime crashes mid-attestation.
         """
+        instance_name = self.generate_instance_name()
+        labels = {
+            "khaos.kind": "toolchain-attestation",
+            "khaos.image": image_digest[:63],
+        }
         args = [
-            str(self._docker), "run", "--rm", "--pull=never",
+            str(self._docker), "create", "--pull=never", "--name", instance_name,
             "--network", "none", "--read-only",
             "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
             "--pids-limit", str(self.profile.pids_limit),
             "--memory", str(self.profile.memory_bytes),
             "--cpus", str(self.profile.cpu_count),
             "--tmpfs", "/tmp:rw,noexec,nosuid,nodev,size=67108864,mode=1777",
-            image_digest, *argv,
         ]
-        process = await asyncio.create_subprocess_exec(
+        for key, value in labels.items():
+            args.extend(("--label", f"{key}={value}"))
+        args.extend((image_digest, *argv))
+        create_proc = await asyncio.create_subprocess_exec(
             *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        create_stdout, create_stderr = await create_proc.communicate()
+        if create_proc.returncode != 0:
+            raise RuntimeError(
+                f"attestation docker create failed (exit {create_proc.returncode}): "
+                f"{create_stderr.decode('utf-8', 'replace')}"
+            )
+        container_id = create_stdout.decode("utf-8", "replace").strip()
+        if not container_id:
+            raise RuntimeError("attestation docker create produced no container ID")
+        # Batch 3.1.4 §1/§5: docker start --attach captures output atomically.
+        attach_proc = await asyncio.create_subprocess_exec(
+            str(self._docker), "start", "--attach", container_id,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=timeout_seconds,
+                attach_proc.communicate(), timeout=timeout_seconds,
             )
+            exit_code = attach_proc.returncode
         except asyncio.TimeoutError:
             try:
-                process.kill()
+                attach_proc.kill()
             except ProcessLookupError:
                 pass
+            # Batch 3.1.4 §5: terminate and remove the container on timeout.
+            await self.terminate_and_remove_instance(container_id)
             raise RuntimeError(
                 f"attestation container timed out: argv={argv}"
             )
-        return process.returncode, stdout, stderr
+        # Batch 3.1.4 §5: always terminate and remove the container after
+        # output is captured.  No --rm containers — persistent lifecycle.
+        await self.terminate_and_remove_instance(container_id)
+        return exit_code, stdout, stderr
 
     async def attest_toolchain(
         self, *, toolchain: TrustedToolchain, image_digest: str,

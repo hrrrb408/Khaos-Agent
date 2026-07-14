@@ -3415,3 +3415,75 @@ def test_real_docker_fast_nonzero_exit_preserves_output(tmp_path):
     assert b"pre-fail-stderr" in result.stderr, f"stderr={result.stderr!r}"
     assert not result.output_truncated
     factory.destroy(disposable)
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_toolchain_attestation_persistent_lifecycle(tmp_path):
+    """§5: toolchain attestation uses persistent container lifecycle.
+
+    Verifies that _run_attestation_command uses docker create + start
+    --attach + terminate_and_remove (NOT docker run --rm), and that no
+    attestation containers linger after the command completes.
+    """
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    # Count toolchain-attestation containers before.
+    def count_attestation_containers():
+        import subprocess as _sp
+        result = _sp.run(
+            ["docker", "ps", "-a", "--filter", "label=khaos.kind=toolchain-attestation",
+             "--format", "{{.ID}}"],
+            capture_output=True, text=True,
+        )
+        return len([line for line in result.stdout.strip().split("\n") if line])
+
+    before = count_attestation_containers()
+
+    # Run a simple attestation command.
+    async def run_attestation():
+        return await backend._run_attestation_command(
+            image_digest=IMAGE,
+            argv=("python", "--version"),
+        )
+    exit_code, stdout, stderr = asyncio.run(run_attestation())
+    assert exit_code == 0, f"exit_code={exit_code} stderr={stderr!r}"
+    assert b"Python" in stdout, f"stdout={stdout!r}"
+
+    # §5: no attestation containers should linger after the command.
+    after = count_attestation_containers()
+    assert after == before, (
+        f"toolchain-attestation containers lingered: before={before} after={after}"
+    )
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_toolchain_attestation_full(tmp_path):
+    """§5: full toolchain attestation produces correct binary digest and version."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    toolchain = TrustedToolchain(
+        executable_id="python",
+        language="python",
+        absolute_path="/usr/local/bin/python3",
+        version="3.13",
+        image_digest=IMAGE,
+        version_argv=("--version",),
+    )
+
+    async def run_attest():
+        return await backend.attest_toolchain(
+            toolchain=toolchain, image_digest=IMAGE,
+            image_attestation_digest="test-image-digest",
+        )
+    attestation = asyncio.run(run_attest())
+    assert attestation.toolchain_id == "python:python"
+    assert attestation.binary_digest.startswith("sha256:")
+    assert attestation.parsed_version  # non-empty
+    assert attestation.image_attestation_digest == "test-image-digest"
+    assert attestation.attestation_digest  # non-empty
