@@ -54,6 +54,16 @@ class SandboxProfile:
     pids_limit: int = 128
     file_size_bytes: int = 64 * 1024 * 1024
     open_files: int = 256
+    # Batch 3.1.5 §1: explicit image identity fields.  When set, these
+    # replace the old ``image_digest`` conflation.  ``requested_image_reference``
+    # is the full ``repository@sha256:digest``; ``approved_repository_digest``
+    # is the digest extracted from RepoDigests; ``approved_platform`` is
+    # the expected ``os/arch``.  The old ``image_digest`` field remains
+    # for backward compatibility with test profiles but production code
+    # must set the new fields.
+    requested_image_reference: str = ""
+    approved_repository_digest: str = ""
+    approved_platform: str = ""
 
     @property
     def digest(self) -> str:
@@ -64,10 +74,28 @@ class SandboxProfile:
             "memory_bytes": self.memory_bytes, "cpu_count": self.cpu_count,
             "pids_limit": self.pids_limit, "file_size_bytes": self.file_size_bytes,
             "open_files": self.open_files,
+            # Batch 3.1.5 §1: include explicit image identity in digest.
+            "requested_image_reference": self.requested_image_reference,
+            "approved_repository_digest": self.approved_repository_digest,
+            "approved_platform": self.approved_platform,
         }
         return hashlib.sha256(json.dumps(
             payload, sort_keys=True, separators=(",", ":"),
         ).encode()).hexdigest()
+
+    @property
+    def sandbox_profile_digest(self) -> str:
+        """Batch 3.1.5 §1: alias for ``digest`` — the canonical profile digest."""
+        return self.digest
+
+    @property
+    def effective_image_reference(self) -> str:
+        """Batch 3.1.5 §1: the image reference to use for probing.
+
+        Returns ``requested_image_reference`` when set (production),
+        otherwise falls back to ``image_digest`` (test compatibility).
+        """
+        return self.requested_image_reference or self.image_digest
 
 
 class TrustedCommandFactory:

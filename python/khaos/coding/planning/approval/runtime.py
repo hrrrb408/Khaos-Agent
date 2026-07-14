@@ -393,10 +393,14 @@ class ApprovalRuntime:
     def _construct_production_backend(
         self, config: Any, profile: Any,
     ) -> Any:
-        """Batch 3.1.4 §2: private factory that constructs the exact backend.
+        """Batch 3.1.4 §2 / Batch 3.1.5 §1: private factory that constructs
+        the exact backend.
 
         Verifies:
         - Profile ID matches the config.
+        - ``config.approved_image_reference`` matches the profile's
+          ``requested_image_reference`` (or ``image_digest`` for
+          backward-compatible test profiles).
         - Docker executable exists and matches the config.
         - The backend is exactly ``DockerVerificationSandboxBackend``.
 
@@ -412,6 +416,16 @@ class ApprovalRuntime:
             raise ValueError(
                 f"profile ID mismatch: config={config.profile_id} "
                 f"profile={profile.profile_id}"
+            )
+        # Batch 3.1.5 §1: verify config.approved_image_reference actually
+        # participates in configuration validation.  The profile's
+        # effective_image_reference must match the config's approved reference.
+        effective_ref = profile.effective_image_reference
+        if config.approved_image_reference != effective_ref:
+            raise ValueError(
+                f"approved_image_reference mismatch: "
+                f"config={config.approved_image_reference} "
+                f"profile={effective_ref}"
             )
         # Verify docker executable.
         docker_path = _Path(config.docker_executable_id).resolve(strict=True)
@@ -469,22 +483,19 @@ class ApprovalRuntime:
         )
         from khaos.coding.planning.verification_store import VerificationExecutionStore
 
-        # Batch 3.1.1 §8: PROBING_BACKEND
+        # Batch 3.1.1 §8 / Batch 3.1.5 §1: PROBING_BACKEND
         self._verification_config_state = "PROBING_BACKEND"
         try:
-            # Batch 3.1.1 §7: probe the backend image with --pull=never.
-            # The probe() method runs `docker image inspect` and verifies
-            # the actual image ID matches the profile's pinned digest.
-            # Use a dedicated event loop in a thread to avoid conflicts
-            # with any existing event loop in the caller's context.
+            # Batch 3.1.5 §1: only ONE authoritative image probe flow.
+            # The old ``backend.probe()`` that conflated local config ID
+            # with repository manifest digest is NO LONGER called separately.
+            # ``probe_image_attestation()`` performs the complete validation:
+            #   - reference exists locally (image inspect)
+            #   - RepoDigests contains approved repository digest
+            #   - local config ID is non-empty
+            #   - platform matches (when approved_platform is set)
             import asyncio as _aio
             import concurrent.futures as _cf
-            with _cf.ThreadPoolExecutor(max_workers=1) as pool:
-                actual_image_id = pool.submit(
-                    lambda: _aio.run(backend.probe())
-                ).result()
-            self._verification_actual_image_id = actual_image_id
-            # Batch 3.1.3 §4: probe the full image attestation.
             probe_attestation = getattr(backend, "probe_image_attestation", None)
             if callable(probe_attestation):
                 with _cf.ThreadPoolExecutor(max_workers=1) as pool_img:
@@ -492,7 +503,19 @@ class ApprovalRuntime:
                         lambda: _aio.run(probe_attestation())
                     ).result()
                 self._verification_image_attestation = image_attestation
+                # Batch 3.1.5 §1: extract the local config ID from the
+                # attestation (not from a separate probe() call).
+                self._verification_actual_image_id = (
+                    image_attestation.local_config_image_id
+                )
             else:
+                # Test backends without probe_image_attestation: fall back
+                # to probe() for backward compatibility.
+                with _cf.ThreadPoolExecutor(max_workers=1) as pool:
+                    actual_image_id = pool.submit(
+                        lambda: _aio.run(backend.probe())
+                    ).result()
+                self._verification_actual_image_id = actual_image_id
                 self._verification_image_attestation = None
         except Exception as exc:
             self._verification_config_state = "UNCONFIGURED"

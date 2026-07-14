@@ -35,7 +35,7 @@ from khaos.coding.planning.verification_sandbox_instance import (
 
 @dataclass(frozen=True)
 class ImageAttestation:
-    """Batch 3.1.3 §4: explicit image identity attestation model.
+    """Batch 3.1.3 §4 / Batch 3.1.5 §1: explicit image identity attestation model.
 
     Captures the full image identity proof with separately verifiable
     fields.  The image reference must be ``repository@sha256:digest``
@@ -45,6 +45,11 @@ class ImageAttestation:
     RepoDigests, local image/config ID, and container .Image are verified
     separately.  The registry manifest digest is NOT required to equal
     the local config image ID (they are different concepts).
+
+    Batch 3.1.5 §1: ``content_digest`` is the canonical content digest
+    excluding ``attested_at`` — it is stable across re-probes and enters
+    the approved verification plan snapshot.  ``attestation_digest`` is
+    retained as an alias for backward compatibility.
     """
     requested_image_reference: str       # repository@sha256:digest
     approved_repository_digest: str      # sha256:... (the approved digest)
@@ -56,6 +61,15 @@ class ImageAttestation:
     no_pull_proof: str                   # "--pull=never" confirmation
     attested_at: float                   # time.time() at attestation
     attestation_digest: str              # canonical digest binding all above
+    # Batch 3.1.5 §1: explicit content digest (same value as attestation_digest,
+    # which excludes attested_at).  This is the field that enters the approved
+    # verification plan snapshot and the approval binding.
+    content_digest: str = ""
+
+    def __post_init__(self) -> None:
+        # content_digest defaults to attestation_digest when not explicitly set.
+        if not self.content_digest and self.attestation_digest:
+            object.__setattr__(self, "content_digest", self.attestation_digest)
 
 
 @dataclass(frozen=True)
@@ -239,12 +253,15 @@ class DockerVerificationSandboxBackend:
         host_paths: Iterable[Path] = (),
         kill_grace_seconds: float = 1.0,
     ) -> None:
-        # Batch 3.1.4 §4: accept both bare config ID (sha256:...) and
-        # full repository@sha256:digest reference.  The full reference is
-        # required for production probe_image_attestation; the bare config
-        # ID is accepted for backward compatibility with existing tests.
-        if not (profile.image_digest.startswith("sha256:") or
-                "@sha256:" in profile.image_digest):
+        # Batch 3.1.4 §4 / Batch 3.1.5 §1: accept both bare config ID
+        # (sha256:...) and full repository@sha256:digest reference.  The
+        # full reference is required for production probe_image_attestation;
+        # the bare config ID is accepted for backward compatibility with
+        # existing tests.  When ``requested_image_reference`` is set on
+        # the profile, it takes precedence.
+        effective_ref = profile.effective_image_reference
+        if not (effective_ref.startswith("sha256:") or
+                "@sha256:" in effective_ref):
             raise ValueError("production sandbox image must be digest pinned")
         if profile.network_enabled or not profile.read_only_root:
             raise ValueError("production verification profile must be offline/read-only")
@@ -816,26 +833,32 @@ class DockerVerificationSandboxBackend:
     # ------------------------------------------------------------------
 
     async def probe(self) -> str:
-        """Probe the local image and return the actual image ID.
+        """Batch 3.1.5 §1: verify the local image exists and return its config ID.
 
-        Batch 3.1.1 §7: uses ``image inspect`` (not ``pull``).  The actual
-        image ID must equal the profile's ``image_digest``.
+        This method NO LONGER conflates the local config image ID with the
+        repository manifest digest.  It simply verifies the image exists
+        locally (via ``image inspect``) and returns the local config ID
+        (``.Id``).  The full identity attestation is performed by
+        ``probe_image_attestation()``, which verifies RepoDigests, platform,
+        and local config ID separately.
+
+        The old comparison ``actual != self.profile.image_digest`` is
+        removed — it conflated the local config ID (``sha256:...``) with
+        the repository reference (``repository@sha256:...``), which are
+        different concepts.
         """
-        actual = await self.inspect_image(self.profile.image_digest)
+        image_reference = self.profile.effective_image_reference
+        actual = await self.inspect_image(image_reference)
         if actual is None:
             raise RuntimeError(
                 f"production sandbox image unavailable (not pulled): "
-                f"{self.profile.image_digest}"
-            )
-        if actual != self.profile.image_digest:
-            raise RuntimeError(
-                f"sandbox image identity mismatch: expected "
-                f"{self.profile.image_digest}, got {actual}"
+                f"{image_reference}"
             )
         return actual
 
     async def probe_image_attestation(self) -> ImageAttestation:
-        """Batch 3.1.3 §4 / Batch 3.1.4 §4: probe and attest the local image identity.
+        """Batch 3.1.3 §4 / Batch 3.1.4 §4 / Batch 3.1.5 §1: probe and attest
+        the local image identity.
 
         Produces an ``ImageAttestation`` with all identity fields verified
         separately:
@@ -852,8 +875,13 @@ class DockerVerificationSandboxBackend:
         separate from ``requested_image_reference`` — for multi-arch images
         the registry manifest list digest differs from the platform-specific
         manifest digest.
+
+        Batch 3.1.5 §1: uses ``profile.effective_image_reference`` which
+        prefers ``requested_image_reference`` (production) over
+        ``image_digest`` (test compatibility).  When ``approved_platform``
+        is set on the profile, the probed platform must match.
         """
-        image_reference = self.profile.image_digest
+        image_reference = self.profile.effective_image_reference
         # Batch 3.1.4 §4: production image reference must include repository
         # and @sha256 — a bare tag or config ID is not acceptable because
         # it cannot be pinned immutably.
@@ -906,6 +934,18 @@ class DockerVerificationSandboxBackend:
             raise RuntimeError(
                 f"approved repository digest not found in RepoDigests: "
                 f"reference={image_reference} repo_digests={list(repo_digests)}"
+            )
+        # Batch 3.1.5 §1: verify local config ID is non-empty.
+        if not local_config_image_id:
+            raise RuntimeError(
+                f"local config image ID is empty for {image_reference}"
+            )
+        # Batch 3.1.5 §1: when the profile specifies approved_platform,
+        # the probed platform must match.
+        if self.profile.approved_platform and platform != self.profile.approved_platform:
+            raise RuntimeError(
+                f"platform mismatch: approved={self.profile.approved_platform} "
+                f"actual={platform}"
             )
         attested_at = time.time()
         # Batch 3.1.4 §4: platform_manifest_digest is the registry manifest
@@ -1347,7 +1387,7 @@ class DockerVerificationSandboxBackend:
         if remove:
             await self.remove_instance(container_id)
         return SandboxStepResult(
-            sandbox_instance_id, self.profile.image_digest,
+            sandbox_instance_id, self.profile.effective_image_reference,
             None if exit_code is not None and exit_code < 0 else exit_code,
             -exit_code if exit_code is not None and exit_code < 0 else None,
             int((time.monotonic() - started) * 1000), stdout, stderr,
@@ -1384,7 +1424,7 @@ class DockerVerificationSandboxBackend:
         started = time.monotonic()
         container_id, attestation, attach_proc, stdout_stream, stderr_stream = (
             await self.launch_instance(
-                instance_name=name, image_digest=self.profile.image_digest,
+                instance_name=name, image_digest=self.profile.effective_image_reference,
                 command=command, workspace_root=workspace.root, labels=labels,
                 expected_manifest_digest=getattr(workspace, "manifest_digest", ""),
             )

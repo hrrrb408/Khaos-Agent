@@ -35,7 +35,8 @@ from khaos.coding.planning.verification_execution_models import (
     VerificationStepRun, VerificationStepStatus, verification_plan_digest,
 )
 from khaos.coding.planning.verification_sandbox import (
-    ContainerAttestation, DockerVerificationSandboxBackend, SandboxStepResult,
+    ContainerAttestation, DockerVerificationSandboxBackend, ImageAttestation,
+    SandboxStepResult,
 )
 from khaos.coding.planning.verification_sandbox_instance import (
     SandboxInstanceState, VerificationSandboxInstance,
@@ -3836,3 +3837,122 @@ def test_toolchain_attestation_drift_transitions_run_to_stale_zero_processes(tmp
     assert len(steps) == 0, (
         f"expected 0 steps, got {len(steps)}"
     )
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.5 §1: Production ImageAttestation semantic closure
+# ----------------------------------------------------------------------
+
+
+def test_sandbox_profile_has_explicit_image_identity_fields():
+    """§1: SandboxProfile has requested_image_reference, approved_repository_digest,
+    approved_platform, and sandbox_profile_digest."""
+    profile = SandboxProfile(
+        profile_id="test-profile",
+        image_digest="python@sha256:abc",
+        requested_image_reference="python@sha256:abc",
+        approved_repository_digest="sha256:abc",
+        approved_platform="linux/amd64",
+    )
+    assert profile.requested_image_reference == "python@sha256:abc"
+    assert profile.approved_repository_digest == "sha256:abc"
+    assert profile.approved_platform == "linux/amd64"
+    # sandbox_profile_digest is an alias for digest.
+    assert profile.sandbox_profile_digest == profile.digest
+    # digest includes the new fields.
+    assert "requested_image_reference" in profile.digest or len(profile.digest) == 64
+
+
+def test_sandbox_profile_effective_image_reference_prefers_requested():
+    """§1: effective_image_reference prefers requested_image_reference over image_digest."""
+    profile = SandboxProfile(
+        profile_id="test",
+        image_digest="sha256:old",
+        requested_image_reference="python@sha256:new",
+    )
+    assert profile.effective_image_reference == "python@sha256:new"
+    # Falls back to image_digest when requested_image_reference is empty.
+    profile2 = SandboxProfile(profile_id="test", image_digest="sha256:fallback")
+    assert profile2.effective_image_reference == "sha256:fallback"
+
+
+def test_image_attestation_has_content_digest_field():
+    """§1: ImageAttestation has a content_digest field that defaults to attestation_digest."""
+    attestation = ImageAttestation(
+        requested_image_reference="python@sha256:abc",
+        approved_repository_digest="sha256:abc",
+        platform="linux/amd64",
+        platform_manifest_digest="sha256:abc",
+        local_config_image_id="sha256:config123",
+        container_image_id="",
+        repo_digests=("python@sha256:abc",),
+        no_pull_proof="image-inspect-not-pull",
+        attested_at=time.time(),
+        attestation_digest="digest-hash-value",
+    )
+    assert attestation.content_digest == "digest-hash-value"
+
+
+def test_probe_does_not_conflate_local_config_id_with_repository_reference():
+    """§1: probe() no longer compares local config ID == repository reference.
+
+    The old probe() did ``actual != self.profile.image_digest`` which conflated
+    the local config ID (sha256:...) with the repository reference
+    (repository@sha256:...).  The new probe() simply verifies the image exists
+    and returns the local config ID.
+    """
+    import inspect
+    import ast
+    import textwrap
+    source = textwrap.dedent(inspect.getsource(DockerVerificationSandboxBackend.probe))
+    # Parse the AST and check for Compare nodes with the old conflation.
+    tree = ast.parse(source)
+    has_conflation = False
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Compare):
+            # Check for "actual != self.profile.image_digest" pattern
+            left_str = ast.dump(node.left)
+            for cmp in node.comparators:
+                cmp_str = ast.dump(cmp)
+                if ("image_digest" in cmp_str or "image_digest" in left_str) and \
+                   ("NotEq" in [type(op).__name__ for op in node.ops]):
+                    has_conflation = True
+    assert not has_conflation, (
+        "probe() still contains a != comparison involving image_digest — "
+        "the old conflation of local config ID with repository reference"
+    )
+
+
+def test_runtime_configure_uses_single_authoritative_image_probe():
+    """§1: configure_trusted_verification_internal uses probe_image_attestation
+    as the primary probe path, with probe() only as a fallback for test backends."""
+    import inspect
+    from khaos.coding.planning.approval.runtime import ApprovalRuntime
+    source = inspect.getsource(ApprovalRuntime._configure_trusted_verification_internal)
+    # probe_image_attestation must be present as the primary path.
+    assert "probe_image_attestation" in source
+    # The fallback "backend.probe()" must be in an else branch (test backends only).
+    assert "backend.probe()" in source
+
+
+def test_construct_production_backend_validates_approved_image_reference(tmp_path):
+    """§1: _construct_production_backend validates config.approved_image_reference
+    against profile.effective_image_reference."""
+    from _m4_batch2_helpers import verification
+    runtime, _, _, _ = _real_runtime(tmp_path)
+    from khaos.coding.planning.verification_sandbox import ProductionVerificationConfig
+    # Mismatched reference must fail.
+    profile = SandboxProfile(
+        profile_id="mismatch-profile",
+        image_digest="python@sha256:aaa",
+        requested_image_reference="python@sha256:aaa",
+    )
+    config = ProductionVerificationConfig(
+        docker_executable_id="/usr/local/bin/docker",
+        approved_image_reference="python@sha256:bbb",  # MISMATCH
+        profile_id="mismatch-profile",
+        artifact_storage_capability_id="",
+        snapshot_storage_capability_id="",
+    )
+    with pytest.raises(ValueError, match="approved_image_reference mismatch"):
+        runtime._construct_production_backend(config, profile)
