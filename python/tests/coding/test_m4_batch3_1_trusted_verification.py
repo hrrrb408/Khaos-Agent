@@ -1250,9 +1250,9 @@ def test_abort_step_and_run_is_atomic(tmp_path):
 
 
 def test_direct_sql_cannot_force_verification_passed(tmp_path):
-    """SQLite trigger rejects a PASSED write without finalization guard."""
+    """SQLite consistency trigger rejects PASSED from the wrong old state."""
     approval, store = _running_store(tmp_path)
-    with pytest.raises(sqlite3.IntegrityError, match="guarded finalization"):
+    with pytest.raises(sqlite3.IntegrityError, match="finalization state and proof"):
         approval._conn.execute(
             "UPDATE plan_verification_runs SET status='passed' "
             "WHERE verification_run_id='verify1'"

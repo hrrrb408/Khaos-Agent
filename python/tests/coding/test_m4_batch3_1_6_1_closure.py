@@ -71,7 +71,7 @@ def test_finish_step_and_run_cannot_write_success(tmp_path):
 def test_direct_sql_success_state_is_rejected(tmp_path, table, status):
     approval, store = _running_store(tmp_path)
     key = "verification_run_id='verify1'" if table == "plan_verification_runs" else "execution_run_id='run1'"
-    with pytest.raises(sqlite3.IntegrityError, match="guarded finalization"):
+    with pytest.raises(sqlite3.IntegrityError, match="finalization|matching passed"):
         approval._conn.execute(
             f"UPDATE {table} SET status=? WHERE {key}", (status,),
         )
@@ -270,7 +270,10 @@ def test_finalizing_recovery_rejects_artifact_attacks(tmp_path, attack):
         path.unlink(); os.mkfifo(path, 0o600)
     elif attack == "socket":
         path.unlink(); socket_handle = socket.socket(socket.AF_UNIX)
-        short_socket = f"/tmp/khaos-art-{os.getpid()}-{time.time_ns()}"
+        # macOS exposes /tmp as a symlink to /private/tmp.  Use the resolved
+        # writable temporary root so sandbox path policy does not reject the
+        # socket bind before the artifact verifier sees the real socket.
+        short_socket = f"/private/tmp/khaos-art-{os.getpid()}-{time.time_ns()}"
         socket_handle.bind(short_socket)
         os.rename(short_socket, path)
     elif attack == "directory":
