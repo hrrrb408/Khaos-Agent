@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 import uuid
 from typing import Any
@@ -50,7 +51,13 @@ CREATE TABLE IF NOT EXISTS plan_verification_artifacts (
  artifact_id TEXT PRIMARY KEY, verification_run_id TEXT NOT NULL,
  relative_name TEXT NOT NULL, content_digest TEXT NOT NULL, byte_length INTEGER NOT NULL,
  expires_at REAL NOT NULL, quarantined INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
- status TEXT NOT NULL DEFAULT 'sealed'
+ status TEXT NOT NULL DEFAULT 'sealed',
+ artifact_dev INTEGER NOT NULL DEFAULT -1,
+ artifact_ino INTEGER NOT NULL DEFAULT -1,
+ artifact_uid INTEGER NOT NULL DEFAULT -1,
+ artifact_gid INTEGER NOT NULL DEFAULT -1,
+ artifact_mode INTEGER NOT NULL DEFAULT -1,
+ artifact_nlink INTEGER NOT NULL DEFAULT -1
 );
 CREATE TABLE IF NOT EXISTS plan_execution_phase_leases (
  phase_lease_id TEXT PRIMARY KEY, execution_run_id TEXT NOT NULL,
@@ -183,6 +190,49 @@ CREATE TABLE IF NOT EXISTS verification_cleanup_proofs (
 );
 CREATE INDEX IF NOT EXISTS ix_vcp_run
 ON verification_cleanup_proofs(verification_run_id);
+CREATE TRIGGER IF NOT EXISTS trg_vcp_immutable_update
+BEFORE UPDATE ON verification_cleanup_proofs
+BEGIN SELECT RAISE(ABORT, 'verification cleanup proof is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_vcp_immutable_delete
+BEFORE DELETE ON verification_cleanup_proofs
+BEGIN SELECT RAISE(ABORT, 'verification cleanup proof cannot be deleted'); END;
+CREATE TRIGGER IF NOT EXISTS trg_verification_passed_guard
+BEFORE UPDATE OF status ON plan_verification_runs
+WHEN NEW.status='passed' AND (
+ OLD.status!='finalizing'
+ OR khaos_verification_finalization_guard(
+      NEW.verification_run_id, NEW.execution_run_id
+    ) != 1
+ OR NOT EXISTS (
+      SELECT 1 FROM verification_cleanup_proofs p
+      WHERE p.verification_run_id=NEW.verification_run_id
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'verification PASSED requires guarded finalization'); END;
+CREATE TRIGGER IF NOT EXISTS trg_verification_passed_insert_guard
+BEFORE INSERT ON plan_verification_runs
+WHEN NEW.status='passed'
+BEGIN SELECT RAISE(ABORT, 'verification PASSED cannot be inserted'); END;
+CREATE TRIGGER IF NOT EXISTS trg_execution_verified_guard
+BEFORE UPDATE OF status ON plan_execution_runs
+WHEN NEW.status='verified' AND (
+ OLD.status!='verifying'
+ OR NOT EXISTS (
+      SELECT 1 FROM plan_verification_runs r
+      JOIN verification_cleanup_proofs p
+        ON p.verification_run_id=r.verification_run_id
+      WHERE r.execution_run_id=NEW.execution_run_id
+        AND r.status='passed'
+        AND khaos_verification_finalization_guard(
+          r.verification_run_id, NEW.execution_run_id
+        ) = 1
+    )
+)
+BEGIN SELECT RAISE(ABORT, 'execution VERIFIED requires guarded finalization'); END;
+CREATE TRIGGER IF NOT EXISTS trg_execution_verified_insert_guard
+BEFORE INSERT ON plan_execution_runs
+WHEN NEW.status='verified'
+BEGIN SELECT RAISE(ABORT, 'execution VERIFIED cannot be inserted'); END;
 """
 
 
@@ -190,6 +240,11 @@ class VerificationExecutionStore:
     def __init__(self, approval_store: Any) -> None:
         self._approval_store = approval_store
         self._conn: sqlite3.Connection = approval_store._conn
+        self._finalization_state = threading.local()
+        self._conn.create_function(
+            "khaos_verification_finalization_guard", 2,
+            self._is_guarded_finalization,
+        )
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
         self._cleanup_validator: Any = None
@@ -199,6 +254,50 @@ class VerificationExecutionStore:
         # Batch 3.1.5 §3: add instance_kind / toolchain_id / probe_ordinal /
         # image_attestation_digest columns to verification_sandbox_instances.
         self._migrate_sandbox_instance_kind()
+        self._migrate_artifact_identity()
+        self._migrate_cleanup_proof_uniqueness()
+
+    def _is_guarded_finalization(
+        self, verification_run_id: str, execution_run_id: str,
+    ) -> int:
+        active = getattr(self._finalization_state, "active", None)
+        return int(active == (verification_run_id, execution_run_id))
+
+    def _migrate_cleanup_proof_uniqueness(self) -> None:
+        """Fail closed instead of choosing among duplicate run proofs."""
+        duplicates = self._conn.execute(
+            "SELECT verification_run_id, COUNT(*) AS proof_count "
+            "FROM verification_cleanup_proofs GROUP BY verification_run_id "
+            "HAVING COUNT(*) > 1 ORDER BY verification_run_id"
+        ).fetchall()
+        if duplicates:
+            run_ids = ",".join(row["verification_run_id"] for row in duplicates)
+            raise RuntimeError(
+                "cleanup proof uniqueness migration found duplicate runs: "
+                f"{run_ids}"
+            )
+        self._conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ux_vcp_run "
+            "ON verification_cleanup_proofs(verification_run_id)"
+        )
+        self._conn.commit()
+
+    def _migrate_artifact_identity(self) -> None:
+        columns = {
+            row["name"] for row in self._conn.execute(
+                "PRAGMA table_info(plan_verification_artifacts)"
+            )
+        }
+        for name in (
+            "artifact_dev", "artifact_ino", "artifact_uid", "artifact_gid",
+            "artifact_mode", "artifact_nlink",
+        ):
+            if name not in columns:
+                self._conn.execute(
+                    f"ALTER TABLE plan_verification_artifacts "
+                    f"ADD COLUMN {name} INTEGER NOT NULL DEFAULT -1"
+                )
+        self._conn.commit()
 
     def _migrate_image_attestation_digest(self) -> None:
         """Add image_attestation_digest column if absent (Batch 3.1.3 §5)."""
@@ -260,6 +359,8 @@ class VerificationExecutionStore:
         self._conn.commit()
 
     def create_run(self, run: VerificationExecutionRun) -> tuple[VerificationExecutionRun, bool]:
+        if run.status != VerificationRunStatus.CREATED:
+            raise RuntimeError("verification run must be created in CREATED state")
         existing = self.get_run_by_execution(run.execution_run_id)
         if existing is not None:
             if existing.verification_plan_digest != run.verification_plan_digest:
@@ -300,23 +401,26 @@ class VerificationExecutionStore:
         self, verification_run_id: str, *, expected: tuple[VerificationRunStatus, ...],
         target: VerificationRunStatus, failure_code: str = "",
     ) -> None:
+        if target == VerificationRunStatus.PASSED:
+            raise RuntimeError(
+                "verification success requires finalize_success()"
+            )
         allowed = {
             VerificationRunStatus.CREATED: {VerificationRunStatus.VALIDATING, VerificationRunStatus.CANCELLED},
             VerificationRunStatus.VALIDATING: {VerificationRunStatus.PREPARING_SANDBOX, VerificationRunStatus.STALE, VerificationRunStatus.ERRORED, VerificationRunStatus.CANCELLED},
             VerificationRunStatus.PREPARING_SANDBOX: {VerificationRunStatus.RUNNING, VerificationRunStatus.ERRORED, VerificationRunStatus.CANCELLED},
-            VerificationRunStatus.RUNNING: {VerificationRunStatus.FINALIZING, VerificationRunStatus.PASSED, VerificationRunStatus.FAILED, VerificationRunStatus.ERRORED, VerificationRunStatus.TIMED_OUT, VerificationRunStatus.CANCELLED, VerificationRunStatus.POISONED},
-            VerificationRunStatus.FINALIZING: {VerificationRunStatus.PASSED, VerificationRunStatus.ERRORED, VerificationRunStatus.POISONED},
+            VerificationRunStatus.RUNNING: {VerificationRunStatus.FINALIZING, VerificationRunStatus.FAILED, VerificationRunStatus.ERRORED, VerificationRunStatus.TIMED_OUT, VerificationRunStatus.CANCELLED, VerificationRunStatus.POISONED},
+            VerificationRunStatus.FINALIZING: {VerificationRunStatus.ERRORED, VerificationRunStatus.POISONED},
         }
         if not expected or any(target not in allowed.get(item, set()) for item in expected):
             raise RuntimeError("invalid verification run transition")
         terminal = target in {
-            VerificationRunStatus.PASSED, VerificationRunStatus.FAILED,
-            VerificationRunStatus.ERRORED, VerificationRunStatus.TIMED_OUT,
+            VerificationRunStatus.FAILED, VerificationRunStatus.ERRORED,
+            VerificationRunStatus.TIMED_OUT,
             VerificationRunStatus.CANCELLED, VerificationRunStatus.STALE,
             VerificationRunStatus.POISONED,
         }
         execution_target = {
-            VerificationRunStatus.PASSED: "verified",
             VerificationRunStatus.FAILED: "verification-failed",
             VerificationRunStatus.ERRORED: "verification-error",
             VerificationRunStatus.TIMED_OUT: "verification-error",
@@ -508,7 +612,10 @@ class VerificationExecutionStore:
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             self._conn.execute(
-                "INSERT INTO plan_verification_artifacts VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO plan_verification_artifacts "
+                "(artifact_id,verification_run_id,relative_name,content_digest,"
+                "byte_length,expires_at,quarantined,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?)",
                 (artifact_id, verification_run_id, relative_name, content_digest,
                  byte_length, expires_at, 0, time.time()),
             )
@@ -867,6 +974,11 @@ class VerificationExecutionStore:
         run_failure_code: str = "",
     ) -> None:
         """Single BEGIN IMMEDIATE: Step → terminal + Run → terminal + Execution → terminal + Audit."""
+        if (run_target == VerificationRunStatus.PASSED
+                or execution_target == "verified"):
+            raise RuntimeError(
+                "verification success requires finalize_success()"
+            )
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -916,10 +1028,9 @@ class VerificationExecutionStore:
             raise
 
     def finish_step_and_run(self, step: VerificationStepRun) -> None:
-        """Step PASSED + Run PASSED + Execution verified — single transaction."""
-        self._finish_step_and_run_impl(
-            step, run_target=VerificationRunStatus.PASSED,
-            execution_target="verified",
+        """Reject the retired weak success path."""
+        raise RuntimeError(
+            "finish_step_and_run cannot finalize success; use finalize_success()"
         )
 
     def finalize_success(
@@ -959,6 +1070,8 @@ class VerificationExecutionStore:
         Any mismatch raises and rolls back — no PASSED/VERIFIED.
         """
         now = time.time()
+        if step is not None and step.status != VerificationStepStatus.PASSED:
+            raise RuntimeError("final success requires a PASSED final step")
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             # Cleanup proof is mandatory for every production success.
@@ -970,6 +1083,10 @@ class VerificationExecutionStore:
                     "cleanup proof not found for verification run — "
                     "cannot finalize without durable cleanup proof"
                 )
+            if persisted.verification_run_id != verification_run_id:
+                raise RuntimeError("cleanup proof verification run mismatch")
+            if cleanup_proof.verification_run_id != verification_run_id:
+                raise RuntimeError("caller cleanup proof belongs to another run")
             if persisted.cleanup_digest != cleanup_proof.cleanup_digest:
                 raise RuntimeError(
                     "persisted cleanup proof digest mismatch — "
@@ -1020,23 +1137,37 @@ class VerificationExecutionStore:
             )
             if staged.rowcount > 1:
                 raise RuntimeError("multiple final verification steps were staged")
-            # 2. Verification Run → PASSED (expected FINALIZING)
-            cur = self._conn.execute(
-                "UPDATE plan_verification_runs SET status=?,updated_at=?,completed_at=?,failure_code=? "
-                "WHERE verification_run_id=? AND status='finalizing'",
-                (VerificationRunStatus.PASSED.value, now, now, "",
-                 verification_run_id),
+            # The connection-local guard is visible only to SQLite triggers
+            # executing on this thread and only around the two success CASes.
+            self._finalization_state.active = (
+                verification_run_id, execution_run_id,
             )
-            if cur.rowcount != 1:
-                raise RuntimeError("verification run CAS failed in finalize_success")
-            # 3. Execution Run → VERIFIED (expected VERIFYING)
-            cur = self._conn.execute(
-                "UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,failure_code=? "
-                "WHERE execution_run_id=? AND status='verifying'",
-                ("verified", now, now, "", execution_run_id),
-            )
-            if cur.rowcount != 1:
-                raise RuntimeError("execution run CAS failed in finalize_success")
+            try:
+                # 2. Verification Run → PASSED (expected FINALIZING)
+                cur = self._conn.execute(
+                    "UPDATE plan_verification_runs SET status=?,updated_at=?,"
+                    "completed_at=?,failure_code=? WHERE verification_run_id=? "
+                    "AND execution_run_id=? AND status='finalizing'",
+                    (VerificationRunStatus.PASSED.value, now, now, "",
+                     verification_run_id, execution_run_id),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        "verification run CAS failed in finalize_success"
+                    )
+                # 3. Execution Run → VERIFIED (expected VERIFYING)
+                cur = self._conn.execute(
+                    "UPDATE plan_execution_runs SET status=?,updated_at=?,"
+                    "completed_at=?,failure_code=? WHERE execution_run_id=? "
+                    "AND status='verifying'",
+                    ("verified", now, now, "", execution_run_id),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError(
+                        "execution run CAS failed in finalize_success"
+                    )
+            finally:
+                self._finalization_state.active = None
             # 4. Terminal Audit (bound to cleanup proof when provided)
             audit_correlation = step.step_run_id if step else ""
             if cleanup_proof is not None:
@@ -1395,20 +1526,61 @@ class VerificationExecutionStore:
         )
         if recomputed != proof.cleanup_digest:
             raise RuntimeError("cleanup proof canonical digest mismatch")
-        cleanup_proof_id = f"vcp_{_uuid.uuid4().hex}"
+        proof_identity = (
+            proof.verification_run_id,
+            proof.disposable_workspace_id,
+            proof.disposable_workspace_identity,
+            float(proof.disposable_cleaned_at),
+            tuple(proof.sandbox_instance_ids),
+            tuple(proof.sandbox_absence_digests),
+            tuple(proof.artifact_ids),
+            tuple(proof.artifact_seal_digests),
+            proof.canonical_workspace_final_digest,
+            proof.cleanup_digest,
+        )
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            existing = self._conn.execute(
+                "SELECT * FROM verification_cleanup_proofs "
+                "WHERE verification_run_id=?",
+                (proof.verification_run_id,),
+            ).fetchone()
+            if existing is not None:
+                existing_identity = (
+                    existing["verification_run_id"],
+                    existing["disposable_workspace_id"],
+                    existing["disposable_workspace_identity"],
+                    float(existing["disposable_cleaned_at"]),
+                    tuple(json.loads(existing["sandbox_instance_ids_json"])),
+                    tuple(json.loads(existing["sandbox_absence_digests_json"])),
+                    tuple(json.loads(existing["artifact_ids_json"])),
+                    tuple(json.loads(existing["artifact_seal_digests_json"])),
+                    existing["canonical_workspace_final_digest"],
+                    existing["cleanup_digest"],
+                )
+                if existing_identity != proof_identity:
+                    raise RuntimeError(
+                        "verification cleanup proof immutable conflict"
+                    )
+                self._conn.commit()
+                return existing["cleanup_proof_id"]
+            cleanup_proof_id = f"vcp_{_uuid.uuid4().hex}"
             self._conn.execute(
-                "INSERT INTO verification_cleanup_proofs VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO verification_cleanup_proofs "
+                "(cleanup_proof_id,verification_run_id,disposable_workspace_id,"
+                "disposable_workspace_identity,disposable_cleaned_at,"
+                "sandbox_instance_ids_json,sandbox_absence_digests_json,"
+                "artifact_ids_json,artifact_seal_digests_json,"
+                "canonical_workspace_final_digest,cleanup_digest,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (cleanup_proof_id, proof.verification_run_id,
                  proof.disposable_workspace_id,
                  proof.disposable_workspace_identity,
                  proof.disposable_cleaned_at,
-                 json.dumps(list(proof.sandbox_instance_ids)),
-                 json.dumps(list(proof.sandbox_absence_digests)),
-                 json.dumps(list(proof.artifact_ids)),
-                 json.dumps(list(proof.artifact_seal_digests)),
+                 json.dumps(list(proof.sandbox_instance_ids), separators=(",", ":")),
+                 json.dumps(list(proof.sandbox_absence_digests), separators=(",", ":")),
+                 json.dumps(list(proof.artifact_ids), separators=(",", ":")),
+                 json.dumps(list(proof.artifact_seal_digests), separators=(",", ":")),
                  proof.canonical_workspace_final_digest,
                  proof.cleanup_digest, proof.created_at),
             )
@@ -1432,7 +1604,7 @@ class VerificationExecutionStore:
         )
         row = self._conn.execute(
             "SELECT * FROM verification_cleanup_proofs "
-            "WHERE verification_run_id=? ORDER BY created_at DESC LIMIT 1",
+            "WHERE verification_run_id=?",
             (verification_run_id,),
         ).fetchone()
         if row is None:
@@ -1502,14 +1674,21 @@ class VerificationExecutionStore:
 
     def seal_artifact(
         self, *, artifact_id: str, content_digest: str, byte_length: int,
+        artifact_dev: int = -1, artifact_ino: int = -1,
+        artifact_uid: int = -1, artifact_gid: int = -1,
+        artifact_mode: int = -1, artifact_nlink: int = -1,
     ) -> None:
         """Batch 3.1.1 §3: atomically transition RESERVED → SEALED after fsync."""
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             cur = self._conn.execute(
                 "UPDATE plan_verification_artifacts SET content_digest=?, byte_length=?, "
-                "status='sealed' WHERE artifact_id=? AND status='reserved'",
-                (content_digest, byte_length, artifact_id),
+                "artifact_dev=?,artifact_ino=?,artifact_uid=?,artifact_gid=?,"
+                "artifact_mode=?,artifact_nlink=?,status='sealed' "
+                "WHERE artifact_id=? AND status='reserved'",
+                (content_digest, byte_length, artifact_dev, artifact_ino,
+                 artifact_uid, artifact_gid, artifact_mode, artifact_nlink,
+                 artifact_id),
             )
             if cur.rowcount != 1:
                 raise RuntimeError("artifact seal CAS failed (not reserved or not found)")

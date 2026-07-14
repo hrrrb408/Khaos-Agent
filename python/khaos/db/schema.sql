@@ -427,7 +427,14 @@ CREATE TABLE IF NOT EXISTS plan_verification_artifacts (
     byte_length INTEGER NOT NULL,
     expires_at REAL NOT NULL,
     quarantined INTEGER NOT NULL DEFAULT 0,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'sealed',
+    artifact_dev INTEGER NOT NULL DEFAULT -1,
+    artifact_ino INTEGER NOT NULL DEFAULT -1,
+    artifact_uid INTEGER NOT NULL DEFAULT -1,
+    artifact_gid INTEGER NOT NULL DEFAULT -1,
+    artifact_mode INTEGER NOT NULL DEFAULT -1,
+    artifact_nlink INTEGER NOT NULL DEFAULT -1
 );
 
 CREATE TABLE IF NOT EXISTS plan_execution_phase_leases (
@@ -487,3 +494,14 @@ CREATE TABLE IF NOT EXISTS verification_cleanup_proofs (
     cleanup_digest TEXT NOT NULL,
     created_at REAL NOT NULL
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_vcp_run
+    ON verification_cleanup_proofs(verification_run_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_vcp_immutable_update
+BEFORE UPDATE ON verification_cleanup_proofs
+BEGIN SELECT RAISE(ABORT, 'verification cleanup proof is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_vcp_immutable_delete
+BEFORE DELETE ON verification_cleanup_proofs
+BEGIN SELECT RAISE(ABORT, 'verification cleanup proof cannot be deleted'); END;
