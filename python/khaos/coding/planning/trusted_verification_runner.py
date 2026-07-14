@@ -485,6 +485,12 @@ class TrustedVerificationRunner:
         disposable = None
         workspace_id = ""
         last_step: VerificationStepRun | None = None
+        # Batch 3.1.3 §8: track cleanup state so the terminal transition
+        # is deferred until cleanup succeeds.  ``cleanup_done`` prevents
+        # double-cleanup in the ``finally`` block when the success path
+        # already ran it.
+        cleanup_failed = False
+        cleanup_done = False
         try:
             # Revalidate immediately before creating any process or copy.
             self._validate_live(context, expected_catalog=catalog.fingerprint,
@@ -739,6 +745,7 @@ class TrustedVerificationRunner:
                             state=SandboxInstanceState.CLEANUP_FAILED,
                             failure_code="cleanup-failed-after-collect",
                         )
+                        cleanup_failed = True
                 else:
                     if removed_ok:
                         self._store.update_sandbox_instance(
@@ -753,6 +760,7 @@ class TrustedVerificationRunner:
                             state=SandboxInstanceState.CLEANUP_FAILED,
                             failure_code="remove-returned-false",
                         )
+                        cleanup_failed = True
                 # §3: write artifact with RESERVED→SEALED protocol.
                 try:
                     artifact_id = self._write_artifact(
@@ -781,6 +789,22 @@ class TrustedVerificationRunner:
                     if bool(command.metadata.get("required", True)):
                         terminal = VerificationRunStatus.FAILED
                         failure_code = "required-step-failed"
+                    else:
+                        # Batch 3.1.3 §9: optional step failure — mark the
+                        # step FAILED with its own failure_code, but do NOT
+                        # escalate the run to FAILED.  The run stays RUNNING
+                        # so it can still reach PASSED if all required steps
+                        # pass.  ``failure_code`` is NOT set here so the
+                        # run-level code remains empty for PASSED.
+                        pass
+                # Batch 3.1.3 §9: set the step's failure_code independently
+                # from the run-level ``failure_code``.  For optional step
+                # failures, the step gets "optional-step-failed" while the
+                # run-level code stays empty (run is still on track to PASSED).
+                step_failure_code = failure_code
+                if (step_status == VerificationStepStatus.FAILED
+                        and not bool(command.metadata.get("required", True))):
+                    step_failure_code = "optional-step-failed"
                 finished = replace(
                     step, status=step_status, exit_code=result.exit_code,
                     signal=result.signal, started_at=started, completed_at=time.time(),
@@ -788,7 +812,7 @@ class TrustedVerificationRunner:
                     stderr_digest=result.stderr_digest, output_artifact_id=artifact_id,
                     output_truncated=result.output_truncated,
                     sandbox_instance_id=sandbox_instance_id,
-                    sandbox_image_digest=result.image_digest, failure_code=failure_code,
+                    sandbox_image_digest=result.image_digest, failure_code=step_failure_code,
                 )
                 # §9: atomic step+run+execution terminal transition.
                 # Cancellation uses cancel_step_and_run (not the prohibited
@@ -799,7 +823,13 @@ class TrustedVerificationRunner:
                 elif step_status == VerificationStepStatus.TIMED_OUT:
                     self._store.timeout_step_and_run(finished)
                 elif step_status == VerificationStepStatus.FAILED:
-                    self._store.fail_step_and_run(finished, run_failure_code=failure_code)
+                    if bool(command.metadata.get("required", True)):
+                        self._store.fail_step_and_run(finished, run_failure_code=failure_code)
+                    else:
+                        # Batch 3.1.3 §9: optional step failure — mark step
+                        # FAILED, run stays RUNNING.  Use finish_step (not
+                        # fail_step_and_run) so the run is not transitioned.
+                        self._store.finish_step(finished)
                 else:
                     # Cancelled — atomic cancel_step_and_run with full step (§9).
                     self._store.cancel_step_and_run(
@@ -823,10 +853,67 @@ class TrustedVerificationRunner:
                     reason="canonical-workspace-drift",
                 )
                 raise RuntimeError("canonical workspace drifted during verification") from exc
-            self._store.transition_run(
-                run.verification_run_id, expected=(VerificationRunStatus.RUNNING,),
-                target=terminal, failure_code=failure_code,
-            )
+            # Batch 3.1.3 §8: run disposable workspace cleanup BEFORE
+            # committing the terminal state.  If cleanup fails, the run
+            # must NOT reach PASSED — it is poisoned instead.  This
+            # ensures no external observer ever sees a PASSED run that
+            # left a dirty workspace behind.
+            if disposable is not None:
+                cleanup_done = True
+                if workspace_id:
+                    try:
+                        self._store.transition_disposable_workspace(
+                            workspace_id,
+                            expected=(DisposableWorkspaceState.MOUNTED,
+                                      DisposableWorkspaceState.SEALED,
+                                      DisposableWorkspaceState.PREPARED),
+                            target=DisposableWorkspaceState.CLEANUP_PENDING,
+                        )
+                    except Exception:
+                        pass
+                try:
+                    self._workspace_factory.destroy(disposable)
+                except Exception:
+                    cleanup_failed = True
+                    if workspace_id:
+                        try:
+                            self._store.mark_disposable_workspace_cleanup_failed(
+                                workspace_id, failure_code="cleanup-failed",
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        self._approval_store.add_workspace_poison_scope(
+                            run.verification_run_id,
+                            owner=f"verification-cleanup:{workspace_id or 'unknown'}",
+                            reason="disposable-workspace-cleanup-failed",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    if workspace_id:
+                        try:
+                            self._store.mark_disposable_workspace_cleaned(workspace_id)
+                        except Exception:
+                            pass
+            # §8: if any cleanup (sandbox instance or disposable workspace)
+            # failed, the run must not reach PASSED.  Downgrade to POISONED.
+            if cleanup_failed and terminal == VerificationRunStatus.PASSED:
+                terminal = VerificationRunStatus.POISONED
+                failure_code = "cleanup-failed"
+            # Batch 3.1.3 §9: only call transition_run when the run is
+            # still RUNNING.  Atomic methods (fail_step_and_run,
+            # timeout_step_and_run, cancel_step_and_run) already
+            # transitioned the run to FAILED/TIMED_OUT/CANCELLED.
+            # The final transition_run is needed only for PASSED (all
+            # steps used finish_step) and POISONED (cleanup failure
+            # after all steps passed).
+            if terminal in (VerificationRunStatus.PASSED,
+                            VerificationRunStatus.POISONED):
+                self._store.transition_run(
+                    run.verification_run_id, expected=(VerificationRunStatus.RUNNING,),
+                    target=terminal, failure_code=failure_code,
+                )
             return VerificationResult(
                 run.verification_run_id, terminal, tuple(completed), False, failure_code,
             )
@@ -846,8 +933,9 @@ class TrustedVerificationRunner:
                 )
             raise
         finally:
-            if disposable is not None:
-                # Batch 3.1.2 §8: transition to CLEANUP_PENDING before destroy.
+            # Batch 3.1.3 §8: only run cleanup here if the success path
+            # didn't already do it (i.e. an exception was raised).
+            if not cleanup_done and disposable is not None:
                 if workspace_id:
                     try:
                         self._store.transition_disposable_workspace(
@@ -862,8 +950,6 @@ class TrustedVerificationRunner:
                 try:
                     self._workspace_factory.destroy(disposable)
                 except Exception:
-                    # §8: cleanup failed — mark workspace, poison scope,
-                    # and transition run/step to ERRORED if still PASSED.
                     if workspace_id:
                         try:
                             self._store.mark_disposable_workspace_cleanup_failed(
@@ -891,7 +977,6 @@ class TrustedVerificationRunner:
                         except Exception:
                             pass
                 else:
-                    # Cleanup succeeded — mark workspace CLEANED.
                     if workspace_id:
                         try:
                             self._store.mark_disposable_workspace_cleaned(workspace_id)

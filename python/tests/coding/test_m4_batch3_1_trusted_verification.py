@@ -2415,3 +2415,174 @@ def test_reconcile_artifacts_sealed_no_digest_quarantined(tmp_path):
     runner._reconcile_artifacts()
     row = _artifact_status(vstore, "art-nd")
     assert row["status"] == "quarantined"
+
+
+# ---------------------------------------------------------------------------
+# Batch 3.1.3 §9: Required vs optional step failures
+# ---------------------------------------------------------------------------
+
+
+class _ConfigurableExitBackend(_FaultMatrixBackend):
+    """Fault matrix backend that returns a configurable exit code."""
+
+    def __init__(self, profile, *, exit_code=0, **kwargs):
+        super().__init__(profile, **kwargs)
+        self._exit_code = exit_code
+
+    async def collect_result(self, *, container_id, attach_proc, stdout_stream,
+                             stderr_stream, command, cancellation, started,
+                             sandbox_instance_id, attestation_digest, remove=True):
+        if self.collect_error:
+            raise self.collect_error
+        data = b"fault-matrix-output"
+        return SandboxStepResult(
+            sandbox_instance_id, self.profile.image_digest, self._exit_code, None, 1,
+            data, b"", hashlib.sha256(data).hexdigest(),
+            hashlib.sha256(b"").hexdigest(), False, False, False,
+            container_id, attestation_digest,
+        )
+
+
+def _optional_verification_plan(plan, workspace):
+    """Create a verification plan with an OPTIONAL requirement (required=False)."""
+    (workspace.worktree_path / "pyproject.toml").write_text("[tool.pytest.ini_options]\n")
+    catalog = __import__(
+        "khaos.coding.planning.verification_catalog", fromlist=["VerificationCatalog"]
+    ).VerificationCatalog(workspace.worktree_path, repository_id=plan.repository_id)
+    entry = catalog.entries[0]
+    requirement = VerificationRequirement(
+        entry.argv, entry.verification_type, entry.language, "exit 0", False, "low",
+        (PlanEvidence(
+            "verification-config", plan.repository_id,
+            path=entry.config_path, query=entry.provenance, confidence=1.0,
+            metadata={"config_hash": entry.config_hash},
+        ),),
+    )
+    steps = tuple(replace(step, verification_requirements=(requirement,)) for step in plan.steps)
+    candidate = replace(plan, steps=steps, verification_requirements=(requirement,))
+    return replace(candidate, content_hash=PersistedPlanRepository._recompute_plan_content_hash(candidate))
+
+
+def _optional_fault_matrix_runtime(tmp_path, *, backend):
+    """Wire a runtime with an optional verification plan."""
+    edit = PlannedFileEdit(
+        "e1", "s1", PlannedEditOperation.CREATE, "fixture.py",
+        expected_exists=False, new_content="print('fixture')\n",
+    )
+    runtime, _, workspaces, _ = _real_runtime(tmp_path)
+    workspace = _workspace(tmp_path, workspaces)
+    plan = _plan((edit,))
+    plan = _optional_verification_plan(plan, workspace)
+    plan, authorization = _authorize(runtime, plan)
+    result = _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
+    profile = _profile()
+    runtime.configure_trusted_verification(
+        backend=backend, command_factory=_factory(profile),
+        workspace_factory=VerificationWorkspaceFactory(tmp_path / "fault-copies"),
+        artifact_root=tmp_path / "fault-artifacts", profile=profile,
+    )
+    return runtime, result
+
+
+def test_optional_step_failure_does_not_fail_run(tmp_path):
+    """§9: optional step failure → step FAILED, run PASSED."""
+    backend = _ConfigurableExitBackend(_profile(), exit_code=1)
+    runtime, result = _optional_fault_matrix_runtime(tmp_path, backend=backend)
+    verification_result = runtime._test_sync._loop.run_until_complete(
+        _run_verification(runtime, result)
+    )
+    # Run must be PASSED despite the step failure.
+    assert verification_result.status == VerificationRunStatus.PASSED
+    # Step must be FAILED with "optional-step-failed" failure_code.
+    assert len(verification_result.step_runs) == 1
+    step = verification_result.step_runs[0]
+    assert step.status == VerificationStepStatus.FAILED
+    assert step.failure_code == "optional-step-failed"
+
+
+def test_required_step_failure_fails_run(tmp_path):
+    """§9: required step failure → step FAILED, run FAILED."""
+    backend = _ConfigurableExitBackend(_profile(), exit_code=1)
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+    verification_result = runtime._test_sync._loop.run_until_complete(
+        _run_verification(runtime, result)
+    )
+    # Run must be FAILED.
+    assert verification_result.status == VerificationRunStatus.FAILED
+    assert verification_result.failure_code == "required-step-failed"
+    # Step must be FAILED with "required-step-failed" failure_code.
+    assert len(verification_result.step_runs) == 1
+    step = verification_result.step_runs[0]
+    assert step.status == VerificationStepStatus.FAILED
+    assert step.failure_code == "required-step-failed"
+
+
+def test_optional_step_pass_then_required_step_pass_run_passes(tmp_path):
+    """§9: both optional and required steps pass → run PASSED."""
+    backend = _ConfigurableExitBackend(_profile(), exit_code=0)
+    runtime, result = _optional_fault_matrix_runtime(tmp_path, backend=backend)
+    verification_result = runtime._test_sync._loop.run_until_complete(
+        _run_verification(runtime, result)
+    )
+    assert verification_result.status == VerificationRunStatus.PASSED
+    assert len(verification_result.step_runs) == 1
+    assert verification_result.step_runs[0].status == VerificationStepStatus.PASSED
+
+
+# ---------------------------------------------------------------------------
+# Batch 3.1.3 §8: Cleanup must succeed before terminal success
+# ---------------------------------------------------------------------------
+
+
+def test_sandbox_cleanup_failure_poisons_run(tmp_path):
+    """§8: sandbox instance cleanup failure → run POISONED, not PASSED."""
+    backend = _ConfigurableExitBackend(
+        _profile(), exit_code=0, remove_returns_false=True,
+    )
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+    verification_result = runtime._test_sync._loop.run_until_complete(
+        _run_verification(runtime, result)
+    )
+    # Run must NOT be PASSED — cleanup failed.
+    assert verification_result.status == VerificationRunStatus.POISONED
+    assert verification_result.failure_code == "cleanup-failed"
+    # Step itself passed (exit_code=0).
+    assert len(verification_result.step_runs) == 1
+    assert verification_result.step_runs[0].status == VerificationStepStatus.PASSED
+    # Sandbox instance must be CLEANUP_FAILED.
+    vstore = runtime._verification_store
+    instances = vstore._conn.execute(
+        "SELECT state, failure_code FROM verification_sandbox_instances"
+    ).fetchall()
+    assert any(r[0] == "cleanup-failed" for r in instances)
+
+
+def test_disposable_workspace_cleanup_failure_poisons_run(tmp_path):
+    """§8: disposable workspace cleanup failure → run POISONED, not PASSED."""
+    backend = _ConfigurableExitBackend(_profile(), exit_code=0)
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+    # Sabotage the workspace factory's destroy method to simulate cleanup failure.
+    original_destroy = runtime._verification_runner._workspace_factory.destroy
+    runtime._verification_runner._workspace_factory.destroy = lambda ws: (_ for _ in ()).throw(
+        RuntimeError("simulated cleanup failure")
+    )
+    try:
+        verification_result = runtime._test_sync._loop.run_until_complete(
+            _run_verification(runtime, result)
+        )
+    finally:
+        runtime._verification_runner._workspace_factory.destroy = original_destroy
+    # Run must NOT be PASSED — cleanup failed.
+    assert verification_result.status == VerificationRunStatus.POISONED
+    assert verification_result.failure_code == "cleanup-failed"
+
+
+def test_successful_cleanup_allows_passed(tmp_path):
+    """§8: when all cleanup succeeds, run reaches PASSED normally."""
+    backend = _ConfigurableExitBackend(_profile(), exit_code=0)
+    runtime, result = _fault_matrix_runtime(tmp_path, backend=backend)
+    verification_result = runtime._test_sync._loop.run_until_complete(
+        _run_verification(runtime, result)
+    )
+    assert verification_result.status == VerificationRunStatus.PASSED
+    assert verification_result.failure_code == ""
