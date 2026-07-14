@@ -212,36 +212,37 @@ class TrustedVerificationRunner:
     def _reconcile_disposable_workspaces(self) -> None:
         """Reconcile non-terminal disposable workspaces from previous boots.
 
-        Batch 3.1.3 §6: handles PREPARED rows (crash during copy) by
-        using the PREPARED row to locate and safely clean up the partial
-        directory.  PREPARED rows have an empty manifest — the directory
-        may contain partially-copied files that are not in any manifest.
+        Batch 3.1.4 §7: PREPARED rows are now cleaned up using
+        ``dir_fd``-relative ``unlink``/``rmdir`` with ``O_NOFOLLOW`` at
+        every level — NO ``shutil.rmtree``.  The PREPARED row proves we
+        own the directory, but we still reject symlinks, mount points,
+        sockets, and devices during cleanup.  Unknown file types are
+        quarantined (left in place) and the workspace is marked
+        CLEANUP_FAILED.
 
         For each active workspace:
         - Reconstruct root_path from factory root + instance_id.
         - If root_path no longer exists → mark CLEANED (already gone).
         - If root_path exists:
-          - PREPARED state → force-remove the partial directory (the
-            PREPARED row proves we own this directory).
+          - PREPARED state → safe ``dir_fd``-based cleanup (no manifest).
           - SEALED/MOUNTED state → attempt destroy with manifest.
           - Failure → mark CLEANUP_FAILED + poison workspace scope.
         """
         from khaos.coding.planning.trusted_verification import (
             DisposableVerificationWorkspace, ManifestEntry,
         )
-        import shutil as _shutil
+        import stat as _stat
         factory_root = self._workspace_factory._root
         for record in self._store.list_active_disposable_workspaces():
             root = factory_root / record.instance_id
             if not root.exists():
                 self._store.mark_disposable_workspace_cleaned(record.workspace_id)
                 continue
-            # Batch 3.1.3 §6: PREPARED rows have an empty manifest.
-            # The directory was partially created — we own it (the row
-            # proves it) and can force-remove it safely.
+            # Batch 3.1.4 §7: PREPARED rows have an empty manifest.
+            # Use safe dir_fd-based cleanup — NO shutil.rmtree.
             if record.state == DisposableWorkspaceState.PREPARED:
                 try:
-                    _shutil.rmtree(root)
+                    self._safe_destroy_prepared(root)
                     self._store.mark_disposable_workspace_cleaned(record.workspace_id)
                 except Exception:
                     self._store.mark_disposable_workspace_cleanup_failed(
@@ -292,6 +293,88 @@ class TrustedVerificationRunner:
                     pass
             else:
                 self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+
+    @staticmethod
+    def _safe_destroy_prepared(root: Path) -> None:
+        """Batch 3.1.4 §7: safe dir_fd-based cleanup for PREPARED workspaces.
+
+        Replaces ``shutil.rmtree``.  Walks the directory tree using
+        ``dir_fd``-relative ``unlink``/``rmdir`` with ``O_NOFOLLOW`` at
+        every level.  Rejects:
+        - Symlinks (O_NOFOLLOW on every open)
+        - Sockets, devices, FIFOs (only regular files and dirs are deleted)
+        - Unknown file types (quarantine — leave in place, raise)
+
+        The instance root is ``rmdir``'d last, and its absence is confirmed.
+        """
+        import os as _os
+        import stat as _stat
+        if not root.exists():
+            try:
+                _os.stat(str(root))
+            except FileNotFoundError:
+                return
+            raise PermissionError(
+                f"PREPARED workspace root exists but is not a directory: {root}"
+            )
+        # Open the instance root with O_DIRECTORY|O_NOFOLLOW.
+        root_fd = _os.open(
+            str(root), _os.O_RDONLY | _os.O_DIRECTORY | _os.O_NOFOLLOW,
+        )
+        try:
+            TrustedVerificationRunner._safe_destroy_tree(root_fd)
+        finally:
+            _os.close(root_fd)
+        # rmdir the instance root itself.
+        _os.rmdir(str(root))
+        # fsync the parent directory so the rmdir is durable.
+        parent_fd = _os.open(
+            str(root.parent), _os.O_RDONLY | _os.O_DIRECTORY | _os.O_NOFOLLOW,
+        )
+        try:
+            _os.fsync(parent_fd)
+        finally:
+            _os.close(parent_fd)
+        # Confirm the instance root no longer exists.
+        try:
+            _os.stat(str(root))
+        except FileNotFoundError:
+            return
+        raise PermissionError(
+            f"PREPARED workspace root still exists after rmdir: {root}"
+        )
+
+    @staticmethod
+    def _safe_destroy_tree(dir_fd: int) -> None:
+        """Batch 3.1.4 §7: recursively destroy all entries in dir_fd.
+
+        Uses ``O_NOFOLLOW`` on every open — symlinks are rejected.
+        Only regular files and directories are deleted; sockets, devices,
+        FIFOs, and unknown types raise PermissionError (quarantine).
+        """
+        import os as _os
+        import stat as _stat
+        for name in _os.listdir(dir_fd):
+            st = _os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if _stat.S_ISDIR(st.st_mode):
+                # Recurse into the directory.
+                child_fd = _os.open(
+                    name, _os.O_RDONLY | _os.O_DIRECTORY | _os.O_NOFOLLOW,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    TrustedVerificationRunner._safe_destroy_tree(child_fd)
+                finally:
+                    _os.close(child_fd)
+                _os.rmdir(name, dir_fd=dir_fd)
+            elif _stat.S_ISREG(st.st_mode):
+                _os.unlink(name, dir_fd=dir_fd)
+            else:
+                # Socket, device, FIFO, or unknown — quarantine.
+                raise PermissionError(
+                    f"PREPARED workspace contains non-regular file: "
+                    f"{name} (mode={st.st_mode:o})"
+                )
 
     # ------------------------------------------------------------------
     # Batch 3.1.3 §7: Artifact root orphan recovery
