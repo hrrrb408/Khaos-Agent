@@ -4448,3 +4448,515 @@ def test_runner_opens_disposable_root_capability(tmp_path):
     assert len(runner._disposable_root_capability.capability_id) == 64
     # verify_identity should pass since the root hasn't been replaced.
     runner._disposable_root_capability.verify_identity()
+
+
+# ---------------------------------------------------------------------------
+# Batch 3.1.5 §7: Cleanup proof and finalization proof matrix tests
+# ---------------------------------------------------------------------------
+
+def test_verification_cleanup_proof_dataclass():
+    """§4: VerificationCleanupProof is a frozen dataclass with all fields."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    proof = VerificationCleanupProof(
+        verification_run_id="run-1",
+        disposable_workspace_id="dvw-1",
+        disposable_workspace_identity="inst:manifest",
+        disposable_cleaned_at=1234567890.0,
+        sandbox_instance_ids=("vsi-1", "vsi-2"),
+        sandbox_absence_digests=("abc", "def"),
+        artifact_ids=("art-1",),
+        artifact_seal_digests=("seal-1",),
+        canonical_workspace_final_digest="canonical-digest",
+        cleanup_digest="cleanup-digest",
+        created_at=1234567891.0,
+    )
+    assert proof.verification_run_id == "run-1"
+    assert proof.disposable_workspace_id == "dvw-1"
+    assert proof.sandbox_instance_ids == ("vsi-1", "vsi-2")
+    assert proof.artifact_ids == ("art-1",)
+    # Frozen — cannot reassign.
+    with pytest.raises(AttributeError):
+        proof.verification_run_id = "run-2"
+
+
+def test_compute_cleanup_digest_is_deterministic():
+    """§4: compute_cleanup_digest is deterministic for the same inputs."""
+    from khaos.coding.planning.verification_execution_models import (
+        compute_cleanup_digest,
+    )
+    kwargs = dict(
+        verification_run_id="run-1",
+        disposable_workspace_id="dvw-1",
+        disposable_workspace_identity="inst:manifest",
+        disposable_cleaned_at=1234567890.0,
+        sandbox_instance_ids=("vsi-1",),
+        sandbox_absence_digests=("abc",),
+        artifact_ids=("art-1",),
+        artifact_seal_digests=("seal-1",),
+        canonical_workspace_final_digest="canonical-digest",
+    )
+    d1 = compute_cleanup_digest(**kwargs)
+    d2 = compute_cleanup_digest(**kwargs)
+    assert d1 == d2
+    assert len(d1) == 64
+
+
+def test_compute_cleanup_digest_changes_with_fields():
+    """§4: any field change produces a different digest."""
+    from khaos.coding.planning.verification_execution_models import (
+        compute_cleanup_digest,
+    )
+    base = dict(
+        verification_run_id="run-1",
+        disposable_workspace_id="dvw-1",
+        disposable_workspace_identity="inst:manifest",
+        disposable_cleaned_at=1234567890.0,
+        sandbox_instance_ids=("vsi-1",),
+        sandbox_absence_digests=("abc",),
+        artifact_ids=("art-1",),
+        artifact_seal_digests=("seal-1",),
+        canonical_workspace_final_digest="canonical-digest",
+    )
+    d_base = compute_cleanup_digest(**base)
+    # Change verification_run_id
+    d2 = compute_cleanup_digest(**{**base, "verification_run_id": "run-2"})
+    assert d2 != d_base
+    # Change disposable_workspace_id
+    d3 = compute_cleanup_digest(**{**base, "disposable_workspace_id": "dvw-2"})
+    assert d3 != d_base
+    # Change sandbox_instance_ids
+    d4 = compute_cleanup_digest(**{**base, "sandbox_instance_ids": ("vsi-2",)})
+    assert d4 != d_base
+    # Change canonical_workspace_final_digest
+    d5 = compute_cleanup_digest(**{**base, "canonical_workspace_final_digest": "other"})
+    assert d5 != d_base
+
+
+def test_verification_cleanup_proofs_table_exists(tmp_path):
+    """§4: the verification_cleanup_proofs table is created."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    approval_store = PlanApprovalStore(conn)
+    store = VerificationExecutionStore(approval_store)
+    cols = {
+        row["name"]
+        for row in store._conn.execute(
+            "PRAGMA table_info(verification_cleanup_proofs)"
+        )
+    }
+    assert "cleanup_proof_id" in cols
+    assert "verification_run_id" in cols
+    assert "disposable_workspace_id" in cols
+    assert "disposable_cleaned_at" in cols
+    assert "sandbox_instance_ids_json" in cols
+    assert "sandbox_absence_digests_json" in cols
+    assert "artifact_ids_json" in cols
+    assert "artifact_seal_digests_json" in cols
+    assert "canonical_workspace_final_digest" in cols
+    assert "cleanup_digest" in cols
+    assert "created_at" in cols
+    conn.close()
+
+
+def test_persist_and_load_cleanup_proof(tmp_path):
+    """§4: persist a cleanup proof and load it back."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    approval_store = PlanApprovalStore(conn)
+    store = VerificationExecutionStore(approval_store)
+    proof = VerificationCleanupProof(
+        verification_run_id="run-pl-1",
+        disposable_workspace_id="dvw-pl-1",
+        disposable_workspace_identity="inst:manifest-pl",
+        disposable_cleaned_at=1234567890.0,
+        sandbox_instance_ids=("vsi-pl-1", "vsi-pl-2"),
+        sandbox_absence_digests=("abs-1", "abs-2"),
+        artifact_ids=("art-pl-1",),
+        artifact_seal_digests=("seal-pl-1",),
+        canonical_workspace_final_digest="canonical-pl",
+        cleanup_digest="cleanup-pl",
+        created_at=1234567891.0,
+    )
+    proof_id = store.persist_cleanup_proof(proof)
+    assert proof_id.startswith("vcp_")
+    loaded = store.get_cleanup_proof_for_run("run-pl-1")
+    assert loaded is not None
+    assert loaded.verification_run_id == "run-pl-1"
+    assert loaded.disposable_workspace_id == "dvw-pl-1"
+    assert loaded.disposable_workspace_identity == "inst:manifest-pl"
+    assert loaded.disposable_cleaned_at == 1234567890.0
+    assert loaded.sandbox_instance_ids == ("vsi-pl-1", "vsi-pl-2")
+    assert loaded.sandbox_absence_digests == ("abs-1", "abs-2")
+    assert loaded.artifact_ids == ("art-pl-1",)
+    assert loaded.artifact_seal_digests == ("seal-pl-1",)
+    assert loaded.canonical_workspace_final_digest == "canonical-pl"
+    assert loaded.cleanup_digest == "cleanup-pl"
+    conn.close()
+
+
+def test_get_cleanup_proof_for_run_returns_none_when_absent(tmp_path):
+    """§4: get_cleanup_proof_for_run returns None when no proof exists."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    approval_store = PlanApprovalStore(conn)
+    store = VerificationExecutionStore(approval_store)
+    assert store.get_cleanup_proof_for_run("run-absent") is None
+    conn.close()
+
+
+def test_get_cleanup_proof_for_run_returns_latest(tmp_path):
+    """§4: when multiple proofs exist, the latest is returned."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    approval_store = PlanApprovalStore(conn)
+    store = VerificationExecutionStore(approval_store)
+    proof1 = VerificationCleanupProof(
+        verification_run_id="run-latest",
+        disposable_workspace_id="dvw-1",
+        disposable_workspace_identity="id1",
+        disposable_cleaned_at=1000.0,
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=(),
+        artifact_seal_digests=(),
+        canonical_workspace_final_digest="",
+        cleanup_digest="digest-1",
+        created_at=1000.0,
+    )
+    proof2 = VerificationCleanupProof(
+        verification_run_id="run-latest",
+        disposable_workspace_id="dvw-2",
+        disposable_workspace_identity="id2",
+        disposable_cleaned_at=2000.0,
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=(),
+        artifact_seal_digests=(),
+        canonical_workspace_final_digest="",
+        cleanup_digest="digest-2",
+        created_at=2000.0,
+    )
+    store.persist_cleanup_proof(proof1)
+    store.persist_cleanup_proof(proof2)
+    loaded = store.get_cleanup_proof_for_run("run-latest")
+    assert loaded is not None
+    assert loaded.cleanup_digest == "digest-2"  # latest
+    conn.close()
+
+
+def test_list_sandbox_instances_for_run_verified_delegates(tmp_path):
+    """§4: list_sandbox_instances_for_run_verified delegates to list_sandbox_instances_for_run."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    approval_store = PlanApprovalStore(conn)
+    store = VerificationExecutionStore(approval_store)
+    result = store.list_sandbox_instances_for_run_verified("run-delegate")
+    assert result == ()
+    conn.close()
+
+
+def test_list_artifacts_for_run_returns_all(tmp_path):
+    """§4: list_artifacts_for_run returns all artifact rows."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    approval_store = PlanApprovalStore(conn)
+    store = VerificationExecutionStore(approval_store)
+    # Insert two artifact rows directly.
+    for aid in ("art-a", "art-b"):
+        store._conn.execute(
+            "INSERT INTO plan_verification_artifacts "
+            "(artifact_id, verification_run_id, relative_name, content_digest, "
+            " byte_length, expires_at, quarantined, created_at, status) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (aid, "run-art", f"{aid}.log", f"digest-{aid}", 100,
+             time.time() + 3600, 0, time.time(), "sealed"),
+        )
+    store._conn.commit()
+    arts = store.list_artifacts_for_run("run-art")
+    assert len(arts) == 2
+    ids = {art["artifact_id"] for art in arts}
+    assert ids == {"art-a", "art-b"}
+    conn.close()
+
+
+def test_build_cleanup_proof_returns_none_for_no_disposable(tmp_path):
+    """§4: _build_cleanup_proof returns None when disposable is None."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    result = runner._build_cleanup_proof("run-nd", "", None)
+    assert result is None
+
+
+def test_build_cleanup_proof_returns_none_for_empty_workspace_id(tmp_path):
+    """§4: _build_cleanup_proof returns None when workspace_id is empty."""
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    # Even with a non-None disposable, empty workspace_id → None.
+    result = runner._build_cleanup_proof("run-ew", "", object())
+    assert result is None
+
+
+def test_build_cleanup_proof_builds_valid_proof(tmp_path):
+    """§4: _build_cleanup_proof builds a proof with correct fields when
+    a disposable workspace record exists."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    store = runner._store
+    # Insert a disposable workspace record (CLEANED state with cleaned_at).
+    workspace_id = "dvw-bcp-1"
+    store.create_disposable_workspace(DisposableWorkspaceRecord(
+        workspace_id=workspace_id,
+        verification_run_id="run-bcp",
+        step_run_id="",
+        instance_id="verify-bcp-1",
+        manifest_digest="manifest-digest-bcp",
+        manifest_json="[]",
+        allowed_generated_output=(),
+        state=DisposableWorkspaceState.CLEANED,
+        boot_id="boot-bcp",
+        created_at=time.time(),
+        cleaned_at=time.time(),
+    ))
+    # Create a fake disposable object (the in-memory workspace).
+    from khaos.coding.planning.trusted_verification import (
+        DisposableVerificationWorkspace,
+    )
+    disposable = DisposableVerificationWorkspace(
+        instance_id="verify-bcp-1",
+        root=tmp_path / "fake-root",
+        manifest=(),
+        manifest_digest="manifest-digest-bcp",
+    )
+    proof = runner._build_cleanup_proof("run-bcp", workspace_id, disposable)
+    assert proof is not None
+    assert isinstance(proof, VerificationCleanupProof)
+    assert proof.verification_run_id == "run-bcp"
+    assert proof.disposable_workspace_id == workspace_id
+    assert "verify-bcp-1" in proof.disposable_workspace_identity
+    assert "manifest-digest-bcp" in proof.disposable_workspace_identity
+    assert proof.cleanup_digest  # non-empty
+    assert proof.created_at > 0
+
+
+def _finalize_test_store(tmp_path):
+    """Create a store with a verification run transitioned to FINALIZING.
+
+    Returns (store, verification_run_id, execution_run_id).
+    """
+    approval, store = _mutated_store(tmp_path)
+    store.create_run(_verification_run())
+    for expected, target in [
+        (VerificationRunStatus.CREATED, VerificationRunStatus.VALIDATING),
+        (VerificationRunStatus.VALIDATING, VerificationRunStatus.PREPARING_SANDBOX),
+        (VerificationRunStatus.PREPARING_SANDBOX, VerificationRunStatus.RUNNING),
+        (VerificationRunStatus.RUNNING, VerificationRunStatus.FINALIZING),
+    ]:
+        store.transition_run("verify1", expected=(expected,), target=target)
+    return store, "verify1", "run1"
+
+
+def test_finalize_success_with_cleanup_proof_succeeds(tmp_path):
+    """§4: finalize_success accepts a valid cleanup proof and finalizes."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    store, ver_run_id, exec_run_id = _finalize_test_store(tmp_path)
+    workspace_id = "dvw-fin-1"
+    proof = VerificationCleanupProof(
+        verification_run_id=ver_run_id,
+        disposable_workspace_id=workspace_id,
+        disposable_workspace_identity="id",
+        disposable_cleaned_at=time.time(),
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=(),
+        artifact_seal_digests=(),
+        canonical_workspace_final_digest="",
+        cleanup_digest="digest-fin",
+        created_at=time.time(),
+    )
+    store.persist_cleanup_proof(proof)
+    store.finalize_success(
+        step=None,
+        verification_run_id=ver_run_id,
+        execution_run_id=exec_run_id,
+        workspace_id=workspace_id,
+        cleanup_proof=proof,
+    )
+    loaded = store.get_run(ver_run_id)
+    assert loaded.status == VerificationRunStatus.PASSED
+
+
+def test_finalize_success_rejects_missing_cleanup_proof(tmp_path):
+    """§4: finalize_success rejects when the proof is not persisted."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    store, ver_run_id, exec_run_id = _finalize_test_store(tmp_path)
+    fake_proof = VerificationCleanupProof(
+        verification_run_id=ver_run_id,
+        disposable_workspace_id="dvw-fake",
+        disposable_workspace_identity="id",
+        disposable_cleaned_at=time.time(),
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=(),
+        artifact_seal_digests=(),
+        canonical_workspace_final_digest="",
+        cleanup_digest="fake-digest",
+        created_at=time.time(),
+    )
+    with pytest.raises(RuntimeError, match="cleanup proof not found"):
+        store.finalize_success(
+            step=None,
+            verification_run_id=ver_run_id,
+            execution_run_id=exec_run_id,
+            workspace_id="dvw-fake",
+            cleanup_proof=fake_proof,
+        )
+    # Run should still be FINALIZING (rolled back).
+    loaded = store.get_run(ver_run_id)
+    assert loaded.status == VerificationRunStatus.FINALIZING
+
+
+def test_finalize_success_rejects_digest_mismatch(tmp_path):
+    """§4: finalize_success rejects when cleanup_digest doesn't match."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    store, ver_run_id, exec_run_id = _finalize_test_store(tmp_path)
+    proof = VerificationCleanupProof(
+        verification_run_id=ver_run_id,
+        disposable_workspace_id="dvw-dm",
+        disposable_workspace_identity="id",
+        disposable_cleaned_at=time.time(),
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=(),
+        artifact_seal_digests=(),
+        canonical_workspace_final_digest="",
+        cleanup_digest="real-digest",
+        created_at=time.time(),
+    )
+    store.persist_cleanup_proof(proof)
+    forged_proof = VerificationCleanupProof(
+        verification_run_id=ver_run_id,
+        disposable_workspace_id="dvw-dm",
+        disposable_workspace_identity="id",
+        disposable_cleaned_at=time.time(),
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=(),
+        artifact_seal_digests=(),
+        canonical_workspace_final_digest="",
+        cleanup_digest="forged-digest",
+        created_at=time.time(),
+    )
+    with pytest.raises(RuntimeError, match="digest mismatch"):
+        store.finalize_success(
+            step=None,
+            verification_run_id=ver_run_id,
+            execution_run_id=exec_run_id,
+            workspace_id="dvw-dm",
+            cleanup_proof=forged_proof,
+        )
+
+
+def test_finalize_success_rejects_workspace_id_mismatch(tmp_path):
+    """§4: finalize_success rejects when workspace_id doesn't match."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    store, ver_run_id, exec_run_id = _finalize_test_store(tmp_path)
+    proof = VerificationCleanupProof(
+        verification_run_id=ver_run_id,
+        disposable_workspace_id="dvw-real",
+        disposable_workspace_identity="id",
+        disposable_cleaned_at=time.time(),
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=(),
+        artifact_seal_digests=(),
+        canonical_workspace_final_digest="",
+        cleanup_digest="digest-wm",
+        created_at=time.time(),
+    )
+    store.persist_cleanup_proof(proof)
+    forged = VerificationCleanupProof(
+        verification_run_id=ver_run_id,
+        disposable_workspace_id="dvw-forged",
+        disposable_workspace_identity="id",
+        disposable_cleaned_at=time.time(),
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=(),
+        artifact_seal_digests=(),
+        canonical_workspace_final_digest="",
+        cleanup_digest="digest-wm",
+        created_at=time.time(),
+    )
+    with pytest.raises(RuntimeError, match="workspace ID mismatch"):
+        store.finalize_success(
+            step=None,
+            verification_run_id=ver_run_id,
+            execution_run_id=exec_run_id,
+            workspace_id="dvw-forged",
+            cleanup_proof=forged,
+        )
+
+
+def test_finalize_success_rejects_unsealed_artifact(tmp_path):
+    """§4: finalize_success rejects when an artifact is not SEALED."""
+    from khaos.coding.planning.verification_execution_models import (
+        VerificationCleanupProof,
+    )
+    store, ver_run_id, exec_run_id = _finalize_test_store(tmp_path)
+    # Insert an unsealed artifact for this run.
+    store._conn.execute(
+        "INSERT INTO plan_verification_artifacts "
+        "(artifact_id, verification_run_id, relative_name, content_digest, "
+        " byte_length, expires_at, quarantined, created_at, status) "
+        "VALUES (?,?,?,?,?,?,?,?,?)",
+        ("art-unsealed", ver_run_id, "art-unsealed.log",
+         "digest", 100, time.time() + 3600, 0, time.time(), "reserved"),
+    )
+    store._conn.commit()
+    proof = VerificationCleanupProof(
+        verification_run_id=ver_run_id,
+        disposable_workspace_id="dvw-us",
+        disposable_workspace_identity="id",
+        disposable_cleaned_at=time.time(),
+        sandbox_instance_ids=(),
+        sandbox_absence_digests=(),
+        artifact_ids=("art-unsealed",),
+        artifact_seal_digests=("digest",),
+        canonical_workspace_final_digest="",
+        cleanup_digest="digest-us",
+        created_at=time.time(),
+    )
+    store.persist_cleanup_proof(proof)
+    with pytest.raises(RuntimeError, match="not SEALED"):
+        store.finalize_success(
+            step=None,
+            verification_run_id=ver_run_id,
+            execution_run_id=exec_run_id,
+            workspace_id="dvw-us",
+            cleanup_proof=proof,
+        )
+
+
+def test_finalize_success_without_cleanup_proof_keeps_legacy(tmp_path):
+    """§4: finalize_success with cleanup_proof=None keeps legacy semantics."""
+    store, ver_run_id, exec_run_id = _finalize_test_store(tmp_path)
+    store.finalize_success(
+        step=None,
+        verification_run_id=ver_run_id,
+        execution_run_id=exec_run_id,
+    )
+    loaded = store.get_run(ver_run_id)
+    assert loaded.status == VerificationRunStatus.PASSED
