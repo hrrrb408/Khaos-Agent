@@ -452,3 +452,38 @@ CREATE TABLE IF NOT EXISTS plan_execution_phase_leases (
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_active_verification_phase_lease
     ON plan_execution_phase_leases(execution_run_id) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS approved_verification_plan_snapshots (
+    approved_verification_plan_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    plan_content_hash TEXT NOT NULL,
+    requirements_digest TEXT NOT NULL,
+    catalog_fingerprint TEXT NOT NULL,
+    ordered_command_digests_json TEXT NOT NULL,
+    config_hashes_json TEXT NOT NULL,
+    sandbox_profile_digest TEXT NOT NULL,
+    image_attestation_content_digest TEXT NOT NULL,
+    ordered_toolchain_attestation_content_digests_json TEXT NOT NULL,
+    binary_digests_json TEXT NOT NULL,
+    version_output_digests_json TEXT NOT NULL,
+    parsed_versions_json TEXT NOT NULL,
+    image_toolchain_policy_fingerprint TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL,
+    boot_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS verification_cleanup_proofs (
+    cleanup_proof_id TEXT PRIMARY KEY,
+    verification_run_id TEXT NOT NULL,
+    disposable_workspace_id TEXT NOT NULL,
+    disposable_workspace_identity TEXT NOT NULL,
+    disposable_cleaned_at REAL NOT NULL,
+    sandbox_instance_ids_json TEXT NOT NULL,
+    sandbox_absence_digests_json TEXT NOT NULL,
+    artifact_ids_json TEXT NOT NULL,
+    artifact_seal_digests_json TEXT NOT NULL,
+    canonical_workspace_final_digest TEXT NOT NULL,
+    cleanup_digest TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
