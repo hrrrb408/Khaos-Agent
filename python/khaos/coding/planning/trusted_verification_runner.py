@@ -405,6 +405,37 @@ class TrustedVerificationRunner:
             raise RuntimeError("canonical workspace final digest drifted")
         return digest
 
+    def _verify_artifact_row(self, row: Any) -> bool:
+        """Use one identity-aware verifier for finalization and recovery."""
+        return self._artifact_capability.verify_sealed_artifact(
+            row["artifact_id"], expected_digest=row["content_digest"],
+            expected_size=int(row["byte_length"]),
+            expected_dev=int(row["artifact_dev"]),
+            expected_ino=int(row["artifact_ino"]),
+            expected_uid=int(row["artifact_uid"]),
+            expected_gid=int(row["artifact_gid"]),
+            expected_mode=int(row["artifact_mode"]),
+            expected_nlink=int(row["artifact_nlink"]),
+        )
+
+    @staticmethod
+    def _artifact_seal_digest(row: Any) -> str:
+        """Bind content, size, type-critical identity and permissions."""
+        payload = {
+            "artifact_id": row["artifact_id"],
+            "content_digest": row["content_digest"],
+            "byte_length": int(row["byte_length"]),
+            "dev": int(row["artifact_dev"]),
+            "ino": int(row["artifact_ino"]),
+            "uid": int(row["artifact_uid"]),
+            "gid": int(row["artifact_gid"]),
+            "mode": int(row["artifact_mode"]),
+            "nlink": int(row["artifact_nlink"]),
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
     def _verify_cleanup_proof(self, proof: Any) -> None:
         """Re-read every cleanup row and artifact/canonical filesystem proof."""
         record = self._store.get_disposable_workspace(
@@ -436,17 +467,15 @@ class TrustedVerificationRunner:
             raise RuntimeError("sandbox absence proof digest mismatch")
         artifacts = self._store.list_artifacts_for_run(proof.verification_run_id)
         artifact_ids = tuple(row["artifact_id"] for row in artifacts)
-        artifact_digests = tuple(row["content_digest"] for row in artifacts)
+        artifact_digests = tuple(
+            self._artifact_seal_digest(row) for row in artifacts
+        )
         if (artifact_ids != proof.artifact_ids
                 or artifact_digests != proof.artifact_seal_digests):
             raise RuntimeError("artifact cleanup proof ordering mismatch")
         for artifact in artifacts:
             if artifact["status"] != "sealed" or not (
-                self._artifact_capability.verify_sealed_artifact(
-                    artifact["artifact_id"],
-                    expected_digest=artifact["content_digest"],
-                    expected_size=int(artifact["byte_length"]),
-                )
+                self._verify_artifact_row(artifact)
             ):
                 raise RuntimeError("sealed verification artifact proof mismatch")
         current_digest = self._canonical_workspace_digest_for_run(
@@ -668,6 +697,12 @@ class TrustedVerificationRunner:
             if not self._artifact_capability.verify_sealed_artifact(
                 artifact_id, expected_digest=content_digest,
                 expected_size=byte_length,
+                expected_dev=int(row["artifact_dev"]),
+                expected_ino=int(row["artifact_ino"]),
+                expected_uid=int(row["artifact_uid"]),
+                expected_gid=int(row["artifact_gid"]),
+                expected_mode=int(row["artifact_mode"]),
+                expected_nlink=int(row["artifact_nlink"]),
             ):
                 # Digest or size mismatch — corruption, quarantine.
                 try:
@@ -1625,6 +1660,12 @@ class TrustedVerificationRunner:
             content_digest, byte_length = self._artifact_capability.write_artifact(
                 artifact_id, payload,
             )
+            identity = self._artifact_capability.attest_sealed_artifact(
+                artifact_id,
+            )
+            if (identity.content_digest != content_digest
+                    or identity.byte_length != byte_length):
+                raise RuntimeError("artifact changed before durable sealing")
         except Exception:
             # Cleanup: if the temp file was created but link failed, the
             # capability already cleaned it up.  Mark the artifact row
@@ -1635,6 +1676,9 @@ class TrustedVerificationRunner:
         self._store.seal_artifact(
             artifact_id=artifact_id,
             content_digest=content_digest, byte_length=byte_length,
+            artifact_dev=identity.dev, artifact_ino=identity.ino,
+            artifact_uid=identity.uid, artifact_gid=identity.gid,
+            artifact_mode=identity.mode, artifact_nlink=identity.nlink,
         )
         return artifact_id
 
@@ -1703,14 +1747,11 @@ class TrustedVerificationRunner:
         artifact_seal_digests: list[str] = []
         for art in artifacts:
             if art["status"] != "sealed" or not (
-                self._artifact_capability.verify_sealed_artifact(
-                    art["artifact_id"], expected_digest=art["content_digest"],
-                    expected_size=int(art["byte_length"]),
-                )
+                self._verify_artifact_row(art)
             ):
                 raise RuntimeError("verification artifact is not durably sealed")
             artifact_ids.append(art["artifact_id"])
-            artifact_seal_digests.append(art["content_digest"])
+            artifact_seal_digests.append(self._artifact_seal_digest(art))
         # Compute canonical workspace final digest from the persisted
         # final mutation attestation.  This is the immutable proof of
         # the canonical workspace's state at mutation time — already

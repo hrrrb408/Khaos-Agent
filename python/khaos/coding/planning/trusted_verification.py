@@ -265,6 +265,93 @@ class ArtifactRootIdentity:
     mode: int
 
 
+@dataclass(frozen=True)
+class AttestedRegularFile:
+    """Identity and content proof for a safely opened regular file."""
+
+    content_digest: str
+    byte_length: int
+    dev: int
+    ino: int
+    uid: int
+    gid: int
+    mode: int
+    nlink: int
+
+
+def _attest_regular_file_at(
+    parent_fd: int, name: str, *, expected_digest: str | None = None,
+    expected_size: int | None = None,
+    expected_identity: AttestedRegularFile | None = None,
+    required_uid: int | None = None,
+) -> AttestedRegularFile:
+    """Read one basename without following links or blocking on special files."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    before_entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    fd = os.open(name, flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(fd)
+        opened_mode = stat.S_IMODE(opened.st_mode)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                or opened_mode != 0o600):
+            raise PermissionError(
+                "verification artifact is not a private single-link regular file"
+            )
+        if required_uid is not None and opened.st_uid != required_uid:
+            raise PermissionError("verification artifact owner is outside policy")
+        if (before_entry.st_dev, before_entry.st_ino, before_entry.st_mode,
+                before_entry.st_nlink, before_entry.st_uid) != (
+            opened.st_dev, opened.st_ino, opened.st_mode,
+            opened.st_nlink, opened.st_uid,
+        ):
+            raise PermissionError("verification artifact changed while opening")
+        digest = hashlib.sha256()
+        byte_length = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            byte_length += len(chunk)
+            digest.update(chunk)
+        after_fd = os.fstat(fd)
+        after_entry = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        identity_fields = (
+            opened.st_dev, opened.st_ino, opened.st_mode, opened.st_nlink,
+            opened.st_uid, opened.st_gid, opened.st_size,
+            opened.st_mtime_ns, opened.st_ctime_ns,
+        )
+        if identity_fields != (
+            after_fd.st_dev, after_fd.st_ino, after_fd.st_mode,
+            after_fd.st_nlink, after_fd.st_uid, after_fd.st_gid,
+            after_fd.st_size, after_fd.st_mtime_ns, after_fd.st_ctime_ns,
+        ) or identity_fields[:6] != (
+            after_entry.st_dev, after_entry.st_ino, after_entry.st_mode,
+            after_entry.st_nlink, after_entry.st_uid, after_entry.st_gid,
+        ):
+            raise PermissionError("verification artifact identity changed during read")
+        evidence = AttestedRegularFile(
+            digest.hexdigest(), byte_length, opened.st_dev, opened.st_ino,
+            opened.st_uid, opened.st_gid, opened_mode, opened.st_nlink,
+        )
+        if expected_digest is not None and evidence.content_digest != expected_digest:
+            raise PermissionError("verification artifact digest mismatch")
+        if expected_size is not None and evidence.byte_length != expected_size:
+            raise PermissionError("verification artifact size mismatch")
+        if expected_identity is not None and (
+            evidence.dev, evidence.ino, evidence.uid, evidence.gid,
+            evidence.mode, evidence.nlink,
+        ) != (
+            expected_identity.dev, expected_identity.ino,
+            expected_identity.uid, expected_identity.gid,
+            expected_identity.mode, expected_identity.nlink,
+        ):
+            raise PermissionError("verification artifact sealed identity mismatch")
+        return evidence
+    finally:
+        os.close(fd)
+
+
 class ArtifactRootCapability:
     """Batch 3.1.2 §7: long-term safe artifact root with dir_fd-only access.
 
@@ -421,6 +508,24 @@ class ArtifactRootCapability:
         os.fsync(self._root_fd)
         return digest_hex, byte_length
 
+    @staticmethod
+    def _artifact_name(artifact_id: str) -> str:
+        if not artifact_id or not all(
+            value.isalnum() or value in "-_" for value in artifact_id
+        ):
+            raise ValueError("invalid verification artifact ID")
+        return f"{artifact_id}.log"
+
+    def attest_sealed_artifact(self, artifact_id: str) -> AttestedRegularFile:
+        """Capture immutable identity and content evidence at seal time."""
+        self.verify_identity()
+        evidence = _attest_regular_file_at(
+            self._root_fd, self._artifact_name(artifact_id),
+            required_uid=os.getuid(),
+        )
+        self.verify_identity()
+        return evidence
+
     def read_artifact(self, artifact_id: str) -> bytes:
         """Read an artifact by ID using dir_fd only (no Path re-parsing)."""
         final_name = f"{artifact_id}.log"
@@ -549,35 +654,32 @@ class ArtifactRootCapability:
 
     def verify_sealed_artifact(
         self, artifact_id: str, *, expected_digest: str, expected_size: int,
+        expected_dev: int = -1, expected_ino: int = -1,
+        expected_uid: int = -1, expected_gid: int = -1,
+        expected_mode: int = -1, expected_nlink: int = -1,
     ) -> bool:
-        """Batch 3.1.3 §7: verify a sealed artifact's digest and size.
-
-        Re-reads the final file and computes its SHA-256, then compares
-        against the expected digest and byte length from the DB.
-        Returns True if both match, False otherwise.
-        """
-        final_name = f"{artifact_id}.log"
+        """Verify sealed content, type, identity, owner, mode and basename."""
         try:
-            fd = os.open(
-                final_name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self._root_fd,
-            )
-        except FileNotFoundError:
-            return False
-        try:
-            st = os.fstat(fd)
-            if st.st_size != expected_size:
+            if min(
+                expected_dev, expected_ino, expected_uid, expected_gid,
+                expected_mode, expected_nlink,
+            ) < 0:
                 return False
-            digest = hashlib.sha256()
-            while True:
-                chunk = os.read(fd, 1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
-            return digest.hexdigest() == expected_digest
-        except OSError:
+            expected_identity = AttestedRegularFile(
+                expected_digest, expected_size, expected_dev, expected_ino,
+                expected_uid, expected_gid, expected_mode, expected_nlink,
+            )
+            self.verify_identity()
+            _attest_regular_file_at(
+                self._root_fd, self._artifact_name(artifact_id),
+                expected_digest=expected_digest, expected_size=expected_size,
+                expected_identity=expected_identity,
+                required_uid=expected_uid,
+            )
+            self.verify_identity()
+            return True
+        except (OSError, PermissionError, ValueError):
             return False
-        finally:
-            os.close(fd)
 
 
 @dataclass(frozen=True)
