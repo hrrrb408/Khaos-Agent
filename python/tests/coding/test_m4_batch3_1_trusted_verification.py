@@ -362,6 +362,10 @@ class UnsafeTestSandboxBackend:
     async def attach_instance(self, container_id_or_name):
         return None, None, None
 
+    async def start_and_attach_instance(self, container_id_or_name):
+        """Batch 3.1.4 §1: combined start + attach."""
+        return None, None, None
+
     async def inspect_instance(self, container_id_or_name):
         if container_id_or_name in self._container_exists:
             return {"Id": container_id_or_name, "State": {"Running": True}}
@@ -532,7 +536,12 @@ def test_real_docker_sandbox_python_network_secret_workspace_and_timeout(tmp_pat
     )
     monkeypatch.setenv("KHAOS_E2E_SECRET", secret)
     factory = VerificationWorkspaceFactory(tmp_path / "copies")
-    disposable = factory.create(source, forbidden_roots=(source,))
+    # Batch 3.1.4 §1: the container writes sandbox-output.txt to /workspace;
+    # allow it as generated output so factory.destroy() can clean it up.
+    disposable = factory.create(
+        source, forbidden_roots=(source,),
+        allowed_generated_output=("sandbox-output.txt",),
+    )
     backend = DockerVerificationSandboxBackend(
         profile=_profile(), secret_values=(secret,), host_paths=(tmp_path,),
     )
@@ -1719,6 +1728,12 @@ class _FaultMatrixBackend:
             raise self.start_error
 
     async def attach_instance(self, container_id_or_name):
+        return None, None, None
+
+    async def start_and_attach_instance(self, container_id_or_name):
+        """Batch 3.1.4 §1: combined start + attach for the fault matrix."""
+        if self.start_error:
+            raise self.start_error
         return None, None, None
 
     async def wait_instance(self, container_id_or_name):
@@ -2910,3 +2925,110 @@ def test_successful_cleanup_allows_passed(tmp_path):
     )
     assert verification_result.status == VerificationRunStatus.PASSED
     assert verification_result.failure_code == ""
+
+
+# ---------------------------------------------------------------------------
+# Batch 3.1.4 §1: Deterministic Docker output — 50-iteration stress
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_fast_exit_output_stress_50_iterations(tmp_path):
+    """§1: fast-exiting container must not lose output across 50 runs.
+
+    Runs a Python container that writes to stdout and stderr in the first
+    millisecond and exits immediately.  Repeats 50 times.  Every iteration
+    must produce identical stdout, stderr, exit code, and output digests.
+    Empty output count must be 0.
+    """
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    # Write to stdout AND stderr immediately, then exit 0.
+    (source / "fast.py").write_text(
+        "import sys\n"
+        "sys.stdout.write('fast-stdout-marker\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('fast-stderr-marker\\n')\n"
+        "sys.stderr.flush()\n"
+    )
+    factory = VerificationWorkspaceFactory(tmp_path / "stress-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    command = _docker_command("fast.py")
+
+    async def run_once():
+        return await backend.execute(command, disposable)
+
+    expected_stdout = b"fast-stdout-marker\n"
+    expected_stderr = b"fast-stderr-marker\n"
+    expected_exit = 0
+    expected_stdout_digest = hashlib.sha256(expected_stdout).hexdigest()
+    expected_stderr_digest = hashlib.sha256(expected_stderr).hexdigest()
+
+    empty_count = 0
+    results = []
+    for i in range(50):
+        result = asyncio.run(run_once())
+        results.append(result)
+        if not result.stdout:
+            empty_count += 1
+        assert result.exit_code == expected_exit, (
+            f"iteration {i}: exit_code={result.exit_code} expected={expected_exit}"
+        )
+        assert result.stdout == expected_stdout, (
+            f"iteration {i}: stdout={result.stdout!r} expected={expected_stdout!r}"
+        )
+        assert result.stderr == expected_stderr, (
+            f"iteration {i}: stderr={result.stderr!r} expected={expected_stderr!r}"
+        )
+        assert result.stdout_digest == expected_stdout_digest, (
+            f"iteration {i}: stdout_digest={result.stdout_digest} "
+            f"expected={expected_stdout_digest}"
+        )
+        assert result.stderr_digest == expected_stderr_digest, (
+            f"iteration {i}: stderr_digest={result.stderr_digest} "
+            f"expected={expected_stderr_digest}"
+        )
+        assert not result.output_truncated, f"iteration {i}: output was truncated"
+        assert not result.timed_out, f"iteration {i}: timed out"
+
+    # §1: actual empty output count must be 0.
+    assert empty_count == 0, f"empty output count must be 0, got {empty_count}"
+    # All 50 results must be byte-for-byte identical.
+    assert len({r.stdout for r in results}) == 1, "stdout varied across iterations"
+    assert len({r.stderr for r in results}) == 1, "stderr varied across iterations"
+    assert len({r.exit_code for r in results}) == 1, "exit code varied across iterations"
+    factory.destroy(disposable)
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_fast_nonzero_exit_preserves_output(tmp_path):
+    """§1: fast non-zero exit must still preserve complete output."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "fail.py").write_text(
+        "import sys\n"
+        "sys.stdout.write('pre-fail-stdout\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('pre-fail-stderr\\n')\n"
+        "sys.stderr.flush()\n"
+        "sys.exit(3)\n"
+    )
+    factory = VerificationWorkspaceFactory(tmp_path / "fail-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    command = _docker_command("fail.py")
+    result = asyncio.run(backend.execute(command, disposable))
+    assert result.exit_code == 3, f"exit_code={result.exit_code}"
+    assert b"pre-fail-stdout" in result.stdout, f"stdout={result.stdout!r}"
+    assert b"pre-fail-stderr" in result.stderr, f"stderr={result.stderr!r}"
+    assert not result.output_truncated
+    factory.destroy(disposable)

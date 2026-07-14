@@ -352,7 +352,14 @@ class DockerVerificationSandboxBackend:
         )
 
     async def start_instance(self, container_id_or_name: str) -> None:
-        """Batch 3.1.2 §1: ``docker start`` the created container."""
+        """Batch 3.1.2 §1: ``docker start`` the created container.
+
+        Batch 3.1.4 §1: this method is NOT used in the production
+        start-and-capture path — it starts the container without
+        capturing output, creating a race where fast-exiting containers
+        lose their stdout/stderr before ``attach_instance`` connects.
+        Use :meth:`start_and_attach_instance` instead.
+        """
         process = await asyncio.create_subprocess_exec(
             str(self._docker), "start", container_id_or_name,
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
@@ -369,12 +376,43 @@ class DockerVerificationSandboxBackend:
     ) -> tuple[asyncio.subprocess.Process, Any, Any]:
         """Batch 3.1.2 §1: ``docker attach`` to capture stdout/stderr.
 
+        Batch 3.1.4 §1: this method is NOT used in the production path
+        because it races with container exit.  Use
+        :meth:`start_and_attach_instance` instead.
+
         Returns (process, stdout_reader, stderr_reader).  The process
         completes when the container exits and the streams are drained.
         """
         process = await asyncio.create_subprocess_exec(
             str(self._docker), "attach", "--no-stdin",
             container_id_or_name,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        return process, process.stdout, process.stderr
+
+    async def start_and_attach_instance(
+        self, container_id_or_name: str,
+    ) -> tuple[asyncio.subprocess.Process, Any, Any]:
+        """Batch 3.1.4 §1: atomically start and attach to capture output.
+
+        Uses ``docker start --attach`` to establish the output pipe BEFORE
+        PID 1 executes, eliminating the start→attach race where
+        fast-exiting containers lose their output.
+
+        The ``--attach`` flag ensures stdout/stderr are connected in the
+        same operation that starts the container, so no byte is lost even
+        if PID 1 exits in the first millisecond.
+
+        ``stdin`` is connected to ``DEVNULL`` (equivalent to
+        ``--no-stdin``) to prevent the container from blocking on stdin.
+
+        Returns ``(process, stdout_reader, stderr_reader)``.  The process
+        completes when the container exits and the streams are drained.
+        """
+        process = await asyncio.create_subprocess_exec(
+            str(self._docker), "start", "--attach",
+            container_id_or_name,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         return process, process.stdout, process.stderr
@@ -963,16 +1001,20 @@ class DockerVerificationSandboxBackend:
         workspace_root: Path, labels: dict[str, str],
         expected_manifest_digest: str,
     ) -> tuple[str, ContainerAttestation, asyncio.subprocess.Process, Any, Any]:
-        """Batch 3.1.2 §1: create + inspect_and_attest + start + attach.
+        """Batch 3.1.2 §1: create + inspect_and_attest + start_and_attach.
+
+        Batch 3.1.4 §1: uses ``docker start --attach --no-stdin`` instead
+        of separate ``docker start`` + ``docker attach`` to eliminate the
+        output race where fast-exiting containers lose their stdout/stderr.
 
         Returns ``(container_id, attestation, attach_proc, stdout_stream,
         stderr_stream)``.  The caller MUST persist ``container_id`` and
         ``attestation`` BEFORE calling :meth:`collect_result`, so that a
         crash between launch and collect leaves a durable trail.
 
-        No project code runs during ``docker create``.  ``docker start``
-        begins the entrypoint, but the caller persists RUNNING before
-        awaiting output via :meth:`collect_result`.
+        No project code runs during ``docker create``.  ``docker start
+        --attach`` begins the entrypoint and establishes the output pipe
+        atomically — no byte is lost even if PID 1 exits immediately.
         """
         normalized = command.normalized()
         if normalized.command_digest != command.command_digest:
@@ -990,10 +1032,10 @@ class DockerVerificationSandboxBackend:
             expected_image_digest=image_digest,
             expected_manifest_digest=expected_manifest_digest,
         )
-        # 3. docker start
-        await self.start_instance(container_id)
-        # 4. docker attach to capture output
-        attach_proc, stdout_stream, stderr_stream = await self.attach_instance(container_id)
+        # 3. docker start --attach --no-stdin (atomic start + output capture)
+        attach_proc, stdout_stream, stderr_stream = (
+            await self.start_and_attach_instance(container_id)
+        )
         return container_id, attestation, attach_proc, stdout_stream, stderr_stream
 
     async def collect_result(
@@ -1008,6 +1050,16 @@ class DockerVerificationSandboxBackend:
     ) -> SandboxStepResult:
         """Batch 3.1.3 §1: wait for completion, read streams, optionally remove.
 
+        Batch 3.1.4 §1: two critical fixes:
+        1. Uses ``attach_proc.wait()`` instead of a separate ``docker wait``
+           when ``attach_proc`` is available.  ``docker start --attach``
+           returns the container's exit code as its own exit code, so there
+           is no need for a separate ``docker wait`` call that races with
+           container startup.
+        2. Streams are fully read BEFORE killing the attach process.  The
+           previous code killed ``attach_proc`` in a ``finally`` block
+           before awaiting the stream read tasks, causing output loss.
+
         Called AFTER the caller has persisted ``container_id`` and
         ``attestation_digest``.  Handles timeout, cancellation, stream
         reading.  When ``remove=True`` (default, backward compat), also
@@ -1021,7 +1073,14 @@ class DockerVerificationSandboxBackend:
         stderr_task = asyncio.create_task(
             self._read_bounded(stderr_stream, command.output_limit_bytes),
         )
-        wait_task = asyncio.create_task(self.wait_instance(container_id))
+        # Batch 3.1.4 §1: use attach_proc.wait() when available — the
+        # docker start --attach process's returncode IS the container's
+        # exit code.  This eliminates the race where docker wait returns
+        # before the container is fully started.
+        if attach_proc is not None:
+            wait_task = asyncio.create_task(attach_proc.wait())
+        else:
+            wait_task = asyncio.create_task(self.wait_instance(container_id))
         cancel_task = asyncio.create_task(cancellation.wait()) if cancellation else None
         timed_out = False
         cancelled = False
@@ -1038,15 +1097,22 @@ class DockerVerificationSandboxBackend:
                 cancelled = cancel_task in done
                 await self.terminate_instance(container_id)
             exit_code = await wait_task
+            # Batch 3.1.4 §1: read streams BEFORE killing attach_proc.
+            # The docker start --attach process holds the output pipes;
+            # killing it before draining causes output loss.
+            stdout, stdout_truncated = await stdout_task
+            stderr, stderr_truncated = await stderr_task
         finally:
             if cancel_task:
                 cancel_task.cancel()
-            try:
-                attach_proc.kill()
-            except ProcessLookupError:
-                pass
-        stdout, stdout_truncated = await stdout_task
-        stderr, stderr_truncated = await stderr_task
+            if attach_proc is not None:
+                try:
+                    attach_proc.kill()
+                except ProcessLookupError:
+                    pass
+            # Cancel stream tasks if they haven't completed (e.g. exception).
+            stdout_task.cancel()
+            stderr_task.cancel()
         stdout = self._redact(stdout)
         stderr = self._redact(stderr)
         if remove:

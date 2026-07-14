@@ -676,19 +676,19 @@ class TrustedVerificationRunner:
                         actual_image_digest=attestation.local_image_id,
                         actual_container_image_id=attestation.container_image_id,
                     )
-                    # Step 5: docker start (project code begins)
-                    await self._backend.start_instance(container_id)
+                    # Step 5: docker start --attach (atomic start + output capture)
+                    # Batch 3.1.4 §1: eliminates the start→attach race.
+                    # Output pipe is established before PID 1 executes.
+                    attach_proc, stdout_stream, stderr_stream = (
+                        await self._backend.start_and_attach_instance(container_id)
+                    )
                     # Step 6: persist RUNNING
                     self._store.update_sandbox_instance(
                         sandbox_instance_id,
                         state=SandboxInstanceState.RUNNING,
                         started_at=time.time(),
                     )
-                    # Step 7: attach to capture output
-                    attach_proc, stdout_stream, stderr_stream = (
-                        await self._backend.attach_instance(container_id)
-                    )
-                    # Step 8: collect result (remove=False — runner controls cleanup)
+                    # Step 7: collect result (remove=False — runner controls cleanup)
                     result = await self._backend.collect_result(
                         container_id=container_id, attach_proc=attach_proc,
                         stdout_stream=stdout_stream, stderr_stream=stderr_stream,
