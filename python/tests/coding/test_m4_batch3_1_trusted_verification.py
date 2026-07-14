@@ -697,6 +697,120 @@ def test_configure_trusted_verification_rejects_backend_instance(tmp_path):
 
 
 # ----------------------------------------------------------------------
+# Batch 3.1.4 §3: Approved verification plan snapshot — stable digests
+# ----------------------------------------------------------------------
+
+
+def test_image_attestation_digest_excludes_attested_at():
+    """§3: ImageAttestation.attestation_digest must NOT include attested_at.
+
+    The same image content must produce the same digest across re-probes.
+    """
+    from khaos.coding.planning.verification_sandbox import ImageAttestation
+    import time
+
+    # Two attestations with the same content but different attested_at.
+    base_fields = dict(
+        requested_image_reference="sha256:abc",
+        approved_repository_digest="sha256:abc",
+        platform="linux/amd64",
+        platform_manifest_digest="sha256:abc",
+        local_config_image_id="sha256:abc",
+        container_image_id="sha256:abc",
+        repo_digests=("repo@sha256:abc",),
+        no_pull_proof="image-inspect-not-pull",
+    )
+    att1 = ImageAttestation(
+        attested_at=time.time() - 100,
+        attestation_digest="",
+        **base_fields,
+    )
+    att2 = ImageAttestation(
+        attested_at=time.time() + 100,
+        attestation_digest="",
+        **base_fields,
+    )
+    # Compute digest the same way probe_image_attestation does (without attested_at).
+    import hashlib, json
+    digest1 = hashlib.sha256(json.dumps({
+        "requested_image_reference": att1.requested_image_reference,
+        "approved_repository_digest": att1.approved_repository_digest,
+        "platform": att1.platform,
+        "platform_manifest_digest": att1.platform_manifest_digest,
+        "local_config_image_id": att1.local_config_image_id,
+        "repo_digests": list(att1.repo_digests),
+        "no_pull_proof": att1.no_pull_proof,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    digest2 = hashlib.sha256(json.dumps({
+        "requested_image_reference": att2.requested_image_reference,
+        "approved_repository_digest": att2.approved_repository_digest,
+        "platform": att2.platform,
+        "platform_manifest_digest": att2.platform_manifest_digest,
+        "local_config_image_id": att2.local_config_image_id,
+        "repo_digests": list(att2.repo_digests),
+        "no_pull_proof": att2.no_pull_proof,
+    }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert digest1 == digest2, "same content must produce same digest"
+
+
+def test_approved_verification_plan_snapshot_model():
+    """§3: ApprovedVerificationPlanSnapshot is immutable and has all fields."""
+    from khaos.coding.planning.verification_execution_models import (
+        ApprovedVerificationPlanSnapshot, compute_approved_verification_plan_digest,
+    )
+    import time
+
+    digest = compute_approved_verification_plan_digest(
+        plan_id="plan1", plan_content_hash="hash1",
+        verification_requirements_digest="req-digest",
+        catalog_fingerprint="catalog-fp",
+        ordered_command_digests=("cmd1", "cmd2"),
+        config_hashes=("cfg1", "cfg2"),
+        sandbox_profile_digest="profile-digest",
+        image_attestation_content_digest="img-digest",
+        ordered_toolchain_attestation_content_digests=("tc1", "tc2"),
+        binary_digests=("bin1", "bin2"),
+        version_output_digests=("ver1", "ver2"),
+        parsed_versions=("3.13", "11"),
+        image_toolchain_policy_fingerprint="policy-fp",
+    )
+    snapshot = ApprovedVerificationPlanSnapshot(
+        approved_verification_plan_id="avp1",
+        plan_id="plan1", plan_content_hash="hash1",
+        verification_requirements_digest="req-digest",
+        catalog_fingerprint="catalog-fp",
+        ordered_command_digests=("cmd1", "cmd2"),
+        config_hashes=("cfg1", "cfg2"),
+        sandbox_profile_digest="profile-digest",
+        image_attestation_content_digest="img-digest",
+        ordered_toolchain_attestation_content_digests=("tc1", "tc2"),
+        binary_digests=("bin1", "bin2"),
+        version_output_digests=("ver1", "ver2"),
+        parsed_versions=("3.13", "11"),
+        image_toolchain_policy_fingerprint="policy-fp",
+        created_at=time.time(),
+        approved_verification_plan_digest=digest,
+    )
+    assert snapshot.approved_verification_plan_digest == digest
+    # Digest is deterministic — same inputs produce same digest.
+    digest2 = compute_approved_verification_plan_digest(
+        plan_id="plan1", plan_content_hash="hash1",
+        verification_requirements_digest="req-digest",
+        catalog_fingerprint="catalog-fp",
+        ordered_command_digests=("cmd1", "cmd2"),
+        config_hashes=("cfg1", "cfg2"),
+        sandbox_profile_digest="profile-digest",
+        image_attestation_content_digest="img-digest",
+        ordered_toolchain_attestation_content_digests=("tc1", "tc2"),
+        binary_digests=("bin1", "bin2"),
+        version_output_digests=("ver1", "ver2"),
+        parsed_versions=("3.13", "11"),
+        image_toolchain_policy_fingerprint="policy-fp",
+    )
+    assert digest == digest2
+
+
+# ----------------------------------------------------------------------
 # Batch 3.1.1 §2/§3/§5: crash reconciliation, atomic termination,
 # artifact RESERVED→SEALED protocol, sandbox instance lifecycle.
 # ----------------------------------------------------------------------

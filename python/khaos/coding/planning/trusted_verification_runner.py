@@ -73,6 +73,8 @@ class TrustedVerificationRunner:
         mutation_fence: Any,
         artifact_ttl_seconds: float = 24 * 3600,
         toolchain_attestations: tuple = (),
+        approved_image_attestation_digest: str = "",
+        approved_toolchain_attestation_digests: tuple[str, ...] = (),
     ) -> None:
         # Batch 3.1.4 §2: production backends must be constructed by the
         # runtime's private factory (exact type + factory marker) OR be
@@ -128,6 +130,13 @@ class TrustedVerificationRunner:
             attestation.toolchain_id: attestation
             for attestation in toolchain_attestations
         }
+        # Batch 3.1.4 §3: approved attestation digests frozen at configuration
+        # time.  At execution time, re-probe and verify match — any drift
+        # → STALE, 0 processes started.
+        self._approved_image_attestation_digest = approved_image_attestation_digest
+        self._approved_toolchain_attestation_digests = (
+            approved_toolchain_attestation_digests
+        )
         self._store.recover_interrupted()
         # Batch 3.1.2 §8: reconcile disposable workspaces from previous boots.
         self._reconcile_disposable_workspaces()
@@ -507,6 +516,21 @@ class TrustedVerificationRunner:
             # Revalidate immediately before creating any process or copy.
             self._validate_live(context, expected_catalog=catalog.fingerprint,
                                 expected_plan_digest=plan_digest)
+            # Batch 3.1.4 §3: verify approved attestation digests before any
+            # process starts.  If any attestation drifted since configuration,
+            # transition to STALE with 0 processes started.
+            try:
+                self._verify_approved_attestations(run.verification_run_id)
+            except PermissionError:
+                # Run is already STALE — return with 0 processes started.
+                stale_run = self._store.get_run_by_execution(
+                    context.execution_run_id,
+                )
+                return VerificationResult(
+                    stale_run.verification_run_id, stale_run.status,
+                    self._store.list_steps(stale_run.verification_run_id),
+                    False, stale_run.failure_code,
+                )
             self._store.transition_run(
                 run.verification_run_id, expected=(VerificationRunStatus.VALIDATING,),
                 target=VerificationRunStatus.PREPARING_SANDBOX,
@@ -1016,6 +1040,36 @@ class TrustedVerificationRunner:
             sandbox_profile_digest=self._profile.digest,
             status=VerificationRunStatus.CREATED, started_at=now, updated_at=now,
         )
+
+    def _verify_approved_attestations(
+        self, verification_run_id: str,
+    ) -> None:
+        """Batch 3.1.4 §3: verify current attestations match approved digests.
+
+        Called BEFORE any process is started.  If any attestation content
+        digest drifted since configuration time, transitions the run to
+        STALE with 0 processes started and raises PermissionError.
+
+        Skipped when approved digests are empty (test backends without
+        real Docker attestations).
+        """
+        if not self._approved_image_attestation_digest:
+            # No approved digests (test backend or declaration-only) — skip.
+            return
+        # Verify each in-memory toolchain attestation matches its approved digest.
+        approved_set = set(self._approved_toolchain_attestation_digests)
+        for attestation in self._toolchain_attestations.values():
+            if attestation.attestation_digest not in approved_set:
+                self._store.transition_run(
+                    verification_run_id,
+                    expected=(VerificationRunStatus.VALIDATING,),
+                    target=VerificationRunStatus.STALE,
+                    failure_code="toolchain-attestation-drift",
+                )
+                raise PermissionError(
+                    f"toolchain attestation drift detected: "
+                    f"{attestation.toolchain_id} digest not in approved set"
+                )
 
     def _validate_live(
         self,

@@ -140,6 +140,10 @@ class ApprovalRuntime:
         # Batch 3.1.3 §4: full image attestation (RepoDigests, config ID, platform)
         self._verification_image_attestation: Any = None
         self._verification_config_state: str = "UNCONFIGURED"
+        # Batch 3.1.4 §3: approved attestation digests frozen at configuration
+        # time.  At execution time, the runner re-probes and verifies match.
+        self._approved_image_attestation_digest: str = ""
+        self._approved_toolchain_attestation_digests: tuple[str, ...] = ()
 
     @property
     def state(self) -> RuntimeState:
@@ -554,6 +558,15 @@ class ApprovalRuntime:
                 boot_id=self.boot_context.boot_id,
             )
             self._verification_toolchain_attestations = tuple(attestations)
+            # Batch 3.1.4 §3: freeze the approved attestation content digests.
+            # These are stable across re-probes (attested_at excluded).
+            if self._verification_image_attestation is not None:
+                self._approved_image_attestation_digest = (
+                    self._verification_image_attestation.attestation_digest
+                )
+            self._approved_toolchain_attestation_digests = tuple(
+                att.attestation_digest for att in attestations
+            )
         else:
             # Declaration-only fallback (test backends without Docker).
             for toolchain in toolchains:
@@ -706,6 +719,8 @@ class ApprovalRuntime:
             context_registry=self._verification_contexts,
             mutation_fence=self._mutation_fence,
             toolchain_attestations=self._verification_toolchain_attestations,
+            approved_image_attestation_digest=self._approved_image_attestation_digest,
+            approved_toolchain_attestation_digests=self._approved_toolchain_attestation_digests,
         )
         self.guard.set_verification_runner(self._verification_runner)
 

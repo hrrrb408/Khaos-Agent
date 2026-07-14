@@ -786,6 +786,9 @@ class DockerVerificationSandboxBackend:
                 approved_repository_digest = rd.split("@", 1)[1]
                 break
         attested_at = time.time()
+        # Batch 3.1.4 §3: attestation_digest must NOT include attested_at —
+        # it's per-probe metadata that doesn't represent supply chain content.
+        # The same image must produce the same digest across re-probes.
         attestation_digest = hashlib.sha256(json.dumps({
             "requested_image_reference": image_digest,
             "approved_repository_digest": approved_repository_digest,
@@ -794,7 +797,6 @@ class DockerVerificationSandboxBackend:
             "local_config_image_id": local_config_image_id,
             "repo_digests": list(repo_digests),
             "no_pull_proof": "image-inspect-not-pull",
-            "attested_at": attested_at,
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return ImageAttestation(
             requested_image_reference=image_digest,
@@ -967,6 +969,8 @@ class DockerVerificationSandboxBackend:
         version_output_digest = f"sha256:{hashlib.sha256(version_out).hexdigest()}"
         attested_at = time.time()
         toolchain_id = f"{toolchain.language}:{toolchain.executable_id}"
+        # Batch 3.1.4 §3: attestation_digest must NOT include attested_at —
+        # it's per-probe metadata that doesn't represent supply chain content.
         attestation_digest = hashlib.sha256(json.dumps({
             "toolchain_id": toolchain_id,
             "executable_path": toolchain.absolute_path,
@@ -975,7 +979,6 @@ class DockerVerificationSandboxBackend:
             "parsed_version": parsed_version,
             "actual_image_attestation": image_digest,
             "image_attestation_digest": image_attestation_digest,
-            "attested_at": attested_at,
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return ToolchainAttestation(
             toolchain_id=toolchain_id,

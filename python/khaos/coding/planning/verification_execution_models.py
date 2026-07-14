@@ -203,6 +203,78 @@ def verification_plan_digest(
 
 
 @dataclass(frozen=True)
+class ApprovedVerificationPlanSnapshot:
+    """Batch 3.1.4 §3: immutable snapshot of the approved verification plan.
+
+    Frozen before human approval.  Contains all supply chain attestations
+    that must match at execution time.  Any drift in binary, version, image,
+    catalog, config, or profile → Verification Run → STALE, 0 processes
+    started, must re-create human Approval.
+
+    The ``approved_verification_plan_digest`` binds all fields into a single
+    immutable digest.  Attestation content digests exclude per-probe
+    metadata (``attested_at``, boot ID, random container ID) so the same
+    supply chain content produces the same digest across re-probes.
+    """
+    approved_verification_plan_id: str
+    plan_id: str
+    plan_content_hash: str
+    verification_requirements_digest: str
+    catalog_fingerprint: str
+    ordered_command_digests: tuple[str, ...]
+    config_hashes: tuple[str, ...]
+    sandbox_profile_digest: str
+    image_attestation_content_digest: str
+    ordered_toolchain_attestation_content_digests: tuple[str, ...]
+    binary_digests: tuple[str, ...]
+    version_output_digests: tuple[str, ...]
+    parsed_versions: tuple[str, ...]
+    image_toolchain_policy_fingerprint: str
+    created_at: float
+    approved_verification_plan_digest: str
+
+
+def compute_approved_verification_plan_digest(
+    *,
+    plan_id: str,
+    plan_content_hash: str,
+    verification_requirements_digest: str,
+    catalog_fingerprint: str,
+    ordered_command_digests: tuple[str, ...],
+    config_hashes: tuple[str, ...],
+    sandbox_profile_digest: str,
+    image_attestation_content_digest: str,
+    ordered_toolchain_attestation_content_digests: tuple[str, ...],
+    binary_digests: tuple[str, ...],
+    version_output_digests: tuple[str, ...],
+    parsed_versions: tuple[str, ...],
+    image_toolchain_policy_fingerprint: str,
+) -> str:
+    """Batch 3.1.4 §3: compute the immutable digest of the snapshot.
+
+    Excludes ``approved_verification_plan_id`` and ``created_at`` — these
+    are per-instance metadata that don't represent supply chain content.
+    """
+    return _digest({
+        "plan_id": plan_id,
+        "plan_content_hash": plan_content_hash,
+        "verification_requirements_digest": verification_requirements_digest,
+        "catalog_fingerprint": catalog_fingerprint,
+        "ordered_command_digests": list(ordered_command_digests),
+        "config_hashes": list(config_hashes),
+        "sandbox_profile_digest": sandbox_profile_digest,
+        "image_attestation_content_digest": image_attestation_content_digest,
+        "ordered_toolchain_attestation_content_digests": list(
+            ordered_toolchain_attestation_content_digests
+        ),
+        "binary_digests": list(binary_digests),
+        "version_output_digests": list(version_output_digests),
+        "parsed_versions": list(parsed_versions),
+        "image_toolchain_policy_fingerprint": image_toolchain_policy_fingerprint,
+    })
+
+
+@dataclass(frozen=True)
 class DisposableWorkspaceRecord:
     """Batch 3.1.2 §8: persistence row for a disposable verification workspace."""
     workspace_id: str
