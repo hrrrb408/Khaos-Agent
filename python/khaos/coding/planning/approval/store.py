@@ -579,6 +579,8 @@ class PlanApprovalStore:
         # callers cannot read or replace it.
         self.__runtime_receipt_writer = None  # type: ignore[assignment]
         self.__runtime_receipt_token = None
+        self.__verification_success_verifier = None
+        self.__authoritative_verification_reads_required = False
         # Public-only verifier registry. Unknown keys fail closed; prior-boot
         # public keys remain loadable across signing-key rotation.
         self.__receipt_verifiers: dict[str, Any] = {}
@@ -625,6 +627,20 @@ class PlanApprovalStore:
     def _has_runtime_receipt_writer(self) -> bool:
         """Test-only introspection: does a writer exist?"""
         return self.__runtime_receipt_writer is not None  # type: ignore[attr-defined]
+
+    def _install_verification_success_verifier(self, verifier: Any) -> None:
+        """Install Runtime-owned validation for authoritative VERIFIED reads."""
+        if self.__verification_success_verifier is not None:
+            if self.__verification_success_verifier == verifier:
+                return
+            raise PermissionError("verification success verifier already installed")
+        self.__verification_success_verifier = verifier
+
+    def _require_authoritative_verification_reads(self) -> None:
+        self.__authoritative_verification_reads_required = True
+
+    def _reset_verification_success_verifier(self) -> None:
+        self.__verification_success_verifier = None
 
     def _persist_receipt_verifier(self, verifier: Any, *, runtime_token: object) -> None:
         """Persist public verification material only."""
@@ -3695,6 +3711,15 @@ class PlanApprovalStore:
             "SELECT * FROM plan_execution_runs WHERE execution_run_id=?",
             (execution_run_id,),
         ).fetchone()
+        if row is not None and row["status"] == "verified":
+            verifier = self.__verification_success_verifier
+            if verifier is None:
+                if self.__authoritative_verification_reads_required:
+                    raise PermissionError(
+                        "VERIFIED execution cannot be trusted without authority"
+                    )
+            else:
+                verifier(execution_run_id)
         return self._row_to_execution_run(row) if row is not None else None
 
     def list_incomplete_execution_runs(self) -> tuple[Any, ...]:

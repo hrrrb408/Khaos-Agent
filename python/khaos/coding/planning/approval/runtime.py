@@ -275,6 +275,7 @@ class ApprovalRuntime:
         self._verification_cancel_events: dict[str, Any] = {}
         self._verification_runner: Any = None
         self._verification_store: Any = None
+        self._verification_write_authority: Any = None
         self._verification_toolchain_attestations: tuple = ()
         self._verification_actual_image_id: str = ""
         # Batch 3.1.3 §4: full image attestation (RepoDigests, config ID, platform)
@@ -301,6 +302,7 @@ class ApprovalRuntime:
         """
         if self.ready:
             raise RuntimeError("approval runtime is already initialized — call shutdown() first")
+        self._store._require_authoritative_verification_reads()
         self._state = RuntimeState.ROTATING
         try:
             # 1. Rotate epoch (generates fresh boot_id, revokes old auths/leases)
@@ -648,6 +650,20 @@ class ApprovalRuntime:
             profile=profile,
         )
 
+    def _revoke_verification_write_authority(self) -> None:
+        authority = self._verification_write_authority
+        if authority is None:
+            return
+        from khaos.coding.planning.verification_authority import (
+            VERIFICATION_AUTHORITIES,
+        )
+        VERIFICATION_AUTHORITIES.revoke(
+            self._runtime_authority_id, self.boot_context.boot_id,
+        )
+        self._store._reset_verification_success_verifier()
+        self._verification_write_authority = None
+        self._verification_store = None
+
     def _configure_trusted_verification_internal(
         self, *, backend: Any, command_factory: Any, workspace_factory: Any,
         artifact_root: Any, profile: Any, artifact_capability: Any = None,
@@ -712,12 +728,23 @@ class ApprovalRuntime:
         # Initialize the verification store early so attestation rows can
         # be persisted before sandbox reconciliation runs.
         self._verification_store = VerificationExecutionStore(self._store)
+        from khaos.coding.planning.verification_authority import (
+            VERIFICATION_AUTHORITIES,
+        )
+        self._verification_write_authority = VERIFICATION_AUTHORITIES.issue(
+            self._store._conn, runtime_id=self._runtime_authority_id,
+            boot_id=self.boot_context.boot_id,
+        )
+        self._verification_store.bind_write_authority(
+            self._verification_write_authority,
+        )
         toolchains = tuple(getattr(command_factory, "_tools", {}).values())
         # Batch 3.1.3 §5: production declaration-only fallback is forbidden.
         # DockerVerificationSandboxBackend must have attest_toolchains.
         is_production_docker = isinstance(backend, DockerVerificationSandboxBackend)
         attest_toolchains = getattr(backend, "attest_toolchains", None)
         if is_production_docker and not callable(attest_toolchains):
+            self._revoke_verification_write_authority()
             self._verification_config_state = "UNCONFIGURED"
             raise RuntimeError(
                 "production DockerVerificationSandboxBackend must provide "
@@ -755,6 +782,7 @@ class ApprovalRuntime:
                         )
                     )).result()
             except Exception as exc:
+                self._revoke_verification_write_authority()
                 self._verification_config_state = "UNCONFIGURED"
                 raise RuntimeError(
                     f"trusted verification toolchain attestation failed: {exc}"
@@ -788,12 +816,14 @@ class ApprovalRuntime:
             # Declaration-only fallback (test backends without Docker).
             for toolchain in toolchains:
                 if toolchain.image_digest != profile.image_digest:
+                    self._revoke_verification_write_authority()
                     self._verification_config_state = "UNCONFIGURED"
                     raise RuntimeError(
                         f"toolchain {toolchain.language}:{toolchain.executable_id} "
                         f"image mismatch: {toolchain.image_digest} != {profile.image_digest}"
                     )
                 if toolchain.binary_digest and not toolchain.binary_digest.startswith("sha256:"):
+                    self._revoke_verification_write_authority()
                     self._verification_config_state = "UNCONFIGURED"
                     raise RuntimeError(
                         f"toolchain {toolchain.language}:{toolchain.executable_id} "
@@ -957,22 +987,30 @@ class ApprovalRuntime:
 
         # Batch 3.1.1 §8: READY
         self._verification_config_state = "READY"
-        self._verification_runner = TrustedVerificationRunner(
-            approval_store=self._store, plan_repository=self._plan_repository,
-            workspace_manager=self._workspace_manager,
-            context_provider=self._context_provider, backend=backend,
-            command_factory=command_factory, workspace_factory=workspace_factory,
-            artifact_root=artifact_root, profile=profile,
-            runtime_boot=self.boot_context,
-            context_registry=self._verification_contexts,
-            mutation_fence=self._mutation_fence,
-            toolchain_attestations=self._verification_toolchain_attestations,
-            approved_image_attestation_digest=self._approved_image_attestation_digest,
-            approved_toolchain_attestation_digests=self._approved_toolchain_attestation_digests,
-            image_attestation=self._verification_image_attestation,
-            artifact_capability=artifact_capability,
-            snapshot_capability=snapshot_capability,
-        )
+        try:
+            self._verification_runner = TrustedVerificationRunner(
+                approval_store=self._store,
+                plan_repository=self._plan_repository,
+                workspace_manager=self._workspace_manager,
+                context_provider=self._context_provider, backend=backend,
+                command_factory=command_factory,
+                workspace_factory=workspace_factory,
+                artifact_root=artifact_root, profile=profile,
+                runtime_boot=self.boot_context,
+                context_registry=self._verification_contexts,
+                mutation_fence=self._mutation_fence,
+                toolchain_attestations=self._verification_toolchain_attestations,
+                approved_image_attestation_digest=self._approved_image_attestation_digest,
+                approved_toolchain_attestation_digests=self._approved_toolchain_attestation_digests,
+                image_attestation=self._verification_image_attestation,
+                artifact_capability=artifact_capability,
+                snapshot_capability=snapshot_capability,
+                verification_store=self._verification_store,
+            )
+        except Exception:
+            self._verification_config_state = "UNCONFIGURED"
+            self._revoke_verification_write_authority()
+            raise
         self.guard.set_verification_runner(self._verification_runner)
         # Batch 3.1.5 §2: wire the VerificationSnapshotProvider into the
         # approval service so request_approval() computes and persists the
@@ -1096,6 +1134,8 @@ class ApprovalRuntime:
                 self._verification_store.invalidate_phase_leases(
                     boot_id=self.boot_context.boot_id,
                 )
+            if self._verification_write_authority is not None:
+                self._revoke_verification_write_authority()
             self._store.rotate_epoch()
             # Clear runtime writer bindings; public verifiers are durable.
             try:

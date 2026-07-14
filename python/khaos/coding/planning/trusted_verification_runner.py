@@ -79,6 +79,7 @@ class TrustedVerificationRunner:
         image_attestation: Any = None,
         artifact_capability: Any = None,
         snapshot_capability: Any = None,
+        verification_store: VerificationExecutionStore | None = None,
     ) -> None:
         # Batch 3.1.4 §2: production backends must be constructed by the
         # runtime's private factory (exact type + factory marker) OR be
@@ -111,7 +112,13 @@ class TrustedVerificationRunner:
         # _verify_approved_attestations instead of short-circuiting at the
         # snapshot gate.
         self._is_unsafe_test_backend = is_unsafe_test
-        self._store = VerificationExecutionStore(approval_store)
+        self._store = verification_store or VerificationExecutionStore(
+            approval_store,
+        )
+        if not is_unsafe_test and not self._store.has_write_authority:
+            raise PermissionError(
+                "production trusted verification requires write authority"
+            )
         self._approval_store = approval_store
         self._plans = plan_repository
         self._workspaces = workspace_manager

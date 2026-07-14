@@ -505,3 +505,23 @@ BEGIN SELECT RAISE(ABORT, 'verification cleanup proof is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_vcp_immutable_delete
 BEFORE DELETE ON verification_cleanup_proofs
 BEGIN SELECT RAISE(ABORT, 'verification cleanup proof cannot be deleted'); END;
+
+CREATE TABLE IF NOT EXISTS verification_success_evidence (
+    verification_run_id TEXT PRIMARY KEY,
+    execution_run_id TEXT NOT NULL UNIQUE,
+    cleanup_proof_id TEXT NOT NULL UNIQUE,
+    cleanup_digest TEXT NOT NULL,
+    authority_instance_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    boot_id TEXT NOT NULL,
+    payload_digest TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_vse_immutable_update
+BEFORE UPDATE ON verification_success_evidence
+BEGIN SELECT RAISE(ABORT, 'verification success evidence is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_vse_immutable_delete
+BEFORE DELETE ON verification_success_evidence
+BEGIN SELECT RAISE(ABORT, 'verification success evidence cannot be deleted'); END;
