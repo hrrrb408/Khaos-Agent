@@ -4130,3 +4130,201 @@ def test_approval_request_persists_snapshot_fields(tmp_path):
     assert loaded is not None
     assert loaded.approved_verification_plan_id == "avp-snap-1"
     assert loaded.approved_verification_plan_digest == "snap-digest-1"
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.5 §3: Toolchain Attestation Sandbox Instance Persistence
+# ----------------------------------------------------------------------
+
+
+def test_sandbox_instance_kind_enum_exists():
+    """§3: SandboxInstanceKind enum exists with verification and toolchain-attestation."""
+    from khaos.coding.planning.verification_sandbox_instance import (
+        SandboxInstanceKind,
+    )
+    assert SandboxInstanceKind.VERIFICATION.value == "verification"
+    assert SandboxInstanceKind.TOOLCHAIN_ATTESTATION.value == "toolchain-attestation"
+
+
+def test_verification_sandbox_instance_has_toolchain_fields():
+    """§3: VerificationSandboxInstance has instance_kind, toolchain_id,
+    probe_ordinal, image_attestation_digest fields."""
+    instance = VerificationSandboxInstance(
+        sandbox_instance_id="vsi_test",
+        verification_run_id="",
+        step_run_id="",
+        backend_id="docker-verification",
+        backend_instance_name="khaos-verify-test",
+        runtime_epoch=1,
+        boot_id="boot-1",
+        image_reference="python@sha256:abc",
+        expected_image_digest="sha256:abc",
+        instance_kind="toolchain-attestation",
+        toolchain_id="python:python",
+        probe_ordinal=2,
+        image_attestation_digest="img-attest-digest",
+    )
+    assert instance.instance_kind == "toolchain-attestation"
+    assert instance.toolchain_id == "python:python"
+    assert instance.probe_ordinal == 2
+    assert instance.image_attestation_digest == "img-attest-digest"
+    # Default is verification
+    default_instance = VerificationSandboxInstance(
+        sandbox_instance_id="vsi_default",
+        verification_run_id="run-1",
+        step_run_id="step-1",
+        backend_id="docker-verification",
+        backend_instance_name="khaos-verify",
+        runtime_epoch=1,
+        boot_id="boot-1",
+        image_reference="python@sha256:abc",
+        expected_image_digest="sha256:abc",
+    )
+    assert default_instance.instance_kind == "verification"
+    assert default_instance.toolchain_id == ""
+    assert default_instance.probe_ordinal == 0
+    assert default_instance.image_attestation_digest == ""
+
+
+def test_toolchain_attestation_labels_full_set():
+    """§3: build_toolchain_attestation_labels produces the full label set
+    required for cross-boot attribution."""
+    backend = DockerVerificationSandboxBackend.__new__(
+        DockerVerificationSandboxBackend
+    )
+    labels = backend.build_toolchain_attestation_labels(
+        instance_id="vsi_test",
+        boot_id="boot-abc",
+        image_attestation_digest="sha256:img-attest",
+        toolchain_id="python:python",
+        probe_ordinal=1,
+    )
+    assert labels["khaos.kind"] == "toolchain-attestation"
+    assert labels["khaos.sandbox-instance-id"] == "vsi_test"
+    assert labels["khaos.boot-id"] == "boot-abc"
+    assert labels["khaos.image-attestation-digest"] == "sha256:img-attest"
+    assert labels["khaos.toolchain-id"] == "python:python"
+    assert labels["khaos.probe-ordinal"] == "1"
+
+
+def test_persist_and_load_toolchain_attestation_sandbox_instance(tmp_path):
+    """§3: toolchain-attestation sandbox instances persist and load with all
+    new fields through the unified verification_sandbox_instances table."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    approval_store = PlanApprovalStore(conn)
+    store = VerificationExecutionStore(approval_store)
+    instance = VerificationSandboxInstance(
+        sandbox_instance_id="vsi_tc_1",
+        verification_run_id="",
+        step_run_id="",
+        backend_id="docker-verification",
+        backend_instance_name="khaos-verify-tc-1",
+        runtime_epoch=1,
+        boot_id="boot-tc-1",
+        image_reference="python@sha256:abc",
+        expected_image_digest="sha256:abc",
+        state=SandboxInstanceState.PREPARED,
+        instance_kind="toolchain-attestation",
+        toolchain_id="python:python",
+        probe_ordinal=0,
+        image_attestation_digest="img-attest-digest-1",
+    )
+    store.create_sandbox_instance(instance)
+    loaded = store.get_sandbox_instance("vsi_tc_1")
+    assert loaded is not None
+    assert loaded.instance_kind == "toolchain-attestation"
+    assert loaded.toolchain_id == "python:python"
+    assert loaded.probe_ordinal == 0
+    assert loaded.image_attestation_digest == "img-attest-digest-1"
+    # list_active_sandbox_instances includes toolchain-attestation instances.
+    active = store.list_active_sandbox_instances()
+    assert any(i.sandbox_instance_id == "vsi_tc_1" for i in active)
+    conn.close()
+
+
+def test_reconcile_toolchain_attestation_instance_atomic(tmp_path):
+    """§3: toolchain-attestation instances reconcile atomically without
+    requiring step/run/execution terminal transitions (unlike verification
+    instances)."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    approval_store = PlanApprovalStore(conn)
+    store = VerificationExecutionStore(approval_store)
+    instance = VerificationSandboxInstance(
+        sandbox_instance_id="vsi_tc_reconcile",
+        verification_run_id="",
+        step_run_id="",
+        backend_id="docker-verification",
+        backend_instance_name="khaos-verify-tc-recon",
+        runtime_epoch=1,
+        boot_id="boot-old",
+        image_reference="python@sha256:abc",
+        expected_image_digest="sha256:abc",
+        state=SandboxInstanceState.RUNNING,
+        instance_kind="toolchain-attestation",
+        toolchain_id="python:python",
+        probe_ordinal=1,
+        image_attestation_digest="img-attest",
+    )
+    store.create_sandbox_instance(instance)
+    # Simulate cross-boot reconciliation: container confirmed terminated.
+    store.reconcile_toolchain_attestation_instance_atomic(
+        sandbox_instance_id="vsi_tc_reconcile",
+        instance_state=SandboxInstanceState.ORPHANED_CLEANED,
+        failure_code="crash-reconciled",
+    )
+    loaded = store.get_sandbox_instance("vsi_tc_reconcile")
+    assert loaded is not None
+    assert loaded.state == SandboxInstanceState.ORPHANED_CLEANED
+    assert loaded.failure_code == "crash-reconciled"
+    assert loaded.terminated_at is not None
+    conn.close()
+
+
+def test_sandbox_instance_migration_adds_kind_columns(tmp_path):
+    """§3: existing databases without instance_kind/toolchain_id/probe_ordinal/
+    image_attestation_digest columns get them added via migration."""
+    conn = sqlite3.connect(":memory:", check_same_thread=False)
+    # Create the table without the new columns (simulating an old DB).
+    conn.executescript("""
+        CREATE TABLE verification_sandbox_instances (
+            sandbox_instance_id TEXT PRIMARY KEY,
+            verification_run_id TEXT NOT NULL,
+            step_run_id TEXT NOT NULL,
+            backend_id TEXT NOT NULL,
+            backend_instance_name TEXT NOT NULL,
+            runtime_epoch INTEGER NOT NULL,
+            boot_id TEXT NOT NULL,
+            image_reference TEXT NOT NULL,
+            expected_image_digest TEXT NOT NULL,
+            actual_image_digest TEXT NOT NULL DEFAULT '',
+            actual_container_image_id TEXT NOT NULL DEFAULT '',
+            workspace_manifest_digest TEXT NOT NULL DEFAULT '',
+            container_id TEXT NOT NULL DEFAULT '',
+            attestation_digest TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL DEFAULT 'prepared',
+            created_at REAL NOT NULL,
+            started_at REAL,
+            terminated_at REAL,
+            cleanup_status TEXT NOT NULL DEFAULT '',
+            failure_code TEXT NOT NULL DEFAULT '',
+            metadata_json TEXT NOT NULL DEFAULT '{}'
+        );
+        INSERT INTO verification_sandbox_instances VALUES (
+            'vsi_old', 'run-1', 'step-1', 'docker-verification',
+            'khaos-verify-old', 1, 'boot-old', 'python@sha256:abc',
+            'sha256:abc', '', '', '', '', '', 'terminated',
+            0, NULL, NULL, '', '', '{}'
+        );
+    """)
+    conn.commit()
+    approval_store = PlanApprovalStore(conn)
+    # The store constructor should trigger the migration.
+    store = VerificationExecutionStore(approval_store)
+    # Old row should still be readable and default to verification kind.
+    loaded = store.get_sandbox_instance("vsi_old")
+    assert loaded is not None
+    assert loaded.instance_kind == "verification"
+    assert loaded.toolchain_id == ""
+    assert loaded.probe_ordinal == 0
+    assert loaded.image_attestation_digest == ""
+    conn.close()

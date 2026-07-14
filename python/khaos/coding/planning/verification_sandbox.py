@@ -292,6 +292,27 @@ class DockerVerificationSandboxBackend:
             "khaos.manifest-digest": manifest_digest[:63],
         }
 
+    def build_toolchain_attestation_labels(
+        self, *, instance_id: str, boot_id: str,
+        image_attestation_digest: str, toolchain_id: str,
+        probe_ordinal: int,
+    ) -> dict[str, str]:
+        """Batch 3.1.5 §3: build the full label set for a toolchain-attestation
+        container.
+
+        Every label is required so cross-boot reconciliation can attribute the
+        container to a specific probe of a specific toolchain under a specific
+        image attestation.  Missing any label is an ownership mismatch.
+        """
+        return {
+            "khaos.kind": "toolchain-attestation",
+            "khaos.sandbox-instance-id": instance_id,
+            "khaos.boot-id": boot_id,
+            "khaos.image-attestation-digest": image_attestation_digest[:63],
+            "khaos.toolchain-id": toolchain_id[:63],
+            "khaos.probe-ordinal": str(probe_ordinal),
+        }
+
     def _build_create_args(
         self, *, instance_name: str, image_digest: str,
         command: TrustedVerificationCommand,
@@ -1024,29 +1045,77 @@ class DockerVerificationSandboxBackend:
     async def _run_attestation_command(
         self, *, image_digest: str, argv: tuple[str, ...],
         timeout_seconds: float = 30.0,
+        toolchain_id: str = "",
+        probe_ordinal: int = 0,
+        image_attestation_digest: str = "",
     ) -> tuple[int, bytes, bytes]:
-        """Batch 3.1.4 §5: run a persistent attestation container and capture output.
+        """Batch 3.1.4 §5 / Batch 3.1.5 §3: run a persistent attestation
+        container and capture output.
 
-        Replaces the previous ``docker run --rm`` with the same persistent
-        lifecycle as verification containers:
-        create → start --attach → collect → terminate → remove.
+        Batch 3.1.5 §3: when ``_verification_store`` and ``_boot_context`` are
+        set (production runtime), the full durable lifecycle is persisted:
+
+            PREPARED → docker create → inspect image/labels
+            → durable actual container ID → CREATED_ATTESTED
+            → start --attach → RUNNING → capture
+            → terminate/remove → absence proof → TERMINATED
 
         The container has:
         - No Workspace mount (can only read the image's own filesystem)
         - network=none
         - read-only root
         - No host credentials
-        - kind=toolchain-attestation label for crash-recovery identification
+        - Full toolchain-attestation label set for cross-boot attribution
 
         The container is always terminated and removed after output is
-        captured, even on timeout.  This ensures no ``--rm`` containers
-        linger if the runtime crashes mid-attestation.
+        captured, even on timeout.  The attestation result is only durable
+        after the container absence proof (TERMINATED state persisted).
         """
         instance_name = self.generate_instance_name()
-        labels = {
-            "khaos.kind": "toolchain-attestation",
-            "khaos.image": image_digest[:63],
-        }
+        labels = self.build_toolchain_attestation_labels(
+            instance_id="",  # filled below after ID generation
+            boot_id="",
+            image_attestation_digest=image_attestation_digest,
+            toolchain_id=toolchain_id,
+            probe_ordinal=probe_ordinal,
+        )
+        store = getattr(self, "_verification_store", None)
+        boot = getattr(self, "_boot_context", None)
+        image_attestation = getattr(self, "_image_attestation", None)
+        use_persistent = store is not None and boot is not None
+        sandbox_instance_id = ""
+        if use_persistent:
+            # Batch 3.1.5 §3: persist PREPARED row BEFORE docker create.
+            import secrets as _sec
+            import time as _time
+            from khaos.coding.planning.verification_sandbox_instance import (
+                SandboxInstanceState, VerificationSandboxInstance,
+            )
+            sandbox_instance_id = f"vsi_{_sec.token_hex(12)}"
+            labels = self.build_toolchain_attestation_labels(
+                instance_id=sandbox_instance_id,
+                boot_id=boot.boot_id,
+                image_attestation_digest=image_attestation_digest,
+                toolchain_id=toolchain_id,
+                probe_ordinal=probe_ordinal,
+            )
+            instance = VerificationSandboxInstance(
+                sandbox_instance_id=sandbox_instance_id,
+                verification_run_id="",
+                step_run_id="",
+                backend_id=getattr(self, "BACKEND_ID", "docker-verification"),
+                backend_instance_name=instance_name,
+                runtime_epoch=boot.server_epoch,
+                boot_id=boot.boot_id,
+                image_reference=image_digest,
+                expected_image_digest=image_digest,
+                state=SandboxInstanceState.PREPARED,
+                instance_kind="toolchain-attestation",
+                toolchain_id=toolchain_id,
+                probe_ordinal=probe_ordinal,
+                image_attestation_digest=image_attestation_digest,
+            )
+            store.create_sandbox_instance(instance)
         args = [
             str(self._docker), "create", "--pull=never", "--name", instance_name,
             "--network", "none", "--read-only",
@@ -1064,19 +1133,96 @@ class DockerVerificationSandboxBackend:
         )
         create_stdout, create_stderr = await create_proc.communicate()
         if create_proc.returncode != 0:
+            if use_persistent:
+                from khaos.coding.planning.verification_sandbox_instance import (
+                    SandboxInstanceState,
+                )
+                store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.TERMINATED,
+                    failure_code="docker-create-failed",
+                    terminated_at=_time.time(),
+                )
             raise RuntimeError(
                 f"attestation docker create failed (exit {create_proc.returncode}): "
                 f"{create_stderr.decode('utf-8', 'replace')}"
             )
         container_id = create_stdout.decode("utf-8", "replace").strip()
         if not container_id:
+            if use_persistent:
+                from khaos.coding.planning.verification_sandbox_instance import (
+                    SandboxInstanceState,
+                )
+                store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.TERMINATED,
+                    failure_code="docker-create-no-id",
+                    terminated_at=_time.time(),
+                )
             raise RuntimeError("attestation docker create produced no container ID")
+        if use_persistent:
+            # Batch 3.1.5 §3: inspect image/labels → durable actual container
+            # ID → CREATED_ATTESTED.  Verify the container's image matches the
+            # approved local_config_image_id and all expected labels are present.
+            from khaos.coding.planning.verification_sandbox_instance import (
+                SandboxInstanceState,
+            )
+            import time as _t
+            try:
+                info = await self.inspect_instance(container_id)
+                if info is None:
+                    raise RuntimeError("attestation container inspect returned None")
+                actual_image = info.get("Image", "")
+                container_labels = info.get("Config", {}).get("Labels", {}) or {}
+                for lk, lv in labels.items():
+                    if container_labels.get(lk) != lv:
+                        raise RuntimeError(
+                            f"attestation container label mismatch: "
+                            f"{lk} expected={lv!r} actual={container_labels.get(lk)!r}"
+                        )
+                if image_attestation is not None:
+                    approved_id = getattr(image_attestation, "local_config_image_id", "")
+                    if approved_id and actual_image != approved_id:
+                        raise RuntimeError(
+                            f"attestation container image mismatch: "
+                            f"actual={actual_image!r} approved={approved_id!r}"
+                        )
+            except Exception:
+                # Inspect failed — clean up via persistent lifecycle.
+                try:
+                    await self.terminate_and_remove_instance(container_id)
+                except Exception:
+                    pass
+                store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.CLEANUP_FAILED,
+                    failure_code="attestation-inspect-mismatch",
+                )
+                raise
+            # Persist CREATED_ATTESTED with the durable container ID.
+            store.persist_created_instance(
+                sandbox_instance_id,
+                container_id=container_id,
+                attestation_digest="",
+                actual_image_digest=actual_image,
+                actual_container_image_id=actual_image,
+            )
         # Batch 3.1.4 §1/§5: docker start --attach captures output atomically.
         attach_proc = await asyncio.create_subprocess_exec(
             str(self._docker), "start", "--attach", container_id,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
+        if use_persistent:
+            from khaos.coding.planning.verification_sandbox_instance import (
+                SandboxInstanceState,
+            )
+            import time as _t2
+            store.update_sandbox_instance(
+                sandbox_instance_id,
+                state=SandboxInstanceState.RUNNING,
+                started_at=_t2.time(),
+            )
         try:
             stdout, stderr = await asyncio.wait_for(
                 attach_proc.communicate(), timeout=timeout_seconds,
@@ -1088,13 +1234,62 @@ class DockerVerificationSandboxBackend:
             except ProcessLookupError:
                 pass
             # Batch 3.1.4 §5: terminate and remove the container on timeout.
-            await self.terminate_and_remove_instance(container_id)
+            _, removed_ok = await self.terminate_and_remove_instance(container_id)
+            if use_persistent:
+                from khaos.coding.planning.verification_sandbox_instance import (
+                    SandboxInstanceState,
+                )
+                import time as _t3
+                if removed_ok:
+                    store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.TERMINATED,
+                        terminated_at=_t3.time(),
+                        failure_code="attestation-timeout",
+                    )
+                else:
+                    store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.CLEANUP_FAILED,
+                        failure_code="attestation-timeout-cleanup-failed",
+                    )
             raise RuntimeError(
                 f"attestation container timed out: argv={argv}"
             )
         # Batch 3.1.4 §5: always terminate and remove the container after
         # output is captured.  No --rm containers — persistent lifecycle.
-        await self.terminate_and_remove_instance(container_id)
+        _, removed_ok = await self.terminate_and_remove_instance(container_id)
+        if use_persistent:
+            from khaos.coding.planning.verification_sandbox_instance import (
+                SandboxInstanceState,
+            )
+            import time as _t4
+            # Batch 3.1.5 §3: absence proof — only persist TERMINATED after
+            # terminate_and_remove_instance confirms the container is gone.
+            if removed_ok:
+                store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.TERMINATED,
+                    terminated_at=_t4.time(),
+                )
+            else:
+                # Absence proof failed — try confirm_instance_gone as fallback.
+                try:
+                    gone = await self.confirm_instance_gone(container_id)
+                except Exception:
+                    gone = False
+                if gone:
+                    store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.TERMINATED,
+                        terminated_at=_t4.time(),
+                    )
+                else:
+                    store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.CLEANUP_FAILED,
+                        failure_code="attestation-cleanup-failed",
+                    )
         return exit_code, stdout, stderr
 
     async def attest_toolchain(
@@ -1122,12 +1317,17 @@ class DockerVerificationSandboxBackend:
             raise RuntimeError(
                 f"toolchain {toolchain.executable_id} has no fixed version argv"
             )
+        # Batch 3.1.5 §3: toolchain_id is needed for persistent instance labels.
+        toolchain_id = f"{toolchain.language}:{toolchain.executable_id}"
         # 1. Compute binary SHA-256 using sha256sum inside the container.
         #    sha256sum is part of coreutils and present in most images;
         #    if absent, attestation fails closed.
         digest_rc, digest_out, digest_err = await self._run_attestation_command(
             image_digest=image_digest,
             argv=("sha256sum", toolchain.absolute_path),
+            toolchain_id=toolchain_id,
+            probe_ordinal=0,
+            image_attestation_digest=image_attestation_digest,
         )
         if digest_rc != 0:
             raise RuntimeError(
@@ -1150,6 +1350,9 @@ class DockerVerificationSandboxBackend:
         test_rc, _, _ = await self._run_attestation_command(
             image_digest=image_digest,
             argv=("test", "-f", toolchain.absolute_path),
+            toolchain_id=toolchain_id,
+            probe_ordinal=1,
+            image_attestation_digest=image_attestation_digest,
         )
         if test_rc != 0:
             raise RuntimeError(
@@ -1160,6 +1363,9 @@ class DockerVerificationSandboxBackend:
         version_rc, version_out, version_err = await self._run_attestation_command(
             image_digest=image_digest,
             argv=(toolchain.absolute_path, *version_argv),
+            toolchain_id=toolchain_id,
+            probe_ordinal=2,
+            image_attestation_digest=image_attestation_digest,
         )
         if version_rc != 0:
             raise RuntimeError(
@@ -1176,7 +1382,6 @@ class DockerVerificationSandboxBackend:
             )
         version_output_digest = f"sha256:{hashlib.sha256(version_out).hexdigest()}"
         attested_at = time.time()
-        toolchain_id = f"{toolchain.language}:{toolchain.executable_id}"
         # Batch 3.1.4 §3: attestation_digest must NOT include attested_at —
         # it's per-probe metadata that doesn't represent supply chain content.
         attestation_digest = hashlib.sha256(json.dumps({

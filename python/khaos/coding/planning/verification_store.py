@@ -83,7 +83,11 @@ CREATE TABLE IF NOT EXISTS verification_sandbox_instances (
  terminated_at REAL,
  cleanup_status TEXT NOT NULL DEFAULT '',
  failure_code TEXT NOT NULL DEFAULT '',
- metadata_json TEXT NOT NULL DEFAULT '{}'
+ metadata_json TEXT NOT NULL DEFAULT '{}',
+ instance_kind TEXT NOT NULL DEFAULT 'verification',
+ toolchain_id TEXT NOT NULL DEFAULT '',
+ probe_ordinal INTEGER NOT NULL DEFAULT 0,
+ image_attestation_digest TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS ix_vsi_boot_state
 ON verification_sandbox_instances(boot_id, state);
@@ -161,6 +165,9 @@ class VerificationExecutionStore:
         # Batch 3.1.3 §5: add image_attestation_digest column to existing
         # databases (CREATE TABLE IF NOT EXISTS won't add columns).
         self._migrate_image_attestation_digest()
+        # Batch 3.1.5 §3: add instance_kind / toolchain_id / probe_ordinal /
+        # image_attestation_digest columns to verification_sandbox_instances.
+        self._migrate_sandbox_instance_kind()
 
     def _migrate_image_attestation_digest(self) -> None:
         """Add image_attestation_digest column if absent (Batch 3.1.3 §5)."""
@@ -174,6 +181,52 @@ class VerificationExecutionStore:
                 "ADD COLUMN image_attestation_digest TEXT NOT NULL DEFAULT ''"
             )
             self._conn.commit()
+
+    def _migrate_sandbox_instance_kind(self) -> None:
+        """Batch 3.1.5 §3: add instance_kind and toolchain-attestation columns
+        to verification_sandbox_instances if absent."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute(
+                "PRAGMA table_info(verification_sandbox_instances)"
+            )
+        }
+        added = False
+        if "instance_kind" not in cols:
+            self._conn.execute(
+                "ALTER TABLE verification_sandbox_instances "
+                "ADD COLUMN instance_kind TEXT NOT NULL DEFAULT 'verification'"
+            )
+            added = True
+        if "toolchain_id" not in cols:
+            self._conn.execute(
+                "ALTER TABLE verification_sandbox_instances "
+                "ADD COLUMN toolchain_id TEXT NOT NULL DEFAULT ''"
+            )
+            added = True
+        if "probe_ordinal" not in cols:
+            self._conn.execute(
+                "ALTER TABLE verification_sandbox_instances "
+                "ADD COLUMN probe_ordinal INTEGER NOT NULL DEFAULT 0"
+            )
+            added = True
+        if "image_attestation_digest" not in cols:
+            self._conn.execute(
+                "ALTER TABLE verification_sandbox_instances "
+                "ADD COLUMN image_attestation_digest TEXT NOT NULL DEFAULT ''"
+            )
+            added = True
+        if added:
+            self._conn.commit()
+        # Batch 3.1.5 §3: index on (instance_kind, state) for filtering
+        # toolchain-attestation instances during reconciliation.  Created
+        # here (not in _SCHEMA) so old databases without the column don't
+        # fail during executescript.
+        self._conn.execute(
+            "CREATE INDEX IF NOT EXISTS ix_vsi_kind_state "
+            "ON verification_sandbox_instances(instance_kind, state)"
+        )
+        self._conn.commit()
 
     def create_run(self, run: VerificationExecutionRun) -> tuple[VerificationExecutionRun, bool]:
         existing = self.get_run_by_execution(run.execution_run_id)
@@ -520,7 +573,7 @@ class VerificationExecutionStore:
         try:
             self._conn.execute(
                 "INSERT INTO verification_sandbox_instances VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (instance.sandbox_instance_id, instance.verification_run_id,
                  instance.step_run_id, instance.backend_id,
                  instance.backend_instance_name, instance.runtime_epoch,
@@ -532,7 +585,9 @@ class VerificationExecutionStore:
                  instance.state.value, instance.created_at, instance.started_at,
                  instance.terminated_at, instance.cleanup_status,
                  instance.failure_code,
-                 json.dumps(instance.metadata, sort_keys=True, separators=(",", ":"))),
+                 json.dumps(instance.metadata, sort_keys=True, separators=(",", ":")),
+                 instance.instance_kind, instance.toolchain_id,
+                 instance.probe_ordinal, instance.image_attestation_digest),
             )
             self._conn.commit()
         except Exception:
@@ -692,6 +747,7 @@ class VerificationExecutionStore:
 
     @staticmethod
     def _row_to_instance(row: sqlite3.Row) -> VerificationSandboxInstance:
+        keys = set(row.keys())
         return VerificationSandboxInstance(
             sandbox_instance_id=row["sandbox_instance_id"],
             verification_run_id=row["verification_run_id"],
@@ -706,7 +762,7 @@ class VerificationExecutionStore:
             actual_container_image_id=row["actual_container_image_id"],
             workspace_manifest_digest=row["workspace_manifest_digest"],
             container_id=row["container_id"],
-            attestation_digest=row["attestation_digest"] if "attestation_digest" in row.keys() else "",
+            attestation_digest=row["attestation_digest"] if "attestation_digest" in keys else "",
             state=SandboxInstanceState(row["state"]),
             created_at=float(row["created_at"]),
             started_at=row["started_at"],
@@ -714,6 +770,13 @@ class VerificationExecutionStore:
             cleanup_status=row["cleanup_status"],
             failure_code=row["failure_code"],
             metadata=json.loads(row["metadata_json"]),
+            instance_kind=row["instance_kind"] if "instance_kind" in keys else "verification",
+            toolchain_id=row["toolchain_id"] if "toolchain_id" in keys else "",
+            probe_ordinal=int(row["probe_ordinal"]) if "probe_ordinal" in keys else 0,
+            image_attestation_digest=(
+                row["image_attestation_digest"]
+                if "image_attestation_digest" in keys else ""
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -1121,6 +1184,38 @@ class VerificationExecutionStore:
                 raise RuntimeError("execution run reconcile CAS failed")
             self._audit(verification_run_id, "crash-reconciled",
                         instance_state.value, failure_code, sandbox_instance_id)
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def reconcile_toolchain_attestation_instance_atomic(
+        self, *, sandbox_instance_id: str,
+        instance_state: SandboxInstanceState, failure_code: str,
+    ) -> None:
+        """Batch 3.1.5 §3: single BEGIN IMMEDIATE for toolchain-attestation
+        instance crash terminalization.
+
+        Unlike verification instances, toolchain-attestation instances have
+        no associated step/run/execution — only the instance row is
+        transitioned.  An audit row is written for traceability.
+        """
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE verification_sandbox_instances SET state=?,terminated_at=?,"
+                "failure_code=? WHERE sandbox_instance_id=?",
+                (instance_state.value, now, failure_code, sandbox_instance_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(
+                    "toolchain attestation sandbox instance reconcile CAS failed"
+                )
+            self._audit(
+                sandbox_instance_id, "toolchain-attestation-crash-reconciled",
+                instance_state.value, failure_code, sandbox_instance_id,
+            )
             self._conn.commit()
         except Exception:
             self._conn.rollback()

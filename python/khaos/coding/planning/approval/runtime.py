@@ -691,6 +691,18 @@ class ApprovalRuntime:
             image_attestation_digest = ""
             if self._verification_image_attestation is not None:
                 image_attestation_digest = self._verification_image_attestation.attestation_digest
+            # Batch 3.1.5 §3: inject the verification store, boot context,
+            # and image attestation into the backend so each probe container
+            # is persisted through the full PREPARED → CREATED_ATTESTED →
+            # RUNNING → TERMINATED lifecycle with absence proof.
+            try:
+                setattr(backend, "_verification_store", self._verification_store)
+                setattr(backend, "_boot_context", self.boot_context)
+                setattr(
+                    backend, "_image_attestation", self._verification_image_attestation,
+                )
+            except Exception:
+                pass
             try:
                 import concurrent.futures as _cf_tc
                 import asyncio as _aio_tc
@@ -707,6 +719,10 @@ class ApprovalRuntime:
                 raise RuntimeError(
                     f"trusted verification toolchain attestation failed: {exc}"
                 ) from exc
+            # Batch 3.1.5 §3: attestation result is only persisted AFTER all
+            # probe containers have reached TERMINATED (absence proven).
+            # The persistent lifecycle in _run_attestation_command guarantees
+            # each probe container is terminated before its result is used.
             # Persist each attestation, bound to the current boot.
             for attestation in attestations:
                 self._verification_store.persist_toolchain_attestation(
@@ -771,14 +787,26 @@ class ApprovalRuntime:
             mismatches: list[str] = []
             cleanup_failures: list[str] = []
             for instance in non_terminal:
-                # Construct full expected labels from the persisted record.
-                expected_labels = {
-                    "khaos.run-id": instance.verification_run_id,
-                    "khaos.step-id": instance.step_run_id,
-                    "khaos.sandbox-instance-id": instance.sandbox_instance_id,
-                    "khaos.boot-id": instance.boot_id,
-                    "khaos.manifest-digest": instance.workspace_manifest_digest[:63],
-                }
+                # Batch 3.1.5 §3: construct expected labels based on instance_kind.
+                # Verification instances use the verification label set;
+                # toolchain-attestation instances use the toolchain label set.
+                if instance.instance_kind == "toolchain-attestation":
+                    expected_labels = {
+                        "khaos.kind": "toolchain-attestation",
+                        "khaos.sandbox-instance-id": instance.sandbox_instance_id,
+                        "khaos.boot-id": instance.boot_id,
+                        "khaos.image-attestation-digest": instance.image_attestation_digest[:63],
+                        "khaos.toolchain-id": instance.toolchain_id[:63],
+                        "khaos.probe-ordinal": str(instance.probe_ordinal),
+                    }
+                else:
+                    expected_labels = {
+                        "khaos.run-id": instance.verification_run_id,
+                        "khaos.step-id": instance.step_run_id,
+                        "khaos.sandbox-instance-id": instance.sandbox_instance_id,
+                        "khaos.boot-id": instance.boot_id,
+                        "khaos.manifest-digest": instance.workspace_manifest_digest[:63],
+                    }
                 try:
                     with _cf2.ThreadPoolExecutor(max_workers=1) as pool2:
                         report = pool2.submit(lambda: _aio2.run(
@@ -797,30 +825,49 @@ class ApprovalRuntime:
                         f"{instance.sandbox_instance_id}: {exc}"
                     ) from exc
                 status = report.get("status", "")
-                # Look up execution_run_id for atomic terminalization.
-                run = self._verification_store.get_run(instance.verification_run_id)
-                execution_run_id = run.execution_run_id if run else ""
+                is_toolchain = instance.instance_kind == "toolchain-attestation"
+                # Look up execution_run_id for atomic terminalization
+                # (verification instances only — toolchain-attestation
+                # instances have no associated step/run/execution).
+                execution_run_id = ""
+                if not is_toolchain and instance.verification_run_id:
+                    run = self._verification_store.get_run(instance.verification_run_id)
+                    execution_run_id = run.execution_run_id if run else ""
                 if status == "terminated":
                     # Full match — container was terminated and removed.
                     # §3: atomic crash terminalization.
-                    self._verification_store.reconcile_sandbox_instance_atomic(
-                        sandbox_instance_id=instance.sandbox_instance_id,
-                        step_run_id=instance.step_run_id,
-                        verification_run_id=instance.verification_run_id,
-                        execution_run_id=execution_run_id,
-                        instance_state=SandboxInstanceState.ORPHANED_CLEANED,
-                        failure_code="crash-reconciled",
-                    )
+                    if is_toolchain:
+                        self._verification_store.reconcile_toolchain_attestation_instance_atomic(
+                            sandbox_instance_id=instance.sandbox_instance_id,
+                            instance_state=SandboxInstanceState.ORPHANED_CLEANED,
+                            failure_code="crash-reconciled",
+                        )
+                    else:
+                        self._verification_store.reconcile_sandbox_instance_atomic(
+                            sandbox_instance_id=instance.sandbox_instance_id,
+                            step_run_id=instance.step_run_id,
+                            verification_run_id=instance.verification_run_id,
+                            execution_run_id=execution_run_id,
+                            instance_state=SandboxInstanceState.ORPHANED_CLEANED,
+                            failure_code="crash-reconciled",
+                        )
                 elif status == "missing":
                     # Container ID not found — deterministic missing.
-                    self._verification_store.reconcile_sandbox_instance_atomic(
-                        sandbox_instance_id=instance.sandbox_instance_id,
-                        step_run_id=instance.step_run_id,
-                        verification_run_id=instance.verification_run_id,
-                        execution_run_id=execution_run_id,
-                        instance_state=SandboxInstanceState.TERMINATED,
-                        failure_code="container-missing",
-                    )
+                    if is_toolchain:
+                        self._verification_store.reconcile_toolchain_attestation_instance_atomic(
+                            sandbox_instance_id=instance.sandbox_instance_id,
+                            instance_state=SandboxInstanceState.TERMINATED,
+                            failure_code="container-missing",
+                        )
+                    else:
+                        self._verification_store.reconcile_sandbox_instance_atomic(
+                            sandbox_instance_id=instance.sandbox_instance_id,
+                            step_run_id=instance.step_run_id,
+                            verification_run_id=instance.verification_run_id,
+                            execution_run_id=execution_run_id,
+                            instance_state=SandboxInstanceState.TERMINATED,
+                            failure_code="container-missing",
+                        )
                 elif status == "ownership-mismatch":
                     # Batch 3.1.3 §3: any label/image/manifest mismatch is
                     # OWNERSHIP_MISMATCH — never terminate, fail closed.
