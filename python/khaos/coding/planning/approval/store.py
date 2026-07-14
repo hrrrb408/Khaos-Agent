@@ -537,6 +537,16 @@ def _post_schema(conn: sqlite3.Connection) -> None:
             "ON plan_execution_edit_events("
             "execution_run_id,status,identity_version,ordinal)"
         )
+    # Batch 3.1.5 §2: add approved_verification_plan columns to old databases.
+    request_cols = {r[1] for r in conn.execute("PRAGMA table_info(plan_approval_requests)")}
+    for col, decl in (
+        ("approved_verification_plan_id", "TEXT NOT NULL DEFAULT ''"),
+        ("approved_verification_plan_digest", "TEXT NOT NULL DEFAULT ''"),
+    ):
+        if col not in request_cols:
+            conn.execute(
+                f"ALTER TABLE plan_approval_requests ADD COLUMN {col} {decl}"
+            )
 
 
 class ApprovalTransitionResult(str, Enum):
@@ -780,8 +790,9 @@ class PlanApprovalStore:
                 task_id, workspace_id, base_sha, repository_generation,
                 risk_level, requested_operations, affected_files, affected_symbols,
                 verification_digest, binding_digest, requested_at, expires_at,
-                status, broker_request_id, reason, metadata
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                status, broker_request_id, reason, metadata,
+                approved_verification_plan_id, approved_verification_plan_digest
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 request.approval_request_id,
@@ -804,6 +815,8 @@ class PlanApprovalStore:
                 request.broker_request_id,
                 request.reason,
                 json.dumps(request.metadata, default=str, sort_keys=True),
+                getattr(request, "approved_verification_plan_id", "") or "",
+                getattr(request, "approved_verification_plan_digest", "") or "",
             ),
         )
         self._conn.commit()
@@ -828,6 +841,11 @@ class PlanApprovalStore:
 
     @staticmethod
     def _row_to_request(row: sqlite3.Row) -> PlanApprovalRequest:
+        # Batch 3.1.5 §2: read approved_verification_plan columns (may be
+        # absent in old rows before migration — use .keys() guard).
+        keys = set(row.keys())
+        avp_id = row["approved_verification_plan_id"] if "approved_verification_plan_id" in keys else ""
+        avp_digest = row["approved_verification_plan_digest"] if "approved_verification_plan_digest" in keys else ""
         return PlanApprovalRequest(
             approval_request_id=row["approval_request_id"],
             plan_id=row["plan_id"],
@@ -849,6 +867,8 @@ class PlanApprovalStore:
             broker_request_id=row["broker_request_id"],
             reason=row["reason"] or "",
             metadata=json.loads(row["metadata"] or "{}"),
+            approved_verification_plan_id=avp_id or "",
+            approved_verification_plan_digest=avp_digest or "",
         )
 
     # ------------------------------------------------------------------

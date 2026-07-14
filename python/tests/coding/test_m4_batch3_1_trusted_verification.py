@@ -3956,3 +3956,177 @@ def test_construct_production_backend_validates_approved_image_reference(tmp_pat
     )
     with pytest.raises(ValueError, match="approved_image_reference mismatch"):
         runtime._construct_production_backend(config, profile)
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.5 §2: Persisted approved verification plan snapshots
+# ----------------------------------------------------------------------
+
+
+def test_approved_verification_plan_snapshot_table_exists(tmp_path):
+    """§2: the approved_verification_plan_snapshots table is created."""
+    from _m4_batch2_helpers import verification
+    runtime, _, _, _ = _real_runtime(tmp_path)
+    from khaos.coding.planning.verification_store import VerificationExecutionStore
+    store = VerificationExecutionStore(runtime._store)
+    cols = {
+        row["name"]
+        for row in store._conn.execute("PRAGMA table_info(approved_verification_plan_snapshots)")
+    }
+    assert "approved_verification_plan_id" in cols
+    assert "snapshot_digest" in cols
+    assert "image_attestation_content_digest" in cols
+    assert "ordered_toolchain_attestation_content_digests_json" in cols
+    assert "created_at" in cols
+
+
+def test_persist_and_load_approved_verification_plan_snapshot(tmp_path):
+    """§2: persist an ApprovedVerificationPlanSnapshot and load it back."""
+    from _m4_batch2_helpers import verification
+    runtime, _, _, _ = _real_runtime(tmp_path)
+    from khaos.coding.planning.verification_store import VerificationExecutionStore
+    store = VerificationExecutionStore(runtime._store)
+    from khaos.coding.planning.verification_execution_models import (
+        ApprovedVerificationPlanSnapshot,
+    )
+    snapshot = ApprovedVerificationPlanSnapshot(
+        approved_verification_plan_id="avp-test-1",
+        plan_id="plan-1",
+        plan_content_hash="hash-1",
+        verification_requirements_digest="req-digest",
+        catalog_fingerprint="cat-fp",
+        ordered_command_digests=("cmd-digest-1", "cmd-digest-2"),
+        config_hashes=("cfg-hash-1",),
+        sandbox_profile_digest="profile-digest",
+        image_attestation_content_digest="img-content-digest",
+        ordered_toolchain_attestation_content_digests=("tc-digest-1",),
+        binary_digests=("bin-1",),
+        version_output_digests=("ver-1",),
+        parsed_versions=("3.11.0",),
+        image_toolchain_policy_fingerprint="policy-fp",
+        approved_verification_plan_digest="snapshot-digest-1",
+        created_at=time.time(),
+    )
+    store.persist_approved_verification_plan_snapshot(snapshot, boot_id="boot-1")
+    # Load by ID
+    loaded = store.get_approved_verification_plan_snapshot("avp-test-1")
+    assert loaded is not None
+    assert loaded.approved_verification_plan_digest == "snapshot-digest-1"
+    assert loaded.ordered_command_digests == ("cmd-digest-1", "cmd-digest-2")
+    assert loaded.image_attestation_content_digest == "img-content-digest"
+    # Load by digest
+    loaded_by_digest = store.get_approved_verification_plan_snapshot_by_digest("snapshot-digest-1")
+    assert loaded_by_digest is not None
+    assert loaded_by_digest.approved_verification_plan_id == "avp-test-1"
+
+
+def test_plan_approval_request_has_snapshot_fields():
+    """§2: PlanApprovalRequest has approved_verification_plan_id and digest fields."""
+    from khaos.coding.planning.approval.models import PlanApprovalRequest, PlanApprovalStatus
+    request = PlanApprovalRequest(
+        approval_request_id="apr-1",
+        plan_id="plan-1",
+        plan_content_hash="hash",
+        repository_id="repo-1",
+        task_id="task-1",
+        workspace_id="ws-1",
+        base_sha="abc",
+        repository_generation=1,
+        risk_level="low",
+        requested_operations=("op1",),
+        affected_files=("file1",),
+        affected_symbols=("sym1",),
+        verification_digest="ver-digest",
+        binding_digest="binding-digest",
+        requested_at=time.time(),
+        expires_at=time.time() + 3600,
+        status=PlanApprovalStatus.PENDING,
+        broker_request_id="br-1",
+        approved_verification_plan_id="avp-1",
+        approved_verification_plan_digest="snap-digest",
+    )
+    assert request.approved_verification_plan_id == "avp-1"
+    assert request.approved_verification_plan_digest == "snap-digest"
+    # Defaults to empty when not provided.
+    request2 = PlanApprovalRequest(
+        approval_request_id="apr-2",
+        plan_id="plan-1",
+        plan_content_hash="hash",
+        repository_id="repo-1",
+        task_id="task-1",
+        workspace_id="ws-1",
+        base_sha="abc",
+        repository_generation=1,
+        risk_level="low",
+        requested_operations=("op1",),
+        affected_files=("file1",),
+        affected_symbols=("sym1",),
+        verification_digest="ver-digest",
+        binding_digest="binding-digest",
+        requested_at=time.time(),
+        expires_at=time.time() + 3600,
+        status=PlanApprovalStatus.PENDING,
+        broker_request_id="br-2",
+    )
+    assert request2.approved_verification_plan_id == ""
+    assert request2.approved_verification_plan_digest == ""
+
+
+def test_compute_plan_binding_digest_includes_snapshot_digest():
+    """§2: compute_plan_binding_digest includes approved_verification_plan_digest."""
+    from khaos.coding.planning.approval.models import compute_plan_binding_digest
+    from test_m4_batch3_0_workspace_mutation import _plan, _workspace
+    from _m4_batch2_helpers import verification
+    # Use the existing _plan helper to create a valid plan.
+    plan = _plan(())
+    digest_without = compute_plan_binding_digest(plan)
+    digest_with = compute_plan_binding_digest(
+        plan, approved_verification_plan_digest="snap-digest-1",
+    )
+    # The digests must differ — the snapshot digest is included.
+    assert digest_without != digest_with
+    # Same snapshot digest produces same binding digest.
+    digest_with_2 = compute_plan_binding_digest(
+        plan, approved_verification_plan_digest="snap-digest-1",
+    )
+    assert digest_with == digest_with_2
+    # Different snapshot digest produces different binding digest.
+    digest_with_3 = compute_plan_binding_digest(
+        plan, approved_verification_plan_digest="snap-digest-2",
+    )
+    assert digest_with != digest_with_3
+
+
+def test_approval_request_persists_snapshot_fields(tmp_path):
+    """§2: insert_request and get_request persist snapshot fields."""
+    from _m4_batch2_helpers import verification
+    runtime, _, _, _ = _real_runtime(tmp_path)
+    from khaos.coding.planning.approval.models import PlanApprovalRequest, PlanApprovalStatus
+    store = runtime._store
+    request = PlanApprovalRequest(
+        approval_request_id="apr-snap-test",
+        plan_id="plan-1",
+        plan_content_hash="hash",
+        repository_id="repo-1",
+        task_id="task-1",
+        workspace_id="ws-1",
+        base_sha="abc",
+        repository_generation=1,
+        risk_level="low",
+        requested_operations=("op1",),
+        affected_files=("file1",),
+        affected_symbols=("sym1",),
+        verification_digest="ver-digest",
+        binding_digest="binding-digest",
+        requested_at=time.time(),
+        expires_at=time.time() + 3600,
+        status=PlanApprovalStatus.PENDING,
+        broker_request_id="br-snap-1",
+        approved_verification_plan_id="avp-snap-1",
+        approved_verification_plan_digest="snap-digest-1",
+    )
+    store.insert_request(request)
+    loaded = store.get_request("apr-snap-test")
+    assert loaded is not None
+    assert loaded.approved_verification_plan_id == "avp-snap-1"
+    assert loaded.approved_verification_plan_digest == "snap-digest-1"

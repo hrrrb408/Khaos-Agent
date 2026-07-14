@@ -190,7 +190,11 @@ def _extract_config_fingerprint(evidence: tuple[Any, ...]) -> str:
     return ""
 
 
-def compute_plan_binding_digest(plan: "ImplementationPlan") -> str:
+def compute_plan_binding_digest(
+    plan: "ImplementationPlan",
+    *,
+    approved_verification_plan_digest: str = "",
+) -> str:
     """Freeze the full plan + repository binding into one SHA-256 digest.
 
     Every field listed in the design spec §6 (plan id, content hash,
@@ -201,6 +205,12 @@ def compute_plan_binding_digest(plan: "ImplementationPlan") -> str:
     If ANY of these changes between request creation and the approve callback
     (or at authorize time), the recomputed digest will differ and the
     approval MUST be moved to ``stale``.
+
+    Batch 3.1.5 §2: ``approved_verification_plan_digest`` binds the persisted
+    verification plan snapshot into the approval binding.  When set, any
+    drift in the snapshot (commands, attestations, toolchain) invalidates
+    the approval.  Empty string means the snapshot is not yet bound (old
+    requests created before Batch 3.1.5).
     """
     affected_files = sorted(
         (
@@ -255,6 +265,8 @@ def compute_plan_binding_digest(plan: "ImplementationPlan") -> str:
         "risk_digest": compute_risk_digest(plan.risks),
         "verification_digest": compute_verification_digest(plan.verification_requirements),
         "config_fingerprint": _extract_config_fingerprint(plan.evidence),
+        # Batch 3.1.5 §2: bind the approved verification plan snapshot digest.
+        "approved_verification_plan_digest": approved_verification_plan_digest,
     }
     return _digest(payload)
 
@@ -539,6 +551,13 @@ class PlanApprovalRequest:
     Immutable by construction. The :attr:`binding_digest` freezes the whole
     plan + repository state at request time; it is recomputed and compared at
     every decision callback and at authorize time.
+
+    Batch 3.1.5 §2: :attr:`approved_verification_plan_id` and
+    :attr:`approved_verification_plan_digest` bind the persisted
+    ApprovedVerificationPlanSnapshot to the request.  At execution time,
+    the runner loads the persisted snapshot by ID and verifies its digest
+    matches.  Old requests without a snapshot have empty fields and
+    fail closed at verification time.
     """
 
     approval_request_id: str
@@ -561,6 +580,9 @@ class PlanApprovalRequest:
     broker_request_id: str
     reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Batch 3.1.5 §2: persisted verification plan snapshot binding.
+    approved_verification_plan_id: str = ""
+    approved_verification_plan_digest: str = ""
 
 
 @dataclass(frozen=True)

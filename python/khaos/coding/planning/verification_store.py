@@ -126,6 +126,29 @@ CREATE INDEX IF NOT EXISTS ix_dvw_boot_state
 ON disposable_verification_workspaces(boot_id, state);
 CREATE INDEX IF NOT EXISTS ix_dvw_run
 ON disposable_verification_workspaces(verification_run_id);
+CREATE TABLE IF NOT EXISTS approved_verification_plan_snapshots (
+ approved_verification_plan_id TEXT PRIMARY KEY,
+ plan_id TEXT NOT NULL,
+ plan_content_hash TEXT NOT NULL,
+ requirements_digest TEXT NOT NULL,
+ catalog_fingerprint TEXT NOT NULL,
+ ordered_command_digests_json TEXT NOT NULL DEFAULT '[]',
+ config_hashes_json TEXT NOT NULL DEFAULT '[]',
+ sandbox_profile_digest TEXT NOT NULL,
+ image_attestation_content_digest TEXT NOT NULL DEFAULT '',
+ ordered_toolchain_attestation_content_digests_json TEXT NOT NULL DEFAULT '[]',
+ binary_digests_json TEXT NOT NULL DEFAULT '[]',
+ version_output_digests_json TEXT NOT NULL DEFAULT '[]',
+ parsed_versions_json TEXT NOT NULL DEFAULT '[]',
+ image_toolchain_policy_fingerprint TEXT NOT NULL DEFAULT '',
+ snapshot_digest TEXT NOT NULL,
+ created_at REAL NOT NULL,
+ boot_id TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS ix_avps_plan
+ON approved_verification_plan_snapshots(plan_id, plan_content_hash);
+CREATE INDEX IF NOT EXISTS ix_avps_snapshot_digest
+ON approved_verification_plan_snapshots(snapshot_digest);
 """
 
 
@@ -1294,6 +1317,129 @@ class VerificationExecutionStore:
         )
         self._conn.commit()
         return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.5 §2: Approved verification plan snapshot persistence
+    # ------------------------------------------------------------------
+
+    def persist_approved_verification_plan_snapshot(
+        self, snapshot: Any, *, boot_id: str = "",
+    ) -> None:
+        """Persist an ApprovedVerificationPlanSnapshot (Batch 3.1.5 §2).
+
+        The snapshot is frozen before human approval and must be loaded
+        at execution time — the runtime's in-memory digest must NOT
+        masquerade as the approved digest.
+        """
+        self._conn.execute(
+            """
+            INSERT OR REPLACE INTO approved_verification_plan_snapshots (
+                approved_verification_plan_id, plan_id, plan_content_hash,
+                requirements_digest, catalog_fingerprint,
+                ordered_command_digests_json, config_hashes_json,
+                sandbox_profile_digest, image_attestation_content_digest,
+                ordered_toolchain_attestation_content_digests_json,
+                binary_digests_json, version_output_digests_json,
+                parsed_versions_json, image_toolchain_policy_fingerprint,
+                snapshot_digest, created_at, boot_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                snapshot.approved_verification_plan_id,
+                snapshot.plan_id, snapshot.plan_content_hash,
+                snapshot.verification_requirements_digest, snapshot.catalog_fingerprint,
+                json.dumps(list(snapshot.ordered_command_digests)),
+                json.dumps(list(snapshot.config_hashes)),
+                snapshot.sandbox_profile_digest,
+                snapshot.image_attestation_content_digest,
+                json.dumps(list(snapshot.ordered_toolchain_attestation_content_digests)),
+                json.dumps(list(snapshot.binary_digests)),
+                json.dumps(list(snapshot.version_output_digests)),
+                json.dumps(list(snapshot.parsed_versions)),
+                snapshot.image_toolchain_policy_fingerprint,
+                snapshot.approved_verification_plan_digest, snapshot.created_at, boot_id,
+            ),
+        )
+        self._conn.commit()
+
+    def get_approved_verification_plan_snapshot(
+        self, approved_verification_plan_id: str,
+    ) -> Any | None:
+        """Load a persisted ApprovedVerificationPlanSnapshot by ID.
+
+        Returns ``None`` if the snapshot doesn't exist.  This is the
+        ONLY source of truth at execution time — the runtime's in-memory
+        digest must NOT be used as a substitute.
+        """
+        from khaos.coding.planning.verification_execution_models import (
+            ApprovedVerificationPlanSnapshot,
+        )
+        row = self._conn.execute(
+            "SELECT * FROM approved_verification_plan_snapshots "
+            "WHERE approved_verification_plan_id = ?",
+            (approved_verification_plan_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ApprovedVerificationPlanSnapshot(
+            approved_verification_plan_id=row["approved_verification_plan_id"],
+            plan_id=row["plan_id"],
+            plan_content_hash=row["plan_content_hash"],
+            verification_requirements_digest=row["requirements_digest"],
+            catalog_fingerprint=row["catalog_fingerprint"],
+            ordered_command_digests=tuple(json.loads(row["ordered_command_digests_json"])),
+            config_hashes=tuple(json.loads(row["config_hashes_json"])),
+            sandbox_profile_digest=row["sandbox_profile_digest"],
+            image_attestation_content_digest=row["image_attestation_content_digest"],
+            ordered_toolchain_attestation_content_digests=tuple(
+                json.loads(row["ordered_toolchain_attestation_content_digests_json"])
+            ),
+            binary_digests=tuple(json.loads(row["binary_digests_json"])),
+            version_output_digests=tuple(json.loads(row["version_output_digests_json"])),
+            parsed_versions=tuple(json.loads(row["parsed_versions_json"])),
+            image_toolchain_policy_fingerprint=row["image_toolchain_policy_fingerprint"],
+            approved_verification_plan_digest=row["snapshot_digest"],
+            created_at=row["created_at"],
+        )
+
+    def get_approved_verification_plan_snapshot_by_digest(
+        self, snapshot_digest: str,
+    ) -> Any | None:
+        """Load a persisted snapshot by its digest (Batch 3.1.5 §2).
+
+        Used at execution time to verify the persisted snapshot matches
+        the approved digest bound to the request.
+        """
+        from khaos.coding.planning.verification_execution_models import (
+            ApprovedVerificationPlanSnapshot,
+        )
+        row = self._conn.execute(
+            "SELECT * FROM approved_verification_plan_snapshots "
+            "WHERE snapshot_digest = ? ORDER BY created_at DESC LIMIT 1",
+            (snapshot_digest,),
+        ).fetchone()
+        if row is None:
+            return None
+        return ApprovedVerificationPlanSnapshot(
+            approved_verification_plan_id=row["approved_verification_plan_id"],
+            plan_id=row["plan_id"],
+            plan_content_hash=row["plan_content_hash"],
+            verification_requirements_digest=row["requirements_digest"],
+            catalog_fingerprint=row["catalog_fingerprint"],
+            ordered_command_digests=tuple(json.loads(row["ordered_command_digests_json"])),
+            config_hashes=tuple(json.loads(row["config_hashes_json"])),
+            sandbox_profile_digest=row["sandbox_profile_digest"],
+            image_attestation_content_digest=row["image_attestation_content_digest"],
+            ordered_toolchain_attestation_content_digests=tuple(
+                json.loads(row["ordered_toolchain_attestation_content_digests_json"])
+            ),
+            binary_digests=tuple(json.loads(row["binary_digests_json"])),
+            version_output_digests=tuple(json.loads(row["version_output_digests_json"])),
+            parsed_versions=tuple(json.loads(row["parsed_versions_json"])),
+            image_toolchain_policy_fingerprint=row["image_toolchain_policy_fingerprint"],
+            approved_verification_plan_digest=row["snapshot_digest"],
+            created_at=row["created_at"],
+        )
 
     # ------------------------------------------------------------------
     # Batch 3.1.2 §8: Disposable verification workspace persistence
