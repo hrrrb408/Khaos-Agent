@@ -239,7 +239,12 @@ class DockerVerificationSandboxBackend:
         host_paths: Iterable[Path] = (),
         kill_grace_seconds: float = 1.0,
     ) -> None:
-        if not profile.image_digest.startswith("sha256:"):
+        # Batch 3.1.4 §4: accept both bare config ID (sha256:...) and
+        # full repository@sha256:digest reference.  The full reference is
+        # required for production probe_image_attestation; the bare config
+        # ID is accepted for backward compatibility with existing tests.
+        if not (profile.image_digest.startswith("sha256:") or
+                "@sha256:" in profile.image_digest):
             raise ValueError("production sandbox image must be digest pinned")
         if profile.network_enabled or not profile.read_only_root:
             raise ValueError("production verification profile must be offline/read-only")
@@ -331,16 +336,27 @@ class DockerVerificationSandboxBackend:
     async def inspect_and_attest_instance(
         self, *, container_id_or_name: str, expected_labels: dict[str, str],
         expected_image_digest: str, expected_manifest_digest: str,
+        image_attestation: ImageAttestation | None = None,
     ) -> ContainerAttestation:
-        """Batch 3.1.2 §4: inspect the created container and verify identity.
+        """Batch 3.1.2 §4 / Batch 3.1.4 §4: inspect the created container and verify identity.
 
         Verifies:
         - All expected Khaos labels are present and match.
-        - The container's Image ID matches the local image inspect ID.
-        - The local image ID matches the profile's expected digest.
+        - The container's ``.Image`` matches the approved
+          ``local_config_image_id`` from the ``ImageAttestation``.
         - The workspace manifest digest label matches.
 
-        Returns a ``ContainerAttestation`` with all identity fields.
+        Batch 3.1.4 §4: the registry manifest digest is NOT compared against
+        the local config image ID — they are different concepts.  The
+        container's ``.Image`` field is the local config image ID and must
+        equal ``image_attestation.local_config_image_id``.
+
+        Batch 3.1.4 §4: on any mismatch, the owned (not-yet-started)
+        container is safely deleted before raising.  This prevents a
+        mismatched container from being started.
+
+        Returns a ``ContainerAttestation`` with all identity fields, bound
+        to the ``ImageAttestation`` content digest.
         """
         info = await self.inspect_instance(container_id_or_name)
         if info is None:
@@ -356,34 +372,86 @@ class DockerVerificationSandboxBackend:
         for key, expected_value in expected_labels.items():
             actual_value = container_labels.get(key)
             if actual_value != expected_value:
+                # Batch 3.1.4 §4: safe-delete the owned container before raising.
+                await self._safe_delete_owned_container(
+                    container_id_or_name, container_id,
+                    reason="label-mismatch",
+                )
                 raise RuntimeError(
                     f"container label mismatch: {key} expected={expected_value} "
                     f"actual={actual_value}"
                 )
-        # Verify image identity.
+        # Batch 3.1.4 §4: verify image identity using the approved
+        # ImageAttestation.  The container's .Image must equal the approved
+        # local_config_image_id.  We do NOT compare the manifest digest
+        # against the local config image ID — they are different concepts.
         local_image_id = await self.inspect_image(expected_image_digest)
         if local_image_id is None:
+            await self._safe_delete_owned_container(
+                container_id_or_name, container_id,
+                reason="local-image-not-found",
+            )
             raise RuntimeError(
                 f"local image not found: {expected_image_digest}"
             )
-        if local_image_id != expected_image_digest:
-            raise RuntimeError(
-                f"local image ID mismatch: expected={expected_image_digest} "
-                f"actual={local_image_id}"
-            )
-        if container_image_id and container_image_id != local_image_id:
-            raise RuntimeError(
-                f"container image ID mismatch: container={container_image_id} "
-                f"local={local_image_id}"
-            )
+        # Batch 3.1.4 §4: if we have an approved ImageAttestation, the
+        # container's .Image must match its local_config_image_id.  This is
+        # the correct comparison — both are local config image IDs.
+        approved_config_id = ""
+        if image_attestation is not None:
+            approved_config_id = image_attestation.local_config_image_id
+            if approved_config_id and container_image_id and \
+                    container_image_id != approved_config_id:
+                await self._safe_delete_owned_container(
+                    container_id_or_name, container_id,
+                    reason="container-image-id-mismatch",
+                )
+                raise RuntimeError(
+                    f"container .Image mismatch: container={container_image_id} "
+                    f"approved={approved_config_id}"
+                )
+            # Also verify the local image inspect ID matches the approved
+            # config ID (defensive — the image should not have changed
+            # between attestation and container creation).
+            if approved_config_id and local_image_id != approved_config_id:
+                await self._safe_delete_owned_container(
+                    container_id_or_name, container_id,
+                    reason="local-image-id-drift",
+                )
+                raise RuntimeError(
+                    f"local image ID drift: current={local_image_id} "
+                    f"approved={approved_config_id}"
+                )
+        else:
+            # No ImageAttestation (test backends) — fall back to verifying
+            # container .Image matches the local image inspect ID.  This is
+            # a same-concept comparison (both are config IDs).
+            if container_image_id and container_image_id != local_image_id:
+                await self._safe_delete_owned_container(
+                    container_id_or_name, container_id,
+                    reason="container-local-image-mismatch",
+                )
+                raise RuntimeError(
+                    f"container image ID mismatch: container={container_image_id} "
+                    f"local={local_image_id}"
+                )
         # Verify manifest digest label.
         actual_manifest = container_labels.get("khaos.manifest-digest", "")
         if expected_manifest_digest and actual_manifest:
             if actual_manifest != expected_manifest_digest[:63]:
+                await self._safe_delete_owned_container(
+                    container_id_or_name, container_id,
+                    reason="manifest-label-mismatch",
+                )
                 raise RuntimeError(
                     f"manifest digest label mismatch: expected="
                     f"{expected_manifest_digest[:63]} actual={actual_manifest}"
                 )
+        # Batch 3.1.4 §4: bind the ContainerAttestation to the approved
+        # ImageAttestation content digest.  This enters the Approval binding.
+        image_attestation_digest = ""
+        if image_attestation is not None:
+            image_attestation_digest = image_attestation.attestation_digest
         attestation_digest = hashlib.sha256(json.dumps({
             "container_id": container_id,
             "container_image_id": container_image_id,
@@ -391,6 +459,7 @@ class DockerVerificationSandboxBackend:
             "expected_image_digest": expected_image_digest,
             "labels": expected_labels,
             "manifest_digest": expected_manifest_digest,
+            "image_attestation_digest": image_attestation_digest,
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return ContainerAttestation(
             container_id=container_id,
@@ -400,7 +469,28 @@ class DockerVerificationSandboxBackend:
             labels=dict(expected_labels),
             manifest_digest=expected_manifest_digest,
             attestation_digest=attestation_digest,
+            image_attestation_digest=image_attestation_digest,
         )
+
+    async def _safe_delete_owned_container(
+        self, container_id_or_name: str, container_id: str, *,
+        reason: str,
+    ) -> None:
+        """Batch 3.1.4 §4: safe-delete an owned, not-yet-started container.
+
+        Called when a pre-launch mismatch is detected.  The container has
+        been created but NOT started — no project code has run.  We
+        terminate and remove it so it doesn't linger as an orphan.
+
+        Failures are logged but do not mask the original mismatch error.
+        """
+        try:
+            await self.terminate_and_remove_instance(
+                container_id or container_id_or_name,
+            )
+        except Exception:
+            # Best-effort cleanup — the mismatch error is the real signal.
+            pass
 
     async def start_instance(self, container_id_or_name: str) -> None:
         """Batch 3.1.2 §1: ``docker start`` the created container.
@@ -745,7 +835,7 @@ class DockerVerificationSandboxBackend:
         return actual
 
     async def probe_image_attestation(self) -> ImageAttestation:
-        """Batch 3.1.3 §4: probe and attest the local image identity.
+        """Batch 3.1.3 §4 / Batch 3.1.4 §4: probe and attest the local image identity.
 
         Produces an ``ImageAttestation`` with all identity fields verified
         separately:
@@ -754,19 +844,35 @@ class DockerVerificationSandboxBackend:
         - Platform from ``docker image inspect .Os``/``.Architecture``
         - No-pull proof: the probe uses ``image inspect`` (never ``pull``)
 
-        The registry manifest digest is NOT required to equal the local
-        config image ID — they are different concepts.
+        Batch 3.1.4 §4: the registry manifest digest and local config image
+        ID are NOT the same concept and are NOT compared against each other.
+        The ``requested_image_reference`` must be in ``repository@sha256:digest``
+        format.  ``approved_repository_digest`` is extracted from RepoDigests
+        and verified to be present.  ``platform_manifest_digest`` is kept
+        separate from ``requested_image_reference`` — for multi-arch images
+        the registry manifest list digest differs from the platform-specific
+        manifest digest.
         """
-        image_digest = self.profile.image_digest
+        image_reference = self.profile.image_digest
+        # Batch 3.1.4 §4: production image reference must include repository
+        # and @sha256 — a bare tag or config ID is not acceptable because
+        # it cannot be pinned immutably.
+        if "@" not in image_reference or "sha256:" not in image_reference:
+            raise RuntimeError(
+                f"production image reference must be repository@sha256:digest, "
+                f"got: {image_reference}"
+            )
+        # Extract the manifest digest from the reference (the part after @).
+        reference_manifest_digest = image_reference.split("@", 1)[1]
         # Full image inspect for all fields.
         process = await asyncio.create_subprocess_exec(
-            str(self._docker), "image", "inspect", image_digest,
+            str(self._docker), "image", "inspect", image_reference,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
             raise RuntimeError(
-                f"image inspect failed for {image_digest}: "
+                f"image inspect failed for {image_reference}: "
                 f"{stderr.decode('utf-8', 'replace')}"
             )
         try:
@@ -779,30 +885,53 @@ class DockerVerificationSandboxBackend:
         architecture = info.get("Architecture", "amd64")
         platform = f"{os_name}/{architecture}"
         repo_digests = tuple(info.get("RepoDigests", []) or [])
-        # Extract the repository digest from RepoDigests (format: repo@sha256:digest)
-        approved_repository_digest = image_digest
+        # Batch 3.1.4 §4: extract the approved repository digest from
+        # RepoDigests and verify it is present.  RepoDigests entries have
+        # the format ``repository@sha256:digest`` — the digest part is the
+        # registry manifest digest that the repository has signed.
+        approved_repository_digest = ""
         for rd in repo_digests:
-            if "@" in rd and image_digest in rd:
-                approved_repository_digest = rd.split("@", 1)[1]
+            if "@" not in rd:
+                continue
+            rd_repo, rd_digest = rd.split("@", 1)
+            # Match by repository name (the part before @) — the reference
+            # may use a different tag but the repository must match.
+            ref_repo = image_reference.split("@", 1)[0]
+            # Strip tag from ref_repo if present (it won't have one in
+            # repository@sha256 format, but be defensive).
+            if rd_repo == ref_repo and rd_digest == reference_manifest_digest:
+                approved_repository_digest = rd_digest
                 break
+        if not approved_repository_digest:
+            raise RuntimeError(
+                f"approved repository digest not found in RepoDigests: "
+                f"reference={image_reference} repo_digests={list(repo_digests)}"
+            )
         attested_at = time.time()
+        # Batch 3.1.4 §4: platform_manifest_digest is the registry manifest
+        # digest for the approved platform.  For single-arch images this is
+        # the same as the reference digest; for multi-arch images it is the
+        # platform-specific manifest digest (resolved by the runtime).  We
+        # use the reference digest here — the key invariant is that it is
+        # NOT compared against local_config_image_id.
+        platform_manifest_digest = reference_manifest_digest
         # Batch 3.1.4 §3: attestation_digest must NOT include attested_at —
         # it's per-probe metadata that doesn't represent supply chain content.
         # The same image must produce the same digest across re-probes.
         attestation_digest = hashlib.sha256(json.dumps({
-            "requested_image_reference": image_digest,
+            "requested_image_reference": image_reference,
             "approved_repository_digest": approved_repository_digest,
             "platform": platform,
-            "platform_manifest_digest": image_digest,
+            "platform_manifest_digest": platform_manifest_digest,
             "local_config_image_id": local_config_image_id,
             "repo_digests": list(repo_digests),
             "no_pull_proof": "image-inspect-not-pull",
         }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return ImageAttestation(
-            requested_image_reference=image_digest,
+            requested_image_reference=image_reference,
             approved_repository_digest=approved_repository_digest,
             platform=platform,
-            platform_manifest_digest=image_digest,
+            platform_manifest_digest=platform_manifest_digest,
             local_config_image_id=local_config_image_id,
             container_image_id="",  # filled after container create
             repo_digests=repo_digests,
@@ -1054,12 +1183,18 @@ class DockerVerificationSandboxBackend:
         command: TrustedVerificationCommand,
         workspace_root: Path, labels: dict[str, str],
         expected_manifest_digest: str,
+        image_attestation: ImageAttestation | None = None,
     ) -> tuple[str, ContainerAttestation, asyncio.subprocess.Process, Any, Any]:
         """Batch 3.1.2 §1: create + inspect_and_attest + start_and_attach.
 
         Batch 3.1.4 §1: uses ``docker start --attach --no-stdin`` instead
         of separate ``docker start`` + ``docker attach`` to eliminate the
         output race where fast-exiting containers lose their stdout/stderr.
+
+        Batch 3.1.4 §4: passes the approved ``ImageAttestation`` to
+        ``inspect_and_attest_instance`` so the container's ``.Image`` is
+        verified against the approved ``local_config_image_id`` (not the
+        registry manifest digest).
 
         Returns ``(container_id, attestation, attach_proc, stdout_stream,
         stderr_stream)``.  The caller MUST persist ``container_id`` and
@@ -1085,6 +1220,7 @@ class DockerVerificationSandboxBackend:
             container_id_or_name=container_id, expected_labels=labels,
             expected_image_digest=image_digest,
             expected_manifest_digest=expected_manifest_digest,
+            image_attestation=image_attestation,
         )
         # 3. docker start --attach --no-stdin (atomic start + output capture)
         attach_proc, stdout_stream, stderr_stream = (

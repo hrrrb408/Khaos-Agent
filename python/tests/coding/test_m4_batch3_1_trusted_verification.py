@@ -343,7 +343,8 @@ class UnsafeTestSandboxBackend:
 
     async def inspect_and_attest_instance(self, *, container_id_or_name,
                                           expected_labels, expected_image_digest,
-                                          expected_manifest_digest):
+                                          expected_manifest_digest,
+                                          image_attestation=None):
         return ContainerAttestation(
             container_id=container_id_or_name,
             container_image_id=expected_image_digest,
@@ -808,6 +809,173 @@ def test_approved_verification_plan_snapshot_model():
         image_toolchain_policy_fingerprint="policy-fp",
     )
     assert digest == digest2
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.4 §4: separate registry and local docker image identities
+# ----------------------------------------------------------------------
+
+def test_image_attestation_has_separate_registry_and_local_fields():
+    """§4: ImageAttestation must have distinct fields for registry manifest
+    digest and local config image ID — they are different concepts and
+    must not be conflated."""
+    from khaos.coding.planning.verification_sandbox import ImageAttestation
+    import time
+
+    # In a real multi-arch image, these would differ.  Here we use
+    # distinct placeholder values to verify the model preserves them.
+    att = ImageAttestation(
+        requested_image_reference="python@sha256:aaa111",
+        approved_repository_digest="sha256:aaa111",
+        platform="linux/amd64",
+        platform_manifest_digest="sha256:aaa111",
+        local_config_image_id="sha256:bbb222",
+        container_image_id="sha256:bbb222",
+        repo_digests=("python@sha256:aaa111",),
+        no_pull_proof="image-inspect-not-pull",
+        attested_at=time.time(),
+        attestation_digest="some-digest",
+    )
+    # Registry manifest digest and local config image ID are distinct.
+    assert att.platform_manifest_digest != att.local_config_image_id
+    assert att.requested_image_reference != att.local_config_image_id
+    assert att.approved_repository_digest != att.local_config_image_id
+    # RepoDigests carries the registry-level identity.
+    assert "python@sha256:aaa111" in att.repo_digests
+
+
+def test_container_attestation_binds_image_attestation_digest():
+    """§4: ContainerAttestation must bind to the approved ImageAttestation
+    content digest via the image_attestation_digest field."""
+    from khaos.coding.planning.verification_sandbox import ContainerAttestation
+
+    ca = ContainerAttestation(
+        container_id="cid",
+        container_image_id="sha256:bbb",
+        local_image_id="sha256:bbb",
+        expected_image_digest="python@sha256:aaa",
+        labels={},
+        manifest_digest="manifest-hash",
+        attestation_digest="container-digest",
+        image_attestation_digest="image-att-digest",
+    )
+    assert ca.image_attestation_digest == "image-att-digest"
+
+
+def test_inspect_and_attest_rejects_container_image_mismatch_with_safe_delete(tmp_path):
+    """§4: when container .Image != approved local_config_image_id, the
+    owned container is safe-deleted and the mismatch is raised.
+
+    Uses a controlled backend that overrides inspect_instance and
+    inspect_image to return mismatched values."""
+    from khaos.coding.planning.verification_sandbox import (
+        DockerVerificationSandboxBackend, ImageAttestation, SandboxProfile,
+    )
+    from pathlib import Path
+    import time
+
+    profile = SandboxProfile(
+        "test-mismatch-v1", "python@sha256:aaa",
+        run_as_user=f"{os.getuid()}:{os.getgid()}",
+    )
+    backend = DockerVerificationSandboxBackend(
+        profile=profile, docker_executable=Path("/usr/bin/env"),
+    )
+    # Approved ImageAttestation with a specific local_config_image_id.
+    approved = ImageAttestation(
+        requested_image_reference="python@sha256:aaa",
+        approved_repository_digest="sha256:aaa",
+        platform="linux/amd64",
+        platform_manifest_digest="sha256:aaa",
+        local_config_image_id="sha256:approved-config-id",
+        container_image_id="",
+        repo_digests=("python@sha256:aaa",),
+        no_pull_proof="image-inspect-not-pull",
+        attested_at=time.time(),
+        attestation_digest="approved-digest",
+    )
+    # Override inspect_instance to return a mismatched container .Image.
+    removed = []
+    async def fake_inspect_instance(cid):
+        return {"Id": cid, "Image": "sha256:wrong-config-id",
+                "Config": {"Labels": {}}}
+    async def fake_inspect_image(ref):
+        return "sha256:approved-config-id"
+    async def fake_terminate_and_remove(cid):
+        removed.append(cid)
+        return True, True
+    backend.inspect_instance = fake_inspect_instance
+    backend.inspect_image = fake_inspect_image
+    backend.terminate_and_remove_instance = fake_terminate_and_remove
+
+    async def run():
+        return await backend.inspect_and_attest_instance(
+            container_id_or_name="test-cid",
+            expected_labels={},
+            expected_image_digest="python@sha256:aaa",
+            expected_manifest_digest="manifest-hash",
+            image_attestation=approved,
+        )
+    with pytest.raises(RuntimeError, match="container .Image mismatch"):
+        asyncio.run(run())
+    # §4: the owned container must have been safe-deleted.
+    assert "test-cid" in removed
+
+
+def test_inspect_and_attest_allows_manifest_different_from_config_id(tmp_path):
+    """§4: registry manifest digest != local config image ID is allowed —
+    they are different concepts and must not be conflated.
+
+    Uses a controlled backend where the manifest digest (from the
+    reference) differs from the local config image ID, but the
+    container .Image matches the approved local config image ID."""
+    from khaos.coding.planning.verification_sandbox import (
+        DockerVerificationSandboxBackend, ImageAttestation, SandboxProfile,
+    )
+    from pathlib import Path
+    import time
+
+    profile = SandboxProfile(
+        "test-diff-v1", "python@sha256:manifest-aaa",
+        run_as_user=f"{os.getuid()}:{os.getgid()}",
+    )
+    backend = DockerVerificationSandboxBackend(
+        profile=profile, docker_executable=Path("/usr/bin/env"),
+    )
+    # Approved ImageAttestation: manifest digest != config image ID.
+    approved = ImageAttestation(
+        requested_image_reference="python@sha256:manifest-aaa",
+        approved_repository_digest="sha256:manifest-aaa",
+        platform="linux/amd64",
+        platform_manifest_digest="sha256:manifest-aaa",
+        local_config_image_id="sha256:config-bbb",
+        container_image_id="",
+        repo_digests=("python@sha256:manifest-aaa",),
+        no_pull_proof="image-inspect-not-pull",
+        attested_at=time.time(),
+        attestation_digest="approved-digest",
+    )
+    # Container .Image matches local_config_image_id (NOT manifest digest).
+    async def fake_inspect_instance(cid):
+        return {"Id": cid, "Image": "sha256:config-bbb",
+                "Config": {"Labels": {"khaos.manifest-digest": "manifest-hash"}}}
+    async def fake_inspect_image(ref):
+        return "sha256:config-bbb"
+    backend.inspect_instance = fake_inspect_instance
+    backend.inspect_image = fake_inspect_image
+
+    async def run():
+        return await backend.inspect_and_attest_instance(
+            container_id_or_name="test-cid",
+            expected_labels={"khaos.manifest-digest": "manifest-hash"},
+            expected_image_digest="python@sha256:manifest-aaa",
+            expected_manifest_digest="manifest-hash",
+            image_attestation=approved,
+        )
+    result = asyncio.run(run())
+    # The attestation must bind to the approved image attestation digest.
+    assert result.image_attestation_digest == "approved-digest"
+    assert result.container_image_id == "sha256:config-bbb"
 
 
 # ----------------------------------------------------------------------
@@ -1922,7 +2090,8 @@ class _FaultMatrixBackend:
 
     async def inspect_and_attest_instance(self, *, container_id_or_name,
                                           expected_labels, expected_image_digest,
-                                          expected_manifest_digest):
+                                          expected_manifest_digest,
+                                          image_attestation=None):
         if self.inspect_error:
             raise self.inspect_error
         return ContainerAttestation(

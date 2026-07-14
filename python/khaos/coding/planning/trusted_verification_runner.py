@@ -75,6 +75,7 @@ class TrustedVerificationRunner:
         toolchain_attestations: tuple = (),
         approved_image_attestation_digest: str = "",
         approved_toolchain_attestation_digests: tuple[str, ...] = (),
+        image_attestation: Any = None,
     ) -> None:
         # Batch 3.1.4 §2: production backends must be constructed by the
         # runtime's private factory (exact type + factory marker) OR be
@@ -137,6 +138,10 @@ class TrustedVerificationRunner:
         self._approved_toolchain_attestation_digests = (
             approved_toolchain_attestation_digests
         )
+        # Batch 3.1.4 §4: the approved ImageAttestation object.  Passed to
+        # inspect_and_attest_instance so the container's .Image is verified
+        # against the approved local_config_image_id (not the manifest digest).
+        self._image_attestation = image_attestation
         self._store.recover_interrupted()
         # Batch 3.1.2 §8: reconcile disposable workspaces from previous boots.
         self._reconcile_disposable_workspaces()
@@ -697,11 +702,15 @@ class TrustedVerificationRunner:
                         labels=labels,
                     )
                     # Step 3: inspect and attest (before start)
+                    # Batch 3.1.4 §4: pass the approved ImageAttestation so
+                    # the container's .Image is verified against the approved
+                    # local_config_image_id, NOT the registry manifest digest.
                     attestation = await self._backend.inspect_and_attest_instance(
                         container_id_or_name=container_id,
                         expected_labels=labels,
                         expected_image_digest=self._profile.image_digest,
                         expected_manifest_digest=disposable.manifest_digest,
+                        image_attestation=self._image_attestation,
                     )
                     # Step 4: persist container_id + attestation + CREATED_ATTESTED
                     # in one atomic transaction BEFORE docker start.

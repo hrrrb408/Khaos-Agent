@@ -721,6 +721,7 @@ class ApprovalRuntime:
             toolchain_attestations=self._verification_toolchain_attestations,
             approved_image_attestation_digest=self._approved_image_attestation_digest,
             approved_toolchain_attestation_digests=self._approved_toolchain_attestation_digests,
+            image_attestation=self._verification_image_attestation,
         )
         self.guard.set_verification_runner(self._verification_runner)
 
