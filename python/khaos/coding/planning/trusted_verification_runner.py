@@ -74,15 +74,27 @@ class TrustedVerificationRunner:
         artifact_ttl_seconds: float = 24 * 3600,
         toolchain_attestations: tuple = (),
     ) -> None:
-        # Batch 3.1.3 §5: production backends must be signed by an explicit
-        # ProductionVerificationAuthority — not by module-name heuristics.
+        # Batch 3.1.4 §2: production backends must be constructed by the
+        # runtime's private factory (exact type + factory marker) OR be
+        # explicitly marked as unsafe test-only.  Malicious objects that
+        # implement create_instance/start_instance but are not exact
+        # DockerVerificationSandboxBackend instances are rejected.
         from khaos.coding.planning.verification_sandbox import (
             ProductionVerificationAuthority,
         )
-        if not ProductionVerificationAuthority.is_production_backend(backend):
+        is_production = ProductionVerificationAuthority.is_production_backend(backend)
+        is_factory = ProductionVerificationAuthority.is_runtime_factory_backend(backend)
+        is_unsafe_test = bool(getattr(backend, "_unsafe_test_only", False))
+        if not is_production:
             raise TypeError(
                 "backend was not signed by a ProductionVerificationAuthority; "
                 "test or unsigned backends cannot be used in the production runner"
+            )
+        if not is_factory and not is_unsafe_test:
+            raise TypeError(
+                "backend was not constructed by the runtime's private factory "
+                "and is not an explicit unsafe test backend; malicious objects "
+                "that set _production_authority cannot impersonate production backends"
             )
         self._store = VerificationExecutionStore(approval_store)
         self._approval_store = approval_store

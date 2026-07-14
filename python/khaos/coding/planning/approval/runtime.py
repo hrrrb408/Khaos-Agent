@@ -346,10 +346,16 @@ class ApprovalRuntime:
         return self.guard.planned_workspace_edit(context, bundle=bundle)
 
     def configure_trusted_verification(
-        self, *, backend: Any, command_factory: Any, workspace_factory: Any,
+        self, *, config: Any, command_factory: Any, workspace_factory: Any,
         artifact_root: Any, profile: Any,
     ) -> None:
         """Install the production-only trusted verifier after Runtime startup.
+
+        Batch 3.1.4 §2: accepts a typed ``ProductionVerificationConfig``
+        instead of a caller-provided backend instance.  The runtime
+        constructs the exact ``DockerVerificationSandboxBackend``
+        internally via a private factory, signed with a runtime-issued
+        factory marker.  Callers cannot pass backend instances.
 
         Batch 3.1.1 §7: probes the backend image (``--pull=never``) and
         verifies the actual image ID matches the profile's pinned digest
@@ -363,18 +369,101 @@ class ApprovalRuntime:
         NOT installed and the runtime is safe to retry.
         """
         self.require_ready()
+        from khaos.coding.planning.verification_sandbox import (
+            ProductionVerificationConfig,
+        )
+        if not isinstance(config, ProductionVerificationConfig):
+            raise TypeError(
+                "configure_trusted_verification requires a "
+                "ProductionVerificationConfig — caller-provided backends "
+                "are not accepted"
+            )
+        # Batch 3.1.4 §2: construct the backend via the private factory.
+        backend = self._construct_production_backend(config, profile)
+        self._configure_trusted_verification_internal(
+            backend=backend, command_factory=command_factory,
+            workspace_factory=workspace_factory, artifact_root=artifact_root,
+            profile=profile,
+        )
+
+    def _construct_production_backend(
+        self, config: Any, profile: Any,
+    ) -> Any:
+        """Batch 3.1.4 §2: private factory that constructs the exact backend.
+
+        Verifies:
+        - Profile ID matches the config.
+        - Docker executable exists and matches the config.
+        - The backend is exactly ``DockerVerificationSandboxBackend``.
+
+        Signs the backend with a runtime-issued factory marker that
+        ``ProductionVerificationAuthority.sign`` verifies before signing.
+        """
+        from pathlib import Path as _Path
+        from khaos.coding.planning.verification_sandbox import (
+            DockerVerificationSandboxBackend, ProductionVerificationAuthority,
+        )
+        # Verify profile ID matches.
+        if profile.profile_id != config.profile_id:
+            raise ValueError(
+                f"profile ID mismatch: config={config.profile_id} "
+                f"profile={profile.profile_id}"
+            )
+        # Verify docker executable.
+        docker_path = _Path(config.docker_executable_id).resolve(strict=True)
+        # Construct the exact backend — no caller object.
+        backend = DockerVerificationSandboxBackend(
+            profile=profile, docker_executable=docker_path,
+        )
+        # Batch 3.1.4 §2: set the runtime factory marker before signing.
+        # This marker is an opaque object that only this runtime possesses.
+        factory_marker = object()
+        object.__setattr__(backend, "_runtime_factory_marker", factory_marker)
+        # Sign with the authority that carries the factory marker.
+        authority = ProductionVerificationAuthority(factory_marker=factory_marker)
+        authority.sign(backend)
+        return backend
+
+    def _configure_trusted_verification_unsafe(
+        self, *, backend: Any, command_factory: Any, workspace_factory: Any,
+        artifact_root: Any, profile: Any,
+    ) -> None:
+        """Batch 3.1.4 §2: UNSAFE test-only configuration path.
+
+        Accepts a caller-provided backend for testing.  This method is
+        explicitly unsafe — production code must use
+        ``configure_trusted_verification`` with a
+        ``ProductionVerificationConfig`` instead.
+
+        The backend is signed with a test-only authority that does NOT
+        carry the runtime factory marker.  The production runner rejects
+        backends without the factory marker.
+        """
+        self.require_ready()
+        from khaos.coding.planning.verification_sandbox import (
+            ProductionVerificationAuthority,
+        )
+        # Batch 3.1.4 §2: sign with a test-only authority (no factory marker).
+        # The runner must accept this via the _unsafe_test_only flag.
+        object.__setattr__(backend, "_production_authority", "khaos-production-v1")
+        object.__setattr__(backend, "_unsafe_test_only", True)
+        self._configure_trusted_verification_internal(
+            backend=backend, command_factory=command_factory,
+            workspace_factory=workspace_factory, artifact_root=artifact_root,
+            profile=profile,
+        )
+
+    def _configure_trusted_verification_internal(
+        self, *, backend: Any, command_factory: Any, workspace_factory: Any,
+        artifact_root: Any, profile: Any,
+    ) -> None:
+        """Internal configuration shared by production and unsafe paths."""
         import asyncio as _asyncio
         from khaos.coding.planning.trusted_verification_runner import TrustedVerificationRunner
         from khaos.coding.planning.verification_sandbox import (
             DockerVerificationSandboxBackend, ProductionVerificationAuthority,
         )
         from khaos.coding.planning.verification_store import VerificationExecutionStore
-
-        # Batch 3.1.3 §5: sign the backend with ProductionVerificationAuthority.
-        # This replaces the module-name ``endswith("tests")`` heuristic.
-        # The runner will reject any backend that was not signed.
-        authority = ProductionVerificationAuthority()
-        authority.sign(backend)
 
         # Batch 3.1.1 §8: PROBING_BACKEND
         self._verification_config_state = "PROBING_BACKEND"

@@ -471,7 +471,7 @@ def test_runtime_phase_context_runner_is_idempotent_and_canonical_workspace_unch
     }
     profile = _profile()
     backend = UnsafeTestSandboxBackend(profile)
-    runtime.configure_trusted_verification(
+    runtime._configure_trusted_verification_unsafe(
         backend=backend, command_factory=_factory(profile),
         workspace_factory=VerificationWorkspaceFactory(tmp_path / "verification-copies"),
         artifact_root=tmp_path / "verification-artifacts", profile=profile,
@@ -594,6 +594,106 @@ def test_static_planned_verification_has_no_agent_tool_or_shell_route():
     assert "ChangeSet" not in source
     assert "git commit" not in source
     assert "git push" not in source
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.4 §2: Production verification authority — typed config,
+# factory construction, malicious backend rejection.
+# ----------------------------------------------------------------------
+
+
+def test_malicious_backend_with_create_instance_rejected_by_authority():
+    """§2: malicious objects implementing create_instance/start_instance
+    are rejected by ProductionVerificationAuthority.sign — exact type check.
+    """
+    from khaos.coding.planning.verification_sandbox import (
+        ProductionVerificationAuthority,
+    )
+
+    class MaliciousBackend:
+        """Implements the lifecycle API but is NOT DockerVerificationSandboxBackend."""
+        async def create_instance(self, **kwargs):
+            return "fake-id"
+        async def start_and_attach_instance(self, container_id):
+            return None, None, None
+        async def start_instance(self, container_id):
+            pass
+        async def attach_instance(self, container_id):
+            return None, None, None
+        async def wait_instance(self, container_id):
+            return 0
+        async def terminate_instance(self, container_id):
+            pass
+        async def remove_instance(self, container_id):
+            pass
+
+    malicious = MaliciousBackend()
+    # Even with a factory marker, the authority rejects non-exact-type backends.
+    authority = ProductionVerificationAuthority(factory_marker=object())
+    with pytest.raises(TypeError, match="exact"):
+        authority.sign(malicious)
+
+
+def test_forged_production_authority_field_rejected_by_runner():
+    """§2: an ordinary object that sets _production_authority cannot
+    impersonate a production backend — the runner checks for the runtime
+    factory marker or the unsafe test flag.
+    """
+    from khaos.coding.planning.verification_sandbox import (
+        ProductionVerificationAuthority,
+    )
+
+    class ForgedBackend:
+        """Sets _production_authority but lacks factory marker and unsafe flag."""
+        _production_authority = "khaos-production-v1"
+        profile = _profile()
+
+    forged = ForgedBackend()
+    # is_production_backend returns True (has _production_authority)...
+    assert ProductionVerificationAuthority.is_production_backend(forged)
+    # ...but is_runtime_factory_backend returns False (not exact type).
+    assert not ProductionVerificationAuthority.is_runtime_factory_backend(forged)
+    # The runner would reject this: not factory, not unsafe_test_only.
+
+
+def test_production_authority_requires_factory_marker_to_sign():
+    """§2: ProductionVerificationAuthority.sign fails without a factory marker."""
+    from khaos.coding.planning.verification_sandbox import (
+        DockerVerificationSandboxBackend, ProductionVerificationAuthority,
+    )
+
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    # No factory marker — sign should fail.
+    authority = ProductionVerificationAuthority()
+    with pytest.raises(PermissionError, match="factory marker"):
+        authority.sign(backend)
+
+
+def test_production_authority_rejects_wrong_factory_marker():
+    """§2: backend constructed by a different factory is rejected."""
+    from khaos.coding.planning.verification_sandbox import (
+        DockerVerificationSandboxBackend, ProductionVerificationAuthority,
+    )
+
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    # Set a wrong factory marker.
+    object.__setattr__(backend, "_runtime_factory_marker", object())
+    authority = ProductionVerificationAuthority(factory_marker=object())
+    with pytest.raises(PermissionError, match="not constructed by the runtime"):
+        authority.sign(backend)
+
+
+def test_configure_trusted_verification_rejects_backend_instance(tmp_path):
+    """§2: configure_trusted_verification must not accept a backend= parameter."""
+    runtime, _, _, _ = _real_runtime(tmp_path)
+    profile = _profile()
+    backend = UnsafeTestSandboxBackend(profile)
+    with pytest.raises(TypeError, match="ProductionVerificationConfig"):
+        runtime.configure_trusted_verification(
+            config=backend, command_factory=_factory(profile),
+            workspace_factory=VerificationWorkspaceFactory(tmp_path / "copies"),
+            artifact_root=tmp_path / "artifacts", profile=profile,
+        )
 
 
 # ----------------------------------------------------------------------
@@ -1811,7 +1911,7 @@ def _fault_matrix_runtime(tmp_path, *, backend):
     plan, authorization = _authorize(runtime, plan)
     result = _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
     profile = _profile()
-    runtime.configure_trusted_verification(
+    runtime._configure_trusted_verification_unsafe(
         backend=backend, command_factory=_factory(profile),
         workspace_factory=VerificationWorkspaceFactory(tmp_path / "fault-copies"),
         artifact_root=tmp_path / "fault-artifacts", profile=profile,
@@ -2815,7 +2915,7 @@ def _optional_fault_matrix_runtime(tmp_path, *, backend):
     plan, authorization = _authorize(runtime, plan)
     result = _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
     profile = _profile()
-    runtime.configure_trusted_verification(
+    runtime._configure_trusted_verification_unsafe(
         backend=backend, command_factory=_factory(profile),
         workspace_factory=VerificationWorkspaceFactory(tmp_path / "fault-copies"),
         artifact_root=tmp_path / "fault-artifacts", profile=profile,

@@ -133,33 +133,77 @@ class VerificationSandboxBackend(Protocol):
     ) -> SandboxStepResult: ...
 
 
-class ProductionVerificationAuthority:
-    """Batch 3.1.3 §5: explicit authority that signs production backends.
+@dataclass(frozen=True)
+class ProductionVerificationConfig:
+    """Batch 3.1.4 §2: typed configuration for production verification.
 
-    Production backends must be created through this authority — the
-    module-name ``endswith("tests")`` check is no longer sufficient.
-    The authority attaches an unforgeable ``_production_authority``
-    marker that the runner checks before accepting the backend.
+    Callers cannot pass backend instances to ``configure_trusted_verification``.
+    The runtime constructs the exact ``DockerVerificationSandboxBackend``
+    internally via a private factory using this config.
+
+    The config carries only identity fields — the runtime already has
+    access to the ``SandboxProfile``, artifact root, and workspace factory
+    through the other ``configure_trusted_verification`` parameters.
+    """
+    docker_executable_id: str           # canonical resolved path to docker
+    approved_image_reference: str       # repository@sha256:digest
+    profile_id: str                     # SandboxProfile.profile_id
+    artifact_storage_capability_id: str # ArtifactRootCapability identity
+    snapshot_storage_capability_id: str # snapshot storage identity
+
+
+class ProductionVerificationAuthority:
+    """Batch 3.1.4 §2: authority that signs production backends.
+
+    Batch 3.1.4 §2: now requires a runtime-issued factory marker to sign.
+    The marker is an opaque object that only ``ApprovalRuntime``'s private
+    factory possesses.  Ordinary objects cannot impersonate a production
+    backend by setting ``_production_authority`` — they must also carry
+    the correct ``_runtime_factory_marker``.
+
+    The sign method verifies:
+    - ``type(backend) is DockerVerificationSandboxBackend`` (exact type,
+      not a subclass or duck-typed impersonator)
+    - ``backend._runtime_factory_marker`` matches the factory marker
 
     Test backends do not pass through this authority and are rejected
     by the production runner.
     """
 
-    def __init__(self, *, authority_id: str = "khaos-production-v1") -> None:
+    def __init__(
+        self, *, factory_marker: Any = None,
+        authority_id: str = "khaos-production-v1",
+    ) -> None:
         self._authority_id = authority_id
+        self._factory_marker = factory_marker
 
     @property
     def authority_id(self) -> str:
         return self._authority_id
 
     def sign(self, backend: Any) -> Any:
-        """Attach the production authority marker to a backend."""
-        # The backend must already be a DockerVerificationSandboxBackend
-        # or equivalent — not a test backend.
-        if not hasattr(backend, "create_instance"):
+        """Attach the production authority marker to a backend.
+
+        Batch 3.1.4 §2: verifies exact type and factory marker before
+        signing.  Malicious objects that implement ``create_instance``
+        / ``start_instance`` but are not exact
+        ``DockerVerificationSandboxBackend`` instances are rejected.
+        """
+        if type(backend) is not DockerVerificationSandboxBackend:
             raise TypeError(
-                "ProductionVerificationAuthority can only sign backends "
-                "with the full explicit container lifecycle API"
+                "ProductionVerificationAuthority can only sign exact "
+                "DockerVerificationSandboxBackend instances — subclasses "
+                "and duck-typed impersonators are rejected"
+            )
+        if self._factory_marker is None:
+            raise PermissionError(
+                "ProductionVerificationAuthority requires a runtime-issued "
+                "factory marker to sign backends"
+            )
+        actual_marker = getattr(backend, "_runtime_factory_marker", None)
+        if actual_marker is not self._factory_marker:
+            raise PermissionError(
+                "backend was not constructed by the runtime's private factory"
             )
         object.__setattr__(backend, "_production_authority", self._authority_id)
         return backend
@@ -168,6 +212,13 @@ class ProductionVerificationAuthority:
     def is_production_backend(backend: Any) -> bool:
         """Check whether a backend was signed by a ProductionVerificationAuthority."""
         return bool(getattr(backend, "_production_authority", None))
+
+    @staticmethod
+    def is_runtime_factory_backend(backend: Any) -> bool:
+        """Batch 3.1.4 §2: check exact type + runtime factory marker."""
+        if type(backend) is not DockerVerificationSandboxBackend:
+            return False
+        return bool(getattr(backend, "_runtime_factory_marker", None))
 
 
 class DockerVerificationSandboxBackend:
