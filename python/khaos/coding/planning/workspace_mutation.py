@@ -64,6 +64,30 @@ class WorkspaceMutationError(RuntimeError):
         self.code = code
 
 
+def _resolve_avp_digest(store: Any, context: Any) -> str:
+    """Batch 3.1.5 §2: resolve the approved verification plan digest bound to
+    the execution's approval request, so the binding digest re-computation
+    embeds the same snapshot digest that was frozen at approval time.
+
+    Returns empty string when no request is bound (test paths without a
+    configured VerificationSnapshotProvider) — matching the empty digest used
+    at request creation time so the binding still matches.
+    """
+    approval_request_id = ""
+    authorization = getattr(context, "authorization", None)
+    if authorization is not None:
+        approval_request_id = getattr(authorization, "approval_request_id", "") or ""
+    if not approval_request_id:
+        return ""
+    try:
+        request = store.get_request(approval_request_id)
+    except Exception:
+        return ""
+    if request is None:
+        return ""
+    return getattr(request, "approved_verification_plan_digest", "") or ""
+
+
 class WorkspaceMutationEngine:
     """The sole Batch 3 entry for structured isolated-workspace edits."""
 
@@ -352,7 +376,10 @@ class WorkspaceMutationEngine:
         for actual, expected, code in fields:
             if actual != expected:
                 raise WorkspaceMutationError(code, code)
-        if compute_plan_binding_digest(plan) != context.binding_digest:
+        if compute_plan_binding_digest(
+            plan,
+            approved_verification_plan_digest=_resolve_avp_digest(self._store, context),
+        ) != context.binding_digest:
             raise WorkspaceMutationError("plan-binding-drift", "plan binding drifted")
         if not bundle.ordered_edits or len(bundle.ordered_edits) > MAX_BUNDLE_FILES:
             raise WorkspaceMutationError("bundle-file-limit", "invalid bundle file count")

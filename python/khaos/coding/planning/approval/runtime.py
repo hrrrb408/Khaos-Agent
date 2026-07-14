@@ -99,6 +99,144 @@ _RUNTIME_AUTHORITIES = _RuntimeAuthorityRegistry()
 def _consume_runtime_capability(capability: Any, scope: str) -> BootContext:
     return _RUNTIME_AUTHORITIES.consume(capability, scope)
 
+
+class VerificationSnapshotProvider:
+    """Batch 3.1.5 §2: trusted provider that computes and persists the
+    :class:`ApprovedVerificationPlanSnapshot` before human approval.
+
+    The provider is constructed by :class:`ApprovalRuntime` after trusted
+    verification is configured (image probed, toolchains attested).  It has
+    access to the runtime's verification components (command factory, profile,
+    attestations) and the workspace manager (to build the catalog from the
+    plan's workspace).
+
+    ``compute_snapshot(plan)`` is called by
+    :meth:`PlanApprovalService.request_approval` BEFORE the PENDING/NOT_REQUIRED
+    row is created.  The returned snapshot's digest enters
+    :func:`compute_plan_binding_digest` so any drift in commands, catalog,
+    profile, image attestation, or toolchain attestations invalidates the
+    approval.
+    """
+
+    def __init__(
+        self,
+        *,
+        workspace_manager: Any,
+        command_factory: Any,
+        profile: Any,
+        image_attestation: Any,
+        toolchain_attestations: tuple,
+        verification_store: Any,
+        boot_context: Any,
+    ) -> None:
+        self._workspace_manager = workspace_manager
+        self._command_factory = command_factory
+        self._profile = profile
+        self._image_attestation = image_attestation
+        self._toolchain_attestations = toolchain_attestations
+        self._verification_store = verification_store
+        self._boot_context = boot_context
+
+    def compute_snapshot(self, plan: Any) -> Any:
+        """Compute, persist, and return the ApprovedVerificationPlanSnapshot."""
+        import hashlib
+        import json
+        import uuid as _uuid
+        from khaos.coding.planning.approval.models import compute_verification_digest
+        from khaos.coding.planning.verification_catalog import VerificationCatalog
+        from khaos.coding.planning.verification_execution_models import (
+            ApprovedVerificationPlanSnapshot,
+            compute_approved_verification_plan_digest,
+        )
+
+        workspace = self._workspace_manager.get(plan.workspace_id)
+        if workspace is None:
+            raise RuntimeError(
+                f"workspace {plan.workspace_id} not found for snapshot computation"
+            )
+        catalog = VerificationCatalog(
+            workspace.worktree_path, repository_id=plan.repository_id,
+        )
+        commands = self._command_factory.build(
+            plan.verification_requirements, catalog.entries,
+            profile_id=self._profile.profile_id,
+        )
+        ordered_command_digests = tuple(c.command_digest for c in commands)
+        config_hashes = tuple(sorted(catalog.config_hashes.values()))
+        image_content_digest = ""
+        if self._image_attestation is not None:
+            image_content_digest = (
+                getattr(self._image_attestation, "content_digest", "")
+                or getattr(self._image_attestation, "attestation_digest", "")
+            )
+        ordered_tc_digests = tuple(
+            getattr(att, "attestation_digest", "") for att in self._toolchain_attestations
+        )
+        binary_digests = tuple(
+            getattr(att, "binary_digest", "") for att in self._toolchain_attestations
+        )
+        version_output_digests = tuple(
+            getattr(att, "version_output_digest", "") for att in self._toolchain_attestations
+        )
+        parsed_versions = tuple(
+            getattr(att, "parsed_version", "") for att in self._toolchain_attestations
+        )
+        # image_toolchain_policy_fingerprint: binds image + toolchain + profile
+        # policy into a single digest.  Any change to the approved image,
+        # toolchain set, or sandbox profile invalidates the fingerprint.
+        policy_payload = {
+            "image_attestation_content_digest": image_content_digest,
+            "ordered_toolchain_attestation_digests": list(ordered_tc_digests),
+            "sandbox_profile_digest": self._profile.digest,
+        }
+        image_toolchain_policy_fingerprint = hashlib.sha256(
+            json.dumps(policy_payload, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+
+        verification_requirements_digest = compute_verification_digest(
+            plan.verification_requirements
+        )
+        approved_verification_plan_id = f"avp_{_uuid.uuid4().hex}"
+        created_at = time.time()
+        snapshot_digest = compute_approved_verification_plan_digest(
+            plan_id=plan.plan_id,
+            plan_content_hash=plan.content_hash,
+            verification_requirements_digest=verification_requirements_digest,
+            catalog_fingerprint=catalog.fingerprint,
+            ordered_command_digests=ordered_command_digests,
+            config_hashes=config_hashes,
+            sandbox_profile_digest=self._profile.digest,
+            image_attestation_content_digest=image_content_digest,
+            ordered_toolchain_attestation_content_digests=ordered_tc_digests,
+            binary_digests=binary_digests,
+            version_output_digests=version_output_digests,
+            parsed_versions=parsed_versions,
+            image_toolchain_policy_fingerprint=image_toolchain_policy_fingerprint,
+        )
+        snapshot = ApprovedVerificationPlanSnapshot(
+            approved_verification_plan_id=approved_verification_plan_id,
+            plan_id=plan.plan_id,
+            plan_content_hash=plan.content_hash,
+            verification_requirements_digest=verification_requirements_digest,
+            catalog_fingerprint=catalog.fingerprint,
+            ordered_command_digests=ordered_command_digests,
+            config_hashes=config_hashes,
+            sandbox_profile_digest=self._profile.digest,
+            image_attestation_content_digest=image_content_digest,
+            ordered_toolchain_attestation_content_digests=ordered_tc_digests,
+            binary_digests=binary_digests,
+            version_output_digests=version_output_digests,
+            parsed_versions=parsed_versions,
+            image_toolchain_policy_fingerprint=image_toolchain_policy_fingerprint,
+            created_at=created_at,
+            approved_verification_plan_digest=snapshot_digest,
+        )
+        self._verification_store.persist_approved_verification_plan_snapshot(
+            snapshot, boot_id=self._boot_context.boot_id,
+        )
+        return snapshot
+
+
 class ApprovalRuntime:
     """Production bootstrap for the approval + lease runtime.
 
@@ -747,6 +885,22 @@ class ApprovalRuntime:
             image_attestation=self._verification_image_attestation,
         )
         self.guard.set_verification_runner(self._verification_runner)
+        # Batch 3.1.5 §2: wire the VerificationSnapshotProvider into the
+        # approval service so request_approval() computes and persists the
+        # ApprovedVerificationPlanSnapshot before the PENDING/NOT_REQUIRED row.
+        # The snapshot digest enters compute_plan_binding_digest, binding the
+        # supply chain snapshot through broker → authorization → execution →
+        # verification.  Any drift invalidates the approval (STALE).
+        if self.service is not None:
+            self.service._snapshot_provider = VerificationSnapshotProvider(
+                workspace_manager=self._workspace_manager,
+                command_factory=command_factory,
+                profile=profile,
+                image_attestation=self._verification_image_attestation,
+                toolchain_attestations=self._verification_toolchain_attestations,
+                verification_store=self._verification_store,
+                boot_context=self.boot_context,
+            )
 
     @asynccontextmanager
     async def acquire_verification_context(

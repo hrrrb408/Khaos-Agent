@@ -68,11 +68,16 @@ class PlanLiveValidator:
         expected_repository_id: str | None = None,
         expected_task_id: str | None = None,
         expected_workspace_id: str | None = None,
+        approved_verification_plan_digest: str = "",
     ) -> PlanValidationContext:
         """Validate the authoritative plan snapshot for ``plan_id``.
 
         Raises :class:`PlanNotRequestableError` if the plan is missing or its
         task/workspace is terminal, :class:`PlanStaleError` on any drift.
+
+        Batch 3.1.5 §2: ``approved_verification_plan_digest`` binds the
+        persisted verification plan snapshot into the recomputed binding
+        digest so any snapshot drift invalidates the approval.
         """
         # Read the AUTHORITATIVE snapshot — never a caller-supplied plan.
         plan = self._plan_repository.get(plan_id)
@@ -88,15 +93,25 @@ class PlanLiveValidator:
         if expected_workspace_id is not None and plan.workspace_id != expected_workspace_id:
             raise PlanNotRequestableError("workspace id mismatch against authoritative plan")
 
-        return self._validate_plan(plan)
+        return self._validate_plan(plan, approved_verification_plan_digest=approved_verification_plan_digest)
 
-    def validate_plan(self, plan: "ImplementationPlan") -> PlanValidationContext:
+    def validate_plan(
+        self,
+        plan: "ImplementationPlan",
+        *,
+        approved_verification_plan_digest: str = "",
+    ) -> PlanValidationContext:
         """Validate a plan object directly (used by the approval service at
         request-creation time, where the plan was just produced server-side
         and registered into the repository in the same call)."""
-        return self._validate_plan(plan)
+        return self._validate_plan(plan, approved_verification_plan_digest=approved_verification_plan_digest)
 
-    def _validate_plan(self, plan: "ImplementationPlan") -> PlanValidationContext:
+    def _validate_plan(
+        self,
+        plan: "ImplementationPlan",
+        *,
+        approved_verification_plan_digest: str = "",
+    ) -> PlanValidationContext:
         # Plan self-status gate.
         status = plan.status
         status_value = getattr(status, "value", str(status))
@@ -155,7 +170,9 @@ class PlanLiveValidator:
         outcome = evaluate_approval_requirement(plan)
 
         # Binding + verification digests.
-        binding_digest = compute_plan_binding_digest(plan)
+        binding_digest = compute_plan_binding_digest(
+            plan, approved_verification_plan_digest=approved_verification_plan_digest,
+        )
         verification_digest = compute_verification_digest(plan.verification_requirements)
 
         return PlanValidationContext(

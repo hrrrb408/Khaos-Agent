@@ -190,6 +190,12 @@ class PlanApprovalService:
             context_provider=context_provider,
             planning_service=planning_service,
         )
+        # Batch 3.1.5 §2: trusted VerificationSnapshotProvider — set by the
+        # ApprovalRuntime after trusted verification is configured.  When set,
+        # request_approval() computes and persists the ApprovedVerificationPlanSnapshot
+        # before creating the PENDING/NOT_REQUIRED row, and the snapshot digest
+        # enters compute_plan_binding_digest so any drift invalidates the approval.
+        self._snapshot_provider: Any = None
 
     def _verify_boot(self) -> None:
         """Batch 2.6 §2: verify persisted epoch + boot_id before every operation.
@@ -227,14 +233,21 @@ class PlanApprovalService:
     # Validation (delegates to the shared PlanLiveValidator)
     # ------------------------------------------------------------------
 
-    def _validate_for_approval(self, plan: "ImplementationPlan") -> PlanValidationContext:
+    def _validate_for_approval(
+        self, plan: "ImplementationPlan", *, approved_verification_plan_digest: str = "",
+    ) -> PlanValidationContext:
         """Validate via the shared :class:`PlanLiveValidator`.
 
         Catches the validator's errors and re-raises them as the service-level
         error types so callers see a single hierarchy.
+
+        Batch 3.1.5 §2: ``approved_verification_plan_digest`` is forwarded so
+        the binding digest embeds the persisted snapshot digest.
         """
         try:
-            return self._validator.validate_plan(plan)
+            return self._validator.validate_plan(
+                plan, approved_verification_plan_digest=approved_verification_plan_digest,
+            )
         except _ValidatorStale as exc:
             raise PlanStaleError(str(exc)) from exc
         except _ValidatorNotRequestable as exc:
@@ -265,7 +278,21 @@ class PlanApprovalService:
         """
         # Batch 2.6 §2: verify persisted boot before any operation.
         self._verify_boot()
-        ctx = self._validate_for_approval(plan)
+        # Batch 3.1.5 §2: compute and persist the ApprovedVerificationPlanSnapshot
+        # BEFORE creating the PENDING/NOT_REQUIRED row.  The snapshot digest
+        # enters compute_plan_binding_digest so any drift in commands, catalog,
+        # profile, image attestation, or toolchain attestations invalidates the
+        # approval.  When no provider is wired (unit-test service without a
+        # configured runtime), the digest is empty (snapshot not bound).
+        snapshot_id = ""
+        snapshot_digest = ""
+        if self._snapshot_provider is not None:
+            snapshot = self._snapshot_provider.compute_snapshot(plan)
+            snapshot_id = snapshot.approved_verification_plan_id
+            snapshot_digest = snapshot.approved_verification_plan_digest
+        ctx = self._validate_for_approval(
+            plan, approved_verification_plan_digest=snapshot_digest,
+        )
         # Register the authoritative snapshot so the gate can resolve it later.
         # Batch 2.3 §9: if the plan_id is already registered with DIFFERENT
         # content, refuse to create the request (no silent overwrite).
@@ -292,6 +319,8 @@ class PlanApprovalService:
                 status=PlanApprovalStatus.NOT_REQUIRED,
                 broker_request_id="",
                 reason=reason or "not-required:" + ",".join(ctx.reason_codes),
+                approved_verification_plan_id=snapshot_id,
+                approved_verification_plan_digest=snapshot_digest,
             )
             self._store.insert_request(request)
             self._record_audit(
@@ -311,6 +340,8 @@ class PlanApprovalService:
             status=PlanApprovalStatus.REGISTERING,
             broker_request_id="",
             reason=reason or "registering:" + ",".join(ctx.reason_codes),
+            approved_verification_plan_id=snapshot_id,
+            approved_verification_plan_digest=snapshot_digest,
         )
         self._store.insert_request(registering)
         self._record_audit(
@@ -353,6 +384,8 @@ class PlanApprovalService:
             status=PlanApprovalStatus.PENDING,
             broker_request_id=broker_request_id,
             reason=reason or "pending:" + ",".join(ctx.reason_codes),
+            approved_verification_plan_id=snapshot_id,
+            approved_verification_plan_digest=snapshot_digest,
         )
         self._record_audit(
             request=request, previous_status=PlanApprovalStatus.REGISTERING.value,
@@ -377,6 +410,8 @@ class PlanApprovalService:
         status: PlanApprovalStatus,
         broker_request_id: str,
         reason: str,
+        approved_verification_plan_id: str = "",
+        approved_verification_plan_digest: str = "",
     ) -> PlanApprovalRequest:
         return PlanApprovalRequest(
             approval_request_id=approval_request_id,
@@ -403,6 +438,8 @@ class PlanApprovalService:
             broker_request_id=broker_request_id,
             reason=reason,
             metadata={"reason_codes": list(ctx.reason_codes)},
+            approved_verification_plan_id=approved_verification_plan_id,
+            approved_verification_plan_digest=approved_verification_plan_digest,
         )
 
     # ------------------------------------------------------------------
@@ -460,8 +497,14 @@ class PlanApprovalService:
 
         # Resolve the AUTHORITATIVE plan snapshot by plan_id (Batch 2.2 §4).
         # No caller-supplied plan object is accepted.
+        # Batch 3.1.5 §2: forward the request's approved_verification_plan_digest
+        # so the recomputed binding embeds the persisted snapshot — any drift
+        # invalidates the approval at decision time.
         try:
-            ctx = self._validator.validate(request.plan_id)
+            ctx = self._validator.validate(
+                request.plan_id,
+                approved_verification_plan_digest=request.approved_verification_plan_digest or "",
+            )
         except _ValidatorStale as exc:
             self._transition(
                 request=request, target=PlanApprovalStatus.STALE,
@@ -602,7 +645,10 @@ class PlanApprovalService:
                     counts["staled"] += 1
                     continue
                 try:
-                    ctx = self._validator.validate_plan(plan)
+                    ctx = self._validator.validate_plan(
+                        plan,
+                        approved_verification_plan_digest=request.approved_verification_plan_digest or "",
+                    )
                 except Exception:
                     self._store.transition_request_status(
                         request.approval_request_id,
@@ -642,7 +688,10 @@ class PlanApprovalService:
                     counts["staled"] += 1
                     continue
                 try:
-                    ctx = self._validator.validate_plan(plan)
+                    ctx = self._validator.validate_plan(
+                        plan,
+                        approved_verification_plan_digest=request.approved_verification_plan_digest or "",
+                    )
                 except Exception:
                     self._store.transition_request_status(
                         request.approval_request_id,

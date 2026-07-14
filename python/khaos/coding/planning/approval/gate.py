@@ -223,9 +223,20 @@ class PlanExecutionGate:
         if plan is None:
             raise PlanBlockedError(f"no authoritative plan snapshot for {plan_id}")
 
+        # Batch 3.1.5 §2: load the approval request early so the persisted
+        # approved_verification_plan_digest can enter the binding digest
+        # re-computation.  The request's snapshot digest binds the supply-chain
+        # snapshot into the authorization — any drift invalidates the mint.
+        request = self._store.get_request(approval_request_id)
+        if request is None:
+            raise ApprovalMissingError(f"unknown approval request {approval_request_id}")
+        avp_digest = request.approved_verification_plan_digest or ""
+
         # Validate the plan live (HEAD/generation/task/workspace/file/symbol).
         try:
-            ctx = self._validator.validate_plan(plan)
+            ctx = self._validator.validate_plan(
+                plan, approved_verification_plan_digest=avp_digest,
+            )
         except _ValidatorStale as exc:
             raise PlanBlockedError(str(exc)) from exc
         except _ValidatorNotRequestable as exc:
@@ -236,9 +247,6 @@ class PlanExecutionGate:
         if plan_status in {"blocked", "stale", "rejected", "failed"}:
             raise PlanBlockedError(f"plan status is {plan_status}")
 
-        request = self._store.get_request(approval_request_id)
-        if request is None:
-            raise ApprovalMissingError(f"unknown approval request {approval_request_id}")
         if request.plan_id != plan.plan_id:
             raise AuthorizationMismatchError("approval request belongs to a different plan")
         if request.repository_id != plan.repository_id:
@@ -257,12 +265,15 @@ class PlanExecutionGate:
             raise AuthorizationAlreadyConsumedError("approval request already consumed")
 
         # Approval expiry.
-        if request is not None and float(self._clock()) >= request.expires_at:
+        if float(self._clock()) >= request.expires_at:
             raise AuthorizationExpiredError("approval request expired")
 
-        # Binding digest must match (drift check at mint).
-        current_binding = compute_plan_binding_digest(plan)
-        if request is not None and request.binding_digest != current_binding:
+        # Binding digest must match (drift check at mint).  Batch 3.1.5 §2:
+        # the snapshot digest is included so any snapshot drift is caught.
+        current_binding = compute_plan_binding_digest(
+            plan, approved_verification_plan_digest=avp_digest,
+        )
+        if request.binding_digest != current_binding:
             raise AuthorizationMismatchError("approval binding does not match current plan digest")
 
         now = float(self._clock())
@@ -446,12 +457,21 @@ class PlanExecutionGate:
             raise AuthorizationExpiredError("authorization expired")
 
         # Revalidate the authoritative plan live.
+        # Batch 3.1.5 §2: forward the request's approved_verification_plan_digest
+        # so the recomputed binding embeds the persisted snapshot — any drift
+        # invalidates the consume.
+        consume_avp_digest = ""
+        if auth.approval_request_id:
+            consume_request = self._store.get_request(auth.approval_request_id)
+            if consume_request is not None:
+                consume_avp_digest = consume_request.approved_verification_plan_digest or ""
         try:
             ctx = self._validator.validate(
                 expected_plan_id,
                 expected_repository_id=expected_repository_id,
                 expected_task_id=expected_task_id,
                 expected_workspace_id=expected_workspace_id,
+                approved_verification_plan_digest=consume_avp_digest,
             )
         except _ValidatorStale as exc:
             self._mark_authorization_stale(auth, now, str(exc))

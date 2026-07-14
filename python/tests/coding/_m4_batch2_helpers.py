@@ -301,6 +301,10 @@ class UnsafeTestPlanApprovalService(PlanApprovalService):
             context_provider=context_provider,
             planning_service=planning_service,
         )
+        # Batch 3.1.5 §2: no snapshot provider in test mode — old requests
+        # without a snapshot fail closed only in production runtime; tests
+        # keep working with the legacy binding-digest semantics.
+        self._snapshot_provider = None
 
 
 def make_service(

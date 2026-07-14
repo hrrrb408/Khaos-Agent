@@ -99,6 +99,15 @@ class TrustedVerificationRunner:
                 "and is not an explicit unsafe test backend; malicious objects "
                 "that set _production_authority cannot impersonate production backends"
             )
+        # Batch 3.1.5 §2: remember whether this is an explicit unsafe test
+        # backend.  The snapshot enforcement (fail-closed on old requests
+        # without an ApprovedVerificationPlanSnapshot) only applies to real
+        # production runs.  Unsafe test backends keep the legacy semantics
+        # so existing tests that inject approved digests to exercise drift
+        # detection (e.g. toolchain-attestation-drift) still reach
+        # _verify_approved_attestations instead of short-circuiting at the
+        # snapshot gate.
+        self._is_unsafe_test_backend = is_unsafe_test
         self._store = VerificationExecutionStore(approval_store)
         self._approval_store = approval_store
         self._plans = plan_repository
@@ -1192,6 +1201,55 @@ class TrustedVerificationRunner:
                     f"{attestation.toolchain_id} digest not in approved set"
                 )
 
+    def _load_and_verify_approved_snapshot(
+        self, request: Any, plan: Any,
+    ) -> Any:
+        """Batch 3.1.5 §2: load and verify the persisted ApprovedVerificationPlanSnapshot.
+
+        Returns the loaded snapshot, or None when snapshots are not enforced
+        (unsafe test backends without a real production runtime).
+
+        Enforced only when this runner is NOT an unsafe test backend (i.e.
+        real production runs).  In production:
+          * Old requests without ``approved_verification_plan_id`` fail closed.
+          * The persisted snapshot digest MUST match the request's bound digest.
+          * The snapshot's plan_id and plan_content_hash MUST match the plan.
+        """
+        is_production = not self._is_unsafe_test_backend
+        avp_id = getattr(request, "approved_verification_plan_id", "") or ""
+        avp_digest = getattr(request, "approved_verification_plan_digest", "") or ""
+        if not avp_id or not avp_digest:
+            if is_production:
+                raise PermissionError(
+                    "production verification requires an approved verification "
+                    "plan snapshot; old requests without a snapshot fail closed"
+                )
+            return None
+        snapshot = self._store.get_approved_verification_plan_snapshot(avp_id)
+        if snapshot is None:
+            if is_production:
+                raise PermissionError(
+                    "persisted approved verification plan snapshot not found"
+                )
+            return None
+        # Verify the persisted snapshot digest matches the request's bound
+        # digest — forbids using the runtime's in-memory digest as the approved
+        # digest.
+        if snapshot.approved_verification_plan_digest != avp_digest:
+            raise PermissionError(
+                "persisted approved verification plan snapshot digest mismatch"
+            )
+        # Verify the snapshot belongs to the same plan.
+        if snapshot.plan_id != plan.plan_id:
+            raise PermissionError(
+                "approved verification plan snapshot plan_id mismatch"
+            )
+        if snapshot.plan_content_hash != plan.content_hash:
+            raise PermissionError(
+                "approved verification plan snapshot plan content hash mismatch"
+            )
+        return snapshot
+
     def _validate_live(
         self,
         context: VerificationPhaseContext,
@@ -1222,6 +1280,17 @@ class TrustedVerificationRunner:
             raise PermissionError("approval binding mismatch")
         if request.verification_digest != compute_verification_digest(plan.verification_requirements):
             raise PermissionError("approval verification digest mismatch")
+        # Batch 3.1.5 §2: load and verify the persisted ApprovedVerificationPlanSnapshot.
+        # The snapshot was frozen before human approval and its digest is bound
+        # into the approval binding.  At execution time we load the PERSISTED
+        # snapshot (never the runtime's in-memory digest) and verify:
+        #   1. The persisted snapshot digest matches the request's bound digest.
+        #   2. The rebuilt commands/catalog/profile match the snapshot fields.
+        # Old requests without a snapshot fail closed in production mode
+        # (approved attestation digests are set).  Test backends without real
+        # Docker attestations skip this check (consistent with
+        # _verify_approved_attestations).
+        approved_snapshot = self._load_and_verify_approved_snapshot(request, plan)
         attestation = self._approval_store.get_final_mutation_attestation(execution.execution_run_id)
         if attestation is None or attestation.attestation_digest != context.attestation_digest:
             raise PermissionError("final mutation attestation mismatch")
@@ -1271,6 +1340,23 @@ class TrustedVerificationRunner:
             commands, catalog_fingerprint=catalog.fingerprint,
             sandbox_profile_digest=self._profile.digest,
         )
+        # Batch 3.1.5 §2: verify the rebuilt commands/catalog/profile match
+        # the persisted snapshot fields.  Any tampering with canonical commands,
+        # catalog, or profile invalidates the approval (STALE, 0 processes).
+        if approved_snapshot is not None:
+            rebuilt_command_digests = tuple(c.command_digest for c in commands)
+            if rebuilt_command_digests != approved_snapshot.ordered_command_digests:
+                raise PermissionError(
+                    "approved verification plan snapshot command drift"
+                )
+            if catalog.fingerprint != approved_snapshot.catalog_fingerprint:
+                raise PermissionError(
+                    "approved verification plan snapshot catalog fingerprint drift"
+                )
+            if self._profile.digest != approved_snapshot.sandbox_profile_digest:
+                raise PermissionError(
+                    "approved verification plan snapshot sandbox profile digest drift"
+                )
         if expected_catalog is not None and catalog.fingerprint != expected_catalog:
             raise PermissionError("verification catalog fingerprint drifted")
         if expected_plan_digest is not None and digest != expected_plan_digest:
