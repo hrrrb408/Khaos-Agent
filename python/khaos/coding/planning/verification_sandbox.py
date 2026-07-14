@@ -159,9 +159,6 @@ class ProductionVerificationConfig:
     access to the ``SandboxProfile``, artifact root, and workspace factory
     through the other ``configure_trusted_verification`` parameters.
     """
-    docker_executable_id: str           # canonical resolved path to docker
-    approved_image_reference: str       # repository@sha256:digest
-    profile_id: str                     # SandboxProfile.profile_id
     artifact_storage_capability_id: str # ArtifactRootCapability identity
     snapshot_storage_capability_id: str # snapshot storage identity
 
@@ -1140,6 +1137,7 @@ class DockerVerificationSandboxBackend:
                 store.update_sandbox_instance(
                     sandbox_instance_id,
                     state=SandboxInstanceState.TERMINATED,
+                    cleanup_status="absent",
                     failure_code="docker-create-failed",
                     terminated_at=_time.time(),
                 )
@@ -1156,6 +1154,7 @@ class DockerVerificationSandboxBackend:
                 store.update_sandbox_instance(
                     sandbox_instance_id,
                     state=SandboxInstanceState.TERMINATED,
+                    cleanup_status="absent",
                     failure_code="docker-create-no-id",
                     terminated_at=_time.time(),
                 )
@@ -1244,6 +1243,7 @@ class DockerVerificationSandboxBackend:
                     store.update_sandbox_instance(
                         sandbox_instance_id,
                         state=SandboxInstanceState.TERMINATED,
+                        cleanup_status="absent",
                         terminated_at=_t3.time(),
                         failure_code="attestation-timeout",
                     )
@@ -1270,6 +1270,7 @@ class DockerVerificationSandboxBackend:
                 store.update_sandbox_instance(
                     sandbox_instance_id,
                     state=SandboxInstanceState.TERMINATED,
+                    cleanup_status="absent",
                     terminated_at=_t4.time(),
                 )
             else:
@@ -1282,6 +1283,7 @@ class DockerVerificationSandboxBackend:
                     store.update_sandbox_instance(
                         sandbox_instance_id,
                         state=SandboxInstanceState.TERMINATED,
+                        cleanup_status="absent",
                         terminated_at=_t4.time(),
                     )
                 else:

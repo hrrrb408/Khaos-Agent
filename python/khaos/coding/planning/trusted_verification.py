@@ -28,6 +28,26 @@ _MAX_SNAPSHOT_DIRS = 5_000
 _MAX_SNAPSHOT_BYTES = 2 * 1024 * 1024 * 1024  # 2 GiB
 
 
+def _open_absolute_directory_chain_nofollow(path: Path) -> int:
+    """Reopen every absolute-path component without following symlinks."""
+    absolute = Path(os.path.abspath(os.fspath(path)))
+    current_fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for component in absolute.parts[1:]:
+            next_fd = os.open(
+                component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=current_fd,
+            )
+            os.close(current_fd)
+            current_fd = next_fd
+        result = current_fd
+        current_fd = -1
+        return result
+    finally:
+        if current_fd >= 0:
+            os.close(current_fd)
+
+
 @dataclass(frozen=True)
 class TrustedToolchain:
     executable_id: str
@@ -297,6 +317,25 @@ class ArtifactRootCapability:
     @property
     def root_path(self) -> Path:
         return self._root_path
+
+    def verify_identity(self) -> None:
+        """Verify both the pinned FD and current path entry identity."""
+        current = os.fstat(self._root_fd)
+        identity = ArtifactRootIdentity(
+            current.st_dev, current.st_ino, current.st_uid, current.st_gid,
+            stat.S_IMODE(current.st_mode),
+        )
+        if identity != self._identity:
+            raise PermissionError("artifact storage root FD identity changed")
+        reopened = _open_absolute_directory_chain_nofollow(self._root_path)
+        try:
+            path_state = os.fstat(reopened)
+            if (path_state.st_dev, path_state.st_ino) != (
+                self._identity.dev, self._identity.ino,
+            ):
+                raise PermissionError("artifact storage path identity changed")
+        finally:
+            os.close(reopened)
 
     def close(self) -> None:
         try:
@@ -669,6 +708,22 @@ class DisposableStorageRootCapability:
                 f"dev={current.dev} ino={current.ino} uid={current.uid} "
                 f"gid={current.gid} mode={current.mode:o}"
             )
+        try:
+            reopened = _open_absolute_directory_chain_nofollow(self._root_path)
+        except OSError as exc:
+            raise PermissionError(
+                "disposable storage path can no longer be opened safely"
+            ) from exc
+        try:
+            path_state = os.fstat(reopened)
+            if (path_state.st_dev, path_state.st_ino) != (
+                self._identity.dev, self._identity.ino,
+            ):
+                raise PermissionError(
+                    "disposable storage path identity changed"
+                )
+        finally:
+            os.close(reopened)
 
     def close(self) -> None:
         try:

@@ -151,8 +151,22 @@ CREATE TABLE IF NOT EXISTS approved_verification_plan_snapshots (
 );
 CREATE INDEX IF NOT EXISTS ix_avps_plan
 ON approved_verification_plan_snapshots(plan_id, plan_content_hash);
-CREATE INDEX IF NOT EXISTS ix_avps_snapshot_digest
+CREATE UNIQUE INDEX IF NOT EXISTS ux_avps_snapshot_digest
 ON approved_verification_plan_snapshots(snapshot_digest);
+CREATE TRIGGER IF NOT EXISTS trg_avps_referenced_update
+BEFORE UPDATE ON approved_verification_plan_snapshots
+WHEN EXISTS (
+ SELECT 1 FROM plan_approval_requests
+ WHERE approved_verification_plan_id=OLD.approved_verification_plan_id
+)
+BEGIN SELECT RAISE(ABORT, 'referenced approved verification snapshot is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS trg_avps_referenced_delete
+BEFORE DELETE ON approved_verification_plan_snapshots
+WHEN EXISTS (
+ SELECT 1 FROM plan_approval_requests
+ WHERE approved_verification_plan_id=OLD.approved_verification_plan_id
+)
+BEGIN SELECT RAISE(ABORT, 'referenced approved verification snapshot cannot be deleted'); END;
 CREATE TABLE IF NOT EXISTS verification_cleanup_proofs (
  cleanup_proof_id TEXT PRIMARY KEY,
  verification_run_id TEXT NOT NULL,
@@ -178,6 +192,7 @@ class VerificationExecutionStore:
         self._conn: sqlite3.Connection = approval_store._conn
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._cleanup_validator: Any = None
         # Batch 3.1.3 §5: add image_attestation_digest column to existing
         # databases (CREATE TABLE IF NOT EXISTS won't add columns).
         self._migrate_image_attestation_digest()
@@ -407,13 +422,17 @@ class VerificationExecutionStore:
             raise
 
     def recover_interrupted(self) -> int:
-        """Never infer PREPARING/RUNNING/FINALIZING work as passed after restart."""
+        """Never infer PREPARING/RUNNING work as passed after restart.
+
+        FINALIZING is deliberately preserved for evidence-backed recovery by
+        ``TrustedVerificationRunner`` after its storage capabilities are ready.
+        """
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             rows = self._conn.execute(
                 "SELECT verification_run_id,execution_run_id FROM plan_verification_runs "
-                "WHERE status IN ('preparing-sandbox','running','finalizing')"
+                "WHERE status IN ('preparing-sandbox','running')"
             ).fetchall()
             for row in rows:
                 self._conn.execute(
@@ -434,6 +453,49 @@ class VerificationExecutionStore:
                 self._audit(row[0], "crash-recovered", "errored", "runtime-restart", row[0])
             self._conn.commit()
             return len(rows)
+        except Exception:
+            self._conn.rollback()
+            raise
+
+    def install_cleanup_validator(self, validator: Any) -> None:
+        """Install the runtime-owned filesystem/canonical-state validator."""
+        if self._cleanup_validator is not None and self._cleanup_validator is not validator:
+            raise RuntimeError("cleanup validator is immutable for this store")
+        self._cleanup_validator = validator
+
+    def list_finalizing_runs(self) -> tuple[VerificationExecutionRun, ...]:
+        rows = self._conn.execute(
+            "SELECT * FROM plan_verification_runs WHERE status='finalizing' "
+            "ORDER BY started_at,verification_run_id"
+        ).fetchall()
+        return tuple(self._row_to_run(row) for row in rows)
+
+    def stage_step_for_finalization(self, step: VerificationStepRun) -> None:
+        """Durably save the last successful result before Run→FINALIZING."""
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            cur = self._conn.execute(
+                "UPDATE plan_verification_steps SET status='finalizing',exit_code=?,"
+                "signal=?,started_at=?,completed_at=?,duration_ms=?,stdout_digest=?,"
+                "stderr_digest=?,output_artifact_id=?,output_truncated=?,"
+                "sandbox_instance_id=?,sandbox_image_digest=?,resource_usage_json=?,"
+                "failure_code=? WHERE step_run_id=? AND verification_run_id=? "
+                "AND status='running'",
+                (step.exit_code, step.signal, step.started_at, step.completed_at,
+                 step.duration_ms, step.stdout_digest, step.stderr_digest,
+                 step.output_artifact_id, int(step.output_truncated),
+                 step.sandbox_instance_id, step.sandbox_image_digest,
+                 json.dumps(step.resource_usage, sort_keys=True), step.failure_code,
+                 step.step_run_id, step.verification_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("final verification step staging CAS failed")
+            self._audit(
+                step.verification_run_id, "step-finalization-staged",
+                "finalizing", "", step.step_run_id,
+            )
+            self._conn.commit()
         except Exception:
             self._conn.rollback()
             raise
@@ -899,42 +961,43 @@ class VerificationExecutionStore:
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            # Batch 3.1.5 §4: verify the persisted cleanup proof from the DB.
-            if cleanup_proof is not None:
-                persisted = self.get_cleanup_proof_for_run(verification_run_id)
-                if persisted is None:
-                    raise RuntimeError(
-                        "cleanup proof not found for verification run — "
-                        "cannot finalize without durable cleanup proof"
-                    )
-                if persisted.cleanup_digest != cleanup_proof.cleanup_digest:
-                    raise RuntimeError(
-                        "persisted cleanup proof digest mismatch — "
-                        "cannot finalize with stale or forged proof"
-                    )
-                if persisted.disposable_workspace_id != cleanup_proof.disposable_workspace_id:
-                    raise RuntimeError(
-                        "persisted cleanup proof workspace ID mismatch"
-                    )
-                # §4: re-verify all sandbox instances for this run are TERMINATED.
-                instances = self.list_sandbox_instances_for_run(verification_run_id)
-                for inst in instances:
-                    if inst.instance_kind == "toolchain-attestation":
-                        continue  # toolchain-attestation instances are not per-run
-                    if inst.state != SandboxInstanceState.TERMINATED:
-                        raise RuntimeError(
-                            f"sandbox instance {inst.sandbox_instance_id} "
-                            f"is not TERMINATED (state={inst.state.value}) — "
-                            f"cannot finalize without absence proof"
-                        )
-                # §4: re-verify all artifacts for this run are SEALED.
-                artifacts = self.list_artifacts_for_run(verification_run_id)
-                for art in artifacts:
-                    if art["status"] != "sealed":
-                        raise RuntimeError(
-                            f"artifact {art['artifact_id']} is not SEALED "
-                            f"(status={art['status']}) — cannot finalize"
-                        )
+            # Cleanup proof is mandatory for every production success.
+            if cleanup_proof is None:
+                raise RuntimeError("cleanup proof is mandatory for final success")
+            persisted = self.get_cleanup_proof_for_run(verification_run_id)
+            if persisted is None:
+                raise RuntimeError(
+                    "cleanup proof not found for verification run — "
+                    "cannot finalize without durable cleanup proof"
+                )
+            if persisted.cleanup_digest != cleanup_proof.cleanup_digest:
+                raise RuntimeError(
+                    "persisted cleanup proof digest mismatch — "
+                    "cannot finalize with stale or forged proof"
+                )
+            if persisted.disposable_workspace_id != workspace_id:
+                raise RuntimeError("persisted cleanup proof workspace ID mismatch")
+            from khaos.coding.planning.verification_execution_models import (
+                compute_cleanup_digest,
+            )
+            recomputed_cleanup_digest = compute_cleanup_digest(
+                verification_run_id=persisted.verification_run_id,
+                disposable_workspace_id=persisted.disposable_workspace_id,
+                disposable_workspace_identity=persisted.disposable_workspace_identity,
+                disposable_cleaned_at=persisted.disposable_cleaned_at,
+                sandbox_instance_ids=persisted.sandbox_instance_ids,
+                sandbox_absence_digests=persisted.sandbox_absence_digests,
+                artifact_ids=persisted.artifact_ids,
+                artifact_seal_digests=persisted.artifact_seal_digests,
+                canonical_workspace_final_digest=(
+                    persisted.canonical_workspace_final_digest
+                ),
+            )
+            if recomputed_cleanup_digest != persisted.cleanup_digest:
+                raise RuntimeError("persisted cleanup proof canonical digest mismatch")
+            if self._cleanup_validator is None:
+                raise RuntimeError("runtime cleanup proof validator is not installed")
+            self._cleanup_validator(persisted)
             # 1. Final Step → PASSED (if deferred)
             if step is not None:
                 cur = self._conn.execute(
@@ -950,6 +1013,13 @@ class VerificationExecutionStore:
                 )
                 if cur.rowcount != 1:
                     raise RuntimeError("final step CAS failed in finalize_success")
+            staged = self._conn.execute(
+                "UPDATE plan_verification_steps SET status='passed' "
+                "WHERE verification_run_id=? AND status='finalizing'",
+                (verification_run_id,),
+            )
+            if staged.rowcount > 1:
+                raise RuntimeError("multiple final verification steps were staged")
             # 2. Verification Run → PASSED (expected FINALIZING)
             cur = self._conn.execute(
                 "UPDATE plan_verification_runs SET status=?,updated_at=?,completed_at=?,failure_code=? "
@@ -1307,6 +1377,24 @@ class VerificationExecutionStore:
         queries this row and verifies it inside BEGIN IMMEDIATE.
         """
         import uuid as _uuid
+        from khaos.coding.planning.verification_execution_models import (
+            compute_cleanup_digest,
+        )
+        if proof.disposable_cleaned_at is None:
+            raise RuntimeError("cleanup proof cleaned_at is required")
+        recomputed = compute_cleanup_digest(
+            verification_run_id=proof.verification_run_id,
+            disposable_workspace_id=proof.disposable_workspace_id,
+            disposable_workspace_identity=proof.disposable_workspace_identity,
+            disposable_cleaned_at=proof.disposable_cleaned_at,
+            sandbox_instance_ids=proof.sandbox_instance_ids,
+            sandbox_absence_digests=proof.sandbox_absence_digests,
+            artifact_ids=proof.artifact_ids,
+            artifact_seal_digests=proof.artifact_seal_digests,
+            canonical_workspace_final_digest=proof.canonical_workspace_final_digest,
+        )
+        if recomputed != proof.cleanup_digest:
+            raise RuntimeError("cleanup proof canonical digest mismatch")
         cleanup_proof_id = f"vcp_{_uuid.uuid4().hex}"
         self._conn.execute("BEGIN IMMEDIATE")
         try:
@@ -1593,9 +1681,77 @@ class VerificationExecutionStore:
         at execution time — the runtime's in-memory digest must NOT
         masquerade as the approved digest.
         """
-        self._conn.execute(
-            """
-            INSERT OR REPLACE INTO approved_verification_plan_snapshots (
+        from khaos.coding.planning.verification_execution_models import (
+            compute_approved_verification_plan_digest,
+        )
+        recomputed = compute_approved_verification_plan_digest(
+            plan_id=snapshot.plan_id,
+            plan_content_hash=snapshot.plan_content_hash,
+            verification_requirements_digest=snapshot.verification_requirements_digest,
+            catalog_fingerprint=snapshot.catalog_fingerprint,
+            ordered_command_digests=snapshot.ordered_command_digests,
+            config_hashes=snapshot.config_hashes,
+            sandbox_profile_digest=snapshot.sandbox_profile_digest,
+            image_attestation_content_digest=snapshot.image_attestation_content_digest,
+            ordered_toolchain_attestation_content_digests=(
+                snapshot.ordered_toolchain_attestation_content_digests
+            ),
+            binary_digests=snapshot.binary_digests,
+            version_output_digests=snapshot.version_output_digests,
+            parsed_versions=snapshot.parsed_versions,
+            image_toolchain_policy_fingerprint=(
+                snapshot.image_toolchain_policy_fingerprint
+            ),
+        )
+        if recomputed != snapshot.approved_verification_plan_digest:
+            raise RuntimeError("approved verification snapshot digest mismatch")
+        values = (
+            snapshot.approved_verification_plan_id,
+            snapshot.plan_id, snapshot.plan_content_hash,
+            snapshot.verification_requirements_digest, snapshot.catalog_fingerprint,
+            json.dumps(list(snapshot.ordered_command_digests)),
+            json.dumps(list(snapshot.config_hashes)),
+            snapshot.sandbox_profile_digest,
+            snapshot.image_attestation_content_digest,
+            json.dumps(list(snapshot.ordered_toolchain_attestation_content_digests)),
+            json.dumps(list(snapshot.binary_digests)),
+            json.dumps(list(snapshot.version_output_digests)),
+            json.dumps(list(snapshot.parsed_versions)),
+            snapshot.image_toolchain_policy_fingerprint,
+            snapshot.approved_verification_plan_digest, snapshot.created_at, boot_id,
+        )
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing = self._conn.execute(
+                "SELECT * FROM approved_verification_plan_snapshots "
+                "WHERE approved_verification_plan_id=?",
+                (snapshot.approved_verification_plan_id,),
+            ).fetchone()
+            if existing is not None:
+                existing_values = (
+                    existing["approved_verification_plan_id"], existing["plan_id"],
+                    existing["plan_content_hash"], existing["requirements_digest"],
+                    existing["catalog_fingerprint"],
+                    existing["ordered_command_digests_json"],
+                    existing["config_hashes_json"], existing["sandbox_profile_digest"],
+                    existing["image_attestation_content_digest"],
+                    existing["ordered_toolchain_attestation_content_digests_json"],
+                    existing["binary_digests_json"],
+                    existing["version_output_digests_json"],
+                    existing["parsed_versions_json"],
+                    existing["image_toolchain_policy_fingerprint"],
+                    existing["snapshot_digest"], existing["created_at"],
+                    existing["boot_id"],
+                )
+                if existing_values != values:
+                    raise RuntimeError(
+                        "approved verification snapshot immutable conflict"
+                    )
+                self._conn.commit()
+                return
+            self._conn.execute(
+                """
+                INSERT INTO approved_verification_plan_snapshots (
                 approved_verification_plan_id, plan_id, plan_content_hash,
                 requirements_digest, catalog_fingerprint,
                 ordered_command_digests_json, config_hashes_json,
@@ -1604,25 +1760,14 @@ class VerificationExecutionStore:
                 binary_digests_json, version_output_digests_json,
                 parsed_versions_json, image_toolchain_policy_fingerprint,
                 snapshot_digest, created_at, boot_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                snapshot.approved_verification_plan_id,
-                snapshot.plan_id, snapshot.plan_content_hash,
-                snapshot.verification_requirements_digest, snapshot.catalog_fingerprint,
-                json.dumps(list(snapshot.ordered_command_digests)),
-                json.dumps(list(snapshot.config_hashes)),
-                snapshot.sandbox_profile_digest,
-                snapshot.image_attestation_content_digest,
-                json.dumps(list(snapshot.ordered_toolchain_attestation_content_digests)),
-                json.dumps(list(snapshot.binary_digests)),
-                json.dumps(list(snapshot.version_output_digests)),
-                json.dumps(list(snapshot.parsed_versions)),
-                snapshot.image_toolchain_policy_fingerprint,
-                snapshot.approved_verification_plan_digest, snapshot.created_at, boot_id,
-            ),
-        )
-        self._conn.commit()
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def get_approved_verification_plan_snapshot(
         self, approved_verification_plan_id: str,
@@ -1633,9 +1778,6 @@ class VerificationExecutionStore:
         ONLY source of truth at execution time — the runtime's in-memory
         digest must NOT be used as a substitute.
         """
-        from khaos.coding.planning.verification_execution_models import (
-            ApprovedVerificationPlanSnapshot,
-        )
         row = self._conn.execute(
             "SELECT * FROM approved_verification_plan_snapshots "
             "WHERE approved_verification_plan_id = ?",
@@ -1643,26 +1785,7 @@ class VerificationExecutionStore:
         ).fetchone()
         if row is None:
             return None
-        return ApprovedVerificationPlanSnapshot(
-            approved_verification_plan_id=row["approved_verification_plan_id"],
-            plan_id=row["plan_id"],
-            plan_content_hash=row["plan_content_hash"],
-            verification_requirements_digest=row["requirements_digest"],
-            catalog_fingerprint=row["catalog_fingerprint"],
-            ordered_command_digests=tuple(json.loads(row["ordered_command_digests_json"])),
-            config_hashes=tuple(json.loads(row["config_hashes_json"])),
-            sandbox_profile_digest=row["sandbox_profile_digest"],
-            image_attestation_content_digest=row["image_attestation_content_digest"],
-            ordered_toolchain_attestation_content_digests=tuple(
-                json.loads(row["ordered_toolchain_attestation_content_digests_json"])
-            ),
-            binary_digests=tuple(json.loads(row["binary_digests_json"])),
-            version_output_digests=tuple(json.loads(row["version_output_digests_json"])),
-            parsed_versions=tuple(json.loads(row["parsed_versions_json"])),
-            image_toolchain_policy_fingerprint=row["image_toolchain_policy_fingerprint"],
-            approved_verification_plan_digest=row["snapshot_digest"],
-            created_at=row["created_at"],
-        )
+        return self._approved_snapshot_from_row(row)
 
     def get_approved_verification_plan_snapshot_by_digest(
         self, snapshot_digest: str,
@@ -1672,9 +1795,6 @@ class VerificationExecutionStore:
         Used at execution time to verify the persisted snapshot matches
         the approved digest bound to the request.
         """
-        from khaos.coding.planning.verification_execution_models import (
-            ApprovedVerificationPlanSnapshot,
-        )
         row = self._conn.execute(
             "SELECT * FROM approved_verification_plan_snapshots "
             "WHERE snapshot_digest = ? ORDER BY created_at DESC LIMIT 1",
@@ -1682,26 +1802,74 @@ class VerificationExecutionStore:
         ).fetchone()
         if row is None:
             return None
-        return ApprovedVerificationPlanSnapshot(
-            approved_verification_plan_id=row["approved_verification_plan_id"],
-            plan_id=row["plan_id"],
-            plan_content_hash=row["plan_content_hash"],
-            verification_requirements_digest=row["requirements_digest"],
-            catalog_fingerprint=row["catalog_fingerprint"],
-            ordered_command_digests=tuple(json.loads(row["ordered_command_digests_json"])),
-            config_hashes=tuple(json.loads(row["config_hashes_json"])),
-            sandbox_profile_digest=row["sandbox_profile_digest"],
-            image_attestation_content_digest=row["image_attestation_content_digest"],
-            ordered_toolchain_attestation_content_digests=tuple(
-                json.loads(row["ordered_toolchain_attestation_content_digests_json"])
-            ),
-            binary_digests=tuple(json.loads(row["binary_digests_json"])),
-            version_output_digests=tuple(json.loads(row["version_output_digests_json"])),
-            parsed_versions=tuple(json.loads(row["parsed_versions_json"])),
-            image_toolchain_policy_fingerprint=row["image_toolchain_policy_fingerprint"],
-            approved_verification_plan_digest=row["snapshot_digest"],
-            created_at=row["created_at"],
+        return self._approved_snapshot_from_row(row)
+
+    @staticmethod
+    def _approved_snapshot_from_row(row: sqlite3.Row) -> Any:
+        """Deserialize and recompute every approved snapshot digest field."""
+        from khaos.coding.planning.verification_execution_models import (
+            ApprovedVerificationPlanSnapshot,
+            compute_approved_verification_plan_digest,
         )
+        try:
+            snapshot = ApprovedVerificationPlanSnapshot(
+                approved_verification_plan_id=(
+                    row["approved_verification_plan_id"]
+                ),
+                plan_id=row["plan_id"],
+                plan_content_hash=row["plan_content_hash"],
+                verification_requirements_digest=row["requirements_digest"],
+                catalog_fingerprint=row["catalog_fingerprint"],
+                ordered_command_digests=tuple(
+                    json.loads(row["ordered_command_digests_json"])
+                ),
+                config_hashes=tuple(json.loads(row["config_hashes_json"])),
+                sandbox_profile_digest=row["sandbox_profile_digest"],
+                image_attestation_content_digest=(
+                    row["image_attestation_content_digest"]
+                ),
+                ordered_toolchain_attestation_content_digests=tuple(
+                    json.loads(
+                        row[
+                            "ordered_toolchain_attestation_content_digests_json"
+                        ]
+                    )
+                ),
+                binary_digests=tuple(json.loads(row["binary_digests_json"])),
+                version_output_digests=tuple(
+                    json.loads(row["version_output_digests_json"])
+                ),
+                parsed_versions=tuple(json.loads(row["parsed_versions_json"])),
+                image_toolchain_policy_fingerprint=(
+                    row["image_toolchain_policy_fingerprint"]
+                ),
+                approved_verification_plan_digest=row["snapshot_digest"],
+                created_at=row["created_at"],
+            )
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError("approved verification snapshot is corrupt") from exc
+        recomputed = compute_approved_verification_plan_digest(
+            plan_id=snapshot.plan_id,
+            plan_content_hash=snapshot.plan_content_hash,
+            verification_requirements_digest=snapshot.verification_requirements_digest,
+            catalog_fingerprint=snapshot.catalog_fingerprint,
+            ordered_command_digests=snapshot.ordered_command_digests,
+            config_hashes=snapshot.config_hashes,
+            sandbox_profile_digest=snapshot.sandbox_profile_digest,
+            image_attestation_content_digest=snapshot.image_attestation_content_digest,
+            ordered_toolchain_attestation_content_digests=(
+                snapshot.ordered_toolchain_attestation_content_digests
+            ),
+            binary_digests=snapshot.binary_digests,
+            version_output_digests=snapshot.version_output_digests,
+            parsed_versions=snapshot.parsed_versions,
+            image_toolchain_policy_fingerprint=(
+                snapshot.image_toolchain_policy_fingerprint
+            ),
+        )
+        if recomputed != snapshot.approved_verification_plan_digest:
+            raise RuntimeError("approved verification snapshot digest mismatch")
+        return snapshot
 
     # ------------------------------------------------------------------
     # Batch 3.1.2 §8: Disposable verification workspace persistence
@@ -1860,8 +2028,8 @@ class VerificationExecutionStore:
         try:
             self._conn.execute(
                 "UPDATE disposable_verification_workspaces SET state='cleanup-failed',"
-                "failure_code=?,cleaned_at=? WHERE workspace_id=?",
-                (failure_code, now, workspace_id),
+                "failure_code=?,cleaned_at=NULL WHERE workspace_id=?",
+                (failure_code, workspace_id),
             )
             self._audit(
                 workspace_id, "disposable-workspace-cleanup-failed",
@@ -1879,11 +2047,14 @@ class VerificationExecutionStore:
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            self._conn.execute(
+            cur = self._conn.execute(
                 "UPDATE disposable_verification_workspaces SET state='cleaned',"
-                "cleaned_at=? WHERE workspace_id=?",
+                "cleaned_at=? WHERE workspace_id=? AND state IN "
+                "('cleanup-pending','prepared','sealed','mounted')",
                 (now, workspace_id),
             )
+            if cur.rowcount != 1:
+                raise RuntimeError("mark disposable workspace CLEANED CAS failed")
             self._audit(
                 workspace_id, "disposable-workspace-cleaned",
                 "cleaned", "", workspace_id,

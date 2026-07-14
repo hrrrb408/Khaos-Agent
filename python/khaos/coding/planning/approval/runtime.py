@@ -139,14 +139,13 @@ class VerificationSnapshotProvider:
 
     def compute_snapshot(self, plan: Any) -> Any:
         """Compute, persist, and return the ApprovedVerificationPlanSnapshot."""
-        import hashlib
-        import json
         import uuid as _uuid
         from khaos.coding.planning.approval.models import compute_verification_digest
         from khaos.coding.planning.verification_catalog import VerificationCatalog
         from khaos.coding.planning.verification_execution_models import (
             ApprovedVerificationPlanSnapshot,
             compute_approved_verification_plan_digest,
+            compute_image_toolchain_policy_fingerprint,
         )
 
         workspace = self._workspace_manager.get(plan.workspace_id)
@@ -184,14 +183,13 @@ class VerificationSnapshotProvider:
         # image_toolchain_policy_fingerprint: binds image + toolchain + profile
         # policy into a single digest.  Any change to the approved image,
         # toolchain set, or sandbox profile invalidates the fingerprint.
-        policy_payload = {
-            "image_attestation_content_digest": image_content_digest,
-            "ordered_toolchain_attestation_digests": list(ordered_tc_digests),
-            "sandbox_profile_digest": self._profile.digest,
-        }
-        image_toolchain_policy_fingerprint = hashlib.sha256(
-            json.dumps(policy_payload, sort_keys=True, separators=(",", ":")).encode()
-        ).hexdigest()
+        image_toolchain_policy_fingerprint = (
+            compute_image_toolchain_policy_fingerprint(
+                image_attestation_content_digest=image_content_digest,
+                ordered_toolchain_attestation_content_digests=ordered_tc_digests,
+                sandbox_profile_digest=self._profile.digest,
+            )
+        )
 
         verification_requirements_digest = compute_verification_digest(
             plan.verification_requirements
@@ -247,7 +245,11 @@ class ApprovalRuntime:
     the failed boot_id, and ensures the runtime is safe to retry.
     """
 
-    def __init__(self, *, store: Any, broker: Any, context_provider: Any, plan_repository: PersistedPlanRepository, planning_service: Any, task_manager: Any = None, workspace_manager: Any = None, repository_indexer: Any = None) -> None:
+    def __init__(self, *, store: Any, broker: Any, context_provider: Any,
+                 plan_repository: PersistedPlanRepository, planning_service: Any,
+                 task_manager: Any = None, workspace_manager: Any = None,
+                 repository_indexer: Any = None,
+                 verification_docker_executable: str = "/usr/local/bin/docker") -> None:
         if not isinstance(plan_repository, PersistedPlanRepository):
             raise TypeError("production ApprovalRuntime requires PersistedPlanRepository")
         if planning_service is None or getattr(planning_service, "_unsafe_test_only", False) or not callable(getattr(planning_service, "validate_plan", None)):
@@ -282,6 +284,7 @@ class ApprovalRuntime:
         # time.  At execution time, the runner re-probes and verifies match.
         self._approved_image_attestation_digest: str = ""
         self._approved_toolchain_attestation_digests: tuple[str, ...] = ()
+        self._verification_docker_executable = verification_docker_executable
 
     @property
     def state(self) -> RuntimeState:
@@ -455,6 +458,10 @@ class ApprovalRuntime:
                 pass
 
         self.boot_context = None
+        from khaos.coding.planning.verification_storage import (
+            VERIFICATION_STORAGE_REGISTRY,
+        )
+        VERIFICATION_STORAGE_REGISTRY.revoke_runtime(self._runtime_authority_id)
         _RUNTIME_AUTHORITIES.revoke(self._runtime_authority_id)
         self._runtime_authority_id = None
         logger.warning("approval runtime initialization failed at %s; rolled back", failed_state.name)
@@ -488,8 +495,7 @@ class ApprovalRuntime:
         return self.guard.planned_workspace_edit(context, bundle=bundle)
 
     def configure_trusted_verification(
-        self, *, config: Any, command_factory: Any, workspace_factory: Any,
-        artifact_root: Any, profile: Any,
+        self, *, config: Any, command_factory: Any, profile: Any,
     ) -> None:
         """Install the production-only trusted verifier after Runtime startup.
 
@@ -520,12 +526,62 @@ class ApprovalRuntime:
                 "ProductionVerificationConfig — caller-provided backends "
                 "are not accepted"
             )
-        # Batch 3.1.4 §2: construct the backend via the private factory.
+        from khaos.coding.planning.verification_storage import (
+            VERIFICATION_STORAGE_REGISTRY,
+        )
+        artifact_capability = VERIFICATION_STORAGE_REGISTRY.resolve(
+            config.artifact_storage_capability_id,
+            runtime_id=self._runtime_authority_id,
+            boot_id=self.boot_context.boot_id, kind="artifact",
+        )
+        snapshot_capability = VERIFICATION_STORAGE_REGISTRY.resolve(
+            config.snapshot_storage_capability_id,
+            runtime_id=self._runtime_authority_id,
+            boot_id=self.boot_context.boot_id, kind="snapshot",
+        )
         backend = self._construct_production_backend(config, profile)
         self._configure_trusted_verification_internal(
             backend=backend, command_factory=command_factory,
-            workspace_factory=workspace_factory, artifact_root=artifact_root,
-            profile=profile,
+            workspace_factory=None, artifact_root=None, profile=profile,
+            artifact_capability=artifact_capability,
+            snapshot_capability=snapshot_capability,
+        )
+
+    def issue_verification_storage_capabilities(
+        self, *, artifact_root: Any, snapshot_root: Any,
+    ) -> Any:
+        """Issue opaque boot-scoped storage IDs from trusted runtime roots."""
+        self.require_ready()
+        from pathlib import Path as _Path
+        from khaos.coding.planning.verification_sandbox import (
+            ProductionVerificationConfig,
+        )
+        from khaos.coding.planning.verification_storage import (
+            VERIFICATION_STORAGE_REGISTRY,
+        )
+        forbidden: list[_Path] = []
+        workspaces = getattr(self._workspace_manager, "_workspaces", {})
+        for workspace in workspaces.values():
+            for value in (
+                workspace.repository_root, workspace.worktree_path,
+                workspace.recovery_root,
+            ):
+                if value is not None:
+                    forbidden.append(_Path(value))
+        for row in self._store._conn.execute("PRAGMA database_list").fetchall():
+            database_path = row[2]
+            if database_path:
+                forbidden.append(_Path(database_path))
+                forbidden.append(_Path(database_path).parent)
+        artifact_id, snapshot_id = VERIFICATION_STORAGE_REGISTRY.issue_pair(
+            runtime_id=self._runtime_authority_id,
+            boot_id=self.boot_context.boot_id,
+            artifact_root=_Path(artifact_root), snapshot_root=_Path(snapshot_root),
+            forbidden_roots=tuple(forbidden),
+        )
+        return ProductionVerificationConfig(
+            artifact_storage_capability_id=artifact_id,
+            snapshot_storage_capability_id=snapshot_id,
         )
 
     def _construct_production_backend(
@@ -549,24 +605,7 @@ class ApprovalRuntime:
         from khaos.coding.planning.verification_sandbox import (
             DockerVerificationSandboxBackend, ProductionVerificationAuthority,
         )
-        # Verify profile ID matches.
-        if profile.profile_id != config.profile_id:
-            raise ValueError(
-                f"profile ID mismatch: config={config.profile_id} "
-                f"profile={profile.profile_id}"
-            )
-        # Batch 3.1.5 §1: verify config.approved_image_reference actually
-        # participates in configuration validation.  The profile's
-        # effective_image_reference must match the config's approved reference.
-        effective_ref = profile.effective_image_reference
-        if config.approved_image_reference != effective_ref:
-            raise ValueError(
-                f"approved_image_reference mismatch: "
-                f"config={config.approved_image_reference} "
-                f"profile={effective_ref}"
-            )
-        # Verify docker executable.
-        docker_path = _Path(config.docker_executable_id).resolve(strict=True)
+        docker_path = _Path(self._verification_docker_executable).resolve(strict=True)
         # Construct the exact backend — no caller object.
         backend = DockerVerificationSandboxBackend(
             profile=profile, docker_executable=docker_path,
@@ -611,7 +650,8 @@ class ApprovalRuntime:
 
     def _configure_trusted_verification_internal(
         self, *, backend: Any, command_factory: Any, workspace_factory: Any,
-        artifact_root: Any, profile: Any,
+        artifact_root: Any, profile: Any, artifact_capability: Any = None,
+        snapshot_capability: Any = None,
     ) -> None:
         """Internal configuration shared by production and unsafe paths."""
         import asyncio as _asyncio
@@ -930,6 +970,8 @@ class ApprovalRuntime:
             approved_image_attestation_digest=self._approved_image_attestation_digest,
             approved_toolchain_attestation_digests=self._approved_toolchain_attestation_digests,
             image_attestation=self._verification_image_attestation,
+            artifact_capability=artifact_capability,
+            snapshot_capability=snapshot_capability,
         )
         self.guard.set_verification_runner(self._verification_runner)
         # Batch 3.1.5 §2: wire the VerificationSnapshotProvider into the
@@ -1069,6 +1111,12 @@ class ApprovalRuntime:
             self.service = None
             self.boot_context = None
             self._state = RuntimeState.UNINITIALIZED
+            from khaos.coding.planning.verification_storage import (
+                VERIFICATION_STORAGE_REGISTRY,
+            )
+            VERIFICATION_STORAGE_REGISTRY.revoke_runtime(
+                self._runtime_authority_id,
+            )
             _RUNTIME_AUTHORITIES.revoke(self._runtime_authority_id)
             self._runtime_authority_id = None
             logger.info("approval runtime shut down")

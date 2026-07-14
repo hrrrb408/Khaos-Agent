@@ -32,6 +32,7 @@ class VerificationRunStatus(str, Enum):
 class VerificationStepStatus(str, Enum):
     CREATED = "created"
     RUNNING = "running"
+    FINALIZING = "finalizing"
     PASSED = "passed"
     FAILED = "failed"
     ERRORED = "errored"
@@ -272,6 +273,21 @@ def compute_approved_verification_plan_digest(
         "version_output_digests": list(version_output_digests),
         "parsed_versions": list(parsed_versions),
         "image_toolchain_policy_fingerprint": image_toolchain_policy_fingerprint,
+    })
+
+
+def compute_image_toolchain_policy_fingerprint(
+    *, image_attestation_content_digest: str,
+    ordered_toolchain_attestation_content_digests: tuple[str, ...],
+    sandbox_profile_digest: str,
+) -> str:
+    """Canonical supply-chain policy fingerprint shared by approval/runtime."""
+    return _digest({
+        "image_attestation_content_digest": image_attestation_content_digest,
+        "ordered_toolchain_attestation_digests": list(
+            ordered_toolchain_attestation_content_digests
+        ),
+        "sandbox_profile_digest": sandbox_profile_digest,
     })
 
 
