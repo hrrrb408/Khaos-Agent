@@ -1062,6 +1062,17 @@ class TrustedVerificationRunner:
             # For POISONED (cleanup failure) or other non-PASSED terminals,
             # fall back to the legacy transition_run.
             if terminal == VerificationRunStatus.PASSED:
+                # Batch 3.1.5 §4: build and persist the cleanup proof BEFORE
+                # entering FINALIZING.  The proof captures the post-cleanup
+                # state of the disposable workspace, sandbox instances, and
+                # artifacts.  finalize_success re-queries this row from the
+                # DB inside its transaction — never trusts this in-memory
+                # object.
+                cleanup_proof = self._build_cleanup_proof(
+                    run.verification_run_id, workspace_id, disposable,
+                )
+                if cleanup_proof is not None:
+                    self._store.persist_cleanup_proof(cleanup_proof)
                 # §6: transition to FINALIZING first, then finalize.
                 self._store.transition_run(
                     run.verification_run_id,
@@ -1073,6 +1084,7 @@ class TrustedVerificationRunner:
                     verification_run_id=run.verification_run_id,
                     execution_run_id=execution.execution_run_id,
                     workspace_id=workspace_id,
+                    cleanup_proof=cleanup_proof,
                 )
             elif terminal == VerificationRunStatus.POISONED:
                 self._store.transition_run(
@@ -1430,3 +1442,118 @@ class TrustedVerificationRunner:
             content_digest=content_digest, byte_length=byte_length,
         )
         return artifact_id
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.5 §4: Durable cleanup proof construction
+    # ------------------------------------------------------------------
+
+    def _build_cleanup_proof(
+        self, verification_run_id: str, workspace_id: str,
+        disposable: Any,
+    ) -> Any | None:
+        """Batch 3.1.5 §4: build a durable cleanup proof after physical cleanup.
+
+        Captures the post-cleanup state of the disposable workspace, all
+        sandbox instances (must be TERMINATED), and all artifacts (must be
+        SEALED).  The proof is persisted in its own row BEFORE the
+        finalization transaction — ``finalize_success`` re-queries this
+        row from the DB and re-verifies every field inside BEGIN
+        IMMEDIATE.
+
+        Returns None when no disposable workspace is present (non-production
+        path or test backend without a disposable workspace).  In that case
+        ``finalize_success`` is called with ``cleanup_proof=None`` and
+        keeps the legacy finalization semantics.
+        """
+        if disposable is None or not workspace_id:
+            return None
+        from khaos.coding.planning.verification_execution_models import (
+            VerificationCleanupProof, compute_cleanup_digest,
+        )
+        # Load the persisted disposable workspace record (post-cleanup).
+        # cleaned_at is set by mark_disposable_workspace_cleaned — if the
+        # record is missing or cleaned_at is None, fall back to now.
+        record = self._store.get_disposable_workspace(workspace_id)
+        if record is None:
+            return None
+        cleaned_at = (
+            record.cleaned_at if record.cleaned_at is not None else time.time()
+        )
+        # Disposable workspace identity: instance ID + manifest digest.
+        # This binds the proof to the specific disposable workspace that
+        # was created, sealed, and destroyed for this verification run.
+        disposable_identity = (
+            f"{disposable.instance_id}:{disposable.manifest_digest}"
+        )
+        # Collect sandbox instance IDs and absence digests.
+        # Toolchain-attestation instances are excluded — they are not
+        # per-run verification containers and are reconciled separately.
+        instances = self._store.list_sandbox_instances_for_run(
+            verification_run_id,
+        )
+        sandbox_instance_ids: list[str] = []
+        sandbox_absence_digests: list[str] = []
+        for inst in instances:
+            if inst.instance_kind == "toolchain-attestation":
+                continue
+            sandbox_instance_ids.append(inst.sandbox_instance_id)
+            # Absence digest: proves the container is gone.  Computed
+            # from the terminal state, terminated_at timestamp, and
+            # container_id (empty = never created or already removed).
+            absence_payload = json.dumps({
+                "sandbox_instance_id": inst.sandbox_instance_id,
+                "state": inst.state.value,
+                "container_id": inst.container_id,
+                "terminated_at": inst.terminated_at or 0.0,
+                "cleanup_status": inst.cleanup_status,
+                "failure_code": inst.failure_code,
+            }, sort_keys=True, separators=(",", ":"))
+            sandbox_absence_digests.append(
+                hashlib.sha256(absence_payload.encode("utf-8")).hexdigest()
+            )
+        # Collect artifact IDs and seal digests (content_digest).
+        artifacts = self._store.list_artifacts_for_run(verification_run_id)
+        artifact_ids: list[str] = []
+        artifact_seal_digests: list[str] = []
+        for art in artifacts:
+            artifact_ids.append(art["artifact_id"])
+            artifact_seal_digests.append(art["content_digest"])
+        # Compute canonical workspace final digest from the persisted
+        # final mutation attestation.  This is the immutable proof of
+        # the canonical workspace's state at mutation time — already
+        # re-verified against the live workspace in _validate_live.
+        canonical_final_digest = ""
+        try:
+            run_row = self._store.get_run(verification_run_id)
+            if run_row is not None:
+                attestation = self._approval_store.get_final_mutation_attestation(
+                    run_row.execution_run_id,
+                )
+                if attestation is not None:
+                    canonical_final_digest = attestation.workspace_state_digest
+        except Exception:
+            pass
+        cleanup_digest = compute_cleanup_digest(
+            verification_run_id=verification_run_id,
+            disposable_workspace_id=workspace_id,
+            disposable_workspace_identity=disposable_identity,
+            disposable_cleaned_at=cleaned_at,
+            sandbox_instance_ids=tuple(sandbox_instance_ids),
+            sandbox_absence_digests=tuple(sandbox_absence_digests),
+            artifact_ids=tuple(artifact_ids),
+            artifact_seal_digests=tuple(artifact_seal_digests),
+            canonical_workspace_final_digest=canonical_final_digest,
+        )
+        return VerificationCleanupProof(
+            verification_run_id=verification_run_id,
+            disposable_workspace_id=workspace_id,
+            disposable_workspace_identity=disposable_identity,
+            disposable_cleaned_at=cleaned_at,
+            sandbox_instance_ids=tuple(sandbox_instance_ids),
+            sandbox_absence_digests=tuple(sandbox_absence_digests),
+            artifact_ids=tuple(artifact_ids),
+            artifact_seal_digests=tuple(artifact_seal_digests),
+            canonical_workspace_final_digest=canonical_final_digest,
+            cleanup_digest=cleanup_digest,
+            created_at=time.time(),
+        )

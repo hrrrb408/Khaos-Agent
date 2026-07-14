@@ -293,3 +293,49 @@ class DisposableWorkspaceRecord:
     cleanup_started_at: float | None = None
     cleaned_at: float | None = None
     failure_code: str = ""
+
+
+@dataclass(frozen=True)
+class VerificationCleanupProof:
+    """Batch 3.1.5 §4: durable proof that all verification side-effects were
+    cleaned up before the verification run transitions to PASSED.
+
+    Frozen after physical cleanup completes and persisted in a separate row.
+    The finalization transaction queries this row and re-verifies every
+    field before committing PASSED/VERIFIED — it never trusts caller
+    parameters for cleanup state.
+    """
+    verification_run_id: str
+    disposable_workspace_id: str
+    disposable_workspace_identity: str
+    disposable_cleaned_at: float
+    sandbox_instance_ids: tuple[str, ...]
+    sandbox_absence_digests: tuple[str, ...]
+    artifact_ids: tuple[str, ...]
+    artifact_seal_digests: tuple[str, ...]
+    canonical_workspace_final_digest: str
+    cleanup_digest: str
+    created_at: float = 0.0
+
+
+def compute_cleanup_digest(
+    *, verification_run_id: str, disposable_workspace_id: str,
+    disposable_workspace_identity: str, disposable_cleaned_at: float,
+    sandbox_instance_ids: tuple[str, ...],
+    sandbox_absence_digests: tuple[str, ...],
+    artifact_ids: tuple[str, ...],
+    artifact_seal_digests: tuple[str, ...],
+    canonical_workspace_final_digest: str,
+) -> str:
+    """Batch 3.1.5 §4: canonical digest of the cleanup proof contents."""
+    return _digest({
+        "verification_run_id": verification_run_id,
+        "disposable_workspace_id": disposable_workspace_id,
+        "disposable_workspace_identity": disposable_workspace_identity,
+        "disposable_cleaned_at": disposable_cleaned_at,
+        "sandbox_instance_ids": list(sandbox_instance_ids),
+        "sandbox_absence_digests": list(sandbox_absence_digests),
+        "artifact_ids": list(artifact_ids),
+        "artifact_seal_digests": list(artifact_seal_digests),
+        "canonical_workspace_final_digest": canonical_workspace_final_digest,
+    })

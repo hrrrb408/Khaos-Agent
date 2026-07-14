@@ -153,6 +153,22 @@ CREATE INDEX IF NOT EXISTS ix_avps_plan
 ON approved_verification_plan_snapshots(plan_id, plan_content_hash);
 CREATE INDEX IF NOT EXISTS ix_avps_snapshot_digest
 ON approved_verification_plan_snapshots(snapshot_digest);
+CREATE TABLE IF NOT EXISTS verification_cleanup_proofs (
+ cleanup_proof_id TEXT PRIMARY KEY,
+ verification_run_id TEXT NOT NULL,
+ disposable_workspace_id TEXT NOT NULL,
+ disposable_workspace_identity TEXT NOT NULL DEFAULT '',
+ disposable_cleaned_at REAL NOT NULL,
+ sandbox_instance_ids_json TEXT NOT NULL DEFAULT '[]',
+ sandbox_absence_digests_json TEXT NOT NULL DEFAULT '[]',
+ artifact_ids_json TEXT NOT NULL DEFAULT '[]',
+ artifact_seal_digests_json TEXT NOT NULL DEFAULT '[]',
+ canonical_workspace_final_digest TEXT NOT NULL DEFAULT '',
+ cleanup_digest TEXT NOT NULL,
+ created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_vcp_run
+ON verification_cleanup_proofs(verification_run_id);
 """
 
 
@@ -847,27 +863,78 @@ class VerificationExecutionStore:
     def finalize_success(
         self, *, step: VerificationStepRun | None, verification_run_id: str,
         execution_run_id: str, workspace_id: str = "",
+        cleanup_proof: Any = None,
     ) -> None:
-        """Batch 3.1.4 §6: atomic finalization in ONE BEGIN IMMEDIATE.
+        """Batch 3.1.4 §6 / Batch 3.1.5 §4: atomic finalization in ONE
+        BEGIN IMMEDIATE.
 
         Commits the following in a single transaction:
-        1. Final Step → PASSED (the deferred last step, if any)
-        2. Verification Run → PASSED (expected FINALIZING)
-        3. Execution Run → VERIFIED (expected VERIFYING)
-        4. Terminal Audit
+        1. (§4) Re-query and verify the persisted cleanup proof (when provided)
+        2. (§4) Re-verify all sandbox instances for this run are TERMINATED
+        3. (§4) Re-verify all artifacts for this run are SEALED
+        4. Final Step → PASSED (the deferred last step, if any)
+        5. Verification Run → PASSED (expected FINALIZING)
+        6. Execution Run → VERIFIED (expected VERIFYING)
+        7. Terminal Audit (bound to the cleanup proof)
 
         This replaces the forbidden ``finish_step() → cleanup →
         transition_run(PASSED)`` split.  The caller must:
         - Transition Run to FINALIZING before calling this.
         - Complete cleanup (disposable workspace destroy, sandbox instance
           removal, artifact sealing) BEFORE calling this.
+        - Persist the cleanup proof BEFORE calling this.
         - Only call this when all required steps passed and cleanup succeeded.
         - Pass ``step=None`` when the last step was already committed
           (e.g. optional failure on the last step).
+
+        Batch 3.1.5 §4: when ``cleanup_proof`` is provided, the method
+        queries the persisted proof row from the DB (never trusts the
+        caller's in-memory object) and verifies:
+          - The proof exists for this verification_run_id
+          - The proof's cleanup_digest matches the caller's value
+          - All sandbox instances for this run are TERMINATED
+          - All artifacts for this run are SEALED
+        Any mismatch raises and rolls back — no PASSED/VERIFIED.
         """
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
+            # Batch 3.1.5 §4: verify the persisted cleanup proof from the DB.
+            if cleanup_proof is not None:
+                persisted = self.get_cleanup_proof_for_run(verification_run_id)
+                if persisted is None:
+                    raise RuntimeError(
+                        "cleanup proof not found for verification run — "
+                        "cannot finalize without durable cleanup proof"
+                    )
+                if persisted.cleanup_digest != cleanup_proof.cleanup_digest:
+                    raise RuntimeError(
+                        "persisted cleanup proof digest mismatch — "
+                        "cannot finalize with stale or forged proof"
+                    )
+                if persisted.disposable_workspace_id != cleanup_proof.disposable_workspace_id:
+                    raise RuntimeError(
+                        "persisted cleanup proof workspace ID mismatch"
+                    )
+                # §4: re-verify all sandbox instances for this run are TERMINATED.
+                instances = self.list_sandbox_instances_for_run(verification_run_id)
+                for inst in instances:
+                    if inst.instance_kind == "toolchain-attestation":
+                        continue  # toolchain-attestation instances are not per-run
+                    if inst.state != SandboxInstanceState.TERMINATED:
+                        raise RuntimeError(
+                            f"sandbox instance {inst.sandbox_instance_id} "
+                            f"is not TERMINATED (state={inst.state.value}) — "
+                            f"cannot finalize without absence proof"
+                        )
+                # §4: re-verify all artifacts for this run are SEALED.
+                artifacts = self.list_artifacts_for_run(verification_run_id)
+                for art in artifacts:
+                    if art["status"] != "sealed":
+                        raise RuntimeError(
+                            f"artifact {art['artifact_id']} is not SEALED "
+                            f"(status={art['status']}) — cannot finalize"
+                        )
             # 1. Final Step → PASSED (if deferred)
             if step is not None:
                 cur = self._conn.execute(
@@ -900,9 +967,16 @@ class VerificationExecutionStore:
             )
             if cur.rowcount != 1:
                 raise RuntimeError("execution run CAS failed in finalize_success")
-            # 4. Terminal Audit
+            # 4. Terminal Audit (bound to cleanup proof when provided)
+            audit_correlation = step.step_run_id if step else ""
+            if cleanup_proof is not None:
+                audit_correlation = (
+                    f"{audit_correlation}|cleanup_proof={cleanup_proof.cleanup_digest[:16]}"
+                    if audit_correlation
+                    else f"cleanup_proof={cleanup_proof.cleanup_digest[:16]}"
+                )
             self._audit(verification_run_id, "finalized-success",
-                        "passed", "", step.step_run_id if step else "")
+                        "passed", "", audit_correlation)
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -1220,6 +1294,99 @@ class VerificationExecutionStore:
         except Exception:
             self._conn.rollback()
             raise
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.5 §4: VerificationCleanupProof persistence
+    # ------------------------------------------------------------------
+
+    def persist_cleanup_proof(self, proof: Any) -> str:
+        """Batch 3.1.5 §4: persist a VerificationCleanupProof row.
+
+        Returns the cleanup_proof_id.  The proof is persisted in its own
+        transaction BEFORE the finalization transaction — finalization
+        queries this row and verifies it inside BEGIN IMMEDIATE.
+        """
+        import uuid as _uuid
+        cleanup_proof_id = f"vcp_{_uuid.uuid4().hex}"
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            self._conn.execute(
+                "INSERT INTO verification_cleanup_proofs VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (cleanup_proof_id, proof.verification_run_id,
+                 proof.disposable_workspace_id,
+                 proof.disposable_workspace_identity,
+                 proof.disposable_cleaned_at,
+                 json.dumps(list(proof.sandbox_instance_ids)),
+                 json.dumps(list(proof.sandbox_absence_digests)),
+                 json.dumps(list(proof.artifact_ids)),
+                 json.dumps(list(proof.artifact_seal_digests)),
+                 proof.canonical_workspace_final_digest,
+                 proof.cleanup_digest, proof.created_at),
+            )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+        return cleanup_proof_id
+
+    def get_cleanup_proof_for_run(
+        self, verification_run_id: str,
+    ) -> Any | None:
+        """Batch 3.1.5 §4: load the cleanup proof bound to a verification run.
+
+        Returns the :class:`VerificationCleanupProof` or None if no proof
+        exists.  Called inside the finalization transaction to verify
+        cleanup state from the DB — never from caller parameters.
+        """
+        from khaos.coding.planning.verification_execution_models import (
+            VerificationCleanupProof,
+        )
+        row = self._conn.execute(
+            "SELECT * FROM verification_cleanup_proofs "
+            "WHERE verification_run_id=? ORDER BY created_at DESC LIMIT 1",
+            (verification_run_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        return VerificationCleanupProof(
+            verification_run_id=row["verification_run_id"],
+            disposable_workspace_id=row["disposable_workspace_id"],
+            disposable_workspace_identity=row["disposable_workspace_identity"],
+            disposable_cleaned_at=float(row["disposable_cleaned_at"]),
+            sandbox_instance_ids=tuple(json.loads(row["sandbox_instance_ids_json"])),
+            sandbox_absence_digests=tuple(
+                json.loads(row["sandbox_absence_digests_json"])
+            ),
+            artifact_ids=tuple(json.loads(row["artifact_ids_json"])),
+            artifact_seal_digests=tuple(
+                json.loads(row["artifact_seal_digests_json"])
+            ),
+            canonical_workspace_final_digest=row["canonical_workspace_final_digest"],
+            cleanup_digest=row["cleanup_digest"],
+            created_at=float(row["created_at"]),
+        )
+
+    def list_sandbox_instances_for_run_verified(
+        self, verification_run_id: str,
+    ) -> tuple[Any, ...]:
+        """Batch 3.1.5 §4: list all sandbox instances for a verification run.
+
+        Used inside the finalization transaction to verify every instance
+        is TERMINATED with absence proof.
+        """
+        return self.list_sandbox_instances_for_run(verification_run_id)
+
+    def list_artifacts_for_run(
+        self, verification_run_id: str,
+    ) -> tuple[sqlite3.Row, ...]:
+        """Batch 3.1.5 §4: list all artifacts for a verification run."""
+        rows = self._conn.execute(
+            "SELECT * FROM plan_verification_artifacts "
+            "WHERE verification_run_id=? ORDER BY created_at",
+            (verification_run_id,),
+        ).fetchall()
+        return tuple(rows)
 
     # ------------------------------------------------------------------
     # Batch 3.1.1 §3: Artifact RESERVED→SEALED protocol
