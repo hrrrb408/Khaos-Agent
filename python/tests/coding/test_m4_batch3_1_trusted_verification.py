@@ -2218,6 +2218,330 @@ def test_real_docker_crash_after_create_before_id_commit(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Batch 3.1.3 §10: Real Docker non-destructive reconciliation matrix.
+#
+# These tests run against a real Docker daemon and exercise the
+# non-destructive reconciliation contracts from §3 with a real backend.
+# They are gated on KHAOS_RUN_PRODUCTION_SANDBOX=1 — when that env var
+# is unset they skip, but the Batch 3.1.3 closure report MUST be produced
+# with the env var set so every test in this section actually executes.
+# ---------------------------------------------------------------------------
+
+
+def _real_docker_skip_guard():
+    """Return True when the real Docker E2E matrix must skip."""
+    return os.environ.get("KHAOS_RUN_PRODUCTION_SANDBOX") != "1"
+
+
+def _start_long_running_container(backend, *, command, workspace_root, labels):
+    """Launch a real container that sleeps long enough for reconcile probes.
+
+    Returns ``(container_id, instance_name)``.
+    """
+    instance_name = backend.generate_instance_name()
+    container_id, _attestation, _, _, _ = asyncio.run(
+        backend.launch_instance(
+            instance_name=instance_name,
+            image_digest=_profile().image_digest,
+            command=command, workspace_root=workspace_root,
+            labels=labels,
+            expected_manifest_digest=labels["khaos.manifest-digest"],
+        )
+    )
+    return container_id, instance_name
+
+
+def _assert_container_still_running(backend, container_id):
+    """A mismatch reconcile must NEVER terminate — assert the container is alive."""
+    info = asyncio.run(backend.inspect_instance(container_id))
+    assert info is not None, "container was terminated by a non-destructive reconcile"
+    state = info.get("State", {})
+    assert state.get("Status") in ("running", "created"), state
+
+
+def _force_cleanup_container(backend, container_id):
+    """Best-effort terminate+remove after a non-destructive test."""
+    try:
+        asyncio.run(backend.terminate_and_remove_instance(container_id))
+    except Exception:
+        pass
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_label_mismatch_does_not_terminate(tmp_path):
+    """§10/§3: label mismatch → OWNERSHIP_MISMATCH, container must stay alive."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "sleeper.py").write_text("import time\ntime.sleep(300)\n")
+    factory = VerificationWorkspaceFactory(tmp_path / "lbl-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    real_labels = backend.build_labels(
+        run_id="lbl-run", step_id="lbl-step", instance_id="lbl-vsi",
+        boot_id="boot-lbl", manifest_digest=disposable.manifest_digest,
+    )
+    command = _docker_command("sleeper.py", timeout=300_000)
+    container_id, _ = _start_long_running_container(
+        backend, command=command, workspace_root=disposable.root, labels=real_labels,
+    )
+    try:
+        # Reconcile with a tampered run-id label.
+        tampered_labels = dict(real_labels)
+        tampered_labels["khaos.run-id"] = "different-run"
+        report = asyncio.run(backend.reconcile_instance_by_record(
+            container_id=container_id,
+            instance_name="",
+            expected_labels=tampered_labels,
+            expected_image_digest=_profile().image_digest,
+            expected_manifest_digest=disposable.manifest_digest,
+        ))
+        assert report["status"] == "ownership-mismatch", report
+        assert "label-mismatch" in report["reason"], report
+        # The container must still be running — non-destructive.
+        _assert_container_still_running(backend, container_id)
+    finally:
+        _force_cleanup_container(backend, container_id)
+        factory.destroy(disposable)
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_image_mismatch_does_not_terminate(tmp_path):
+    """§10/§3: image digest mismatch → OWNERSHIP_MISMATCH, container stays alive."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "sleeper.py").write_text("import time\ntime.sleep(300)\n")
+    factory = VerificationWorkspaceFactory(tmp_path / "img-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    real_labels = backend.build_labels(
+        run_id="img-run", step_id="img-step", instance_id="img-vsi",
+        boot_id="boot-img", manifest_digest=disposable.manifest_digest,
+    )
+    command = _docker_command("sleeper.py", timeout=300_000)
+    container_id, _ = _start_long_running_container(
+        backend, command=command, workspace_root=disposable.root, labels=real_labels,
+    )
+    try:
+        report = asyncio.run(backend.reconcile_instance_by_record(
+            container_id=container_id,
+            instance_name="",
+            expected_labels=real_labels,
+            # A wildly wrong image digest — must trigger mismatch.
+            expected_image_digest="sha256:" + "0" * 64,
+            expected_manifest_digest=disposable.manifest_digest,
+        ))
+        assert report["status"] == "ownership-mismatch", report
+        assert "image-mismatch" in report["reason"], report
+        _assert_container_still_running(backend, container_id)
+    finally:
+        _force_cleanup_container(backend, container_id)
+        factory.destroy(disposable)
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_manifest_mismatch_does_not_terminate(tmp_path):
+    """§10/§3: manifest digest mismatch → OWNERSHIP_MISMATCH, no terminate."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "sleeper.py").write_text("import time\ntime.sleep(300)\n")
+    factory = VerificationWorkspaceFactory(tmp_path / "man-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    real_labels = backend.build_labels(
+        run_id="man-run", step_id="man-step", instance_id="man-vsi",
+        boot_id="boot-man", manifest_digest=disposable.manifest_digest,
+    )
+    command = _docker_command("sleeper.py", timeout=300_000)
+    container_id, _ = _start_long_running_container(
+        backend, command=command, workspace_root=disposable.root, labels=real_labels,
+    )
+    try:
+        report = asyncio.run(backend.reconcile_instance_by_record(
+            container_id=container_id,
+            instance_name="",
+            expected_labels=real_labels,
+            expected_image_digest=_profile().image_digest,
+            # A tampered manifest digest — must trigger mismatch.
+            expected_manifest_digest="sha256:" + "f" * 64,
+        ))
+        assert report["status"] == "ownership-mismatch", report
+        assert "manifest-mismatch" in report["reason"], report
+        _assert_container_still_running(backend, container_id)
+    finally:
+        _force_cleanup_container(backend, container_id)
+        factory.destroy(disposable)
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_reconcile_missing_container_returns_missing(tmp_path):
+    """§10/§3: reconcile a non-existent container_id → status=missing, no error."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+    report = asyncio.run(backend.reconcile_instance_by_record(
+        container_id="khaos-verify-definitely-missing-" + "0" * 12,
+        instance_name="",
+        expected_labels={"khaos.run-id": "any"},
+        expected_image_digest=_profile().image_digest,
+        expected_manifest_digest="any",
+    ))
+    assert report["status"] == "missing", report
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_list_unknown_khaos_containers_is_read_only(tmp_path):
+    """§10/§3: list_unknown_khaos_containers lists khaos.* containers, never terminates."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "sleeper.py").write_text("import time\ntime.sleep(300)\n")
+    factory = VerificationWorkspaceFactory(tmp_path / "list-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    real_labels = backend.build_labels(
+        run_id="list-run", step_id="list-step", instance_id="list-vsi",
+        boot_id="boot-list", manifest_digest=disposable.manifest_digest,
+    )
+    command = _docker_command("sleeper.py", timeout=300_000)
+    container_id, _ = _start_long_running_container(
+        backend, command=command, workspace_root=disposable.root, labels=real_labels,
+    )
+    try:
+        unknown = asyncio.run(backend.list_unknown_khaos_containers())
+        # Our container must appear in the listing (it has khaos.* labels).
+        names = {entry["name"] for entry in unknown}
+        # The container_id may be a prefix of the Name; match by inclusion.
+        listed = any(
+            container_id in (entry.get("name", "")) or entry.get("name", "") == container_id
+            for entry in unknown
+        )
+        # list_unknown uses Names from `docker ps`, which are instance_names,
+        # not container IDs.  We cannot always find our container by ID here,
+        # so we settle for the call returning a list and never terminating.
+        assert isinstance(unknown, list)
+        # The container must still be running — list is non-destructive.
+        _assert_container_still_running(backend, container_id)
+        # Sanity: at least one khaos-labeled container is present (ours).
+        assert listed or any(
+            entry.get("labels", {}).get("khaos.run-id") == "list-run"
+            for entry in unknown
+        ), unknown
+    finally:
+        _force_cleanup_container(backend, container_id)
+        factory.destroy(disposable)
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_reconcile_instances_rejects_empty_labels(tmp_path):
+    """§10/§3: reconcile_instances({}) raises ValueError on the real backend."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+    with pytest.raises(ValueError, match="non-empty expected_labels"):
+        asyncio.run(backend.reconcile_instances(expected_labels={}))
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_unknown_khaos_container_not_terminated_by_reconcile_instances(tmp_path):
+    """§10/§3: a khaos-labeled container with non-matching run-id is listed, never terminated."""
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "sleeper.py").write_text("import time\ntime.sleep(300)\n")
+    factory = VerificationWorkspaceFactory(tmp_path / "unk-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    # Container belongs to a DIFFERENT run-id — must be treated as unknown.
+    other_labels = backend.build_labels(
+        run_id="other-runtime-run", step_id="other-step", instance_id="other-vsi",
+        boot_id="boot-other", manifest_digest=disposable.manifest_digest,
+    )
+    command = _docker_command("sleeper.py", timeout=300_000)
+    container_id, instance_name = _start_long_running_container(
+        backend, command=command, workspace_root=disposable.root, labels=other_labels,
+    )
+    try:
+        report = asyncio.run(backend.reconcile_instances(
+            expected_labels={
+                "khaos.run-id": "our-runtime-run",
+                "khaos.step-id": "our-step",
+            },
+        ))
+        # The other-runtime container must appear in `unknown`, never in `terminated`.
+        assert instance_name not in report.get("terminated", []), report
+        # And it must not be listed as `found` (which would mean we tried to terminate).
+        assert instance_name not in report.get("found", []), report
+        # The container must still be running.
+        _assert_container_still_running(backend, container_id)
+    finally:
+        _force_cleanup_container(backend, container_id)
+        factory.destroy(disposable)
+
+
+@pytest.mark.production_sandbox_real
+def test_real_docker_full_ownership_proof_terminates(tmp_path):
+    """§10/§3: full ownership proof (all evidence matches) → terminated.
+
+    Positive control for the non-destructive matrix: when every piece of
+    ownership evidence matches, reconcile_instance_by_record terminates
+    and removes the container.
+    """
+    if _real_docker_skip_guard():
+        pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")
+    source = tmp_path / "canonical"
+    source.mkdir()
+    (source / "sleeper.py").write_text("import time\ntime.sleep(300)\n")
+    factory = VerificationWorkspaceFactory(tmp_path / "pos-copies")
+    disposable = factory.create(source, forbidden_roots=(source,))
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+    asyncio.run(backend.probe())
+
+    real_labels = backend.build_labels(
+        run_id="pos-run", step_id="pos-step", instance_id="pos-vsi",
+        boot_id="boot-pos", manifest_digest=disposable.manifest_digest,
+    )
+    command = _docker_command("sleeper.py", timeout=300_000)
+    container_id, _ = _start_long_running_container(
+        backend, command=command, workspace_root=disposable.root, labels=real_labels,
+    )
+    try:
+        report = asyncio.run(backend.reconcile_instance_by_record(
+            container_id=container_id,
+            instance_name="",
+            expected_labels=real_labels,
+            expected_image_digest=_profile().image_digest,
+            expected_manifest_digest=disposable.manifest_digest,
+        ))
+        assert report["status"] == "terminated", report
+        # Confirm the container is actually gone.
+        info = asyncio.run(backend.inspect_instance(container_id))
+        assert info is None, "container must be removed after full-proof reconcile"
+    finally:
+        _force_cleanup_container(backend, container_id)
+        factory.destroy(disposable)
+
+
+# ---------------------------------------------------------------------------
 # Batch 3.1.3 §7: Artifact root orphan recovery
 # ---------------------------------------------------------------------------
 
