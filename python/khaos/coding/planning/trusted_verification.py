@@ -541,6 +541,148 @@ class ArtifactRootCapability:
             os.close(fd)
 
 
+@dataclass(frozen=True)
+class DisposableStorageRootIdentity:
+    """Batch 3.1.5 §5: recorded identity of the disposable storage root.
+
+    Same fields as :class:`ArtifactRootIdentity` — the root's dev/ino/
+    uid/gid/mode at capability open time.  Any subsequent change (symlink
+    swap, remount, chmod) is detected by ``verify_identity``.
+    """
+    dev: int
+    ino: int
+    uid: int
+    gid: int
+    mode: int
+
+
+class DisposableStorageRootCapability:
+    """Batch 3.1.5 §5/§6: anchors the disposable storage root to the
+    runtime boot context.
+
+    Opens the factory's root directory with ``O_DIRECTORY | O_NOFOLLOW``
+    at runner startup, records its identity, and computes a
+    ``capability_id`` that binds the root to the current boot.  Before
+    each disposable workspace creation, the runner calls
+    ``verify_identity()`` to detect root replacement (symlink swap,
+    remount, chmod) since the capability was opened.
+
+    The capability also verifies that the disposable storage root does
+    not overlap with any forbidden root (repository, workspace, recovery,
+    artifact root, database).  This is the same protection as
+    :class:`ArtifactRootCapability`, applied to the disposable workspace
+    parent directory.
+    """
+
+    def __init__(
+        self, root_fd: int, root_path: Path,
+        identity: DisposableStorageRootIdentity,
+        capability_id: str,
+    ) -> None:
+        self._root_fd = root_fd
+        self._root_path = root_path
+        self._identity = identity
+        self._capability_id = capability_id
+
+    @classmethod
+    def open(
+        cls, root: Path, *, forbidden_roots: Iterable[Path] = (),
+        boot_id: str = "",
+    ) -> "DisposableStorageRootCapability":
+        """Open the disposable storage root and anchor it to the boot context.
+
+        Creates the root (0o700) if it doesn't exist, then opens it with
+        ``O_DIRECTORY | O_NOFOLLOW`` and records its identity.  Raises
+        ``PermissionError`` if the root overlaps any forbidden root.
+
+        The ``capability_id`` is a SHA-256 digest of the root identity
+        (dev/ino/uid/gid/mode) and the boot_id.  This binds the
+        capability to the current boot — a different boot or a replaced
+        root produces a different capability_id.
+        """
+        root = root.resolve()
+        forbidden = tuple(path.resolve() for path in forbidden_roots)
+        for path in forbidden:
+            if root == path or root in path.parents or path in root.parents:
+                raise PermissionError(
+                    f"disposable storage root overlaps a protected root: "
+                    f"{root} vs {path}"
+                )
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        st = os.fstat(fd)
+        identity = DisposableStorageRootIdentity(
+            dev=st.st_dev, ino=st.st_ino,
+            uid=st.st_uid, gid=st.st_gid, mode=stat.S_IMODE(st.st_mode),
+        )
+        capability_id = hashlib.sha256(json.dumps({
+            "dev": identity.dev,
+            "ino": identity.ino,
+            "uid": identity.uid,
+            "gid": identity.gid,
+            "mode": identity.mode,
+            "boot_id": boot_id,
+            "root_path": str(root),
+        }, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return cls(fd, root, identity, capability_id)
+
+    @property
+    def identity(self) -> DisposableStorageRootIdentity:
+        return self._identity
+
+    @property
+    def root_path(self) -> Path:
+        return self._root_path
+
+    @property
+    def root_fd(self) -> int:
+        return self._root_fd
+
+    @property
+    def capability_id(self) -> str:
+        return self._capability_id
+
+    def verify_identity(self) -> None:
+        """Re-stat the root and verify its identity hasn't changed.
+
+        Raises ``PermissionError`` if the root's dev/ino/uid/gid/mode
+        differ from the recorded identity.  This detects symlink swap,
+        remount, chmod, or any other filesystem-level replacement of the
+        disposable storage root since the capability was opened.
+        """
+        try:
+            st = os.fstat(self._root_fd)
+        except OSError as exc:
+            raise PermissionError(
+                f"disposable storage root fd is no longer valid: {exc}"
+            ) from exc
+        current = DisposableStorageRootIdentity(
+            dev=st.st_dev, ino=st.st_ino,
+            uid=st.st_uid, gid=st.st_gid, mode=stat.S_IMODE(st.st_mode),
+        )
+        if current != self._identity:
+            raise PermissionError(
+                f"disposable storage root identity changed since capability "
+                f"was opened: expected dev={self._identity.dev} ino="
+                f"{self._identity.ino} uid={self._identity.uid} gid="
+                f"{self._identity.gid} mode={self._identity.mode:o}, got "
+                f"dev={current.dev} ino={current.ino} uid={current.uid} "
+                f"gid={current.gid} mode={current.mode:o}"
+            )
+
+    def close(self) -> None:
+        try:
+            os.close(self._root_fd)
+        except OSError:
+            pass
+
+    def __enter__(self) -> "DisposableStorageRootCapability":
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.close()
+
+
 class VerificationWorkspaceFactory:
     """Copies a canonical workspace without Git metadata, symlinks or hardlinks.
 

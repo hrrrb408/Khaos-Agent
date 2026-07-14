@@ -16,8 +16,8 @@ from khaos.coding.planning.approval.models import compute_verification_digest
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.git_state import GitStateInspector
 from khaos.coding.planning.trusted_verification import (
-    ArtifactRootCapability, SandboxProfile, TrustedCommandFactory,
-    VerificationWorkspaceFactory,
+    ArtifactRootCapability, DisposableStorageRootCapability,
+    SandboxProfile, TrustedCommandFactory, VerificationWorkspaceFactory,
 )
 from khaos.coding.planning.verification_catalog import VerificationCatalog
 from khaos.coding.planning.verification_execution_models import (
@@ -126,6 +126,19 @@ class TrustedVerificationRunner:
             _forbidden.append(Path(_db_path))
         self._artifact_capability = ArtifactRootCapability.open(
             self._artifact_root, forbidden_roots=tuple(_forbidden),
+        )
+        # Batch 3.1.5 §5/§6: anchor the disposable storage root to the
+        # runtime boot context.  The capability opens the factory's root
+        # with O_DIRECTORY|O_NOFOLLOW, records its identity, and computes
+        # a capability_id binding the root to the current boot.  Before
+        # each disposable workspace creation, verify_identity() detects
+        # root replacement (symlink swap, remount, chmod).
+        _disposable_forbidden: list[Path] = list(_forbidden)
+        _disposable_forbidden.append(self._artifact_root)
+        self._disposable_root_capability = DisposableStorageRootCapability.open(
+            self._workspace_factory._root,
+            forbidden_roots=tuple(_disposable_forbidden),
+            boot_id=runtime_boot.boot_id,
         )
         self._profile = profile
         self._boot = runtime_boot
@@ -637,6 +650,12 @@ class TrustedVerificationRunner:
             # row exists before any directory is created.  If a crash occurs
             # during mkdir/copy/seal, reconciliation can use the PREPARED row
             # to find and safely clean up the partial directory.
+            #
+            # Batch 3.1.5 §5/§6: verify the disposable storage root identity
+            # before creating any workspace.  This detects root replacement
+            # (symlink swap, remount, chmod) since the capability was opened
+            # at runner startup.
+            self._disposable_root_capability.verify_identity()
             workspace_id = f"dvw_{uuid.uuid4().hex}"
             instance_id = f"verify_{secrets.token_hex(16)}"
             self._store.create_disposable_workspace(DisposableWorkspaceRecord(

@@ -4327,4 +4327,124 @@ def test_sandbox_instance_migration_adds_kind_columns(tmp_path):
     assert loaded.toolchain_id == ""
     assert loaded.probe_ordinal == 0
     assert loaded.image_attestation_digest == ""
-    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Batch 3.1.5 §5/§6: DisposableStorageRootCapability tests
+# ---------------------------------------------------------------------------
+
+def test_disposable_storage_root_capability_open_and_identity(tmp_path):
+    """§5: DisposableStorageRootCapability.open records the root identity."""
+    from khaos.coding.planning.trusted_verification import (
+        DisposableStorageRootCapability, DisposableStorageRootIdentity,
+    )
+    root = tmp_path / "disposable-root"
+    cap = DisposableStorageRootCapability.open(root, boot_id="boot-123")
+    try:
+        assert cap.root_path == root.resolve()
+        assert isinstance(cap.identity, DisposableStorageRootIdentity)
+        assert cap.identity.mode == 0o700
+        assert len(cap.capability_id) == 64  # SHA-256 hex
+        # capability_id should change with a different boot_id
+        cap2 = DisposableStorageRootCapability.open(root, boot_id="boot-456")
+        try:
+            assert cap2.capability_id != cap.capability_id
+        finally:
+            cap2.close()
+    finally:
+        cap.close()
+
+
+def test_disposable_storage_root_capability_rejects_overlap(tmp_path):
+    """§5: capability rejects roots that overlap forbidden roots."""
+    from khaos.coding.planning.trusted_verification import (
+        DisposableStorageRootCapability,
+    )
+    root = tmp_path / "disposable-root"
+    root.mkdir()
+    # forbidden is inside root → root is a parent of forbidden → must reject
+    forbidden = root / "protected"
+    forbidden.mkdir()
+    with pytest.raises(PermissionError, match="overlaps a protected root"):
+        DisposableStorageRootCapability.open(root, forbidden_roots=(forbidden,))
+
+
+def test_disposable_storage_root_capability_verify_identity_pass(tmp_path):
+    """§5: verify_identity passes when the root hasn't changed."""
+    from khaos.coding.planning.trusted_verification import (
+        DisposableStorageRootCapability,
+    )
+    root = tmp_path / "disposable-root"
+    cap = DisposableStorageRootCapability.open(root, boot_id="boot-1")
+    try:
+        cap.verify_identity()  # should not raise
+    finally:
+        cap.close()
+
+
+def test_disposable_storage_root_capability_verify_identity_detects_replacement(tmp_path):
+    """§5: verify_identity detects root mode change via fstat.
+
+    After the capability is opened, changing the root directory's mode
+    (e.g. via chmod) causes verify_identity to raise PermissionError
+    because the recorded mode no longer matches.
+    """
+    from khaos.coding.planning.trusted_verification import (
+        DisposableStorageRootCapability,
+    )
+    root = tmp_path / "disposable-root"
+    cap = DisposableStorageRootCapability.open(root, boot_id="boot-1")
+    try:
+        # Change the root's mode — fstat on the open fd will see the new mode.
+        os.chmod(str(root), 0o755)
+        with pytest.raises(PermissionError, match="identity changed"):
+            cap.verify_identity()
+    finally:
+        cap.close()
+
+
+def test_disposable_storage_root_capability_context_manager(tmp_path):
+    """§5: capability supports context manager protocol."""
+    from khaos.coding.planning.trusted_verification import (
+        DisposableStorageRootCapability,
+    )
+    root = tmp_path / "disposable-root"
+    with DisposableStorageRootCapability.open(root, boot_id="boot-ctx") as cap:
+        assert cap.root_path == root.resolve()
+        cap.verify_identity()
+    # After close, root_fd should be closed (fstat fails).
+    with pytest.raises(OSError):
+        os.fstat(cap.root_fd)
+
+
+def test_disposable_storage_root_capability_creates_root_if_missing(tmp_path):
+    """§5: capability creates the root directory if it doesn't exist."""
+    from khaos.coding.planning.trusted_verification import (
+        DisposableStorageRootCapability,
+    )
+    root = tmp_path / "nested" / "disposable-root"
+    assert not root.exists()
+    cap = DisposableStorageRootCapability.open(root, boot_id="boot-create")
+    try:
+        assert root.exists()
+        assert root.stat().st_mode & 0o777 == 0o700
+    finally:
+        cap.close()
+
+
+def test_runner_opens_disposable_root_capability(tmp_path):
+    """§6: TrustedVerificationRunner opens a DisposableStorageRootCapability
+    anchored to the boot context."""
+    from khaos.coding.planning.trusted_verification import (
+        DisposableStorageRootCapability,
+    )
+    runtime, _ = _artifact_runtime(tmp_path)
+    runner = runtime._verification_runner
+    assert hasattr(runner, "_disposable_root_capability")
+    assert isinstance(
+        runner._disposable_root_capability,
+        DisposableStorageRootCapability,
+    )
+    assert len(runner._disposable_root_capability.capability_id) == 64
+    # verify_identity should pass since the root hasn't been replaced.
+    runner._disposable_root_capability.verify_identity()
