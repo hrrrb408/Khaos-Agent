@@ -41,6 +41,7 @@ from khaos.coding.planning.verification_sandbox_instance import (
     SandboxInstanceState, VerificationSandboxInstance,
 )
 from khaos.coding.planning.verification_store import VerificationExecutionStore
+from khaos.coding.planning.trusted_verification_runner import TrustedVerificationRunner
 
 
 IMAGE = "sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280"
@@ -3620,3 +3621,218 @@ def test_real_docker_toolchain_attestation_full(tmp_path):
     assert attestation.parsed_version  # non-empty
     assert attestation.image_attestation_digest == "test-image-digest"
     assert attestation.attestation_digest  # non-empty
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.4 §7: Safe PREPARED workspace cleanup — dir_fd-based destroy
+# ----------------------------------------------------------------------
+
+
+def test_safe_destroy_prepared_removes_regular_files_and_nested_dirs(tmp_path):
+    """§7: _safe_destroy_prepared removes regular files and nested directories."""
+    root = tmp_path / "prepared-ws"
+    root.mkdir()
+    (root / "a.py").write_text("print('a')\n")
+    (root / "b.txt").write_text("data\n")
+    nested = root / "sub" / "deep"
+    nested.mkdir(parents=True)
+    (nested / "c.py").write_text("print('c')\n")
+    TrustedVerificationRunner._safe_destroy_prepared(root)
+    # Root must be gone — confirmed via stat.
+    with pytest.raises(FileNotFoundError):
+        os.stat(str(root))
+
+
+def test_safe_destroy_prepared_rejects_symlink_in_tree(tmp_path):
+    """§7: symlinks inside a PREPARED workspace are rejected via O_NOFOLLOW."""
+    root = tmp_path / "prepared-sym"
+    root.mkdir()
+    (root / "a.py").write_text("print('a')\n")
+    # Inject a symlink — simulates a TOCTOU swap after crash.
+    (root / "escape").symlink_to(tmp_path / "outside")
+    with pytest.raises(PermissionError, match="non-regular file"):
+        TrustedVerificationRunner._safe_destroy_prepared(root)
+    # Root must still exist — cleanup was quarantined.
+    assert root.exists()
+
+
+def test_safe_destroy_prepared_rejects_fifo_in_tree(tmp_path):
+    """§7: FIFOs inside a PREPARED workspace are rejected (quarantine)."""
+    root = tmp_path / "prepared-fifo"
+    root.mkdir()
+    (root / "a.py").write_text("print('a')\n")
+    os.mkfifo(root / "pipe")
+    with pytest.raises(PermissionError, match="non-regular file"):
+        TrustedVerificationRunner._safe_destroy_prepared(root)
+    assert root.exists()
+
+
+def test_safe_destroy_prepared_already_gone_is_noop(tmp_path):
+    """§7: a non-existent root is a safe no-op (returns without error)."""
+    ghost = tmp_path / "ghost"
+    assert not ghost.exists()
+    TrustedVerificationRunner._safe_destroy_prepared(ghost)
+    # Still doesn't exist — no side effects.
+    assert not ghost.exists()
+
+
+def test_safe_destroy_prepared_confirms_root_absence_after_rmdir(tmp_path):
+    """§7: after rmdir, _safe_destroy_prepared confirms root is gone via stat."""
+    root = tmp_path / "prepared-confirm"
+    root.mkdir()
+    (root / "a.py").write_text("data\n")
+    TrustedVerificationRunner._safe_destroy_prepared(root)
+    with pytest.raises(FileNotFoundError):
+        os.stat(str(root))
+
+
+def test_reconcile_prepared_workspace_safe_destroy_marks_cleaned(tmp_path):
+    """§7: reconciliation of a PREPARED workspace uses _safe_destroy_prepared
+    and marks the workspace CLEANED."""
+    from _m4_batch2_helpers import verification
+    runtime, _, workspaces, _ = _real_runtime(tmp_path)
+    workspace = _workspace(tmp_path, workspaces)
+    edit = PlannedFileEdit(
+        "e1", "s1", PlannedEditOperation.CREATE, "fixture.py",
+        expected_exists=False, new_content="print('ok')\n",
+    )
+    plan = _plan((edit,))
+    plan = _verification_plan(plan, workspace)
+    plan, authorization = _authorize(runtime, plan)
+    result = _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
+    profile = _profile()
+    ws_factory = VerificationWorkspaceFactory(tmp_path / "reconcile-prepared-copies")
+    runtime._configure_trusted_verification_unsafe(
+        backend=UnsafeTestSandboxBackend(profile), command_factory=_factory(profile),
+        workspace_factory=ws_factory, artifact_root=tmp_path / "reconcile-prepared-artifacts",
+        profile=profile,
+    )
+    runner = runtime._verification_runner
+    store = runner._store
+    # Create a PREPARED workspace directory with regular files.
+    instance_id = "prep-inst-1"
+    ws_root = ws_factory._root / instance_id
+    ws_root.mkdir(parents=True)
+    (ws_root / "partial.py").write_text("# partial copy\n")
+    (ws_root / "sub").mkdir()
+    (ws_root / "sub" / "deep.py").write_text("# deep\n")
+    # Insert a PREPARED disposable workspace record.
+    record = DisposableWorkspaceRecord(
+        workspace_id="dvw-prep-1", verification_run_id=result.execution_run_id,
+        step_run_id="", instance_id=instance_id, manifest_digest="",
+        manifest_json="[]", allowed_generated_output=(),
+        state=DisposableWorkspaceState.PREPARED, boot_id="boot1",
+        created_at=time.time(),
+    )
+    store.create_disposable_workspace(record)
+    # Trigger reconciliation.
+    runner._reconcile_disposable_workspaces()
+    # The workspace must be CLEANED and the directory must be gone.
+    fetched = store.get_disposable_workspace("dvw-prep-1")
+    assert fetched.state == DisposableWorkspaceState.CLEANED
+    assert not ws_root.exists()
+
+
+def test_reconcile_prepared_workspace_symlink_marks_cleanup_failed(tmp_path):
+    """§7: reconciliation of a PREPARED workspace with a symlink marks
+    CLEANUP_FAILED and poisons the workspace scope."""
+    from _m4_batch2_helpers import verification
+    runtime, _, workspaces, _ = _real_runtime(tmp_path)
+    workspace = _workspace(tmp_path, workspaces)
+    edit = PlannedFileEdit(
+        "e1", "s1", PlannedEditOperation.CREATE, "fixture.py",
+        expected_exists=False, new_content="print('ok')\n",
+    )
+    plan = _plan((edit,))
+    plan = _verification_plan(plan, workspace)
+    plan, authorization = _authorize(runtime, plan)
+    result = _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
+    profile = _profile()
+    ws_factory = VerificationWorkspaceFactory(tmp_path / "reconcile-symlink-copies")
+    runtime._configure_trusted_verification_unsafe(
+        backend=UnsafeTestSandboxBackend(profile), command_factory=_factory(profile),
+        workspace_factory=ws_factory, artifact_root=tmp_path / "reconcile-symlink-artifacts",
+        profile=profile,
+    )
+    runner = runtime._verification_runner
+    store = runner._store
+    # Create a PREPARED workspace directory with a symlink inside.
+    instance_id = "prep-sym-1"
+    ws_root = ws_factory._root / instance_id
+    ws_root.mkdir(parents=True)
+    (ws_root / "a.py").write_text("data\n")
+    (ws_root / "escape").symlink_to(tmp_path / "outside")
+    record = DisposableWorkspaceRecord(
+        workspace_id="dvw-prep-sym", verification_run_id=result.execution_run_id,
+        step_run_id="", instance_id=instance_id, manifest_digest="",
+        manifest_json="[]", allowed_generated_output=(),
+        state=DisposableWorkspaceState.PREPARED, boot_id="boot1",
+        created_at=time.time(),
+    )
+    store.create_disposable_workspace(record)
+    # Trigger reconciliation — must fail closed.
+    runner._reconcile_disposable_workspaces()
+    fetched = store.get_disposable_workspace("dvw-prep-sym")
+    assert fetched.state == DisposableWorkspaceState.CLEANUP_FAILED
+    assert fetched.failure_code == "prepared-cleanup-failed"
+    # Root must still exist — cleanup was quarantined.
+    assert ws_root.exists()
+
+
+# ----------------------------------------------------------------------
+# Batch 3.1.4 §3/§9: Approval binding drift matrix — STALE on drift
+# ----------------------------------------------------------------------
+
+
+def test_toolchain_attestation_drift_transitions_run_to_stale_zero_processes(tmp_path):
+    """§3/§9: if a toolchain attestation digest drifts from the approved
+    snapshot, the run transitions to STALE with 0 processes started."""
+    from _m4_batch2_helpers import verification
+    runtime, _, workspaces, _ = _real_runtime(tmp_path)
+    workspace = _workspace(tmp_path, workspaces)
+    edit = PlannedFileEdit(
+        "e1", "s1", PlannedEditOperation.CREATE, "fixture.py",
+        expected_exists=False, new_content="print('ok')\n",
+    )
+    plan = _plan((edit,))
+    plan = _verification_plan(plan, workspace)
+    plan, authorization = _authorize(runtime, plan)
+    result = _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
+    profile = _profile()
+    backend = UnsafeTestSandboxBackend(profile)
+    runtime._configure_trusted_verification_unsafe(
+        backend=backend, command_factory=_factory(profile),
+        workspace_factory=VerificationWorkspaceFactory(tmp_path / "drift-copies"),
+        artifact_root=tmp_path / "drift-artifacts", profile=profile,
+    )
+    runner = runtime._verification_runner
+    # Inject approved digests that DON'T match the current attestation.
+    runner._approved_image_attestation_digest = "approved-image-digest"
+    runner._approved_toolchain_attestation_digests = ("approved-tc-digest",)
+    # Inject a toolchain attestation with a DIFFERENT digest (drift).
+    drifted_attestation = _toolchain_attestation(
+        toolchain_id="python:python",
+        attestation_digest="drifted-tc-digest",
+    )
+    runner._toolchain_attestations = {"python:python": drifted_attestation}
+
+    async def run():
+        async with runtime.acquire_verification_context(
+            execution_run_id=result.execution_run_id, owner_execution_id="verifier",
+        ) as context:
+            return await runtime.run_trusted_verification(context=context)
+    ver_result = runtime._test_sync._loop.run_until_complete(run())
+    # §3: run must be STALE — attestation drift detected.
+    assert ver_result.status == VerificationRunStatus.STALE, (
+        f"expected STALE, got {ver_result.status}"
+    )
+    assert ver_result.failure_code == "toolchain-attestation-drift"
+    # §3: 0 processes started — no sandbox instances created.
+    assert len(backend.calls) == 0, (
+        f"expected 0 backend calls, got {len(backend.calls)}"
+    )
+    # §3: 0 steps started.
+    steps = runtime._verification_store.list_steps(ver_result.verification_run_id)
+    assert len(steps) == 0, (
+        f"expected 0 steps, got {len(steps)}"
+    )
