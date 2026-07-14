@@ -600,7 +600,13 @@ class TrustedVerificationRunner:
             completed: list[VerificationStepRun] = []
             terminal = VerificationRunStatus.PASSED
             failure_code = ""
-            for command, step in zip(commands, steps):
+            # Batch 3.1.4 §6: defer the last passing step's commit so it
+            # can be finalized atomically with Run=PASSED + Execution=VERIFIED
+            # in a single BEGIN IMMEDIATE transaction after cleanup.
+            deferred_step: VerificationStepRun | None = None
+            step_count = len(steps)
+            for step_index, (command, step) in enumerate(zip(commands, steps)):
+                is_last_step = (step_index == step_count - 1)
                 self._require_context(context)
                 if cancellation is not None and cancellation.is_set():
                     terminal = VerificationRunStatus.CANCELLED
@@ -862,9 +868,17 @@ class TrustedVerificationRunner:
                 # §9: atomic step+run+execution terminal transition.
                 # Cancellation uses cancel_step_and_run (not the prohibited
                 # finish_step() → transition_run() split).
+                #
+                # Batch 3.1.4 §6: defer the last passing step's commit
+                # so it can be finalized atomically with Run=PASSED +
+                # Execution=VERIFIED after cleanup succeeds.
                 if step_status == VerificationStepStatus.PASSED and terminal == VerificationRunStatus.PASSED:
-                    # Non-terminal step pass — use legacy finish_step.
-                    self._store.finish_step(finished)
+                    if is_last_step:
+                        # §6: don't commit yet — hold for finalization.
+                        deferred_step = finished
+                    else:
+                        # Non-terminal step pass — use legacy finish_step.
+                        self._store.finish_step(finished)
                 elif step_status == VerificationStepStatus.TIMED_OUT:
                     self._store.timeout_step_and_run(finished)
                 elif step_status == VerificationStepStatus.FAILED:
@@ -946,15 +960,29 @@ class TrustedVerificationRunner:
             if cleanup_failed and terminal == VerificationRunStatus.PASSED:
                 terminal = VerificationRunStatus.POISONED
                 failure_code = "cleanup-failed"
-            # Batch 3.1.3 §9: only call transition_run when the run is
-            # still RUNNING.  Atomic methods (fail_step_and_run,
-            # timeout_step_and_run, cancel_step_and_run) already
-            # transitioned the run to FAILED/TIMED_OUT/CANCELLED.
-            # The final transition_run is needed only for PASSED (all
-            # steps used finish_step) and POISONED (cleanup failure
-            # after all steps passed).
-            if terminal in (VerificationRunStatus.PASSED,
-                            VerificationRunStatus.POISONED):
+            # Batch 3.1.4 §6: atomic finalization.  The final Step=PASSED,
+            # Verification Run=PASSED, and Execution Run=VERIFIED must all
+            # be committed in ONE BEGIN IMMEDIATE transaction.  This replaces
+            # the forbidden finish_step() → cleanup → transition_run(PASSED)
+            # split where an external observer could see a PASSED run before
+            # cleanup was confirmed.
+            #
+            # For POISONED (cleanup failure) or other non-PASSED terminals,
+            # fall back to the legacy transition_run.
+            if terminal == VerificationRunStatus.PASSED:
+                # §6: transition to FINALIZING first, then finalize.
+                self._store.transition_run(
+                    run.verification_run_id,
+                    expected=(VerificationRunStatus.RUNNING,),
+                    target=VerificationRunStatus.FINALIZING,
+                )
+                self._store.finalize_success(
+                    step=deferred_step,
+                    verification_run_id=run.verification_run_id,
+                    execution_run_id=execution.execution_run_id,
+                    workspace_id=workspace_id,
+                )
+            elif terminal == VerificationRunStatus.POISONED:
                 self._store.transition_run(
                     run.verification_run_id, expected=(VerificationRunStatus.RUNNING,),
                     target=terminal, failure_code=failure_code,
@@ -968,6 +996,7 @@ class TrustedVerificationRunner:
                 VerificationRunStatus.VALIDATING,
                 VerificationRunStatus.PREPARING_SANDBOX,
                 VerificationRunStatus.RUNNING,
+                VerificationRunStatus.FINALIZING,
             }:
                 target = (VerificationRunStatus.POISONED
                           if "canonical workspace" in str(exc)

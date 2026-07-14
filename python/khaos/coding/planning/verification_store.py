@@ -197,7 +197,8 @@ class VerificationExecutionStore:
             VerificationRunStatus.CREATED: {VerificationRunStatus.VALIDATING, VerificationRunStatus.CANCELLED},
             VerificationRunStatus.VALIDATING: {VerificationRunStatus.PREPARING_SANDBOX, VerificationRunStatus.STALE, VerificationRunStatus.ERRORED, VerificationRunStatus.CANCELLED},
             VerificationRunStatus.PREPARING_SANDBOX: {VerificationRunStatus.RUNNING, VerificationRunStatus.ERRORED, VerificationRunStatus.CANCELLED},
-            VerificationRunStatus.RUNNING: {VerificationRunStatus.PASSED, VerificationRunStatus.FAILED, VerificationRunStatus.ERRORED, VerificationRunStatus.TIMED_OUT, VerificationRunStatus.CANCELLED, VerificationRunStatus.POISONED},
+            VerificationRunStatus.RUNNING: {VerificationRunStatus.FINALIZING, VerificationRunStatus.PASSED, VerificationRunStatus.FAILED, VerificationRunStatus.ERRORED, VerificationRunStatus.TIMED_OUT, VerificationRunStatus.CANCELLED, VerificationRunStatus.POISONED},
+            VerificationRunStatus.FINALIZING: {VerificationRunStatus.PASSED, VerificationRunStatus.ERRORED, VerificationRunStatus.POISONED},
         }
         if not expected or any(target not in allowed.get(item, set()) for item in expected):
             raise RuntimeError("invalid verification run transition")
@@ -314,13 +315,13 @@ class VerificationExecutionStore:
             raise
 
     def recover_interrupted(self) -> int:
-        """Never infer PREPARING/RUNNING work as passed after restart."""
+        """Never infer PREPARING/RUNNING/FINALIZING work as passed after restart."""
         now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             rows = self._conn.execute(
                 "SELECT verification_run_id,execution_run_id FROM plan_verification_runs "
-                "WHERE status IN ('preparing-sandbox','running')"
+                "WHERE status IN ('preparing-sandbox','running','finalizing')"
             ).fetchall()
             for row in rows:
                 self._conn.execute(
@@ -756,6 +757,70 @@ class VerificationExecutionStore:
             step, run_target=VerificationRunStatus.PASSED,
             execution_target="verified",
         )
+
+    def finalize_success(
+        self, *, step: VerificationStepRun | None, verification_run_id: str,
+        execution_run_id: str, workspace_id: str = "",
+    ) -> None:
+        """Batch 3.1.4 §6: atomic finalization in ONE BEGIN IMMEDIATE.
+
+        Commits the following in a single transaction:
+        1. Final Step → PASSED (the deferred last step, if any)
+        2. Verification Run → PASSED (expected FINALIZING)
+        3. Execution Run → VERIFIED (expected VERIFYING)
+        4. Terminal Audit
+
+        This replaces the forbidden ``finish_step() → cleanup →
+        transition_run(PASSED)`` split.  The caller must:
+        - Transition Run to FINALIZING before calling this.
+        - Complete cleanup (disposable workspace destroy, sandbox instance
+          removal, artifact sealing) BEFORE calling this.
+        - Only call this when all required steps passed and cleanup succeeded.
+        - Pass ``step=None`` when the last step was already committed
+          (e.g. optional failure on the last step).
+        """
+        now = time.time()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            # 1. Final Step → PASSED (if deferred)
+            if step is not None:
+                cur = self._conn.execute(
+                    "UPDATE plan_verification_steps SET status=?,exit_code=?,signal=?,started_at=?,"
+                    "completed_at=?,duration_ms=?,stdout_digest=?,stderr_digest=?,output_artifact_id=?,"
+                    "output_truncated=?,sandbox_instance_id=?,sandbox_image_digest=?,resource_usage_json=?,"
+                    "failure_code=? WHERE step_run_id=? AND status IN ('created','running')",
+                    (step.status.value, step.exit_code, step.signal, step.started_at,
+                     step.completed_at, step.duration_ms, step.stdout_digest, step.stderr_digest,
+                     step.output_artifact_id, int(step.output_truncated), step.sandbox_instance_id,
+                     step.sandbox_image_digest, json.dumps(step.resource_usage, sort_keys=True),
+                     step.failure_code, step.step_run_id),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("final step CAS failed in finalize_success")
+            # 2. Verification Run → PASSED (expected FINALIZING)
+            cur = self._conn.execute(
+                "UPDATE plan_verification_runs SET status=?,updated_at=?,completed_at=?,failure_code=? "
+                "WHERE verification_run_id=? AND status='finalizing'",
+                (VerificationRunStatus.PASSED.value, now, now, "",
+                 verification_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("verification run CAS failed in finalize_success")
+            # 3. Execution Run → VERIFIED (expected VERIFYING)
+            cur = self._conn.execute(
+                "UPDATE plan_execution_runs SET status=?,updated_at=?,completed_at=?,failure_code=? "
+                "WHERE execution_run_id=? AND status='verifying'",
+                ("verified", now, now, "", execution_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("execution run CAS failed in finalize_success")
+            # 4. Terminal Audit
+            self._audit(verification_run_id, "finalized-success",
+                        "passed", "", step.step_run_id if step else "")
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
 
     def fail_step_and_run(self, step: VerificationStepRun, *, run_failure_code: str = "required-step-failed") -> None:
         """Step FAILED + Run FAILED + Execution verification-failed — single transaction."""

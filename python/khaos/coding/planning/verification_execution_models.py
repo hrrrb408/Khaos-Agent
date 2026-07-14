@@ -19,6 +19,7 @@ class VerificationRunStatus(str, Enum):
     VALIDATING = "validating"
     PREPARING_SANDBOX = "preparing-sandbox"
     RUNNING = "running"
+    FINALIZING = "finalizing"
     PASSED = "passed"
     FAILED = "failed"
     ERRORED = "errored"
