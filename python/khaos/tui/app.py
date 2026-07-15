@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 import uuid
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from khaos.tui.commands import TuiContext, handle_command, is_command
 from khaos.tui.input_panel import InputPanel
 from khaos.tui.permission_dialog import PermissionDialog
 from khaos.tui.status_bar import StatusBar
+from khaos.tui.view_model import tool_diff_preview
 
 logger = logging.getLogger(__name__)
 
@@ -288,26 +290,12 @@ class KhaosApp(App):
         return meta.get("success") is True and meta.get("name") in self._DIFF_TRIGGER_TOOLS
 
     def _maybe_show_diff(self, message: Message) -> None:
-        """Run ``git diff`` in the project root and render it if non-empty."""
-        try:
-            import subprocess
-
-            result = subprocess.run(
-                ["git", "diff", "--color=never"],
-                cwd=str(self.project_root),
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-        except (OSError, subprocess.SubprocessError) as exc:
-            logger.debug("diff preview skipped: %s", exc)
-            return
-        if result.returncode != 0:
-            logger.debug("diff preview skipped (rc=%d): %s", result.returncode, result.stderr.strip())
-            return
-        diff_text = result.stdout.strip()
         meta = message.metadata or {}
-        file_path = self._extract_changed_path(meta) or "working tree"
+        preview = tool_diff_preview(meta)
+        if preview is None:
+            logger.debug("diff preview skipped: tool result has no trusted diff artifact")
+            return
+        file_path, diff_text = preview
         try:
             self.query_one(ChatPanel).append_diff(file_path, diff_text)
         except Exception as exc:  # noqa: BLE001 — never let the preview crash the turn
@@ -421,6 +409,12 @@ class KhaosApp(App):
 
     async def _confirm_callback(self, request: dict) -> dict:
         """Bridge the scheduler's permission request to a modal dialog."""
+        expires_at = float(request.get("expires_at") or 0.0)
+        if expires_at and expires_at <= time.time():
+            return {"approved": False, "remember": False}
+        if request["id"] in self._pending_confirmations:
+            logger.warning("duplicate pending approval denied: %s", request["id"])
+            return {"approved": False, "remember": False}
         future: asyncio.Future[bool] = asyncio.get_event_loop().create_future()
         self._pending_confirmations[request["id"]] = future
 
@@ -435,8 +429,13 @@ class KhaosApp(App):
             _show()
         else:
             self.call_from_thread(_show)
-        approved = await future
-        return {"approved": approved, "remember": False}
+        try:
+            approved = await future
+            if expires_at and expires_at <= time.time():
+                approved = False
+            return {"approved": approved, "remember": False}
+        finally:
+            self._pending_confirmations.pop(request["id"], None)
 
     # --- helpers -----------------------------------------------------------
 

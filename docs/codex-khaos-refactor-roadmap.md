@@ -184,6 +184,14 @@ tool call 或 tool result 发送给摘要模型；每次压缩将输入 window d
 
 ## 9. Batch H：TUI 与用户体验
 
+实施进度（2026-07-15）：H1、H2、H4、H6 已完成安全收敛。Permission view model
+只消费 server-issued binding 字段，展示 principal/task/workspace、permission level、arguments/
+profile/binding digest 和 expiry；过期或重复 pending callback fail closed，所有动态文案进行
+markup escape。TUI 不再调用 host `subprocess git diff`，只渲染受控工具结果已经携带的
+diff/patch artifact。既有 slash command、Office/Coding 双模式和 typed turn metadata 保留。
+H3 的跨进程恢复状态展示与 H5 的全尺寸 Textual snapshot matrix 继续受可选 Textual CI
+环境门禁约束，不得成为恢复 host 旁路的理由。
+
 | 项 | 内容 |
 | --- | --- |
 | 范围 | Textual TUI、Gateway clients、permission dialog、task/recovery/sandbox status、diff preview |
