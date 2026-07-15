@@ -138,6 +138,24 @@ async def test_supervisor_enforces_file_size_limit(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_external_backend_can_own_payload_resource_enforcement(tmp_path: Path):
+    supervisor = ProcessSupervisor()
+    request = ExecutionRequest(
+        (sys.executable, "-c", "print('control-plane')"),
+        tmp_path,
+        correlation_id="external-limits",
+    )
+
+    result = await supervisor.run(request, enforce_resource_limits=False)
+
+    assert result.status == "passed"
+    assert result.stdout.strip() == "control-plane"
+    assert result.diagnostics["resource_limits"] == {
+        "enforced_by": "external-backend",
+    }
+
+
+@pytest.mark.asyncio
 async def test_supervisor_terminates_process_tree_on_budget_violation(
     tmp_path: Path, monkeypatch,
 ):

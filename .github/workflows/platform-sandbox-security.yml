@@ -38,8 +38,10 @@ jobs:
           if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
-      - name: Ensure bwrap is setuid root
-        run: sudo chmod 4755 /usr/bin/bwrap
+      - name: Use unprivileged bwrap with bounded tmpfs support
+        run: |
+          sudo chmod 0755 /usr/bin/bwrap
+          test ! -u /usr/bin/bwrap
       - name: Install test dependencies
         run: python -m pip install -e '.[test]'
       - name: Capture pre-test diagnostics

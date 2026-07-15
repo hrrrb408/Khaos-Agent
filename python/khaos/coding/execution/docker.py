@@ -123,6 +123,11 @@ class DockerBackend:
                 docker_request,
                 cwd=context.cwd,
                 env={"PATH": os.environ.get("PATH", "")},
+                # The Docker daemon enforces the request's pids/CPU/memory/
+                # tmpfs limits on the container. Applying the payload's
+                # RLIMIT_AS to the host-side Go Docker CLI can prevent that
+                # control process from starting before a container exists.
+                enforce_resource_limits=False,
             )
             diagnostics.update(result.diagnostics)
             return ExecutionResult(
@@ -260,6 +265,7 @@ class DockerBackend:
                     correlation_id=f"docker-cli-{uuid.uuid4().hex[:12]}",
                 ),
                 env={"PATH": os.environ.get("PATH", "")},
+                enforce_resource_limits=False,
             )
         except FileNotFoundError:
             return -1, "", "Docker CLI not installed"

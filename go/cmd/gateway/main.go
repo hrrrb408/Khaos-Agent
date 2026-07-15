@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 
@@ -147,6 +148,17 @@ func loadOrCreateAPIKey(configured, configuredPath string) (string, string, erro
 	if err != nil {
 		return "", "", fmt.Errorf("resolve gateway token path: %w", err)
 	}
+	if runtime.GOOS == "windows" {
+		configRoot, rootErr := os.UserConfigDir()
+		if rootErr != nil {
+			return "", "", fmt.Errorf("resolve Windows user config directory: %w", rootErr)
+		}
+		privateRoot := filepath.Join(configRoot, "khaos")
+		relative, relErr := filepath.Rel(privateRoot, absolute)
+		if relErr != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+			return "", "", errors.New("Windows gateway token must be inside the current user config directory")
+		}
+	}
 	if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
 		return "", "", fmt.Errorf("create gateway token directory: %w", err)
 	}
@@ -195,7 +207,7 @@ func readProtectedToken(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !entryInfo.Mode().IsRegular() || entryInfo.Mode().Perm()&0o077 != 0 {
+	if !entryInfo.Mode().IsRegular() || (runtime.GOOS != "windows" && entryInfo.Mode().Perm()&0o077 != 0) {
 		return "", errors.New("gateway token must be a regular file inaccessible to group and others")
 	}
 	file, err := os.Open(path)

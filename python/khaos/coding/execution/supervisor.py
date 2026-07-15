@@ -41,6 +41,7 @@ class ProcessSupervisor:
         *,
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
+        enforce_resource_limits: bool = True,
     ) -> ExecutionResult:
         """Run one foreground process with bounded, fairly split output."""
         execution_id = request.correlation_id
@@ -54,8 +55,9 @@ class ProcessSupervisor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
-            preexec_fn=resource_limit_preexec(
-                request.permission_profile.resources
+            preexec_fn=(
+                resource_limit_preexec(request.permission_profile.resources)
+                if enforce_resource_limits else None
             ),
         )
         active = _ActiveProcess(process)
@@ -64,7 +66,7 @@ class ProcessSupervisor:
             _resource_watchdog(
                 process, active, request.permission_profile.resources,
                 self._terminate_active,
-            )
+            ) if enforce_resource_limits else _no_resource_violation()
         )
         total_limit = request.permission_profile.resources.output_bytes
         stdout_limit = (total_limit + 1) // 2
@@ -132,7 +134,9 @@ class ProcessSupervisor:
                 ),
                 "resource_limits": _resource_limit_diagnostics(
                     request.permission_profile.resources
-                ),
+                ) if enforce_resource_limits else {
+                    "enforced_by": "external-backend",
+                },
             }
         )
         return ExecutionResult(
@@ -199,6 +203,10 @@ class ProcessSupervisor:
             except asyncio.TimeoutError:
                 _signal_process_group(process, signal.SIGKILL)
                 await process.wait()
+
+
+async def _no_resource_violation() -> None:
+    return None
 
 
 async def _drain_bounded(

@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -23,7 +24,11 @@ func TestValidateListenConfigRequiresKeyOffLoopback(t *testing.T) {
 }
 
 func TestLoadOrCreateAPIKeyUsesProtectedHighEntropyFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "private", "gateway-token")
+	root := t.TempDir()
+	if runtime.GOOS == "windows" {
+		t.Setenv("AppData", root)
+	}
+	path := filepath.Join(root, "khaos", "gateway-token")
 	first, storedAt, err := loadOrCreateAPIKey("", path)
 	if err != nil {
 		t.Fatal(err)
@@ -35,12 +40,24 @@ func TestLoadOrCreateAPIKeyUsesProtectedHighEntropyFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if runtime.GOOS != "windows" && info.Mode().Perm() != 0o600 {
 		t.Fatalf("token mode=%#o", info.Mode().Perm())
 	}
 	second, _, err := loadOrCreateAPIKey("", path)
 	if err != nil || second != first {
 		t.Fatalf("token was not reused: err=%v equal=%v", err, second == first)
+	}
+}
+
+func TestWindowsTokenPathCannotEscapeUserConfig(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows profile ACL boundary")
+	}
+	root := t.TempDir()
+	t.Setenv("AppData", root)
+	outside := filepath.Join(filepath.Dir(root), "shared", "gateway-token")
+	if _, _, err := loadOrCreateAPIKey("", outside); err == nil {
+		t.Fatal("token path outside the Windows user config directory was accepted")
 	}
 }
 
