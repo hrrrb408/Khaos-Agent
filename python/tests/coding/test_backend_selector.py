@@ -15,6 +15,7 @@ def test_selector_never_uses_host_for_read_without_platform_sandbox(monkeypatch)
 
 
 @pytest.mark.asyncio
+@pytest.mark.windows_fail_closed
 async def test_windows_is_explicitly_unsupported_and_fails_closed(monkeypatch):
     monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "win32")
 

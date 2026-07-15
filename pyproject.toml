@@ -48,6 +48,10 @@ asyncio_mode = "auto"
 pythonpath = ["python"]
 testpaths = ["python/tests"]
 markers = [
+    "security_contract: cross-platform security contract without a real OS sandbox",
+    "platform_sandbox_real: requires a real OS-enforced platform sandbox",
+    "docker_sandbox_real: requires a real Docker daemon and pinned image",
+    "windows_fail_closed: proves Windows refuses execution while no backend exists",
     "tree_sitter_real: requires locked Tree-sitter optional dependencies",
     "lsp_real: requires a trusted pre-installed Language Server (never downloaded at test time)",
     "production_sandbox_real: requires a supported production sandbox daemon and pinned image",

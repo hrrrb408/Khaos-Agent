@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -19,6 +20,12 @@ from khaos.tools.file_tools import (
     search_files,
     tree_view,
     write_file,
+)
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="dirfd/O_NOFOLLOW workspace capability is POSIX-only",
 )
 
 
