@@ -274,9 +274,9 @@ class KhaosApp(App):
     def _render_message(self, message: Message) -> None:
         chat = self.query_one(ChatPanel)
         chat.append_message(message)
-        # After a successful write-class tool call, surface a live git diff so
-        # the user immediately sees what changed — purely cosmetic, never sent
-        # back to the model.
+        # After a successful write-class tool call, render a diff artifact when
+        # the restricted tool result already contains one. The UI never runs
+        # host Git to synthesize this preview.
         if self._is_write_tool_result(message):
             self._maybe_show_diff(message)
 

@@ -135,7 +135,7 @@ class ChatPanel(RichLog):
     def append_diff(self, file_path: str, diff_text: str) -> None:
         """Append a colourised diff block to the chat panel.
 
-        ``diff_text`` is the raw output of ``git diff --color=never``. Lines
+        ``diff_text`` is a backend-provided diff artifact. Lines
         starting with ``+``/``-``/``@@`` are tinted green/red/yellow; context
         and header lines keep the default colour. Empty diffs render a single
         dim note so the user knows the tool ran.
