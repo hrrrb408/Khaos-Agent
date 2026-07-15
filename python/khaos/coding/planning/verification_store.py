@@ -697,6 +697,8 @@ class VerificationExecutionStore:
             raise
 
     def get_run_by_execution(self, execution_run_id: str) -> VerificationExecutionRun | None:
+        if self._write_authority is not None:
+            self._write_authority.verify_storage()
         row = self._conn.execute(
             "SELECT * FROM plan_verification_runs WHERE execution_run_id=?", (execution_run_id,),
         ).fetchone()
@@ -706,6 +708,8 @@ class VerificationExecutionStore:
 
     def get_run(self, verification_run_id: str) -> VerificationExecutionRun | None:
         """Batch 3.1.2 §2: look up a verification run by verification_run_id."""
+        if self._write_authority is not None:
+            self._write_authority.verify_storage()
         row = self._conn.execute(
             "SELECT * FROM plan_verification_runs WHERE verification_run_id=?",
             (verification_run_id,),

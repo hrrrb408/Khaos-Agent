@@ -140,8 +140,10 @@ active TaskWorkspace，拒绝 traversal、protected metadata、symlink、hardlin
 ## 7. Batch F：Verification
 
 实施进度（2026-07-15）：F1-F4 已完成并保留 Khaos 差异化证明。Verification writer
-已位于独立 spawn 子进程，canonical read handle 固定 query/ro connection，DB/WAL/SHM
-和 schema identity 被 pin，旧 boot success 必须重新验证。Authority proof/success ledger
+的 proof/success ledger 已位于独立 spawn 子进程；主状态 writer 仍在受信任 Runtime，
+但通过 boot-lifetime SQLite EXCLUSIVE lock 阻断预打开 writer FD 竞态。canonical read
+handle 只提供固定 query，DB/WAL/SHM（或 SHM 持续缺失）和 schema identity 被 pin，
+旧 boot success 必须重新验证。Authority proof/success ledger
 现改为跨启动保留的 boot-scoped SQLite ledger；每个 accepted/rejected/boot event 进入
 SHA-256 previous-hash chain，启动先验证全链，旧 boot proof 仍不可用于当前 boot。
 
