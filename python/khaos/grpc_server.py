@@ -76,7 +76,7 @@ class AgentService:
         self.config_path = config_path or self.project_root / "config.yaml"
         self._router = router
         self.pending_confirmations: dict[str, dict] = {}
-        self.approval_broker = ApprovalBroker()
+        self.approval_broker = ApprovalBroker(db=db)
         # Shared coding-task tracker so the TUI / TaskService can observe
         # long-running coding turns alongside the AgentLoop.
         self.task_manager = TaskManager(db=db)

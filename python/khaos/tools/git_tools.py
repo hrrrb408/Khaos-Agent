@@ -35,10 +35,12 @@ class _GitExecutionContext:
     approval_context: dict[str, Any] | None
     network_policy: str
     credential_context: dict[str, Any] | None = None
+    principal_id: str | None = None
+    requester: str | None = None
 
 
-def _context(task_id: str | None, workspace_id: str | None, access_mode: str, execution_service: Any, approval_context: dict[str, Any] | None, network_policy: str, credential_context: dict[str, Any] | None = None) -> _GitExecutionContext:
-    return _GitExecutionContext(task_id, workspace_id, access_mode, execution_service, approval_context, network_policy, credential_context)
+def _context(task_id: str | None, workspace_id: str | None, access_mode: str, execution_service: Any, approval_context: dict[str, Any] | None, network_policy: str, credential_context: dict[str, Any] | None = None, principal_id: str | None = None, requester: str | None = None) -> _GitExecutionContext:
+    return _GitExecutionContext(task_id, workspace_id, access_mode, execution_service, approval_context, network_policy, credential_context, principal_id, requester)
 
 
 async def git_diff(repo: str = ".", staged: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
@@ -57,11 +59,11 @@ async def git_commit(repo: str = ".", message: str = "", *, task_id: str | None 
     return await _git(args, repo, _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, "none"))
 
 
-async def git_branch(repo: str = ".", name: str = "", checkout: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
+async def git_branch(repo: str = ".", name: str = "", checkout: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", principal_id: str | None = None, requester: str | None = None) -> dict[str, Any]:
     """List, create, or checkout branches."""
     if name and checkout:
         _validate_branch_name(name)
-        context = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none")
+        context = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none", principal_id=principal_id, requester=requester)
         result = await _git(["git", *_GIT_SAFE_CONFIG, "switch", "-c", name], repo, context)
         if result["returncode"] == 0:
             workspace = execution_service.workspace_manager.get(workspace_id)
@@ -191,13 +193,13 @@ async def git_smart_commit(cwd: str = ".", message: str = "", *, task_id: str | 
     )
 
 
-async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.destructive-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> str:
+async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.destructive-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", principal_id: str | None = None, requester: str | None = None) -> str:
     """Undo the last commit, keeping its changes staged (soft reset).
 
     Returns the hash and message of the commit that was undone plus the list
     of files now staged as a result.
     """
-    destructive_ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none")
+    destructive_ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none", principal_id=principal_id, requester=requester)
     read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
     log = await _git(["git", "log", "-1", "--pretty=%H%x09%s"], cwd, read_ctx)
     if log["returncode"] != 0 or not log["stdout"].strip():
@@ -232,7 +234,7 @@ async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: 
 
 
 async def git_create_branch(
-    cwd: str = ".", branch_name: str = "", from_base: str = "main", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.destructive-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none"
+    cwd: str = ".", branch_name: str = "", from_base: str = "main", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.destructive-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", principal_id: str | None = None, requester: str | None = None
 ) -> str:
     """Create a new branch from ``from_base`` and switch to it.
 
@@ -257,7 +259,7 @@ async def git_create_branch(
     base = from_base or "main"
     _validate_branch_name(branch_name)
     _validate_revision(base)
-    destructive_ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none")
+    destructive_ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none", principal_id=principal_id, requester=requester)
     read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
     base_lookup = await _git(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], cwd, read_ctx)
     if base_lookup["returncode"] != 0:
@@ -306,7 +308,7 @@ async def git_create_branch(
 
 
 async def git_push(
-    cwd: str = ".", remote: str = "origin", branch: str = "", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.remote-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", credential_context: dict[str, Any] | None = None
+    cwd: str = ".", remote: str = "origin", branch: str = "", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "vcs.remote-write", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none", credential_context: dict[str, Any] | None = None, principal_id: str | None = None, requester: str | None = None
 ) -> str:
     """Push the current (or named) branch to ``remote``.
 
@@ -319,7 +321,7 @@ async def git_push(
     """
     remote = remote or "origin"
     _validate_remote_name(remote)
-    ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy, credential_context)
+    ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy, credential_context, principal_id, requester)
     read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
     branch_result = await _git(["git", "branch", "--show-current"], cwd, read_ctx)
     current_branch = branch_result["stdout"].strip()
@@ -732,7 +734,10 @@ async def prepare_destructive_git_approval(
     else:
         target = f"{target_hint}@{head}"
     expiry = time.time() + 120.0
+    principal_id = str(tool_context.get("principal_id") or requester)
     binding = {
+        "principal_id": principal_id,
+        "session_id": requester,
         "task_id": workspace.task_id,
         "workspace_id": context.workspace_id,
         "operation": operation,
@@ -805,7 +810,10 @@ async def prepare_remote_git_approval(
     head, diff_hash = await _git_state(cwd, context)
     refspec = f"{branch}:{branch}"
     expiry = time.time() + 120.0
+    principal_id = str(tool_context.get("principal_id") or requester)
     binding = {
+        "principal_id": principal_id,
+        "session_id": requester,
         "task_id": workspace.task_id,
         "workspace_id": context.workspace_id,
         "operation": "git.push-set-upstream",
@@ -883,6 +891,8 @@ async def _consume_destructive_approval(
         branch = target_hint.split("@", 1)[0]
         expected_target = f"{branch}@{target_hint.split('@', 1)[1]}"
     current = {
+        "principal_id": context.principal_id or binding.get("principal_id"),
+        "session_id": context.requester or binding.get("session_id"),
         "task_id": workspace.task_id,
         "workspace_id": context.workspace_id,
         "operation": operation,
@@ -931,6 +941,8 @@ async def _consume_remote_approval(
     credential_scope, _ = _credential_material(remote_url, context.credential_context)
     head, diff_hash = await _git_state(cwd, read_context)
     current = {
+        "principal_id": context.principal_id or binding.get("principal_id"),
+        "session_id": context.requester or binding.get("session_id"),
         "task_id": workspace.task_id,
         "workspace_id": context.workspace_id,
         "operation": "git.push-set-upstream",

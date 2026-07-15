@@ -114,7 +114,7 @@ class PlanApprovalOutcome:
 class ApprovalBroker:
     """One await/resolve channel keyed by tool call id."""
 
-    def __init__(self, authenticator=None) -> None:
+    def __init__(self, authenticator=None, db=None) -> None:
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
         self._tool_approvals: dict[str, _ToolApprovalRecord] = {}
         self._operation_approvals: dict[str, dict] = {}
@@ -125,6 +125,7 @@ class ApprovalBroker:
         # AuthenticatedApprovalContext signatures. If None, the broker
         # refuses all plan-approval decisions (fail closed).
         self._authenticator = authenticator
+        self._db = db
         # Broker-private Ed25519 authority for durable decision receipts.
         # Only its public verifier is persisted by the runtime.
         from khaos.coding.planning.approval.receipt_crypto import _ReceiptSigningAuthority
@@ -272,23 +273,64 @@ class ApprovalBroker:
         self, approval_id: str, binding: dict, expiry: float
     ) -> None:
         """Register immutable destructive-operation state before prompting."""
+        normalized = _normalize_operation_binding(binding, expiry)
+        binding_digest = _canonical_digest(normalized)
         async with self._lock:
             self._operation_approvals[approval_id] = {
-                "binding": dict(binding),
+                "binding": normalized,
+                "binding_digest": binding_digest,
                 "expiry": expiry,
                 "approved": False,
                 "used": False,
             }
+        if self._db is not None:
+            nonce = secrets.token_bytes(32)
+            await self._db.register_operation_approval(
+                approval_id=approval_id,
+                binding_digest=binding_digest,
+                binding_json=json.dumps(
+                    normalized, sort_keys=True, separators=(",", ":")
+                ),
+                principal_id=normalized["principal_id"],
+                session_id=normalized["session_id"],
+                task_id=normalized["task_id"],
+                workspace_id=normalized["workspace_id"],
+                operation=normalized["operation"],
+                nonce_hash=hashlib.sha256(nonce).hexdigest(),
+                expires_at=float(expiry),
+                created_at=time.time(),
+            )
 
-    async def approve_operation(self, approval_id: str, requester: str) -> bool:
+    async def approve_operation(
+        self,
+        approval_id: str,
+        requester: str,
+        *,
+        principal_id: str | None = None,
+    ) -> bool:
         """Mark a registered operation approved by its bound requester."""
+        principal = principal_id or requester
+        if self._db is not None:
+            approved = await self._db.approve_operation_approval(
+                approval_id,
+                principal_id=principal,
+                session_id=requester,
+                now=time.time(),
+            )
+            if approved:
+                async with self._lock:
+                    record = self._operation_approvals.get(approval_id)
+                    if record is not None:
+                        record["approved"] = True
+            return approved
         async with self._lock:
             record = self._operation_approvals.get(approval_id)
             if (
                 record is None
                 or record["used"]
                 or time.time() >= record["expiry"]
-                or record["binding"].get("requester") != requester
+                or record["binding"].get("session_id") != requester
+                or record["binding"].get("principal_id") != principal
             ):
                 return False
             record["approved"] = True
@@ -296,6 +338,17 @@ class ApprovalBroker:
 
     async def consume_operation(self, approval_id: str, binding: dict) -> bool:
         """Atomically consume an approved operation; every attempt is one-shot."""
+        expiry = float(binding.get("expiry") or 0)
+        normalized = _normalize_operation_binding(binding, expiry)
+        binding_digest = _canonical_digest(normalized)
+        if self._db is not None:
+            return await self._db.consume_operation_approval(
+                approval_id,
+                binding_digest=binding_digest,
+                principal_id=normalized["principal_id"],
+                session_id=normalized["session_id"],
+                now=time.time(),
+            )
         async with self._lock:
             record = self._operation_approvals.get(approval_id)
             if record is None or record["used"]:
@@ -304,7 +357,7 @@ class ApprovalBroker:
             return bool(
                 record["approved"]
                 and time.time() < record["expiry"]
-                and record["binding"] == binding
+                and record["binding_digest"] == binding_digest
             )
 
     async def cancel_operation(self, approval_id: str) -> None:
@@ -313,6 +366,10 @@ class ApprovalBroker:
             record = self._operation_approvals.get(approval_id)
             if record is not None:
                 record["used"] = True
+        if self._db is not None:
+            await self._db.cancel_operation_approval(
+                approval_id, now=time.time()
+            )
 
     # ------------------------------------------------------------------
     # Plan-execution approvals (namespaced, disjoint from Task / operation)
@@ -527,3 +584,50 @@ class ApprovalBroker:
                 record.decision = "rejected"
             record.decide_count += 1
             return True
+
+
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalize_operation_binding(binding: dict, expiry: float) -> dict:
+    normalized = dict(binding)
+    requester = str(normalized.get("requester") or normalized.get("session_id") or "")
+    normalized["requester"] = requester
+    normalized["session_id"] = str(normalized.get("session_id") or requester)
+    normalized["principal_id"] = str(
+        normalized.get("principal_id") or normalized["session_id"]
+    )
+    # Expiry is an authoritative ledger column and is deliberately excluded
+    # from caller-recomputed binding JSON so restart consumers need not echo it.
+    normalized.pop("expiry", None)
+    for key in (
+        "principal_id", "session_id", "task_id", "workspace_id", "operation"
+    ):
+        if not str(normalized.get(key) or ""):
+            raise ValueError(f"operation approval binding requires {key}")
+    normalized.setdefault(
+        "arguments_digest",
+        _canonical_digest(
+            {
+                "operation": normalized["operation"],
+                "target": normalized.get("target"),
+                "changeset_id": normalized.get("changeset_id"),
+                "payload_hash": normalized.get("payload_hash"),
+            }
+        ),
+    )
+    normalized.setdefault(
+        "profile_digest",
+        _canonical_digest(
+            {
+                "network_policy": normalized.get("network_policy", "none"),
+                "credential_scope": normalized.get("credential_scope", ""),
+                "operation": normalized["operation"],
+            }
+        ),
+    )
+    return normalized

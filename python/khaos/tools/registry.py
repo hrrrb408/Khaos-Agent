@@ -143,6 +143,8 @@ class ToolInvocationBroker:
             handler_params["workspace_id"] = context.get("workspace_id")
             handler_params["approval_context"] = context.get("approval_context")
             handler_params["network_policy"] = context.get("network_policy", "none")
+            handler_params["principal_id"] = context.get("principal_id")
+            handler_params["requester"] = context.get("requester")
             if name == "git_push":
                 handler_params["credential_context"] = context.get("credential_context")
         if any(capability.name == "network.access" for capability in capabilities):
@@ -150,6 +152,8 @@ class ToolInvocationBroker:
             handler_params["credential_context"] = context.get("credential_context")
         if any(capability.name in {"remote.write", "remote.destructive-write"} for capability in capabilities):
             handler_params["approval_context"] = context.get("approval_context")
+            handler_params["principal_id"] = context.get("principal_id")
+            handler_params["requester"] = context.get("requester")
         if mode == "coding" and any(capability.name == "filesystem.write" for capability in capabilities):
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")

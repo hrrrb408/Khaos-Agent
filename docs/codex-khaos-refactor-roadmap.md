@@ -68,8 +68,9 @@ destructive E2E 仅在干净 CI runner gate。Windows 在实现 OS 强制 backen
 实施进度（2026-07-15）：C1 普通 tool approval 已完成 principal/session/task/turn/call/
 arguments/workspace/profile/expiry/nonce binding 与 one-shot consume；Gateway confirm 和
 task approve/reject principal 来自认证 context，客户端自报 principal 无效。既有 Plan
-Approval signed durable receipt 保留。C2 destructive operation/ChangeSet durable ledger、
-C3 多租户 principal provider 与 durable invalidation audit 尚未关闭。
+Approval signed durable receipt 保留。C2 destructive operation/ChangeSet durable ledger
+已完成，使用事务化 one-shot consume，并覆盖 restart 与跨连接竞争。C3 多租户 principal
+provider 与 ordinary approval durable invalidation audit 尚未关闭。
 
 | 项 | 内容 |
 | --- | --- |

@@ -124,7 +124,12 @@ async def test_operation_approval_is_bound_and_single_use():
 
 async def test_operation_approval_expiry_and_mismatch_are_consumed():
     broker = ApprovalBroker()
-    binding = {"requester": "session", "operation": "git.undo"}
+    binding = {
+        "requester": "session",
+        "task_id": "task",
+        "workspace_id": "workspace",
+        "operation": "git.undo",
+    }
     await broker.register_operation("expired", binding, time.time() - 1)
     assert await broker.approve_operation("expired", "session") is False
     assert await broker.consume_operation("expired", binding) is False

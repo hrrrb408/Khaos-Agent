@@ -25,13 +25,17 @@ class ChangeSetApplicationService:
         operation: OutputMode,
         requester: str,
         expiry: float,
+        principal_id: str | None = None,
     ) -> str:
         """Register a one-shot immutable approval before an external apply."""
         workspace = self._workspace(task_id, workspace_id)
         approval_key = changeset.approval_key(operation.value)
         await self.approval_broker.register_operation(
             approval_key,
-            await self._binding(workspace, task_id, changeset, operation, requester),
+            await self._binding(
+                workspace, task_id, changeset, operation, requester,
+                principal_id or requester,
+            ),
             expiry,
         )
         return approval_key
@@ -46,10 +50,14 @@ class ChangeSetApplicationService:
         approval_key: str,
         expiry: float,
         requester: str = "",
+        principal_id: str | None = None,
     ) -> str:
         """Apply only an approved, unchanged ChangeSet exactly once."""
         workspace = self._workspace(task_id, workspace_id)
-        binding = await self._binding(workspace, task_id, changeset, operation, requester)
+        binding = await self._binding(
+            workspace, task_id, changeset, operation, requester,
+            principal_id or requester,
+        )
         if time.time() >= expiry or approval_key in self._used or approval_key != changeset.approval_key(operation.value):
             raise PermissionError("approval is expired, replayed, or bound to another operation")
         if not await self.approval_broker.consume_operation(approval_key, binding):
@@ -66,13 +74,15 @@ class ChangeSetApplicationService:
             raise WorkspaceError("invalid task workspace")
         return workspace
 
-    async def _binding(self, workspace, task_id: str, changeset: ChangeSet, operation: OutputMode, requester: str) -> dict:
+    async def _binding(self, workspace, task_id: str, changeset: ChangeSet, operation: OutputMode, requester: str, principal_id: str) -> dict:
         """Recompute mutable Git facts, invalidating approvals after drift."""
         current_head = await self.manager._git(workspace.worktree_path, "rev-parse", "HEAD")
         patch = await self.manager._git(
             workspace.worktree_path, "diff", "--binary", workspace.base_sha, preserve_output=True
         )
         return {
+            "principal_id": principal_id,
+            "session_id": requester,
             "requester": requester,
             "task_id": task_id,
             "workspace_id": workspace.id,

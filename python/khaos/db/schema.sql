@@ -525,3 +525,40 @@ BEGIN SELECT RAISE(ABORT, 'verification success evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS trg_vse_immutable_delete
 BEFORE DELETE ON verification_success_evidence
 BEGIN SELECT RAISE(ABORT, 'verification success evidence cannot be deleted'); END;
+
+-- Principal-bound one-shot approvals for destructive Git/GitHub/ChangeSet
+-- operations. State changes are performed by transaction/CAS in Database;
+-- triggers are intentionally not used as a connection-authority boundary.
+CREATE TABLE IF NOT EXISTS operation_approvals (
+    approval_id TEXT PRIMARY KEY,
+    binding_digest TEXT NOT NULL,
+    binding_json TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    nonce_hash TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','approved','consumed','cancelled')),
+    created_at REAL NOT NULL,
+    approved_at REAL,
+    consumed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operation_approvals_expiry
+    ON operation_approvals(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS operation_approval_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    approval_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    binding_digest TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operation_approval_events_approval
+    ON operation_approval_events(approval_id, id);

@@ -137,7 +137,7 @@ class AgentLoop:
         if approval_broker is None:
             from khaos.agent.approval import ApprovalBroker
 
-            approval_broker = ApprovalBroker()
+            approval_broker = ApprovalBroker(db=db)
         self.approval_broker = approval_broker
         self.principal_id = principal_id or f"local-uid:{os.getuid()}"
         if self.execution_service is None:

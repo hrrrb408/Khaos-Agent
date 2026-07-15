@@ -738,7 +738,10 @@ async def test_git_push_rejects_requester_operation_and_expiry(tmp_path):
     context, broker = await _approve_remote(service, task, approval_id="operation")
     context["approval_context"]["binding"]["operation"] = "git.other"
     broker._operation_approvals["operation"]["binding"]["operation"] = "git.other"
-    assert "stale" in json.loads(await git_push(str(task), **context))["error"]
+    # The mutable compatibility mirror is not authorization authority. The
+    # durable canonical digest remains bound to the real git.push operation.
+    result = json.loads(await git_push(str(task), **context))
+    assert result["pushed"] is True
 
     context, broker = await _approve_remote(service, task, approval_id="expired")
     broker._operation_approvals["expired"]["expiry"] = time.time() - 1

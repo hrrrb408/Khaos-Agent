@@ -152,7 +152,10 @@ async def prepare_github_approval(
         raise PermissionError("PR head must be the current TaskWorkspace branch")
     head = await _current_head(tool_context)
     expiry = time.time() + 120.0
+    principal_id = str(tool_context.get("principal_id") or requester)
     binding = {
+        "principal_id": principal_id,
+        "session_id": requester,
         "task_id": workspace.task_id,
         "workspace_id": tool_context.get("workspace_id"),
         "operation": _operation(tool_name),
@@ -188,6 +191,8 @@ async def _consume_github_approval(
     if tool_name == "github_create_pr" and payload["head"] and payload["head"] != workspace.branch_name:
         raise PermissionError("PR head must be the current TaskWorkspace branch")
     current = {
+        "principal_id": context.get("principal_id") or binding.get("principal_id"),
+        "session_id": context.get("requester") or binding.get("session_id"),
         "task_id": workspace.task_id,
         "workspace_id": context.get("workspace_id"),
         "operation": _operation(tool_name),

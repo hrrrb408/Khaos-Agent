@@ -325,7 +325,8 @@ class ToolScheduler:
                     continue
                 if destructive_context is not None:
                     approved = await destructive_context["approval_broker"].approve_operation(
-                        normalized["id"], session_id or ""
+                        normalized["id"], session_id or "",
+                        principal_id=principal_id,
                     )
                     if not approved:
                         yield SchedulerEvent(

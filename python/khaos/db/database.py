@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -51,6 +52,9 @@ class _AsyncSqliteFallback:
     async def commit(self) -> None:
         self._conn.commit()
 
+    async def rollback(self) -> None:
+        self._conn.rollback()
+
     async def close(self) -> None:
         self._conn.close()
 
@@ -61,6 +65,7 @@ class Database:
     def __init__(self, path: str | Path = "khaos.db"):
         self.path = str(path)
         self._conn: aiosqlite.Connection | None = None
+        self._operation_approval_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Open the SQLite connection if it is not already open."""
@@ -892,6 +897,216 @@ class Database:
             (limit, offset),
         )
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def register_operation_approval(
+        self,
+        *,
+        approval_id: str,
+        binding_digest: str,
+        binding_json: str,
+        principal_id: str,
+        session_id: str,
+        task_id: str,
+        workspace_id: str,
+        operation: str,
+        nonce_hash: str,
+        expires_at: float,
+        created_at: float,
+    ) -> None:
+        """Persist an immutable destructive-operation approval challenge."""
+        conn = await self._require_conn()
+        async with self._operation_approval_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "SELECT binding_digest FROM operation_approvals WHERE approval_id = ?",
+                    (approval_id,),
+                )
+                existing = await cursor.fetchone()
+                if existing is not None:
+                    if str(existing["binding_digest"]) != binding_digest:
+                        raise PermissionError(
+                            "operation approval id is already bound to another operation"
+                        )
+                    await conn.commit()
+                    return
+                await conn.execute(
+                    """
+                    INSERT INTO operation_approvals (
+                        approval_id, binding_digest, binding_json, principal_id,
+                        session_id, task_id, workspace_id, operation, nonce_hash,
+                        expires_at, status, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (
+                        approval_id, binding_digest, binding_json, principal_id,
+                        session_id, task_id, workspace_id, operation, nonce_hash,
+                        expires_at, created_at,
+                    ),
+                )
+                await self._insert_operation_event(
+                    conn, approval_id, "registered", binding_digest,
+                    principal_id, session_id, {}, created_at,
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def approve_operation_approval(
+        self,
+        approval_id: str,
+        *,
+        principal_id: str,
+        session_id: str,
+        now: float,
+    ) -> bool:
+        conn = await self._require_conn()
+        async with self._operation_approval_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "SELECT * FROM operation_approvals WHERE approval_id = ?",
+                    (approval_id,),
+                )
+                row = await cursor.fetchone()
+                success = bool(
+                    row is not None
+                    and row["status"] == "pending"
+                    and float(row["expires_at"]) > now
+                    and row["principal_id"] == principal_id
+                    and row["session_id"] == session_id
+                )
+                if success:
+                    await conn.execute(
+                        "UPDATE operation_approvals SET status='approved', approved_at=? "
+                        "WHERE approval_id=? AND status='pending'",
+                        (now, approval_id),
+                    )
+                if row is not None:
+                    await self._insert_operation_event(
+                        conn, approval_id,
+                        "approved" if success else "approve-rejected",
+                        str(row["binding_digest"]), principal_id, session_id,
+                        {}, now,
+                    )
+                await conn.commit()
+                return success
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def consume_operation_approval(
+        self,
+        approval_id: str,
+        *,
+        binding_digest: str,
+        principal_id: str,
+        session_id: str,
+        now: float,
+    ) -> bool:
+        """Consume once; a mismatch burns any pending/approved capability."""
+        conn = await self._require_conn()
+        async with self._operation_approval_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "SELECT * FROM operation_approvals WHERE approval_id = ?",
+                    (approval_id,),
+                )
+                row = await cursor.fetchone()
+                active = bool(
+                    row is not None
+                    and row["status"] in {"pending", "approved"}
+                )
+                success = bool(
+                    active
+                    and row["status"] == "approved"
+                    and float(row["expires_at"]) > now
+                    and row["binding_digest"] == binding_digest
+                    and row["principal_id"] == principal_id
+                    and row["session_id"] == session_id
+                )
+                if active:
+                    await conn.execute(
+                        "UPDATE operation_approvals SET status='consumed', consumed_at=? "
+                        "WHERE approval_id=? AND status IN ('pending','approved')",
+                        (now, approval_id),
+                    )
+                if row is not None:
+                    await self._insert_operation_event(
+                        conn, approval_id,
+                        "consumed" if success else "consume-rejected",
+                        binding_digest, principal_id, session_id,
+                        {"previous_status": str(row["status"])}, now,
+                    )
+                await conn.commit()
+                return success
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def cancel_operation_approval(
+        self, approval_id: str, *, now: float
+    ) -> None:
+        conn = await self._require_conn()
+        async with self._operation_approval_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "SELECT * FROM operation_approvals WHERE approval_id = ?",
+                    (approval_id,),
+                )
+                row = await cursor.fetchone()
+                if row is not None and row["status"] in {"pending", "approved"}:
+                    await conn.execute(
+                        "UPDATE operation_approvals SET status='cancelled', consumed_at=? "
+                        "WHERE approval_id=? AND status IN ('pending','approved')",
+                        (now, approval_id),
+                    )
+                    await self._insert_operation_event(
+                        conn, approval_id, "cancelled",
+                        str(row["binding_digest"]), str(row["principal_id"]),
+                        str(row["session_id"]), {}, now,
+                    )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def list_operation_approval_events(
+        self, approval_id: str
+    ) -> list[dict[str, Any]]:
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT * FROM operation_approval_events WHERE approval_id=? ORDER BY id",
+            (approval_id,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def _insert_operation_event(
+        self,
+        conn,
+        approval_id: str,
+        event_type: str,
+        binding_digest: str,
+        principal_id: str,
+        session_id: str,
+        detail: dict[str, Any],
+        created_at: float,
+    ) -> None:
+        await conn.execute(
+            """
+            INSERT INTO operation_approval_events (
+                approval_id, event_type, binding_digest, principal_id,
+                session_id, detail_json, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                approval_id, event_type, binding_digest, principal_id,
+                session_id, json.dumps(detail, sort_keys=True), created_at,
+            ),
+        )
 
     async def _require_conn(self):
         if self._conn is None:
