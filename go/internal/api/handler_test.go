@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"khaos/go/internal/rate"
 )
@@ -18,6 +19,12 @@ type mockAgent struct {
 	mode      string
 	principal string
 	binding   string
+}
+
+type blockingAgent struct{ mockAgent }
+
+func (m *blockingAgent) Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
+	return make(chan ChatEvent), nil
 }
 
 func (m *mockAgent) Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
@@ -161,6 +168,9 @@ func TestAuthRequired(t *testing.T) {
 
 func TestConfirmAndMode(t *testing.T) {
 	handler, agent := newTestHandler("secret")
+	if rec := serve(handler, http.MethodPost, "/api/chat", `{"session_id":"s1","message":"hello","mode":"office"}`, "secret"); rec.Code != http.StatusOK {
+		t.Fatalf("chat status=%d", rec.Code)
+	}
 	rec := serve(handler, http.MethodPost, "/api/chat/s1/confirm", `{"tool_call_id":"c1","binding_digest":"abc","approved":true}`, "secret")
 	if rec.Code != http.StatusOK || !agent.confirmed {
 		t.Fatalf("confirm status=%d confirmed=%v", rec.Code, agent.confirmed)
@@ -173,6 +183,63 @@ func TestConfirmAndMode(t *testing.T) {
 	_ = json.NewDecoder(rec.Body).Decode(&payload)
 	if payload["current_mode"] != "coding" || agent.mode != "coding" {
 		t.Fatalf("mode payload=%v agent=%s", payload, agent.mode)
+	}
+}
+
+func TestProtocolStrictJSONAndRequestLimit(t *testing.T) {
+	handler, _ := newTestHandler("")
+	unknown := serve(handler, http.MethodPost, "/api/chat", `{"message":"hello","unexpected":true}`, "")
+	if unknown.Code != http.StatusBadRequest {
+		t.Fatalf("unknown field status=%d", unknown.Code)
+	}
+	multiple := serve(handler, http.MethodPost, "/api/chat", `{"message":"hello"}{"message":"again"}`, "")
+	if multiple.Code != http.StatusBadRequest {
+		t.Fatalf("multiple JSON status=%d", multiple.Code)
+	}
+	oversized := `{"message":"` + strings.Repeat("x", int(maxRequestBodyBytes)) + `"}`
+	large := serve(handler, http.MethodPost, "/api/chat", oversized, "")
+	if large.Code != http.StatusBadRequest {
+		t.Fatalf("oversized status=%d", large.Code)
+	}
+	health := serve(handler, http.MethodGet, "/api/health", "", "")
+	if health.Header().Get("X-Khaos-Protocol-Version") != protocolVersion {
+		t.Fatalf("protocol header=%q", health.Header().Get("X-Khaos-Protocol-Version"))
+	}
+}
+
+func TestAuthenticatedSessionOwnershipIsFailClosed(t *testing.T) {
+	apiHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), "secret", rate.NewTokenBucket(100, 10))
+	handler := apiHandler.Routes()
+	if rec := serve(handler, http.MethodPost, "/api/chat", `{"session_id":"owned","message":"hello"}`, "secret"); rec.Code != http.StatusOK {
+		t.Fatalf("create=%d", rec.Code)
+	}
+	apiHandler.mu.Lock()
+	apiHandler.sessionOwners["owned"] = "api-key:another"
+	apiHandler.mu.Unlock()
+	if rec := serve(handler, http.MethodGet, "/api/chat/owned/stream", "", "secret"); rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-principal stream=%d", rec.Code)
+	}
+	if rec := serve(handler, http.MethodPost, "/api/chat/owned/confirm", `{"tool_call_id":"c1","binding_digest":"abc","approved":true}`, "secret"); rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-principal confirm=%d", rec.Code)
+	}
+}
+
+func TestStreamDisconnectPropagatesCancellation(t *testing.T) {
+	apiHandler := NewHandler(&blockingAgent{}, NewMemoryMap(), NewMapConfig(nil), "", rate.NewTokenBucket(100, 10))
+	handler := apiHandler.Routes()
+	if rec := serve(handler, http.MethodPost, "/api/chat", `{"session_id":"blocking","message":"hello"}`, ""); rec.Code != http.StatusOK {
+		t.Fatalf("create=%d", rec.Code)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	req := httptest.NewRequest(http.MethodGet, "/api/chat/blocking/stream", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { handler.ServeHTTP(rec, req); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stream did not stop after request cancellation")
 	}
 }
 
@@ -269,6 +336,29 @@ func TestTaskRESTAndEvents(t *testing.T) {
 	rec := serve(handler, http.MethodGet, "/v1/tasks/t1/events", "", "")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"event_id":"e1"`) {
 		t.Fatalf("events=%d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTaskEventReplayCursorAndOwnership(t *testing.T) {
+	tasks := &mockTaskClient{}
+	apiHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), "secret", rate.NewTokenBucket(100, 10)).WithTasks(tasks)
+	handler := apiHandler.Routes()
+	if rec := serve(handler, http.MethodPost, "/v1/tasks", `{"goal":"ship"}`, "secret"); rec.Code != http.StatusCreated {
+		t.Fatalf("create=%d %s", rec.Code, rec.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodGet, "/v1/tasks/t1/events", nil)
+	req.Header.Set("X-Khaos-Key", "secret")
+	req.Header.Set("Last-Event-ID", "1")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), `"sequence":1`) {
+		t.Fatalf("replay cursor status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	apiHandler.mu.Lock()
+	apiHandler.taskOwners["t1"] = "api-key:another"
+	apiHandler.mu.Unlock()
+	if rec := serve(handler, http.MethodGet, "/v1/tasks/t1", "", "secret"); rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-principal task=%d", rec.Code)
 	}
 }
 

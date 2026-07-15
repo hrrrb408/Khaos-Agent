@@ -88,6 +88,12 @@ provider 与 ordinary approval durable invalidation audit 尚未关闭。
 
 ## 5. Batch D：App Server / RPC
 
+实施进度（2026-07-15）：D1 Gateway HTTP boundary 已完成 protocol version header、
+1 MiB 普通请求/2 MiB webhook 上限、strict single-value JSON、authenticated session/task
+ownership、SSE `Last-Event-ID` sequence replay cursor，以及 client disconnect 到上游 context
+的取消传播。认证态下未知 ownership 在进程重启后 fail closed；durable ownership source、
+全客户端统一 schema generation 与跨进程 backpressure telemetry 仍待后续 D2。
+
 | 项 | 内容 |
 | --- | --- |
 | 范围 | Go Gateway、Python server/client、SSE/WS、TUI/IDE/渠道 adapter、Task/Approval/Audit API |
