@@ -17,7 +17,10 @@ from khaos.coding.execution.models import (
     PermissionProfile,
     ResolvedExecutionContext,
 )
-from khaos.coding.execution.supervisor import ProcessSupervisor
+from khaos.coding.execution.supervisor import (
+    ProcessSupervisor,
+    resource_limit_preexec,
+)
 from khaos.coding.workspace.models import WorkspaceState
 
 
@@ -182,11 +185,13 @@ class ExecutionService:
             raise PermissionError("unsupported: managed process backend is unavailable")
         execution_id = request.correlation_id or uuid.uuid4().hex[:12]
         temporary_home = Path(tempfile.mkdtemp(prefix="khaos-lsp-home-"))
+        temporary_tmp = temporary_home / "tmp"
+        temporary_tmp.mkdir(mode=0o700)
         environment = {
             "PATH": os.environ.get("PATH", ""),
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "HOME": str(temporary_home),
-            "TMPDIR": tempfile.gettempdir(),
+            "TMPDIR": str(temporary_tmp),
         }
         resolved = ResolvedExecutionContext(
             request.task_id, request.workspace_id, workspace.state.value,
@@ -204,11 +209,12 @@ class ExecutionService:
             if self.managed_process_factory is not None:
                 handle = await self.managed_process_factory(resolved, temporary_home)
             else:
-                argv = self._managed_argv(resolved, backend)
+                argv = self._managed_argv(resolved, backend, temporary_home)
                 process = await asyncio.create_subprocess_exec(
                     *argv, cwd=str(cwd), env=environment,
                     stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE, start_new_session=True,
+                    preexec_fn=resource_limit_preexec(request.budget),
                 )
                 await self.process_supervisor.register_process(
                     execution_id, process
@@ -226,13 +232,23 @@ class ExecutionService:
         self._active[execution_id] = (request.task_id, request.workspace_id, handle)
         return handle
 
-    def _managed_argv(self, context: ResolvedExecutionContext, backend) -> tuple[str, ...]:
+    def _managed_argv(
+        self,
+        context: ResolvedExecutionContext,
+        backend,
+        temporary_home: Path,
+    ) -> tuple[str, ...]:
         backend_name = backend.__class__.__name__
         if backend_name == "MacOSSandboxBackend":
             sandbox_profile = backend.profile(
                 context.worktree_path,
                 writable=False,
                 unreadable_roots=context.permission_profile.unreadable_roots,
+                runtime_roots=backend.runtime_read_roots(
+                    context.argv, context.worktree_path
+                ),
+                synthetic_home=temporary_home,
+                synthetic_tmp=temporary_home / "tmp",
             )
             return (
                 "/usr/bin/sandbox-exec",
@@ -246,8 +262,12 @@ class ExecutionService:
                 cwd=context.cwd,
                 writable=False,
                 unreadable_roots=context.permission_profile.unreadable_roots,
+                synthetic_home=temporary_home,
+                resources=context.resources,
+                command=context.argv,
+                environment=context.environment,
             )
-            return (*prefix, *context.argv)
+            return (*prefix, "--", *context.argv)
         raise PermissionError("unsupported: managed process backend cannot enforce network isolation")
 
     async def shutdown(self) -> None:

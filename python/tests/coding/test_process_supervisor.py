@@ -117,6 +117,52 @@ async def test_timeout_is_terminal_and_registry_is_cleaned(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_supervisor_enforces_file_size_limit(tmp_path: Path):
+    supervisor = ProcessSupervisor()
+    request = ExecutionRequest(
+        (
+            sys.executable,
+            "-c",
+            "from pathlib import Path; Path('large').write_bytes(b'x' * 65536)",
+        ),
+        tmp_path,
+        budget=ResourceBudget(file_bytes=4096),
+        correlation_id="file-limit",
+    )
+
+    result = await supervisor.run(request)
+
+    assert result.status == "failed"
+    assert (tmp_path / "large").stat().st_size <= 4096
+    assert result.diagnostics["resource_limits"]["file_bytes"] == 4096
+
+
+@pytest.mark.asyncio
+async def test_supervisor_terminates_process_tree_on_budget_violation(
+    tmp_path: Path, monkeypatch,
+):
+    monkeypatch.setattr(
+        "khaos.coding.execution.supervisor._process_group_usage",
+        lambda _process_group: (3, 4096),
+    )
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    request = ExecutionRequest(
+        (sys.executable, "-c", "import time; time.sleep(30)"),
+        tmp_path,
+        budget=ResourceBudget(pids=2, memory_bytes=8192),
+        correlation_id="pid-limit",
+    )
+
+    result = await supervisor.run(request)
+
+    assert result.status == "resource-exhausted"
+    assert result.diagnostics["resource_violation"] == {
+        "kind": "pids", "observed": 3, "limit": 2,
+    }
+    assert result.diagnostics["process_group_terminated"] is True
+
+
+@pytest.mark.asyncio
 async def test_execution_service_terminate_reaches_foreground_process(
     tmp_path: Path,
 ):

@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
+
+from khaos.coding.execution.models import ResourceBudget
+from khaos.coding.execution.supervisor import ProcessSupervisor
 
 
 @dataclass(frozen=True)
@@ -95,6 +99,12 @@ class MacOSSandboxBackend:
     def __init__(self, supervisor=None) -> None:
         self.supervisor = supervisor
 
+    @staticmethod
+    def runtime_read_roots(
+        command: tuple[str, ...], workspace: Path
+    ) -> tuple[Path, ...]:
+        return _runtime_read_roots(command, workspace)
+
     async def probe(self) -> BackendAvailability:
         return self.probe_capability()
 
@@ -132,7 +142,12 @@ class MacOSSandboxBackend:
                     (
                         "/usr/bin/sandbox-exec",
                         "-p",
-                        self.profile(workspace),
+                        self.profile(
+                            workspace,
+                            runtime_roots=_runtime_read_roots(
+                                (sys.executable,), workspace
+                            ),
+                        ),
                         sys.executable,
                         "-c",
                         script,
@@ -175,34 +190,93 @@ class MacOSSandboxBackend:
         *,
         writable: bool = True,
         unreadable_roots: tuple[Path, ...] = (),
+        runtime_roots: tuple[Path, ...] = (),
+        synthetic_home: Path | None = None,
+        synthetic_tmp: Path | None = None,
     ) -> str:
-        escaped = str(worktree.resolve()).replace("\\", "\\\\").replace('"', '\\"')
-        workspace_write = f'(allow file-write* (subpath "{escaped}"))' if writable else ""
-        deny_reads = "".join(
-            f'(deny file-read* (subpath "{_seatbelt_escape(path)}"))'
-            for path in unreadable_roots
+        workspace = worktree.resolve()
+        read_roots = _deduplicate_paths(
+            (
+                workspace,
+                *_macos_system_read_roots(),
+                *runtime_roots,
+                *(() if synthetic_home is None else (synthetic_home.resolve(),)),
+                *(() if synthetic_tmp is None else (synthetic_tmp.resolve(),)),
+            )
         )
-        return (
-            "(version 1)(deny default)(allow process*)(allow file-read*)"
-            f"{workspace_write}{deny_reads}(deny network*)"
+        read_rules = "".join(
+            f'(allow file-read* (subpath "{_seatbelt_escape(path)}"))'
+            for path in read_roots if path.exists()
         )
+        literal_reads = "".join(
+            f'(allow file-read* (literal "{_seatbelt_escape(path)}"))'
+            for path in _macos_literal_read_files() if path.exists()
+        )
+        executable_map_rules = "".join(
+            f'(allow file-map-executable (subpath "{_seatbelt_escape(path)}"))'
+            for path in read_roots if path.exists()
+        )
+        write_roots = tuple(
+            path for path in (
+                workspace if writable else None,
+                synthetic_home.resolve() if synthetic_home else None,
+                synthetic_tmp.resolve() if synthetic_tmp else None,
+            ) if path is not None
+        )
+        write_rules = "".join(
+            f'(allow file-write* (subpath "{_seatbelt_escape(path)}"))'
+            for path in write_roots
+        )
+        # unreadable_roots are deliberately not represented as deny exceptions:
+        # deny-default plus the positive allowlist makes all non-runtime host
+        # paths invisible, including credential roots not known in advance.
+        _ = unreadable_roots
+        return "".join((
+            "(version 1)(deny default)(allow process-exec process-fork)",
+            "(allow signal (target same-sandbox))",
+            "(allow process-info* (target same-sandbox))",
+            "(allow sysctl-read)(allow mach-lookup)(allow file-read-metadata)",
+            '(allow file-read* (literal "/"))',
+            '(allow file-read* file-write-data (literal "/dev/null"))',
+            '(allow file-read* (literal "/dev/random"))',
+            '(allow file-read* (literal "/dev/urandom"))',
+            read_rules, literal_reads, executable_map_rules, write_rules,
+            "(deny network*)",
+        ))
 
     async def execute(self, request):
-        from khaos.coding.execution.host import HostExecutionBackend
         from dataclasses import replace
         profile = _validated_profile(request)
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
-        sandbox_profile = self.profile(
-            worktree,
-            writable=writable,
-            unreadable_roots=profile.unreadable_roots,
-        )
-        sandboxed = replace(
-            request,
-            argv=("/usr/bin/sandbox-exec", "-p", sandbox_profile, *request.argv),
-        )
-        return await HostExecutionBackend(self.supervisor).execute(sandboxed)
+        with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value, \
+                tempfile.TemporaryDirectory(prefix="khaos-tmp-") as tmp_value:
+            home = Path(home_value)
+            sandbox_tmp = Path(tmp_value)
+            sandbox_profile = self.profile(
+                worktree,
+                writable=writable,
+                unreadable_roots=profile.unreadable_roots,
+                runtime_roots=_runtime_read_roots(request.argv, worktree),
+                synthetic_home=home,
+                synthetic_tmp=sandbox_tmp,
+            )
+            sandboxed = replace(
+                request,
+                argv=(
+                    "/usr/bin/sandbox-exec", "-p", sandbox_profile,
+                    *request.argv,
+                ),
+            )
+            environment = _sandbox_environment(
+                profile, request.environment,
+                home=str(home), tmpdir=str(sandbox_tmp),
+            )
+            supervisor = self.supervisor or ProcessSupervisor()
+            self.supervisor = supervisor
+            return await supervisor.run(
+                sandboxed, cwd=request.cwd.resolve(), env=environment
+            )
 
     async def terminate(self, execution_id: str) -> None:
         if self.supervisor is not None:
@@ -230,30 +304,24 @@ class LinuxBubblewrapBackend:
         (the default pytest tmp_path location), making the writable bind
         invisible and the sandboxed process fall back to read-only ``/``.
 
-        Mount topology: ``--ro-bind / /`` first (read-only root), then
-        ``--dev /dev`` (fresh devtmpfs so /dev/null etc. are accessible),
-        then ``--tmpfs /tmp`` (fresh writable tmpfs), then ``--bind
-        <worktree> /tmp/workspace``.  The tmpfs must precede the bind so
-        that bwrap can ``mkdir /tmp/workspace`` inside the writable tmpfs
-        — a ``--bind`` to a top-level path that does not exist on the
-        host (e.g. ``/workspace``) fails because ``--ro-bind / /`` makes
-        the root read-only and bwrap cannot create the mount point.
-
-        Without ``--dev /dev``, the read-only root bind exposes the
-        host's /dev/null as a read-only device node, and subprocess
-        redirection (subprocess.DEVNULL) fails with EACCES.
-
-        This probe runs the real sandbox with the same mount topology as
-        ``argv_prefix`` and actually writes a probe file, so it catches
-        both the namespace failure and the bind-shadow failure.
+        The probe uses the same empty-root topology as production: a tmpfs
+        root, explicitly mounted runtime directories, a synthetic HOME,
+        bounded /tmp, and exactly one workspace bind.  It therefore catches
+        accidental regressions to a host-root bind as well as namespace
+        failures.
         """
         if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
             return BackendAvailability(self.name, False, False, "bwrap unavailable on this platform")
         if LinuxBubblewrapBackend._capability_cache is not None:
             return LinuxBubblewrapBackend._capability_cache
         try:
-            with tempfile.TemporaryDirectory() as tmp:
-                prefix = self.argv_prefix(Path(tmp), cwd=Path(tmp))
+            with tempfile.TemporaryDirectory() as tmp, \
+                    tempfile.TemporaryDirectory(prefix="khaos-home-") as home:
+                budget = ResourceBudget()
+                prefix = self.argv_prefix(
+                    Path(tmp), cwd=Path(tmp), synthetic_home=Path(home),
+                    resources=budget, command=("/bin/sh",),
+                )
                 completed = subprocess.run(
                     (*prefix, "--", "/bin/sh", "-c", "echo probe > .probe && cat .probe"),
                     capture_output=True,
@@ -279,14 +347,7 @@ class LinuxBubblewrapBackend:
         LinuxBubblewrapBackend._capability_cache = availability
         return availability
 
-    # The worktree is bound to /tmp/workspace inside the sandbox.  --tmpfs /tmp
-    # is applied BEFORE the bind so that /tmp is a fresh writable tmpfs; bwrap
-    # can then mkdir /tmp/workspace (inside the tmpfs) and mount the worktree
-    # there.  Binding to a path under /tmp avoids the tmpfs-shadow problem
-    # (host worktree under /tmp being shadowed by --tmpfs /tmp) AND avoids the
-    # read-only-root problem (bwrap cannot create a top-level path like
-    # /workspace because --ro-bind / / makes the root read-only).
-    SANDBOX_WORKDIR = "/tmp/workspace"
+    SANDBOX_WORKDIR = "/workspace"
 
     def argv_prefix(
         self,
@@ -295,6 +356,10 @@ class LinuxBubblewrapBackend:
         cwd: Path | None = None,
         writable: bool = True,
         unreadable_roots: tuple[Path, ...] = (),
+        synthetic_home: Path | None = None,
+        resources: ResourceBudget | None = None,
+        command: tuple[str, ...] = (),
+        environment: dict[str, str] | None = None,
     ) -> tuple[str, ...]:
         canonical_worktree = worktree.expanduser().resolve()
         canonical_cwd = (cwd or canonical_worktree).expanduser().resolve()
@@ -305,19 +370,39 @@ class LinuxBubblewrapBackend:
             raise PermissionError("sandbox cwd is outside the active workspace")
         relative_cwd = canonical_cwd.relative_to(canonical_worktree)
         sandbox_cwd = Path(self.SANDBOX_WORKDIR) / relative_cwd
+        budget = resources or ResourceBudget()
+        home = (synthetic_home or canonical_worktree / ".khaos-home").resolve()
+        home.mkdir(mode=0o700, parents=True, exist_ok=True)
         prefix = [
             "bwrap",
-            "--ro-bind", "/", "/",
+            "--tmpfs", "/",
+            "--dir", "/home",
+            "--dir", "/etc",
             "--dev", "/dev",
             "--proc", "/proc",
+            "--size", str(budget.tmpfs_bytes),
             "--tmpfs", "/tmp",
+            "--bind", str(home), "/home/khaos",
             "--bind" if writable else "--ro-bind", str(canonical_worktree), self.SANDBOX_WORKDIR,
         ]
-        for denied in unreadable_roots:
-            if denied.is_dir():
-                prefix.extend(("--tmpfs", str(denied)))
-            elif denied.exists():
-                prefix.extend(("--ro-bind", "/dev/null", str(denied)))
+        for link in (Path("/bin"), Path("/sbin"), Path("/lib"), Path("/lib64")):
+            if link.is_symlink():
+                prefix.extend(("--symlink", os.readlink(link), str(link)))
+        runtime_roots = _linux_runtime_read_roots(command, canonical_worktree)
+        for runtime_root in runtime_roots:
+            prefix.extend(("--ro-bind", str(runtime_root), str(runtime_root)))
+        for literal in _linux_literal_read_files():
+            if literal.is_file():
+                prefix.extend(("--ro-bind", str(literal), str(literal)))
+        safe_environment = _sandbox_environment(
+            None, environment or {}, home="/home/khaos", tmpdir="/tmp"
+        )
+        prefix.append("--clearenv")
+        for key, value in sorted(safe_environment.items()):
+            prefix.extend(("--setenv", key, value))
+        # deny-default mount construction makes unreadable roots absent.  They
+        # must never be mounted merely to cover them with another mount.
+        _ = unreadable_roots
         prefix.extend((
             "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
             "--new-session", "--die-with-parent",
@@ -326,20 +411,25 @@ class LinuxBubblewrapBackend:
         return tuple(prefix)
 
     async def execute(self, request):
-        from khaos.coding.execution.host import HostExecutionBackend
         from dataclasses import replace
         profile = _validated_profile(request)
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
-        prefix = self.argv_prefix(
-            worktree,
-            cwd=request.cwd,
-            writable=writable,
-            unreadable_roots=profile.unreadable_roots,
-        )
-        return await HostExecutionBackend(self.supervisor).execute(
-            replace(request, argv=(*prefix, *request.argv))
-        )
+        with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
+            prefix = self.argv_prefix(
+                worktree,
+                cwd=request.cwd,
+                writable=writable,
+                unreadable_roots=profile.unreadable_roots,
+                synthetic_home=Path(home_value),
+                resources=profile.resources,
+                command=request.argv,
+                environment=request.environment,
+            )
+            sandboxed = replace(request, argv=(*prefix, "--", *request.argv))
+            supervisor = self.supervisor or ProcessSupervisor()
+            self.supervisor = supervisor
+            return await supervisor.run(sandboxed, cwd=request.cwd.resolve())
 
     async def terminate(self, execution_id: str) -> None:
         if self.supervisor is not None:
@@ -360,3 +450,115 @@ def _validated_profile(request):
 
 def _seatbelt_escape(path: Path) -> str:
     return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _deduplicate_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in paths:
+        canonical = path.expanduser().resolve()
+        if canonical not in seen:
+            result.append(canonical)
+            seen.add(canonical)
+    return tuple(result)
+
+
+def _runtime_read_roots(
+    command: tuple[str, ...], workspace: Path
+) -> tuple[Path, ...]:
+    """Return the narrow installation root needed to launch argv[0]."""
+    if not command:
+        return ()
+    executable = command[0]
+    located = shutil.which(executable) if not Path(executable).is_absolute() else executable
+    if not located:
+        return ()
+    resolved = Path(located).expanduser().resolve()
+    canonical_workspace = workspace.expanduser().resolve()
+    if resolved == canonical_workspace or canonical_workspace in resolved.parents:
+        return ()
+    for root in _macos_system_read_roots():
+        if resolved == root or root in resolved.parents:
+            return ()
+    parents = resolved.parents
+    if len(parents) < 2:
+        return (resolved,)
+    # /opt/homebrew/bin/python -> /opt/homebrew; framework and application
+    # binaries receive their product root rather than the user's whole HOME.
+    if resolved.parts[:3] == ("/", "opt", "homebrew"):
+        return (Path("/opt/homebrew"),)
+    if "Library" in resolved.parts and "Frameworks" in resolved.parts:
+        index = resolved.parts.index("Frameworks")
+        return (Path(*resolved.parts[: index + 2]),)
+    if ".app" in "".join(resolved.parts):
+        for index, part in enumerate(resolved.parts):
+            if part.endswith(".app"):
+                return (Path(*resolved.parts[: index + 1]),)
+    candidate = parents[1]
+    home = Path.home().resolve()
+    if candidate == home or candidate in home.parents:
+        return (resolved,)
+    return (candidate,)
+
+
+def _macos_system_read_roots() -> tuple[Path, ...]:
+    return tuple(
+        path for path in (
+            Path("/System"), Path("/usr"), Path("/bin"), Path("/sbin"),
+            Path("/Library/Apple"),
+            Path("/private/var/db/dyld"),
+            Path("/System/Volumes/Preboot/Cryptexes/OS"),
+        ) if path.exists()
+    )
+
+
+def _macos_literal_read_files() -> tuple[Path, ...]:
+    return tuple(
+        path for path in (
+            Path("/etc/hosts"), Path("/etc/passwd"), Path("/etc/group"),
+            Path("/etc/localtime"),
+        ) if path.exists()
+    )
+
+
+def _linux_runtime_read_roots(
+    command: tuple[str, ...], workspace: Path
+) -> tuple[Path, ...]:
+    roots = [
+        path for path in (
+            Path("/usr"), Path("/bin"), Path("/sbin"), Path("/lib"),
+            Path("/lib64"),
+        ) if path.exists() and not path.is_symlink()
+    ]
+    roots.extend(_runtime_read_roots(command, workspace))
+    return _deduplicate_paths(tuple(roots))
+
+
+def _linux_literal_read_files() -> tuple[Path, ...]:
+    return tuple(
+        path for path in (
+            Path("/etc/ld.so.cache"), Path("/etc/ld.so.conf"),
+            Path("/etc/nsswitch.conf"), Path("/etc/passwd"),
+            Path("/etc/group"), Path("/etc/localtime"),
+        ) if path.exists()
+    )
+
+
+def _sandbox_environment(
+    profile,
+    requested: dict[str, str],
+    *,
+    home: str,
+    tmpdir: str,
+) -> dict[str, str]:
+    allowed_keys = (
+        profile.environment_keys if profile is not None
+        else frozenset({"PATH", "LANG", "LC_ALL", "TERM"})
+    )
+    environment = {
+        key: value for key, value in requested.items() if key in allowed_keys
+    }
+    environment.setdefault("PATH", os.defpath)
+    environment.setdefault("LANG", "C.UTF-8")
+    environment.update({"HOME": home, "TMPDIR": tmpdir, "TMP": tmpdir, "TEMP": tmpdir})
+    return environment

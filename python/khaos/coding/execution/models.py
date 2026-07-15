@@ -31,6 +31,8 @@ class ResourceBudget:
     cpu_count: float = 1.0
     memory_bytes: int = 512 * 1024 * 1024
     tmpfs_bytes: int = 256 * 1024 * 1024
+    file_bytes: int = 64 * 1024 * 1024
+    open_files: int = 256
 
 
 @dataclass(frozen=True)
@@ -164,6 +166,8 @@ class PermissionProfile:
                 "cpu_count": self.resources.cpu_count,
                 "memory_bytes": self.resources.memory_bytes,
                 "tmpfs_bytes": self.resources.tmpfs_bytes,
+                "file_bytes": self.resources.file_bytes,
+                "open_files": self.resources.open_files,
             },
         }
         encoded = json.dumps(
@@ -282,3 +286,5 @@ def _validate_resource_budget(budget: ResourceBudget) -> None:
         raise ValueError("resource process and CPU limits must be positive")
     if budget.memory_bytes <= 0 or budget.tmpfs_bytes <= 0:
         raise ValueError("resource memory limits must be positive")
+    if budget.file_bytes <= 0 or budget.open_files <= 0:
+        raise ValueError("resource file and open-file limits must be positive")

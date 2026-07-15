@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 import signal
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -52,9 +54,18 @@ class ProcessSupervisor:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
+            preexec_fn=resource_limit_preexec(
+                request.permission_profile.resources
+            ),
         )
         active = _ActiveProcess(process)
         await self._register(execution_id, active)
+        watchdog_task = asyncio.create_task(
+            _resource_watchdog(
+                process, active, request.permission_profile.resources,
+                self._terminate_active,
+            )
+        )
         total_limit = request.permission_profile.resources.output_bytes
         stdout_limit = (total_limit + 1) // 2
         stderr_limit = total_limit // 2
@@ -72,11 +83,7 @@ class ProcessSupervisor:
                     process.wait(),
                     timeout=request.permission_profile.resources.timeout_seconds,
                 )
-                status = (
-                    "cancelled"
-                    if active.termination_requested
-                    else "passed" if process.returncode == 0 else "failed"
-                )
+                status = "passed" if process.returncode == 0 else "failed"
             except asyncio.TimeoutError:
                 active.termination_requested = True
                 await self._terminate_active(active)
@@ -95,10 +102,19 @@ class ProcessSupervisor:
                 await asyncio.shield(
                     asyncio.gather(stdout_task, stderr_task)
                 )
+                watchdog_task.cancel()
                 raise
+            resource_violation = await watchdog_task
+            if resource_violation is not None:
+                status = "resource-exhausted"
+                diagnostics["resource_violation"] = resource_violation
+            elif active.termination_requested and status != "timed-out":
+                status = "cancelled"
             stdout, stdout_total = await stdout_task
             stderr, stderr_total = await stderr_task
         finally:
+            if not watchdog_task.done():
+                watchdog_task.cancel()
             await self._unregister(execution_id, active)
 
         diagnostics.update(
@@ -113,6 +129,9 @@ class ProcessSupervisor:
                 "process_group_terminated": bool(
                     diagnostics.get("process_group_terminated")
                     or active.termination_requested
+                ),
+                "resource_limits": _resource_limit_diagnostics(
+                    request.permission_profile.resources
                 ),
             }
         )
@@ -217,3 +236,153 @@ def _signal_process_group(
         process.kill()
     else:
         process.terminate()
+
+
+def resource_limit_preexec(budget):
+    """Build a POSIX child hook that makes declared budgets non-optional."""
+    if os.name != "posix":
+        return None
+
+    def apply_limits() -> None:
+        import resource
+
+        limits = [
+            (resource.RLIMIT_FSIZE, budget.file_bytes),
+            (resource.RLIMIT_NOFILE, budget.open_files),
+            (
+                resource.RLIMIT_CPU,
+                max(1, math.ceil(budget.timeout_seconds * budget.cpu_count)),
+            ),
+        ]
+        # Darwin exposes RLIMIT_AS/RLIMIT_RSS constants but rejects attempts
+        # to lower them. Memory is enforced by the supervisor watchdog there.
+        if sys.platform != "darwin":
+            limits.append((resource.RLIMIT_AS, budget.memory_bytes))
+        for resource_id, requested in limits:
+            _, hard = resource.getrlimit(resource_id)
+            effective = requested
+            if hard != resource.RLIM_INFINITY:
+                effective = min(effective, hard)
+            resource.setrlimit(resource_id, (effective, effective))
+
+    return apply_limits
+
+
+def _resource_limit_diagnostics(budget) -> dict[str, object]:
+    return {
+        "posix_rlimit_enforced": os.name == "posix",
+        "process_tree_watchdog_enforced": os.name == "posix",
+        "pids": budget.pids,
+        "memory_bytes": budget.memory_bytes,
+        "memory_limit_kind": (
+            "supervisor-watchdog" if sys.platform == "darwin"
+            else "address-space"
+        ),
+        "file_bytes": budget.file_bytes,
+        "open_files": budget.open_files,
+        "cpu_seconds": max(
+            1, math.ceil(budget.timeout_seconds * budget.cpu_count)
+        ),
+        "tmpfs_bytes": budget.tmpfs_bytes,
+    }
+
+
+async def _resource_watchdog(process, active, budget, terminate) -> dict | None:
+    """Bound aggregate process count and resident memory for the process group."""
+    if os.name != "posix" or process.pid is None:
+        return None
+    while process.returncode is None:
+        process_count, resident_bytes = await asyncio.to_thread(
+            _process_group_usage, process.pid
+        )
+        violation = None
+        if process_count > budget.pids:
+            violation = {
+                "kind": "pids", "observed": process_count,
+                "limit": budget.pids,
+            }
+        elif resident_bytes > budget.memory_bytes:
+            violation = {
+                "kind": "memory", "observed": resident_bytes,
+                "limit": budget.memory_bytes,
+            }
+        if violation is not None:
+            active.termination_requested = True
+            await terminate(active)
+            return violation
+        await asyncio.sleep(0.05)
+    return None
+
+
+def _process_group_usage(process_group_id: int) -> tuple[int, int]:
+    if sys.platform.startswith("linux"):
+        return _linux_process_group_usage(process_group_id)
+    if sys.platform == "darwin":
+        return _darwin_process_group_usage(process_group_id)
+    return 0, 0
+
+
+def _darwin_process_group_usage(process_group_id: int) -> tuple[int, int]:
+    import ctypes
+
+    class ProcTaskInfo(ctypes.Structure):
+        _fields_ = [
+            ("virtual_size", ctypes.c_uint64),
+            ("resident_size", ctypes.c_uint64),
+            ("total_user", ctypes.c_uint64),
+            ("total_system", ctypes.c_uint64),
+            ("threads_user", ctypes.c_uint64),
+            ("threads_system", ctypes.c_uint64),
+            ("policy", ctypes.c_int32),
+            ("faults", ctypes.c_int32),
+            ("pageins", ctypes.c_int32),
+            ("cow_faults", ctypes.c_int32),
+            ("messages_sent", ctypes.c_int32),
+            ("messages_received", ctypes.c_int32),
+            ("syscalls_mach", ctypes.c_int32),
+            ("syscalls_unix", ctypes.c_int32),
+            ("csw", ctypes.c_int32),
+            ("threadnum", ctypes.c_int32),
+            ("numrunning", ctypes.c_int32),
+            ("priority", ctypes.c_int32),
+        ]
+
+    libproc = ctypes.CDLL("/usr/lib/libproc.dylib", use_errno=True)
+    required = libproc.proc_listpids(2, process_group_id, None, 0)
+    if required <= 0:
+        return 0, 0
+    capacity = max(1, required // ctypes.sizeof(ctypes.c_int) + 8)
+    pids = (ctypes.c_int * capacity)()
+    returned = libproc.proc_listpids(
+        2, process_group_id, ctypes.byref(pids), ctypes.sizeof(pids)
+    )
+    count = max(0, returned // ctypes.sizeof(ctypes.c_int))
+    resident_bytes = 0
+    live_count = 0
+    for pid in pids[:count]:
+        if pid <= 0:
+            continue
+        info = ProcTaskInfo()
+        size = libproc.proc_pidinfo(
+            pid, 4, 0, ctypes.byref(info), ctypes.sizeof(info)
+        )
+        if size == ctypes.sizeof(info):
+            live_count += 1
+            resident_bytes += int(info.resident_size)
+    return live_count, resident_bytes
+
+
+def _linux_process_group_usage(process_group_id: int) -> tuple[int, int]:
+    count = 0
+    resident_bytes = 0
+    page_size = os.sysconf("SC_PAGE_SIZE")
+    for stat_path in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+            if int(fields[2]) != process_group_id:
+                continue
+            count += 1
+            resident_bytes += int(fields[21]) * page_size
+        except (OSError, ValueError, IndexError):
+            continue
+    return count, resident_bytes
