@@ -54,8 +54,9 @@ export function useSettings() {
   const refreshConfig = useCallback(async () => {
     const current = readSettings();
     try {
-      const keyParam = current.apiKey ? `?key=${encodeURIComponent(current.apiKey)}` : "";
-      const response = await fetch(`${current.gatewayUrl}/api/config${keyParam}`);
+      const response = await fetch(`${current.gatewayUrl}/api/config`, {
+        headers: current.apiKey ? { "X-Khaos-Key": current.apiKey } : {},
+      });
       if (!response.ok) return;
       const config = (await response.json()) as Record<string, unknown>;
       const modelName = extractModelName(config);
