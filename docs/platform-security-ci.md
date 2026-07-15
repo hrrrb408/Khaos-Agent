@@ -1,6 +1,7 @@
 # 跨平台安全 CI 与真实 Sandbox 门禁
 
-状态：已实现，等待远端 runner 生成首轮证据。日期：2026-07-15。
+状态：已实现并由远端 runner 验证。日期：2026-07-15。验证提交：
+`de80fdec05b2d15bdfd5282b3bb0f75a24fb22a0`。
 
 ## 门禁分层
 
@@ -29,6 +30,17 @@ Windows 当前的安全承诺是 **fail closed**，不是功能可用。没有 A
 在 GitHub branch protection 中把上述五类 check 设为 required。首次推送后，应保存每个
 job 的 run URL、runner image/version、artifact digest 和结论到审计记录。runner image 会
 随 GitHub 更新，因此 Actions 结果是“该次运行”的证据，不是永久的平台认证。
+
+## 远端验证证据
+
+| Workflow run | 结论 | 覆盖 |
+| --- | --- | --- |
+| [Security Contract Matrix #29414601437](https://github.com/hrrrb408/Khaos-Agent/actions/runs/29414601437) | PASS | Ubuntu 24.04、macOS 14、Windows 2025 的 Python/Go/Rust 合同；POSIX 文件系统边界 |
+| [Platform Sandbox Security E2E #29414601436](https://github.com/hrrrb408/Khaos-Agent/actions/runs/29414601436) | PASS | Linux bwrap、macOS sandbox-exec、Windows fail-closed |
+| [Docker Security E2E #29414601438](https://github.com/hrrrb408/Khaos-Agent/actions/runs/29414601438) | PASS | Docker 与 Trusted Verification 真实隔离 |
+
+以上结论绑定验证提交和对应 run；后续代码、Action SHA、runner image 或平台策略变化后必须
+重新运行，不得沿用旧证据。
 
 ## 本地与远端边界
 
