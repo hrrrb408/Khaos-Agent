@@ -17,6 +17,10 @@ from khaos.coding.planning.verification_execution_models import (
 from khaos.coding.planning.verification_sandbox_instance import (
     SandboxInstanceState, VerificationSandboxInstance,
 )
+from khaos.coding.planning.verification_authority import (
+    canonical_success_payload_digest,
+    require_canonical_success,
+)
 
 
 _SCHEMA = """
@@ -716,16 +720,15 @@ class VerificationExecutionStore:
         cleanup_proof_id: str, cleanup_digest: str,
         authority_instance_id: str, runtime_id: str, boot_id: str,
     ) -> str:
-        payload = json.dumps({
-            "authority_instance_id": authority_instance_id,
-            "boot_id": boot_id,
-            "cleanup_digest": cleanup_digest,
-            "cleanup_proof_id": cleanup_proof_id,
-            "execution_run_id": execution_run_id,
-            "runtime_id": runtime_id,
-            "verification_run_id": verification_run_id,
-        }, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return canonical_success_payload_digest(
+            verification_run_id=verification_run_id,
+            execution_run_id=execution_run_id,
+            cleanup_proof_id=cleanup_proof_id,
+            cleanup_digest=cleanup_digest,
+            authority_instance_id=authority_instance_id,
+            runtime_id=runtime_id,
+            boot_id=boot_id,
+        )
 
     def _require_authoritative_success(self, run_row: sqlite3.Row) -> None:
         if run_row["status"] != VerificationRunStatus.PASSED.value:
@@ -734,25 +737,10 @@ class VerificationExecutionStore:
             return
         if self._write_authority is None:
             return  # Explicit unsafe-test store; never used by production Runtime.
-        evidence = self._conn.execute(
-            "SELECT * FROM verification_success_evidence "
-            "WHERE verification_run_id=? AND execution_run_id=?",
-            (run_row["verification_run_id"], run_row["execution_run_id"]),
-        ).fetchone()
-        if evidence is None:
-            raise PermissionError("persisted PASSED status lacks authority evidence")
-        recomputed = self._success_payload_digest(
-            verification_run_id=evidence["verification_run_id"],
-            execution_run_id=evidence["execution_run_id"],
-            cleanup_proof_id=evidence["cleanup_proof_id"],
-            cleanup_digest=evidence["cleanup_digest"],
-            authority_instance_id=evidence["authority_instance_id"],
-            runtime_id=evidence["runtime_id"], boot_id=evidence["boot_id"],
-        )
-        if recomputed != evidence["payload_digest"]:
-            raise PermissionError("verification success evidence digest mismatch")
-        self._write_authority.require_success(
-            run_row["verification_run_id"], recomputed,
+        require_canonical_success(
+            self._conn, self._write_authority,
+            verification_run_id=str(run_row["verification_run_id"]),
+            execution_run_id=str(run_row["execution_run_id"]),
         )
 
     def _require_execution_success(self, execution_run_id: str) -> None:

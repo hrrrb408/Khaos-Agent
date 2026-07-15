@@ -16,7 +16,9 @@ import pytest
 
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.verification_authority import (
+    PROTECTED_SCHEMA_OBJECTS,
     VERIFICATION_AUTHORITIES,
+    VerificationReadHandle,
     VerificationWriteAuthority,
     VerificationWriteCapability,
 )
@@ -65,6 +67,50 @@ def test_production_store_has_no_finalization_udf_registration():
     source = inspect.getsource(verification_store_module)
     assert "khaos_verification_finalization_guard" not in source
     assert "create_function(" not in source
+
+
+def test_schema_manifest_explicitly_covers_all_security_trigger_families():
+    for prefix in ("trg_execution_", "trg_vse_", "trg_vcp_"):
+        assert any(name.startswith(prefix) for name in PROTECTED_SCHEMA_OBJECTS)
+    assert PROTECTED_SCHEMA_OBJECTS["plan_execution_runs"] == "table"
+    assert PROTECTED_SCHEMA_OBJECTS["verification_success_evidence"] == "table"
+
+
+def test_read_handle_recomputes_all_canonical_success_bindings():
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        "CREATE TABLE plan_verification_runs(verification_run_id TEXT,"
+        "execution_run_id TEXT,status TEXT);"
+        "CREATE TABLE plan_execution_runs(execution_run_id TEXT,status TEXT);"
+        "CREATE TABLE verification_success_evidence(verification_run_id TEXT,"
+        "execution_run_id TEXT,cleanup_proof_id TEXT,cleanup_digest TEXT,"
+        "authority_instance_id TEXT,runtime_id TEXT,boot_id TEXT,"
+        "payload_digest TEXT);"
+    )
+    connection.execute(
+        "INSERT INTO plan_verification_runs VALUES ('vr','er','passed')"
+    )
+    connection.execute("INSERT INTO plan_execution_runs VALUES ('er','verified')")
+    connection.execute(
+        "INSERT INTO verification_success_evidence VALUES "
+        "('vr','er','proof','transplanted-cleanup','authority','runtime','boot',"
+        "'authority-accepted-old-digest')"
+    )
+
+    class FakeAuthority:
+        def verify_storage(self):
+            return None
+
+        def require_success(self, run_id, digest):
+            assert run_id == "vr"
+            assert digest == "authority-accepted-old-digest"
+
+    reader = VerificationReadHandle(connection, FakeAuthority())
+    with pytest.raises(PermissionError, match="digest mismatch"):
+        reader.verification_status("vr")
+    with pytest.raises(PermissionError, match="digest mismatch"):
+        reader.execution_status("er")
+    reader.close()
 
 
 def test_authority_ledger_runs_in_distinct_process(tmp_path):

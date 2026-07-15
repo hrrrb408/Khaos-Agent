@@ -25,6 +25,101 @@ from typing import Any, Iterator
 from urllib.parse import quote
 
 
+PROTECTED_SCHEMA_OBJECTS: dict[str, str] = {
+    "plan_execution_runs": "table",
+    "plan_verification_runs": "table",
+    "plan_verification_steps": "table",
+    "plan_verification_audit_events": "table",
+    "plan_verification_artifacts": "table",
+    "plan_execution_phase_leases": "table",
+    "verification_sandbox_instances": "table",
+    "toolchain_attestations": "table",
+    "disposable_verification_workspaces": "table",
+    "approved_verification_plan_snapshots": "table",
+    "verification_cleanup_proofs": "table",
+    "verification_success_evidence": "table",
+    "ux_active_verification_phase_lease": "index",
+    "ix_vsi_boot_state": "index",
+    "ix_vsi_run": "index",
+    "ix_ta_boot": "index",
+    "ix_dvw_boot_state": "index",
+    "ix_dvw_run": "index",
+    "ix_avps_plan": "index",
+    "ux_avps_snapshot_digest": "index",
+    "ix_vcp_run": "index",
+    "trg_avps_referenced_update": "trigger",
+    "trg_avps_referenced_delete": "trigger",
+    "trg_vcp_immutable_update": "trigger",
+    "trg_vcp_immutable_delete": "trigger",
+    "trg_verification_passed_guard": "trigger",
+    "trg_verification_passed_insert_guard": "trigger",
+    "trg_execution_verified_guard": "trigger",
+    "trg_execution_verified_insert_guard": "trigger",
+    "trg_vse_immutable_update": "trigger",
+    "trg_vse_immutable_delete": "trigger",
+}
+
+
+def canonical_success_payload_digest(
+    *, verification_run_id: str, execution_run_id: str,
+    cleanup_proof_id: str, cleanup_digest: str,
+    authority_instance_id: str, runtime_id: str, boot_id: str,
+) -> str:
+    payload = json.dumps({
+        "authority_instance_id": authority_instance_id,
+        "boot_id": boot_id,
+        "cleanup_digest": cleanup_digest,
+        "cleanup_proof_id": cleanup_proof_id,
+        "execution_run_id": execution_run_id,
+        "runtime_id": runtime_id,
+        "verification_run_id": verification_run_id,
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def require_canonical_success(
+    connection: sqlite3.Connection,
+    authority: Any,
+    *,
+    verification_run_id: str,
+    execution_run_id: str | None = None,
+) -> None:
+    """Reload and verify every success binding before returning trusted state."""
+    authority.verify_storage()
+    run = connection.execute(
+        "SELECT verification_run_id,execution_run_id,status "
+        "FROM plan_verification_runs WHERE verification_run_id=?",
+        (verification_run_id,),
+    ).fetchone()
+    if run is None or str(run[2]) != "passed":
+        raise PermissionError("trusted success requires a persisted PASSED run")
+    persisted_execution_id = str(run[1])
+    if execution_run_id is not None and persisted_execution_id != execution_run_id:
+        raise PermissionError("verification success execution binding mismatch")
+    evidence = connection.execute(
+        "SELECT verification_run_id,execution_run_id,cleanup_proof_id,"
+        "cleanup_digest,authority_instance_id,runtime_id,boot_id,payload_digest "
+        "FROM verification_success_evidence WHERE verification_run_id=?",
+        (verification_run_id,),
+    ).fetchone()
+    if evidence is None:
+        raise PermissionError("persisted PASSED status lacks authority evidence")
+    if str(evidence[0]) != verification_run_id or str(evidence[1]) != persisted_execution_id:
+        raise PermissionError("verification success evidence identity mismatch")
+    recomputed = canonical_success_payload_digest(
+        verification_run_id=str(evidence[0]),
+        execution_run_id=str(evidence[1]),
+        cleanup_proof_id=str(evidence[2]),
+        cleanup_digest=str(evidence[3]),
+        authority_instance_id=str(evidence[4]),
+        runtime_id=str(evidence[5]),
+        boot_id=str(evidence[6]),
+    )
+    if recomputed != str(evidence[7]):
+        raise PermissionError("verification success evidence digest mismatch")
+    authority.require_success(verification_run_id, recomputed)
+
+
 def _authority_event_payload(
     runtime_id: str, boot_id: str, event_type: str,
     detail: dict[str, Any], created_at: float,
@@ -232,13 +327,10 @@ class VerificationReadHandle:
             return None
         status = str(row[0])
         if status == "passed":
-            evidence = self.__connection.execute(
-                "SELECT payload_digest FROM verification_success_evidence "
-                "WHERE verification_run_id=?", (verification_run_id,),
-            ).fetchone()
-            if evidence is None:
-                raise PermissionError("persisted PASSED status lacks authority evidence")
-            self.__authority.require_success(verification_run_id, str(evidence[0]))
+            require_canonical_success(
+                self.__connection, self.__authority,
+                verification_run_id=verification_run_id,
+            )
         return status
 
     def execution_status(self, execution_run_id: str) -> str | None:
@@ -251,14 +343,18 @@ class VerificationReadHandle:
             return None
         status = str(row[0])
         if status == "verified":
-            evidence = self.__connection.execute(
-                "SELECT verification_run_id,payload_digest "
-                "FROM verification_success_evidence WHERE execution_run_id=?",
+            run = self.__connection.execute(
+                "SELECT verification_run_id FROM plan_verification_runs "
+                "WHERE execution_run_id=?",
                 (execution_run_id,),
             ).fetchone()
-            if evidence is None:
+            if run is None:
                 raise PermissionError("persisted VERIFIED status lacks authority evidence")
-            self.__authority.require_success(str(evidence[0]), str(evidence[1]))
+            require_canonical_success(
+                self.__connection, self.__authority,
+                verification_run_id=str(run[0]),
+                execution_run_id=execution_run_id,
+            )
         return status
 
     def close(self) -> None:
@@ -383,12 +479,24 @@ class VerificationWriteAuthority:
         )
 
     def _compute_schema_digest(self) -> str:
+        placeholders = ",".join("?" for _ in PROTECTED_SCHEMA_OBJECTS)
         rows = self._connection.execute(
             "SELECT type,name,tbl_name,sql FROM sqlite_master "
-            "WHERE name LIKE 'plan_verification_%' "
-            "OR name LIKE 'verification_%' OR name LIKE 'trg_verification_%' "
-            "ORDER BY type,name"
+            f"WHERE name IN ({placeholders}) ORDER BY type,name",
+            tuple(PROTECTED_SCHEMA_OBJECTS),
         ).fetchall()
+        actual = {str(row[1]): str(row[0]) for row in rows}
+        if actual != PROTECTED_SCHEMA_OBJECTS:
+            missing = sorted(set(PROTECTED_SCHEMA_OBJECTS) - set(actual))
+            extra_or_wrong = sorted(
+                name for name, object_type in actual.items()
+                if PROTECTED_SCHEMA_OBJECTS.get(name) != object_type
+            )
+            raise PermissionError(
+                "verification database schema/trigger digest drift; "
+                "protected manifest mismatch: "
+                f"missing={missing}, wrong_type={extra_or_wrong}"
+            )
         canonical = "\n".join(
             "|".join("" if item is None else str(item) for item in row)
             for row in rows
