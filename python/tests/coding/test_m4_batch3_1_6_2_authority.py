@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -70,6 +71,39 @@ def test_authority_ledger_runs_in_distinct_process(tmp_path):
     _, authority, _, _, _ = _authority_store(tmp_path)
     assert authority.authority_process_id != os.getpid()
     authority.close()
+
+
+def test_authority_ledger_is_durable_hash_chained_and_boot_scoped(tmp_path):
+    store, first, _, _, _ = _authority_store(
+        tmp_path, runtime_id="runtime-ledger", boot_id="boot-one",
+    )
+    ledger_path = first.ledger_path
+    first.authorize_cleanup_proof("proof", "run", "digest")
+    first.close()
+    assert ledger_path.exists()
+
+    second = VERIFICATION_AUTHORITIES.issue(
+        store._conn, runtime_id="runtime-ledger", boot_id="boot-two",
+    )
+    with pytest.raises(PermissionError, match="not authority-issued"):
+        second.require_cleanup_proof("proof", "run", "digest")
+    second.close()
+
+    ledger = sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True)
+    rows = ledger.execute(
+        "SELECT boot_id,payload_json,previous_hash,event_hash "
+        "FROM authority_events ORDER BY sequence"
+    ).fetchall()
+    assert {row[0] for row in rows} == {"boot-one", "boot-two"}
+    previous_hash = "0" * 64
+    for _, payload, stored_previous, stored_hash in rows:
+        assert stored_previous == previous_hash
+        expected = hashlib.sha256(
+            f"{previous_hash}\n{payload}".encode("utf-8")
+        ).hexdigest()
+        assert stored_hash == expected
+        previous_hash = stored_hash
+    ledger.close()
 
 
 def test_same_boot_authority_cannot_be_issued_twice(tmp_path):

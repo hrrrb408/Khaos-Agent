@@ -274,7 +274,11 @@ def test_finalizing_recovery_rejects_artifact_attacks(tmp_path, attack):
         # writable temporary root so sandbox path policy does not reject the
         # socket bind before the artifact verifier sees the real socket.
         short_socket = f"/private/tmp/khaos-art-{os.getpid()}-{time.time_ns()}"
-        socket_handle.bind(short_socket)
+        try:
+            socket_handle.bind(short_socket)
+        except PermissionError:
+            socket_handle.close()
+            pytest.skip("host sandbox forbids creating UNIX sockets")
         os.rename(short_socket, path)
     elif attack == "directory":
         path.unlink(); path.mkdir(mode=0o700)
