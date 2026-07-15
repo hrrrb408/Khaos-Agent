@@ -1,0 +1,1792 @@
+"""Orchestrates approved verification without Agent tools or host execution."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import json
+import os
+import secrets
+import time
+import uuid
+from dataclasses import replace
+from pathlib import Path
+from typing import Any
+
+from khaos.coding.planning.approval.models import compute_verification_digest
+from khaos.coding.planning.execution_models import ExecutionRunStatus
+from khaos.coding.planning.git_state import GitStateInspector
+from khaos.coding.planning.trusted_verification import (
+    ArtifactRootCapability, DisposableStorageRootCapability,
+    SandboxProfile, TrustedCommandFactory, VerificationWorkspaceFactory,
+)
+from khaos.coding.planning.verification_catalog import VerificationCatalog
+from khaos.coding.planning.verification_execution_models import (
+    DisposableWorkspaceRecord, DisposableWorkspaceState,
+    VerificationExecutionRun, VerificationPhaseContext, VerificationResult,
+    VerificationRunStatus, VerificationStepRun, VerificationStepStatus,
+    compute_image_toolchain_policy_fingerprint,
+    verification_plan_digest,
+)
+from khaos.coding.planning.verification_sandbox import VerificationSandboxBackend
+from khaos.coding.planning.verification_sandbox_instance import (
+    SandboxInstanceState, VerificationSandboxInstance,
+)
+from khaos.coding.planning.verification_store import VerificationExecutionStore
+
+
+# Batch 3.1.2 §8: conservative default for files verification may generate.
+# These are cache/build byproducts that don't affect verification integrity.
+_DEFAULT_ALLOWED_GENERATED_OUTPUT = (
+    "__pycache__/*",
+    "*.pyc",
+    ".pytest_cache/*",
+    ".coverage",
+    ".mypy_cache/*",
+    ".ruff_cache/*",
+    "node_modules/*",
+    ".tox/*",
+    "build/*",
+    "dist/*",
+    "*.egg-info/*",
+    "target/*",
+    ".next/*",
+    ".nuxt/*",
+)
+
+
+class TrustedVerificationRunner:
+    """Single production entry for planned verification execution."""
+
+    def __init__(
+        self,
+        *,
+        approval_store: Any,
+        plan_repository: Any,
+        workspace_manager: Any,
+        context_provider: Any,
+        backend: VerificationSandboxBackend,
+        command_factory: TrustedCommandFactory,
+        workspace_factory: VerificationWorkspaceFactory | None,
+        artifact_root: Path | None,
+        profile: SandboxProfile,
+        runtime_boot: Any,
+        context_registry: dict[str, VerificationPhaseContext],
+        mutation_fence: Any,
+        artifact_ttl_seconds: float = 24 * 3600,
+        toolchain_attestations: tuple = (),
+        approved_image_attestation_digest: str = "",
+        approved_toolchain_attestation_digests: tuple[str, ...] = (),
+        image_attestation: Any = None,
+        artifact_capability: Any = None,
+        snapshot_capability: Any = None,
+        verification_store: VerificationExecutionStore | None = None,
+    ) -> None:
+        # Batch 3.1.4 §2: production backends must be constructed by the
+        # runtime's private factory (exact type + factory marker) OR be
+        # explicitly marked as unsafe test-only.  Malicious objects that
+        # implement create_instance/start_instance but are not exact
+        # DockerVerificationSandboxBackend instances are rejected.
+        from khaos.coding.planning.verification_sandbox import (
+            ProductionVerificationAuthority,
+        )
+        is_production = ProductionVerificationAuthority.is_production_backend(backend)
+        is_factory = ProductionVerificationAuthority.is_runtime_factory_backend(backend)
+        is_unsafe_test = bool(getattr(backend, "_unsafe_test_only", False))
+        if not is_production:
+            raise TypeError(
+                "backend was not signed by a ProductionVerificationAuthority; "
+                "test or unsigned backends cannot be used in the production runner"
+            )
+        if not is_factory and not is_unsafe_test:
+            raise TypeError(
+                "backend was not constructed by the runtime's private factory "
+                "and is not an explicit unsafe test backend; malicious objects "
+                "that set _production_authority cannot impersonate production backends"
+            )
+        # Batch 3.1.5 §2: remember whether this is an explicit unsafe test
+        # backend.  The snapshot enforcement (fail-closed on old requests
+        # without an ApprovedVerificationPlanSnapshot) only applies to real
+        # production runs.  Unsafe test backends keep the legacy semantics
+        # so existing tests that inject approved digests to exercise drift
+        # detection (e.g. toolchain-attestation-drift) still reach
+        # _verify_approved_attestations instead of short-circuiting at the
+        # snapshot gate.
+        self._is_unsafe_test_backend = is_unsafe_test
+        self._store = verification_store or VerificationExecutionStore(
+            approval_store,
+        )
+        if not is_unsafe_test and not self._store.has_write_authority:
+            raise PermissionError(
+                "production trusted verification requires write authority"
+            )
+        self._approval_store = approval_store
+        self._plans = plan_repository
+        self._workspaces = workspace_manager
+        self._context_provider = context_provider
+        self._backend = backend
+        self._commands = command_factory
+        if artifact_capability is not None and snapshot_capability is not None:
+            artifact_capability.verify_identity()
+            snapshot_capability.verify_identity()
+            self._artifact_capability = artifact_capability
+            self._artifact_root = artifact_capability.root_path
+            self._disposable_root_capability = snapshot_capability
+            self._workspace_factory = VerificationWorkspaceFactory(
+                snapshot_capability.root_path,
+            )
+        elif is_unsafe_test and workspace_factory is not None and artifact_root is not None:
+            self._workspace_factory = workspace_factory
+            self._artifact_root = artifact_root.resolve()
+            _forbidden: list[Path] = []
+            _db_path = getattr(self._approval_store, "_db_path", None)
+            if _db_path:
+                _forbidden.append(Path(_db_path))
+            self._artifact_capability = ArtifactRootCapability.open(
+                self._artifact_root, forbidden_roots=tuple(_forbidden),
+            )
+            self._disposable_root_capability = DisposableStorageRootCapability.open(
+                self._workspace_factory._root,
+                forbidden_roots=tuple(_forbidden) + (self._artifact_root,),
+                boot_id=runtime_boot.boot_id,
+            )
+        else:
+            raise PermissionError(
+                "production verification requires runtime storage capabilities"
+            )
+        self._profile = profile
+        self._boot = runtime_boot
+        self._contexts = context_registry
+        self._fence = mutation_fence
+        self._git = GitStateInspector()
+        self._store.install_cleanup_validator(self._verify_cleanup_proof)
+        self._artifact_ttl = artifact_ttl_seconds
+        # Batch 3.1.2 §5: toolchain attestations from configure_trusted_verification.
+        # Re-verified before each launch_instance to detect binary replacement
+        # after configuration (re-bind attestation digest at execution time).
+        self._ordered_toolchain_attestations = tuple(toolchain_attestations)
+        self._toolchain_attestations: dict[str, Any] = {
+            attestation.toolchain_id: attestation
+            for attestation in toolchain_attestations
+        }
+        # Batch 3.1.4 §3: approved attestation digests frozen at configuration
+        # time.  At execution time, re-probe and verify match — any drift
+        # → STALE, 0 processes started.
+        self._approved_image_attestation_digest = approved_image_attestation_digest
+        self._approved_toolchain_attestation_digests = (
+            approved_toolchain_attestation_digests
+        )
+        # Batch 3.1.4 §4: the approved ImageAttestation object.  Passed to
+        # inspect_and_attest_instance so the container's .Image is verified
+        # against the approved local_config_image_id (not the manifest digest).
+        self._image_attestation = image_attestation
+        self._store.recover_interrupted()
+        # Batch 3.1.2 §8: reconcile disposable workspaces from previous boots.
+        self._reconcile_disposable_workspaces()
+        # Batch 3.1.3 §7: reconcile artifact root orphans before runtime readiness.
+        self._reconcile_artifacts()
+        # FINALIZING is recovered only after storage capabilities and all
+        # durable cleanup evidence are available.
+        self._recover_finalizing_runs()
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.3 §2: Real cleanup states for sandbox instances
+    # ------------------------------------------------------------------
+
+    async def _cleanup_sandbox_instance(
+        self, sandbox_instance_id: str, container_id_or_name: str,
+    ) -> None:
+        """Batch 3.1.3 §2: attempt cleanup after a lifecycle failure.
+
+        Marks CLEANUP_PENDING, attempts terminate_and_remove, and only
+        marks TERMINATED if the container is confirmed gone.  On failure,
+        marks CLEANUP_FAILED — never guesses the container is gone.
+        """
+        self._store.update_sandbox_instance(
+            sandbox_instance_id,
+            state=SandboxInstanceState.CLEANUP_PENDING,
+            failure_code="cleanup-after-lifecycle-failure",
+        )
+        if not container_id_or_name:
+            # No container was created — nothing to clean up.
+            self._store.update_sandbox_instance(
+                sandbox_instance_id,
+                state=SandboxInstanceState.TERMINATED,
+                cleanup_status="absent",
+                terminated_at=time.time(),
+            )
+            return
+        try:
+            terminated_ok, removed_ok = (
+                await self._backend.terminate_and_remove_instance(container_id_or_name)
+            )
+        except Exception:
+            removed_ok = False
+        if removed_ok:
+            self._store.update_sandbox_instance(
+                sandbox_instance_id,
+                state=SandboxInstanceState.TERMINATED,
+                cleanup_status="absent",
+                terminated_at=time.time(),
+            )
+        else:
+            # Best-effort: try to confirm gone via inspect.
+            try:
+                gone = await self._backend.confirm_instance_gone(container_id_or_name)
+            except Exception:
+                gone = False
+            if gone:
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.TERMINATED,
+                    cleanup_status="absent",
+                    terminated_at=time.time(),
+                )
+            else:
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.CLEANUP_FAILED,
+                    failure_code="cleanup-failed-after-lifecycle-failure",
+                )
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.2 §8: Disposable workspace reconciliation
+    # ------------------------------------------------------------------
+
+    def _reconcile_disposable_workspaces(self) -> None:
+        """Reconcile non-terminal disposable workspaces from previous boots.
+
+        Batch 3.1.4 §7: PREPARED rows are now cleaned up using
+        ``dir_fd``-relative ``unlink``/``rmdir`` with ``O_NOFOLLOW`` at
+        every level — NO ``shutil.rmtree``.  The PREPARED row proves we
+        own the directory, but we still reject symlinks, mount points,
+        sockets, and devices during cleanup.  Unknown file types are
+        quarantined (left in place) and the workspace is marked
+        CLEANUP_FAILED.
+
+        For each active workspace:
+        - Reconstruct root_path from factory root + instance_id.
+        - If root_path no longer exists → mark CLEANED (already gone).
+        - If root_path exists:
+          - PREPARED state → safe ``dir_fd``-based cleanup (no manifest).
+          - SEALED/MOUNTED state → attempt destroy with manifest.
+          - Failure → mark CLEANUP_FAILED + poison workspace scope.
+        """
+        from khaos.coding.planning.trusted_verification import (
+            DisposableVerificationWorkspace, ManifestEntry,
+        )
+        import stat as _stat
+        factory_root = self._workspace_factory._root
+        for record in self._store.list_active_disposable_workspaces():
+            root = factory_root / record.instance_id
+            if not root.exists():
+                self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+                continue
+            if record.state == DisposableWorkspaceState.PREPARED:
+                try:
+                    self._safe_destroy_prepared(root)
+                    self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+                except Exception:
+                    self._store.mark_disposable_workspace_cleanup_failed(
+                        record.workspace_id, failure_code="prepared-cleanup-failed",
+                    )
+                    self._approval_store.add_workspace_poison_scope(
+                        record.verification_run_id,
+                        owner=f"verification-cleanup:{record.workspace_id}",
+                        reason="disposable-workspace-cleanup-failed",
+                    )
+                continue
+            try:
+                manifest_entries = tuple(
+                    ManifestEntry(
+                        path=entry["path"],
+                        content_hash=entry["content_hash"],
+                        mode=entry["mode"],
+                    )
+                    for entry in json.loads(record.manifest_json)
+                )
+            except (json.JSONDecodeError, KeyError, TypeError):
+                self._store.mark_disposable_workspace_cleanup_failed(
+                    record.workspace_id, failure_code="manifest-invalid",
+                )
+                self._approval_store.add_workspace_poison_scope(
+                    record.verification_run_id,
+                    owner=f"verification-cleanup:{record.workspace_id}",
+                    reason="disposable-workspace-manifest-invalid",
+                )
+                continue
+            workspace = DisposableVerificationWorkspace(
+                instance_id=record.instance_id,
+                root=root,
+                manifest=manifest_entries,
+                manifest_digest=record.manifest_digest,
+                source_root="",
+                allowed_generated_output=record.allowed_generated_output,
+            )
+            try:
+                self._workspace_factory.destroy(workspace)
+            except Exception:
+                self._store.mark_disposable_workspace_cleanup_failed(
+                    record.workspace_id, failure_code="reconcile-cleanup-failed",
+                )
+                self._approval_store.add_workspace_poison_scope(
+                    record.verification_run_id,
+                    owner=f"verification-cleanup:{record.workspace_id}",
+                    reason="disposable-workspace-cleanup-failed",
+                )
+            else:
+                self._store.mark_disposable_workspace_cleaned(record.workspace_id)
+
+    def _cleanup_disposable_or_raise(
+        self, *, verification_run_id: str, workspace_id: str,
+        disposable: Any,
+    ) -> None:
+        """Durably CLEANUP_PENDING→physical destroy→CLEANED without swallowing."""
+        if not workspace_id or disposable is None:
+            raise RuntimeError("production cleanup requires a disposable workspace")
+        self._store.transition_disposable_workspace(
+            workspace_id,
+            expected=(DisposableWorkspaceState.MOUNTED,
+                      DisposableWorkspaceState.SEALED,
+                      DisposableWorkspaceState.PREPARED),
+            target=DisposableWorkspaceState.CLEANUP_PENDING,
+        )
+        try:
+            self._workspace_factory.destroy(disposable)
+        except Exception as exc:
+            self._store.mark_disposable_workspace_cleanup_failed(
+                workspace_id, failure_code="cleanup-failed",
+            )
+            self._approval_store.add_workspace_poison_scope(
+                verification_run_id,
+                owner=f"verification-cleanup:{workspace_id}",
+                reason="disposable-workspace-cleanup-failed",
+            )
+            raise RuntimeError("disposable workspace cleanup failed") from exc
+        self._store.mark_disposable_workspace_cleaned(workspace_id)
+
+    @staticmethod
+    def _sandbox_absence_digest(instance: Any) -> str:
+        payload = json.dumps({
+            "sandbox_instance_id": instance.sandbox_instance_id,
+            "state": instance.state.value,
+            "container_id": instance.container_id,
+            "terminated_at": instance.terminated_at or 0.0,
+            "cleanup_status": instance.cleanup_status,
+            "failure_code": instance.failure_code,
+        }, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _canonical_workspace_digest_for_run(self, verification_run_id: str) -> str:
+        run = self._store.get_run(verification_run_id)
+        if run is None:
+            raise RuntimeError("verification run missing during cleanup validation")
+        execution = self._approval_store.get_execution_run(run.execution_run_id)
+        if execution is None:
+            raise RuntimeError("execution run missing during cleanup validation")
+        workspace = self._workspaces.get(execution.workspace_id)
+        if workspace is None or workspace.task_id != execution.task_id:
+            raise RuntimeError("canonical workspace missing during cleanup validation")
+        state = self._context_provider.current_state(
+            repository_id=execution.repository_id, task_id=execution.task_id,
+            workspace_id=execution.workspace_id,
+        )
+        attestation = self._approval_store.get_final_mutation_attestation(
+            execution.execution_run_id,
+        )
+        if attestation is None:
+            raise RuntimeError("final mutation attestation missing")
+        git = self._git.snapshot(
+            workspace, repository_generation=state.repository_generation,
+        )
+        digest = hashlib.sha256("|".join(
+            f"{item.relative_path}:{item.state_digest}"
+            for item in sorted(git.file_states, key=lambda value: value.relative_path)
+        ).encode()).hexdigest()
+        if (not state.task_active or not state.workspace_active
+                or state.head_sha != attestation.head
+                or state.repository_generation != attestation.generation
+                or git.head_commit != attestation.head
+                or git.index_digest != attestation.index_digest
+                or git.worktree_admin_identity != attestation.worktree_admin_digest
+                or digest != attestation.workspace_state_digest):
+            raise RuntimeError("canonical workspace final digest drifted")
+        return digest
+
+    def _verify_artifact_row(self, row: Any) -> bool:
+        """Use one identity-aware verifier for finalization and recovery."""
+        return self._artifact_capability.verify_sealed_artifact(
+            row["artifact_id"], expected_digest=row["content_digest"],
+            expected_size=int(row["byte_length"]),
+            expected_dev=int(row["artifact_dev"]),
+            expected_ino=int(row["artifact_ino"]),
+            expected_uid=int(row["artifact_uid"]),
+            expected_gid=int(row["artifact_gid"]),
+            expected_mode=int(row["artifact_mode"]),
+            expected_nlink=int(row["artifact_nlink"]),
+        )
+
+    @staticmethod
+    def _artifact_seal_digest(row: Any) -> str:
+        """Bind content, size, type-critical identity and permissions."""
+        payload = {
+            "artifact_id": row["artifact_id"],
+            "content_digest": row["content_digest"],
+            "byte_length": int(row["byte_length"]),
+            "dev": int(row["artifact_dev"]),
+            "ino": int(row["artifact_ino"]),
+            "uid": int(row["artifact_uid"]),
+            "gid": int(row["artifact_gid"]),
+            "mode": int(row["artifact_mode"]),
+            "nlink": int(row["artifact_nlink"]),
+        }
+        return hashlib.sha256(json.dumps(
+            payload, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")).hexdigest()
+
+    def _verify_cleanup_proof(self, proof: Any) -> None:
+        """Re-read every cleanup row and artifact/canonical filesystem proof."""
+        record = self._store.get_disposable_workspace(
+            proof.disposable_workspace_id,
+        )
+        if (record is None or record.verification_run_id != proof.verification_run_id
+                or record.state != DisposableWorkspaceState.CLEANED
+                or record.cleaned_at is None
+                or record.cleaned_at != proof.disposable_cleaned_at
+                or f"{record.instance_id}:{record.manifest_digest}"
+                != proof.disposable_workspace_identity):
+            raise RuntimeError("disposable workspace cleanup proof mismatch")
+        instances = tuple(
+            item for item in self._store.list_sandbox_instances_for_run(
+                proof.verification_run_id,
+            ) if item.instance_kind != "toolchain-attestation"
+        )
+        instance_ids = tuple(item.sandbox_instance_id for item in instances)
+        if instance_ids != proof.sandbox_instance_ids:
+            raise RuntimeError("sandbox cleanup proof instance ordering mismatch")
+        absence_digests: list[str] = []
+        for instance in instances:
+            if (instance.state != SandboxInstanceState.TERMINATED
+                    or instance.terminated_at is None
+                    or instance.cleanup_status != "absent"):
+                raise RuntimeError("sandbox instance lacks a real absence proof")
+            absence_digests.append(self._sandbox_absence_digest(instance))
+        if tuple(absence_digests) != proof.sandbox_absence_digests:
+            raise RuntimeError("sandbox absence proof digest mismatch")
+        artifacts = self._store.list_artifacts_for_run(proof.verification_run_id)
+        artifact_ids = tuple(row["artifact_id"] for row in artifacts)
+        artifact_digests = tuple(
+            self._artifact_seal_digest(row) for row in artifacts
+        )
+        if (artifact_ids != proof.artifact_ids
+                or artifact_digests != proof.artifact_seal_digests):
+            raise RuntimeError("artifact cleanup proof ordering mismatch")
+        for artifact in artifacts:
+            if artifact["status"] != "sealed" or not (
+                self._verify_artifact_row(artifact)
+            ):
+                raise RuntimeError("sealed verification artifact proof mismatch")
+        current_digest = self._canonical_workspace_digest_for_run(
+            proof.verification_run_id,
+        )
+        if current_digest != proof.canonical_workspace_final_digest:
+            raise RuntimeError("canonical workspace cleanup proof mismatch")
+
+    def _recover_finalizing_runs(self) -> None:
+        for run in self._store.list_finalizing_runs():
+            proof = self._store.get_cleanup_proof_for_run(run.verification_run_id)
+            try:
+                if proof is None:
+                    raise RuntimeError("FINALIZING run has no cleanup proof")
+                self._store.finalize_success(
+                    step=None, verification_run_id=run.verification_run_id,
+                    execution_run_id=run.execution_run_id,
+                    workspace_id=proof.disposable_workspace_id,
+                    cleanup_proof=proof,
+                )
+            except Exception:
+                self._store.transition_run(
+                    run.verification_run_id,
+                    expected=(VerificationRunStatus.FINALIZING,),
+                    target=VerificationRunStatus.ERRORED,
+                    failure_code="finalization-recovery-proof-invalid",
+                )
+
+    @staticmethod
+    def _safe_destroy_prepared(root: Path) -> None:
+        """Batch 3.1.4 §7: safe dir_fd-based cleanup for PREPARED workspaces.
+
+        Replaces ``shutil.rmtree``.  Walks the directory tree using
+        ``dir_fd``-relative ``unlink``/``rmdir`` with ``O_NOFOLLOW`` at
+        every level.  Rejects:
+        - Symlinks (O_NOFOLLOW on every open)
+        - Sockets, devices, FIFOs (only regular files and dirs are deleted)
+        - Unknown file types (quarantine — leave in place, raise)
+
+        The instance root is ``rmdir``'d last, and its absence is confirmed.
+        """
+        import os as _os
+        import stat as _stat
+        if not root.exists():
+            try:
+                _os.stat(str(root))
+            except FileNotFoundError:
+                return
+            raise PermissionError(
+                f"PREPARED workspace root exists but is not a directory: {root}"
+            )
+        # Open the instance root with O_DIRECTORY|O_NOFOLLOW.
+        root_fd = _os.open(
+            str(root), _os.O_RDONLY | _os.O_DIRECTORY | _os.O_NOFOLLOW,
+        )
+        try:
+            TrustedVerificationRunner._safe_destroy_tree(root_fd)
+        finally:
+            _os.close(root_fd)
+        # rmdir the instance root itself.
+        _os.rmdir(str(root))
+        # fsync the parent directory so the rmdir is durable.
+        parent_fd = _os.open(
+            str(root.parent), _os.O_RDONLY | _os.O_DIRECTORY | _os.O_NOFOLLOW,
+        )
+        try:
+            _os.fsync(parent_fd)
+        finally:
+            _os.close(parent_fd)
+        # Confirm the instance root no longer exists.
+        try:
+            _os.stat(str(root))
+        except FileNotFoundError:
+            return
+        raise PermissionError(
+            f"PREPARED workspace root still exists after rmdir: {root}"
+        )
+
+    @staticmethod
+    def _safe_destroy_tree(dir_fd: int) -> None:
+        """Batch 3.1.4 §7: recursively destroy all entries in dir_fd.
+
+        Uses ``O_NOFOLLOW`` on every open — symlinks are rejected.
+        Only regular files and directories are deleted; sockets, devices,
+        FIFOs, and unknown types raise PermissionError (quarantine).
+        """
+        import os as _os
+        import stat as _stat
+        for name in _os.listdir(dir_fd):
+            st = _os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            if _stat.S_ISDIR(st.st_mode):
+                # Recurse into the directory.
+                child_fd = _os.open(
+                    name, _os.O_RDONLY | _os.O_DIRECTORY | _os.O_NOFOLLOW,
+                    dir_fd=dir_fd,
+                )
+                try:
+                    TrustedVerificationRunner._safe_destroy_tree(child_fd)
+                finally:
+                    _os.close(child_fd)
+                _os.rmdir(name, dir_fd=dir_fd)
+            elif _stat.S_ISREG(st.st_mode):
+                _os.unlink(name, dir_fd=dir_fd)
+            else:
+                # Socket, device, FIFO, or unknown — quarantine.
+                raise PermissionError(
+                    f"PREPARED workspace contains non-regular file: "
+                    f"{name} (mode={st.st_mode:o})"
+                )
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.3 §7: Artifact root orphan recovery
+    # ------------------------------------------------------------------
+
+    def _reconcile_artifacts(self) -> None:
+        """Reconcile artifact root files against DB rows before runtime readiness.
+
+        Batch 3.1.3 §7: the artifact root may contain orphan files,
+        incomplete writes, or sealed artifacts whose final file was
+        deleted or corrupted after a crash.  This method:
+
+        1. Reads all RESERVED and SEALED rows from the DB.
+        2. Calls ``ArtifactRootCapability.reconcile()`` to compare the
+           expected artifacts against the actual files on disk.
+        3. For each category returned by the reconcile report:
+           - ``reserved_no_file`` → quarantine (incomplete reserve).
+           - ``reserved_temp``    → cleanup_orphan temp + quarantine.
+           - ``reserved_final``   → quarantine (cannot verify without digest).
+           - ``sealed_missing``   → quarantine (file deleted after sealing).
+           - ``unknown_files``    → cleanup_orphan (orphan file).
+           - ``cleanup_failed``   → poison the owning verification run.
+        4. For SEALED artifacts with a final file present, re-verify the
+           content digest and byte length.  Any mismatch → quarantine.
+        5. If any artifact could not be cleaned up, poison the owning
+           verification run so it cannot reach a terminal success state.
+        """
+        all_rows = self._store.list_all_artifacts()
+        expected = tuple(
+            (row["artifact_id"], row["status"], int(row["byte_length"]))
+            for row in all_rows
+        )
+        try:
+            report = self._artifact_capability.reconcile(
+                expected_artifacts=expected,
+            )
+        except PermissionError:
+            # Non-regular file in the artifact root — fail-closed by
+            # poisoning every active verification run.  The root is not
+            # safe to use until an operator inspects it.
+            for row in all_rows:
+                self._approval_store.add_workspace_poison_scope(
+                    row["verification_run_id"],
+                    owner="verification-cleanup:artifact-root",
+                    reason="artifact-root-non-regular-file",
+                )
+            raise
+        # Index rows by artifact_id for digest verification.
+        rows_by_id = {row["artifact_id"]: row for row in all_rows}
+        cleanup_failures: list[str] = []
+        # RESERVED artifacts with no file — incomplete reserve.
+        for artifact_id in report["reserved_no_file"]:
+            try:
+                self._store.quarantine_artifact(
+                    artifact_id, reason="reserved-no-file",
+                )
+            except Exception:
+                cleanup_failures.append(artifact_id)
+        # RESERVED artifacts with only a temp file — partial write.
+        for artifact_id in report["reserved_temp"]:
+            temp_name = f".{artifact_id}.tmp"
+            if not self._artifact_capability.cleanup_orphan(temp_name):
+                cleanup_failures.append(artifact_id)
+            try:
+                self._store.quarantine_artifact(
+                    artifact_id, reason="reserved-temp-only",
+                )
+            except Exception:
+                cleanup_failures.append(artifact_id)
+        # RESERVED artifacts with a final file — link succeeded but seal
+        # faulted.  Cannot verify without a digest, so quarantine.
+        for artifact_id in report["reserved_final"]:
+            try:
+                self._store.quarantine_artifact(
+                    artifact_id, reason="reserved-final-without-seal",
+                )
+            except Exception:
+                cleanup_failures.append(artifact_id)
+        # SEALED artifacts whose final file is missing — deleted after sealing.
+        for artifact_id in report["sealed_missing"]:
+            try:
+                self._store.quarantine_artifact(
+                    artifact_id, reason="sealed-file-missing",
+                )
+            except Exception:
+                cleanup_failures.append(artifact_id)
+        # Unknown files in the root — orphan files with no DB row.
+        for name in report["unknown_files"]:
+            if not self._artifact_capability.cleanup_orphan(name):
+                cleanup_failures.append(name)
+        # Re-verify SEALED artifacts with a final file present.
+        for row in all_rows:
+            if row["status"] != "sealed":
+                continue
+            artifact_id = row["artifact_id"]
+            # Skip if the file is missing (already handled above).
+            if artifact_id in report["sealed_missing"]:
+                continue
+            content_digest = row["content_digest"]
+            byte_length = int(row["byte_length"])
+            if not content_digest:
+                # No digest recorded — cannot verify, quarantine.
+                try:
+                    self._store.quarantine_artifact(
+                        artifact_id, reason="sealed-no-digest",
+                    )
+                except Exception:
+                    cleanup_failures.append(artifact_id)
+                continue
+            if not self._artifact_capability.verify_sealed_artifact(
+                artifact_id, expected_digest=content_digest,
+                expected_size=byte_length,
+                expected_dev=int(row["artifact_dev"]),
+                expected_ino=int(row["artifact_ino"]),
+                expected_uid=int(row["artifact_uid"]),
+                expected_gid=int(row["artifact_gid"]),
+                expected_mode=int(row["artifact_mode"]),
+                expected_nlink=int(row["artifact_nlink"]),
+            ):
+                # Digest or size mismatch — corruption, quarantine.
+                try:
+                    self._store.quarantine_artifact(
+                        artifact_id, reason="sealed-digest-mismatch",
+                    )
+                except Exception:
+                    cleanup_failures.append(artifact_id)
+        # Poison verification runs that own artifacts we could not clean up.
+        if cleanup_failures:
+            failed_runs: set[str] = set()
+            for artifact_id in cleanup_failures:
+                row = rows_by_id.get(artifact_id)
+                if row is not None:
+                    failed_runs.add(row["verification_run_id"])
+            for verification_run_id in failed_runs:
+                self._approval_store.add_workspace_poison_scope(
+                    verification_run_id,
+                    owner="verification-cleanup:artifact-root",
+                    reason="artifact-reconcile-cleanup-failed",
+                )
+
+    async def run(
+        self,
+        context: VerificationPhaseContext,
+        *,
+        cancellation: asyncio.Event | None = None,
+    ) -> VerificationResult:
+        self._require_context(context)
+        existing = self._store.get_run_by_execution(context.execution_run_id)
+        if existing is not None:
+            return VerificationResult(
+                existing.verification_run_id, existing.status,
+                self._store.list_steps(existing.verification_run_id), True,
+                existing.failure_code,
+            )
+        try:
+            execution, plan, attestation, workspace, catalog, commands = (
+                self._validate_live(context)
+            )
+        except Exception:
+            execution = self._approval_store.get_execution_run(context.execution_run_id)
+            if execution is None:
+                raise
+            plan = self._plans.get(execution.plan_id)
+            stale_digest = hashlib.sha256(json.dumps({
+                "approved_verification": (
+                    compute_verification_digest(plan.verification_requirements)
+                    if plan is not None else "unavailable"
+                ),
+                "profile": self._profile.digest,
+            }, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            stale = self._new_run(
+                context=context, execution=execution,
+                plan_content_hash=(plan.content_hash if plan is not None
+                                   else execution.plan_content_hash),
+                attestation_digest=context.attestation_digest,
+                plan_digest=stale_digest, catalog_fingerprint="unavailable",
+            )
+            run, idempotent = self._store.create_run(stale)
+            if not idempotent:
+                self._store.transition_run(
+                    run.verification_run_id,
+                    expected=(VerificationRunStatus.CREATED,),
+                    target=VerificationRunStatus.VALIDATING,
+                )
+                self._store.transition_run(
+                    run.verification_run_id,
+                    expected=(VerificationRunStatus.VALIDATING,),
+                    target=VerificationRunStatus.STALE,
+                    failure_code="live-validation-drift",
+                )
+                run = self._store.get_run_by_execution(execution.execution_run_id)
+            return VerificationResult(
+                run.verification_run_id, run.status,
+                self._store.list_steps(run.verification_run_id), idempotent,
+                run.failure_code,
+            )
+        plan_digest = verification_plan_digest(
+            commands, catalog_fingerprint=catalog.fingerprint,
+            sandbox_profile_digest=self._profile.digest,
+        )
+        candidate = self._new_run(
+            context=context, execution=execution,
+            plan_content_hash=plan.content_hash,
+            attestation_digest=attestation.attestation_digest,
+            plan_digest=plan_digest, catalog_fingerprint=catalog.fingerprint,
+        )
+        run, idempotent = self._store.create_run(candidate)
+        if idempotent:
+            return VerificationResult(
+                run.verification_run_id, run.status,
+                self._store.list_steps(run.verification_run_id), True, run.failure_code,
+            )
+        self._store.transition_run(
+            run.verification_run_id, expected=(VerificationRunStatus.CREATED,),
+            target=VerificationRunStatus.VALIDATING,
+        )
+        disposable = None
+        workspace_id = ""
+        last_step: VerificationStepRun | None = None
+        # Batch 3.1.3 §8: track cleanup state so the terminal transition
+        # is deferred until cleanup succeeds.  ``cleanup_done`` prevents
+        # double-cleanup in the ``finally`` block when the success path
+        # already ran it.
+        cleanup_failed = False
+        cleanup_done = False
+        try:
+            # Revalidate immediately before creating any process or copy.
+            self._validate_live(context, expected_catalog=catalog.fingerprint,
+                                expected_plan_digest=plan_digest)
+            # Batch 3.1.4 §3: verify approved attestation digests before any
+            # process starts.  If any attestation drifted since configuration,
+            # transition to STALE with 0 processes started.
+            try:
+                self._verify_approved_attestations(run.verification_run_id)
+            except PermissionError:
+                # Run is already STALE — return with 0 processes started.
+                stale_run = self._store.get_run_by_execution(
+                    context.execution_run_id,
+                )
+                return VerificationResult(
+                    stale_run.verification_run_id, stale_run.status,
+                    self._store.list_steps(stale_run.verification_run_id),
+                    False, stale_run.failure_code,
+                )
+            self._store.transition_run(
+                run.verification_run_id, expected=(VerificationRunStatus.VALIDATING,),
+                target=VerificationRunStatus.PREPARING_SANDBOX,
+            )
+            # Batch 3.1.3 §6: persist PREPARED row BEFORE filesystem creation.
+            # The workspace_id and instance_id are generated here so the DB
+            # row exists before any directory is created.  If a crash occurs
+            # during mkdir/copy/seal, reconciliation can use the PREPARED row
+            # to find and safely clean up the partial directory.
+            #
+            # Batch 3.1.5 §5/§6: verify the disposable storage root identity
+            # before creating any workspace.  This detects root replacement
+            # (symlink swap, remount, chmod) since the capability was opened
+            # at runner startup.
+            self._disposable_root_capability.verify_identity()
+            workspace_id = f"dvw_{uuid.uuid4().hex}"
+            instance_id = f"verify_{secrets.token_hex(16)}"
+            self._store.create_disposable_workspace(DisposableWorkspaceRecord(
+                workspace_id=workspace_id,
+                verification_run_id=run.verification_run_id,
+                step_run_id="",
+                instance_id=instance_id,
+                manifest_digest="",  # filled after copy
+                manifest_json="[]",  # filled after copy
+                allowed_generated_output=_DEFAULT_ALLOWED_GENERATED_OUTPUT,
+                state=DisposableWorkspaceState.PREPARED,
+                boot_id=self._boot.boot_id,
+                created_at=time.time(),
+            ))
+            disposable = self._workspace_factory.create(
+                workspace.worktree_path,
+                forbidden_roots=(workspace.repository_root, workspace.worktree_path,
+                                 workspace.recovery_root, self._artifact_root,
+                                 Path(self._approval_store._db_path)
+                                 if getattr(self._approval_store, "_db_path", None)
+                                 else workspace.repository_root),
+                allowed_generated_output=_DEFAULT_ALLOWED_GENERATED_OUTPUT,
+                instance_id=instance_id,
+            )
+            # Batch 3.1.3 §6: update the PREPARED row with the sealed manifest.
+            manifest_json = json.dumps(
+                [entry.__dict__ for entry in disposable.manifest],
+                sort_keys=True, separators=(",", ":"),
+            )
+            self._store.seal_disposable_workspace(
+                workspace_id,
+                manifest_digest=disposable.manifest_digest,
+                manifest_json=manifest_json,
+            )
+            self._store.transition_disposable_workspace(
+                workspace_id,
+                expected=(DisposableWorkspaceState.SEALED,),
+                target=DisposableWorkspaceState.MOUNTED,
+            )
+            steps = tuple(VerificationStepRun(
+                step_run_id=f"pvs_{uuid.uuid4().hex}",
+                verification_run_id=run.verification_run_id,
+                requirement_id=command.requirement_id, command_id=command.command_id,
+                command_digest=command.command_digest, ordinal=index,
+                status=VerificationStepStatus.CREATED, timeout_ms=command.timeout_ms,
+            ) for index, command in enumerate(commands))
+            self._store.create_steps(steps)
+            self._store.transition_run(
+                run.verification_run_id,
+                expected=(VerificationRunStatus.PREPARING_SANDBOX,),
+                target=VerificationRunStatus.RUNNING,
+            )
+            completed: list[VerificationStepRun] = []
+            terminal = VerificationRunStatus.PASSED
+            failure_code = ""
+            # Batch 3.1.4 §6: defer the last passing step's commit so it
+            # can be finalized atomically with Run=PASSED + Execution=VERIFIED
+            # in a single BEGIN IMMEDIATE transaction after cleanup.
+            deferred_step: VerificationStepRun | None = None
+            step_count = len(steps)
+            for step_index, (command, step) in enumerate(zip(commands, steps)):
+                is_last_step = (step_index == step_count - 1)
+                self._require_context(context)
+                if cancellation is not None and cancellation.is_set():
+                    terminal = VerificationRunStatus.CANCELLED
+                    failure_code = "cancelled"
+                    break
+                self._store.mark_step_running(step.step_run_id)
+                last_step = step
+                started = time.time()
+                # §5: re-bind toolchain attestation digest before execution.
+                # If the binary was replaced after configuration, the
+                # attestation_digest no longer matches the persisted record
+                # and execution is rejected (fail-closed).
+                #
+                # Batch 3.1.3 §5: also verify the binary_digest and
+                # image_attestation_digest match the persisted record.
+                # If they differ, the Run goes STALE — no new proof is
+                # regenerated to continue using the old approval.
+                toolchain_id = command.toolchain_id
+                if self._toolchain_attestations:
+                    attestation = self._toolchain_attestations.get(toolchain_id)
+                    if attestation is None:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="toolchain-attestation-missing",
+                        )
+                        raise PermissionError(
+                            f"toolchain attestation not found for {toolchain_id}"
+                        )
+                    persisted = self._store.get_toolchain_attestation(toolchain_id)
+                    if persisted is None or persisted.attestation_digest != attestation.attestation_digest:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="toolchain-attestation-stale",
+                        )
+                        raise PermissionError(
+                            f"toolchain attestation stale or missing for {toolchain_id}"
+                        )
+                    # Batch 3.1.3 §5: verify binary_digest and image_attestation_digest.
+                    if persisted.binary_digest != attestation.binary_digest:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="toolchain-binary-digest-mismatch",
+                        )
+                        raise PermissionError(
+                            f"toolchain binary digest mismatch for {toolchain_id}"
+                        )
+                    if persisted.image_attestation_digest != attestation.image_attestation_digest:
+                        self._store.abort_step_and_run(
+                            step.step_run_id,
+                            verification_run_id=run.verification_run_id,
+                            failure_code="image-attestation-digest-mismatch",
+                        )
+                        raise PermissionError(
+                            f"image attestation digest mismatch for {toolchain_id}"
+                        )
+                # §1 steps 1-2: persist PREPARED sandbox instance BEFORE
+                # creating the container, so a crash leaves a durable trail.
+                sandbox_instance_id = f"vsi_{secrets.token_hex(12)}"
+                instance_name = self._backend.generate_instance_name()
+                instance = VerificationSandboxInstance(
+                    sandbox_instance_id=sandbox_instance_id,
+                    verification_run_id=run.verification_run_id,
+                    step_run_id=step.step_run_id,
+                    backend_id=getattr(self._backend, "BACKEND_ID", "unknown"),
+                    backend_instance_name=instance_name,
+                    runtime_epoch=self._boot.server_epoch,
+                    boot_id=self._boot.boot_id,
+                    image_reference=self._profile.image_digest,
+                    expected_image_digest=self._profile.image_digest,
+                    workspace_manifest_digest=disposable.manifest_digest,
+                    state=SandboxInstanceState.PREPARED,
+                )
+                self._store.create_sandbox_instance(instance)
+                labels = self._backend.build_labels(
+                    run_id=run.verification_run_id, step_id=step.step_run_id,
+                    instance_id=sandbox_instance_id, boot_id=self._boot.boot_id,
+                    manifest_digest=disposable.manifest_digest,
+                )
+                started_monotonic = time.monotonic()
+                container_id = ""
+                attestation = None
+                attach_proc = None
+                stdout_stream = None
+                stderr_stream = None
+                try:
+                    # Batch 3.1.3 §1: explicit lifecycle — create, inspect,
+                    # persist, start, persist, attach, collect.  Container
+                    # identity is persisted BEFORE docker start, so a crash
+                    # after create leaves a durable trail.
+                    self._backend.validate_command(command)
+                    # Step 2: docker create --pull=never (no project code)
+                    container_id = await self._backend.create_instance(
+                        instance_name=instance_name,
+                        image_digest=self._profile.image_digest,
+                        command=command, workspace_root=disposable.root,
+                        labels=labels,
+                    )
+                    # Step 3: inspect and attest (before start)
+                    # Batch 3.1.4 §4: pass the approved ImageAttestation so
+                    # the container's .Image is verified against the approved
+                    # local_config_image_id, NOT the registry manifest digest.
+                    attestation = await self._backend.inspect_and_attest_instance(
+                        container_id_or_name=container_id,
+                        expected_labels=labels,
+                        expected_image_digest=self._profile.image_digest,
+                        expected_manifest_digest=disposable.manifest_digest,
+                        image_attestation=self._image_attestation,
+                    )
+                    # Step 4: persist container_id + attestation + CREATED_ATTESTED
+                    # in one atomic transaction BEFORE docker start.
+                    self._store.persist_created_instance(
+                        sandbox_instance_id,
+                        container_id=container_id,
+                        attestation_digest=attestation.attestation_digest,
+                        actual_image_digest=attestation.local_image_id,
+                        actual_container_image_id=attestation.container_image_id,
+                    )
+                    # Step 5: docker start --attach (atomic start + output capture)
+                    # Batch 3.1.4 §1: eliminates the start→attach race.
+                    # Output pipe is established before PID 1 executes.
+                    attach_proc, stdout_stream, stderr_stream = (
+                        await self._backend.start_and_attach_instance(container_id)
+                    )
+                    # Step 6: persist RUNNING
+                    self._store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.RUNNING,
+                        started_at=time.time(),
+                    )
+                    # Step 7: collect result (remove=False — runner controls cleanup)
+                    result = await self._backend.collect_result(
+                        container_id=container_id, attach_proc=attach_proc,
+                        stdout_stream=stdout_stream, stderr_stream=stderr_stream,
+                        command=command, cancellation=cancellation,
+                        started=started_monotonic,
+                        sandbox_instance_id=sandbox_instance_id,
+                        attestation_digest=attestation.attestation_digest,
+                        remove=False,
+                    )
+                except Exception:
+                    # Batch 3.1.3 §2: real cleanup states.  Do NOT mark
+                    # TERMINATED unless we confirm the container is gone.
+                    await self._cleanup_sandbox_instance(
+                        sandbox_instance_id, container_id or instance_name,
+                    )
+                    self._store.abort_step_and_run(
+                        step.step_run_id,
+                        verification_run_id=run.verification_run_id,
+                        failure_code="backend-lifecycle-failed",
+                    )
+                    raise
+                # Batch 3.1.3 §2: terminate, remove, and CONFIRM container
+                # is gone before persisting TERMINATED.
+                self._store.update_sandbox_instance(
+                    sandbox_instance_id,
+                    state=SandboxInstanceState.TERMINATING,
+                    terminated_at=time.time(),
+                )
+                try:
+                    terminated_ok, removed_ok = (
+                        await self._backend.terminate_and_remove_instance(container_id)
+                    )
+                except Exception:
+                    # Cleanup failed — mark CLEANUP_PENDING, attempt best-effort.
+                    self._store.update_sandbox_instance(
+                        sandbox_instance_id,
+                        state=SandboxInstanceState.CLEANUP_PENDING,
+                        failure_code="terminate-remove-exception",
+                    )
+                    try:
+                        await self._backend.terminate_and_remove_instance(container_id)
+                        gone = await self._backend.confirm_instance_gone(container_id)
+                    except Exception:
+                        gone = False
+                    if gone:
+                        self._store.update_sandbox_instance(
+                            sandbox_instance_id,
+                            state=SandboxInstanceState.TERMINATED,
+                            cleanup_status="absent",
+                            terminated_at=time.time(),
+                        )
+                    else:
+                        self._store.update_sandbox_instance(
+                            sandbox_instance_id,
+                            state=SandboxInstanceState.CLEANUP_FAILED,
+                            failure_code="cleanup-failed-after-collect",
+                        )
+                        cleanup_failed = True
+                else:
+                    if removed_ok:
+                        self._store.update_sandbox_instance(
+                            sandbox_instance_id,
+                            state=SandboxInstanceState.TERMINATED,
+                            cleanup_status="absent",
+                            terminated_at=time.time(),
+                        )
+                    else:
+                        # Container still exists — cleanup failed.
+                        self._store.update_sandbox_instance(
+                            sandbox_instance_id,
+                            state=SandboxInstanceState.CLEANUP_FAILED,
+                            failure_code="remove-returned-false",
+                        )
+                        cleanup_failed = True
+                # §3: write artifact with RESERVED→SEALED protocol.
+                try:
+                    artifact_id = self._write_artifact(
+                        run.verification_run_id, result.stdout, result.stderr,
+                    )
+                except Exception:
+                    # Artifact write failed — abort step+run atomically.
+                    self._store.abort_step_and_run(
+                        step.step_run_id,
+                        verification_run_id=run.verification_run_id,
+                        failure_code="artifact-write-failed",
+                    )
+                    raise
+                if result.cancelled:
+                    step_status = VerificationStepStatus.CANCELLED
+                    terminal = VerificationRunStatus.CANCELLED
+                    failure_code = "cancelled"
+                elif result.timed_out:
+                    step_status = VerificationStepStatus.TIMED_OUT
+                    terminal = VerificationRunStatus.TIMED_OUT
+                    failure_code = "timeout"
+                elif result.exit_code in command.expected_exit_codes:
+                    step_status = VerificationStepStatus.PASSED
+                else:
+                    step_status = VerificationStepStatus.FAILED
+                    if bool(command.metadata.get("required", True)):
+                        terminal = VerificationRunStatus.FAILED
+                        failure_code = "required-step-failed"
+                    else:
+                        # Batch 3.1.3 §9: optional step failure — mark the
+                        # step FAILED with its own failure_code, but do NOT
+                        # escalate the run to FAILED.  The run stays RUNNING
+                        # so it can still reach PASSED if all required steps
+                        # pass.  ``failure_code`` is NOT set here so the
+                        # run-level code remains empty for PASSED.
+                        pass
+                # Batch 3.1.3 §9: set the step's failure_code independently
+                # from the run-level ``failure_code``.  For optional step
+                # failures, the step gets "optional-step-failed" while the
+                # run-level code stays empty (run is still on track to PASSED).
+                step_failure_code = failure_code
+                if (step_status == VerificationStepStatus.FAILED
+                        and not bool(command.metadata.get("required", True))):
+                    step_failure_code = "optional-step-failed"
+                finished = replace(
+                    step, status=step_status, exit_code=result.exit_code,
+                    signal=result.signal, started_at=started, completed_at=time.time(),
+                    duration_ms=result.duration_ms, stdout_digest=result.stdout_digest,
+                    stderr_digest=result.stderr_digest, output_artifact_id=artifact_id,
+                    output_truncated=result.output_truncated,
+                    sandbox_instance_id=sandbox_instance_id,
+                    sandbox_image_digest=result.image_digest, failure_code=step_failure_code,
+                )
+                # §9: atomic step+run+execution terminal transition.
+                # Cancellation uses cancel_step_and_run (not the prohibited
+                # finish_step() → transition_run() split).
+                #
+                # Batch 3.1.4 §6: defer the last passing step's commit
+                # so it can be finalized atomically with Run=PASSED +
+                # Execution=VERIFIED after cleanup succeeds.
+                if step_status == VerificationStepStatus.PASSED and terminal == VerificationRunStatus.PASSED:
+                    if is_last_step:
+                        # §6: don't commit yet — hold for finalization.
+                        deferred_step = finished
+                    else:
+                        # Non-terminal step pass — use legacy finish_step.
+                        self._store.finish_step(finished)
+                elif step_status == VerificationStepStatus.TIMED_OUT:
+                    self._store.timeout_step_and_run(finished)
+                elif step_status == VerificationStepStatus.FAILED:
+                    if bool(command.metadata.get("required", True)):
+                        self._store.fail_step_and_run(finished, run_failure_code=failure_code)
+                    else:
+                        # Batch 3.1.3 §9: optional step failure — mark step
+                        # FAILED, run stays RUNNING.  Use finish_step (not
+                        # fail_step_and_run) so the run is not transitioned.
+                        self._store.finish_step(finished)
+                else:
+                    # Cancelled — atomic cancel_step_and_run with full step (§9).
+                    self._store.cancel_step_and_run(
+                        step.step_run_id,
+                        verification_run_id=run.verification_run_id,
+                        failure_code="cancelled",
+                        step=finished,
+                    )
+                completed.append(finished)
+                if terminal != VerificationRunStatus.PASSED:
+                    break
+            # Canonical workspace must still equal the immutable mutation proof.
+            try:
+                self._validate_live(context, expected_catalog=catalog.fingerprint,
+                                    expected_plan_digest=plan_digest)
+            except Exception as exc:
+                terminal = VerificationRunStatus.POISONED
+                failure_code = "canonical-workspace-drift"
+                self._approval_store.add_workspace_poison_scope(
+                    workspace.id, owner=f"verification:{run.verification_run_id}",
+                    reason="canonical-workspace-drift",
+                )
+                raise RuntimeError("canonical workspace drifted during verification") from exc
+            # Batch 3.1.3 §8: run disposable workspace cleanup BEFORE
+            # committing the terminal state.  If cleanup fails, the run
+            # must NOT reach PASSED — it is poisoned instead.  This
+            # ensures no external observer ever sees a PASSED run that
+            # left a dirty workspace behind.
+            if disposable is not None:
+                cleanup_done = True
+                self._cleanup_disposable_or_raise(
+                    verification_run_id=run.verification_run_id,
+                    workspace_id=workspace_id, disposable=disposable,
+                )
+            # §8: if any cleanup (sandbox instance or disposable workspace)
+            # failed, the run must not reach PASSED.  Downgrade to POISONED.
+            if cleanup_failed and terminal == VerificationRunStatus.PASSED:
+                terminal = VerificationRunStatus.POISONED
+                failure_code = "cleanup-failed"
+            # Batch 3.1.4 §6: atomic finalization.  The final Step=PASSED,
+            # Verification Run=PASSED, and Execution Run=VERIFIED must all
+            # be committed in ONE BEGIN IMMEDIATE transaction.  This replaces
+            # the forbidden finish_step() → cleanup → transition_run(PASSED)
+            # split where an external observer could see a PASSED run before
+            # cleanup was confirmed.
+            #
+            # For POISONED (cleanup failure) or other non-PASSED terminals,
+            # fall back to the legacy transition_run.
+            if terminal == VerificationRunStatus.PASSED:
+                # Batch 3.1.5 §4: build and persist the cleanup proof BEFORE
+                # entering FINALIZING.  The proof captures the post-cleanup
+                # state of the disposable workspace, sandbox instances, and
+                # artifacts.  finalize_success re-queries this row from the
+                # DB inside its transaction — never trusts this in-memory
+                # object.
+                cleanup_proof = self._build_cleanup_proof(
+                    run.verification_run_id, workspace_id, disposable,
+                )
+                self._store.persist_cleanup_proof(cleanup_proof)
+                if deferred_step is not None:
+                    self._store.stage_step_for_finalization(deferred_step)
+                # §6: transition to FINALIZING first, then finalize.
+                self._store.transition_run(
+                    run.verification_run_id,
+                    expected=(VerificationRunStatus.RUNNING,),
+                    target=VerificationRunStatus.FINALIZING,
+                )
+                self._store.finalize_success(
+                    step=None,
+                    verification_run_id=run.verification_run_id,
+                    execution_run_id=execution.execution_run_id,
+                    workspace_id=workspace_id,
+                    cleanup_proof=cleanup_proof,
+                )
+            elif terminal == VerificationRunStatus.POISONED:
+                self._store.transition_run(
+                    run.verification_run_id, expected=(VerificationRunStatus.RUNNING,),
+                    target=terminal, failure_code=failure_code,
+                )
+            return VerificationResult(
+                run.verification_run_id, terminal, tuple(completed), False, failure_code,
+            )
+        except Exception as exc:
+            current = self._store.get_run_by_execution(execution.execution_run_id)
+            if current and current.status in {
+                VerificationRunStatus.VALIDATING,
+                VerificationRunStatus.PREPARING_SANDBOX,
+                VerificationRunStatus.RUNNING,
+                VerificationRunStatus.FINALIZING,
+            }:
+                target = (VerificationRunStatus.POISONED
+                          if "canonical workspace" in str(exc)
+                          else VerificationRunStatus.ERRORED)
+                exception_failure_code = (
+                    "cleanup-failed"
+                    if "cleanup failed" in str(exc)
+                    else "verification-error"
+                )
+                self._store.transition_run(
+                    current.verification_run_id, expected=(current.status,),
+                    target=target, failure_code=exception_failure_code,
+                )
+            raise
+        finally:
+            # Batch 3.1.3 §8: only run cleanup here if the success path
+            # didn't already do it (i.e. an exception was raised).
+            if not cleanup_done and disposable is not None:
+                try:
+                    self._cleanup_disposable_or_raise(
+                        verification_run_id=run.verification_run_id,
+                        workspace_id=workspace_id, disposable=disposable,
+                    )
+                except Exception as cleanup_exc:
+                    current = self._store.get_run(run.verification_run_id)
+                    if (current is not None and current.status
+                            in {VerificationRunStatus.RUNNING,
+                                VerificationRunStatus.FINALIZING}):
+                        self._store.transition_run(
+                            run.verification_run_id,
+                            expected=(current.status,),
+                            target=VerificationRunStatus.POISONED,
+                            failure_code="disposable-workspace-cleanup-failed",
+                        )
+                    raise RuntimeError(
+                        "verification cleanup evidence could not be persisted"
+                    ) from cleanup_exc
+
+    def _new_run(
+        self, *, context: VerificationPhaseContext, execution: Any,
+        plan_content_hash: str, attestation_digest: str, plan_digest: str,
+        catalog_fingerprint: str,
+    ) -> VerificationExecutionRun:
+        now = time.time()
+        return VerificationExecutionRun(
+            verification_run_id=f"pvr_{uuid.uuid4().hex}",
+            execution_run_id=execution.execution_run_id, plan_id=execution.plan_id,
+            plan_content_hash=plan_content_hash,
+            approval_request_id=execution.approval_request_id,
+            execution_context_id=context.verification_context_id,
+            task_id=execution.task_id, workspace_id=execution.workspace_id,
+            repository_id=execution.repository_id,
+            bundle_digest=execution.edit_bundle_digest,
+            final_mutation_attestation_digest=attestation_digest,
+            verification_plan_digest=plan_digest,
+            trusted_catalog_fingerprint=catalog_fingerprint,
+            sandbox_profile_digest=self._profile.digest,
+            status=VerificationRunStatus.CREATED, started_at=now, updated_at=now,
+        )
+
+    def _verify_approved_attestations(
+        self, verification_run_id: str,
+    ) -> None:
+        """Batch 3.1.4 §3: verify current attestations match approved digests.
+
+        Called BEFORE any process is started.  If any attestation content
+        digest drifted since configuration time, transitions the run to
+        STALE with 0 processes started and raises PermissionError.
+
+        Skipped when approved digests are empty (test backends without
+        real Docker attestations).
+        """
+        if not self._approved_image_attestation_digest:
+            # No approved digests (test backend or declaration-only) — skip.
+            return
+        # Verify each in-memory toolchain attestation matches its approved digest.
+        approved_set = set(self._approved_toolchain_attestation_digests)
+        for attestation in self._toolchain_attestations.values():
+            if attestation.attestation_digest not in approved_set:
+                self._store.transition_run(
+                    verification_run_id,
+                    expected=(VerificationRunStatus.VALIDATING,),
+                    target=VerificationRunStatus.STALE,
+                    failure_code="toolchain-attestation-drift",
+                )
+                raise PermissionError(
+                    f"toolchain attestation drift detected: "
+                    f"{attestation.toolchain_id} digest not in approved set"
+                )
+
+    def _load_and_verify_approved_snapshot(
+        self, request: Any, plan: Any,
+    ) -> Any:
+        """Batch 3.1.5 §2: load and verify the persisted ApprovedVerificationPlanSnapshot.
+
+        Returns the loaded snapshot, or None when snapshots are not enforced
+        (unsafe test backends without a real production runtime).
+
+        Enforced only when this runner is NOT an unsafe test backend (i.e.
+        real production runs).  In production:
+          * Old requests without ``approved_verification_plan_id`` fail closed.
+          * The persisted snapshot digest MUST match the request's bound digest.
+          * The snapshot's plan_id and plan_content_hash MUST match the plan.
+        """
+        is_production = not self._is_unsafe_test_backend
+        avp_id = getattr(request, "approved_verification_plan_id", "") or ""
+        avp_digest = getattr(request, "approved_verification_plan_digest", "") or ""
+        if not avp_id or not avp_digest:
+            if is_production:
+                raise PermissionError(
+                    "production verification requires an approved verification "
+                    "plan snapshot; old requests without a snapshot fail closed"
+                )
+            return None
+        snapshot = self._store.get_approved_verification_plan_snapshot(avp_id)
+        if snapshot is None:
+            if is_production:
+                raise PermissionError(
+                    "persisted approved verification plan snapshot not found"
+                )
+            return None
+        # Verify the persisted snapshot digest matches the request's bound
+        # digest — forbids using the runtime's in-memory digest as the approved
+        # digest.
+        if snapshot.approved_verification_plan_digest != avp_digest:
+            raise PermissionError(
+                "persisted approved verification plan snapshot digest mismatch"
+            )
+        # Verify the snapshot belongs to the same plan.
+        if snapshot.plan_id != plan.plan_id:
+            raise PermissionError(
+                "approved verification plan snapshot plan_id mismatch"
+            )
+        if snapshot.plan_content_hash != plan.content_hash:
+            raise PermissionError(
+                "approved verification plan snapshot plan content hash mismatch"
+            )
+        return snapshot
+
+    def _validate_live(
+        self,
+        context: VerificationPhaseContext,
+        *,
+        expected_catalog: str | None = None,
+        expected_plan_digest: str | None = None,
+    ) -> tuple[Any, Any, Any, Any, VerificationCatalog, tuple[Any, ...]]:
+        self._require_context(context)
+        execution = self._approval_store.get_execution_run(context.execution_run_id)
+        if execution is None or execution.status not in {
+            ExecutionRunStatus.MUTATED, ExecutionRunStatus.VERIFYING,
+            ExecutionRunStatus.VERIFIED, ExecutionRunStatus.VERIFICATION_FAILED,
+            ExecutionRunStatus.VERIFICATION_ERROR,
+        }:
+            raise PermissionError("verification requires MUTATED execution run")
+        if (execution.plan_id, execution.task_id, execution.workspace_id,
+                execution.repository_id, execution.edit_bundle_digest,
+                execution.binding_digest) != (
+            context.plan_id, context.task_id, context.workspace_id,
+            context.repository_id, context.bundle_digest, context.binding_digest,
+        ):
+            raise PermissionError("verification context scope mismatch")
+        plan = self._plans.get(execution.plan_id)
+        if plan is None or plan.content_hash != execution.plan_content_hash:
+            raise PermissionError("persisted plan snapshot mismatch")
+        request = self._approval_store.get_request(execution.approval_request_id)
+        if request is None or request.binding_digest != execution.binding_digest:
+            raise PermissionError("approval binding mismatch")
+        if request.verification_digest != compute_verification_digest(plan.verification_requirements):
+            raise PermissionError("approval verification digest mismatch")
+        # Batch 3.1.5 §2: load and verify the persisted ApprovedVerificationPlanSnapshot.
+        # The snapshot was frozen before human approval and its digest is bound
+        # into the approval binding.  At execution time we load the PERSISTED
+        # snapshot (never the runtime's in-memory digest) and verify:
+        #   1. The persisted snapshot digest matches the request's bound digest.
+        #   2. The rebuilt commands/catalog/profile match the snapshot fields.
+        # Old requests without a snapshot fail closed in production mode
+        # (approved attestation digests are set).  Test backends without real
+        # Docker attestations skip this check (consistent with
+        # _verify_approved_attestations).
+        approved_snapshot = self._load_and_verify_approved_snapshot(request, plan)
+        attestation = self._approval_store.get_final_mutation_attestation(execution.execution_run_id)
+        if attestation is None or attestation.attestation_digest != context.attestation_digest:
+            raise PermissionError("final mutation attestation mismatch")
+        workspace = self._workspaces.get(execution.workspace_id)
+        if workspace is None or workspace.task_id != execution.task_id:
+            raise PermissionError("verification workspace identity mismatch")
+        state = self._context_provider.current_state(
+            repository_id=execution.repository_id, task_id=execution.task_id,
+            workspace_id=execution.workspace_id,
+        )
+        if (not state.task_active or not state.workspace_active or state.task_terminal
+                or state.workspace_terminal or state.head_sha != attestation.head
+                or state.repository_generation != attestation.generation):
+            raise PermissionError("live execution state drifted")
+        git = self._git.snapshot(workspace, repository_generation=state.repository_generation)
+        workspace_digest = hashlib.sha256("|".join(
+            f"{item.relative_path}:{item.state_digest}"
+            for item in sorted(git.file_states, key=lambda value: value.relative_path)
+        ).encode()).hexdigest()
+        if (git.head_commit != attestation.head or git.index_digest != attestation.index_digest
+                or git.worktree_admin_identity != attestation.worktree_admin_digest
+                or workspace_digest != attestation.workspace_state_digest):
+            raise PermissionError("canonical workspace no longer matches final attestation")
+        catalog = VerificationCatalog(workspace.worktree_path, repository_id=execution.repository_id)
+        for requirement in plan.verification_requirements:
+            if requirement.command is None:
+                continue
+            matches = tuple(entry for entry in catalog.entries if (
+                entry.verification_type == requirement.verification_type
+                and entry.language == requirement.scope
+                and entry.argv == requirement.command
+            ))
+            expected_configs = {
+                (evidence.path or "", str(evidence.metadata.get("config_hash", "")))
+                for evidence in requirement.evidence
+                if evidence.metadata.get("config_hash")
+            }
+            if len(matches) != 1 or not expected_configs or (
+                matches[0].config_path, matches[0].config_hash
+            ) not in expected_configs:
+                raise PermissionError("trusted verification config evidence drifted")
+        commands = self._commands.build(
+            plan.verification_requirements, catalog.entries,
+            profile_id=self._profile.profile_id,
+        )
+        digest = verification_plan_digest(
+            commands, catalog_fingerprint=catalog.fingerprint,
+            sandbox_profile_digest=self._profile.digest,
+        )
+        # Batch 3.1.5 §2: verify the rebuilt commands/catalog/profile match
+        # the persisted snapshot fields.  Any tampering with canonical commands,
+        # catalog, or profile invalidates the approval (STALE, 0 processes).
+        if approved_snapshot is not None:
+            rebuilt_command_digests = tuple(c.command_digest for c in commands)
+            if rebuilt_command_digests != approved_snapshot.ordered_command_digests:
+                raise PermissionError(
+                    "approved verification plan snapshot command drift"
+                )
+            if catalog.fingerprint != approved_snapshot.catalog_fingerprint:
+                raise PermissionError(
+                    "approved verification plan snapshot catalog fingerprint drift"
+                )
+            if self._profile.digest != approved_snapshot.sandbox_profile_digest:
+                raise PermissionError(
+                    "approved verification plan snapshot sandbox profile digest drift"
+                )
+            if (compute_verification_digest(plan.verification_requirements)
+                    != approved_snapshot.verification_requirements_digest):
+                raise PermissionError(
+                    "approved verification plan snapshot requirements drift"
+                )
+            if (tuple(sorted(catalog.config_hashes.values()))
+                    != approved_snapshot.config_hashes):
+                raise PermissionError(
+                    "approved verification plan snapshot config hash drift"
+                )
+            current_image_digest = ""
+            if self._image_attestation is not None:
+                current_image_digest = (
+                    getattr(self._image_attestation, "content_digest", "")
+                    or getattr(self._image_attestation, "attestation_digest", "")
+                )
+            if (current_image_digest
+                    != approved_snapshot.image_attestation_content_digest):
+                raise PermissionError(
+                    "approved verification plan snapshot image proof drift"
+                )
+            current_toolchain_digests = tuple(
+                item.attestation_digest
+                for item in self._ordered_toolchain_attestations
+            )
+            current_binary_digests = tuple(
+                item.binary_digest for item in self._ordered_toolchain_attestations
+            )
+            current_version_output_digests = tuple(
+                item.version_output_digest
+                for item in self._ordered_toolchain_attestations
+            )
+            current_parsed_versions = tuple(
+                item.parsed_version for item in self._ordered_toolchain_attestations
+            )
+            current_image_bindings = tuple(
+                item.image_attestation_digest
+                for item in self._ordered_toolchain_attestations
+            )
+            if (current_toolchain_digests
+                    != approved_snapshot.ordered_toolchain_attestation_content_digests):
+                raise PermissionError(
+                    "approved verification plan snapshot toolchain proof drift"
+                )
+            if current_binary_digests != approved_snapshot.binary_digests:
+                raise PermissionError(
+                    "approved verification plan snapshot binary digest drift"
+                )
+            if (current_version_output_digests
+                    != approved_snapshot.version_output_digests):
+                raise PermissionError(
+                    "approved verification plan snapshot version output drift"
+                )
+            if current_parsed_versions != approved_snapshot.parsed_versions:
+                raise PermissionError(
+                    "approved verification plan snapshot parsed version drift"
+                )
+            if any(binding != current_image_digest for binding in current_image_bindings):
+                raise PermissionError(
+                    "approved verification plan snapshot image/toolchain binding drift"
+                )
+            current_policy = compute_image_toolchain_policy_fingerprint(
+                image_attestation_content_digest=current_image_digest,
+                ordered_toolchain_attestation_content_digests=(
+                    current_toolchain_digests
+                ),
+                sandbox_profile_digest=self._profile.digest,
+            )
+            if (current_policy
+                    != approved_snapshot.image_toolchain_policy_fingerprint):
+                raise PermissionError(
+                    "approved verification plan snapshot policy fingerprint drift"
+                )
+        if expected_catalog is not None and catalog.fingerprint != expected_catalog:
+            raise PermissionError("verification catalog fingerprint drifted")
+        if expected_plan_digest is not None and digest != expected_plan_digest:
+            raise PermissionError("verification plan digest drifted")
+        return execution, plan, attestation, workspace, catalog, commands
+
+    def _require_context(self, context: VerificationPhaseContext) -> None:
+        if self._contexts.get(getattr(context, "verification_context_id", "")) is not context:
+            raise PermissionError("verification context was not issued by runtime")
+        self._fence.assert_owner(
+            context.workspace_id, f"verification-lease:{context.phase_lease_id}",
+        )
+        row = self._store.require_phase_lease(context.phase_lease_id)
+        if (
+            row["execution_run_id"], row["owner_execution_id"], row["task_id"],
+            row["workspace_id"], row["repository_id"], row["plan_id"],
+            row["bundle_digest"], row["attestation_digest"],
+            row["binding_digest"],
+        ) != (
+            context.execution_run_id, context.owner_execution_id, context.task_id,
+            context.workspace_id, context.repository_id, context.plan_id,
+            context.bundle_digest, context.attestation_digest,
+            context.binding_digest,
+        ):
+            raise PermissionError("verification phase lease binding mismatch")
+        persisted_epoch, persisted_boot = self._approval_store.get_current_epoch()
+        if (int(row["server_epoch"]) != context.server_epoch
+                or row["boot_id"] != context.boot_id
+                or persisted_epoch != context.server_epoch
+                or persisted_boot != context.boot_id
+                or context.server_epoch != self._boot.server_epoch
+                or context.boot_id != self._boot.boot_id):
+            raise PermissionError("verification runtime boot is stale")
+
+    def _write_artifact(self, run_id: str, stdout: bytes, stderr: bytes) -> str:
+        """Batch 3.1.2 §7: RESERVED → temp → final no-replace → fsync → SEALED.
+
+        Uses :class:`ArtifactRootCapability` for all file operations:
+        dir_fd-only access, no Path re-parsing, no ``os.rename`` to
+        overwrite existing final files.  The protocol is:
+        1. Insert a RESERVED artifact row (BEFORE writing the file).
+        2. Write temp file (O_CREAT|O_EXCL|O_NOFOLLOW) + fsync.
+        3. Link temp → final (no-replace, fails if final exists).
+        4. fsync the artifact root directory.
+        5. Unlink the temp file.
+        6. Atomically transition RESERVED → SEALED in the DB.
+        """
+        self._artifact_capability.verify_identity()
+        artifact_id = f"pvo_{secrets.token_hex(20)}"
+        relative = f"{artifact_id}.log"
+        expires_at = time.time() + self._artifact_ttl
+        # Step 1: RESERVED row BEFORE writing the file.
+        self._store.reserve_artifact(
+            artifact_id=artifact_id, verification_run_id=run_id,
+            relative_name=relative, expires_at=expires_at,
+        )
+        payload = b"stdout:\n" + stdout + b"\nstderr:\n" + stderr
+        # Steps 2-5: write via capability (temp + fsync + link + root fsync + unlink temp).
+        try:
+            content_digest, byte_length = self._artifact_capability.write_artifact(
+                artifact_id, payload,
+            )
+            identity = self._artifact_capability.attest_sealed_artifact(
+                artifact_id,
+            )
+            if (identity.content_digest != content_digest
+                    or identity.byte_length != byte_length):
+                raise RuntimeError("artifact changed before durable sealing")
+        except Exception:
+            # Cleanup: if the temp file was created but link failed, the
+            # capability already cleaned it up.  Mark the artifact row
+            # as quarantined so reconciliation can handle it.
+            self._store.quarantine_artifact(artifact_id, reason="write-failed")
+            raise
+        # Step 6: SEALED.
+        self._store.seal_artifact(
+            artifact_id=artifact_id,
+            content_digest=content_digest, byte_length=byte_length,
+            artifact_dev=identity.dev, artifact_ino=identity.ino,
+            artifact_uid=identity.uid, artifact_gid=identity.gid,
+            artifact_mode=identity.mode, artifact_nlink=identity.nlink,
+        )
+        return artifact_id
+
+    # ------------------------------------------------------------------
+    # Batch 3.1.5 §4: Durable cleanup proof construction
+    # ------------------------------------------------------------------
+
+    def _build_cleanup_proof(
+        self, verification_run_id: str, workspace_id: str,
+        disposable: Any,
+    ) -> Any:
+        """Batch 3.1.5 §4: build a durable cleanup proof after physical cleanup.
+
+        Captures the post-cleanup state of the disposable workspace, all
+        sandbox instances (must be TERMINATED), and all artifacts (must be
+        SEALED).  The proof is persisted in its own row BEFORE the
+        finalization transaction — ``finalize_success`` re-queries this
+        row from the DB and re-verifies every field inside BEGIN
+        IMMEDIATE.
+
+        Missing durable cleanup state is always a hard failure.
+        """
+        if disposable is None or not workspace_id:
+            raise RuntimeError("cleanup proof requires a disposable workspace")
+        from khaos.coding.planning.verification_execution_models import (
+            VerificationCleanupProof, compute_cleanup_digest,
+        )
+        # Load the persisted disposable workspace record (post-cleanup).
+        record = self._store.get_disposable_workspace(workspace_id)
+        if (record is None or record.state != DisposableWorkspaceState.CLEANED
+                or record.cleaned_at is None
+                or record.verification_run_id != verification_run_id
+                or record.instance_id != disposable.instance_id
+                or record.manifest_digest != disposable.manifest_digest):
+            raise RuntimeError("disposable workspace is not durably CLEANED")
+        cleaned_at = record.cleaned_at
+        # Disposable workspace identity: instance ID + manifest digest.
+        # This binds the proof to the specific disposable workspace that
+        # was created, sealed, and destroyed for this verification run.
+        disposable_identity = (
+            f"{disposable.instance_id}:{disposable.manifest_digest}"
+        )
+        # Collect sandbox instance IDs and absence digests.
+        # Toolchain-attestation instances are excluded — they are not
+        # per-run verification containers and are reconciled separately.
+        instances = self._store.list_sandbox_instances_for_run(
+            verification_run_id,
+        )
+        sandbox_instance_ids: list[str] = []
+        sandbox_absence_digests: list[str] = []
+        for inst in instances:
+            if inst.instance_kind == "toolchain-attestation":
+                continue
+            if (inst.state != SandboxInstanceState.TERMINATED
+                    or inst.terminated_at is None
+                    or inst.cleanup_status != "absent"):
+                raise RuntimeError("sandbox instance lacks durable absence proof")
+            sandbox_instance_ids.append(inst.sandbox_instance_id)
+            # Absence digest: proves the container is gone.  Computed
+            # from the terminal state, terminated_at timestamp, and
+            # container_id (empty = never created or already removed).
+            sandbox_absence_digests.append(self._sandbox_absence_digest(inst))
+        # Collect artifact IDs and seal digests (content_digest).
+        artifacts = self._store.list_artifacts_for_run(verification_run_id)
+        artifact_ids: list[str] = []
+        artifact_seal_digests: list[str] = []
+        for art in artifacts:
+            if art["status"] != "sealed" or not (
+                self._verify_artifact_row(art)
+            ):
+                raise RuntimeError("verification artifact is not durably sealed")
+            artifact_ids.append(art["artifact_id"])
+            artifact_seal_digests.append(self._artifact_seal_digest(art))
+        # Compute canonical workspace final digest from the persisted
+        # final mutation attestation.  This is the immutable proof of
+        # the canonical workspace's state at mutation time — already
+        # re-verified against the live workspace in _validate_live.
+        canonical_final_digest = self._canonical_workspace_digest_for_run(
+            verification_run_id,
+        )
+        cleanup_digest = compute_cleanup_digest(
+            verification_run_id=verification_run_id,
+            disposable_workspace_id=workspace_id,
+            disposable_workspace_identity=disposable_identity,
+            disposable_cleaned_at=cleaned_at,
+            sandbox_instance_ids=tuple(sandbox_instance_ids),
+            sandbox_absence_digests=tuple(sandbox_absence_digests),
+            artifact_ids=tuple(artifact_ids),
+            artifact_seal_digests=tuple(artifact_seal_digests),
+            canonical_workspace_final_digest=canonical_final_digest,
+        )
+        return VerificationCleanupProof(
+            verification_run_id=verification_run_id,
+            disposable_workspace_id=workspace_id,
+            disposable_workspace_identity=disposable_identity,
+            disposable_cleaned_at=cleaned_at,
+            sandbox_instance_ids=tuple(sandbox_instance_ids),
+            sandbox_absence_digests=tuple(sandbox_absence_digests),
+            artifact_ids=tuple(artifact_ids),
+            artifact_seal_digests=tuple(artifact_seal_digests),
+            canonical_workspace_final_digest=canonical_final_digest,
+            cleanup_digest=cleanup_digest,
+            created_at=time.time(),
+        )

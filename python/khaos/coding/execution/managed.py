@@ -19,6 +19,7 @@ class ManagedProcessHandle:
         *,
         temporary_home: Path | None = None,
         stderr_limit: int = 65536,
+        supervisor=None,
     ) -> None:
         self.execution_id = execution_id
         self._process = process
@@ -29,6 +30,7 @@ class ManagedProcessHandle:
         self._stderr = bytearray()
         self._stderr_truncated = False
         self._closed = False
+        self._supervisor = supervisor
         self._stderr_task = asyncio.create_task(self._collect_stderr())
 
     @property
@@ -52,6 +54,8 @@ class ManagedProcessHandle:
     async def wait(self) -> int:
         code = await self._process.wait()
         await self._finish_stderr()
+        if self._supervisor is not None:
+            await self._supervisor.unregister_process(self.execution_id)
         return code
 
     async def terminate(self) -> None:
@@ -61,11 +65,15 @@ class ManagedProcessHandle:
         immediate LSP process leaves language-server helpers alive, so use the
         group on POSIX and retain the normal asyncio fallback on Windows.
         """
-        if self._process.returncode is None:
+        if self._supervisor is not None:
+            await self._supervisor.terminate(self.execution_id)
+        elif self._process.returncode is None:
             _signal_process_tree(self._process.pid, signal.SIGTERM, self._process.terminate)
 
     async def kill(self) -> None:
-        if self._process.returncode is None:
+        if self._supervisor is not None:
+            await self._supervisor.terminate(self.execution_id)
+        elif self._process.returncode is None:
             _signal_process_tree(self._process.pid, signal.SIGKILL, self._process.kill)
 
     async def aclose(self) -> None:
@@ -81,6 +89,8 @@ class ManagedProcessHandle:
                 await self._process.wait()
         finally:
             await self._finish_stderr()
+            if self._supervisor is not None:
+                await self._supervisor.unregister_process(self.execution_id)
             if self._temporary_home is not None:
                 shutil.rmtree(self._temporary_home, ignore_errors=True)
 

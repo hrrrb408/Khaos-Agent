@@ -1,6 +1,20 @@
 package auth
 
-import "net/http"
+import (
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/hex"
+	"net/http"
+)
+
+type principalContextKey struct{}
+
+// PrincipalFromContext returns the authenticated API-key principal.
+func PrincipalFromContext(ctx context.Context) (string, bool) {
+	principal, ok := ctx.Value(principalContextKey{}).(string)
+	return principal, ok && principal != ""
+}
 
 // Middleware validates X-Khaos-Key when apiKey is configured.
 func Middleware(apiKey string, next http.Handler) http.Handler {
@@ -9,10 +23,16 @@ func Middleware(apiKey string, next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		if r.Header.Get("X-Khaos-Key") != apiKey && r.URL.Query().Get("key") != apiKey {
+		provided := r.Header.Get("X-Khaos-Key")
+		providedDigest := sha256.Sum256([]byte(provided))
+		expectedDigest := sha256.Sum256([]byte(apiKey))
+		if subtle.ConstantTimeCompare(providedDigest[:], expectedDigest[:]) != 1 {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
-		next.ServeHTTP(w, r)
+		principal := "api-key:" + hex.EncodeToString(expectedDigest[:])
+		next.ServeHTTP(w, r.WithContext(context.WithValue(
+			r.Context(), principalContextKey{}, principal,
+		)))
 	})
 }

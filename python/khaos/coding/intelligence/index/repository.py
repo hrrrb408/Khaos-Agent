@@ -105,10 +105,51 @@ class RepositoryIndexer:
         self._locks_guard = asyncio.Lock()
         self._closed = False
         self._resolution_service = resolution_service
+        # Batch 2.6 §5: optional per-workspace mutation fence. When set,
+        # index() acquires the fence (owner="indexer:{repository_id}")
+        # BEFORE writing parse results so generation updates are
+        # serialized with active lease acquisition / Batch 3 execution.
+        self._mutation_fence: Any = None
+        self._fence_workspace_resolver: Any = None
 
-    async def index(self, repository_id: str, root: Path, *, full_reindex: bool = False) -> dict[str, Any]:
+    def set_mutation_fence(self, fence: Any, *, workspace_resolver: Any = None) -> None:
+        """Batch 2.6 §5: register the shared per-workspace mutation fence.
+
+        ``workspace_resolver`` is an optional callable that takes
+        ``repository_id`` and returns the ``workspace_id`` whose fence
+        should be acquired (or ``None`` if no workspace is active). When
+        no resolver is provided, the fence is acquired with
+        ``workspace_id=repository_id`` (repository-level serialization).
+        """
+        self._mutation_fence = fence
+        self._fence_workspace_resolver = workspace_resolver
+
+    async def index(
+        self, repository_id: str, root: Path, *, workspace_id: str | None = None,
+        full_reindex: bool = False,
+    ) -> dict[str, Any]:
         if self._closed:
             raise RuntimeError("RepositoryIndexer is closed")
+        # Batch 2.6 §5: acquire the mutation fence BEFORE writing parse
+        # results so generation updates are serialized with active lease
+        # acquisition / Batch 3 execution / cleanup. Falls back to
+        # repository_id as the workspace key when no resolver is set.
+        if self._mutation_fence is not None:
+            if not workspace_id:
+                raise RuntimeError("workspace_id is required for fenced repository indexing")
+            if self._fence_workspace_resolver is None:
+                raise RuntimeError("canonical repository/workspace resolver is required")
+            resolved = self._fence_workspace_resolver(repository_id, workspace_id)
+            if resolved != workspace_id:
+                raise RuntimeError("repository/workspace mutation scope is invalid or ambiguous")
+            async with self._mutation_fence.use(
+                workspace_id, owner=f"indexer:{repository_id}",
+            ):
+                return await self._index_impl(repository_id, root, full_reindex=full_reindex)
+        return await self._index_impl(repository_id, root, full_reindex=full_reindex)
+
+    async def _index_impl(self, repository_id: str, root: Path, *, full_reindex: bool = False) -> dict[str, Any]:
+        """Internal index — assumes fence (if any) is already held."""
         started = time.perf_counter(); root = root.expanduser().resolve(strict=True); root_identity = _root_identity(root)
         if full_reindex: self.cache.clear_repository(repository_id, root_identity)
         paths, rejected_paths = _enumerate_files(root, self.ignored_dirs)

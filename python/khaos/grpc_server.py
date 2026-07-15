@@ -1,7 +1,7 @@
 """Python AgentService and MemoryService.
 
-The service classes mirror the LLD gRPC surface. The optional JSON-line TCP
-server keeps Phase 2 testable without generated protobuf dependencies.
+The service classes mirror the LLD gRPC surface. The JSON-line Unix socket
+server keeps the control plane local without generated protobuf dependencies.
 """
 
 from __future__ import annotations
@@ -9,6 +9,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
+import stat
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -52,6 +54,7 @@ class ChatRequest:
     session_id: str
     message: str
     mode: str = ""
+    principal_id: str = ""
 
 
 @dataclass
@@ -60,6 +63,8 @@ class ConfirmRequest:
     tool_call_id: str
     approved: bool
     remember: bool = False
+    principal_id: str = ""
+    binding_digest: str = ""
 
 
 class AgentService:
@@ -71,7 +76,7 @@ class AgentService:
         self.config_path = config_path or self.project_root / "config.yaml"
         self._router = router
         self.pending_confirmations: dict[str, dict] = {}
-        self.approval_broker = ApprovalBroker()
+        self.approval_broker = ApprovalBroker(db=db)
         # Shared coding-task tracker so the TUI / TaskService can observe
         # long-running coding turns alongside the AgentLoop.
         self.task_manager = TaskManager(db=db)
@@ -105,7 +110,11 @@ class AgentService:
     async def chat(self, request: ChatRequest) -> AsyncIterator[dict]:
         """Stream chat events."""
         session_id = request.session_id or str(uuid.uuid4())
-        mode_manager, loop = await self._build_runtime(session_id, request.mode)
+        mode_manager, loop = await self._build_runtime(
+            session_id,
+            request.mode,
+            request.principal_id or f"local-uid:{os.getuid()}",
+        )
         del mode_manager
         async for message in loop.run(request.message, session_id):
             yield _message_to_event(message)
@@ -120,7 +129,18 @@ class AgentService:
         return {"current_mode": mode.value}
 
     async def confirm_permission(self, request: ConfirmRequest) -> dict:
-        return {"ok": await self.approval_broker.resolve(request.tool_call_id, request.approved, request.remember)}
+        if not request.principal_id or not request.binding_digest:
+            return {"ok": False, "error": "approval principal/binding required"}
+        return {
+            "ok": await self.approval_broker.resolve(
+                request.tool_call_id,
+                request.approved,
+                request.remember,
+                principal_id=request.principal_id,
+                session_id=request.session_id,
+                binding_digest=request.binding_digest,
+            )
+        }
 
     async def handle_webhook(
         self,
@@ -159,7 +179,9 @@ class AgentService:
         changed = self.channel_registry.enable(channel_id) if enabled else self.channel_registry.disable(channel_id)
         return {"ok": changed, "channel_id": channel_id}
 
-    async def _build_runtime(self, session_id: str, mode: str) -> tuple[ModeManager, AgentLoop]:
+    async def _build_runtime(
+        self, session_id: str, mode: str, principal_id: str = ""
+    ) -> tuple[ModeManager, AgentLoop]:
         await self.db.create_session(session_id, mode or "office")
         from khaos.runtime import RuntimeConfig, build_runtime
 
@@ -170,11 +192,16 @@ class AgentService:
             task_manager=self.task_manager,
             approval_broker=self.approval_broker,
             router=self._router,
+            principal_id=principal_id or f"local-uid:{os.getuid()}",
         ))
         return result.mode_manager, result.loop
 
     async def _wait_for_confirmation(self, request: dict) -> dict:
-        return await self.approval_broker.wait(request["id"], timeout=120.0)
+        return await self.approval_broker.wait(
+            request["id"],
+            timeout=120.0,
+            binding_digest=request["binding_digest"],
+        )
 
     def _build_security_middleware(self) -> SecurityMiddleware:
         """Build the full security stack from the policy file.
@@ -310,7 +337,13 @@ class TaskService:
             return {"ok": False, "error": "task already terminal", "task_id": task_id}
         return {"ok": True, "task_id": task_id}
 
-    async def approve(self, task_id: str) -> dict:
+    async def approve(
+        self,
+        task_id: str,
+        principal_id: str = "",
+        session_id: str = "",
+        binding_digest: str = "",
+    ) -> dict:
         from khaos.coding.task_manager import TaskStatus, TransitionResult
 
         task = await self.task_manager.get(task_id)
@@ -319,13 +352,42 @@ class TaskService:
         if task.status != TaskStatus.BLOCKED:
             return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
         pending = task.metadata.get("pending_approval") or {}
+        if (
+            not self.approval_broker
+            or principal_id != pending.get("principal_id")
+            or session_id != pending.get("session_id")
+            or binding_digest != pending.get("binding_digest")
+        ):
+            return {
+                "ok": False,
+                "error": "approval principal/session/binding mismatch",
+                "task_id": task_id,
+            }
         result = await self.task_manager.transition(task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.RUNNING, pending_approval=None)
         if result != TransitionResult.UPDATED:
             return {"ok": False, "error": "task is no longer blocked", "task_id": task_id}
-        resolved = await self.approval_broker.resolve(pending.get("tool_call_id", ""), True) if self.approval_broker else True
+        resolved = await self.approval_broker.resolve(
+            pending.get("tool_call_id", ""),
+            True,
+            principal_id=principal_id,
+            session_id=session_id,
+            binding_digest=binding_digest,
+        )
+        if not resolved:
+            await self.task_manager.update_status(
+                task_id,
+                TaskStatus.FAILED,
+                error="approval capability was stale or already consumed",
+            )
         return {"ok": resolved, "task_id": task_id}
 
-    async def reject(self, task_id: str) -> dict:
+    async def reject(
+        self,
+        task_id: str,
+        principal_id: str = "",
+        session_id: str = "",
+        binding_digest: str = "",
+    ) -> dict:
         from khaos.coding.task_manager import TaskStatus, TransitionResult
 
         task = await self.task_manager.get(task_id)
@@ -334,10 +396,27 @@ class TaskService:
         if task.status != TaskStatus.BLOCKED:
             return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
         pending = task.metadata.get("pending_approval") or {}
+        if (
+            not self.approval_broker
+            or principal_id != pending.get("principal_id")
+            or session_id != pending.get("session_id")
+            or binding_digest != pending.get("binding_digest")
+        ):
+            return {
+                "ok": False,
+                "error": "approval principal/session/binding mismatch",
+                "task_id": task_id,
+            }
         result = await self.task_manager.transition(task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.FAILED, error="rejected by user", pending_approval=None)
         if result != TransitionResult.UPDATED:
             return {"ok": False, "error": "task is no longer blocked", "task_id": task_id}
-        resolved = await self.approval_broker.resolve(pending.get("tool_call_id", ""), False) if self.approval_broker else True
+        resolved = await self.approval_broker.resolve(
+            pending.get("tool_call_id", ""),
+            False,
+            principal_id=principal_id,
+            session_id=session_id,
+            binding_digest=binding_digest,
+        )
         return {"ok": resolved, "task_id": task_id}
 
     async def artifacts(self, task_id: str) -> list[dict]:
@@ -348,15 +427,22 @@ class TaskService:
 
 
 async def serve_json_lines(
-    host: str,
-    port: int,
+    socket_path: str,
     db_path: str,
     project_root: Path | None = None,
     config_path: Path | None = None,
     enable_subagents: bool = False,
     router=None,
 ) -> None:
-    """Serve JSON-line RPC requests over TCP."""
+    """Serve the privileged JSON-line control plane over a mode-0600 UDS."""
+    uds_path = Path(socket_path).expanduser().resolve()
+    uds_path.parent.mkdir(parents=True, exist_ok=True)
+    if uds_path.exists() or uds_path.is_symlink():
+        mode = uds_path.lstat().st_mode
+        if not stat.S_ISSOCK(mode):
+            raise PermissionError(f"refusing to replace non-socket RPC path: {uds_path}")
+        uds_path.unlink()
+
     db = Database(db_path)
     await db.connect()
     await db.run_migrations()
@@ -455,7 +541,7 @@ async def serve_json_lines(
                 writer.write((json.dumps(await task_service.create(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
             elif method in {"TaskService.Cancel", "TaskService.Approve", "TaskService.Reject"}:
                 action = method.rsplit(".", 1)[-1].lower()
-                writer.write((json.dumps(await getattr(task_service, action)(payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
+                writer.write((json.dumps(await getattr(task_service, action)(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
             elif method == "TaskService.Artifacts":
                 writer.write((json.dumps(await task_service.artifacts(payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
             elif method == "TaskService.Events":
@@ -479,10 +565,13 @@ async def serve_json_lines(
             await writer.wait_closed()
 
     try:
-        server = await asyncio.start_server(handle, host, port)
+        server = await asyncio.start_unix_server(handle, path=str(uds_path))
+        os.chmod(uds_path, 0o600)
         async with server:
             await server.serve_forever()
     finally:
+        if uds_path.exists() and stat.S_ISSOCK(uds_path.lstat().st_mode):
+            uds_path.unlink()
         await agent.shutdown()
         await db.close()
 
@@ -490,7 +579,7 @@ async def serve_json_lines(
 def _parse_json_line(line: bytes) -> dict:
     """Decode one JSON-line request into a dict.
 
-    Empty TCP probes are handled before this function. Malformed payloads get a
+    Empty connection probes are handled before this function. Malformed payloads get a
     structured error response instead of bubbling into asyncio's
     client_connected_cb exception logger.
     """
@@ -597,16 +686,14 @@ def _memory_to_dict(memory: Memory) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=50051)
+    parser.add_argument("--socket", default="/tmp/khaos-agent.sock")
     parser.add_argument("--db", default="khaos.db")
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--subagents", action="store_true")
     args = parser.parse_args()
     asyncio.run(
         serve_json_lines(
-            args.host,
-            args.port,
+            args.socket,
             args.db,
             project_root=Path.cwd(),
             config_path=Path(args.config),

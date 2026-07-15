@@ -110,8 +110,8 @@ def _make_db() -> sqlite3.Connection:
 
 def _insert_code_file(conn: sqlite3.Connection, repo_id: str, path: str, generation: int = 1) -> None:
     conn.execute(
-        "INSERT OR REPLACE INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (repo_id, path, "python", 1, 100, 0, "hash", "", "{}", 0, generation),
+        "INSERT OR REPLACE INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (repo_id, path, "python", 1, 100, 0, "hash", "", "{}", 0, generation, "source", "", "", ""),
     )
     conn.commit()
 

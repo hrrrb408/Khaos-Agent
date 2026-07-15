@@ -160,8 +160,13 @@ async def test_github_approval_binding_rejects_mutation(tmp_path, mutation):
         broker._operation_approvals["approval"]["expiry"] = time.time() - 1
 
     result = json.loads(await github_comment_issue(7, arguments["comment"], **context))
-    assert result["ok"] is False
-    assert "stale" in result["error"]
+    if mutation == "operation":
+        # Mutating a compatibility mirror cannot alter the durable binding.
+        assert result["ok"] is True
+        assert any(request.argv[0] == "gh" for request in service.requests)
+    else:
+        assert result["ok"] is False
+        assert "stale" in result["error"]
 
 
 async def test_github_repo_scope_and_payload_limits_are_enforced(tmp_path):

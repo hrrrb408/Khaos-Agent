@@ -58,7 +58,7 @@ gateway:
   host: "127.0.0.1"
   port: 8080
   api_key: "${KHAOS_API_KEY}"
-  python_agent: "127.0.0.1:50051"
+  python_agent: "/tmp/khaos-agent.sock"
   listen: "127.0.0.1:8080"
 
 web:
@@ -72,8 +72,7 @@ model:
   temperature: 0.7
 
 agent:
-  host: "127.0.0.1"
-  port: 50051
+  socket: "/tmp/khaos-agent.sock"
 
 security:
   enabled: true

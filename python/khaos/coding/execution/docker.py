@@ -4,11 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
+import secrets
 import tempfile
-import time
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 
-from khaos.coding.execution.models import ExecutionResult, NetworkPolicy, ResolvedExecutionContext
+from khaos.coding.execution.models import (
+    ExecutionRequest,
+    ExecutionResult,
+    NetworkPolicy,
+    ResolvedExecutionContext,
+    ResourceBudget,
+)
+from khaos.coding.execution.supervisor import ProcessSupervisor
 
 
 _DENIED_ENV_KEYS = frozenset({
@@ -16,6 +26,21 @@ _DENIED_ENV_KEYS = frozenset({
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GOOGLE_APPLICATION_CREDENTIALS",
 })
+DEFAULT_DOCKER_IMAGE = (
+    "python@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280"
+)
+_DIGEST_PINNED_IMAGE = re.compile(
+    r"^[a-z0-9][a-z0-9._/-]*(?::[a-zA-Z0-9._-]+)?@sha256:[0-9a-f]{64}$"
+)
+_SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+_OWNER_LABEL = "io.khaos.owner-nonce"
+
+
+@dataclass
+class _ContainerLease:
+    name: str
+    owner_nonce: str
+    cleanup_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 class DockerBackend:
@@ -23,11 +48,26 @@ class DockerBackend:
 
     name = "docker"
 
-    def __init__(self, *, allowed_images: set[str] | None = None, docker_binary: str = "docker") -> None:
-        self.allowed_images = frozenset(allowed_images or {"python:3.13-slim"})
+    def __init__(
+        self,
+        *,
+        allowed_images: set[str] | None = None,
+        docker_binary: str = "docker",
+        supervisor: ProcessSupervisor | None = None,
+    ) -> None:
+        self.allowed_images = frozenset(
+            allowed_images or {DEFAULT_DOCKER_IMAGE}
+        )
+        if not self.allowed_images or any(
+            _DIGEST_PINNED_IMAGE.fullmatch(image) is None
+            for image in self.allowed_images
+        ):
+            raise ValueError(
+                "Docker image allowlist entries must be pinned by sha256 digest"
+            )
         self.docker_binary = docker_binary
-        self._active: dict[str, str] = {}
-        self._artifacts: set[Path] = set()
+        self.supervisor = supervisor or ProcessSupervisor()
+        self._active: dict[str, _ContainerLease] = {}
         self._lock = asyncio.Lock()
 
     async def execute_resolved(self, context: ResolvedExecutionContext) -> ExecutionResult:
@@ -35,16 +75,24 @@ class DockerBackend:
         image = _image_from_environment(context.environment)
         if image not in self.allowed_images:
             raise PermissionError("Docker image is not in the configured allowlist")
+        if _DIGEST_PINNED_IMAGE.fullmatch(image) is None:
+            raise PermissionError("Docker image must be pinned by sha256 digest")
         inspected = await self._run_cli(("image", "inspect", image), timeout=10)
         if inspected[0] != 0:
             raise PermissionError("Docker image is unavailable locally; automatic pull is disabled")
 
         execution_id = context.correlation_id
+        if _SAFE_EXECUTION_ID.fullmatch(execution_id) is None:
+            raise PermissionError("execution id is unsafe for a container name")
         container_name = f"khaos-{execution_id}"
+        lease = _ContainerLease(container_name, secrets.token_hex(16))
         relative_cwd = context.cwd.relative_to(context.worktree_path)
         container_cwd = Path("/workspace") / relative_cwd
         argv = [
             self.docker_binary, "run", "--name", container_name, "--rm",
+            "--pull", "never", "--init", "--ipc", "none",
+            "--label", f"{_OWNER_LABEL}={lease.owner_nonce}",
+            "--label", f"io.khaos.execution={execution_id}",
             "--read-only", "--tmpfs", f"/tmp:rw,noexec,nosuid,nodev,size={context.budget.tmpfs_bytes}",
             "--user", "65534:65534", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--pids-limit", str(context.budget.pids),
@@ -58,76 +106,76 @@ class DockerBackend:
             argv.extend(["--env-file", str(env_file)])
         argv.extend([image, *context.argv])
 
-        started = time.monotonic()
-        process = await asyncio.create_subprocess_exec(
-            *argv,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-        )
         async with self._lock:
-            self._active[execution_id] = container_name
-        status = "failed"
-        return_code = None
-        diagnostics: dict[str, object] = {"container_id": container_name, "cleanup": "pending"}
+            self._active[execution_id] = lease
+        diagnostics: dict[str, object] = {
+            "container_id": container_name,
+            "cleanup": "pending",
+        }
         try:
-            try:
-                stdout, stderr = await asyncio.wait_for(
-                    process.communicate(), timeout=context.budget.timeout_seconds
-                )
-                return_code = process.returncode
-                status = "passed" if return_code == 0 else "failed"
-            except asyncio.TimeoutError:
-                stdout, stderr = b"", b"docker execution timed out"
-                status = "timed-out"
-                await self._cleanup_container(container_name)
-                if process.returncode is None:
-                    process.kill()
-                    await process.wait()
-            limit = context.budget.output_bytes
-            combined_size = len(stdout) + len(stderr)
-            if combined_size > limit:
-                artifact = self._write_output_artifact(execution_id, stdout, stderr)
-                diagnostics.update({
-                    "output_truncated": True,
-                    "output_bytes_dropped": combined_size - limit,
-                    "output_artifact": str(artifact),
-                })
-            stdout_limit = min(len(stdout), limit)
-            stderr_limit = max(0, limit - stdout_limit)
+            docker_request = ExecutionRequest(
+                argv=tuple(argv),
+                cwd=context.cwd,
+                permission_profile=context.permission_profile,
+                correlation_id=execution_id,
+            )
+            result = await self.supervisor.run(
+                docker_request,
+                cwd=context.cwd,
+                env={"PATH": os.environ.get("PATH", "")},
+            )
+            diagnostics.update(result.diagnostics)
             return ExecutionResult(
-                execution_id, status, return_code,
-                stdout[:stdout_limit].decode("utf-8", errors="replace"),
-                stderr[:stderr_limit].decode("utf-8", errors="replace"),
-                int((time.monotonic() - started) * 1000), diagnostics,
+                execution_id=execution_id,
+                status=result.status,
+                return_code=result.return_code,
+                stdout=result.stdout,
+                stderr=result.stderr,
+                duration_ms=result.duration_ms,
+                diagnostics=diagnostics,
             )
         finally:
-            await self._cleanup_container(container_name)
-            diagnostics["cleanup"] = "removed"
-            async with self._lock:
-                self._active.pop(execution_id, None)
-            if env_file is not None:
-                env_file.unlink(missing_ok=True)
+            try:
+                await self._cleanup_container(lease)
+                diagnostics["cleanup"] = "removed"
+            finally:
+                async with self._lock:
+                    self._active.pop(execution_id, None)
+                if env_file is not None:
+                    env_file.unlink(missing_ok=True)
 
     async def execute(self, request):
         raise PermissionError("DockerBackend requires ResolvedExecutionContext")
 
     async def terminate(self, execution_id: str) -> None:
+        await self.supervisor.terminate(execution_id)
         async with self._lock:
-            container_name = self._active.get(execution_id)
-        if container_name is not None:
-            await self._cleanup_container(container_name)
+            lease = self._active.get(execution_id)
+        if lease is not None:
+            await self._cleanup_container(lease)
 
     async def shutdown(self) -> None:
+        await self.supervisor.shutdown()
         async with self._lock:
             active = tuple(self._active.values())
-        for container_name in active:
-            await self._cleanup_container(container_name)
-        for artifact in tuple(self._artifacts):
-            artifact.unlink(missing_ok=True)
-            self._artifacts.discard(artifact)
+        for lease in active:
+            await self._cleanup_container(lease)
 
     def _validate_context(self, context: ResolvedExecutionContext) -> None:
+        profile = context.permission_profile
+        if profile is None:
+            raise PermissionError("Docker execution requires a permission profile")
+        profile.validate_resolved()
+        if context.access_mode != profile.filesystem.value:
+            raise PermissionError("resolved access mode differs from permission profile")
+        if context.network_policy is not profile.network:
+            raise PermissionError("resolved network policy differs from permission profile")
+        if context.writable_roots != profile.writable_roots:
+            raise PermissionError("resolved writable roots differ from permission profile")
+        if context.allowed_environment_keys != profile.environment_keys:
+            raise PermissionError("resolved environment keys differ from permission profile")
+        if context.budget != profile.resources:
+            raise PermissionError("resolved resource budget differs from permission profile")
         if context.workspace_state not in {"ready", "running", "verifying"}:
             raise PermissionError("Docker execution requires an active writable Workspace state")
         if context.access_mode != "workspace-write":
@@ -140,6 +188,8 @@ class DockerBackend:
             raise PermissionError("Docker writable roots must equal the active TaskWorkspace")
         if context.cwd != context.worktree_path and context.worktree_path not in context.cwd.parents:
             raise PermissionError("Docker cwd is outside the active TaskWorkspace")
+        if any(character in str(context.worktree_path) for character in (",", "\n", "\r", "\x00")):
+            raise PermissionError("Docker workspace path is unsafe for mount syntax")
         if not (context.worktree_path / ".git").is_file():
             raise PermissionError("Docker mount is not an active Git Worktree")
         if not context.argv:
@@ -169,45 +219,58 @@ class DockerBackend:
             raise
         return path
 
-    def _write_output_artifact(self, execution_id: str, stdout: bytes, stderr: bytes) -> Path:
-        descriptor, name = tempfile.mkstemp(prefix=f"khaos-docker-{execution_id}-", suffix=".log")
-        path = Path(name)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(stdout)
-            stream.write(b"\n--- stderr ---\n")
-            stream.write(stderr)
-        self._artifacts.add(path)
-        return path
-
-    async def _cleanup_container(self, container_name: str) -> None:
-        await self._run_cli(("stop", "--time", "2", container_name), timeout=5)
-        await self._run_cli(("kill", container_name), timeout=5)
-        await self._run_cli(("rm", "-f", container_name), timeout=5)
-        inspected = await self._run_cli(("inspect", container_name), timeout=5)
-        if inspected[0] == 0:
-            raise RuntimeError("Docker container cleanup could not be verified")
+    async def _cleanup_container(self, lease: _ContainerLease) -> None:
+        async with lease.cleanup_lock:
+            inspected = await self._run_cli(
+                (
+                    "inspect",
+                    "--format",
+                    f'{{{{ index .Config.Labels "{_OWNER_LABEL}" }}}}',
+                    lease.name,
+                ),
+                timeout=5,
+            )
+            if inspected[0] != 0:
+                return
+            if inspected[1].strip() != lease.owner_nonce:
+                raise PermissionError(
+                    "refusing to clean up a container not owned by this execution"
+                )
+            await self._run_cli(("stop", "--time", "2", lease.name), timeout=5)
+            await self._run_cli(("kill", lease.name), timeout=5)
+            await self._run_cli(("rm", "-f", lease.name), timeout=5)
+            verified = await self._run_cli(
+                ("inspect", lease.name), timeout=5
+            )
+            if verified[0] == 0:
+                raise RuntimeError(
+                    "Docker container cleanup could not be verified"
+                )
 
     async def _run_cli(self, args: tuple[str, ...], *, timeout: float) -> tuple[int, str, str]:
         try:
-            process = await asyncio.create_subprocess_exec(
-                self.docker_binary, *args,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
+            result = await self.supervisor.run(
+                ExecutionRequest(
+                    (self.docker_binary, *args),
+                    Path.cwd(),
+                    budget=ResourceBudget(
+                        timeout_seconds=timeout,
+                        output_bytes=16 * 1024,
+                    ),
+                    correlation_id=f"docker-cli-{uuid.uuid4().hex[:12]}",
+                ),
+                env={"PATH": os.environ.get("PATH", "")},
             )
         except FileNotFoundError:
             return -1, "", "Docker CLI not installed"
-        try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            process.kill()
-            await process.wait()
+        if result.status == "timed-out":
             return -1, "", "Docker CLI timed out"
         return (
-            int(process.returncode or 0),
-            stdout.decode("utf-8", errors="replace"),
-            stderr.decode("utf-8", errors="replace"),
+            int(result.return_code if result.return_code is not None else -1),
+            result.stdout,
+            result.stderr,
         )
 
 
 def _image_from_environment(environment: dict[str, str]) -> str:
-    return environment.get("KHAOS_DOCKER_IMAGE", "python:3.13-slim")
+    return environment.get("KHAOS_DOCKER_IMAGE", DEFAULT_DOCKER_IMAGE)

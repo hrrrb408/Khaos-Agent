@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from rich.markup import escape
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Button, Static
+
+from khaos.tui.view_model import build_approval_view
 
 
 class PermissionDialog(ModalScreen[bool]):
@@ -44,16 +47,22 @@ class PermissionDialog(ModalScreen[bool]):
         self.request = request
 
     def compose(self) -> ComposeResult:  # type: ignore[override]
-        name = self.request.get("name", "tool")
-        target = _friendly_target(self.request)
+        view = build_approval_view(self.request)
+        expiry = "EXPIRED — approval will be denied" if view.expired else f"expires in {view.expires_in_seconds}s"
         with Vertical():
             yield Static(
-                f"[b]Allow {name}?[/]\n"
-                + (f"[dim]{target}[/]" if target else "[dim]This action needs permission.[/]"),
+                f"[b]Allow {escape(view.name)}?[/]\n"
+                f"[dim]{escape(view.target or view.reason)}[/]\n"
+                f"level={escape(view.level)} principal={escape(view.principal_id)}\n"
+                f"task={escape(view.task_id)} workspace={escape(view.workspace_id)}\n"
+                f"binding={view.binding_digest} args={view.arguments_digest}\n"
+                f"profile={view.profile_digest} {expiry}",
                 markup=True,
             )
             with Horizontal():
-                yield Button("Allow (y)", id="allow", variant="success")
+                yield Button(
+                    "Allow (y)", id="allow", variant="success", disabled=view.expired
+                )
                 yield Button("Deny (n)", id="deny", variant="error")
 
     def on_mount(self) -> None:  # type: ignore[override]
@@ -63,7 +72,7 @@ class PermissionDialog(ModalScreen[bool]):
         self.dismiss(event.button.id == "allow")
 
     def action_approve(self) -> None:
-        self.dismiss(True)
+        self.dismiss(not build_approval_view(self.request).expired)
 
     def action_deny(self) -> None:
         self.dismiss(False)
@@ -71,13 +80,4 @@ class PermissionDialog(ModalScreen[bool]):
 
 def _friendly_target(request: dict) -> str:
     """Return a concise user-facing target string for permission prompts."""
-    arguments = request.get("arguments")
-    if isinstance(arguments, dict):
-        for key in ("path", "root", "url", "command", "src", "dst"):
-            value = arguments.get(key)
-            if value:
-                return str(value)
-    target = str(request.get("target", ""))
-    if ":" in target and "{" in target:
-        return target.split(":", 1)[0]
-    return target
+    return build_approval_view(request, now=0.0).target

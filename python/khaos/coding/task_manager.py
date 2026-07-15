@@ -67,6 +67,7 @@ class TransitionResult(Enum):
     UNCHANGED = "unchanged"
     NOT_FOUND = "not_found"
     INVALID_TRANSITION = "invalid_transition"
+    LEASE_INVALIDATION_FAILED = "lease_invalidation_failed"  # Batch 2.6 §4
 
 
 @dataclass
@@ -127,6 +128,28 @@ class TaskManager:
         self._lock = asyncio.Lock()
         self._db = db
         self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
+        # Batch 2.5 §4: optional lease invalidation hook. When set
+        # (by ApprovalRuntime / WorkspaceExecutionLeaseCoordinator),
+        # cancel() calls it BEFORE transitioning the task to CANCELLED
+        # so the ACTIVE execution lease is released.
+        self._lease_invalidation_hook: Any = None
+        # Batch 2.6 §5: optional per-workspace mutation fence. When set,
+        # cancel() acquires the fence BEFORE lease invalidation so cancel
+        # is serialized with active lease acquisition / Batch 3 execution.
+        self._mutation_fence: Any = None
+        self._execution_scope_resolver: Any = None
+
+    def set_lease_invalidation_hook(self, hook: Any) -> None:
+        """Register a callable invoked during cancel to release execution leases."""
+        self._lease_invalidation_hook = hook
+
+    def set_mutation_fence(self, fence: Any) -> None:
+        """Batch 2.6 §5: register the shared per-workspace mutation fence."""
+        self._mutation_fence = fence
+
+    def set_execution_scope_resolver(self, resolver: Any) -> None:
+        """Install the persisted ACTIVE-lease task/workspace resolver."""
+        self._execution_scope_resolver = resolver
 
     async def load(self) -> None:
         """Restore tasks and mark interrupted in-flight work as blocked."""
@@ -286,13 +309,60 @@ class TaskManager:
             return [task.to_dict() for task in self._tasks.values()]
 
     async def cancel(self, task_id: str) -> TransitionResult:
-        """Cancel an active task without overwriting a terminal state."""
+        """Cancel an active task without overwriting a terminal state.
+
+        Batch 2.6 §4: if a lease invalidation hook is registered, calls it
+        BEFORE transitioning the task to CANCELLED. If the hook raises,
+        cancel FAILS CLOSED — the task does NOT transition to CANCELLED,
+        and ``TransitionResult.LEASE_INVALIDATION_FAILED`` is returned.
+        The task stays in its current state so cancel can be retried.
+
+        Batch 2.6 §5: if a mutation fence is registered AND the task is
+        bound to a workspace, acquires the fence (owner="cancel:{task_id}")
+        BEFORE the manager lock so cancel is serialized with active lease
+        acquisition / Batch 3 execution / cleanup.
+
+        Invariant: ``TaskStatus`` terminal ⇒ ACTIVE lease count = 0.
+        """
+        # Batch 2.6 §5: acquire the mutation fence FIRST (outermost lock)
+        # if a workspace binding exists. This serializes cancel with
+        # lease acquisition and cleanup on the same workspace.
+        if self._mutation_fence is not None:
+            if self._execution_scope_resolver is None:
+                raise RuntimeError("TaskManager execution scope resolver is not configured")
+            workspace_id = self._execution_scope_resolver(task_id)
+        else:
+            workspace_id = None
+        if workspace_id is not None:
+            async with self._mutation_fence.use(
+                workspace_id, owner=f"cancel:{task_id}",
+            ):
+                return await self._cancel_impl(task_id)
+        return await self._cancel_impl(task_id)
+
+    async def _cancel_impl(self, task_id: str) -> TransitionResult:
+        """Internal cancel — assumes fence (if any) is already held."""
         async with self._lock:
             task = self._tasks.get(task_id)
             if task is None:
                 return TransitionResult.NOT_FOUND
             if task.status in TERMINAL_STATUSES:
                 return TransitionResult.INVALID_TRANSITION
+            # Release any ACTIVE execution lease for this task.
+            # Batch 2.6 §4: fail closed on lease invalidation error — do
+            # NOT transition to CANCELLED. The task stays in its current
+            # state so cancel can be retried after the lease issue is
+            # resolved.
+            if self._lease_invalidation_hook is not None:
+                try:
+                    self._lease_invalidation_hook(task_id=task_id)
+                except Exception as exc:
+                    logger.warning(
+                        "lease invalidation failed for task %s; "
+                        "cancel refused (fail-closed): %s",
+                        task_id, exc,
+                    )
+                    return TransitionResult.LEASE_INVALIDATION_FAILED
             task.status = TaskStatus.CANCELLED
             task.touch()
             await self._persist(task)

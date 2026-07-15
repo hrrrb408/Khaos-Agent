@@ -2,11 +2,18 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
 
-from khaos.coding.execution import ExecutionRequest, NetworkPolicy, ResourceBudget
+from khaos.coding.execution import (
+    ExecutionRequest,
+    FileSystemAccess,
+    NetworkPolicy,
+    PermissionProfile,
+    ResourceBudget,
+)
 from khaos.coding.execution.platform import (
     BackendSelector,
     LinuxBubblewrapBackend,
@@ -19,8 +26,10 @@ from khaos.coding.execution.platform import (
 def _reset_bwrap_cache():
     """Ensure each test probes bwrap capability fresh (no cross-test leakage)."""
     LinuxBubblewrapBackend._capability_cache = None
+    MacOSSandboxBackend._capability_cache = None
     yield
     LinuxBubblewrapBackend._capability_cache = None
+    MacOSSandboxBackend._capability_cache = None
 
 
 @pytest.mark.asyncio
@@ -34,6 +43,68 @@ def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
 
 
+def test_read_only_platform_profiles_do_not_mount_workspace_writable(tmp_path: Path):
+    mac_profile = MacOSSandboxBackend().profile(tmp_path, writable=False)
+    assert f'(allow file-write* (subpath "{tmp_path.resolve()}"))' not in mac_profile
+    linux_argv = LinuxBubblewrapBackend().argv_prefix(tmp_path, writable=False)
+    worktree_index = linux_argv.index(str(tmp_path.resolve()))
+    assert linux_argv[worktree_index - 1] == "--ro-bind"
+
+
+def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path):
+    argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
+
+    assert ("--proc", "/proc") == argv[
+        argv.index("--proc"):argv.index("--proc") + 2
+    ]
+    assert "--unshare-pid" in argv
+    assert "--unshare-ipc" in argv
+    assert "--unshare-uts" in argv
+    assert "--unshare-net" in argv
+    assert "--new-session" in argv
+    assert "--die-with-parent" in argv
+
+
+def test_linux_profile_preserves_cwd_relative_to_workspace(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    cwd = workspace / "src" / "pkg"
+    cwd.mkdir(parents=True)
+
+    argv = LinuxBubblewrapBackend().argv_prefix(workspace, cwd=cwd)
+    chdir_index = argv.index("--chdir")
+
+    assert argv[chdir_index + 1] == "/tmp/workspace/src/pkg"
+
+
+def test_linux_profile_rejects_cwd_outside_workspace(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    with pytest.raises(PermissionError, match="cwd"):
+        LinuxBubblewrapBackend().argv_prefix(
+            workspace, cwd=tmp_path / "outside"
+        )
+
+
+def test_platform_profiles_hide_explicit_secret_roots(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    secret_root = tmp_path / "host-secrets"
+    workspace.mkdir()
+    secret_root.mkdir()
+
+    mac_profile = MacOSSandboxBackend().profile(
+        workspace, unreadable_roots=(secret_root,)
+    )
+    assert f'(deny file-read* (subpath "{secret_root}"))' in mac_profile
+    assert '(allow file-write* (subpath "/tmp"))' not in mac_profile
+
+    linux_argv = LinuxBubblewrapBackend().argv_prefix(
+        workspace, unreadable_roots=(secret_root,)
+    )
+    secret_index = linux_argv.index(str(secret_root))
+    assert linux_argv[secret_index - 1] == "--tmpfs"
+
+
 def _require_or_skip(binary: str) -> None:
     if shutil.which(binary):
         return
@@ -43,8 +114,9 @@ def _require_or_skip(binary: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux bubblewrap evidence")
-async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
+async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request):
     """Real bwrap execution verifying all 9 isolation requirements.
 
     1. actually executed through bwrap (not argv-only);
@@ -71,10 +143,18 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
             )
         pytest.skip(f"bwrap cannot enforce isolation: {availability.reason}")
 
+    # /tmp is intentionally a writable tmpfs inside bwrap, so negative host
+    # write evidence must live under a ro-bound host path such as $HOME.
+    host_root = Path(tempfile.mkdtemp(prefix=".khaos-bwrap-e2e-", dir=Path.home()))
+    request.addfinalizer(lambda: shutil.rmtree(host_root, ignore_errors=True))
     workspace = tmp_path / "workspace"
-    outside = tmp_path / "outside.txt"
-    main_repo = tmp_path / "repository"
+    secret_root = host_root / "host-secrets"
+    secret_file = secret_root / "token"
+    outside = host_root / "outside.txt"
+    main_repo = host_root / "repository"
     workspace.mkdir()
+    secret_root.mkdir()
+    secret_file.write_text("host-secret", encoding="utf-8")
     main_repo.mkdir()
     (main_repo / "README.txt").write_text("main\n", encoding="utf-8")
 
@@ -98,6 +178,10 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
         "try: socket.create_connection(('1.1.1.1', 53), timeout=1)",
         "except OSError: pass",
         "else: raise SystemExit('network allowed')",
+        # Host credential roots are not merely read-only; they are hidden.
+        f"try: Path({str(secret_file)!r}).read_text()",
+        "except OSError: pass",
+        "else: raise SystemExit('host secret readable')",
         # 7. PID isolation — new PID namespace yields a low namespace-local PID
         "pid = os.getpid()",
         "assert pid < 100, f'unexpected host PID {pid}'",
@@ -114,9 +198,12 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
     # 1. Real bwrap execution
     result = await LinuxBubblewrapBackend().execute(
         ExecutionRequest(
-            (sys.executable, "-c", command), workspace, (workspace,),
-            network_policy=NetworkPolicy.NONE,
-            budget=ResourceBudget(timeout_seconds=15),
+            (sys.executable, "-c", command), workspace,
+            permission_profile=PermissionProfile(
+                filesystem=FileSystemAccess.WORKSPACE_WRITE,
+                unreadable_roots=(secret_root,),
+                resources=ResourceBudget(timeout_seconds=15),
+            ).bind_workspace(workspace),
         )
     )
     assert result.status == "passed", result.stderr
@@ -139,7 +226,6 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_backend_selector_returns_unsupported_when_bwrap_probe_fails(monkeypatch):
     """Req 9: no security capability → infrastructure-unsupported, not host fallback."""
-    from khaos.coding.execution.host import HostExecutionBackend
     from khaos.coding.execution.platform import BackendAvailability
 
     def _fail_probe(self):
@@ -157,33 +243,115 @@ async def test_backend_selector_returns_unsupported_when_bwrap_probe_fails(monke
     with pytest.raises(PermissionError):
         await writable_backend.execute(object())
 
-    # Read-only execution may still use host — only writable is fail-closed.
+    # Agent-originated read-only execution also fails closed: command labels
+    # are not an OS isolation boundary.
     readonly_backend = BackendSelector().select(writable=False)
-    assert isinstance(readonly_backend, HostExecutionBackend)
+    assert isinstance(readonly_backend, UnsupportedBackend)
 
 
 @pytest.mark.asyncio
+async def test_backend_selector_fails_closed_when_bwrap_probe_raises(monkeypatch):
+    def _raise_probe(self):
+        raise subprocess.TimeoutExpired("bwrap", 10)
+
+    monkeypatch.setattr(LinuxBubblewrapBackend, "probe_capability", _raise_probe)
+    monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "linux")
+    monkeypatch.setattr(
+        "khaos.coding.execution.platform.shutil.which",
+        lambda _: "/usr/bin/bwrap",
+    )
+
+    backend = BackendSelector().select(writable=False)
+    assert isinstance(backend, UnsupportedBackend)
+    with pytest.raises(PermissionError):
+        await backend.execute(object())
+
+
+@pytest.mark.asyncio
+async def test_backend_selector_fails_closed_when_macos_probe_fails(monkeypatch):
+    from khaos.coding.execution.platform import BackendAvailability
+
+    monkeypatch.setattr(
+        MacOSSandboxBackend,
+        "probe_capability",
+        lambda self: BackendAvailability(
+            self.name, False, False, "seatbelt probe denied"
+        ),
+    )
+    monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "khaos.coding.execution.platform.shutil.which",
+        lambda _: "/usr/bin/sandbox-exec",
+    )
+
+    backend = BackendSelector().select(writable=True)
+
+    assert isinstance(backend, UnsupportedBackend)
+    with pytest.raises(PermissionError):
+        await backend.execute(object())
+
+
+@pytest.mark.asyncio
+async def test_backend_selector_fails_closed_when_macos_probe_raises(monkeypatch):
+    monkeypatch.setattr(
+        MacOSSandboxBackend,
+        "probe_capability",
+        lambda self: (_ for _ in ()).throw(RuntimeError("probe crashed")),
+    )
+    monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "darwin")
+    monkeypatch.setattr(
+        "khaos.coding.execution.platform.shutil.which",
+        lambda _: "/usr/bin/sandbox-exec",
+    )
+
+    assert isinstance(
+        BackendSelector().select(writable=False), UnsupportedBackend
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec evidence")
 async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: Path):
     """Run sandbox-exec against an actual process, with no host fallback."""
     _require_or_skip("sandbox-exec")
+    availability = MacOSSandboxBackend().probe_capability()
+    if (
+        not availability.available
+        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+    ):
+        pytest.skip(availability.reason)
+    assert availability.available, availability.reason
+    assert availability.network_enforced, availability.reason
     workspace = tmp_path / "workspace"
+    secret_root = tmp_path / "host-secrets"
+    secret_file = secret_root / "token"
     outside = tmp_path / "outside.txt"
     workspace.mkdir()
+    secret_root.mkdir()
+    secret_file.write_text("host-secret", encoding="utf-8")
     command = (
         "from pathlib import Path; import socket; "
         "Path('inside.txt').write_text('ok'); "
         f"\ntry: Path({str(outside)!r}).write_text('no')\nexcept OSError: pass\nelse: raise SystemExit('outside write allowed'); "
         "\ntry: socket.create_connection(('1.1.1.1', 53), timeout=1)\nexcept OSError: pass\nelse: raise SystemExit('network allowed')"
+        f"\ntry: Path({str(secret_file)!r}).read_text()\nexcept OSError: pass\nelse: raise SystemExit('host secret readable')"
     )
     result = await MacOSSandboxBackend().execute(
         ExecutionRequest(
-            (sys.executable, "-c", command), workspace, (workspace,),
-            network_policy=NetworkPolicy.NONE,
-            budget=ResourceBudget(timeout_seconds=15),
+            (sys.executable, "-c", command), workspace,
+            permission_profile=PermissionProfile(
+                filesystem=FileSystemAccess.WORKSPACE_WRITE,
+                unreadable_roots=(secret_root,),
+                resources=ResourceBudget(timeout_seconds=15),
+            ).bind_workspace(workspace),
         )
     )
-    if result.status != "passed" and "Operation not permitted" in result.stderr and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1":
+    if (
+        result.status != "passed"
+        and "Operation not permitted" in result.stderr
+        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+    ):
         pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
     assert result.status == "passed", result.stderr
     assert (workspace / "inside.txt").read_text(encoding="utf-8") == "ok"

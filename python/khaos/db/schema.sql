@@ -23,6 +23,30 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 
+CREATE TABLE IF NOT EXISTS agent_turns (
+    turn_id       TEXT PRIMARY KEY,
+    attempt_id    TEXT NOT NULL,
+    session_id    TEXT NOT NULL REFERENCES sessions(id),
+    task_id       TEXT,
+    status        TEXT NOT NULL CHECK(status IN ('running','completed','interrupted','failed')),
+    last_sequence INTEGER NOT NULL DEFAULT 0,
+    error_code    TEXT,
+    started_at    REAL NOT NULL,
+    finished_at   REAL
+);
+
+CREATE TABLE IF NOT EXISTS agent_turn_events (
+    turn_id      TEXT NOT NULL REFERENCES agent_turns(turn_id),
+    sequence     INTEGER NOT NULL,
+    event_type   TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at   REAL NOT NULL,
+    PRIMARY KEY(turn_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_turns_session
+ON agent_turns(session_id, started_at);
+
 CREATE TABLE IF NOT EXISTS memories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     scope       TEXT NOT NULL,
@@ -165,3 +189,400 @@ CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     created_at,
     tokenize='unicode61'
 );
+
+-- M4 Batch 2: Plan approval state machine + execution authorization gate.
+-- These tables persist the server-authoritative approval lifecycle and the
+-- short-lived, single-use execution authorizations. See
+-- python/khaos/coding/planning/approval/ for the Python implementation.
+CREATE TABLE IF NOT EXISTS plan_approval_requests (
+    approval_request_id   TEXT PRIMARY KEY,
+    plan_id               TEXT NOT NULL,
+    plan_content_hash     TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    base_sha              TEXT NOT NULL,
+    repository_generation INTEGER NOT NULL,
+    risk_level            TEXT NOT NULL,
+    requested_operations  TEXT NOT NULL DEFAULT '[]',
+    affected_files        TEXT NOT NULL DEFAULT '[]',
+    affected_symbols      TEXT NOT NULL DEFAULT '[]',
+    verification_digest   TEXT NOT NULL,
+    binding_digest        TEXT NOT NULL,
+    requested_at          REAL NOT NULL,
+    expires_at            REAL NOT NULL,
+    status                TEXT NOT NULL,
+    broker_request_id     TEXT NOT NULL DEFAULT '',
+    reason                TEXT NOT NULL DEFAULT '',
+    metadata              TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_plan
+    ON plan_approval_requests(plan_id, plan_content_hash);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_repo
+    ON plan_approval_requests(repository_id, task_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_broker
+    ON plan_approval_requests(broker_request_id);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_requests_status
+    ON plan_approval_requests(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS plan_approval_decisions (
+    decision_id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    approval_request_id    TEXT NOT NULL,
+    decision               TEXT NOT NULL,
+    actor_id               TEXT NOT NULL,
+    actor_type             TEXT NOT NULL,
+    decided_at             REAL NOT NULL,
+    reason                 TEXT NOT NULL DEFAULT '',
+    authenticated_context  TEXT NOT NULL DEFAULT '{}',
+    metadata               TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_approval_decisions_request
+    ON plan_approval_decisions(approval_request_id, decided_at);
+
+CREATE TABLE IF NOT EXISTS plan_execution_authorizations (
+    authorization_id      TEXT PRIMARY KEY,
+    approval_request_id   TEXT NOT NULL,
+    plan_id               TEXT NOT NULL,
+    plan_content_hash     TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    base_sha              TEXT NOT NULL,
+    repository_generation INTEGER NOT NULL,
+    issued_at             REAL NOT NULL,
+    expires_at            REAL NOT NULL,
+    nonce_hash            TEXT NOT NULL UNIQUE,
+    binding_digest        TEXT NOT NULL,
+    status                TEXT NOT NULL,
+    server_epoch          INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_plan
+    ON plan_execution_authorizations(plan_id, approval_request_id);
+CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_scope
+    ON plan_execution_authorizations(repository_id, task_id, workspace_id);
+CREATE INDEX IF NOT EXISTS idx_plan_execution_authorizations_status
+    ON plan_execution_authorizations(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS plan_approval_audit_events (
+    event_id              TEXT PRIMARY KEY,
+    event_type            TEXT NOT NULL,
+    approval_request_id   TEXT NOT NULL,
+    plan_id               TEXT NOT NULL,
+    previous_status       TEXT NOT NULL,
+    new_status            TEXT NOT NULL,
+    actor_id              TEXT NOT NULL,
+    actor_type            TEXT NOT NULL,
+    authenticated_source  TEXT NOT NULL,
+    timestamp             REAL NOT NULL,
+    reason_code           TEXT NOT NULL,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    correlation_id        TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_request
+    ON plan_approval_audit_events(approval_request_id, timestamp);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_audit_events_plan
+    ON plan_approval_audit_events(plan_id, timestamp);
+
+-- M4 Batch 2.1 + 2.2: Broker authenticity and atomic authorization closure.
+-- Durable broker-decision receipt outbox with FULL field binding. Only
+-- ApprovalBroker can create a row here; apply_authenticated_decision
+-- verifies the token hash AND every authoritative field against this row.
+CREATE TABLE IF NOT EXISTS plan_approval_receipts (
+    receipt_id               TEXT PRIMARY KEY,
+    token_hash               TEXT NOT NULL UNIQUE,
+    approval_request_id      TEXT NOT NULL,
+    broker_request_id        TEXT NOT NULL,
+    binding_digest           TEXT NOT NULL,
+    decision                 TEXT NOT NULL,
+    namespace                TEXT NOT NULL DEFAULT 'plan-execution',
+    authenticated_actor_id   TEXT NOT NULL DEFAULT '',
+    authenticated_actor_type TEXT NOT NULL DEFAULT '',
+    authenticated_source     TEXT NOT NULL DEFAULT '',
+    session_request_id       TEXT NOT NULL DEFAULT '',
+    server_capability        TEXT NOT NULL DEFAULT '',
+    decided_at               REAL NOT NULL DEFAULT 0,
+    reason_digest            TEXT NOT NULL DEFAULT '',
+    consumed                 INTEGER NOT NULL DEFAULT 0,
+    created_at               REAL NOT NULL,
+    expires_at               REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_token
+    ON plan_approval_receipts(token_hash);
+CREATE INDEX IF NOT EXISTS idx_plan_approval_receipts_request
+    ON plan_approval_receipts(approval_request_id);
+
+-- At most one ACTIVE authorization per approval request (defense-in-depth
+-- for the single-execution-per-approval invariant; the service refuses
+-- re-mint anyway). Partial unique index so consumed/revoked rows don't block.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_exec_auth_active_per_request
+    ON plan_execution_authorizations(approval_request_id) WHERE status = 'active';
+
+-- broker_request_id uniqueness for non-empty values (old not-required rows
+-- used '' and many can coexist).
+CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_approval_requests_broker
+    ON plan_approval_requests(broker_request_id) WHERE broker_request_id != '';
+
+-- M4 Batch 2.2: persisted monotonic server epoch. The gate reads and rotates
+-- this atomically at startup so a restart genuinely invalidates old
+-- authorizations (the in-memory default epoch was not a real safety property).
+CREATE TABLE IF NOT EXISTS plan_execution_server_state (
+    singleton_key  TEXT PRIMARY KEY DEFAULT 'global',
+    current_epoch  INTEGER NOT NULL DEFAULT 0,
+    boot_id        TEXT NOT NULL DEFAULT '',
+    updated_at     REAL NOT NULL DEFAULT 0
+);
+
+-- M4 Batch 2.2: persisted authoritative plan snapshots. The gate and decision
+-- path resolve plans by plan_id from here, not from a caller-supplied object.
+-- A plan_id cannot be silently replaced with different content.
+CREATE TABLE IF NOT EXISTS plan_snapshots (
+    plan_id              TEXT PRIMARY KEY,
+    content_hash         TEXT NOT NULL,
+    binding_digest       TEXT NOT NULL,
+    repository_id        TEXT NOT NULL,
+    task_id              TEXT NOT NULL,
+    workspace_id         TEXT NOT NULL,
+    schema_version       TEXT NOT NULL DEFAULT 'khaos.planning.v1',
+    canonical_plan_json  TEXT NOT NULL,
+    created_at           REAL NOT NULL,
+    status               TEXT NOT NULL DEFAULT 'active'
+);
+
+CREATE INDEX IF NOT EXISTS idx_plan_snapshots_repo
+    ON plan_snapshots(repository_id, task_id, workspace_id);
+
+-- M4 Batch 2.2: workspace execution leases (TOCTOU closure for consume).
+CREATE TABLE IF NOT EXISTS plan_execution_leases (
+    lease_id              TEXT PRIMARY KEY,
+    task_id               TEXT NOT NULL,
+    workspace_id          TEXT NOT NULL,
+    repository_id         TEXT NOT NULL,
+    plan_id               TEXT NOT NULL,
+    head_sha              TEXT NOT NULL,
+    repository_generation INTEGER NOT NULL,
+    evidence_digest       TEXT NOT NULL,
+    binding_digest        TEXT NOT NULL,
+    authorization_id      TEXT NOT NULL,
+    expiry                REAL NOT NULL,
+    owner_execution_id    TEXT NOT NULL,
+    status                TEXT NOT NULL DEFAULT 'active',
+    server_epoch          INTEGER NOT NULL DEFAULT 0,
+    created_at            REAL NOT NULL
+);
+
+-- At most one ACTIVE lease per workspace — enforces workspace exclusivity.
+CREATE UNIQUE INDEX IF NOT EXISTS uq_plan_execution_leases_active_workspace
+    ON plan_execution_leases(workspace_id) WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_plan_execution_leases_task
+    ON plan_execution_leases(task_id, status);
+
+-- M4 Batch 3.1: trusted verification execution.  Output bodies remain in a
+-- private artifact root; SQLite stores only identities, digests and status.
+CREATE TABLE IF NOT EXISTS plan_verification_runs (
+    verification_run_id TEXT PRIMARY KEY,
+    execution_run_id TEXT NOT NULL UNIQUE,
+    plan_id TEXT NOT NULL,
+    plan_content_hash TEXT NOT NULL,
+    approval_request_id TEXT NOT NULL,
+    execution_context_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    bundle_digest TEXT NOT NULL,
+    final_mutation_attestation_digest TEXT NOT NULL,
+    verification_plan_digest TEXT NOT NULL,
+    trusted_catalog_fingerprint TEXT NOT NULL,
+    sandbox_profile_digest TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    completed_at REAL,
+    failure_code TEXT NOT NULL DEFAULT '',
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE TABLE IF NOT EXISTS plan_verification_steps (
+    step_run_id TEXT PRIMARY KEY,
+    verification_run_id TEXT NOT NULL,
+    requirement_id TEXT NOT NULL,
+    command_id TEXT NOT NULL,
+    command_digest TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    exit_code INTEGER,
+    signal INTEGER,
+    started_at REAL,
+    completed_at REAL,
+    duration_ms INTEGER NOT NULL DEFAULT 0,
+    timeout_ms INTEGER NOT NULL,
+    stdout_digest TEXT NOT NULL DEFAULT '',
+    stderr_digest TEXT NOT NULL DEFAULT '',
+    output_artifact_id TEXT NOT NULL DEFAULT '',
+    output_truncated INTEGER NOT NULL DEFAULT 0,
+    sandbox_instance_id TEXT NOT NULL DEFAULT '',
+    sandbox_image_digest TEXT NOT NULL DEFAULT '',
+    resource_usage_json TEXT NOT NULL DEFAULT '{}',
+    failure_code TEXT NOT NULL DEFAULT '',
+    UNIQUE(verification_run_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS plan_verification_audit_events (
+    audit_id TEXT PRIMARY KEY,
+    verification_run_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    result TEXT NOT NULL,
+    error_code TEXT NOT NULL DEFAULT '',
+    correlation_id TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS plan_verification_artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    verification_run_id TEXT NOT NULL,
+    relative_name TEXT NOT NULL,
+    content_digest TEXT NOT NULL,
+    byte_length INTEGER NOT NULL,
+    expires_at REAL NOT NULL,
+    quarantined INTEGER NOT NULL DEFAULT 0,
+    created_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'sealed',
+    artifact_dev INTEGER NOT NULL DEFAULT -1,
+    artifact_ino INTEGER NOT NULL DEFAULT -1,
+    artifact_uid INTEGER NOT NULL DEFAULT -1,
+    artifact_gid INTEGER NOT NULL DEFAULT -1,
+    artifact_mode INTEGER NOT NULL DEFAULT -1,
+    artifact_nlink INTEGER NOT NULL DEFAULT -1
+);
+
+CREATE TABLE IF NOT EXISTS plan_execution_phase_leases (
+    phase_lease_id TEXT PRIMARY KEY,
+    execution_run_id TEXT NOT NULL,
+    phase TEXT NOT NULL,
+    owner_execution_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    repository_id TEXT NOT NULL,
+    plan_id TEXT NOT NULL,
+    bundle_digest TEXT NOT NULL,
+    attestation_digest TEXT NOT NULL,
+    binding_digest TEXT NOT NULL,
+    server_epoch INTEGER NOT NULL,
+    boot_id TEXT NOT NULL,
+    expiry REAL NOT NULL,
+    status TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    released_at REAL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS uq_active_verification_phase_lease
+    ON plan_execution_phase_leases(execution_run_id) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS approved_verification_plan_snapshots (
+    approved_verification_plan_id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL,
+    plan_content_hash TEXT NOT NULL,
+    requirements_digest TEXT NOT NULL,
+    catalog_fingerprint TEXT NOT NULL,
+    ordered_command_digests_json TEXT NOT NULL,
+    config_hashes_json TEXT NOT NULL,
+    sandbox_profile_digest TEXT NOT NULL,
+    image_attestation_content_digest TEXT NOT NULL,
+    ordered_toolchain_attestation_content_digests_json TEXT NOT NULL,
+    binary_digests_json TEXT NOT NULL,
+    version_output_digests_json TEXT NOT NULL,
+    parsed_versions_json TEXT NOT NULL,
+    image_toolchain_policy_fingerprint TEXT NOT NULL,
+    snapshot_digest TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL,
+    boot_id TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS verification_cleanup_proofs (
+    cleanup_proof_id TEXT PRIMARY KEY,
+    verification_run_id TEXT NOT NULL,
+    disposable_workspace_id TEXT NOT NULL,
+    disposable_workspace_identity TEXT NOT NULL,
+    disposable_cleaned_at REAL NOT NULL,
+    sandbox_instance_ids_json TEXT NOT NULL,
+    sandbox_absence_digests_json TEXT NOT NULL,
+    artifact_ids_json TEXT NOT NULL,
+    artifact_seal_digests_json TEXT NOT NULL,
+    canonical_workspace_final_digest TEXT NOT NULL,
+    cleanup_digest TEXT NOT NULL,
+    created_at REAL NOT NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_vcp_run
+    ON verification_cleanup_proofs(verification_run_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_vcp_immutable_update
+BEFORE UPDATE ON verification_cleanup_proofs
+BEGIN SELECT RAISE(ABORT, 'verification cleanup proof is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_vcp_immutable_delete
+BEFORE DELETE ON verification_cleanup_proofs
+BEGIN SELECT RAISE(ABORT, 'verification cleanup proof cannot be deleted'); END;
+
+CREATE TABLE IF NOT EXISTS verification_success_evidence (
+    verification_run_id TEXT PRIMARY KEY,
+    execution_run_id TEXT NOT NULL UNIQUE,
+    cleanup_proof_id TEXT NOT NULL UNIQUE,
+    cleanup_digest TEXT NOT NULL,
+    authority_instance_id TEXT NOT NULL,
+    runtime_id TEXT NOT NULL,
+    boot_id TEXT NOT NULL,
+    payload_digest TEXT NOT NULL UNIQUE,
+    created_at REAL NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_vse_immutable_update
+BEFORE UPDATE ON verification_success_evidence
+BEGIN SELECT RAISE(ABORT, 'verification success evidence is immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS trg_vse_immutable_delete
+BEFORE DELETE ON verification_success_evidence
+BEGIN SELECT RAISE(ABORT, 'verification success evidence cannot be deleted'); END;
+
+-- Principal-bound one-shot approvals for destructive Git/GitHub/ChangeSet
+-- operations. State changes are performed by transaction/CAS in Database;
+-- triggers are intentionally not used as a connection-authority boundary.
+CREATE TABLE IF NOT EXISTS operation_approvals (
+    approval_id TEXT PRIMARY KEY,
+    binding_digest TEXT NOT NULL,
+    binding_json TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    workspace_id TEXT NOT NULL,
+    operation TEXT NOT NULL,
+    nonce_hash TEXT NOT NULL,
+    expires_at REAL NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','approved','consumed','cancelled')),
+    created_at REAL NOT NULL,
+    approved_at REAL,
+    consumed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operation_approvals_expiry
+    ON operation_approvals(status, expires_at);
+
+CREATE TABLE IF NOT EXISTS operation_approval_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    approval_id TEXT NOT NULL,
+    event_type TEXT NOT NULL,
+    binding_digest TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    detail_json TEXT NOT NULL DEFAULT '{}',
+    created_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_operation_approval_events_approval
+    ON operation_approval_events(approval_id, id);

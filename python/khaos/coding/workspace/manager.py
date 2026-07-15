@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import tempfile
 import uuid
 from pathlib import Path
 
 from khaos.coding.workspace.models import ChangeSet, TaskWorkspace, WorkspaceState, WorkspaceTransition
+
+logger = logging.getLogger(__name__)
 
 
 class WorkspaceError(RuntimeError):
@@ -39,6 +42,24 @@ class WorkspaceManager:
         self._workspaces: dict[str, TaskWorkspace] = {}
         self._task_ids: set[str] = set()
         self._lock = asyncio.Lock()
+        # Batch 2.5 §4: optional lease invalidation hook. When set
+        # (by ApprovalRuntime / WorkspaceExecutionLeaseCoordinator),
+        # cleanup() calls it BEFORE removing the worktree so the ACTIVE
+        # execution lease is released.
+        self._lease_invalidation_hook: Any = None
+        # Batch 2.6 §5: optional per-workspace mutation fence. When set,
+        # cleanup() acquires the fence BEFORE lease invalidation so that
+        # cleanup is serialized with active lease acquisition / Batch 3
+        # execution / RepositoryIndexer generation updates.
+        self._mutation_fence: Any = None
+
+    def set_lease_invalidation_hook(self, hook: Any) -> None:
+        """Register a callable invoked during cleanup to release execution leases."""
+        self._lease_invalidation_hook = hook
+
+    def set_mutation_fence(self, fence: Any) -> None:
+        """Batch 2.6 §5: register the shared per-workspace mutation fence."""
+        self._mutation_fence = fence
 
     async def _git(self, repository: Path, *args: str, preserve_output: bool = False) -> str:
         process = await asyncio.create_subprocess_exec(
@@ -66,7 +87,11 @@ class WorkspaceManager:
             path = (self.root / workspace_id).resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
             await self._git(repository, "worktree", "add", "-b", branch, str(path), base_sha)
-            workspace = TaskWorkspace(workspace_id, task_id, repository, path, base_ref, base_sha, branch, WorkspaceState.READY, (path,))
+            recovery_root = (self.root.parent / ".khaos-recovery").resolve()
+            workspace = TaskWorkspace(
+                workspace_id, task_id, repository, path, base_ref, base_sha,
+                branch, WorkspaceState.READY, (path,), recovery_root=recovery_root,
+            )
             self._workspaces[workspace_id] = workspace
             self._task_ids.add(task_id)
             return workspace
@@ -109,12 +134,55 @@ class WorkspaceManager:
         return await self._git(workspace.worktree_path, "rev-parse", "HEAD")
 
     async def cleanup(self, workspace_id: str, *, force: bool = False) -> WorkspaceTransition:
+        """Clean up a workspace worktree.
+
+        Batch 2.6 §4: if a lease invalidation hook is registered, calls it
+        BEFORE removing the worktree. If the hook raises, cleanup FAILS
+        CLOSED — the worktree is NOT removed, the workspace does NOT enter
+        CLEANED, and ``WorkspaceTransition.FAILED`` is returned. The
+        workspace stays in its current state so cleanup can be retried.
+
+        Batch 2.6 §5: if a mutation fence is registered, acquires it
+        BEFORE the manager lock (fence-first ordering) so cleanup is
+        serialized with active lease acquisition / Batch 3 execution /
+        RepositoryIndexer generation updates. Owner is
+        ``"cleanup:{workspace_id}"``.
+
+        Invariant: ``WorkspaceState.CLEANED`` ⇒ ACTIVE lease count = 0.
+        """
+        # Batch 2.6 §5: acquire the mutation fence FIRST (outermost lock)
+        # so cleanup is serialized with lease acquisition. If no fence is
+        # configured, fall back to the old behavior.
+        if self._mutation_fence is not None:
+            async with self._mutation_fence.use(
+                workspace_id, owner=f"cleanup:{workspace_id}",
+            ):
+                return await self._cleanup_impl(workspace_id, force=force)
+        return await self._cleanup_impl(workspace_id, force=force)
+
+    async def _cleanup_impl(self, workspace_id: str, *, force: bool) -> WorkspaceTransition:
+        """Internal cleanup — assumes fence (if any) is already held."""
         async with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace is None:
                 return WorkspaceTransition.NOT_FOUND
             if workspace.state not in {WorkspaceState.APPLIED, WorkspaceState.FAILED, WorkspaceState.CANCELLED} and not force:
                 return WorkspaceTransition.INVALID
+            # Release any ACTIVE execution lease for this workspace.
+            # Batch 2.6 §4: fail closed on lease invalidation error — do
+            # NOT continue to CLEANING/CLEANED. The workspace stays in its
+            # current state so cleanup can be retried after the lease
+            # issue is resolved.
+            if self._lease_invalidation_hook is not None:
+                try:
+                    self._lease_invalidation_hook(workspace_id=workspace_id)
+                except Exception as exc:
+                    logger.warning(
+                        "lease invalidation failed for workspace %s; "
+                        "cleanup refused (fail-closed): %s",
+                        workspace_id, exc,
+                    )
+                    return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANING
             if force:
                 await self._git(workspace.repository_root, "worktree", "remove", "--force", str(workspace.worktree_path))

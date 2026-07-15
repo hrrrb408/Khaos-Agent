@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
+from khaos.agent.approval import ApprovalBinding
 from khaos.security.middleware import SecurityMiddleware
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 
@@ -39,6 +42,14 @@ class PermissionRequest:
     level: str
     target: str
     reason: str
+    binding_digest: str = ""
+    expires_at: float = 0.0
+    principal_id: str = ""
+    session_id: str = ""
+    task_id: str = ""
+    workspace_id: str = ""
+    arguments_digest: str = ""
+    profile_digest: str = ""
 
 
 @dataclass
@@ -224,6 +235,67 @@ class ToolScheduler:
                         f"{binding['operation']}:{binding['target']} "
                         f"head={binding['head']} diff={binding['diff_hash']}"
                     )
+                principal_id = str(tool_context.get("principal_id") or "")
+                current_session = str(session_id or "")
+                if not principal_id or not current_session:
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=normalized["id"],
+                            name=tool.name,
+                            success=False,
+                            error=(
+                                "Approval requires authenticated principal "
+                                "and session binding"
+                            ),
+                            arguments=normalized["arguments"],
+                        ),
+                    )
+                    continue
+                expires_at = time.time() + 120.0
+                binding = ApprovalBinding(
+                    principal_id=principal_id,
+                    session_id=current_session,
+                    task_id=str(
+                        tool_context.get("task_id")
+                        or f"session:{current_session}"
+                    ),
+                    turn_id=str(
+                        tool_context.get("turn_id")
+                        or f"turn:{normalized['id']}"
+                    ),
+                    tool_call_id=normalized["id"],
+                    tool_name=tool.name,
+                    arguments_digest=_canonical_digest(
+                        normalized["arguments"]
+                    ),
+                    workspace_id=str(
+                        tool_context.get("workspace_id")
+                        or f"session:{current_session}"
+                    ),
+                    profile_digest=_canonical_digest(
+                        {
+                            "permission_level": tool.permission_level,
+                            "target": approval_target,
+                            "network_policy": tool_context["network_policy"],
+                        }
+                    ),
+                    expires_at=expires_at,
+                )
+                broker = tool_context.get("approval_broker")
+                if broker is None:
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=normalized["id"],
+                            name=tool.name,
+                            success=False,
+                            error="ApprovalBroker is required",
+                            arguments=normalized["arguments"],
+                        ),
+                    )
+                    continue
+                binding_digest = await broker.register_tool_approval(binding)
                 request = PermissionRequest(
                     tool_call_id=normalized["id"],
                     name=tool.name,
@@ -231,9 +303,25 @@ class ToolScheduler:
                     level=tool.permission_level,
                     target=approval_target,
                     reason=decision.reason,
+                    binding_digest=binding_digest,
+                    expires_at=expires_at,
+                    principal_id=binding.principal_id,
+                    session_id=binding.session_id,
+                    task_id=binding.task_id,
+                    workspace_id=binding.workspace_id,
+                    arguments_digest=binding.arguments_digest,
+                    profile_digest=binding.profile_digest,
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
+                confirmation = await broker.consume_for_dispatch(
+                    normalized["id"],
+                    bool(confirmation.get("approved", False)),
+                    bool(confirmation.get("remember", False)),
+                    principal_id=principal_id,
+                    session_id=current_session,
+                    binding_digest=binding_digest,
+                )
                 if not confirmation.get("approved", False):
                     if destructive_context is not None:
                         await destructive_context["approval_broker"].cancel_operation(normalized["id"])
@@ -257,7 +345,8 @@ class ToolScheduler:
                     continue
                 if destructive_context is not None:
                     approved = await destructive_context["approval_broker"].approve_operation(
-                        normalized["id"], session_id or ""
+                        normalized["id"], session_id or "",
+                        principal_id=principal_id,
                     )
                     if not approved:
                         yield SchedulerEvent(
@@ -409,6 +498,14 @@ class ToolScheduler:
                 "level": request.level,
                 "target": request.target,
                 "reason": request.reason,
+                "binding_digest": request.binding_digest,
+                "expires_at": request.expires_at,
+                "principal_id": request.principal_id,
+                "session_id": request.session_id,
+                "task_id": request.task_id,
+                "workspace_id": request.workspace_id,
+                "arguments_digest": request.arguments_digest,
+                "profile_digest": request.profile_digest,
             }
         )
         if inspect.isawaitable(value):
@@ -424,3 +521,10 @@ class ToolScheduler:
             "name": str(call["name"]),
             "arguments": dict(call.get("arguments") or {}),
         }
+
+
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

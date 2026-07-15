@@ -1,6 +1,12 @@
 from __future__ import annotations
 
-from khaos.coding.execution import ExecutionRequest, ExecutionService, HostExecutionBackend, ResourceBudget
+from khaos.coding.execution import (
+    ExecutionRequest,
+    ExecutionService,
+    HostExecutionBackend,
+    ResourceBudget,
+    UnsupportedBackend,
+)
 from khaos.coding.verification.detector import ProjectDetector
 from khaos.coding.verification.models import VerificationStepResult
 from khaos.coding.verification.planner import VerificationPlanner
@@ -15,7 +21,7 @@ class VerificationPipeline:
     ) -> None:
         self.detector = ProjectDetector()
         self.planner = VerificationPlanner()
-        self.execution = execution_service or ExecutionService(backend or HostExecutionBackend())
+        self.execution = execution_service or ExecutionService(backend or UnsupportedBackend())
 
     def plan(self, root):
         return self.planner.plan(self.detector.detect(root))

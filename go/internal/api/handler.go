@@ -20,21 +20,29 @@ import (
 
 // Handler serves Khaos Phase 2 REST and SSE endpoints.
 type Handler struct {
-	agent     AgentClient
-	memory    MemoryClient
-	audit     AuditClient
-	subagents SubagentClient
-	tasks     TaskClient
-	config    ConfigStore
-	limiter   *rate.TokenBucket
-	metrics   *metrics.Collector
-	apiKey    string
-	startedAt time.Time
-	mu        sync.Mutex
-	streams   map[string]<-chan ChatEvent
-	sessions  map[string]ChatRequest
-	tools     []map[string]any
+	agent         AgentClient
+	memory        MemoryClient
+	audit         AuditClient
+	subagents     SubagentClient
+	tasks         TaskClient
+	config        ConfigStore
+	limiter       *rate.TokenBucket
+	metrics       *metrics.Collector
+	apiKey        string
+	startedAt     time.Time
+	mu            sync.Mutex
+	streams       map[string]<-chan ChatEvent
+	sessions      map[string]ChatRequest
+	sessionOwners map[string]string
+	taskOwners    map[string]string
+	tools         []map[string]any
 }
+
+const (
+	protocolVersion           = "1"
+	maxRequestBodyBytes int64 = 1 << 20
+	maxWebhookBodyBytes int64 = 2 << 20
+)
 
 // WithTasks attaches the persistent coding task service.
 func (h *Handler) WithTasks(tasks TaskClient) *Handler { h.tasks = tasks; return h }
@@ -48,15 +56,17 @@ func (h *Handler) WithAudit(audit AuditClient) *Handler {
 // NewHandler creates an API handler.
 func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiKey string, limiter *rate.TokenBucket) *Handler {
 	return &Handler{
-		agent:     agent,
-		memory:    memory,
-		config:    config,
-		limiter:   limiter,
-		metrics:   metrics.NewCollector(),
-		apiKey:    apiKey,
-		startedAt: time.Now(),
-		streams:   map[string]<-chan ChatEvent{},
-		sessions:  map[string]ChatRequest{},
+		agent:         agent,
+		memory:        memory,
+		config:        config,
+		limiter:       limiter,
+		metrics:       metrics.NewCollector(),
+		apiKey:        apiKey,
+		startedAt:     time.Now(),
+		streams:       map[string]<-chan ChatEvent{},
+		sessions:      map[string]ChatRequest{},
+		sessionOwners: map[string]string{},
+		taskOwners:    map[string]string{},
 		tools: []map[string]any{
 			{"name": "read_file", "modes": []string{"all"}, "permission_level": "read"},
 			{"name": "write_file", "modes": []string{"coding"}, "permission_level": "write"},
@@ -116,7 +126,7 @@ func (h *Handler) Routes() http.Handler {
 		}
 		secured.ServeHTTP(w, r)
 	})
-	return h.cors(root)
+	return h.cors(h.protocol(h.limitRequestBody(root)))
 }
 
 func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -127,7 +137,7 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	var request struct {
 		Goal string `json:"goal"`
 	}
-	if json.NewDecoder(r.Body).Decode(&request) != nil || strings.TrimSpace(request.Goal) == "" {
+	if decodeJSON(r, &request) != nil || strings.TrimSpace(request.Goal) == "" {
 		writeError(w, http.StatusBadRequest, "goal is required")
 		return
 	}
@@ -135,6 +145,16 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
+	}
+	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
+		id, valid := result["id"].(string)
+		if !valid || id == "" {
+			writeError(w, http.StatusBadGateway, "task service returned no task id")
+			return
+		}
+		h.mu.Lock()
+		h.taskOwners[id] = principalID
+		h.mu.Unlock()
 	}
 	writeJSON(w, http.StatusCreated, result)
 }
@@ -149,12 +169,27 @@ func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
+		filtered := make([]map[string]any, 0, len(result))
+		h.mu.Lock()
+		for _, task := range result {
+			id, _ := task["id"].(string)
+			if h.taskOwners[id] == principalID {
+				filtered = append(filtered, task)
+			}
+		}
+		h.mu.Unlock()
+		result = filtered
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
 func (h *Handler) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	if h.tasks == nil {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	if !h.authorizeTask(w, r) {
 		return
 	}
 	result, err := h.tasks.GetTask(r.Context(), r.PathValue("id"))
@@ -170,6 +205,9 @@ func (h *Handler) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
+	if !h.authorizeTask(w, r) {
+		return
+	}
 	h.changeTask(w, r, "cancelled", h.tasks.CancelTask)
 }
 func (h *Handler) handleApproveTask(w http.ResponseWriter, r *http.Request) {
@@ -177,14 +215,50 @@ func (h *Handler) handleApproveTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
-	h.changeTask(w, r, "approved", h.tasks.ApproveTask)
+	if !h.authorizeTask(w, r) {
+		return
+	}
+	h.changeTaskApproval(w, r, "approved", h.tasks.ApproveTask)
 }
 func (h *Handler) handleRejectTask(w http.ResponseWriter, r *http.Request) {
 	if h.tasks == nil {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
-	h.changeTask(w, r, "rejected", h.tasks.RejectTask)
+	if !h.authorizeTask(w, r) {
+		return
+	}
+	h.changeTaskApproval(w, r, "rejected", h.tasks.RejectTask)
+}
+
+func (h *Handler) changeTaskApproval(w http.ResponseWriter, r *http.Request, status string, action func(context.Context, string, string, string, string) (TransitionResult, error)) {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	var body struct {
+		SessionID     string `json:"session_id"`
+		BindingDigest string `json:"binding_digest"`
+	}
+	if decodeJSON(r, &body) != nil || body.SessionID == "" || body.BindingDigest == "" {
+		writeError(w, http.StatusBadRequest, "session_id and binding_digest are required")
+		return
+	}
+	result, err := action(r.Context(), r.PathValue("id"), principalID, body.SessionID, body.BindingDigest)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if result == TransitionNotFound {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if result != TransitionUpdated {
+		writeError(w, http.StatusConflict, "invalid task transition or approval binding")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status, "task_id": r.PathValue("id")})
 }
 func (h *Handler) changeTask(w http.ResponseWriter, r *http.Request, status string, action func(context.Context, string) (TransitionResult, error)) {
 	if h.tasks == nil {
@@ -217,6 +291,9 @@ func (h *Handler) handleTaskEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
+	if !h.authorizeTask(w, r) {
+		return
+	}
 	events, err := h.tasks.TaskEvents(r.Context(), r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
@@ -229,16 +306,35 @@ func (h *Handler) handleTaskEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "streaming not supported")
 		return
 	}
-	for event := range events {
-		data, _ := json.Marshal(event)
-		fmt.Fprintf(w, "data: %s\n\n", data)
-		flusher.Flush()
+	lastSequence, _ := strconv.ParseUint(r.Header.Get("Last-Event-ID"), 10, 64)
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, open := <-events:
+			if !open {
+				return
+			}
+			sequence := eventSequence(event["sequence"])
+			if sequence > 0 && sequence <= lastSequence {
+				continue
+			}
+			data, _ := json.Marshal(event)
+			if sequence > 0 {
+				fmt.Fprintf(w, "id: %d\n", sequence)
+			}
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
 	}
 }
 
 func (h *Handler) handleTaskArtifacts(w http.ResponseWriter, r *http.Request) {
 	if h.tasks == nil {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
+		return
+	}
+	if !h.authorizeTask(w, r) {
 		return
 	}
 	result, err := h.tasks.TaskArtifacts(r.Context(), r.PathValue("id"))
@@ -331,6 +427,56 @@ func (h *Handler) cors(next http.Handler) http.Handler {
 	})
 }
 
+func (h *Handler) protocol(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Khaos-Protocol-Version", protocolVersion)
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Handler) limitRequestBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		limit := maxRequestBodyBytes
+		if strings.HasPrefix(r.URL.Path, "/api/webhook/") {
+			limit = maxWebhookBodyBytes
+		}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (h *Handler) authorizeSession(w http.ResponseWriter, r *http.Request, sessionID string) bool {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		return true
+	}
+	h.mu.Lock()
+	owner := h.sessionOwners[sessionID]
+	h.mu.Unlock()
+	if owner == "" || owner != principalID {
+		writeError(w, http.StatusForbidden, "session is not owned by authenticated principal")
+		return false
+	}
+	return true
+}
+
+func (h *Handler) authorizeTask(w http.ResponseWriter, r *http.Request) bool {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		return true
+	}
+	h.mu.Lock()
+	owner := h.taskOwners[r.PathValue("id")]
+	h.mu.Unlock()
+	if owner == "" || owner != principalID {
+		writeError(w, http.StatusForbidden, "task is not owned by authenticated principal")
+		return false
+	}
+	return true
+}
+
 func (h *Handler) rateLimit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if h.limiter != nil && !h.limiter.Allow() {
@@ -388,7 +534,7 @@ func (r *statusRecorder) Flush() {
 
 func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	var req ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -399,7 +545,19 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	if req.SessionID == "" {
 		req.SessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
 	}
-	stream, err := h.agent.Chat(context.Background(), req)
+	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
+		req.PrincipalID = principalID
+	} else {
+		req.PrincipalID = ""
+	}
+	h.mu.Lock()
+	owner := h.sessionOwners[req.SessionID]
+	h.mu.Unlock()
+	if owner != "" && owner != req.PrincipalID {
+		writeError(w, http.StatusForbidden, "session belongs to another principal")
+		return
+	}
+	stream, err := h.agent.Chat(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -407,12 +565,18 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.streams[req.SessionID] = stream
 	h.sessions[req.SessionID] = req
+	if req.PrincipalID != "" {
+		h.sessionOwners[req.SessionID] = req.PrincipalID
+	}
 	h.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"session_id": req.SessionID})
 }
 
 func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("id")
+	if !h.authorizeSession(w, r, sessionID) {
+		return
+	}
 	h.mu.Lock()
 	stream := h.streams[sessionID]
 	h.mu.Unlock()
@@ -423,11 +587,19 @@ func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
-	for event := range stream {
-		payload, _ := json.Marshal(event.Data)
-		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Event, payload)
-		if flusher != nil {
-			flusher.Flush()
+	for {
+		select {
+		case <-r.Context().Done():
+			return
+		case event, open := <-stream:
+			if !open {
+				return
+			}
+			payload, _ := json.Marshal(event.Data)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Event, payload)
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
 	}
 }
@@ -438,7 +610,7 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 		sessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
 	}
 	var req ChatRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSON(r, &req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -447,38 +619,77 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.SessionID = sessionID
+	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
+		req.PrincipalID = principalID
+	} else {
+		req.PrincipalID = ""
+	}
+	h.mu.Lock()
+	owner := h.sessionOwners[sessionID]
+	h.mu.Unlock()
+	if owner != "" && owner != req.PrincipalID {
+		writeError(w, http.StatusForbidden, "session belongs to another principal")
+		return
+	}
 	stream, err := h.agent.Chat(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
+	h.mu.Lock()
+	if req.PrincipalID != "" {
+		h.sessionOwners[sessionID] = req.PrincipalID
+	}
+	h.sessions[sessionID] = req
+	h.mu.Unlock()
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	encoder := json.NewEncoder(w)
-	for event := range stream {
-		if err := encoder.Encode(event); err != nil {
+	for {
+		select {
+		case <-r.Context().Done():
 			return
-		}
-		if flusher != nil {
-			flusher.Flush()
+		case event, open := <-stream:
+			if !open {
+				return
+			}
+			if err := encoder.Encode(event); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
 		}
 	}
 }
 
 func (h *Handler) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ToolCallID string `json:"tool_call_id"`
-		Approved   bool   `json:"approved"`
-		Remember   bool   `json:"remember"`
+		ToolCallID    string `json:"tool_call_id"`
+		Approved      bool   `json:"approved"`
+		Remember      bool   `json:"remember"`
+		BindingDigest string `json:"binding_digest"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	if err := h.agent.ConfirmPermission(r.Context(), r.PathValue("id"), body.ToolCallID, body.Approved, body.Remember); err != nil {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	if body.ToolCallID == "" || body.BindingDigest == "" {
+		writeError(w, http.StatusBadRequest, "tool_call_id and binding_digest are required")
+		return
+	}
+	if !h.authorizeSession(w, r, r.PathValue("id")) {
+		return
+	}
+	if err := h.agent.ConfirmPermission(r.Context(), principalID, r.PathValue("id"), body.ToolCallID, body.BindingDigest, body.Approved, body.Remember); err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -490,8 +701,11 @@ func (h *Handler) handleMode(w http.ResponseWriter, r *http.Request) {
 		SessionID  string `json:"session_id"`
 		TargetMode string `json:"target_mode"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
+		return
+	}
+	if !h.authorizeSession(w, r, body.SessionID) {
 		return
 	}
 	mode, err := h.agent.SwitchMode(r.Context(), body.SessionID, body.TargetMode)
@@ -513,7 +727,7 @@ func (h *Handler) handleSubagentSpawn(w http.ResponseWriter, r *http.Request) {
 		Tools   []string `json:"tools"`
 		Timeout int      `json:"timeout"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+	if err := decodeJSON(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -580,7 +794,7 @@ func (h *Handler) handleMemoryGet(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleMemorySet(w http.ResponseWriter, r *http.Request) {
 	var memory Memory
-	if err := json.NewDecoder(r.Body).Decode(&memory); err != nil {
+	if err := decodeJSON(r, &memory); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -628,13 +842,20 @@ func (h *Handler) handleSessions(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	sessions := []ChatRequest{}
-	for _, session := range h.sessions {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	for id, session := range h.sessions {
+		if authenticated && h.sessionOwners[id] != principalID {
+			continue
+		}
 		sessions = append(sessions, session)
 	}
 	writeJSON(w, http.StatusOK, sessions)
 }
 
 func (h *Handler) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
+	if !h.authorizeSession(w, r, r.PathValue("id")) {
+		return
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	session, ok := h.sessions[r.PathValue("id")]
@@ -651,7 +872,7 @@ func (h *Handler) handleConfigGet(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleConfigSet(w http.ResponseWriter, r *http.Request) {
 	var cfg map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+	if err := decodeJSON(r, &cfg); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
@@ -706,6 +927,43 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 
 func writeError(w http.ResponseWriter, status int, message string) {
 	writeJSON(w, status, map[string]string{"error": message})
+}
+
+func decodeJSON(r *http.Request, target any) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("multiple JSON values are not allowed")
+		}
+		return err
+	}
+	return nil
+}
+
+func eventSequence(value any) uint64 {
+	switch sequence := value.(type) {
+	case int:
+		if sequence > 0 {
+			return uint64(sequence)
+		}
+	case int64:
+		if sequence > 0 {
+			return uint64(sequence)
+		}
+	case float64:
+		if sequence > 0 {
+			return uint64(sequence)
+		}
+	case json.Number:
+		parsed, _ := strconv.ParseUint(sequence.String(), 10, 64)
+		return parsed
+	}
+	return 0
 }
 
 // MemoryMap is an in-memory MemoryClient used by the gateway binary and tests.

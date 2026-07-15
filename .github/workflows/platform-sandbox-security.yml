@@ -1,5 +1,12 @@
 name: Platform Sandbox Security E2E
 
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-sandbox-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     branches:
@@ -13,9 +20,12 @@ on:
 jobs:
   linux-bwrap-security:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
       - name: Install bubblewrap
@@ -51,7 +61,7 @@ jobs:
             python3 -c "import tempfile; print('gettempdir:', tempfile.gettempdir())"
             echo "=== bwrap isolation probe (argv_prefix topology) ==="
             tmpdir=$(mktemp -d)
-            bwrap --ro-bind / / --dev /dev --tmpfs /tmp --bind "$tmpdir" /tmp/workspace --unshare-net --unshare-pid --chdir /tmp/workspace -- /bin/sh -c 'echo probe > .probe && cat .probe' 2>&1
+            bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --bind "$tmpdir" /tmp/workspace --unshare-net --unshare-pid --unshare-ipc --unshare-uts --new-session --die-with-parent --chdir /tmp/workspace -- /bin/sh -c 'echo probe > .probe && cat .probe' 2>&1
             echo "probe exit: $?"
             rm -rf "$tmpdir"
           } > diagnostics/linux-bwrap-pre.txt
@@ -74,16 +84,19 @@ jobs:
           exit 0
       - name: Upload diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: linux-bwrap-diagnostics
           path: diagnostics/
 
   macos-sandbox-security:
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
       - name: Install test dependencies
@@ -116,7 +129,35 @@ jobs:
           exit 0
       - name: Upload diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: macos-sandbox-diagnostics
+          path: diagnostics/
+
+  windows-fail-closed-security:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Prove Windows has no Host fallback
+        run: python -m pytest python/tests/coding/test_windows_fail_closed.py python/tests/coding/test_backend_selector.py -q -m windows_fail_closed -v
+      - name: Capture Windows diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force diagnostics | Out-Null
+          Get-ComputerInfo | Out-File diagnostics/windows-platform.txt
+          Get-Process | Sort-Object ProcessName | Format-Table -AutoSize | Out-File diagnostics/windows-processes.txt
+      - name: Upload Windows diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: windows-fail-closed-diagnostics
           path: diagnostics/

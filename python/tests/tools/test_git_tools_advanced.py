@@ -22,7 +22,12 @@ class _LocalRemoteBackend(HostExecutionBackend):
     """Test-only backend that permits a local bare remote without public network."""
 
     async def execute(self, request):
-        return await super().execute(replace(request, network_policy=NetworkPolicy.NONE))
+        local_profile = replace(
+            request.permission_profile, network=NetworkPolicy.NONE
+        )
+        return await super().execute(
+            replace(request, permission_profile=local_profile)
+        )
 
 
 def _ctx(repo, access_mode="vcs.destructive-write"):

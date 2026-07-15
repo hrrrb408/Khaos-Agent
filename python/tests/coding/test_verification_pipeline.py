@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from khaos.coding.verification import ProjectDetector, VerificationPipeline, VerificationPlanner
+from khaos.coding.execution import HostExecutionBackend
 
 
 def test_detector_and_planner_use_manifest_without_execution(tmp_path: Path):
@@ -21,7 +22,7 @@ def test_unknown_project_has_no_plan(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_pipeline_runs_steps_through_execution_backend(tmp_path: Path):
     (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n", encoding="utf-8")
-    pipeline = VerificationPipeline()
+    pipeline = VerificationPipeline(backend=HostExecutionBackend())
     plan = pipeline.plan(tmp_path)
     # Use an explicit tiny plan to keep this fixture independent of pytest installation.
     from khaos.coding.verification.models import VerificationPlan, VerificationStep

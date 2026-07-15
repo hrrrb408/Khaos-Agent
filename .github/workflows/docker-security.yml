@@ -1,5 +1,12 @@
 name: Docker Security E2E
 
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     branches:
@@ -13,14 +20,19 @@ on:
 jobs:
   docker-isolation:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
       - name: Install test dependencies
         run: python -m pip install -e '.[test]'
       - name: Preload allowlisted image
-        run: docker pull python:3.13-slim
+        run: docker pull python@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280
       - name: Run real Docker isolation E2E
-        run: python -m pytest python/tests/tools/test_sandbox_tools.py -q -k real_docker_workspace_isolation_e2e
+        env:
+          KHAOS_RUN_PRODUCTION_SANDBOX: "1"
+        run: python -m pytest python/tests/tools/test_sandbox_tools.py python/tests/coding/test_m4_batch3_1_trusted_verification.py -q -m docker_sandbox_real -v

@@ -1,5 +1,6 @@
 import asyncio
 
+from khaos.agent.approval import ApprovalBroker
 from khaos.db import Database
 from khaos.permissions import ApprovalMode, PermissionEngine
 from khaos.tools.registry import ToolDefinition, ToolRegistry
@@ -52,6 +53,16 @@ def _registry() -> ToolRegistry:
     return registry
 
 
+def _approval_context() -> dict:
+    return {
+        "approval_broker": ApprovalBroker(),
+        "principal_id": "test-principal",
+        "task_id": "test-task",
+        "workspace_id": "test-workspace",
+        "turn_id": "test-turn",
+    }
+
+
 async def test_scheduler_executes_parallel_and_serial(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
@@ -83,6 +94,7 @@ async def test_scheduler_emits_permission_request_and_denies_without_confirm(tmp
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
     scheduler = ToolScheduler(_registry(), PermissionEngine(db))
 
     events = [
@@ -90,6 +102,8 @@ async def test_scheduler_emits_permission_request_and_denies_without_confirm(tmp
         async for event in scheduler.stream_batch(
             [{"id": "1", "name": "write", "arguments": {"value": "b"}}],
             mode="coding",
+            session_id="test-session",
+            tool_context=_approval_context(),
         )
     ]
 
@@ -103,18 +117,88 @@ async def test_scheduler_confirm_with_remember_creates_rule(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
     engine = PermissionEngine(db)
     scheduler = ToolScheduler(_registry(), engine)
 
     results = await scheduler.execute_batch(
         [{"id": "1", "name": "write", "arguments": {"value": "b"}}],
         mode="coding",
+        session_id="test-session",
         confirm_callback=lambda request: {"approved": True, "remember": True},
+        tool_context=_approval_context(),
     )
     rules = await db.list_permission_rules()
 
     assert results[0].success
     assert rules[0]["approval"] == "auto-approve"
+    await db.close()
+
+
+async def test_scheduler_consumes_bound_approval_before_dispatch(tmp_path):
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
+    broker = ApprovalBroker()
+    context = _approval_context()
+    context["approval_broker"] = broker
+    captured = {}
+
+    def approve(request):
+        captured.update(request)
+        return {"approved": True, "remember": False}
+
+    scheduler = ToolScheduler(_registry(), PermissionEngine(db))
+    results = await scheduler.execute_batch(
+        [{"id": "call-1", "name": "write", "arguments": {"value": "b"}}],
+        mode="coding",
+        session_id="test-session",
+        confirm_callback=approve,
+        tool_context=context,
+    )
+
+    assert results[0].success
+    assert captured["principal_id"] == "test-principal"
+    assert captured["session_id"] == "test-session"
+    assert captured["task_id"] == "test-task"
+    assert captured["workspace_id"] == "test-workspace"
+    assert len(captured["binding_digest"]) == 64
+    assert len(captured["arguments_digest"]) == 64
+    assert len(captured["profile_digest"]) == 64
+    assert not await broker.resolve(
+        "call-1",
+        True,
+        principal_id="test-principal",
+        session_id="test-session",
+        binding_digest=captured["binding_digest"],
+    )
+    await db.close()
+
+
+async def test_scheduler_denies_when_bound_approval_cannot_be_resolved(tmp_path):
+    class RejectingBroker(ApprovalBroker):
+        async def consume_for_dispatch(self, *args, **kwargs):
+            return {"approved": False, "remember": False}
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
+    context = _approval_context()
+    context["approval_broker"] = RejectingBroker()
+    scheduler = ToolScheduler(_registry(), PermissionEngine(db))
+
+    results = await scheduler.execute_batch(
+        [{"id": "call-1", "name": "write", "arguments": {"value": "b"}}],
+        mode="coding",
+        session_id="test-session",
+        confirm_callback=lambda request: {"approved": True},
+        tool_context=context,
+    )
+
+    assert not results[0].success
+    assert results[0].error == "User denied permission"
     await db.close()
 
 

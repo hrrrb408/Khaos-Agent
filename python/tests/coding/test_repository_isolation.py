@@ -143,8 +143,8 @@ def _seed_code_file(store: IndexStore, repo_id: str, path: str, generation: int 
     """Insert a minimal code_files row so CAS can verify generation."""
     conn = store._conn
     conn.execute(
-        "INSERT OR REPLACE INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-        (repo_id, path, "python", 100, 0, "abc", "test", "test", "{}", 0, generation),
+        "INSERT OR REPLACE INTO code_files VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (repo_id, path, "python", 100, 0, "abc", "test", "test", "{}", 0, generation, "source", "", "", ""),
     )
     conn.commit()
 

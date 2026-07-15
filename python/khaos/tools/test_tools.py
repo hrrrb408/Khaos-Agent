@@ -69,7 +69,12 @@ async def test_run(
             ExecutionRequest(
                 tuple(parts),
                 Path(workdir),
-                budget=ResourceBudget(timeout_seconds=TEST_RUN_TIMEOUT),
+                # ResourceBudget rejects non-positive values. Preserve the
+                # historical zero-timeout test/control surface as an immediate
+                # supervised timeout rather than failing request validation.
+                budget=ResourceBudget(
+                    timeout_seconds=max(float(TEST_RUN_TIMEOUT), 0.001)
+                ),
                 task_id=task_id,
                 workspace_id=workspace_id,
                 access_mode="workspace-write",

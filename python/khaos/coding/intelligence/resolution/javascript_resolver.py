@@ -40,6 +40,10 @@ def resolve_javascript_imports(
         alias: str | None = imp.get("alias")
         metadata: dict[str, Any] = imp.get("metadata", {})
         is_relative = module.startswith(".") or module.startswith("/")
+        # Preserve semantic re-export evidence from the adapter.
+        is_reexport = bool(metadata.get("reexport") or metadata.get("import_kind") == "reexport")
+        reexport_meta = {"reexport": True, "import_kind": "reexport"} if is_reexport else {}
+        base_kind = reexport_meta.get("import_kind", metadata.get("import_kind", "import"))
 
         if not is_relative:
             # External npm package
@@ -47,7 +51,7 @@ def resolve_javascript_imports(
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.EXTERNAL,
                     None, None, 0.9, "external-npm-package",
-                    (), {"import_kind": metadata.get("import_kind", "import"), "external": True},
+                    (), {**reexport_meta, "import_kind": base_kind, "external": True},
                 ))
             continue
 
@@ -57,7 +61,7 @@ def resolve_javascript_imports(
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.UNRESOLVED,
                     None, None, 0.6, "relative-module-not-found",
-                    (), {"import_kind": metadata.get("import_kind", "import"), "relative": True},
+                    (), {**reexport_meta, "import_kind": base_kind, "relative": True},
                 ))
             continue
 
@@ -67,7 +71,7 @@ def resolve_javascript_imports(
             results.append(ResolvedImport(
                 source_file, module, "", alias, ResolutionStatus.RESOLVED,
                 target_file, None, 0.93, "js-relative-module-path",
-                (target_file,), {"import_kind": metadata.get("import_kind", "import")},
+                (target_file,), {**reexport_meta, "import_kind": base_kind},
             ))
             table.register_reverse_dep(source_file, target_file)
             continue
@@ -78,7 +82,7 @@ def resolve_javascript_imports(
                 results.append(ResolvedImport(
                     source_file, module, "*", alias, ResolutionStatus.RESOLVED,
                     target_file, None, 0.92, "js-namespace-import",
-                    (target_file,), {"import_kind": "import", "namespace": True},
+                    (target_file,), {**reexport_meta, "import_kind": base_kind, "namespace": True},
                 ))
                 table.register_reverse_dep(source_file, target_file)
                 continue
@@ -91,14 +95,14 @@ def resolve_javascript_imports(
                     results.append(ResolvedImport(
                         source_file, module, "default", alias, ResolutionStatus.RESOLVED,
                         target_file, default_syms[0].stable_symbol_id, 0.92, "js-default-import",
-                        (target_file,), {"import_kind": "import", "default": True},
+                        (target_file,), {**reexport_meta, "import_kind": base_kind, "default": True},
                     ))
                 else:
                     # Can't pinpoint default export symbol, but module is resolved
                     results.append(ResolvedImport(
                         source_file, module, "default", alias, ResolutionStatus.RESOLVED,
                         target_file, None, 0.88, "js-default-import-module-resolved",
-                        (target_file,), {"import_kind": "import", "default": True},
+                        (target_file,), {**reexport_meta, "import_kind": base_kind, "default": True},
                     ))
                 table.register_reverse_dep(source_file, target_file)
                 continue
@@ -109,19 +113,19 @@ def resolve_javascript_imports(
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.RESOLVED,
                     target_file, target_symbols[0].stable_symbol_id, 0.93, "js-named-import",
-                    (target_file,), {"import_kind": "import"},
+                    (target_file,), {**reexport_meta, "import_kind": base_kind},
                 ))
             elif len(target_symbols) > 1:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.AMBIGUOUS,
                     target_file, None, 0.4, "js-named-import-multiple",
-                    tuple(s.stable_symbol_id for s in target_symbols), {"import_kind": "import", "count": len(target_symbols)},
+                    tuple(s.stable_symbol_id for s in target_symbols), {**reexport_meta, "import_kind": base_kind, "count": len(target_symbols)},
                 ))
             else:
                 results.append(ResolvedImport(
                     source_file, module, name, alias, ResolutionStatus.UNRESOLVED,
                     target_file, None, 0.6, "js-named-import-not-found",
-                    (target_file,), {"import_kind": "import"},
+                    (target_file,), {**reexport_meta, "import_kind": base_kind},
                 ))
             table.register_reverse_dep(source_file, target_file)
 

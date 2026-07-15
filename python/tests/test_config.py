@@ -1,3 +1,5 @@
+import os
+
 import pytest
 
 import yaml
@@ -68,3 +70,23 @@ def test_set_user_config_value(monkeypatch, tmp_path):
     data = yaml.safe_load(target.read_text(encoding="utf-8"))
 
     assert data["models"]["default_model"] == "test-model"
+    assert target.stat().st_mode & 0o777 == 0o600
+
+
+def test_config_writer_rejects_symlink_and_hardlink_targets(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    config_dir = tmp_path / ".khaos"
+    config_dir.mkdir()
+    outside = tmp_path / "outside.yaml"
+    outside.write_text("safe: true\n", encoding="utf-8")
+    target = config_dir / "config.yaml"
+    target.symlink_to(outside)
+    with pytest.raises(ConfigError, match="single-link"):
+        set_user_config_value("models.default_model", "blocked")
+    assert outside.read_text(encoding="utf-8") == "safe: true\n"
+
+    target.unlink()
+    os.link(outside, target)
+    with pytest.raises(ConfigError, match="single-link"):
+        set_user_config_value("models.default_model", "blocked")
+    assert outside.read_text(encoding="utf-8") == "safe: true\n"

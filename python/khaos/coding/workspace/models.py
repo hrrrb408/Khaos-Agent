@@ -29,6 +29,7 @@ class WorkspaceTransition(str, Enum):
     UPDATED = "updated"
     NOT_FOUND = "not_found"
     INVALID = "invalid_transition"
+    FAILED = "failed"  # Batch 2.6 §4: lease invalidation failure (retryable)
 
 
 @dataclass
@@ -43,6 +44,7 @@ class TaskWorkspace:
     state: WorkspaceState = WorkspaceState.CREATING
     writable_roots: tuple[Path, ...] = ()
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    recovery_root: Path | None = None
 
 
 @dataclass(frozen=True)

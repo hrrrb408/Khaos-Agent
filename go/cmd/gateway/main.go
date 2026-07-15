@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"time"
@@ -11,7 +13,6 @@ import (
 	"khaos/go/internal/api"
 	"khaos/go/internal/platform"
 	"khaos/go/internal/rate"
-	"khaos/go/internal/ws"
 )
 
 type mockAgentClient struct{}
@@ -26,7 +27,7 @@ func (m mockAgentClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan 
 	return ch, nil
 }
 
-func (m mockAgentClient) ConfirmPermission(ctx context.Context, sessionID string, toolCallID string, approved bool, remember bool) error {
+func (m mockAgentClient) ConfirmPermission(ctx context.Context, principalID string, sessionID string, toolCallID string, bindingDigest string, approved bool, remember bool) error {
 	return nil
 }
 
@@ -38,17 +39,16 @@ func main() {
 	defaultAPIKey := os.Getenv("KHAOS_API_KEY")
 	defaultPythonAgent := os.Getenv("KHAOS_PYTHON_AGENT")
 	if defaultPythonAgent == "" {
-		defaultPythonAgent = "127.0.0.1:50051"
+		defaultPythonAgent = "/tmp/khaos-agent.sock"
 	}
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
-	wsAddr := flag.String("ws-addr", "", "WebSocket listen address, defaults to --addr")
 	apiKey := flag.String("api-key", defaultAPIKey, "X-Khaos-Key value")
-	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService JSON-line address")
+	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService Unix socket path")
 	mockAgent := flag.Bool("mock-agent", false, "use in-process mock agent")
 	enableSubagents := flag.Bool("subagents", false, "enable subagent proxy")
 	flag.Parse()
-	if *wsAddr == "" {
-		*wsAddr = *addr
+	if err := validateListenConfig(*addr, *apiKey); err != nil {
+		log.Fatal(err)
 	}
 	var agent api.AgentClient = platform.PythonClient{Address: *pythonAddr}
 	if *mockAgent {
@@ -72,26 +72,31 @@ func main() {
 			handler = handler.WithSubagents(client)
 		}
 	}
-	wsHub := ws.NewHub()
-	go wsHub.Run()
-	wsRoute := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ws.HandleWebSocket(wsHub, agent, w, r)
-	})
-	root := http.NewServeMux()
-	root.Handle("/api/ws/", wsRoute)
-	root.Handle("/", handler.Routes())
-
 	log.Printf("Khaos gateway listening on %s", *addr)
-	log.Printf("WebSocket available at ws://%s/api/ws/{session}", *wsAddr)
 	if *enableSubagents {
 		log.Printf("Subagent proxy enabled (Python agent: %s)", *pythonAddr)
 	}
-	if *wsAddr != *addr {
-		wsMux := http.NewServeMux()
-		wsMux.Handle("/api/ws/", wsRoute)
-		go func() {
-			log.Fatal(http.ListenAndServe(*wsAddr, wsMux))
-		}()
+	server := &http.Server{
+		Addr:              *addr,
+		Handler:           handler.Routes(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      2 * time.Minute,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 20,
 	}
-	log.Fatal(http.ListenAndServe(*addr, root))
+	log.Fatal(server.ListenAndServe())
+}
+
+func validateListenConfig(addr, apiKey string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	ip := net.ParseIP(host)
+	isLoopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+	if !isLoopback && apiKey == "" {
+		return errors.New("refusing non-loopback gateway listen without KHAOS_API_KEY")
+	}
+	return nil
 }

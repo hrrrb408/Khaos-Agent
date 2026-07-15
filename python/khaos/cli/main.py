@@ -125,8 +125,7 @@ def build_command_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     start_parser = subparsers.add_parser("start", help="Start Khaos agent server + gateway")
-    start_parser.add_argument("--host", default="127.0.0.1")
-    start_parser.add_argument("--port", type=int, default=50051)
+    start_parser.add_argument("--socket", default="/tmp/khaos-agent.sock")
     start_parser.add_argument("--db", default="khaos.db")
     start_parser.add_argument("--config", default="config.yaml")
     start_parser.add_argument("--gateway", action="store_true", help="Also start Go gateway")
@@ -171,7 +170,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         gateway_process = subprocess.Popen(gateway_cmd, cwd=str(_project_root()))
         print("Started Go gateway with: go run ./go/cmd/gateway")
 
-    print(f"Starting Khaos agent on {args.host}:{args.port}")
+    print(f"Starting Khaos agent on Unix socket {args.socket}")
     print(f"Database: {args.db}")
     print(f"Config: {args.config}")
     from khaos.grpc_server import serve_json_lines
@@ -179,8 +178,7 @@ def cmd_start(args: argparse.Namespace) -> None:
     try:
         asyncio.run(
             serve_json_lines(
-                args.host,
-                args.port,
+                args.socket,
                 args.db,
                 project_root=Path.cwd(),
                 config_path=Path(args.config),
@@ -252,7 +250,7 @@ def cmd_config(args: argparse.Namespace) -> None:
         print(f"Config file not found: {config_path}")
         print("Creating default config...")
         config_path.write_text(
-            yaml.safe_dump({"model": "default", "port": 50051}, sort_keys=False),
+            yaml.safe_dump({"model": "default", "socket": "/tmp/khaos-agent.sock"}, sort_keys=False),
             encoding="utf-8",
         )
         return

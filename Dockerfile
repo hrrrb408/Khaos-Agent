@@ -18,11 +18,9 @@ COPY prompts/ prompts/
 COPY AGENTS.md KHAOS.md config.yaml ./
 
 # Data directories.
-RUN mkdir -p /app/data /app/skills
+RUN mkdir -p /app/data /app/skills /run/khaos
 
-EXPOSE 50051
-
-CMD ["python", "-m", "khaos.cli", "start", "--host", "0.0.0.0", "--port", "50051", "--db", "/app/data/khaos.db"]
+CMD ["python", "-m", "khaos.cli", "start", "--socket", "/run/khaos/agent.sock", "--db", "/app/data/khaos.db"]
 
 # Stage 2: Go gateway
 FROM golang:1.22-alpine AS go-builder

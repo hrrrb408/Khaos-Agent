@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"path/filepath"
 
 	"khaos/go/internal/api"
 )
@@ -32,11 +33,28 @@ func (c PythonClient) GetTask(ctx context.Context, id string) (map[string]any, e
 func (c PythonClient) CancelTask(ctx context.Context, id string) (api.TransitionResult, error) {
 	return c.taskAction(ctx, "TaskService.Cancel", id)
 }
-func (c PythonClient) ApproveTask(ctx context.Context, id string) (api.TransitionResult, error) {
-	return c.taskAction(ctx, "TaskService.Approve", id)
+func (c PythonClient) ApproveTask(ctx context.Context, id string, principalID string, sessionID string, bindingDigest string) (api.TransitionResult, error) {
+	return c.taskApprovalAction(ctx, "TaskService.Approve", id, principalID, sessionID, bindingDigest)
 }
-func (c PythonClient) RejectTask(ctx context.Context, id string) (api.TransitionResult, error) {
-	return c.taskAction(ctx, "TaskService.Reject", id)
+func (c PythonClient) RejectTask(ctx context.Context, id string, principalID string, sessionID string, bindingDigest string) (api.TransitionResult, error) {
+	return c.taskApprovalAction(ctx, "TaskService.Reject", id, principalID, sessionID, bindingDigest)
+}
+
+func (c PythonClient) taskApprovalAction(ctx context.Context, method, id, principalID, sessionID, bindingDigest string) (api.TransitionResult, error) {
+	response, err := c.callMap(ctx, method, map[string]any{
+		"task_id": id, "principal_id": principalID, "session_id": sessionID,
+		"binding_digest": bindingDigest,
+	})
+	if err != nil {
+		return "", err
+	}
+	if ok, _ := response["ok"].(bool); !ok {
+		if stringValue(response["error"]) == "task not found" {
+			return api.TransitionNotFound, nil
+		}
+		return api.TransitionInvalid, nil
+	}
+	return api.TransitionUpdated, nil
 }
 func (c PythonClient) TaskArtifacts(ctx context.Context, id string) ([]map[string]any, error) {
 	return c.callList(ctx, "TaskService.Artifacts", map[string]any{"task_id": id})
@@ -57,11 +75,13 @@ func (c PythonClient) taskAction(ctx context.Context, method, id string) (api.Tr
 }
 
 func (c PythonClient) TaskEvents(ctx context.Context, id string) (<-chan map[string]any, error) {
-	conn, err := net.Dial("tcp", c.Address)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
+	stopCancelWatch := closeOnContextDone(ctx, conn)
 	if err := json.NewEncoder(conn).Encode(map[string]any{"method": "TaskService.Events", "payload": map[string]any{"task_id": id}}); err != nil {
+		stopCancelWatch()
 		conn.Close()
 		return nil, err
 	}
@@ -69,6 +89,7 @@ func (c PythonClient) TaskEvents(ctx context.Context, id string) (<-chan map[str
 	go func() {
 		defer close(ch)
 		defer conn.Close()
+		defer stopCancelWatch()
 		scanner := bufio.NewScanner(conn)
 		for scanner.Scan() {
 			var event map[string]any
@@ -139,12 +160,14 @@ func stringValue(value any) string {
 
 // Chat starts a chat RPC and streams events.
 func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api.ChatEvent, error) {
-	conn, err := net.Dial("tcp", c.Address)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
+	stopCancelWatch := closeOnContextDone(ctx, conn)
 	payload := map[string]any{"method": "AgentService.Chat", "payload": req}
 	if err := json.NewEncoder(conn).Encode(payload); err != nil {
+		stopCancelWatch()
 		conn.Close()
 		return nil, err
 	}
@@ -152,6 +175,7 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 	go func() {
 		defer close(ch)
 		defer conn.Close()
+		defer stopCancelWatch()
 		scanner := bufio.NewScanner(conn)
 		for scanner.Scan() {
 			var event api.ChatEvent
@@ -168,30 +192,34 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 }
 
 // ConfirmPermission forwards a permission confirmation.
-func (c PythonClient) ConfirmPermission(ctx context.Context, sessionID string, toolCallID string, approved bool, remember bool) error {
-	conn, err := net.Dial("tcp", c.Address)
+func (c PythonClient) ConfirmPermission(ctx context.Context, principalID string, sessionID string, toolCallID string, bindingDigest string, approved bool, remember bool) error {
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
+	defer closeOnContextDone(ctx, conn)()
 	return json.NewEncoder(conn).Encode(map[string]any{
 		"method": "AgentService.ConfirmPermission",
 		"payload": map[string]any{
-			"session_id":   sessionID,
-			"tool_call_id": toolCallID,
-			"approved":     approved,
-			"remember":     remember,
+			"session_id":     sessionID,
+			"principal_id":   principalID,
+			"tool_call_id":   toolCallID,
+			"binding_digest": bindingDigest,
+			"approved":       approved,
+			"remember":       remember,
 		},
 	})
 }
 
 // SwitchMode switches mode through Python.
 func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error) {
-	conn, err := net.Dial("tcp", c.Address)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
+	defer closeOnContextDone(ctx, conn)()
 	if err := json.NewEncoder(conn).Encode(map[string]any{
 		"method":  "AgentService.SwitchMode",
 		"payload": map[string]any{"session_id": sessionID, "target_mode": targetMode},
@@ -207,11 +235,12 @@ func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMo
 
 // Query queries audit records through Python.
 func (c PythonClient) Query(ctx context.Context, action, result, since, until string, limit int) ([]api.AuditEntry, error) {
-	conn, err := net.Dial("tcp", c.Address)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	defer closeOnContextDone(ctx, conn)()
 	payload := map[string]any{
 		"limit": limit,
 	}
@@ -261,11 +290,12 @@ func (c PythonClient) Status(ctx context.Context) (map[string]any, error) {
 }
 
 func (c PythonClient) callMap(ctx context.Context, method string, payload map[string]any) (map[string]any, error) {
-	conn, err := net.Dial("tcp", c.Address)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	defer closeOnContextDone(ctx, conn)()
 	if err := json.NewEncoder(conn).Encode(map[string]any{
 		"method":  method,
 		"payload": payload,
@@ -280,11 +310,12 @@ func (c PythonClient) callMap(ctx context.Context, method string, payload map[st
 }
 
 func (c PythonClient) callList(ctx context.Context, method string, payload map[string]any) ([]map[string]any, error) {
-	conn, err := net.Dial("tcp", c.Address)
+	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
+	defer closeOnContextDone(ctx, conn)()
 	if err := json.NewEncoder(conn).Encode(map[string]any{"method": method, "payload": payload}); err != nil {
 		return nil, err
 	}
@@ -293,4 +324,33 @@ func (c PythonClient) callList(ctx context.Context, method string, payload map[s
 		return nil, err
 	}
 	return response, nil
+}
+
+func (c PythonClient) dial(ctx context.Context) (net.Conn, error) {
+	if !filepath.IsAbs(c.Address) {
+		return nil, fmt.Errorf("Python AgentService requires an absolute Unix socket path")
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", c.Address)
+	if err != nil {
+		return nil, err
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		if err := conn.SetDeadline(deadline); err != nil {
+			conn.Close()
+			return nil, err
+		}
+	}
+	return conn, nil
+}
+
+func closeOnContextDone(ctx context.Context, conn net.Conn) func() {
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = conn.Close()
+		case <-done:
+		}
+	}()
+	return func() { close(done) }
 }
