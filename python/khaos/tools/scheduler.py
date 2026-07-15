@@ -42,8 +42,8 @@ class PermissionRequest:
     level: str
     target: str
     reason: str
-    binding_digest: str
-    expires_at: float
+    binding_digest: str = ""
+    expires_at: float = 0.0
 
 
 @dataclass

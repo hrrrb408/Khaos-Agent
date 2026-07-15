@@ -137,7 +137,7 @@ async def test_agent_loop_reports_error_after_repeated_empty_model_response(tmp_
     await db.close()
 
 
-async def test_agent_loop_executes_real_read_file_tool(tmp_path):
+async def test_agent_loop_read_file_without_workspace_fails_closed(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
     (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
@@ -166,8 +166,8 @@ async def test_agent_loop_executes_real_read_file_tool(tmp_path):
     assert "tool_call" in [message.event for message in events]
     assert "permission_request" in [message.event for message in events]
     tool_results = [message for message in events if message.event == "tool_result"]
-    assert tool_results[0].metadata["success"] is True
-    assert "1: hello" in str(tool_results[0].metadata["output"])
+    assert tool_results[0].metadata["success"] is False
+    assert "active TaskWorkspace" in str(tool_results[0].metadata["error"])
     assert [message.role for message in persisted] == ["user", "assistant", "tool", "assistant"]
     await db.close()
 
