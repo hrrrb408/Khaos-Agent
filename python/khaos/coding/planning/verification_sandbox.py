@@ -18,6 +18,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
 import time
 from dataclasses import dataclass
@@ -245,7 +246,7 @@ class DockerVerificationSandboxBackend:
         self,
         *,
         profile: SandboxProfile,
-        docker_executable: Path = Path("/usr/local/bin/docker"),
+        docker_executable: Path | None = None,
         secret_values: Iterable[str] = (),
         host_paths: Iterable[Path] = (),
         kill_grace_seconds: float = 1.0,
@@ -263,7 +264,13 @@ class DockerVerificationSandboxBackend:
         if profile.network_enabled or not profile.read_only_root:
             raise ValueError("production verification profile must be offline/read-only")
         self.profile = profile
-        self._docker = docker_executable.resolve(strict=True)
+        selected_docker = docker_executable
+        if selected_docker is None:
+            discovered = shutil.which("docker")
+            if discovered is None:
+                raise FileNotFoundError("Docker executable was not found on PATH")
+            selected_docker = Path(discovered)
+        self._docker = selected_docker.resolve(strict=True)
         self._secrets = tuple(value for value in secret_values if value)
         self._host_paths = tuple(str(path.resolve()) for path in host_paths)
         self._grace = kill_grace_seconds

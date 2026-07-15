@@ -65,11 +65,16 @@ async def sandbox_exec(
         backend_hint="docker",
     )
     result = await execution_service.execute(request)
+    timed_out = result.status == "timed-out"
+    raw_returncode = result.return_code
     return {
         "container_id": str(result.diagnostics.get("container_id", "")),
         "command": command,
         "network": False,
-        "returncode": result.return_code if result.return_code is not None else -1,
+        "returncode": -1 if timed_out or raw_returncode is None else raw_returncode,
+        "raw_returncode": raw_returncode,
+        "status": result.status,
+        "timed_out": timed_out,
         "stdout": result.stdout,
         "stderr": result.stderr,
         "backend": "docker",

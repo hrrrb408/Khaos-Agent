@@ -115,7 +115,7 @@ def _require_or_skip(binary: str) -> None:
 @pytest.mark.asyncio
 @pytest.mark.platform_sandbox_real
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux bubblewrap evidence")
-async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
+async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request):
     """Real bwrap execution verifying all 9 isolation requirements.
 
     1. actually executed through bwrap (not argv-only);
@@ -142,11 +142,15 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
             )
         pytest.skip(f"bwrap cannot enforce isolation: {availability.reason}")
 
+    # /tmp is intentionally a writable tmpfs inside bwrap, so negative host
+    # write evidence must live under a ro-bound host path such as $HOME.
+    host_root = Path(tempfile.mkdtemp(prefix=".khaos-bwrap-e2e-", dir=Path.home()))
+    request.addfinalizer(lambda: shutil.rmtree(host_root, ignore_errors=True))
     workspace = tmp_path / "workspace"
-    secret_root = tmp_path / "host-secrets"
+    secret_root = host_root / "host-secrets"
     secret_file = secret_root / "token"
-    outside = tmp_path / "outside.txt"
-    main_repo = tmp_path / "repository"
+    outside = host_root / "outside.txt"
+    main_repo = host_root / "repository"
     workspace.mkdir()
     secret_root.mkdir()
     secret_file.write_text("host-secret", encoding="utf-8")

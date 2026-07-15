@@ -101,6 +101,7 @@ async def test_sandbox_exec_routes_through_execution_service_and_docker_backend(
         "container_id": "container-1", "command": "python -V", "network": False,
         "returncode": 0, "stdout": "ok\n", "stderr": "", "backend": "docker",
         "workspace_id": "workspace", "cleanup": "removed",
+        "raw_returncode": 0, "status": "passed", "timed_out": False,
     }
     context = backend.contexts[0]
     assert context.task_id == "task"
@@ -540,6 +541,8 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
     else:
         result = await running
         assert result["returncode"] == -1
+        assert result["timed_out"] is True
+        assert result["status"] == "timed-out"
         assert result["cleanup"] == "removed"
     leftovers = subprocess.run(
         ["docker", "ps", "-aq", "--filter", "name=khaos-"],

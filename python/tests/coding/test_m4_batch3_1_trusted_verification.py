@@ -160,6 +160,20 @@ def test_caller_command_field_tampering_is_rejected_before_process(tmp_path, fie
         asyncio.run(backend.execute(tampered, workspace))
 
 
+def test_verification_backend_discovers_docker_from_path(tmp_path, monkeypatch):
+    docker = tmp_path / "docker"
+    docker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    docker.chmod(0o755)
+    monkeypatch.setattr(
+        "khaos.coding.planning.verification_sandbox.shutil.which",
+        lambda name: str(docker) if name == "docker" else None,
+    )
+
+    backend = DockerVerificationSandboxBackend(profile=_profile())
+
+    assert backend._docker == docker.resolve()
+
+
 @pytest.mark.parametrize("language,executable,absolute,argv", [
     ("python", "python", "/usr/local/bin/python3", ("python", "-m", "pytest", "-q")),
     ("javascript", "npm", "/usr/local/bin/npm", ("npm", "run", "test")),
