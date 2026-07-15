@@ -44,6 +44,12 @@ class PermissionRequest:
     reason: str
     binding_digest: str = ""
     expires_at: float = 0.0
+    principal_id: str = ""
+    session_id: str = ""
+    task_id: str = ""
+    workspace_id: str = ""
+    arguments_digest: str = ""
+    profile_digest: str = ""
 
 
 @dataclass
@@ -299,9 +305,29 @@ class ToolScheduler:
                     reason=decision.reason,
                     binding_digest=binding_digest,
                     expires_at=expires_at,
+                    principal_id=binding.principal_id,
+                    session_id=binding.session_id,
+                    task_id=binding.task_id,
+                    workspace_id=binding.workspace_id,
+                    arguments_digest=binding.arguments_digest,
+                    profile_digest=binding.profile_digest,
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
+                resolved = await broker.resolve(
+                    normalized["id"],
+                    bool(confirmation.get("approved", False)),
+                    bool(confirmation.get("remember", False)),
+                    principal_id=principal_id,
+                    session_id=current_session,
+                    binding_digest=binding_digest,
+                )
+                if resolved:
+                    confirmation = await broker.wait(
+                        normalized["id"], binding_digest=binding_digest
+                    )
+                else:
+                    confirmation = {"approved": False, "remember": False}
                 if not confirmation.get("approved", False):
                     if destructive_context is not None:
                         await destructive_context["approval_broker"].cancel_operation(normalized["id"])
@@ -480,6 +506,12 @@ class ToolScheduler:
                 "reason": request.reason,
                 "binding_digest": request.binding_digest,
                 "expires_at": request.expires_at,
+                "principal_id": request.principal_id,
+                "session_id": request.session_id,
+                "task_id": request.task_id,
+                "workspace_id": request.workspace_id,
+                "arguments_digest": request.arguments_digest,
+                "profile_digest": request.profile_digest,
             }
         )
         if inspect.isawaitable(value):

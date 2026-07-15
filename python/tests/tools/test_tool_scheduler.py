@@ -135,6 +135,73 @@ async def test_scheduler_confirm_with_remember_creates_rule(tmp_path):
     await db.close()
 
 
+async def test_scheduler_consumes_bound_approval_before_dispatch(tmp_path):
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
+    broker = ApprovalBroker()
+    context = _approval_context()
+    context["approval_broker"] = broker
+    captured = {}
+
+    def approve(request):
+        captured.update(request)
+        return {"approved": True, "remember": False}
+
+    scheduler = ToolScheduler(_registry(), PermissionEngine(db))
+    results = await scheduler.execute_batch(
+        [{"id": "call-1", "name": "write", "arguments": {"value": "b"}}],
+        mode="coding",
+        session_id="test-session",
+        confirm_callback=approve,
+        tool_context=context,
+    )
+
+    assert results[0].success
+    assert captured["principal_id"] == "test-principal"
+    assert captured["session_id"] == "test-session"
+    assert captured["task_id"] == "test-task"
+    assert captured["workspace_id"] == "test-workspace"
+    assert len(captured["binding_digest"]) == 64
+    assert len(captured["arguments_digest"]) == 64
+    assert len(captured["profile_digest"]) == 64
+    assert not await broker.resolve(
+        "call-1",
+        True,
+        principal_id="test-principal",
+        session_id="test-session",
+        binding_digest=captured["binding_digest"],
+    )
+    await db.close()
+
+
+async def test_scheduler_denies_when_bound_approval_cannot_be_resolved(tmp_path):
+    class RejectingBroker(ApprovalBroker):
+        async def resolve(self, *args, **kwargs):
+            return False
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
+    context = _approval_context()
+    context["approval_broker"] = RejectingBroker()
+    scheduler = ToolScheduler(_registry(), PermissionEngine(db))
+
+    results = await scheduler.execute_batch(
+        [{"id": "call-1", "name": "write", "arguments": {"value": "b"}}],
+        mode="coding",
+        session_id="test-session",
+        confirm_callback=lambda request: {"approved": True},
+        tool_context=context,
+    )
+
+    assert not results[0].success
+    assert results[0].error == "User denied permission"
+    await db.close()
+
+
 async def test_scheduler_budget_exhaustion_stops_serial_calls(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
