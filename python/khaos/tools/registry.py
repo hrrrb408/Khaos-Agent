@@ -6,6 +6,13 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from khaos.exceptions import ToolNotFoundError
+
+
+_WORKSPACE_FILE_TOOLS = frozenset({
+    "read_file", "search_files", "list_directory", "file_info", "tree_view",
+    "file_search_content", "write_file", "patch", "multi_edit", "copy_file",
+    "move_file", "code_search", "code_symbols",
+})
 from dataclasses import field
 
 
@@ -126,6 +133,13 @@ class ToolInvocationBroker:
             if capability.name == "filesystem.write" and mode == "coding":
                 if context.get("workspace_id") is None or context.get("task_id") is None:
                     raise PermissionError("filesystem.write requires active TaskWorkspace")
+            if (
+                capability.name == "filesystem.read"
+                and mode == "coding"
+                and name in _WORKSPACE_FILE_TOOLS
+            ):
+                if context.get("workspace_id") is None or context.get("task_id") is None:
+                    raise PermissionError("filesystem.read requires active TaskWorkspace")
             if capability.name == "network.access" and context.get("network_policy") != "unrestricted-with-approval":
                 raise PermissionError("network.access requires server-authorized network policy")
             if capability.name == "host.integration" and mode == "coding":
@@ -154,7 +168,10 @@ class ToolInvocationBroker:
             handler_params["approval_context"] = context.get("approval_context")
             handler_params["principal_id"] = context.get("principal_id")
             handler_params["requester"] = context.get("requester")
-        if mode == "coding" and any(capability.name == "filesystem.write" for capability in capabilities):
+        if mode == "coding" and name in _WORKSPACE_FILE_TOOLS and any(
+            capability.name in {"filesystem.read", "filesystem.write"}
+            for capability in capabilities
+        ):
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")

@@ -6,6 +6,8 @@ import copy
 import getpass
 import os
 import re
+import secrets
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -251,10 +253,50 @@ def _read_yaml_file(path: Path) -> dict[str, Any]:
 
 def _write_yaml_file(path: Path, config: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(
-        yaml.safe_dump(config, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
+    parent_fd = os.open(
+        path.parent,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
     )
+    temporary = f".khaos-config-{secrets.token_hex(16)}"
+    descriptor = -1
+    try:
+        try:
+            current = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            current = None
+        if current is not None and (
+            not stat.S_ISREG(current.st_mode) or current.st_nlink != 1
+        ):
+            raise ConfigError("config target must be a single-link regular file")
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=parent_fd,
+        )
+        payload = yaml.safe_dump(
+            config, allow_unicode=True, sort_keys=False
+        ).encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(descriptor, payload[offset:])
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        os.rename(
+            temporary, path.name,
+            src_dir_fd=parent_fd, dst_dir_fd=parent_fd,
+        )
+        os.fsync(parent_fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=parent_fd)
+        except FileNotFoundError:
+            pass
+        os.close(parent_fd)
 
 
 def _is_configured_secret(value: str) -> bool:

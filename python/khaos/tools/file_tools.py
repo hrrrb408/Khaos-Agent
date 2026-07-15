@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import shutil
+import stat
 import tempfile
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
@@ -40,8 +41,15 @@ def enable_security(enabled: bool = True) -> None:
     _SECURITY_ENABLED = enabled
 
 
-async def read_file(path: str, offset: int = 1, limit: int = 500) -> dict[str, Any]:
+async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
     """Read a file page with one-based line numbers."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding read requires matching active TaskWorkspace")
+        return await asyncio.to_thread(
+            _workspace_read_sync, workspace.worktree_path, path, offset, limit
+        )
     return await asyncio.to_thread(_read_file_sync, path, offset, limit)
 
 
@@ -79,8 +87,9 @@ async def write_file(path: str, content: str, workspace_manager=None, task_id: s
         workspace = workspace_manager.get(workspace_id or "")
         if workspace is None or workspace.task_id != task_id:
             raise PermissionError("coding write requires matching active TaskWorkspace")
-        from khaos.coding.workspace.boundary import resolve_write_target
-        path = str(resolve_write_target(workspace.worktree_path, path))
+        return await asyncio.to_thread(
+            _workspace_write_sync, workspace.worktree_path, path, content
+        )
     return await asyncio.to_thread(_write_file_sync, path, content)
 
 
@@ -106,8 +115,14 @@ async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_man
         workspace = workspace_manager.get(workspace_id or "")
         if workspace is None or workspace.task_id != task_id:
             raise PermissionError("coding patch requires matching active TaskWorkspace")
-        from khaos.coding.workspace.boundary import resolve_write_target
-        path = str(resolve_write_target(workspace.worktree_path, path))
+        return await asyncio.to_thread(
+            _workspace_patch_sync,
+            workspace.worktree_path,
+            path,
+            old,
+            new,
+            fuzzy,
+        )
     return await asyncio.to_thread(_patch_sync, path, old, new, fuzzy)
 
 
@@ -136,8 +151,12 @@ async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_
         workspace = workspace_manager.get(workspace_id or "")
         if workspace is None or workspace.task_id != task_id:
             raise PermissionError("coding edit requires matching active TaskWorkspace")
-        from khaos.coding.workspace.boundary import resolve_write_target
-        path = str(resolve_write_target(workspace.worktree_path, path))
+        return await asyncio.to_thread(
+            _workspace_multi_edit_sync,
+            workspace.worktree_path,
+            path,
+            edits,
+        )
     return await asyncio.to_thread(_multi_edit_sync, path, edits)
 
 
@@ -215,8 +234,19 @@ async def search_files(
     glob: str = "*",
     content: bool = False,
     limit: int = 100,
+    workspace_manager=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Search file paths by glob or file contents by text."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding search requires matching active TaskWorkspace")
+        return await asyncio.to_thread(
+            _workspace_search_sync, workspace.worktree_path, root, query,
+            glob, content, limit,
+        )
     return await asyncio.to_thread(_search_files_sync, root, query, glob, content, limit)
 
 
@@ -258,8 +288,15 @@ def _search_files_sync(
     return {"root": str(root_path), "matches": matches, "count": len(matches)}
 
 
-async def list_directory(path: str = ".", include_hidden: bool = True) -> dict[str, Any]:
+async def list_directory(path: str = ".", include_hidden: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
     """List directory contents with structured metadata."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding list requires matching active TaskWorkspace")
+        return await asyncio.to_thread(
+            _workspace_list_sync, workspace.worktree_path, path, include_hidden
+        )
     return await asyncio.to_thread(_list_directory_sync, path, include_hidden)
 
 
@@ -307,8 +344,15 @@ def _list_directory_sync(path: str, include_hidden: bool) -> dict[str, Any]:
     }
 
 
-async def file_info(path: str) -> dict[str, Any]:
+async def file_info(path: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
     """Get detailed file or directory metadata."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding info requires matching active TaskWorkspace")
+        return await asyncio.to_thread(
+            _workspace_info_sync, workspace.worktree_path, path
+        )
     return await asyncio.to_thread(_file_info_sync, path)
 
 
@@ -338,8 +382,15 @@ def _file_info_sync(path: str) -> dict[str, Any]:
     }
 
 
-async def tree_view(path: str = ".", max_depth: int = 3) -> dict[str, Any]:
+async def tree_view(path: str = ".", max_depth: int = 3, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
     """Generate a formatted directory tree view."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding tree requires matching active TaskWorkspace")
+        return await asyncio.to_thread(
+            _workspace_tree_sync, workspace.worktree_path, path, max_depth
+        )
     return await asyncio.to_thread(_tree_view_sync, path, max_depth)
 
 
@@ -370,9 +421,9 @@ async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | N
         workspace = workspace_manager.get(workspace_id or "")
         if workspace is None or workspace.task_id != task_id:
             raise PermissionError("coding copy requires matching active TaskWorkspace")
-        from khaos.coding.workspace.boundary import resolve_write_target
-        src = str(resolve_write_target(workspace.worktree_path, src))
-        dst = str(resolve_write_target(workspace.worktree_path, dst))
+        return await asyncio.to_thread(
+            _workspace_copy_sync, workspace.worktree_path, src, dst
+        )
     return await asyncio.to_thread(_copy_file_sync, src, dst)
 
 
@@ -413,9 +464,9 @@ async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | N
         workspace = workspace_manager.get(workspace_id or "")
         if workspace is None or workspace.task_id != task_id:
             raise PermissionError("coding move requires matching active TaskWorkspace")
-        from khaos.coding.workspace.boundary import resolve_write_target
-        src = str(resolve_write_target(workspace.worktree_path, src))
-        dst = str(resolve_write_target(workspace.worktree_path, dst))
+        return await asyncio.to_thread(
+            _workspace_move_sync, workspace.worktree_path, src, dst
+        )
     return await asyncio.to_thread(_move_file_sync, src, dst)
 
 
@@ -448,8 +499,22 @@ async def file_search_content(
     path: str,
     pattern: str,
     max_results: int = 50,
+    workspace_manager=None,
+    task_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, Any]:
     """Search text file contents for a substring or basic regular expression."""
+    if workspace_manager is not None:
+        workspace = workspace_manager.get(workspace_id or "")
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("coding content search requires matching active TaskWorkspace")
+        return await asyncio.to_thread(
+            _workspace_content_search_sync,
+            workspace.worktree_path,
+            path,
+            pattern,
+            max_results,
+        )
     return await asyncio.to_thread(_file_search_content_sync, path, pattern, max_results)
 
 
@@ -580,6 +645,316 @@ def _iter_searchable_files(root_path: Path) -> list[Path]:
         for file_name in sorted(file_names, key=str.lower):
             files.append(Path(dir_path) / file_name)
     return files
+
+
+def _workspace_write_sync(
+    root: Path, path: str, content: str
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        relative = filesystem.relative(path)
+        filesystem.write_bytes(path, content.encode("utf-8"))
+        return {
+            "path": str(filesystem.root / relative),
+            "bytes": len(content.encode("utf-8")),
+        }
+
+
+def _workspace_read_sync(
+    root: Path, path: str, offset: int, limit: int
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    if offset < 1 or limit < 1:
+        raise ValueError("offset and limit must be >= 1")
+    with SafeWorkspaceFS(root) as filesystem:
+        relative = filesystem.relative(path)
+        lines = filesystem.read_bytes(path).decode("utf-8").splitlines()
+        start = offset - 1
+        selected = lines[start:start + limit]
+        return {
+            "path": str(filesystem.root / relative),
+            "offset": offset,
+            "limit": limit,
+            "total_lines": len(lines),
+            "content": "\n".join(
+                f"{start + index + 1}: {line}"
+                for index, line in enumerate(selected)
+            ),
+        }
+
+
+def _workspace_search_sync(
+    workspace_root: Path, root: str, query: str, glob: str,
+    content: bool, limit: int,
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    with SafeWorkspaceFS(workspace_root) as filesystem:
+        base = filesystem._directory_relative(root)
+        matches: list[dict[str, Any]] = []
+        for relative in filesystem.iter_files(root):
+            display = relative[len(base) + 1:] if base else relative
+            if not fnmatch.fnmatch(display, glob):
+                continue
+            if not content:
+                if not query or query in display:
+                    matches.append({"path": str(filesystem.root / relative)})
+            else:
+                try:
+                    lines = filesystem.read_bytes(relative).decode("utf-8").splitlines()
+                except UnicodeDecodeError:
+                    continue
+                for line_number, line in enumerate(lines, start=1):
+                    if query in line:
+                        matches.append({
+                            "path": str(filesystem.root / relative),
+                            "line": line_number,
+                            "text": line,
+                        })
+                        break
+            if len(matches) >= limit:
+                break
+        return {
+            "root": str(filesystem.root / base),
+            "matches": matches,
+            "count": len(matches),
+        }
+
+
+def _workspace_list_sync(
+    workspace_root: Path, path: str, include_hidden: bool
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(workspace_root) as filesystem:
+        base = filesystem._directory_relative(path)
+        direct_files: dict[str, dict[str, Any]] = {}
+        directories: set[str] = set()
+        for relative in filesystem.iter_files(path):
+            display = relative[len(base) + 1:] if base else relative
+            first, separator, remainder = display.partition("/")
+            if not include_hidden and first.startswith("."):
+                continue
+            if separator:
+                directories.add(first)
+            else:
+                info = filesystem.stat(relative)
+                direct_files[first] = {
+                    "name": first,
+                    "size_bytes": info.st_size,
+                    "extension": Path(first).suffix,
+                }
+        dirs = [{"name": name, "item_count": 0} for name in sorted(directories, key=str.lower)]
+        files = [direct_files[name] for name in sorted(direct_files, key=str.lower)]
+        return {
+            "ok": True,
+            "path": str(filesystem.root / base),
+            "dirs": dirs,
+            "files": files,
+            "total_items": len(dirs) + len(files),
+        }
+
+
+def _workspace_info_sync(workspace_root: Path, path: str) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(workspace_root) as filesystem:
+        if path in {"", "."}:
+            stat_result = os.fstat(filesystem._handle.root_fd)
+            relative = ""
+        else:
+            relative = filesystem.relative(path)
+            stat_result = filesystem.stat(path)
+        is_directory = stat.S_ISDIR(stat_result.st_mode)
+        modified = datetime.fromtimestamp(
+            stat_result.st_mtime, tz=timezone.utc
+        ).isoformat()
+        return {
+            "ok": True,
+            "path": str(filesystem.root / relative),
+            "type": "directory" if is_directory else "file",
+            "size_bytes": stat_result.st_size,
+            "extension": "" if is_directory else Path(relative).suffix,
+            "modified": modified,
+            "is_hidden": bool(relative and Path(relative).name.startswith(".")),
+            "is_symlink": False,
+            "mime_type": mimetypes.guess_type(relative)[0],
+        }
+
+
+def _workspace_tree_sync(
+    workspace_root: Path, path: str, max_depth: int
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    if max_depth < 0:
+        raise ValueError("max_depth must be >= 0")
+    with SafeWorkspaceFS(workspace_root) as filesystem:
+        base = filesystem._directory_relative(path)
+        visible: list[str] = []
+        directories: set[str] = set()
+        for relative in filesystem.iter_files(path):
+            display = relative[len(base) + 1:] if base else relative
+            parts = display.split("/")
+            for depth in range(1, min(len(parts), max_depth + 1)):
+                directories.add("/".join(parts[:depth]))
+            if len(parts) <= max_depth:
+                visible.append(display)
+        lines = [f"{entry}/" for entry in sorted(directories)] + sorted(visible)
+        return {
+            "ok": True,
+            "path": str(filesystem.root / base),
+            "tree": "\n".join(lines),
+            "total_files": len(visible),
+            "total_dirs": len(directories),
+        }
+
+
+def _workspace_content_search_sync(
+    workspace_root: Path, path: str, pattern: str, max_results: int
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    if max_results < 1:
+        raise ValueError("max_results must be >= 1")
+    try:
+        regex = re.compile(pattern)
+    except re.error:
+        regex = None
+    with SafeWorkspaceFS(workspace_root) as filesystem:
+        try:
+            candidates = filesystem.iter_files(path)
+        except (NotADirectoryError, FileNotFoundError):
+            candidates = [filesystem.relative(path)]
+        matches: list[dict[str, Any]] = []
+        searched = 0
+        for relative in candidates:
+            try:
+                lines = filesystem.read_bytes(relative).decode("utf-8").splitlines()
+            except UnicodeDecodeError:
+                continue
+            searched += 1
+            for line_number, line in enumerate(lines, start=1):
+                matched = regex.search(line) is not None if regex else pattern in line
+                if matched:
+                    matches.append({
+                        "file": str(filesystem.root / relative),
+                        "line_number": line_number,
+                        "line": line,
+                    })
+                    if len(matches) >= max_results:
+                        return {"ok": True, "pattern": pattern, "matches": matches, "match_count": len(matches), "files_searched": searched}
+        return {"ok": True, "pattern": pattern, "matches": matches, "match_count": len(matches), "files_searched": searched}
+
+
+def _workspace_patch_sync(
+    root: Path, path: str, old: str, new: str, fuzzy: bool
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        relative = filesystem.relative(path)
+        result: dict[str, Any] = {}
+
+        def transform(original: str) -> str:
+            if old in original:
+                result.update(replaced=1, fuzzy=False)
+                return original.replace(old, new, 1)
+            if not fuzzy:
+                raise ValueError("old text not found")
+            match = _find_fuzzy_block(original, old)
+            if match is None:
+                raise ValueError("old text not found")
+            start, end, score = match
+            result.update(replaced=1, fuzzy=True, score=score)
+            return original[:start] + new + original[end:]
+
+        filesystem.transform_text(path, transform)
+        return {"path": str(filesystem.root / relative), **result}
+
+
+def _workspace_multi_edit_sync(
+    root: Path, path: str, edits: list[dict]
+) -> str:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    normalized_edits = _normalize_multi_edits(edits)
+    sorted_edits = sorted(
+        enumerate(normalized_edits),
+        key=lambda item: len(item[1]["old_text"]),
+        reverse=True,
+    )
+    with SafeWorkspaceFS(root) as filesystem:
+        relative = filesystem.relative(path)
+        original = filesystem.read_bytes(path).decode("utf-8")
+        failures: list[dict[str, Any]] = []
+        for original_index, edit in sorted_edits:
+            count = original.count(edit["old_text"])
+            if count != 1:
+                failures.append({
+                    "index": original_index,
+                    "old_text": edit["old_text"],
+                    "matches": count,
+                    "error": (
+                        "old_text not found" if count == 0
+                        else "old_text is not unique"
+                    ),
+                })
+        if failures:
+            return json.dumps({
+                "path": str(filesystem.root / relative),
+                "applied": 0,
+                "failed": sorted(failures, key=lambda item: int(item["index"])),
+            }, ensure_ascii=False)
+        updated = original
+        applied: list[dict[str, Any]] = []
+        for original_index, edit in sorted_edits:
+            updated = updated.replace(edit["old_text"], edit["new_text"], 1)
+            applied.append({"index": original_index, "old_text": edit["old_text"]})
+        filesystem.write_bytes(path, updated.encode("utf-8"))
+        return json.dumps({
+            "path": str(filesystem.root / relative),
+            "applied": len(applied),
+            "failed": [],
+            "message": "All edits applied.",
+        }, ensure_ascii=False)
+
+
+def _workspace_copy_sync(
+    root: Path, source: str, destination: str
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        source_relative = filesystem.relative(source)
+        destination_relative = filesystem.relative(destination)
+        size = filesystem.copy_file(source, destination)
+        return {
+            "ok": True,
+            "src": str(filesystem.root / source_relative),
+            "dst": str(filesystem.root / destination_relative),
+            "size_bytes": size,
+        }
+
+
+def _workspace_move_sync(
+    root: Path, source: str, destination: str
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        source_relative = filesystem.relative(source)
+        destination_relative = filesystem.relative(destination)
+        filesystem.move_file(source, destination)
+        return {
+            "ok": True,
+            "src": str(filesystem.root / source_relative),
+            "dst": str(filesystem.root / destination_relative),
+        }
 
 
 def _atomic_write(path: Path, content: str) -> None:

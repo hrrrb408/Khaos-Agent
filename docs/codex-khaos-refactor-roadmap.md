@@ -110,6 +110,13 @@ ownership、SSE `Last-Event-ID` sequence replay cursor，以及 client disconnec
 
 ## 6. Batch E：Filesystem
 
+实施进度（2026-07-15）：E1-E5 已完成。复用既有 planned mutation 的固定 root dirfd/
+逐段 `O_NOFOLLOW`/inode revalidation/fsync/atomic exchange 原语，新增通用
+`SafeWorkspaceFS`。Coding read/write/patch/multi-edit/copy/move/search/symbol 工具均绑定
+active TaskWorkspace，拒绝 traversal、protected metadata、symlink、hardlink 与目标覆盖；
+用户配置写入改为 0600 同目录临时文件 + fsync + dirfd rename。平台真实 rename-race 与
+磁盘故障注入继续由 CI security gate 覆盖。
+
 | 项 | 内容 |
 | --- | --- |
 | 范围 | file tools、workspace boundary/apply/recovery、config writes、patch/ChangeSet、Rust bridge |
