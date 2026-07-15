@@ -140,6 +140,7 @@ class AgentLoop:
             approval_broker = ApprovalBroker(db=db)
         self.approval_broker = approval_broker
         self.principal_id = principal_id or f"local-uid:{os.getuid()}"
+        self._active_context_facts: list[Message] = []
         if self.execution_service is None:
             from khaos.coding.execution import ExecutionService, UnsupportedBackend
 
@@ -200,6 +201,9 @@ class AgentLoop:
             task_id=active_task_id,
             principal_id=self.principal_id,
         )
+        self._active_context_facts = await self._build_durable_task_facts(
+            active_task_id
+        )
         total_tokens = 0
         try:
             messages = await self._build_context(session_id, user_input)
@@ -224,6 +228,17 @@ class AgentLoop:
                             self.config.compression_threshold,
                         )
                         messages = result.messages
+                        await turn.emit(
+                            "context.compacted",
+                            {
+                                "level": result.level.name,
+                                "window_id": result.window_id,
+                                "result_digest": result.result_digest,
+                                "original_tokens": result.original_tokens,
+                                "compressed_tokens": result.compressed_tokens,
+                                "replaced_message_count": result.replaced_message_count,
+                            },
+                        )
                 # Phase 6.3: 记录本轮的输入 token（整个上下文）。
                 if self.cost_tracker is not None:
                     input_tokens = sum(
@@ -659,15 +674,56 @@ class AgentLoop:
                 role="system",
                 content=await self._build_system_prompt(session_id, user_input),
                 token_count=0,
+                metadata={
+                    "durable_fact": True,
+                    "context_layer": "immutable-rules",
+                },
             )
         ]
         messages.extend(await self.db.list_messages(session_id))
+        messages.extend(self._active_context_facts)
 
         relevant = self._build_relevant_files_message(user_input)
         if relevant is not None:
             messages.append(relevant)
 
         return messages
+
+    async def _build_durable_task_facts(
+        self, task_id: str | None
+    ) -> list[Message]:
+        """Reconstruct authoritative Task/approval facts outside summaries."""
+        if task_id is None or self.task_manager is None:
+            return []
+        task = await self.task_manager.get(task_id)
+        if task is None:
+            return []
+        raw = task.to_dict(include_internal=True)
+        metadata = raw.get("metadata") if isinstance(raw.get("metadata"), dict) else {}
+        facts = {
+            "task_id": raw.get("id"),
+            "goal": raw.get("goal"),
+            "status": raw.get("status"),
+            "workspace_id": metadata.get("workspace_id"),
+            "base_sha": metadata.get("base_sha"),
+            "pending_approval": metadata.get("pending_approval"),
+            "plan_id": metadata.get("plan_id"),
+            "changeset_id": metadata.get("changeset_id"),
+            "verification_run_id": metadata.get("verification_run_id"),
+        }
+        content = "# Durable Task Facts\n" + json.dumps(
+            facts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        return [Message(
+            role="system",
+            content=content,
+            token_count=self.token_engine.count_tokens(content),
+            metadata={
+                "durable_fact": True,
+                "context_layer": "durable-facts",
+                "task_id": task_id,
+            },
+        )]
 
     def _build_tools_schema(self) -> list[dict] | None:
         """Return provider-neutral function tool schemas for the current mode."""
@@ -834,11 +890,19 @@ class AgentLoop:
         if cache is not None and len(blocks) == 1:
             return None
 
-        text = "\n".join(blocks)
+        text = (
+            "<untrusted_repository_content>\n"
+            + "\n".join(blocks)
+            + "\n</untrusted_repository_content>"
+        )
         return Message(
-            role="system",
+            role="user",
             content=text,
             token_count=self.token_engine.count_tokens(text),
+            metadata={
+                "context_layer": "ephemeral-observation",
+                "trusted": False,
+            },
         )
 
     def _trim_to_budget(self, text: str, budget: int) -> str:

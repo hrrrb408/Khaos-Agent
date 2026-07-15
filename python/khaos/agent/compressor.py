@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from dataclasses import dataclass
 from enum import Enum
 
 from khaos.agent.core import Message, SimpleTokenEngine
+from khaos.agent.context_facts import ContextLayer, is_structured_fact
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +31,9 @@ class CompressionResult:
     original_tokens: int
     compressed_tokens: int
     messages: list[Message]
+    window_id: str = ""
+    result_digest: str = ""
+    replaced_message_count: int = 0
 
 
 class ContextCompressor:
@@ -49,48 +55,71 @@ class ContextCompressor:
     async def compress(self, messages: list[Message], threshold: int) -> CompressionResult:
         """Compress context while protecting system and recent messages."""
         original_tokens = self._count_messages(messages)
+        window_id = self._messages_digest(messages)
         working = [self._clone_message(message) for message in messages]
         system_messages, middle_messages, recent_messages = self._split_boundaries(working)
 
-        middle_messages = [
+        protected_middle, collapsible_middle = self._partition_tool_pairs(
+            middle_messages
+        )
+        original_collapsible_middle = collapsible_middle
+        collapsible_middle = [
             await self._micro_compact(message)
             if self._can_micro_compact(message)
             else message
-            for message in middle_messages
+            for message in collapsible_middle
         ]
+        micro_replaced_count = sum(
+            original.content != compacted.content
+            for original, compacted in zip(
+                original_collapsible_middle, collapsible_middle
+            )
+        )
+        middle_messages = protected_middle + collapsible_middle
         micro_messages = system_messages + middle_messages + recent_messages
         micro_tokens = self._count_messages(micro_messages)
         if micro_tokens <= threshold or not middle_messages:
-            return CompressionResult(
+            return self._result(
                 CompressionLevel.MICRO_COMPACT,
                 original_tokens,
-                micro_tokens,
                 micro_messages,
+                window_id=window_id,
+                replaced_message_count=micro_replaced_count,
             )
 
-        if micro_tokens > threshold * 1.5 and not self.is_circuit_open:
+        if (
+            micro_tokens > threshold * 1.5
+            and collapsible_middle
+            and not self.is_circuit_open
+        ):
             try:
-                collapsed = await self._auto_compact(middle_messages)
-                result_messages = system_messages + collapsed + recent_messages
+                collapsed = await self._auto_compact(collapsible_middle)
+                result_messages = (
+                    system_messages + protected_middle + collapsed + recent_messages
+                )
                 self._consecutive_l2_failures = 0
-                return CompressionResult(
+                return self._result(
                     CompressionLevel.AUTO_COMPACT,
                     original_tokens,
-                    self._count_messages(result_messages),
                     result_messages,
+                    window_id=window_id,
+                    replaced_message_count=len(collapsible_middle),
                 )
             except Exception as exc:
                 self._consecutive_l2_failures += 1
                 logger.warning("Level 2 compression failed: %s", exc)
 
         try:
-            collapsed = await self._context_collapse(middle_messages)
-            result_messages = system_messages + collapsed + recent_messages
-            return CompressionResult(
+            collapsed = await self._context_collapse(collapsible_middle)
+            result_messages = (
+                system_messages + protected_middle + collapsed + recent_messages
+            )
+            return self._result(
                 CompressionLevel.CONTEXT_COLLAPSE,
                 original_tokens,
-                self._count_messages(result_messages),
                 result_messages,
+                window_id=window_id,
+                replaced_message_count=len(collapsible_middle),
             )
         except Exception as exc:
             logger.warning("Level 1 compression failed: %s", exc)
@@ -99,11 +128,12 @@ class ContextCompressor:
                 for message in middle_messages[:1]
             ]
             result_messages = system_messages + compacted + recent_messages
-            return CompressionResult(
+            return self._result(
                 CompressionLevel.MICRO_COMPACT,
                 original_tokens,
-                self._count_messages(result_messages),
                 result_messages,
+                window_id=window_id,
+                replaced_message_count=len(middle_messages[:1]),
             )
 
     async def _micro_compact(
@@ -138,6 +168,10 @@ class ContextCompressor:
                 f"包含关键决策: {key_decisions} [摘要结束]"
             ),
         )
+        summary.metadata = {
+            "context_layer": ContextLayer.CONVERSATION_SUMMARY.value,
+            "source_count": len(collapsible),
+        }
         summary.token_count = self.token_engine.count_tokens(summary.content)
         return [self._clone_message(message) for message in protected] + [summary]
 
@@ -162,6 +196,10 @@ class ContextCompressor:
                 f"包含关键决策: {summary} [摘要结束]"
             )
         message = Message(role="assistant", content=summary)
+        message.metadata = {
+            "context_layer": ContextLayer.CONVERSATION_SUMMARY.value,
+            "source_count": len(messages),
+        }
         message.token_count = self.token_engine.count_tokens(summary)
         return [message]
 
@@ -177,8 +215,14 @@ class ContextCompressor:
         self,
         messages: list[Message],
     ) -> tuple[list[Message], list[Message], list[Message]]:
-        system_messages = [message for message in messages if message.role == "system"]
-        non_system = [message for message in messages if message.role != "system"]
+        system_messages = [
+            message for message in messages
+            if message.role == "system" or is_structured_fact(message)
+        ]
+        non_system = [
+            message for message in messages
+            if message.role != "system" and not is_structured_fact(message)
+        ]
         if len(non_system) <= 4:
             return system_messages, [], non_system
         recent_messages = non_system[-4:]
@@ -191,27 +235,13 @@ class ContextCompressor:
     ) -> tuple[list[Message], list[Message]]:
         protected: list[Message] = []
         collapsible: list[Message] = []
-        result_by_id = {
-            message.tool_call_id: message
-            for message in messages
-            if message.role == "tool" and message.tool_call_id
-        }
-        protected_ids: set[str] = set()
         for message in messages:
-            if not message.tool_calls:
-                continue
-            ids = [str(call.get("id")) for call in message.tool_calls if call.get("id")]
-            pair_results = [result_by_id[call_id] for call_id in ids if call_id in result_by_id]
-            if len(pair_results) == len(ids):
+            if message.tool_calls or message.role == "tool" or is_structured_fact(message):
                 protected.append(message)
-                protected.extend(pair_results)
-                protected_ids.update(ids)
 
         protected_message_ids = {id(message) for message in protected}
         for message in messages:
             if id(message) in protected_message_ids:
-                continue
-            if message.role == "tool" and message.tool_call_id in protected_ids:
                 continue
             collapsible.append(message)
         return protected, collapsible
@@ -219,8 +249,50 @@ class ContextCompressor:
     def _count_messages(self, messages: list[Message]) -> int:
         return sum(self.token_engine.count_tokens(message.content) for message in messages)
 
+    def _result(
+        self,
+        level: CompressionLevel,
+        original_tokens: int,
+        messages: list[Message],
+        *,
+        window_id: str,
+        replaced_message_count: int,
+    ) -> CompressionResult:
+        return CompressionResult(
+            level=level,
+            original_tokens=original_tokens,
+            compressed_tokens=self._count_messages(messages),
+            messages=messages,
+            window_id=window_id,
+            result_digest=self._messages_digest(messages),
+            replaced_message_count=replaced_message_count,
+        )
+
+    @staticmethod
+    def _messages_digest(messages: list[Message]) -> str:
+        """Hash a context window without persisting its potentially secret text."""
+        canonical = [
+            {
+                "role": message.role,
+                "content": message.content,
+                "tool_call_id": message.tool_call_id,
+                "tool_calls": message.tool_calls,
+                "context_layer": message.metadata.get("context_layer"),
+            }
+            for message in messages
+        ]
+        encoded = json.dumps(
+            canonical, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
     def _can_micro_compact(self, message: Message) -> bool:
-        return len(message.content) > self.micro_max_chars and not message.tool_calls
+        return (
+            len(message.content) > self.micro_max_chars
+            and not message.tool_calls
+            and message.role != "tool"
+            and not is_structured_fact(message)
+        )
 
     @staticmethod
     def _clone_message(message: Message) -> Message:

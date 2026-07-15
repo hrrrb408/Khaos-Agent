@@ -110,6 +110,9 @@ async def test_coding_mode_injects_project_structure_and_relevant_files(tmp_path
     assert "## main.py" in relevant_msgs[0].content
     assert "```python" in relevant_msgs[0].content
     assert "print('hi')" in relevant_msgs[0].content
+    assert relevant_msgs[0].role == "user"
+    assert relevant_msgs[0].metadata["trusted"] is False
+    assert "<untrusted_repository_content>" in relevant_msgs[0].content
     # The builder received the task description.
     assert builder.calls == [("edit main.py", tmp_path.resolve())]
 
@@ -139,6 +142,32 @@ async def test_coding_mode_omits_relevant_files_when_builder_returns_empty(tmp_p
     assert "# Project Structure" in messages[0].content
     # No "# Relevant Files" message when build() returns [].
     assert not any("# Relevant Files" in m.content for m in messages)
+
+
+async def test_durable_task_facts_reconstruct_internal_workspace_binding(tmp_path):
+    from khaos.coding.task_manager import TaskManager
+
+    loop, db = await _make_loop(tmp_path, mode=Mode.CODING, builder=None)
+    manager = TaskManager(db=db)
+    task = await manager.create("keep approval scope")
+    await manager.update_status(
+        task.id,
+        "blocked",
+        workspace_id="workspace-1",
+        base_sha="abc123",
+        pending_approval={"binding_digest": "digest-1"},
+        plan_id="plan-1",
+    )
+    loop.task_manager = manager
+
+    facts = await loop._build_durable_task_facts(task.id)
+    await db.close()
+
+    assert len(facts) == 1
+    assert facts[0].metadata["durable_fact"] is True
+    assert '\"workspace_id\":\"workspace-1\"' in facts[0].content
+    assert '\"binding_digest\":\"digest-1\"' in facts[0].content
+    assert '\"plan_id\":\"plan-1\"' in facts[0].content
 
 
 # ---------------------------------------------------------------------------

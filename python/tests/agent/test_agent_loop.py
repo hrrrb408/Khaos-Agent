@@ -1,3 +1,5 @@
+import json
+
 from khaos.agent import AgentConfig, AgentLoop, Message
 from khaos.agent.compressor import CompressionLevel, CompressionResult
 from khaos.db import Database
@@ -284,10 +286,18 @@ async def test_agent_loop_triggers_compression_before_model_call(tmp_path):
         context_compressor=compressor,
     )
 
-    [message async for message in loop.run("new " * 10, "s1")]
+    output = [message async for message in loop.run("new " * 10, "s1")]
 
     assert compressor.called
     assert any("[摘要开始]" in message.content for message in router.seen_messages)
+    done = next(message for message in output if message.event == "done")
+    events = await db.list_agent_turn_events(done.metadata["turn_id"])
+    compaction = next(
+        event for event in events if event["event_type"] == "context.compacted"
+    )
+    payload = json.loads(compaction["payload_json"])
+    assert payload["original_tokens"] == 100
+    assert payload["compressed_tokens"] == 2
     await db.close()
 
 

@@ -59,6 +59,61 @@ async def test_tool_call_and_result_pair_are_preserved():
     assert collapsed[1].tool_call_id == "call_1"
 
 
+async def test_unmatched_tool_call_is_never_summarized():
+    call = Message(
+        role="assistant", content="", tool_calls=[{"id": "pending", "name": "terminal"}]
+    )
+    compressor = ContextCompressor(create_default_router())
+
+    collapsed = await compressor._context_collapse([
+        Message(role="user", content="old conversation"), call,
+    ])
+
+    assert any(message.tool_calls == call.tool_calls for message in collapsed)
+
+
+async def test_auto_compact_excludes_tools_and_durable_facts_from_model_prompt():
+    class CapturingRouter:
+        def __init__(self):
+            self.prompt = ""
+
+        async def call(self, function, messages):
+            self.prompt = messages[0].content
+            yield Message(role="assistant", content="safe summary")
+
+    router = CapturingRouter()
+    compressor = ContextCompressor(router)
+    durable = Message(
+        role="system",
+        content="APPROVAL_DIGEST_DO_NOT_SUMMARIZE",
+        metadata={"durable_fact": True, "context_layer": "durable-facts"},
+    )
+    call = Message(
+        role="assistant", content="TOOL_SECRET", tool_calls=[{"id": "call", "name": "x"}]
+    )
+    result = Message(role="tool", content="TOOL_RESULT_SECRET", tool_call_id="call")
+    conversation = [
+        Message(role="user", content="conversation " * 100),
+        Message(role="assistant", content="response " * 100),
+        call, result,
+        Message(role="user", content="more " * 100),
+        Message(role="assistant", content="more response " * 100),
+        Message(role="user", content="recent"),
+        Message(role="assistant", content="recent"),
+        Message(role="user", content="recent"),
+        Message(role="assistant", content="recent"),
+        durable,
+    ]
+
+    compressed = await compressor.compress(conversation, threshold=20)
+
+    assert "TOOL_SECRET" not in router.prompt
+    assert "TOOL_RESULT_SECRET" not in router.prompt
+    assert "APPROVAL_DIGEST_DO_NOT_SUMMARIZE" not in router.prompt
+    assert any(message.content == durable.content for message in compressed.messages)
+    assert any(message.tool_calls for message in compressed.messages)
+
+
 async def test_auto_compact_uses_router_summary():
     messages = _messages(8, words=40)
     router = create_default_router()
@@ -125,6 +180,10 @@ async def test_compressed_tokens_decrease():
     result = await compressor.compress(messages, threshold=50)
 
     assert result.compressed_tokens < result.original_tokens
+    assert len(result.window_id) == 64
+    assert len(result.result_digest) == 64
+    assert result.window_id != result.result_digest
+    assert result.replaced_message_count > 0
 
 
 async def test_no_middle_messages_returns_micro_result():
@@ -155,4 +214,3 @@ def test_extract_key_decisions_limits_empty_input():
     from khaos.agent.compressor import extract_key_decisions
 
     assert extract_key_decisions([Message(role="user", content="")]) == "无明确关键决策"
-
