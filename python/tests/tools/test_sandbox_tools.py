@@ -442,6 +442,7 @@ def _docker_available():
 
 
 @pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
+@pytest.mark.docker_sandbox_real
 async def test_real_docker_workspace_isolation_e2e(tmp_path):
     repository = tmp_path / "repo"
     worktree = tmp_path / "worktree"
@@ -490,6 +491,7 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
 
 
 @pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
+@pytest.mark.docker_sandbox_real
 @pytest.mark.parametrize("action", ["timeout", "cancel", "shutdown"])
 async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
     repository = tmp_path / "repo"

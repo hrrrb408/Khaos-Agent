@@ -530,6 +530,7 @@ def _docker_command(*argv, timeout=10_000, limit=64 * 1024):
 
 
 @pytest.mark.production_sandbox_real
+@pytest.mark.docker_sandbox_real
 def test_real_docker_sandbox_python_network_secret_workspace_and_timeout(tmp_path, monkeypatch):
     if os.environ.get("KHAOS_RUN_PRODUCTION_SANDBOX") != "1":
         pytest.skip("set KHAOS_RUN_PRODUCTION_SANDBOX=1 for the production backend E2E")

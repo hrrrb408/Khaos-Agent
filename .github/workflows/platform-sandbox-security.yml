@@ -1,5 +1,12 @@
 name: Platform Sandbox Security E2E
 
+permissions:
+  contents: read
+
+concurrency:
+  group: platform-sandbox-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 on:
   pull_request:
     branches:
@@ -13,9 +20,12 @@ on:
 jobs:
   linux-bwrap-security:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
       - name: Install bubblewrap
@@ -74,16 +84,19 @@ jobs:
           exit 0
       - name: Upload diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: linux-bwrap-diagnostics
           path: diagnostics/
 
   macos-sandbox-security:
     runs-on: macos-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"
       - name: Install test dependencies
@@ -116,7 +129,35 @@ jobs:
           exit 0
       - name: Upload diagnostics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos-sandbox-diagnostics
+          path: diagnostics/
+
+  windows-fail-closed-security:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: python -m pip install -e ".[test]"
+      - name: Prove Windows has no Host fallback
+        run: python -m pytest python/tests/coding/test_windows_fail_closed.py python/tests/coding/test_backend_selector.py -q -m windows_fail_closed -v
+      - name: Capture Windows diagnostics
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force diagnostics | Out-Null
+          Get-ComputerInfo | Out-File diagnostics/windows-platform.txt
+          Get-Process | Sort-Object ProcessName | Format-Table -AutoSize | Out-File diagnostics/windows-processes.txt
+      - name: Upload Windows diagnostics
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: windows-fail-closed-diagnostics
           path: diagnostics/

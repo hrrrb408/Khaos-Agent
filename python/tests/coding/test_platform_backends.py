@@ -113,6 +113,7 @@ def _require_or_skip(binary: str) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux bubblewrap evidence")
 async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path):
     """Real bwrap execution verifying all 9 isolation requirements.
@@ -304,6 +305,7 @@ async def test_backend_selector_fails_closed_when_macos_probe_raises(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
 @pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec evidence")
 async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: Path):
     """Run sandbox-exec against an actual process, with no host fallback."""
