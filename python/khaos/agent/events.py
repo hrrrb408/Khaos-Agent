@@ -31,8 +31,7 @@ class TurnCoordinator:
         self.attempt_id = attempt_id
         self.sequence = sequence
         self._terminal = False
-        self._tool_calls: set[str] = set()
-        self._tool_results: set[str] = set()
+        self._active_tool_calls: set[str] = set()
 
     @classmethod
     async def start(
@@ -69,14 +68,14 @@ class TurnCoordinator:
         value = dict(payload or {})
         call_id = str(value.get("tool_call_id") or value.get("id") or "")
         if event_type == "tool.call":
-            if not call_id or call_id in self._tool_calls:
+            if not call_id or call_id in self._active_tool_calls:
                 raise PermissionError("duplicate or missing tool call id")
-            self._tool_calls.add(call_id)
+            self._active_tool_calls.add(call_id)
         elif event_type == "tool.result":
-            if call_id not in self._tool_calls or call_id in self._tool_results:
+            if call_id not in self._active_tool_calls:
                 raise PermissionError("tool result has no unmatched tool call")
-            self._tool_results.add(call_id)
-        elif event_type == "approval.wait" and call_id not in self._tool_calls:
+            self._active_tool_calls.remove(call_id)
+        elif event_type == "approval.wait" and call_id not in self._active_tool_calls:
             raise PermissionError("approval wait has no tool call")
         self.sequence = await self._db.append_agent_turn_event(
             turn_id=self.turn_id,
@@ -101,7 +100,7 @@ class TurnCoordinator:
         event_type = f"turn.{status}"
         payload = {
             "reason": reason,
-            "unmatched_tool_calls": sorted(self._tool_calls - self._tool_results),
+            "unmatched_tool_calls": sorted(self._active_tool_calls),
         }
         self.sequence = await self._db.append_agent_turn_event(
             turn_id=self.turn_id,

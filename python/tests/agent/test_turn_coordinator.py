@@ -24,6 +24,8 @@ async def test_turn_events_are_ordered_paired_and_single_terminal(tmp_path):
     await turn.emit("tool.call", {"tool_call_id": "call", "name": "read_file"})
     await turn.emit("approval.wait", {"tool_call_id": "call"})
     await turn.emit("tool.result", {"tool_call_id": "call", "success": True})
+    await turn.emit("tool.call", {"tool_call_id": "call", "name": "read_file"})
+    await turn.emit("tool.result", {"tool_call_id": "call", "success": True})
     terminal = await turn.terminal("completed", reason="end_turn")
     assert terminal.payload["unmatched_tool_calls"] == []
     with pytest.raises(PermissionError, match="terminal"):
@@ -32,10 +34,10 @@ async def test_turn_events_are_ordered_paired_and_single_terminal(tmp_path):
         await turn.emit("tool.call", {"tool_call_id": "late"})
 
     events = await db.list_agent_turn_events(turn.turn_id)
-    assert [event["sequence"] for event in events] == list(range(1, 6))
+    assert [event["sequence"] for event in events] == list(range(1, 8))
     assert [event["event_type"] for event in events] == [
         "turn.started", "tool.call", "approval.wait", "tool.result",
-        "turn.completed",
+        "tool.call", "tool.result", "turn.completed",
     ]
     await db.close()
 

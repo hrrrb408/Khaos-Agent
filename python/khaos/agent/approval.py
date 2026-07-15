@@ -82,6 +82,7 @@ class _ToolApprovalRecord:
     binding_digest: str
     decision: ApprovalDecision | None = None
     used: bool = False
+    dispatched: bool = False
 
 
 @dataclass
@@ -268,6 +269,46 @@ class ApprovalBroker:
                 return False
             future.set_result(decision)
             return True
+
+    async def consume_for_dispatch(
+        self,
+        tool_call_id: str,
+        approved: bool,
+        remember: bool = False,
+        *,
+        principal_id: str,
+        session_id: str,
+        binding_digest: str,
+    ) -> dict:
+        """Validate UI intent and authorize at most one scheduler dispatch.
+
+        A remote callback may already have called :meth:`resolve` and
+        :meth:`wait`; a local callback has not. Both paths converge here and
+        are checked against the server-held immutable binding.
+        """
+        async with self._lock:
+            record = self._tool_approvals.get(tool_call_id)
+            if (
+                record is None
+                or record.dispatched
+                or record.binding_digest != binding_digest
+                or record.binding.principal_id != principal_id
+                or record.binding.session_id != session_id
+                or time.time() >= record.binding.expires_at
+            ):
+                return {"approved": False, "remember": False}
+            callback_decision = ApprovalDecision(approved, remember)
+            if record.decision is not None and record.decision != callback_decision:
+                record.used = True
+                return {"approved": False, "remember": False}
+            if record.decision is None:
+                record.decision = callback_decision
+            record.used = True
+            record.dispatched = True
+            return {
+                "approved": record.decision.approved,
+                "remember": record.decision.remember,
+            }
 
     async def register_operation(
         self, approval_id: str, binding: dict, expiry: float

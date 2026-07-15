@@ -178,8 +178,8 @@ async def test_scheduler_consumes_bound_approval_before_dispatch(tmp_path):
 
 async def test_scheduler_denies_when_bound_approval_cannot_be_resolved(tmp_path):
     class RejectingBroker(ApprovalBroker):
-        async def resolve(self, *args, **kwargs):
-            return False
+        async def consume_for_dispatch(self, *args, **kwargs):
+            return {"approved": False, "remember": False}
 
     db = Database(tmp_path / "khaos.db")
     await db.connect()

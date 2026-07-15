@@ -19,9 +19,10 @@ broker。
 可暂存，但仍只能消费一次。
 
 Scheduler 不把 UI callback 的布尔返回值直接当作执行权限。callback 返回后必须使用
-server-held principal、session 和 binding digest 调用 Broker `resolve`，再通过一次性
-`wait` 消费 decision；resolve 失败、过期或 replay 均转为拒绝，工具不会进入 dispatch
-队列。
+server-held principal、session 和 binding digest 调用 Broker `consume_for_dispatch`。
+远端 callback 可先通过 `resolve` + `wait` 等待 Gateway 决策，本地 callback 可直接返回
+用户意图；两条路径最终都在同一 immutable binding 上一次性消费 dispatch 权限。scope
+不匹配、过期、decision 不一致或 replay 均转为拒绝。
 
 Gateway 从通过校验的 API key 派生稳定 principal ID，并覆盖客户端 JSON 中的任何自报
 principal。没有认证 principal 的 confirm、task approve 和 task reject 请求拒绝。Python

@@ -314,7 +314,7 @@ class ToolScheduler:
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
-                resolved = await broker.resolve(
+                confirmation = await broker.consume_for_dispatch(
                     normalized["id"],
                     bool(confirmation.get("approved", False)),
                     bool(confirmation.get("remember", False)),
@@ -322,12 +322,6 @@ class ToolScheduler:
                     session_id=current_session,
                     binding_digest=binding_digest,
                 )
-                if resolved:
-                    confirmation = await broker.wait(
-                        normalized["id"], binding_digest=binding_digest
-                    )
-                else:
-                    confirmation = {"approved": False, "remember": False}
                 if not confirmation.get("approved", False):
                     if destructive_context is not None:
                         await destructive_context["approval_broker"].cancel_operation(normalized["id"])
