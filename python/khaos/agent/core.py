@@ -192,7 +192,9 @@ class AgentLoop:
             else:
                 task = await self.task_manager.get(active_task_id)
                 if task is not None and task.status.value == "blocked":
-                    await self.task_manager.update_status(active_task_id, "running")
+                    raise PermissionError(
+                        "blocked task must consume its approval capability before resume"
+                    )
         from khaos.agent.events import TurnCoordinator
 
         turn = await TurnCoordinator.start(

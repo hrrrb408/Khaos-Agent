@@ -14,6 +14,8 @@ import (
 	"khaos/go/internal/rate"
 )
 
+const testAPIKey = "test-gateway-key"
+
 type mockAgent struct {
 	confirmed bool
 	mode      string
@@ -122,6 +124,9 @@ func (m *mockSubagentClient) Status(ctx context.Context) (map[string]any, error)
 }
 
 func newTestHandler(apiKey string) (http.Handler, *mockAgent) {
+	if apiKey == "" {
+		apiKey = testAPIKey
+	}
 	agent := &mockAgent{}
 	handler := NewHandler(agent, NewMemoryMap(), NewMapConfig(map[string]any{"mode": "office"}), apiKey, rate.NewTokenBucket(1000, 100))
 	return handler.Routes(), agent
@@ -134,6 +139,20 @@ func serve(handler http.Handler, method string, path string, body string, key st
 	}
 	if key != "" {
 		req.Header.Set("X-Khaos-Key", key)
+	} else {
+		req.Header.Set("X-Khaos-Key", testAPIKey)
+	}
+	req.Host = "127.0.0.1:8080"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	return rec
+}
+
+func serveUnauthenticated(handler http.Handler, method string, path string, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(method, path, bytes.NewBufferString(body))
+	req.Host = "127.0.0.1:8080"
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
@@ -155,13 +174,13 @@ func TestChatAndStream(t *testing.T) {
 
 func TestAuthRequired(t *testing.T) {
 	handler, _ := newTestHandler("secret")
-	if rec := serve(handler, http.MethodGet, "/api/health", "", ""); rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d", rec.Code)
+	if rec := serveUnauthenticated(handler, http.MethodGet, "/api/health", ""); rec.Code != http.StatusOK {
+		t.Fatalf("anonymous health status = %d", rec.Code)
 	}
-	if rec := serve(handler, http.MethodGet, "/api/health", "", "secret"); rec.Code != http.StatusOK {
-		t.Fatalf("status = %d", rec.Code)
+	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/chat", `{"message":"hello"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous chat status = %d", rec.Code)
 	}
-	if rec := serve(handler, http.MethodGet, "/api/health?key=secret", "", ""); rec.Code != http.StatusUnauthorized {
+	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/chat?key=secret", `{"message":"hello"}`); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("query key status = %d", rec.Code)
 	}
 }
@@ -225,7 +244,7 @@ func TestAuthenticatedSessionOwnershipIsFailClosed(t *testing.T) {
 }
 
 func TestStreamDisconnectPropagatesCancellation(t *testing.T) {
-	apiHandler := NewHandler(&blockingAgent{}, NewMemoryMap(), NewMapConfig(nil), "", rate.NewTokenBucket(100, 10))
+	apiHandler := NewHandler(&blockingAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10))
 	handler := apiHandler.Routes()
 	if rec := serve(handler, http.MethodPost, "/api/chat", `{"session_id":"blocking","message":"hello"}`, ""); rec.Code != http.StatusOK {
 		t.Fatalf("create=%d", rec.Code)
@@ -233,6 +252,8 @@ func TestStreamDisconnectPropagatesCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	req := httptest.NewRequest(http.MethodGet, "/api/chat/blocking/stream", nil).WithContext(ctx)
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("X-Khaos-Key", testAPIKey)
 	rec := httptest.NewRecorder()
 	done := make(chan struct{})
 	go func() { handler.ServeHTTP(rec, req); close(done) }()
@@ -245,7 +266,7 @@ func TestStreamDisconnectPropagatesCancellation(t *testing.T) {
 
 func TestConfirmRequiresAuthenticatedPrincipalAndBinding(t *testing.T) {
 	handler, _ := newTestHandler("")
-	if rec := serve(handler, http.MethodPost, "/api/chat/s1/confirm", `{"tool_call_id":"c1","binding_digest":"abc","approved":true}`, ""); rec.Code != http.StatusUnauthorized {
+	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/chat/s1/confirm", `{"tool_call_id":"c1","binding_digest":"abc","approved":true}`); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("unauthenticated status=%d", rec.Code)
 	}
 	handler, _ = newTestHandler("secret")
@@ -281,7 +302,7 @@ func TestConfigToolsSessionsHealth(t *testing.T) {
 }
 
 func TestRateLimit(t *testing.T) {
-	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1, 1)).Routes()
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), testAPIKey, rate.NewTokenBucket(1, 1)).Routes()
 	if rec := serve(handler, http.MethodGet, "/api/health", "", ""); rec.Code != http.StatusOK {
 		t.Fatalf("first status=%d", rec.Code)
 	}
@@ -292,10 +313,10 @@ func TestRateLimit(t *testing.T) {
 
 func TestAPIKeyIsHeaderOnly(t *testing.T) {
 	handler, _ := newTestHandler("gateway-key")
-	if rec := serve(handler, http.MethodGet, "/api/health?key=gateway-key", "", ""); rec.Code != http.StatusUnauthorized {
+	if rec := serveUnauthenticated(handler, http.MethodGet, "/api/config?key=gateway-key", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("query credential status=%d", rec.Code)
 	}
-	if rec := serve(handler, http.MethodGet, "/api/health", "", "gateway-key"); rec.Code != http.StatusOK {
+	if rec := serve(handler, http.MethodGet, "/api/config", "", "gateway-key"); rec.Code != http.StatusOK {
 		t.Fatalf("header credential status=%d", rec.Code)
 	}
 }
@@ -317,7 +338,7 @@ func TestWebhookAndChannelEndpoints(t *testing.T) {
 
 func TestTaskRESTAndEvents(t *testing.T) {
 	tasks := &mockTaskClient{}
-	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), "", rate.NewTokenBucket(100, 10)).WithTasks(tasks).Routes()
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithTasks(tasks).Routes()
 	if rec := serve(handler, http.MethodPost, "/v1/tasks", `{"goal":"ship"}`, ""); rec.Code != http.StatusCreated {
 		t.Fatalf("create=%d %s", rec.Code, rec.Body.String())
 	}
@@ -347,6 +368,7 @@ func TestTaskEventReplayCursorAndOwnership(t *testing.T) {
 		t.Fatalf("create=%d %s", rec.Code, rec.Body.String())
 	}
 	req := httptest.NewRequest(http.MethodGet, "/v1/tasks/t1/events", nil)
+	req.Host = "127.0.0.1:8080"
 	req.Header.Set("X-Khaos-Key", "secret")
 	req.Header.Set("Last-Event-ID", "1")
 	rec := httptest.NewRecorder()
@@ -359,6 +381,54 @@ func TestTaskEventReplayCursorAndOwnership(t *testing.T) {
 	apiHandler.mu.Unlock()
 	if rec := serve(handler, http.MethodGet, "/v1/tasks/t1", "", "secret"); rec.Code != http.StatusForbidden {
 		t.Fatalf("cross-principal task=%d", rec.Code)
+	}
+}
+
+func TestGatewayFailsClosedWithoutConfiguredAuthentication(t *testing.T) {
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), "", rate.NewTokenBucket(100, 10)).Routes()
+	if rec := serveUnauthenticated(handler, http.MethodGet, "/api/health", ""); rec.Code != http.StatusOK {
+		t.Fatalf("health status=%d", rec.Code)
+	}
+	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/chat", `{"message":"drive-by"}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("empty-auth chat status=%d body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestOriginAllowlistAndDNSRebindingDefense(t *testing.T) {
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).
+		WithAllowedOrigins("http://127.0.0.1:3000").Routes()
+
+	malicious := httptest.NewRequest(http.MethodPost, "/api/chat/new/stream", strings.NewReader(`{"message":"steal files"}`))
+	malicious.Host = "127.0.0.1:8080"
+	malicious.Header.Set("Origin", "https://evil.example")
+	malicious.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, malicious)
+	if rec.Code != http.StatusForbidden || rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("malicious origin status=%d cors=%q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	preflight := httptest.NewRequest(http.MethodOptions, "/api/chat", nil)
+	preflight.Host = "127.0.0.1:8080"
+	preflight.Header.Set("Origin", "http://127.0.0.1:3000")
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, preflight)
+	if rec.Code != http.StatusNoContent || rec.Header().Get("Access-Control-Allow-Origin") != "http://127.0.0.1:3000" {
+		t.Fatalf("allowlisted preflight status=%d cors=%q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	rebinding := httptest.NewRequest(http.MethodGet, "/api/health", nil)
+	rebinding.Host = "attacker.example"
+	rec = httptest.NewRecorder()
+	handler.ServeHTTP(rec, rebinding)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("DNS rebinding Host status=%d", rec.Code)
+	}
+
+	defaultHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).Routes()
+	plain := serve(defaultHandler, http.MethodGet, "/api/health", "", testAPIKey)
+	if plain.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("default CORS header=%q", plain.Header().Get("Access-Control-Allow-Origin"))
 	}
 }
 
@@ -385,7 +455,7 @@ func TestAuditEndpointReturnsEntries(t *testing.T) {
 		{ID: 1, Action: "write_file", Target: "/x", Result: "success"},
 		{ID: 2, Action: "terminal", Target: "rm", Result: "denied"},
 	}}
-	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1000, 100))
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), testAPIKey, rate.NewTokenBucket(1000, 100))
 	handler = handler.WithAudit(audit)
 
 	rec := serve(handler.Routes(), http.MethodGet, "/api/audit?result=denied&limit=5", "", "")
@@ -409,7 +479,7 @@ func TestAuditEndpointReturnsEntries(t *testing.T) {
 }
 
 func TestAuditEndpointWithoutClientReturnsEmpty(t *testing.T) {
-	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1000, 100))
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), testAPIKey, rate.NewTokenBucket(1000, 100))
 	// No WithAudit call -> audit client is nil.
 	rec := serve(handler.Routes(), http.MethodGet, "/api/audit", "", "")
 
@@ -424,7 +494,7 @@ func TestAuditEndpointWithoutClientReturnsEmpty(t *testing.T) {
 
 func TestAuditEndpointDefaultsLimit(t *testing.T) {
 	audit := &mockAudit{}
-	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1000, 100)).WithAudit(audit)
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), testAPIKey, rate.NewTokenBucket(1000, 100)).WithAudit(audit)
 
 	serve(handler.Routes(), http.MethodGet, "/api/audit", "", "")
 
@@ -454,7 +524,7 @@ func TestMetricsEndpoint(t *testing.T) {
 
 func TestSubagentSpawn(t *testing.T) {
 	subagents := &mockSubagentClient{}
-	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), "", rate.NewTokenBucket(1000, 100)).WithSubagents(subagents)
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(map[string]any{}), testAPIKey, rate.NewTokenBucket(1000, 100)).WithSubagents(subagents)
 
 	rec := serve(handler.Routes(), http.MethodPost, "/api/subagents/spawn", `{"goal":"inspect","context":"ctx","tools":["read_file"],"timeout":300}`, "")
 

@@ -16,7 +16,9 @@ import pytest
 
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.verification_authority import (
+    PROTECTED_SCHEMA_OBJECTS,
     VERIFICATION_AUTHORITIES,
+    VerificationReadHandle,
     VerificationWriteAuthority,
     VerificationWriteCapability,
 )
@@ -67,6 +69,50 @@ def test_production_store_has_no_finalization_udf_registration():
     assert "create_function(" not in source
 
 
+def test_schema_manifest_explicitly_covers_all_security_trigger_families():
+    for prefix in ("trg_execution_", "trg_vse_", "trg_vcp_"):
+        assert any(name.startswith(prefix) for name in PROTECTED_SCHEMA_OBJECTS)
+    assert PROTECTED_SCHEMA_OBJECTS["plan_execution_runs"] == "table"
+    assert PROTECTED_SCHEMA_OBJECTS["verification_success_evidence"] == "table"
+
+
+def test_read_handle_recomputes_all_canonical_success_bindings():
+    connection = sqlite3.connect(":memory:")
+    connection.executescript(
+        "CREATE TABLE plan_verification_runs(verification_run_id TEXT,"
+        "execution_run_id TEXT,status TEXT);"
+        "CREATE TABLE plan_execution_runs(execution_run_id TEXT,status TEXT);"
+        "CREATE TABLE verification_success_evidence(verification_run_id TEXT,"
+        "execution_run_id TEXT,cleanup_proof_id TEXT,cleanup_digest TEXT,"
+        "authority_instance_id TEXT,runtime_id TEXT,boot_id TEXT,"
+        "payload_digest TEXT);"
+    )
+    connection.execute(
+        "INSERT INTO plan_verification_runs VALUES ('vr','er','passed')"
+    )
+    connection.execute("INSERT INTO plan_execution_runs VALUES ('er','verified')")
+    connection.execute(
+        "INSERT INTO verification_success_evidence VALUES "
+        "('vr','er','proof','transplanted-cleanup','authority','runtime','boot',"
+        "'authority-accepted-old-digest')"
+    )
+
+    class FakeAuthority:
+        def verify_storage(self):
+            return None
+
+        def require_success(self, run_id, digest):
+            assert run_id == "vr"
+            assert digest == "authority-accepted-old-digest"
+
+    reader = VerificationReadHandle(connection, FakeAuthority())
+    with pytest.raises(PermissionError, match="digest mismatch"):
+        reader.verification_status("vr")
+    with pytest.raises(PermissionError, match="digest mismatch"):
+        reader.execution_status("er")
+    reader.close()
+
+
 def test_authority_ledger_runs_in_distinct_process(tmp_path):
     _, authority, _, _, _ = _authority_store(tmp_path)
     assert authority.authority_process_id != os.getpid()
@@ -74,7 +120,7 @@ def test_authority_ledger_runs_in_distinct_process(tmp_path):
 
 
 def test_authority_ledger_is_durable_hash_chained_and_boot_scoped(tmp_path):
-    store, first, _, _, _ = _authority_store(
+    _store, first, database_path, _, _ = _authority_store(
         tmp_path, runtime_id="runtime-ledger", boot_id="boot-one",
     )
     ledger_path = first.ledger_path
@@ -82,8 +128,10 @@ def test_authority_ledger_is_durable_hash_chained_and_boot_scoped(tmp_path):
     first.close()
     assert ledger_path.exists()
 
+    next_connection = sqlite3.connect(database_path)
+    next_connection.row_factory = sqlite3.Row
     second = VERIFICATION_AUTHORITIES.issue(
-        store._conn, runtime_id="runtime-ledger", boot_id="boot-two",
+        next_connection, runtime_id="runtime-ledger", boot_id="boot-two",
     )
     with pytest.raises(PermissionError, match="not authority-issued"):
         second.require_cleanup_proof("proof", "run", "digest")
@@ -150,11 +198,13 @@ def test_independent_connection_cannot_write_authority_database(tmp_path, mode):
     store, authority, database_path, verification_run_id, execution_run_id = (
         _authority_store(tmp_path)
     )
-    attacker = sqlite3.connect(f"file:{database_path}?mode={mode}", uri=True)
+    attacker = sqlite3.connect(
+        f"file:{database_path}?mode={mode}", uri=True, timeout=0.05,
+    )
     attacker.create_function(
         "khaos_verification_finalization_guard", 2, lambda *_: 1,
     )
-    with pytest.raises(sqlite3.OperationalError, match="readonly"):
+    with pytest.raises(sqlite3.OperationalError, match="readonly|locked"):
         attacker.execute(
             "UPDATE plan_verification_runs SET status='passed' "
             "WHERE verification_run_id=?", (verification_run_id,),
@@ -166,6 +216,53 @@ def test_independent_connection_cannot_write_authority_database(tmp_path, mode):
     authority.close()
 
 
+def test_writer_opened_before_authority_cannot_write_after_activation(tmp_path):
+    store, verification_run_id, execution_run_id = _finalize_test_store(tmp_path)
+    database_path = Path(
+        store._conn.execute("PRAGMA database_list").fetchone()[2]
+    )
+    preopened = sqlite3.connect(database_path, timeout=0.05)
+    authority = VERIFICATION_AUTHORITIES.issue(
+        store._conn,
+        runtime_id=f"runtime-{uuid.uuid4().hex}",
+        boot_id=f"boot-{uuid.uuid4().hex}",
+    )
+    store.bind_write_authority(authority)
+
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        preopened.execute(
+            "UPDATE plan_verification_runs SET status='passed' "
+            "WHERE verification_run_id=?", (verification_run_id,),
+        )
+        preopened.commit()
+    preopened.rollback()
+    preopened.close()
+    _assert_not_success(store, verification_run_id, execution_run_id)
+    authority.close()
+
+
+def test_active_preopened_writer_makes_authority_start_fail_closed(tmp_path):
+    store, _, _ = _finalize_test_store(tmp_path)
+    database_path = Path(
+        store._conn.execute("PRAGMA database_list").fetchone()[2]
+    )
+    attacker = sqlite3.connect(database_path, timeout=0.05)
+    attacker.execute("BEGIN IMMEDIATE")
+    attacker.execute(
+        "UPDATE plan_verification_runs SET failure_code='attacker-active'"
+    )
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            VERIFICATION_AUTHORITIES.issue(
+                store._conn,
+                runtime_id=f"runtime-{uuid.uuid4().hex}",
+                boot_id=f"boot-{uuid.uuid4().hex}",
+            )
+    finally:
+        attacker.rollback()
+        attacker.close()
+
+
 @pytest.mark.parametrize("attack_kind", [
     "drop-trigger", "writable-schema", "create-table", "attach",
 ])
@@ -175,7 +272,9 @@ def test_independent_connection_cannot_mutate_schema_or_attach(
     store, authority, database_path, verification_run_id, execution_run_id = (
         _authority_store(tmp_path)
     )
-    attacker = sqlite3.connect(f"file:{database_path}?mode=rw", uri=True)
+    attacker = sqlite3.connect(
+        f"file:{database_path}?mode=rw", uri=True, timeout=0.05,
+    )
     if attack_kind == "writable-schema":
         attacker.execute("PRAGMA writable_schema=ON")
         attack_sql = (
@@ -184,9 +283,12 @@ def test_independent_connection_cannot_mutate_schema_or_attach(
         )
     elif attack_kind == "attach":
         attached = tmp_path / "attached.sqlite"
-        attacker.execute(f"ATTACH DATABASE '{attached}' AS forged")
-        attacker.execute("CREATE TABLE forged.decoy(value TEXT)")
-        attack_sql = "DROP TABLE main.plan_verification_runs"
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            attacker.execute(f"ATTACH DATABASE '{attached}' AS forged")
+        attacker.close()
+        _assert_not_success(store, verification_run_id, execution_run_id)
+        authority.close()
+        return
     elif attack_kind == "drop-trigger":
         attack_sql = "DROP TRIGGER trg_verification_passed_guard"
     else:
@@ -207,7 +309,7 @@ def test_udf_spoof_and_forged_cleanup_proof_fail_in_real_subprocess(tmp_path):
     script = """
 import sqlite3,sys
 p,vr,er=sys.argv[1:]
-c=sqlite3.connect(f'file:{p}?mode=rw',uri=True)
+c=sqlite3.connect(f'file:{p}?mode=rw',uri=True,timeout=0.05)
 c.create_function('khaos_verification_finalization_guard',2,lambda *_:1)
 statements=[
  (\"INSERT INTO verification_cleanup_proofs VALUES ('fake',?, 'w','i',1,'[]','[]','[]','[]','c','d',1)\",(vr,)),
@@ -341,7 +443,7 @@ def test_authority_process_crash_rolls_back_cleanup_proof_insert(tmp_path):
         authority.close()
 
 
-@pytest.mark.parametrize("suffix", ["", "-wal", "-shm"])
+@pytest.mark.parametrize("suffix", ["", "-wal"])
 def test_database_and_sidecar_inode_replacement_fail_closed(tmp_path, suffix):
     store, authority, database_path, verification_run_id, execution_run_id = (
         _authority_store(tmp_path)
@@ -357,6 +459,15 @@ def test_database_and_sidecar_inode_replacement_fail_closed(tmp_path, suffix):
         store._approval_store.get_execution_run(execution_run_id).status
         != ExecutionRunStatus.VERIFIED
     )
+
+
+def test_unexpected_exclusive_mode_shm_sidecar_fails_closed(tmp_path):
+    store, authority, database_path, verification_run_id, _ = _authority_store(tmp_path)
+    if "-shm" not in authority._absent_objects:
+        pytest.skip("SQLite build uses a pinned shm inode in exclusive mode")
+    Path(f"{database_path}-shm").write_bytes(b"forged")
+    with pytest.raises(PermissionError, match="unexpected sidecar"):
+        store.get_run(verification_run_id)
 
 
 def test_database_parent_symlink_swap_fails_closed(tmp_path):

@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
+import secrets
 import subprocess
 import sys
 import uuid
@@ -125,7 +127,9 @@ def build_command_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     start_parser = subparsers.add_parser("start", help="Start Khaos agent server + gateway")
-    start_parser.add_argument("--socket", default="/tmp/khaos-agent.sock")
+    start_parser.add_argument(
+        "--socket", default=f"/tmp/khaos-{os.getuid()}/agent.sock"
+    )
     start_parser.add_argument("--db", default="khaos.db")
     start_parser.add_argument("--config", default="config.yaml")
     start_parser.add_argument("--gateway", action="store_true", help="Also start Go gateway")
@@ -164,10 +168,23 @@ def cmd_start(args: argparse.Namespace) -> None:
     except ImportError:
         pass
 
+    gateway_capability = os.environ.get("KHAOS_PYTHON_CAPABILITY", "")
+    if args.gateway and len(gateway_capability) < 32:
+        gateway_capability = secrets.token_urlsafe(48)
+    if len(gateway_capability) < 32:
+        raise RuntimeError(
+            "KHAOS_PYTHON_CAPABILITY must contain at least 32 characters "
+            "when Gateway is managed separately"
+        )
     gateway_process: subprocess.Popen | None = None
     if args.gateway:
         gateway_cmd = ["go", "run", "./go/cmd/gateway"]
-        gateway_process = subprocess.Popen(gateway_cmd, cwd=str(_project_root()))
+        gateway_environment = dict(os.environ)
+        gateway_environment["KHAOS_PYTHON_CAPABILITY"] = gateway_capability
+        gateway_environment["KHAOS_PYTHON_AGENT"] = args.socket
+        gateway_process = subprocess.Popen(
+            gateway_cmd, cwd=str(_project_root()), env=gateway_environment,
+        )
         print("Started Go gateway with: go run ./go/cmd/gateway")
 
     print(f"Starting Khaos agent on Unix socket {args.socket}")
@@ -182,6 +199,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 args.db,
                 project_root=Path.cwd(),
                 config_path=Path(args.config),
+                gateway_capability=gateway_capability,
             )
         )
     finally:

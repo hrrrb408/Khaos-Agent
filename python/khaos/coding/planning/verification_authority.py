@@ -1,11 +1,13 @@
 """Boot-scoped write authority for the trusted-verification database.
 
-The authority is an in-process production boundary: it protects an already
-opened SQLite writer with file permissions, pins database/parent/WAL/SHM
-identities, and issues opaque boot-scoped capabilities to the verification
-store.  It does not claim to defend hostile Python executing in the Khaos
-runtime process or an OS administrator.  Those principals can inspect process
-memory or change owner-controlled permissions and are outside this boundary.
+The authority is a boot-scoped production boundary.  Before filesystem modes
+are reduced it acquires and retains SQLite's EXCLUSIVE database lock, so a
+connection opened before startup cannot keep writing through an already-open
+file descriptor.  It also pins database/parent/WAL/SHM identities and issues
+opaque capabilities to the verification store.  It does not claim to defend
+hostile Python executing in the Khaos runtime process or an OS administrator.
+Those principals can inspect process memory or change owner-controlled
+permissions and are outside this boundary.
 """
 from __future__ import annotations
 
@@ -22,7 +24,101 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
-from urllib.parse import quote
+
+
+PROTECTED_SCHEMA_OBJECTS: dict[str, str] = {
+    "plan_execution_runs": "table",
+    "plan_verification_runs": "table",
+    "plan_verification_steps": "table",
+    "plan_verification_audit_events": "table",
+    "plan_verification_artifacts": "table",
+    "plan_execution_phase_leases": "table",
+    "verification_sandbox_instances": "table",
+    "toolchain_attestations": "table",
+    "disposable_verification_workspaces": "table",
+    "approved_verification_plan_snapshots": "table",
+    "verification_cleanup_proofs": "table",
+    "verification_success_evidence": "table",
+    "ux_active_verification_phase_lease": "index",
+    "ix_vsi_boot_state": "index",
+    "ix_vsi_run": "index",
+    "ix_ta_boot": "index",
+    "ix_dvw_boot_state": "index",
+    "ix_dvw_run": "index",
+    "ix_avps_plan": "index",
+    "ux_avps_snapshot_digest": "index",
+    "ix_vcp_run": "index",
+    "trg_avps_referenced_update": "trigger",
+    "trg_avps_referenced_delete": "trigger",
+    "trg_vcp_immutable_update": "trigger",
+    "trg_vcp_immutable_delete": "trigger",
+    "trg_verification_passed_guard": "trigger",
+    "trg_verification_passed_insert_guard": "trigger",
+    "trg_execution_verified_guard": "trigger",
+    "trg_execution_verified_insert_guard": "trigger",
+    "trg_vse_immutable_update": "trigger",
+    "trg_vse_immutable_delete": "trigger",
+}
+
+
+def canonical_success_payload_digest(
+    *, verification_run_id: str, execution_run_id: str,
+    cleanup_proof_id: str, cleanup_digest: str,
+    authority_instance_id: str, runtime_id: str, boot_id: str,
+) -> str:
+    payload = json.dumps({
+        "authority_instance_id": authority_instance_id,
+        "boot_id": boot_id,
+        "cleanup_digest": cleanup_digest,
+        "cleanup_proof_id": cleanup_proof_id,
+        "execution_run_id": execution_run_id,
+        "runtime_id": runtime_id,
+        "verification_run_id": verification_run_id,
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def require_canonical_success(
+    connection: sqlite3.Connection,
+    authority: Any,
+    *,
+    verification_run_id: str,
+    execution_run_id: str | None = None,
+) -> None:
+    """Reload and verify every success binding before returning trusted state."""
+    authority.verify_storage()
+    run = connection.execute(
+        "SELECT verification_run_id,execution_run_id,status "
+        "FROM plan_verification_runs WHERE verification_run_id=?",
+        (verification_run_id,),
+    ).fetchone()
+    if run is None or str(run[2]) != "passed":
+        raise PermissionError("trusted success requires a persisted PASSED run")
+    persisted_execution_id = str(run[1])
+    if execution_run_id is not None and persisted_execution_id != execution_run_id:
+        raise PermissionError("verification success execution binding mismatch")
+    evidence = connection.execute(
+        "SELECT verification_run_id,execution_run_id,cleanup_proof_id,"
+        "cleanup_digest,authority_instance_id,runtime_id,boot_id,payload_digest "
+        "FROM verification_success_evidence WHERE verification_run_id=?",
+        (verification_run_id,),
+    ).fetchone()
+    if evidence is None:
+        raise PermissionError("persisted PASSED status lacks authority evidence")
+    if str(evidence[0]) != verification_run_id or str(evidence[1]) != persisted_execution_id:
+        raise PermissionError("verification success evidence identity mismatch")
+    recomputed = canonical_success_payload_digest(
+        verification_run_id=str(evidence[0]),
+        execution_run_id=str(evidence[1]),
+        cleanup_proof_id=str(evidence[2]),
+        cleanup_digest=str(evidence[3]),
+        authority_instance_id=str(evidence[4]),
+        runtime_id=str(evidence[5]),
+        boot_id=str(evidence[6]),
+    )
+    if recomputed != str(evidence[7]):
+        raise PermissionError("verification success evidence digest mismatch")
+    authority.require_success(verification_run_id, recomputed)
 
 
 def _authority_event_payload(
@@ -110,7 +206,10 @@ def _authority_process_main(
     expected_sequence = 1
     try:
         while True:
-            request = connection.recv()
+            try:
+                request = connection.recv()
+            except EOFError:
+                break
             token, sequence, operation, arguments = request
             if token != capability or sequence != expected_sequence:
                 _append_authority_event(
@@ -216,11 +315,15 @@ class VerificationWriteCapability:
 class VerificationReadHandle:
     """Fixed-query read facade; it never returns its SQLite connection."""
 
-    __slots__ = ("__connection", "__authority")
+    __slots__ = ("__connection", "__authority", "__owns_connection")
 
-    def __init__(self, connection: sqlite3.Connection, authority: Any) -> None:
+    def __init__(
+        self, connection: sqlite3.Connection, authority: Any,
+        *, owns_connection: bool = True,
+    ) -> None:
         self.__connection = connection
         self.__authority = authority
+        self.__owns_connection = owns_connection
 
     def verification_status(self, verification_run_id: str) -> str | None:
         self.__authority.verify_storage()
@@ -232,13 +335,10 @@ class VerificationReadHandle:
             return None
         status = str(row[0])
         if status == "passed":
-            evidence = self.__connection.execute(
-                "SELECT payload_digest FROM verification_success_evidence "
-                "WHERE verification_run_id=?", (verification_run_id,),
-            ).fetchone()
-            if evidence is None:
-                raise PermissionError("persisted PASSED status lacks authority evidence")
-            self.__authority.require_success(verification_run_id, str(evidence[0]))
+            require_canonical_success(
+                self.__connection, self.__authority,
+                verification_run_id=verification_run_id,
+            )
         return status
 
     def execution_status(self, execution_run_id: str) -> str | None:
@@ -251,18 +351,23 @@ class VerificationReadHandle:
             return None
         status = str(row[0])
         if status == "verified":
-            evidence = self.__connection.execute(
-                "SELECT verification_run_id,payload_digest "
-                "FROM verification_success_evidence WHERE execution_run_id=?",
+            run = self.__connection.execute(
+                "SELECT verification_run_id FROM plan_verification_runs "
+                "WHERE execution_run_id=?",
                 (execution_run_id,),
             ).fetchone()
-            if evidence is None:
+            if run is None:
                 raise PermissionError("persisted VERIFIED status lacks authority evidence")
-            self.__authority.require_success(str(evidence[0]), str(evidence[1]))
+            require_canonical_success(
+                self.__connection, self.__authority,
+                verification_run_id=str(run[0]),
+                execution_run_id=execution_run_id,
+            )
         return status
 
     def close(self) -> None:
-        self.__connection.close()
+        if self.__owns_connection:
+            self.__connection.close()
 
 
 class VerificationWriteAuthority:
@@ -294,6 +399,35 @@ class VerificationWriteAuthority:
         authority._ledger_path = authority._database_path.with_name(
             f"{authority._database_path.name}.verification-authority.sqlite"
         )
+        journal_mode = str(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+        if journal_mode.casefold() != "wal":
+            raise PermissionError("verification authority requires SQLite WAL mode")
+        locking_mode = str(
+            connection.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()[0]
+        )
+        if locking_mode.casefold() != "exclusive":
+            raise PermissionError("verification authority requires exclusive locking")
+        # A committed write is required for EXCLUSIVE locking_mode to acquire
+        # and retain the OS lock.  If another pre-opened writer currently owns
+        # a transaction this fails closed before the authority becomes ready.
+        connection.execute("BEGIN EXCLUSIVE")
+        try:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS _verification_authority_bootstrap "
+                "(id INTEGER)"
+            )
+            connection.commit()
+            connection.execute("BEGIN EXCLUSIVE")
+            connection.execute(
+                "INSERT INTO _verification_authority_bootstrap VALUES (1)"
+            )
+            connection.commit()
+            connection.execute("BEGIN EXCLUSIVE")
+            connection.execute("DROP TABLE _verification_authority_bootstrap")
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
         for path in (
             authority._ledger_path,
             Path(f"{authority._ledger_path}-wal"),
@@ -324,13 +458,6 @@ class VerificationWriteAuthority:
         ready, authority._authority_process_id = parent_connection.recv()
         if ready != "ready":
             raise RuntimeError("verification authority process startup failed")
-        journal_mode = str(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
-        if journal_mode.casefold() != "wal":
-            raise PermissionError("verification authority requires SQLite WAL mode")
-        connection.execute("CREATE TABLE IF NOT EXISTS _verification_authority_bootstrap (id INTEGER)")
-        connection.commit()
-        connection.execute("DROP TABLE _verification_authority_bootstrap")
-        connection.commit()
         authority._schema_digest = authority._compute_schema_digest()
         authority._parent_fd = authority._open_directory_chain(
             authority._database_path.parent,
@@ -339,6 +466,7 @@ class VerificationWriteAuthority:
             authority._parent_fd, authority._database_path.parent,
         )
         authority._objects: dict[str, tuple[int, VerificationDatabaseObjectIdentity]] = {}
+        authority._absent_objects: set[str] = set()
         for suffix in ("", "-wal", "-shm"):
             path = Path(f"{authority._database_path}{suffix}")
             try:
@@ -348,6 +476,12 @@ class VerificationWriteAuthority:
                     dir_fd=authority._parent_fd,
                 )
             except FileNotFoundError as exc:
+                if suffix == "-shm" and locking_mode.casefold() == "exclusive":
+                    # SQLite may keep WAL-index state in process memory under
+                    # EXCLUSIVE locking mode.  Pin the absence just as strictly
+                    # as an inode: a later sidecar appearance is drift.
+                    authority._absent_objects.add(suffix)
+                    continue
                 raise PermissionError(
                     f"verification authority storage missing: {suffix or 'database'}"
                 ) from exc
@@ -383,12 +517,24 @@ class VerificationWriteAuthority:
         )
 
     def _compute_schema_digest(self) -> str:
+        placeholders = ",".join("?" for _ in PROTECTED_SCHEMA_OBJECTS)
         rows = self._connection.execute(
             "SELECT type,name,tbl_name,sql FROM sqlite_master "
-            "WHERE name LIKE 'plan_verification_%' "
-            "OR name LIKE 'verification_%' OR name LIKE 'trg_verification_%' "
-            "ORDER BY type,name"
+            f"WHERE name IN ({placeholders}) ORDER BY type,name",
+            tuple(PROTECTED_SCHEMA_OBJECTS),
         ).fetchall()
+        actual = {str(row[1]): str(row[0]) for row in rows}
+        if actual != PROTECTED_SCHEMA_OBJECTS:
+            missing = sorted(set(PROTECTED_SCHEMA_OBJECTS) - set(actual))
+            extra_or_wrong = sorted(
+                name for name, object_type in actual.items()
+                if PROTECTED_SCHEMA_OBJECTS.get(name) != object_type
+            )
+            raise PermissionError(
+                "verification database schema/trigger digest drift; "
+                "protected manifest mismatch: "
+                f"missing={missing}, wrong_type={extra_or_wrong}"
+            )
         canonical = "\n".join(
             "|".join("" if item is None else str(item) for item in row)
             for row in rows
@@ -480,6 +626,17 @@ class VerificationWriteAuthority:
                 raise PermissionError(
                     f"verification database {suffix or 'file'} identity drift"
                 )
+        for suffix in self._absent_objects:
+            try:
+                os.stat(
+                    f"{self._database_path.name}{suffix}",
+                    dir_fd=self._parent_fd, follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                continue
+            raise PermissionError(
+                f"verification database {suffix} unexpected sidecar appeared"
+            )
         if self._compute_schema_digest() != self._schema_digest:
             raise PermissionError("verification database schema/trigger digest drift")
 
@@ -516,24 +673,12 @@ class VerificationWriteAuthority:
 
     def open_readonly(self) -> VerificationReadHandle:
         self.verify_storage()
-        uri = f"file:{quote(str(self._database_path))}?mode=ro"
-        connection = sqlite3.connect(uri, uri=True)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA query_only=ON")
-        denied = {
-            sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH,
-            sqlite3.SQLITE_INSERT, sqlite3.SQLITE_UPDATE, sqlite3.SQLITE_DELETE,
-            sqlite3.SQLITE_ALTER_TABLE, sqlite3.SQLITE_DROP_TABLE,
-            sqlite3.SQLITE_DROP_TRIGGER, sqlite3.SQLITE_DROP_INDEX,
-            sqlite3.SQLITE_CREATE_TABLE, sqlite3.SQLITE_CREATE_TRIGGER,
-            sqlite3.SQLITE_CREATE_INDEX, sqlite3.SQLITE_PRAGMA,
-        }
-        connection.set_authorizer(
-            lambda action, _one, _two, _db, _source: (
-                sqlite3.SQLITE_DENY if action in denied else sqlite3.SQLITE_OK
-            )
+        # EXCLUSIVE mode intentionally prevents opening a second SQLite
+        # connection.  The fixed-query facade shares the authority-owned
+        # handle but never exposes execute/cursor and never closes the owner.
+        return VerificationReadHandle(
+            self._connection, self, owns_connection=False,
         )
-        return VerificationReadHandle(connection, self)
 
     def close(self) -> None:
         with self._lock:
@@ -556,6 +701,11 @@ class VerificationWriteAuthority:
                     os.fchmod(fd, 0o600)
                 finally:
                     os.close(fd)
+            try:
+                self._connection.execute("PRAGMA locking_mode=NORMAL")
+            except sqlite3.Error:
+                pass
+            self._connection.close()
             os.close(self._parent_fd)
             if shutdown_error is not None:
                 raise shutdown_error

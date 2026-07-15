@@ -19,6 +19,7 @@ from khaos.coding.execution.platform import (
     LinuxBubblewrapBackend,
     MacOSSandboxBackend,
     UnsupportedBackend,
+    _runtime_read_roots,
 )
 
 
@@ -63,6 +64,32 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
     assert "--unshare-net" in argv
     assert "--new-session" in argv
     assert "--die-with-parent" in argv
+    assert ("--ro-bind", "/", "/") not in tuple(
+        argv[index:index + 3] for index in range(len(argv) - 2)
+    )
+    size_index = argv.index("--size")
+    assert int(argv[size_index + 1]) == ResourceBudget().tmpfs_bytes
+    assert "--clearenv" in argv
+
+
+def test_macos_profile_uses_positive_read_allowlist(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = MacOSSandboxBackend().profile(workspace)
+
+    assert "(deny default)" in profile
+    assert "(allow file-read*)" not in profile
+    assert str(workspace.resolve()) in profile
+    assert str(Path.home()) not in profile
+
+
+def test_user_home_executable_never_exposes_entire_home(tmp_path: Path):
+    executable = Path.home() / "bin" / "custom-tool"
+
+    roots = _runtime_read_roots((str(executable),), tmp_path)
+
+    assert Path.home().resolve() not in roots
+    assert roots == (executable.resolve(),)
 
 
 def test_linux_profile_preserves_cwd_relative_to_workspace(tmp_path: Path):
@@ -73,7 +100,7 @@ def test_linux_profile_preserves_cwd_relative_to_workspace(tmp_path: Path):
     argv = LinuxBubblewrapBackend().argv_prefix(workspace, cwd=cwd)
     chdir_index = argv.index("--chdir")
 
-    assert argv[chdir_index + 1] == "/tmp/workspace/src/pkg"
+    assert argv[chdir_index + 1] == "/workspace/src/pkg"
 
 
 def test_linux_profile_rejects_cwd_outside_workspace(tmp_path: Path):
@@ -95,14 +122,18 @@ def test_platform_profiles_hide_explicit_secret_roots(tmp_path: Path):
     mac_profile = MacOSSandboxBackend().profile(
         workspace, unreadable_roots=(secret_root,)
     )
-    assert f'(deny file-read* (subpath "{secret_root}"))' in mac_profile
+    assert str(secret_root) not in mac_profile
+    assert "(allow file-read*)" not in mac_profile
     assert '(allow file-write* (subpath "/tmp"))' not in mac_profile
 
     linux_argv = LinuxBubblewrapBackend().argv_prefix(
         workspace, unreadable_roots=(secret_root,)
     )
-    secret_index = linux_argv.index(str(secret_root))
-    assert linux_argv[secret_index - 1] == "--tmpfs"
+    assert str(secret_root) not in linux_argv
+    assert ("--ro-bind", "/", "/") not in tuple(
+        linux_argv[index:index + 3]
+        for index in range(len(linux_argv) - 2)
+    )
 
 
 def _require_or_skip(binary: str) -> None:

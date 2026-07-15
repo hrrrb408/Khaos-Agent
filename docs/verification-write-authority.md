@@ -7,7 +7,7 @@
 | `approval.store.open_store()` | Legacy `sqlite3.connect(path)` read/write; caller chooses path | Not an authority factory. Production `ApprovalRuntime` must receive this store only from trusted bootstrap and never expose it to Agent/plugin code. |
 | `ApprovalRuntime._configure_trusted_verification_internal()` | Uses the already-open trusted approval connection | Creates the only production `VerificationExecutionStore`, starts the boot-scoped authority, and binds the store before Runner construction. |
 | `TrustedVerificationRunner.__init__()` | Does not open a production DB | Reuses the Runtime-bound store. A production backend without write authority is rejected. |
-| `VerificationExecutionStore.open_readonly()` | No caller path/factory | Returns a fixed-query `VerificationReadHandle`; internally uses SQLite URI `mode=ro` and `query_only`. |
+| `VerificationExecutionStore.open_readonly()` | No caller path/factory | Returns a fixed-query `VerificationReadHandle` over the authority-owned EXCLUSIVE connection; it exposes no SQL API and cannot close the owner handle. |
 | Approval/verification startup recovery | Same Runtime-owned store | No independent connection or caller path. Success requires current authority evidence. |
 | CLI/TUI `Database` | Application `khaos.db` selected by CLI | General application persistence, not a Verification Authority API. It is not passed to Sandbox/project code. |
 | `IndexStore` and repository intelligence | Separate caller/store connection | Code intelligence data only; cannot establish trusted verification success. |
@@ -65,11 +65,17 @@ SQLite triggers enforce state-machine prerequisites, existence of a
 CleanupProof and immutable evidence. They do not identify a trusted
 connection. The former connection-local UDF is absent from production code.
 
-After schema migration, Runtime pins the schema/trigger digest and opens the
+After schema migration, Runtime switches SQLite to WAL + EXCLUSIVE locking,
+commits a bootstrap write, retains the resulting OS lock for the authority
+lifetime, pins the schema/trigger digest and opens the
 database parent chain with `O_DIRECTORY | O_NOFOLLOW`. It records
-dev/inode/uid/gid/mode for parent, DB, WAL and SHM. DB/WAL/SHM directory entries
-are set to `0o400` while the pre-opened Runtime connection remains active.
-Independent `mode=rw`/`mode=rwc` writers therefore fail at the OS boundary.
+dev/inode/uid/gid/mode for parent, DB, WAL and SHM when present; an SHM omitted
+by SQLite's exclusive-WAL mode is pinned as absent. DB/WAL/SHM directory entries
+are set to `0o400` while the authority connection remains active. A connection
+opened before activation but not holding a transaction is still denied by the
+retained SQLite lock; an already-active writer makes authority startup fail
+closed. Independent `mode=rw`/`mode=rwc` writers therefore cannot rely on a
+pre-open descriptor to bypass later chmod.
 Every authority operation checks directory entries against the fixed FDs and
 checks the schema digest. Database, WAL, SHM or parent replacement fails
 closed. Shutdown restores owner write permission through the fixed FDs, not
@@ -105,7 +111,7 @@ Covered:
 - independent local processes attempting ordinary SQLite writes, UDF spoofing,
   trigger removal, forged CleanupProof insertion or state updates during an
   active Runtime;
-- DB/WAL/SHM inode replacement and parent rename/symlink swap, which are
+- DB/WAL/SHM inode replacement, unexpected sidecar creation and parent rename/symlink swap, which are
   detected and fail closed;
 - Sandbox and repository code, which never receives the database, pipe or
   capability.

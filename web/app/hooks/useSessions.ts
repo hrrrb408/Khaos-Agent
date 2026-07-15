@@ -114,8 +114,9 @@ export function useSessions(initialMode: ChatMode) {
 
   const syncGatewaySessions = useCallback(async (gatewayUrl: string, apiKey: string) => {
     try {
-      const keyParam = apiKey ? `?key=${encodeURIComponent(apiKey)}` : "";
-      const response = await fetch(`${gatewayUrl}/api/sessions${keyParam}`);
+      const response = await fetch(`${gatewayUrl}/api/sessions`, {
+        headers: apiKey ? { "X-Khaos-Key": apiKey } : {},
+      });
       if (!response.ok) return;
       const remote = await response.json() as Array<{ session_id?: string; mode?: ChatMode; message?: string }>;
       if (!Array.isArray(remote)) return;

@@ -58,7 +58,12 @@ gateway:
   host: "127.0.0.1"
   port: 8080
   api_key: "${KHAOS_API_KEY}"
-  python_agent: "/tmp/khaos-agent.sock"
+  # Empty KHAOS_API_KEY causes the Go gateway to create a protected 256-bit
+  # token in the user config directory; browsers must enter that token.
+  api_key_file: ""
+  cors_origins: []
+  allowed_hosts: ["127.0.0.1", "localhost", "::1"]
+  python_agent: "/tmp/khaos/agent.sock"
   listen: "127.0.0.1:8080"
 
 web:
@@ -72,7 +77,7 @@ model:
   temperature: 0.7
 
 agent:
-  socket: "/tmp/khaos-agent.sock"
+  socket: "/tmp/khaos/agent.sock"
 
 security:
   enabled: true

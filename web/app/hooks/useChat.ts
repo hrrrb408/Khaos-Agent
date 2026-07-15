@@ -21,15 +21,6 @@ function makeId(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function parseEventData(data: string): Record<string, unknown> {
-  try {
-    const parsed = JSON.parse(data);
-    return parsed && typeof parsed === "object" ? parsed as Record<string, unknown> : { value: parsed };
-  } catch {
-    return { raw: data };
-  }
-}
-
 function contentFromPayload(payload: Record<string, unknown>): string {
   const candidate = payload.content ?? payload.text ?? payload.delta ?? payload.message;
   if (typeof candidate === "string") return candidate;
@@ -74,13 +65,12 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
   const [isSending, setIsSending] = useState(false);
   const [lastError, setLastError] = useState("");
   const [doneStats, setDoneStats] = useState<DoneStats | null>(null);
-  const sourceRef = useRef<EventSource | null>(null);
+  const sourceRef = useRef<AbortController | null>(null);
   const assistantMessageIdRef = useRef("");
   const assistantTextRef = useRef("");
-  const terminalEventSeenRef = useRef(false);
 
   const closeStream = useCallback(() => {
-    sourceRef.current?.close();
+    sourceRef.current?.abort();
     sourceRef.current = null;
   }, []);
 
@@ -119,7 +109,6 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
     )));
     assistantMessageIdRef.current = "";
     assistantTextRef.current = "";
-    terminalEventSeenRef.current = false;
   }, [updateMessages]);
 
   const addEventItem = useCallback((sessionId: string, event: StreamEventName, data: Record<string, unknown>) => {
@@ -155,13 +144,16 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
     updateMessages(sessionId, (messages) => [...messages, userMessage], { titleFrom: message, mode });
 
     try {
-      const response = await fetch(`${settings.gatewayUrl}/api/chat`, {
+      const controller = new AbortController();
+      sourceRef.current = controller;
+      const response = await fetch(`${settings.gatewayUrl}/api/chat/${sessionId}/stream`, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           ...(settings.apiKey ? { "X-Khaos-Key": settings.apiKey } : {}),
         },
-        body: JSON.stringify({ session_id: sessionId, mode, message }),
+        body: JSON.stringify({ mode, message }),
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -169,53 +161,50 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
         throw new Error(text || `Chat request failed with ${response.status}`);
       }
 
-      const payload = await response.json() as { session_id?: string };
-      const streamSessionId = payload.session_id || sessionId;
-      const keyParam = settings.apiKey ? `?key=${encodeURIComponent(settings.apiKey)}` : "";
-      const source = new EventSource(`${settings.gatewayUrl}/api/chat/${streamSessionId}/stream${keyParam}`);
-      sourceRef.current = source;
-
-      source.addEventListener("message", (event) => {
-        const data = parseEventData((event as MessageEvent).data);
-        appendAssistantChunk(sessionId, contentFromPayload(data));
-      });
-
-      for (const eventName of streamEvents) {
-        source.addEventListener(eventName, (event) => {
-          const data = parseEventData((event as MessageEvent).data);
-          if (eventName !== "done") {
-            finishAssistant(sessionId);
+      if (!response.body) throw new Error("Gateway returned no response stream.");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffered = "";
+      let terminal = false;
+      while (!terminal) {
+        const { value, done } = await reader.read();
+        buffered += decoder.decode(value, { stream: !done });
+        const lines = buffered.split("\n");
+        buffered = done ? "" : (lines.pop() ?? "");
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          const item = JSON.parse(line) as { event?: StreamEventName | "message"; data?: Record<string, unknown> };
+          const eventName = item.event;
+          const data = item.data ?? {};
+          if (eventName === "message") {
+            appendAssistantChunk(sessionId, contentFromPayload(data));
+            continue;
           }
+          if (!eventName || !streamEvents.includes(eventName)) continue;
+          if (eventName !== "done") finishAssistant(sessionId);
           addEventItem(sessionId, eventName, data);
           if (eventName === "done") {
-            terminalEventSeenRef.current = true;
             finishAssistant(sessionId);
             setDoneStats(statsFromPayload(data));
-            closeStream();
-            setIsSending(false);
+            terminal = true;
+          } else if (eventName === "error") {
+            setLastError(errorFromPayload(data));
+            terminal = true;
           }
-          if (eventName === "error") {
-            terminalEventSeenRef.current = true;
-            const errorMessage = errorFromPayload(data);
-            setLastError(errorMessage);
-            closeStream();
-            setIsSending(false);
-          }
-        });
-      }
-
-      source.onerror = () => {
-        if (terminalEventSeenRef.current || sourceRef.current === null) {
-          return;
         }
-        const errorMessage = "Stream connection failed.";
-        setLastError(errorMessage);
-        addEventItem(sessionId, "error", { error: errorMessage });
-        finishAssistant(sessionId);
-        closeStream();
-        setIsSending(false);
-      };
+        if (done) break;
+      }
+      if (!terminal) throw new Error("Gateway stream ended without a terminal event.");
+      sourceRef.current = null;
+      setIsSending(false);
     } catch (error) {
+      if (error instanceof DOMException && error.name === "AbortError") {
+        sourceRef.current = null;
+        setIsSending(false);
+        return;
+      }
+      sourceRef.current?.abort();
+      sourceRef.current = null;
       const errorMessage = requestErrorMessage(error, settings.gatewayUrl);
       setLastError(errorMessage);
       addEventItem(sessionId, "error", { error: errorMessage });

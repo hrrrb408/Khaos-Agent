@@ -1,15 +1,21 @@
 import subprocess
 import os
+import hashlib
+import hmac
+import json
+import time
 import uuid
 from pathlib import Path
 
 import pytest
 
 from khaos.db import Database
+from khaos.agent.approval import ApprovalBinding, ApprovalBroker
 from khaos.grpc_server import (
     AgentService,
     ChatRequest,
     ConfirmRequest,
+    GatewayRPCAuthenticator,
     _parse_json_line,
     load_router_from_config,
     MemoryService,
@@ -85,6 +91,76 @@ async def test_task_service_only_approves_or_rejects_blocked_tasks():
     assert not rejected["ok"]
 
 
+async def test_task_approval_is_consumed_before_running_is_observable():
+    from khaos.coding.task_manager import TaskManager, TaskStatus
+
+    broker = ApprovalBroker()
+    manager = TaskManager()
+    task = await manager.create("atomic approval")
+    binding = ApprovalBinding(
+        principal_id="principal", session_id="session", task_id=task.id,
+        turn_id="turn", tool_call_id="tool-call", tool_name="shell",
+        arguments_digest="args", workspace_id="workspace",
+        profile_digest="profile", expires_at=time.time() + 60,
+    )
+    binding_digest = await broker.register_tool_approval(binding)
+    await manager.update_status(
+        task.id, TaskStatus.BLOCKED,
+        pending_approval={
+            "tool_call_id": binding.tool_call_id,
+            "principal_id": binding.principal_id,
+            "session_id": binding.session_id,
+            "binding_digest": binding_digest,
+        },
+    )
+    service = TaskService(manager, broker)
+
+    approved = await service.approve(
+        task.id, principal_id="principal", session_id="session",
+        binding_digest=binding_digest,
+    )
+
+    assert approved["ok"] is True
+    approved_task = await manager.get(task.id)
+    assert approved_task.status is TaskStatus.RUNNING
+    evidence = approved_task.metadata["approval_consumption"]
+    assert evidence["tool_call_id"] == "tool-call"
+    assert evidence["binding_digest"] == binding_digest
+    assert evidence["principal_id"] == "principal"
+    assert evidence["session_id"] == "session"
+    assert evidence["decision"] == "approved"
+    assert evidence["consumed_at"] <= time.time()
+    record = broker._tool_approvals[binding.tool_call_id]
+    assert record.used and record.dispatched
+    replay = await service.approve(
+        task.id, principal_id="principal", session_id="session",
+        binding_digest=binding_digest,
+    )
+    assert replay["ok"] is False
+
+
+async def test_stale_task_approval_never_publishes_running_state():
+    from khaos.coding.task_manager import TaskManager, TaskStatus
+
+    broker = ApprovalBroker()
+    manager = TaskManager()
+    task = await manager.create("stale approval")
+    await manager.update_status(
+        task.id, TaskStatus.BLOCKED,
+        pending_approval={
+            "tool_call_id": "missing", "principal_id": "principal",
+            "session_id": "session", "binding_digest": "digest",
+        },
+    )
+    response = await TaskService(manager, broker).approve(
+        task.id, principal_id="principal", session_id="session",
+        binding_digest="digest",
+    )
+
+    assert response["ok"] is False
+    assert (await manager.get(task.id)).status is TaskStatus.BLOCKED
+
+
 async def test_agent_service_permission_waits_for_confirm(tmp_path):
     project = tmp_path / "project"
     (project / "prompts").mkdir(parents=True)
@@ -153,9 +229,14 @@ async def test_json_line_server_chat(tmp_path):
     (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
     import asyncio
 
-    socket_path = Path("/tmp") / f"khaos-test-{uuid.uuid4().hex}.sock"
+    socket_parent = Path("/tmp") / f"khaos-test-{uuid.uuid4().hex}"
+    socket_parent.mkdir(mode=0o700)
+    socket_path = socket_parent / "agent.sock"
     task = asyncio.create_task(
-        serve_json_lines(str(socket_path), str(tmp_path / "khaos.db"), project_root=tmp_path)
+        serve_json_lines(
+            str(socket_path), str(tmp_path / "khaos.db"),
+            project_root=tmp_path, gateway_capability="c" * 48,
+        )
     )
     await asyncio.sleep(0.01)
     task.cancel()
@@ -165,6 +246,51 @@ async def test_json_line_server_chat(tmp_path):
         pytest.skip("sandbox does not allow binding Unix sockets")
     except asyncio.CancelledError:
         pass
+
+
+def _signed_rpc_request(method: str, payload: dict, *, nonce: str = "n" * 32):
+    capability = "c" * 48
+    issued_at = int(time.time())
+    canonical = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    ).encode("utf-8")
+    digest = hashlib.sha256(canonical).hexdigest()
+    principal = str(payload.get("principal_id") or "gateway")
+    signed = f"{method}\n{nonce}\n{issued_at}\n{principal}\n{digest}".encode()
+    return {
+        "method": method, "payload": payload,
+        "auth": {
+            "nonce": nonce, "issued_at": issued_at,
+            "principal_id": principal, "payload_digest": digest,
+            "mac": hmac.new(capability.encode(), signed, hashlib.sha256).hexdigest(),
+        },
+    }
+
+
+def test_rpc_capability_is_method_payload_principal_and_nonce_bound():
+    authenticator = GatewayRPCAuthenticator("c" * 48)
+    request = _signed_rpc_request(
+        "TaskService.Approve", {"task_id": "task", "principal_id": "user"}
+    )
+    assert authenticator.authenticate(request) == "user"
+    with pytest.raises(PermissionError, match="replayed"):
+        authenticator.authenticate(request)
+
+    tampered = _signed_rpc_request(
+        "TaskService.Approve", {"task_id": "other", "principal_id": "user"},
+        nonce="x" * 32,
+    )
+    tampered["payload"]["task_id"] = "attacker"
+    with pytest.raises(PermissionError, match="payload digest"):
+        authenticator.authenticate(tampered)
+
+    wrong_method = _signed_rpc_request(
+        "TaskService.Approve", {"task_id": "task", "principal_id": "user"},
+        nonce="y" * 32,
+    )
+    wrong_method["method"] = "MemoryService.SetMemory"
+    with pytest.raises(PermissionError, match="method capability"):
+        authenticator.authenticate(wrong_method)
 
 
 def test_parse_json_line_accepts_object_request():
@@ -304,3 +430,4 @@ async def test_audit_service_query_roundtrip(tmp_path):
     assert entries[0]["action"] == "write_file"
     assert entries[0]["result"] == "success"
     await db.close()
+    GatewayRPCAuthenticator,

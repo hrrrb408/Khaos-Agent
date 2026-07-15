@@ -16,11 +16,12 @@ func PrincipalFromContext(ctx context.Context) (string, bool) {
 	return principal, ok && principal != ""
 }
 
-// Middleware validates X-Khaos-Key when apiKey is configured.
+// Middleware validates X-Khaos-Key and fails closed when authentication is
+// not configured. Public endpoints must be routed outside this middleware.
 func Middleware(apiKey string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if apiKey == "" {
-			next.ServeHTTP(w, r)
+			http.Error(w, "gateway authentication unavailable", http.StatusServiceUnavailable)
 			return
 		}
 		provided := r.Header.Get("X-Khaos-Key")

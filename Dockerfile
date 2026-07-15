@@ -18,7 +18,7 @@ COPY prompts/ prompts/
 COPY AGENTS.md KHAOS.md config.yaml ./
 
 # Data directories.
-RUN mkdir -p /app/data /app/skills /run/khaos
+RUN mkdir -p /app/data /app/skills /run/khaos && chmod 0700 /run/khaos
 
 CMD ["python", "-m", "khaos.cli", "start", "--socket", "/run/khaos/agent.sock", "--db", "/app/data/khaos.db"]
 

@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,22 +22,24 @@ import (
 
 // Handler serves Khaos Phase 2 REST and SSE endpoints.
 type Handler struct {
-	agent         AgentClient
-	memory        MemoryClient
-	audit         AuditClient
-	subagents     SubagentClient
-	tasks         TaskClient
-	config        ConfigStore
-	limiter       *rate.TokenBucket
-	metrics       *metrics.Collector
-	apiKey        string
-	startedAt     time.Time
-	mu            sync.Mutex
-	streams       map[string]<-chan ChatEvent
-	sessions      map[string]ChatRequest
-	sessionOwners map[string]string
-	taskOwners    map[string]string
-	tools         []map[string]any
+	agent          AgentClient
+	memory         MemoryClient
+	audit          AuditClient
+	subagents      SubagentClient
+	tasks          TaskClient
+	config         ConfigStore
+	limiter        *rate.TokenBucket
+	metrics        *metrics.Collector
+	apiKey         string
+	allowedHosts   map[string]struct{}
+	allowedOrigins map[string]struct{}
+	startedAt      time.Time
+	mu             sync.Mutex
+	streams        map[string]<-chan ChatEvent
+	sessions       map[string]ChatRequest
+	sessionOwners  map[string]string
+	taskOwners     map[string]string
+	tools          []map[string]any
 }
 
 const (
@@ -56,23 +60,51 @@ func (h *Handler) WithAudit(audit AuditClient) *Handler {
 // NewHandler creates an API handler.
 func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiKey string, limiter *rate.TokenBucket) *Handler {
 	return &Handler{
-		agent:         agent,
-		memory:        memory,
-		config:        config,
-		limiter:       limiter,
-		metrics:       metrics.NewCollector(),
-		apiKey:        apiKey,
-		startedAt:     time.Now(),
-		streams:       map[string]<-chan ChatEvent{},
-		sessions:      map[string]ChatRequest{},
-		sessionOwners: map[string]string{},
-		taskOwners:    map[string]string{},
+		agent:   agent,
+		memory:  memory,
+		config:  config,
+		limiter: limiter,
+		metrics: metrics.NewCollector(),
+		apiKey:  apiKey,
+		allowedHosts: map[string]struct{}{
+			"localhost": {}, "127.0.0.1": {}, "::1": {},
+		},
+		allowedOrigins: map[string]struct{}{},
+		startedAt:      time.Now(),
+		streams:        map[string]<-chan ChatEvent{},
+		sessions:       map[string]ChatRequest{},
+		sessionOwners:  map[string]string{},
+		taskOwners:     map[string]string{},
 		tools: []map[string]any{
 			{"name": "read_file", "modes": []string{"all"}, "permission_level": "read"},
 			{"name": "write_file", "modes": []string{"coding"}, "permission_level": "write"},
 			{"name": "terminal", "modes": []string{"coding"}, "permission_level": "execute"},
 		},
 	}
+}
+
+// WithAllowedHosts replaces the HTTP Host allowlist used to prevent DNS
+// rebinding. Values are host names or IP literals; ports are ignored.
+func (h *Handler) WithAllowedHosts(hosts ...string) *Handler {
+	h.allowedHosts = map[string]struct{}{}
+	for _, host := range hosts {
+		if normalized := normalizeHost(host); normalized != "" {
+			h.allowedHosts[normalized] = struct{}{}
+		}
+	}
+	return h
+}
+
+// WithAllowedOrigins enables browser access for exact http(s) origins. The
+// default is an empty allowlist and therefore emits no CORS headers.
+func (h *Handler) WithAllowedOrigins(origins ...string) *Handler {
+	h.allowedOrigins = map[string]struct{}{}
+	for _, origin := range origins {
+		if normalized := normalizeOrigin(origin); normalized != "" {
+			h.allowedOrigins[normalized] = struct{}{}
+		}
+	}
+	return h
 }
 
 // WithSubagents attaches a subagent client so subagent endpoints are served.
@@ -119,6 +151,12 @@ func (h *Handler) Routes() http.Handler {
 	common := h.rateLimit(h.requestLog(h.metricsMiddleware(mux)))
 	secured := auth.Middleware(h.apiKey, common)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Health is intentionally the only anonymous Khaos endpoint. Platform
+		// webhooks use their own signature authentication in the Python service.
+		if r.URL.Path == "/api/health" {
+			common.ServeHTTP(w, r)
+			return
+		}
 		// Platform webhooks authenticate with their platform signature in Python.
 		if strings.HasPrefix(r.URL.Path, "/api/webhook/") {
 			common.ServeHTTP(w, r)
@@ -126,7 +164,7 @@ func (h *Handler) Routes() http.Handler {
 		}
 		secured.ServeHTTP(w, r)
 	})
-	return h.cors(h.protocol(h.limitRequestBody(root)))
+	return h.hostGuard(h.originPolicy(h.protocol(h.limitRequestBody(root))))
 }
 
 func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
@@ -146,16 +184,19 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
-		id, valid := result["id"].(string)
-		if !valid || id == "" {
-			writeError(w, http.StatusBadGateway, "task service returned no task id")
-			return
-		}
-		h.mu.Lock()
-		h.taskOwners[id] = principalID
-		h.mu.Unlock()
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
 	}
+	id, valid := result["id"].(string)
+	if !valid || id == "" {
+		writeError(w, http.StatusBadGateway, "task service returned no task id")
+		return
+	}
+	h.mu.Lock()
+	h.taskOwners[id] = principalID
+	h.mu.Unlock()
 	writeJSON(w, http.StatusCreated, result)
 }
 
@@ -169,18 +210,21 @@ func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
-		filtered := make([]map[string]any, 0, len(result))
-		h.mu.Lock()
-		for _, task := range result {
-			id, _ := task["id"].(string)
-			if h.taskOwners[id] == principalID {
-				filtered = append(filtered, task)
-			}
-		}
-		h.mu.Unlock()
-		result = filtered
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
 	}
+	filtered := make([]map[string]any, 0, len(result))
+	h.mu.Lock()
+	for _, task := range result {
+		id, _ := task["id"].(string)
+		if h.taskOwners[id] == principalID {
+			filtered = append(filtered, task)
+		}
+	}
+	h.mu.Unlock()
+	result = filtered
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -414,9 +458,20 @@ func (h *Handler) setChannelEnabled(w http.ResponseWriter, r *http.Request, enab
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
-func (h *Handler) cors(next http.Handler) http.Handler {
+func (h *Handler) originPolicy(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		normalized := normalizeOrigin(origin)
+		if _, allowed := h.allowedOrigins[normalized]; !allowed || normalized == "" {
+			writeError(w, http.StatusForbidden, "origin is not allowed")
+			return
+		}
+		w.Header().Set("Access-Control-Allow-Origin", normalized)
+		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Khaos-Key")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
 		if r.Method == http.MethodOptions {
@@ -425,6 +480,45 @@ func (h *Handler) cors(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (h *Handler) hostGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := normalizeHost(r.Host)
+		if host == "" {
+			writeError(w, http.StatusBadRequest, "invalid Host header")
+			return
+		}
+		if _, allowed := h.allowedHosts[host]; !allowed {
+			writeError(w, http.StatusForbidden, "Host header is not allowed")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func normalizeHost(value string) string {
+	value = strings.TrimSpace(strings.ToLower(value))
+	if value == "" {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(value); err == nil {
+		value = host
+	} else if strings.Count(value, ":") == 1 {
+		return ""
+	}
+	value = strings.TrimSuffix(strings.Trim(value, "[]"), ".")
+	return value
+}
+
+func normalizeOrigin(value string) string {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") ||
+		parsed.Host == "" || parsed.User != nil || parsed.Path != "" ||
+		parsed.RawQuery != "" || parsed.Fragment != "" {
+		return ""
+	}
+	return strings.ToLower(parsed.Scheme) + "://" + strings.ToLower(parsed.Host)
 }
 
 func (h *Handler) protocol(next http.Handler) http.Handler {
@@ -450,7 +544,8 @@ func (h *Handler) limitRequestBody(next http.Handler) http.Handler {
 func (h *Handler) authorizeSession(w http.ResponseWriter, r *http.Request, sessionID string) bool {
 	principalID, authenticated := auth.PrincipalFromContext(r.Context())
 	if !authenticated {
-		return true
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return false
 	}
 	h.mu.Lock()
 	owner := h.sessionOwners[sessionID]
@@ -465,7 +560,8 @@ func (h *Handler) authorizeSession(w http.ResponseWriter, r *http.Request, sessi
 func (h *Handler) authorizeTask(w http.ResponseWriter, r *http.Request) bool {
 	principalID, authenticated := auth.PrincipalFromContext(r.Context())
 	if !authenticated {
-		return true
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return false
 	}
 	h.mu.Lock()
 	owner := h.taskOwners[r.PathValue("id")]
@@ -545,11 +641,12 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	if req.SessionID == "" {
 		req.SessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
 	}
-	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
-		req.PrincipalID = principalID
-	} else {
-		req.PrincipalID = ""
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
 	}
+	req.PrincipalID = principalID
 	h.mu.Lock()
 	owner := h.sessionOwners[req.SessionID]
 	h.mu.Unlock()
@@ -565,9 +662,7 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.streams[req.SessionID] = stream
 	h.sessions[req.SessionID] = req
-	if req.PrincipalID != "" {
-		h.sessionOwners[req.SessionID] = req.PrincipalID
-	}
+	h.sessionOwners[req.SessionID] = req.PrincipalID
 	h.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"session_id": req.SessionID})
 }
@@ -619,11 +714,12 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.SessionID = sessionID
-	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
-		req.PrincipalID = principalID
-	} else {
-		req.PrincipalID = ""
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
 	}
+	req.PrincipalID = principalID
 	h.mu.Lock()
 	owner := h.sessionOwners[sessionID]
 	h.mu.Unlock()
@@ -637,9 +733,7 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	h.mu.Lock()
-	if req.PrincipalID != "" {
-		h.sessionOwners[sessionID] = req.PrincipalID
-	}
+	h.sessionOwners[sessionID] = req.PrincipalID
 	h.sessions[sessionID] = req
 	h.mu.Unlock()
 	w.Header().Set("Content-Type", "application/x-ndjson")
