@@ -541,7 +541,7 @@ make sandbox-run      # 启动沙箱容器
 
 ```bash
 docker compose up -d
-# Agent: localhost:50051
+# Agent control plane: /run/khaos/agent.sock (Unix socket)
 # Gateway: localhost:8080
 ```
 
@@ -553,7 +553,7 @@ pip install -e .
 khaos start --db khaos.db
 
 # Go 网关
-cd go && go run ./cmd/gateway/ --python-agent 127.0.0.1:50051
+cd go && go run ./cmd/gateway/ --python-agent /tmp/khaos-agent.sock
 
 # 运行测试
 khaos test --all

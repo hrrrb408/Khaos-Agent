@@ -7,6 +7,7 @@ import shlex
 from pathlib import Path
 from typing import Any
 
+from khaos.coding.execution.docker import DEFAULT_DOCKER_IMAGE
 from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy, ResourceBudget
 
 
@@ -15,7 +16,7 @@ _MEMORY_PATTERN = re.compile(r"^(\d+)([kKmMgG])$")
 
 async def sandbox_exec(
     command: str,
-    image: str = "python:3.13-slim",
+    image: str = DEFAULT_DOCKER_IMAGE,
     project_dir: str = ".",
     network: bool = False,
     cpus: float = 1.0,

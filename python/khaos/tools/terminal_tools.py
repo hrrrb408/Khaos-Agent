@@ -15,17 +15,14 @@ from khaos.security.command_guard import CommandGuard
 
 
 READ_ONLY_COMMANDS = {
-    "awk",
     "cat",
     "date",
     "echo",
-    "find",
     "grep",
     "head",
     "ls",
     "pwd",
     "rg",
-    "sed",
     "tail",
     "test",
     "true",

@@ -7,9 +7,10 @@ import (
 
 // ChatRequest is the REST request body for POST /api/chat.
 type ChatRequest struct {
-	SessionID string `json:"session_id"`
-	Mode      string `json:"mode"`
-	Message   string `json:"message"`
+	SessionID   string `json:"session_id"`
+	Mode        string `json:"mode"`
+	Message     string `json:"message"`
+	PrincipalID string `json:"principal_id,omitempty"`
 }
 
 // ChatEvent is the gateway-neutral event shape streamed as SSE.
@@ -21,7 +22,7 @@ type ChatEvent struct {
 // AgentClient is implemented by the Python gRPC client and by tests.
 type AgentClient interface {
 	Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
-	ConfirmPermission(ctx context.Context, sessionID string, toolCallID string, approved bool, remember bool) error
+	ConfirmPermission(ctx context.Context, principalID string, sessionID string, toolCallID string, bindingDigest string, approved bool, remember bool) error
 	SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error)
 }
 
@@ -72,8 +73,8 @@ type TaskClient interface {
 	ListTasks(ctx context.Context, activeOnly bool) ([]map[string]any, error)
 	GetTask(ctx context.Context, id string) (map[string]any, error)
 	CancelTask(ctx context.Context, id string) (TransitionResult, error)
-	ApproveTask(ctx context.Context, id string) (TransitionResult, error)
-	RejectTask(ctx context.Context, id string) (TransitionResult, error)
+	ApproveTask(ctx context.Context, id string, principalID string, sessionID string, bindingDigest string) (TransitionResult, error)
+	RejectTask(ctx context.Context, id string, principalID string, sessionID string, bindingDigest string) (TransitionResult, error)
 	TaskEvents(ctx context.Context, id string) (<-chan map[string]any, error)
 	TaskArtifacts(ctx context.Context, id string) ([]map[string]any, error)
 }

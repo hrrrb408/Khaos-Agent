@@ -177,14 +177,44 @@ func (h *Handler) handleApproveTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
-	h.changeTask(w, r, "approved", h.tasks.ApproveTask)
+	h.changeTaskApproval(w, r, "approved", h.tasks.ApproveTask)
 }
 func (h *Handler) handleRejectTask(w http.ResponseWriter, r *http.Request) {
 	if h.tasks == nil {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
-	h.changeTask(w, r, "rejected", h.tasks.RejectTask)
+	h.changeTaskApproval(w, r, "rejected", h.tasks.RejectTask)
+}
+
+func (h *Handler) changeTaskApproval(w http.ResponseWriter, r *http.Request, status string, action func(context.Context, string, string, string, string) (TransitionResult, error)) {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	var body struct {
+		SessionID     string `json:"session_id"`
+		BindingDigest string `json:"binding_digest"`
+	}
+	if json.NewDecoder(r.Body).Decode(&body) != nil || body.SessionID == "" || body.BindingDigest == "" {
+		writeError(w, http.StatusBadRequest, "session_id and binding_digest are required")
+		return
+	}
+	result, err := action(r.Context(), r.PathValue("id"), principalID, body.SessionID, body.BindingDigest)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if result == TransitionNotFound {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	if result != TransitionUpdated {
+		writeError(w, http.StatusConflict, "invalid task transition or approval binding")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status, "task_id": r.PathValue("id")})
 }
 func (h *Handler) changeTask(w http.ResponseWriter, r *http.Request, status string, action func(context.Context, string) (TransitionResult, error)) {
 	if h.tasks == nil {
@@ -399,7 +429,12 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	if req.SessionID == "" {
 		req.SessionID = fmt.Sprintf("session-%d", time.Now().UnixNano())
 	}
-	stream, err := h.agent.Chat(context.Background(), req)
+	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
+		req.PrincipalID = principalID
+	} else {
+		req.PrincipalID = ""
+	}
+	stream, err := h.agent.Chat(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -447,6 +482,11 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.SessionID = sessionID
+	if principalID, ok := auth.PrincipalFromContext(r.Context()); ok {
+		req.PrincipalID = principalID
+	} else {
+		req.PrincipalID = ""
+	}
 	stream, err := h.agent.Chat(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
@@ -470,15 +510,25 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 
 func (h *Handler) handleConfirm(w http.ResponseWriter, r *http.Request) {
 	var body struct {
-		ToolCallID string `json:"tool_call_id"`
-		Approved   bool   `json:"approved"`
-		Remember   bool   `json:"remember"`
+		ToolCallID    string `json:"tool_call_id"`
+		Approved      bool   `json:"approved"`
+		Remember      bool   `json:"remember"`
+		BindingDigest string `json:"binding_digest"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	if err := h.agent.ConfirmPermission(r.Context(), r.PathValue("id"), body.ToolCallID, body.Approved, body.Remember); err != nil {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	if body.ToolCallID == "" || body.BindingDigest == "" {
+		writeError(w, http.StatusBadRequest, "tool_call_id and binding_digest are required")
+		return
+	}
+	if err := h.agent.ConfirmPermission(r.Context(), principalID, r.PathValue("id"), body.ToolCallID, body.BindingDigest, body.Approved, body.Remember); err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}

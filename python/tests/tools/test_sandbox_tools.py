@@ -8,7 +8,11 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from khaos.coding.execution.docker import DockerBackend
+from khaos.coding.execution.docker import (
+    DEFAULT_DOCKER_IMAGE,
+    DockerBackend,
+    _ContainerLease,
+)
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.models import (
     ExecutionResult,
@@ -185,6 +189,13 @@ class _FakeProcess:
         self.returncode = returncode
         self.delay = delay
         self.killed = False
+        self.pid = None
+        self.stdout = asyncio.StreamReader()
+        self.stdout.feed_data(stdout)
+        self.stdout.feed_eof()
+        self.stderr = asyncio.StreamReader()
+        self.stderr.feed_data(stderr)
+        self.stderr.feed_eof()
 
     async def communicate(self):
         if self.delay:
@@ -195,25 +206,45 @@ class _FakeProcess:
         self.killed = True
         self.returncode = -9
 
+    def terminate(self):
+        self.returncode = -15
+
     async def wait(self):
+        if self.delay:
+            await asyncio.sleep(self.delay)
         return self.returncode
 
 
 class _InspectableDockerBackend(DockerBackend):
     def __init__(self):
-        super().__init__(allowed_images={"python:3.13-slim"})
+        super().__init__(allowed_images={DEFAULT_DOCKER_IMAGE})
         self.cli_calls = []
+        self.removed = set()
+        self.foreign_owner = False
 
     async def _run_cli(self, args, *, timeout):
         self.cli_calls.append(args)
         if args[:2] == ("image", "inspect"):
             return 0, "image", ""
+        if args[:2] == ("inspect", "--format"):
+            name = args[-1]
+            if name in self.removed:
+                return 1, "", "not found"
+            for lease in self._active.values():
+                if lease.name == name:
+                    return 0, (
+                        "foreign" if self.foreign_owner else lease.owner_nonce
+                    ), ""
+            return 1, "", "not found"
+        if args[:1] == ("rm",):
+            self.removed.add(args[-1])
+            return 0, "", ""
         if args[:1] == ("inspect",):
             return 1, "", "not found"
         return 0, "", ""
 
 
-def _resolved(tmp_path, *, image="python:3.13-slim", budget=None, environment=None):
+def _resolved(tmp_path, *, image=DEFAULT_DOCKER_IMAGE, budget=None, environment=None):
     worktree = tmp_path / "worktree"
     worktree.mkdir(exist_ok=True)
     (worktree / ".git").write_text("gitdir: ../repo/.git/worktrees/task\n", encoding="utf-8")
@@ -240,6 +271,9 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     assert argv[argv.index("--cap-drop") + 1] == "ALL"
     assert argv[argv.index("--security-opt") + 1] == "no-new-privileges"
     assert argv[argv.index("--network") + 1] == "none"
+    assert argv[argv.index("--pull") + 1] == "never"
+    assert "--init" in argv
+    assert argv[argv.index("--ipc") + 1] == "none"
     assert argv[argv.index("--pids-limit") + 1] == "256"
     assert argv[argv.index("--cpus") + 1] == "1.0"
     assert argv[argv.index("--memory") + 1] == str(512 * 1024 * 1024)
@@ -254,16 +288,60 @@ async def test_docker_backend_rejects_unavailable_or_unapproved_image_without_pu
     backend = _InspectableDockerBackend()
     with pytest.raises(PermissionError, match="allowlist"):
         await backend.execute_resolved(_resolved(tmp_path, image="evil/latest"))
-    backend.allowed_images = frozenset({"missing:local"})
+    missing = "example.invalid/khaos@sha256:" + "1" * 64
+    backend.allowed_images = frozenset({missing})
 
-    async def missing(args, *, timeout):
+    async def missing_cli(args, *, timeout):
         backend.cli_calls.append(args)
         return 1, "", "missing"
 
-    backend._run_cli = missing
+    backend._run_cli = missing_cli
     with pytest.raises(PermissionError, match="automatic pull"):
-        await backend.execute_resolved(_resolved(tmp_path, image="missing:local"))
+        await backend.execute_resolved(_resolved(tmp_path, image=missing))
     assert not any(call[:1] == ("pull",) for call in backend.cli_calls)
+
+
+def test_docker_backend_requires_digest_pinned_allowlist():
+    with pytest.raises(ValueError, match="digest"):
+        DockerBackend(allowed_images={"python:3.13-slim"})
+
+
+async def test_docker_cleanup_refuses_foreign_container_name_collision(tmp_path):
+    backend = _InspectableDockerBackend()
+    backend.foreign_owner = True
+    process = _FakeProcess(stderr=b"name already in use", returncode=125)
+
+    with patch(
+        "khaos.coding.execution.docker.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        with pytest.raises(PermissionError, match="not owned"):
+            await backend.execute_resolved(_resolved(tmp_path))
+
+    destructive = {"stop", "kill", "rm"}
+    assert not any(call[0] in destructive for call in backend.cli_calls)
+    assert backend._active == {}
+
+
+async def test_docker_backend_rejects_mount_option_injection_path(tmp_path):
+    backend = _InspectableDockerBackend()
+    context = _resolved(tmp_path)
+    unsafe = tmp_path / "worktree,dst=host"
+    context.worktree_path.rename(unsafe)
+    context = ResolvedExecutionContext(
+        **{
+            **context.__dict__,
+            "worktree_path": unsafe,
+            "cwd": unsafe,
+            "writable_roots": (unsafe,),
+            "permission_profile": context.permission_profile.bind_workspace(
+                unsafe
+            ),
+        }
+    )
+
+    with pytest.raises(PermissionError, match="mount syntax"):
+        await backend.execute_resolved(context)
 
 
 @pytest.mark.parametrize("violation", ["network", "writable-root", "sensitive-env", "main-repository"])
@@ -301,32 +379,29 @@ async def test_docker_backend_timeout_cleanup_output_truncation_and_shutdown(tmp
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
         result = await backend.execute_resolved(_resolved(tmp_path, budget=budget))
     assert result.status == "timed-out"
-    assert process.killed is True
+    assert process.returncode in {-15, -9}
+    assert result.diagnostics["process_group_terminated"] is True
     assert any(call[:1] == ("rm",) for call in backend.cli_calls)
     assert result.diagnostics["cleanup"] == "removed"
 
-    backend._active["active"] = "khaos-active"
-    artifact = tmp_path / "artifact.log"
-    artifact.write_text("output", encoding="utf-8")
-    backend._artifacts.add(artifact)
+    backend._active["active"] = _ContainerLease("khaos-active", "owner")
     await backend.shutdown()
     assert any(call[-1:] == ("khaos-active",) for call in backend.cli_calls)
-    assert not artifact.exists()
 
 
-async def test_docker_backend_truncates_output_and_retains_artifact_until_shutdown(tmp_path):
+async def test_docker_backend_truncates_output_without_unbounded_artifact(tmp_path):
     backend = _InspectableDockerBackend()
     process = _FakeProcess(stdout=b"0123456789", stderr=b"abcdefghij")
     with patch("khaos.coding.execution.docker.asyncio.create_subprocess_exec", new=AsyncMock(return_value=process)):
         result = await backend.execute_resolved(
             _resolved(tmp_path, budget=ResourceBudget(output_bytes=8))
-        )
+    )
     assert len(result.stdout.encode()) + len(result.stderr.encode()) <= 8
     assert result.diagnostics["output_truncated"] is True
-    artifact = Path(result.diagnostics["output_artifact"])
-    assert artifact.exists()
+    assert result.diagnostics["stdout_bytes_dropped"] == 6
+    assert result.diagnostics["stderr_bytes_dropped"] == 6
+    assert "output_artifact" not in result.diagnostics
     await backend.shutdown()
-    assert not artifact.exists()
 
 
 async def test_execution_service_shutdown_closes_docker_backend(tmp_path):
@@ -389,7 +464,7 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
     manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
     service = ExecutionService(
         HostExecutionBackend(), manager,
-        DockerBackend(allowed_images={"python:3.13-slim"}),
+        DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE}),
     )
     script = (
         "import os,pathlib,socket;"
@@ -436,7 +511,7 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
         state=WorkspaceState.RUNNING,
     )
     manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
-    backend = DockerBackend(allowed_images={"python:3.13-slim"})
+    backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
     service = ExecutionService(HostExecutionBackend(), manager, backend)
     running = asyncio.create_task(sandbox_exec(
         'python -c "import time; time.sleep(30)"',
@@ -450,7 +525,7 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
             await asyncio.sleep(0.05)
         assert backend._active
         execution_id = next(iter(backend._active))
-        container_name = backend._active[execution_id]
+        container_name = backend._active[execution_id].name
         if action == "cancel":
             await service.terminate(execution_id)
         else:

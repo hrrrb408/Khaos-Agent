@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -97,6 +98,7 @@ class AgentLoop:
         workspace_manager=None,
         execution_service=None,
         approval_broker=None,
+        principal_id: str | None = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -132,11 +134,20 @@ class AgentLoop:
         self.workspace_manager = workspace_manager
         self.active_workspace = None
         self.execution_service = execution_service
-        self.approval_broker = approval_broker
-        if self.execution_service is None:
-            from khaos.coding.execution import ExecutionService, HostExecutionBackend
+        if approval_broker is None:
+            from khaos.agent.approval import ApprovalBroker
 
-            self.execution_service = ExecutionService(HostExecutionBackend())
+            approval_broker = ApprovalBroker()
+        self.approval_broker = approval_broker
+        self.principal_id = principal_id or f"local-uid:{os.getuid()}"
+        if self.execution_service is None:
+            from khaos.coding.execution import ExecutionService, UnsupportedBackend
+
+            # Agent construction must fail closed.  Office-only callers may
+            # still construct a loop without an execution service, but any
+            # accidental coding/tool execution is denied instead of escaping
+            # to an unrestricted host subprocess.
+            self.execution_service = ExecutionService(UnsupportedBackend())
 
     async def run(
         self,
@@ -303,6 +314,8 @@ class AgentLoop:
                         "coding_workspace_enforced": self.active_workspace is not None,
                         "approval_broker": self.approval_broker,
                         "requester": session_id,
+                        "principal_id": self.principal_id,
+                        "turn_id": f"{session_id}:{turn_count}",
                     },
                 }
                 if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:
@@ -319,6 +332,10 @@ class AgentLoop:
                                     "tool_call_id": request.tool_call_id,
                                     "tool_name": request.name,
                                     "target": request.target,
+                                    "binding_digest": request.binding_digest,
+                                    "expires_at": request.expires_at,
+                                    "principal_id": self.principal_id,
+                                    "session_id": session_id,
                                 },
                             )
                         yield Message(
@@ -332,6 +349,8 @@ class AgentLoop:
                                 "level": request.level,
                                 "target": request.target,
                                 "reason": request.reason,
+                                "binding_digest": request.binding_digest,
+                                "expires_at": request.expires_at,
                             },
                             created_at=time.time(),
                         )

@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import secrets
 import time
 from dataclasses import dataclass, field
 
@@ -17,6 +20,68 @@ PLAN_APPROVAL_NAMESPACE = "plan-execution"
 class ApprovalDecision:
     approved: bool
     remember: bool = False
+
+
+@dataclass(frozen=True)
+class ApprovalBinding:
+    """Immutable authority scope for one ordinary tool approval."""
+
+    principal_id: str
+    session_id: str
+    task_id: str
+    turn_id: str
+    tool_call_id: str
+    tool_name: str
+    arguments_digest: str
+    workspace_id: str
+    profile_digest: str
+    expires_at: float
+    nonce: str = field(default_factory=lambda: secrets.token_hex(32))
+
+    def __post_init__(self) -> None:
+        required = (
+            self.principal_id,
+            self.session_id,
+            self.task_id,
+            self.turn_id,
+            self.tool_call_id,
+            self.tool_name,
+            self.arguments_digest,
+            self.workspace_id,
+            self.profile_digest,
+            self.nonce,
+        )
+        if any(not value for value in required):
+            raise ValueError("approval binding fields must not be empty")
+        if self.expires_at <= 0:
+            raise ValueError("approval binding expiry must be positive")
+
+    def digest(self) -> str:
+        payload = {
+            "principal_id": self.principal_id,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "turn_id": self.turn_id,
+            "tool_call_id": self.tool_call_id,
+            "tool_name": self.tool_name,
+            "arguments_digest": self.arguments_digest,
+            "workspace_id": self.workspace_id,
+            "profile_digest": self.profile_digest,
+            "expires_at": self.expires_at,
+            "nonce": self.nonce,
+        }
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        return hashlib.sha256(canonical).hexdigest()
+
+
+@dataclass
+class _ToolApprovalRecord:
+    binding: ApprovalBinding
+    binding_digest: str
+    decision: ApprovalDecision | None = None
+    used: bool = False
 
 
 @dataclass
@@ -51,8 +116,7 @@ class ApprovalBroker:
 
     def __init__(self, authenticator=None) -> None:
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
-        self._decisions: dict[str, ApprovalDecision] = {}
-        self._bindings: dict[str, tuple[str, float | None]] = {}
+        self._tool_approvals: dict[str, _ToolApprovalRecord] = {}
         self._operation_approvals: dict[str, dict] = {}
         # Namespaced plan-execution approvals (disjoint key space).
         self._plan_approvals: dict[str, PlanApprovalRecord] = {}
@@ -112,49 +176,96 @@ class ApprovalBroker:
         """Test-only introspection: does a writer exist?"""
         return self.__runtime_receipt_writer is not None  # type: ignore[attr-defined]
 
-    async def bind(self, tool_call_id: str, approval_key: str, expiry: float | None = None) -> None:
-        """Bind a pending approval to an immutable ChangeSet operation."""
+    async def register_tool_approval(
+        self, binding: ApprovalBinding
+    ) -> str:
+        """Register one immutable, principal-bound tool challenge."""
+        digest = binding.digest()
         async with self._lock:
-            self._bindings[tool_call_id] = (approval_key, expiry)
+            existing = self._tool_approvals.get(binding.tool_call_id)
+            if existing is not None:
+                if existing.binding_digest != digest:
+                    raise PermissionError(
+                        "tool call id is already bound to another approval"
+                    )
+                return digest
+            self._tool_approvals[binding.tool_call_id] = _ToolApprovalRecord(
+                binding=binding, binding_digest=digest
+            )
+        return digest
 
-    async def wait(self, tool_call_id: str, timeout: float | None = None) -> dict:
+    async def wait(
+        self,
+        tool_call_id: str,
+        timeout: float | None = None,
+        *,
+        binding_digest: str,
+    ) -> dict:
         async with self._lock:
+            record = self._tool_approvals.get(tool_call_id)
+            if (
+                record is None
+                or record.used
+                or record.binding_digest != binding_digest
+                or time.time() >= record.binding.expires_at
+            ):
+                return {"approved": False, "remember": False}
             future = self._pending.get(tool_call_id)
+            if record.decision is not None:
+                record.used = True
+                return {
+                    "approved": record.decision.approved,
+                    "remember": record.decision.remember,
+                }
             if future is None:
-                decision = self._decisions.pop(tool_call_id, None)
-                if decision is not None:
-                    self._bindings.pop(tool_call_id, None)
-                    return {"approved": decision.approved, "remember": decision.remember}
                 future = asyncio.get_running_loop().create_future()
                 self._pending[tool_call_id] = future
         try:
             decision = await asyncio.wait_for(asyncio.shield(future), timeout) if timeout else await future
             return {"approved": decision.approved, "remember": decision.remember}
         except asyncio.TimeoutError:
+            async with self._lock:
+                record = self._tool_approvals.get(tool_call_id)
+                if record is not None:
+                    record.used = True
             return {"approved": False, "remember": False}
         finally:
             async with self._lock:
                 self._pending.pop(tool_call_id, None)
+                record = self._tool_approvals.get(tool_call_id)
+                if record is not None:
+                    record.used = True
 
     async def resolve(
         self,
         tool_call_id: str,
         approved: bool,
         remember: bool = False,
-        approval_key: str | None = None,
+        *,
+        principal_id: str,
+        session_id: str,
+        binding_digest: str,
     ) -> bool:
         async with self._lock:
-            binding = self._bindings.get(tool_call_id)
-            if binding is not None and (binding[0] != approval_key or binding[1] is not None and time.time() >= binding[1]):
+            record = self._tool_approvals.get(tool_call_id)
+            if (
+                record is None
+                or record.used
+                or record.decision is not None
+                or record.binding_digest != binding_digest
+                or record.binding.principal_id != principal_id
+                or record.binding.session_id != session_id
+                or time.time() >= record.binding.expires_at
+            ):
                 return False
+            decision = ApprovalDecision(approved, remember)
+            record.decision = decision
             future = self._pending.get(tool_call_id)
             if future is None:
-                self._decisions[tool_call_id] = ApprovalDecision(approved, remember)
                 return True
             if future.done():
                 return False
-            future.set_result(ApprovalDecision(approved, remember))
-            self._bindings.pop(tool_call_id, None)
+            future.set_result(decision)
             return True
 
     async def register_operation(

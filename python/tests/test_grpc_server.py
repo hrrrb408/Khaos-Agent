@@ -1,4 +1,7 @@
 import subprocess
+import os
+import uuid
+from pathlib import Path
 
 import pytest
 
@@ -45,7 +48,8 @@ async def test_agent_service_switch_and_confirm(tmp_path):
     confirmation = await service.confirm_permission(ConfirmRequest("s1", "call_1", True, False))
 
     assert mode == {"current_mode": "coding"}
-    assert confirmation == {"ok": True}
+    assert confirmation["ok"] is False
+    assert "principal/binding" in confirmation["error"]
     await db.close()
 
 
@@ -77,8 +81,8 @@ async def test_task_service_only_approves_or_rejects_blocked_tasks():
     await manager.update_status(task.id, "blocked")
     rejected = await service.reject(task.id)
     assert not not_blocked["ok"]
-    assert approved["ok"]
-    assert rejected["ok"]
+    assert not approved["ok"]
+    assert not rejected["ok"]
 
 
 async def test_agent_service_permission_waits_for_confirm(tmp_path):
@@ -103,7 +107,17 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
     assert first["event"] == "tool_call"
     assert second["event"] == "permission_request"
 
-    await service.confirm_permission(ConfirmRequest("s1", second["data"]["id"], True, False))
+    confirmation = await service.confirm_permission(
+        ConfirmRequest(
+            "s1",
+            second["data"]["id"],
+            True,
+            False,
+            principal_id=f"local-uid:{os.getuid()}",
+            binding_digest=second["data"]["binding_digest"],
+        )
+    )
+    assert confirmation == {"ok": True}
     events = [event async for event in stream]
 
     assert any(event["event"] == "tool_result" and event["data"]["success"] for event in events)
@@ -139,15 +153,16 @@ async def test_json_line_server_chat(tmp_path):
     (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
     import asyncio
 
+    socket_path = Path("/tmp") / f"khaos-test-{uuid.uuid4().hex}.sock"
     task = asyncio.create_task(
-        serve_json_lines("127.0.0.1", 0, str(tmp_path / "khaos.db"), project_root=tmp_path)
+        serve_json_lines(str(socket_path), str(tmp_path / "khaos.db"), project_root=tmp_path)
     )
     await asyncio.sleep(0.01)
     task.cancel()
     try:
         await task
     except PermissionError:
-        pytest.skip("sandbox does not allow binding TCP sockets")
+        pytest.skip("sandbox does not allow binding Unix sockets")
     except asyncio.CancelledError:
         pass
 

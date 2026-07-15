@@ -172,7 +172,7 @@ async def test_agent_loop_executes_real_read_file_tool(tmp_path):
     await db.close()
 
 
-async def test_agent_loop_terminal_read_only_auto_approved(tmp_path):
+async def test_agent_loop_terminal_read_only_without_workspace_fails_closed(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
     (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
@@ -195,8 +195,8 @@ async def test_agent_loop_terminal_read_only_auto_approved(tmp_path):
 
     assert "permission_request" not in [message.event for message in events]
     tool_result = next(message for message in events if message.event == "tool_result")
-    assert tool_result.metadata["success"] is True
-    assert tool_result.metadata["output"]["stdout"] == "hi\n"
+    assert tool_result.metadata["success"] is False
+    assert "no safe execution backend" in tool_result.metadata["error"]
     await db.close()
 
 

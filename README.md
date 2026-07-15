@@ -5,7 +5,7 @@
 ## 架构
 
 - **Python**：Agent 核心循环、工具系统、记忆/技能/审计、安全中间件
-- **Go**：API 网关（REST/SSE/WebSocket/Subagent API）
+- **Go**：API 网关（REST/SSE/Subagent API）
 - **Rust**：高性能 token 计数与并行执行（可选）
 
 ## 功能
@@ -16,7 +16,7 @@
 - 🤖 子代理编排：任务拆分、DAG 调度、并行执行
 - 🛠️ 40+ 工具：文件、终端、浏览器、搜索、笔记、剪贴板、Markdown
 - 📊 可观测性：审计日志、请求指标、权限管理
-- 🌐 API 网关：REST + SSE + WebSocket + 速率限制
+- 🌐 API 网关：REST + SSE + 统一认证和速率限制
 
 ## 快速开始
 

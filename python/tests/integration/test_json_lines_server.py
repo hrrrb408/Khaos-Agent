@@ -1,12 +1,13 @@
 """JSON-line RPC 服务器集成测试。
 
-启动一个真实的 asyncio TCP server（用随机端口），测试 Go 网关的调用路径。
+启动一个真实的 asyncio Unix socket server，测试控制面调用契约。
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -26,7 +27,7 @@ class MockAgentService:
         yield {"event": "done", "data": {"total_tokens": 2, "stop_reason": "end_turn"}}
 
 
-async def serve_test_json_lines(host: str, port: int, agent: MockAgentService):
+async def serve_test_json_lines(socket_path: Path, agent: MockAgentService):
     """Start a JSON-line server using the same method contract as serve_json_lines."""
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -46,25 +47,23 @@ async def serve_test_json_lines(host: str, port: int, agent: MockAgentService):
             writer.close()
             await writer.wait_closed()
 
-    return await asyncio.start_server(handle, host, port)
+    return await asyncio.start_unix_server(handle, path=str(socket_path))
 
 
 async def read_json_line(reader: asyncio.StreamReader) -> dict:
-    """Read one JSON line from a TCP stream."""
+    """Read one JSON line from a local stream."""
     return json.loads((await reader.readline()).decode("utf-8"))
 
 
 class TestJSONLinesChat:
     async def test_chat_streams_sse_style_events(self, tmp_path):
-        del tmp_path
+        socket_path = Path("/tmp") / f"khaos-json-{uuid.uuid4().hex}.sock"
         try:
-            server = await serve_test_json_lines("127.0.0.1", 0, MockAgentService())
+            server = await serve_test_json_lines(socket_path, MockAgentService())
         except PermissionError:
-            pytest.skip("sandbox does not allow binding TCP sockets")
-        sockets = server.sockets or []
-        host, port = sockets[0].getsockname()[:2]
+            pytest.skip("sandbox does not allow binding Unix sockets")
         async with server:
-            reader, writer = await asyncio.open_connection(host, port)
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
             writer.write(
                 json.dumps(
                     {
@@ -80,6 +79,7 @@ class TestJSONLinesChat:
             second = await read_json_line(reader)
             writer.close()
             await writer.wait_closed()
+        socket_path.unlink(missing_ok=True)
 
         assert first["event"] == "message"
         assert first["data"]["content"] == "mock reply: hello"
@@ -88,20 +88,19 @@ class TestJSONLinesChat:
 
 class TestJSONLinesHealth:
     async def test_unknown_method_returns_error(self, tmp_path):
-        del tmp_path
+        socket_path = Path("/tmp") / f"khaos-json-{uuid.uuid4().hex}.sock"
         try:
-            server = await serve_test_json_lines("127.0.0.1", 0, MockAgentService())
+            server = await serve_test_json_lines(socket_path, MockAgentService())
         except PermissionError:
-            pytest.skip("sandbox does not allow binding TCP sockets")
-        sockets = server.sockets or []
-        host, port = sockets[0].getsockname()[:2]
+            pytest.skip("sandbox does not allow binding Unix sockets")
         async with server:
-            reader, writer = await asyncio.open_connection(host, port)
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
             writer.write(json.dumps({"method": "NoSuch.Method", "payload": {}}).encode("utf-8") + b"\n")
             await writer.drain()
             response = await read_json_line(reader)
             writer.close()
             await writer.wait_closed()
+        socket_path.unlink(missing_ok=True)
 
         assert response == {"error": "unknown method"}
 

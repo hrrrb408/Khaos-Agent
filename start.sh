@@ -38,7 +38,7 @@ trap cleanup EXIT INT TERM
 set -m
 
 PYTHONPATH=python "$PYTHON_BIN" -m khaos.grpc_server \
-    --host 127.0.0.1 --port 50051 --db khaos.db --config config.yaml \
+    --socket "$ROOT/.cache/khaos-agent.sock" --db khaos.db --config config.yaml \
     > "$ROOT/.cache/python.log" 2>&1 &
 PY_PID=$!
 
@@ -47,7 +47,7 @@ sleep 1
 mkdir -p "$ROOT/.cache/go-build"
 cd "$ROOT/go"
 GOCACHE="$ROOT/.cache/go-build" "$GO_BIN" run ./cmd/gateway \
-    --addr 127.0.0.1:8080 --python-agent 127.0.0.1:50051 \
+    --addr 127.0.0.1:8080 --python-agent "$ROOT/.cache/khaos-agent.sock" \
     > "$ROOT/.cache/go.log" 2>&1 &
 GO_PID=$!
 

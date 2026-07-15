@@ -16,9 +16,12 @@ import (
 type mockAgent struct {
 	confirmed bool
 	mode      string
+	principal string
+	binding   string
 }
 
 func (m *mockAgent) Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
+	m.principal = req.PrincipalID
 	ch := make(chan ChatEvent, 2)
 	go func() {
 		defer close(ch)
@@ -28,8 +31,10 @@ func (m *mockAgent) Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent
 	return ch, nil
 }
 
-func (m *mockAgent) ConfirmPermission(ctx context.Context, sessionID string, toolCallID string, approved bool, remember bool) error {
+func (m *mockAgent) ConfirmPermission(ctx context.Context, principalID string, sessionID string, toolCallID string, bindingDigest string, approved bool, remember bool) error {
 	m.confirmed = approved
+	m.principal = principalID
+	m.binding = bindingDigest
 	return nil
 }
 
@@ -66,10 +71,10 @@ func (m *mockTaskClient) GetTask(_ context.Context, id string) (map[string]any, 
 func (m *mockTaskClient) CancelTask(_ context.Context, id string) (TransitionResult, error) {
 	return TransitionUpdated, nil
 }
-func (m *mockTaskClient) ApproveTask(_ context.Context, id string) (TransitionResult, error) {
+func (m *mockTaskClient) ApproveTask(_ context.Context, id string, principalID string, sessionID string, bindingDigest string) (TransitionResult, error) {
 	return TransitionUpdated, nil
 }
-func (m *mockTaskClient) RejectTask(_ context.Context, id string) (TransitionResult, error) {
+func (m *mockTaskClient) RejectTask(_ context.Context, id string, principalID string, sessionID string, bindingDigest string) (TransitionResult, error) {
 	return TransitionUpdated, nil
 }
 func (m *mockTaskClient) TaskEvents(_ context.Context, id string) (<-chan map[string]any, error) {
@@ -149,22 +154,36 @@ func TestAuthRequired(t *testing.T) {
 	if rec := serve(handler, http.MethodGet, "/api/health", "", "secret"); rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	if rec := serve(handler, http.MethodGet, "/api/health?key=secret", "", ""); rec.Code != http.StatusOK {
+	if rec := serve(handler, http.MethodGet, "/api/health?key=secret", "", ""); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("query key status = %d", rec.Code)
 	}
 }
 
 func TestConfirmAndMode(t *testing.T) {
-	handler, agent := newTestHandler("")
-	rec := serve(handler, http.MethodPost, "/api/chat/s1/confirm", `{"tool_call_id":"c1","approved":true}`, "")
+	handler, agent := newTestHandler("secret")
+	rec := serve(handler, http.MethodPost, "/api/chat/s1/confirm", `{"tool_call_id":"c1","binding_digest":"abc","approved":true}`, "secret")
 	if rec.Code != http.StatusOK || !agent.confirmed {
 		t.Fatalf("confirm status=%d confirmed=%v", rec.Code, agent.confirmed)
 	}
-	rec = serve(handler, http.MethodPost, "/api/mode", `{"session_id":"s1","target_mode":"coding"}`, "")
+	if !strings.HasPrefix(agent.principal, "api-key:") || agent.binding != "abc" {
+		t.Fatalf("unbound confirmation principal=%q binding=%q", agent.principal, agent.binding)
+	}
+	rec = serve(handler, http.MethodPost, "/api/mode", `{"session_id":"s1","target_mode":"coding"}`, "secret")
 	var payload map[string]string
 	_ = json.NewDecoder(rec.Body).Decode(&payload)
 	if payload["current_mode"] != "coding" || agent.mode != "coding" {
 		t.Fatalf("mode payload=%v agent=%s", payload, agent.mode)
+	}
+}
+
+func TestConfirmRequiresAuthenticatedPrincipalAndBinding(t *testing.T) {
+	handler, _ := newTestHandler("")
+	if rec := serve(handler, http.MethodPost, "/api/chat/s1/confirm", `{"tool_call_id":"c1","binding_digest":"abc","approved":true}`, ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated status=%d", rec.Code)
+	}
+	handler, _ = newTestHandler("secret")
+	if rec := serve(handler, http.MethodPost, "/api/chat/s1/confirm", `{"tool_call_id":"c1","approved":true}`, "secret"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("missing binding status=%d", rec.Code)
 	}
 }
 
@@ -201,6 +220,16 @@ func TestRateLimit(t *testing.T) {
 	}
 	if rec := serve(handler, http.MethodGet, "/api/health", "", ""); rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("second status=%d", rec.Code)
+	}
+}
+
+func TestAPIKeyIsHeaderOnly(t *testing.T) {
+	handler, _ := newTestHandler("gateway-key")
+	if rec := serve(handler, http.MethodGet, "/api/health?key=gateway-key", "", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("query credential status=%d", rec.Code)
+	}
+	if rec := serve(handler, http.MethodGet, "/api/health", "", "gateway-key"); rec.Code != http.StatusOK {
+		t.Fatalf("header credential status=%d", rec.Code)
 	}
 }
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +54,9 @@ class RuntimeConfig:
     workspace_manager: WorkspaceManager | None = None
     execution_service: ExecutionService | None = None
     approval_broker: Any = None
+    principal_id: str = field(
+        default_factory=lambda: f"local-uid:{os.getuid()}"
+    )
 
 
 @dataclass
@@ -122,7 +126,10 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         task_manager = TaskManager(db=cfg.db)
         await task_manager.load()
     workspace_manager = cfg.workspace_manager or WorkspaceManager()
-    execution_service = cfg.execution_service or ExecutionService(BackendSelector().select(writable=False), workspace_manager)
+    execution_service = cfg.execution_service or ExecutionService(
+        workspace_manager=workspace_manager,
+        backend_selector=BackendSelector(),
+    )
     policy = load_policy(root / "khaos_policy.yaml")
     sandbox = cfg.sandbox or Sandbox.from_policy_mode(policy.mode, root)
     network_guard = cfg.network_guard or NetworkGuard(
@@ -154,5 +161,6 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         workspace_manager=workspace_manager,
         execution_service=execution_service,
         approval_broker=cfg.approval_broker,
+        principal_id=cfg.principal_id,
     )
     return RuntimeResult(loop, mode_manager, task_manager, skill_generator, scheduler, memory_manager, skill_manager, verify_factory, execution_service)

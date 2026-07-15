@@ -1,5 +1,6 @@
 import asyncio
 
+from khaos.agent.approval import ApprovalBroker
 from khaos.db import Database
 from khaos.permissions import ApprovalMode, PermissionEngine
 from khaos.tools.registry import ToolDefinition, ToolRegistry
@@ -52,6 +53,16 @@ def _registry() -> ToolRegistry:
     return registry
 
 
+def _approval_context() -> dict:
+    return {
+        "approval_broker": ApprovalBroker(),
+        "principal_id": "test-principal",
+        "task_id": "test-task",
+        "workspace_id": "test-workspace",
+        "turn_id": "test-turn",
+    }
+
+
 async def test_scheduler_executes_parallel_and_serial(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
@@ -83,6 +94,7 @@ async def test_scheduler_emits_permission_request_and_denies_without_confirm(tmp
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
     scheduler = ToolScheduler(_registry(), PermissionEngine(db))
 
     events = [
@@ -90,6 +102,8 @@ async def test_scheduler_emits_permission_request_and_denies_without_confirm(tmp
         async for event in scheduler.stream_batch(
             [{"id": "1", "name": "write", "arguments": {"value": "b"}}],
             mode="coding",
+            session_id="test-session",
+            tool_context=_approval_context(),
         )
     ]
 
@@ -103,13 +117,16 @@ async def test_scheduler_confirm_with_remember_creates_rule(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
     engine = PermissionEngine(db)
     scheduler = ToolScheduler(_registry(), engine)
 
     results = await scheduler.execute_batch(
         [{"id": "1", "name": "write", "arguments": {"value": "b"}}],
         mode="coding",
+        session_id="test-session",
         confirm_callback=lambda request: {"approved": True, "remember": True},
+        tool_context=_approval_context(),
     )
     rules = await db.list_permission_rules()
 

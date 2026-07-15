@@ -39,6 +39,12 @@ def test_is_read_only_command():
     assert not is_read_only_command("touch x")
 
 
+def test_shell_capable_text_tools_are_never_classified_read_only():
+    assert not is_read_only_command("sed -i 's/a/b/' file")
+    assert not is_read_only_command("find . -exec sh -c 'touch pwned' ';'")
+    assert not is_read_only_command("awk 'BEGIN { system(\"touch pwned\") }'")
+
+
 async def test_terminal_foreground_success(tmp_path):
     result = await terminal(
         "echo hello", cwd=str(tmp_path), timeout=5, execution_service=_execution_service()

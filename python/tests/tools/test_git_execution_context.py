@@ -37,7 +37,15 @@ class _RecordingLocalRemoteBackend(HostExecutionBackend):
 
     async def execute(self, request):
         self.requests.append(request)
-        return await super().execute(replace(request, network_policy=NetworkPolicy.NONE))
+        # Explicitly replace the authoritative profile for this test-only
+        # local bare remote. Mutating the legacy network field alone must not
+        # downgrade an approved production request.
+        local_profile = replace(
+            request.permission_profile, network=NetworkPolicy.NONE
+        )
+        return await super().execute(
+            replace(request, permission_profile=local_profile)
+        )
 
 
 class _RecordingExecutionService:

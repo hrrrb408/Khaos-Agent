@@ -9,13 +9,14 @@ The test now injects a Fake Provider (``_FakeRouter``) that yields a
 single assistant message followed by an end-turn — no external network
 access, no API key required, fully deterministic.
 
-The server readiness is probed by actively connecting to the TCP port
+The server readiness is probed by actively connecting to the Unix socket
 before sending the request, and the test fails with the server task's
 stdout/stderr if the ready probe times out.
 """
 
 import asyncio
 import json
+import uuid
 from pathlib import Path
 
 import pytest
@@ -38,12 +39,12 @@ class _FakeRouter:
             yield item
 
 
-async def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
-    """Actively probe the TCP port until it accepts a connection."""
+async def _wait_for_socket(socket_path: Path, timeout: float = 5.0) -> bool:
+    """Actively probe the UDS until it accepts a connection."""
     deadline = asyncio.get_event_loop().time() + timeout
     while asyncio.get_event_loop().time() < deadline:
         try:
-            _, writer = await asyncio.open_connection(host, port)
+            _, writer = await asyncio.open_unix_connection(str(socket_path))
             writer.close()
             await writer.wait_closed()
             return True
@@ -53,28 +54,24 @@ async def _wait_for_port(host: str, port: int, timeout: float = 5.0) -> bool:
 
 
 async def _start_server(tmp_path: Path, config: Path, router):
-    """Start the JSON-line server on the first available port."""
-    for port in range(55100, 55120):
-        task = asyncio.create_task(
-            serve_json_lines(
-                "127.0.0.1",
-                port,
-                str(tmp_path / "khaos.db"),
-                project_root=tmp_path,
-                config_path=config,
-                router=router,
-            )
+    """Start the JSON-line server on a private Unix socket."""
+    socket_path = Path("/tmp") / f"khaos-triad-{uuid.uuid4().hex}.sock"
+    task = asyncio.create_task(
+        serve_json_lines(
+            str(socket_path),
+            str(tmp_path / "khaos.db"),
+            project_root=tmp_path,
+            config_path=config,
+            router=router,
         )
-        await asyncio.sleep(0.02)
-        if task.done():
-            try:
-                await task
-            except PermissionError:
-                return None
-            except OSError:
-                continue
-        return task, port
-    return None
+    )
+    await asyncio.sleep(0.02)
+    if task.done():
+        try:
+            await task
+        except PermissionError:
+            return None
+    return task, socket_path
 
 
 async def test_python_json_line_server_round_trip(tmp_path):
@@ -92,19 +89,19 @@ async def test_python_json_line_server_round_trip(tmp_path):
 
     server = await _start_server(tmp_path, config, fake_router)
     if server is None:
-        pytest.skip("sandbox does not allow binding TCP sockets")
-    task, port = server
+        pytest.skip("sandbox does not allow binding Unix sockets")
+    task, socket_path = server
     try:
         # Ready probe: actively wait for the port to accept connections.
-        ready = await _wait_for_port("127.0.0.1", port, timeout=5.0)
+        ready = await _wait_for_socket(socket_path, timeout=5.0)
         if not ready:
             # Surface the server task exception for diagnosis.
             if task.done():
                 exc = task.exception()
                 pytest.fail(f"server failed to start: {exc}")
-            pytest.fail(f"server did not become ready on port {port} within 5s")
+            pytest.fail(f"server did not become ready on {socket_path} within 5s")
 
-        reader, writer = await asyncio.open_connection("127.0.0.1", port)
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
         writer.write(
             (
                 json.dumps(
