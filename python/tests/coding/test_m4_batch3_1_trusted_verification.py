@@ -568,8 +568,17 @@ def test_real_docker_sandbox_python_network_secret_workspace_and_timeout(tmp_pat
         source, forbidden_roots=(source,),
         allowed_generated_output=("sandbox-output.txt",),
     )
+    # Use the immutable repository reference for real Docker execution.  A
+    # registry manifest digest is not itself a local config image ID and
+    # therefore must not be passed as a bare ``sha256:...`` image selector.
+    profile = replace(
+        _profile(),
+        requested_image_reference=f"python@{IMAGE}",
+        approved_repository_digest=IMAGE,
+        approved_platform="linux/amd64",
+    )
     backend = DockerVerificationSandboxBackend(
-        profile=_profile(), secret_values=(secret,), host_paths=(tmp_path,),
+        profile=profile, secret_values=(secret,), host_paths=(tmp_path,),
     )
 
     async def scenario():
