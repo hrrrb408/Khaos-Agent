@@ -2,11 +2,17 @@ package platform
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
 	"path/filepath"
+	"time"
 
 	"khaos/go/internal/api"
 )
@@ -80,7 +86,7 @@ func (c PythonClient) TaskEvents(ctx context.Context, id string) (<-chan map[str
 		return nil, err
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
-	if err := json.NewEncoder(conn).Encode(map[string]any{"method": "TaskService.Events", "payload": map[string]any{"task_id": id}}); err != nil {
+	if err := c.writeRequest(conn, "TaskService.Events", map[string]any{"task_id": id}); err != nil {
 		stopCancelWatch()
 		conn.Close()
 		return nil, err
@@ -107,7 +113,60 @@ func (c PythonClient) TaskEvents(ctx context.Context, id string) (<-chan map[str
 
 // PythonClient talks to the Python AgentService JSON-line endpoint.
 type PythonClient struct {
-	Address string
+	Address    string
+	Capability string
+}
+
+func (c PythonClient) writeRequest(conn net.Conn, method string, payload any) error {
+	if len(c.Capability) < 32 {
+		return fmt.Errorf("Python AgentService capability is missing or too short")
+	}
+	raw, err := canonicalJSON(payload)
+	if err != nil {
+		return err
+	}
+	var normalized any
+	if err := json.Unmarshal(raw, &normalized); err != nil {
+		return err
+	}
+	canonical, err := canonicalJSON(normalized)
+	if err != nil {
+		return err
+	}
+	digest := sha256.Sum256(canonical)
+	nonceBytes := make([]byte, 16)
+	if _, err := rand.Read(nonceBytes); err != nil {
+		return err
+	}
+	nonce := hex.EncodeToString(nonceBytes)
+	issuedAt := time.Now().Unix()
+	principalID := "gateway"
+	if value, ok := normalized.(map[string]any); ok {
+		if principal, ok := value["principal_id"].(string); ok && principal != "" {
+			principalID = principal
+		}
+	}
+	payloadDigest := hex.EncodeToString(digest[:])
+	signed := fmt.Sprintf("%s\n%s\n%d\n%s\n%s", method, nonce, issuedAt, principalID, payloadDigest)
+	mac := hmac.New(sha256.New, []byte(c.Capability))
+	_, _ = mac.Write([]byte(signed))
+	return json.NewEncoder(conn).Encode(map[string]any{
+		"method": method, "payload": normalized,
+		"auth": map[string]any{
+			"nonce": nonce, "issued_at": issuedAt, "principal_id": principalID,
+			"payload_digest": payloadDigest, "mac": hex.EncodeToString(mac.Sum(nil)),
+		},
+	})
+}
+
+func canonicalJSON(value any) ([]byte, error) {
+	var buffer bytes.Buffer
+	encoder := json.NewEncoder(&buffer)
+	encoder.SetEscapeHTML(false)
+	if err := encoder.Encode(value); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buffer.Bytes(), []byte("\n")), nil
 }
 
 // HandleWebhook forwards an inbound webhook to Python without interpreting it.
@@ -165,8 +224,7 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 		return nil, err
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
-	payload := map[string]any{"method": "AgentService.Chat", "payload": req}
-	if err := json.NewEncoder(conn).Encode(payload); err != nil {
+	if err := c.writeRequest(conn, "AgentService.Chat", req); err != nil {
 		stopCancelWatch()
 		conn.Close()
 		return nil, err
@@ -199,16 +257,13 @@ func (c PythonClient) ConfirmPermission(ctx context.Context, principalID string,
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	return json.NewEncoder(conn).Encode(map[string]any{
-		"method": "AgentService.ConfirmPermission",
-		"payload": map[string]any{
-			"session_id":     sessionID,
-			"principal_id":   principalID,
-			"tool_call_id":   toolCallID,
-			"binding_digest": bindingDigest,
-			"approved":       approved,
-			"remember":       remember,
-		},
+	return c.writeRequest(conn, "AgentService.ConfirmPermission", map[string]any{
+		"session_id":     sessionID,
+		"principal_id":   principalID,
+		"tool_call_id":   toolCallID,
+		"binding_digest": bindingDigest,
+		"approved":       approved,
+		"remember":       remember,
 	})
 }
 
@@ -220,9 +275,8 @@ func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMo
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	if err := json.NewEncoder(conn).Encode(map[string]any{
-		"method":  "AgentService.SwitchMode",
-		"payload": map[string]any{"session_id": sessionID, "target_mode": targetMode},
+	if err := c.writeRequest(conn, "AgentService.SwitchMode", map[string]any{
+		"session_id": sessionID, "target_mode": targetMode,
 	}); err != nil {
 		return "", err
 	}
@@ -256,10 +310,7 @@ func (c PythonClient) Query(ctx context.Context, action, result, since, until st
 	if until != "" {
 		payload["until"] = until
 	}
-	if err := json.NewEncoder(conn).Encode(map[string]any{
-		"method":  "AuditService.Query",
-		"payload": payload,
-	}); err != nil {
+	if err := c.writeRequest(conn, "AuditService.Query", payload); err != nil {
 		return nil, err
 	}
 	var entries []api.AuditEntry
@@ -296,10 +347,7 @@ func (c PythonClient) callMap(ctx context.Context, method string, payload map[st
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	if err := json.NewEncoder(conn).Encode(map[string]any{
-		"method":  method,
-		"payload": payload,
-	}); err != nil {
+	if err := c.writeRequest(conn, method, payload); err != nil {
 		return nil, err
 	}
 	var response map[string]any
@@ -316,7 +364,7 @@ func (c PythonClient) callList(ctx context.Context, method string, payload map[s
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	if err := json.NewEncoder(conn).Encode(map[string]any{"method": method, "payload": payload}); err != nil {
+	if err := c.writeRequest(conn, method, payload); err != nil {
 		return nil, err
 	}
 	var response []map[string]any

@@ -12,6 +12,7 @@ services:
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - KHAOS_MODE=office
+      - KHAOS_PYTHON_CAPABILITY=${KHAOS_PYTHON_CAPABILITY:?set a 32+ character boot capability}
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/khaos/agent.sock'); s.close()"]
@@ -32,6 +33,7 @@ services:
     environment:
       - KHAOS_PYTHON_AGENT=/run/khaos/agent.sock
       - KHAOS_API_KEY=${KHAOS_API_KEY:-}
+      - KHAOS_PYTHON_CAPABILITY=${KHAOS_PYTHON_CAPABILITY:?set a 32+ character boot capability}
     volumes:
       - khaos-runtime:/run/khaos
     restart: unless-stopped

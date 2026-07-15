@@ -48,8 +48,9 @@ func main() {
 	defaultAllowedHosts := os.Getenv("KHAOS_ALLOWED_HOSTS")
 	defaultPythonAgent := os.Getenv("KHAOS_PYTHON_AGENT")
 	if defaultPythonAgent == "" {
-		defaultPythonAgent = "/tmp/khaos-agent.sock"
+		defaultPythonAgent = fmt.Sprintf("/tmp/khaos-%d/agent.sock", os.Getuid())
 	}
+	pythonCapability := os.Getenv("KHAOS_PYTHON_CAPABILITY")
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	apiKey := flag.String("api-key", defaultAPIKey, "X-Khaos-Key value")
 	apiKeyFile := flag.String("api-key-file", defaultAPIKeyFile, "path to the mode-0600 local gateway token")
@@ -66,7 +67,12 @@ func main() {
 	if err := validateListenConfig(*addr, resolvedKey); err != nil {
 		log.Fatal(err)
 	}
-	var agent api.AgentClient = platform.PythonClient{Address: *pythonAddr}
+	if !*mockAgent && len(pythonCapability) < 32 {
+		log.Fatal("KHAOS_PYTHON_CAPABILITY must contain at least 32 characters")
+	}
+	var agent api.AgentClient = platform.PythonClient{
+		Address: *pythonAddr, Capability: pythonCapability,
+	}
 	if *mockAgent {
 		agent = mockAgentClient{}
 	}
@@ -83,7 +89,9 @@ func main() {
 	// When talking to a real Python agent, also forward audit queries. The mock
 	// agent path leaves audit unconfigured (GET /api/audit returns []).
 	if !*mockAgent {
-		client := platform.PythonClient{Address: *pythonAddr}
+		client := platform.PythonClient{
+			Address: *pythonAddr, Capability: pythonCapability,
+		}
 		handler = handler.WithAudit(client)
 		handler = handler.WithTasks(client)
 		if *enableSubagents {

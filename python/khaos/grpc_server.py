@@ -8,9 +8,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hashlib
+import hmac
 import json
 import os
+import socket
 import stat
+import struct
+import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -47,6 +52,87 @@ from khaos.tools import create_runtime_registry
 from khaos.tools.channel_tools import set_channel_registry
 from khaos.tools.cron_tools import set_cron_engine
 from khaos.tools.scheduler import ToolScheduler
+
+
+RPC_MAX_REQUEST_BYTES = 1024 * 1024
+RPC_AUTH_WINDOW_SECONDS = 30
+
+
+class GatewayRPCAuthenticator:
+    """Verify peer UID and one-shot, method-scoped Gateway capabilities."""
+
+    def __init__(self, capability: str, *, expected_uid: int | None = None) -> None:
+        if len(capability) < 32:
+            raise ValueError("Gateway RPC capability must contain at least 32 characters")
+        self._key = capability.encode("utf-8")
+        self._expected_uid = os.getuid() if expected_uid is None else expected_uid
+        self._used_nonces: dict[str, float] = {}
+
+    def verify_peer(self, writer: asyncio.StreamWriter) -> None:
+        peer = writer.get_extra_info("socket")
+        if peer is None:
+            raise PermissionError("RPC peer socket identity is unavailable")
+        peer = getattr(peer, "_sock", peer)
+        if hasattr(peer, "getpeereid"):
+            peer_uid, _peer_gid = peer.getpeereid()
+        elif hasattr(socket, "LOCAL_PEERCRED"):
+            credentials = peer.getsockopt(
+                getattr(socket, "SOL_LOCAL", 0), socket.LOCAL_PEERCRED, 128
+            )
+            if len(credentials) < 8:
+                raise PermissionError("RPC peer credentials are truncated")
+            _version, peer_uid = struct.unpack_from("=II", credentials)
+        elif hasattr(socket, "SO_PEERCRED"):
+            credentials = peer.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            _pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
+        else:
+            raise PermissionError("RPC peer credentials are unsupported")
+        if peer_uid != self._expected_uid:
+            raise PermissionError("RPC peer UID is not the configured Gateway UID")
+
+    def authenticate(self, request: dict) -> str:
+        method = str(request.get("method") or "")
+        payload = request.get("payload", {})
+        auth = request.get("auth")
+        if not isinstance(auth, dict) or not isinstance(payload, dict):
+            raise PermissionError("RPC authentication envelope is required")
+        nonce = str(auth.get("nonce") or "")
+        principal_id = str(auth.get("principal_id") or "")
+        payload_digest = str(auth.get("payload_digest") or "")
+        mac = str(auth.get("mac") or "")
+        try:
+            issued_at = int(auth.get("issued_at"))
+        except (TypeError, ValueError) as exc:
+            raise PermissionError("RPC issued_at is invalid") from exc
+        now = int(time.time())
+        if abs(now - issued_at) > RPC_AUTH_WINDOW_SECONDS:
+            raise PermissionError("RPC capability has expired")
+        if len(nonce) < 32 or nonce in self._used_nonces:
+            raise PermissionError("RPC nonce is invalid or replayed")
+        canonical_payload = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        expected_digest = hashlib.sha256(canonical_payload).hexdigest()
+        if not hmac.compare_digest(payload_digest, expected_digest):
+            raise PermissionError("RPC payload digest mismatch")
+        signed = (
+            f"{method}\n{nonce}\n{issued_at}\n{principal_id}\n{payload_digest}"
+        ).encode("utf-8")
+        expected_mac = hmac.new(self._key, signed, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(mac, expected_mac):
+            raise PermissionError("RPC method capability is invalid")
+        claimed_principal = str(payload.get("principal_id") or "")
+        if claimed_principal and claimed_principal != principal_id:
+            raise PermissionError("RPC payload principal is not transport-bound")
+        self._used_nonces[nonce] = float(issued_at)
+        cutoff = now - RPC_AUTH_WINDOW_SECONDS
+        self._used_nonces = {
+            key: value for key, value in self._used_nonces.items()
+            if value >= cutoff
+        }
+        return principal_id
 
 
 @dataclass
@@ -363,22 +449,29 @@ class TaskService:
                 "error": "approval principal/session/binding mismatch",
                 "task_id": task_id,
             }
-        result = await self.task_manager.transition(task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.RUNNING, pending_approval=None)
-        if result != TransitionResult.UPDATED:
-            return {"ok": False, "error": "task is no longer blocked", "task_id": task_id}
-        resolved = await self.approval_broker.resolve(
+        async def commit() -> bool:
+            result = await self.task_manager.transition(
+                task_id, expected={TaskStatus.BLOCKED},
+                target=TaskStatus.RUNNING, pending_approval=None,
+                approval_consumption={
+                    "tool_call_id": pending.get("tool_call_id", ""),
+                    "binding_digest": binding_digest,
+                    "principal_id": principal_id,
+                    "session_id": session_id,
+                    "decision": "approved",
+                    "consumed_at": time.time(),
+                },
+            )
+            return result == TransitionResult.UPDATED
+
+        resolved = await self.approval_broker.consume_task_decision_and_commit(
             pending.get("tool_call_id", ""),
             True,
             principal_id=principal_id,
             session_id=session_id,
             binding_digest=binding_digest,
+            commit=commit,
         )
-        if not resolved:
-            await self.task_manager.update_status(
-                task_id,
-                TaskStatus.FAILED,
-                error="approval capability was stale or already consumed",
-            )
         return {"ok": resolved, "task_id": task_id}
 
     async def reject(
@@ -407,15 +500,28 @@ class TaskService:
                 "error": "approval principal/session/binding mismatch",
                 "task_id": task_id,
             }
-        result = await self.task_manager.transition(task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.FAILED, error="rejected by user", pending_approval=None)
-        if result != TransitionResult.UPDATED:
-            return {"ok": False, "error": "task is no longer blocked", "task_id": task_id}
-        resolved = await self.approval_broker.resolve(
+        async def commit() -> bool:
+            result = await self.task_manager.transition(
+                task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.FAILED,
+                error="rejected by user", pending_approval=None,
+                approval_consumption={
+                    "tool_call_id": pending.get("tool_call_id", ""),
+                    "binding_digest": binding_digest,
+                    "principal_id": principal_id,
+                    "session_id": session_id,
+                    "decision": "rejected",
+                    "consumed_at": time.time(),
+                },
+            )
+            return result == TransitionResult.UPDATED
+
+        resolved = await self.approval_broker.consume_task_decision_and_commit(
             pending.get("tool_call_id", ""),
             False,
             principal_id=principal_id,
             session_id=session_id,
             binding_digest=binding_digest,
+            commit=commit,
         )
         return {"ok": resolved, "task_id": task_id}
 
@@ -433,10 +539,17 @@ async def serve_json_lines(
     config_path: Path | None = None,
     enable_subagents: bool = False,
     router=None,
+    gateway_capability: str | None = None,
+    gateway_uid: int | None = None,
 ) -> None:
     """Serve the privileged JSON-line control plane over a mode-0600 UDS."""
     uds_path = Path(socket_path).expanduser().resolve()
-    uds_path.parent.mkdir(parents=True, exist_ok=True)
+    capability = gateway_capability or os.environ.get("KHAOS_PYTHON_CAPABILITY", "")
+    authenticator = GatewayRPCAuthenticator(capability, expected_uid=gateway_uid)
+    uds_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_stat = uds_path.parent.stat()
+    if parent_stat.st_uid != os.getuid() or stat.S_IMODE(parent_stat.st_mode) != 0o700:
+        raise PermissionError("RPC socket parent must be owned by Runtime and mode 0700")
     if uds_path.exists() or uds_path.is_symlink():
         mode = uds_path.lstat().st_mode
         if not stat.S_ISSOCK(mode):
@@ -457,6 +570,10 @@ async def serve_json_lines(
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
+            try:
+                authenticator.verify_peer(writer)
+            except PermissionError:
+                return
             line = await reader.readline()
             if not line:
                 return
@@ -481,8 +598,18 @@ async def serve_json_lines(
                 )
                 await writer.drain()
                 return
+            try:
+                principal_id = authenticator.authenticate(request)
+            except PermissionError as exc:
+                writer.write((json.dumps({
+                    "error": "unauthenticated", "message": str(exc),
+                }) + "\n").encode("utf-8"))
+                await writer.drain()
+                return
             method = request.get("method")
             payload = request.get("payload", {})
+            if "principal_id" in payload:
+                payload["principal_id"] = principal_id
             if method == "AgentService.Chat":
                 try:
                     async for event in agent.chat(ChatRequest(**payload)):
@@ -565,8 +692,13 @@ async def serve_json_lines(
             await writer.wait_closed()
 
     try:
-        server = await asyncio.start_unix_server(handle, path=str(uds_path))
+        server = await asyncio.start_unix_server(
+            handle, path=str(uds_path), limit=RPC_MAX_REQUEST_BYTES,
+        )
         os.chmod(uds_path, 0o600)
+        socket_stat = uds_path.lstat()
+        if socket_stat.st_uid != os.getuid() or not stat.S_ISSOCK(socket_stat.st_mode):
+            raise PermissionError("RPC socket inode ownership/type validation failed")
         async with server:
             await server.serve_forever()
     finally:

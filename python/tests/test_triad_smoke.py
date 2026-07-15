@@ -15,6 +15,8 @@ stdout/stderr if the ready probe times out.
 """
 
 import asyncio
+import hashlib
+import hmac
 import json
 import uuid
 from pathlib import Path
@@ -55,7 +57,9 @@ async def _wait_for_socket(socket_path: Path, timeout: float = 5.0) -> bool:
 
 async def _start_server(tmp_path: Path, config: Path, router):
     """Start the JSON-line server on a private Unix socket."""
-    socket_path = Path("/tmp") / f"khaos-triad-{uuid.uuid4().hex}.sock"
+    socket_parent = Path("/tmp") / f"khaos-triad-{uuid.uuid4().hex}"
+    socket_parent.mkdir(mode=0o700)
+    socket_path = socket_parent / "agent.sock"
     task = asyncio.create_task(
         serve_json_lines(
             str(socket_path),
@@ -63,6 +67,7 @@ async def _start_server(tmp_path: Path, config: Path, router):
             project_root=tmp_path,
             config_path=config,
             router=router,
+            gateway_capability="c" * 48,
         )
     )
     await asyncio.sleep(0.02)
@@ -102,12 +107,29 @@ async def test_python_json_line_server_round_trip(tmp_path):
             pytest.fail(f"server did not become ready on {socket_path} within 5s")
 
         reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        payload = {"session_id": "s1", "message": "hello", "mode": "office"}
+        nonce = "n" * 32
+        issued_at = int(__import__("time").time())
+        canonical = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+        ).encode("utf-8")
+        digest = hashlib.sha256(canonical).hexdigest()
+        signed = (
+            f"AgentService.Chat\n{nonce}\n{issued_at}\ngateway\n{digest}"
+        ).encode()
         writer.write(
             (
                 json.dumps(
                     {
                         "method": "AgentService.Chat",
-                        "payload": {"session_id": "s1", "message": "hello", "mode": "office"},
+                        "payload": payload,
+                        "auth": {
+                            "nonce": nonce, "issued_at": issued_at,
+                            "principal_id": "gateway", "payload_digest": digest,
+                            "mac": hmac.new(
+                                ("c" * 48).encode(), signed, hashlib.sha256,
+                            ).hexdigest(),
+                        },
                     }
                 )
                 + "\n"

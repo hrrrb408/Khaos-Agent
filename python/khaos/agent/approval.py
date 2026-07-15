@@ -8,6 +8,7 @@ import json
 import secrets
 import time
 from dataclasses import dataclass, field
+from typing import Awaitable, Callable
 
 
 #: Namespace prefix reserved for plan-execution approval requests. This keeps
@@ -309,6 +310,47 @@ class ApprovalBroker:
                 "approved": record.decision.approved,
                 "remember": record.decision.remember,
             }
+
+    async def consume_task_decision_and_commit(
+        self,
+        tool_call_id: str,
+        approved: bool,
+        *,
+        principal_id: str,
+        session_id: str,
+        binding_digest: str,
+        commit: Callable[[], Awaitable[bool]],
+    ) -> bool:
+        """Consume a task approval before publishing its state transition.
+
+        Broker validation, one-shot consumption, task CAS/persistence and
+        waiter notification execute under one authority critical section.
+        A failed task CAS leaves the capability consumed and never exposes a
+        RUNNING task without a consumed approval.
+        """
+        async with self._lock:
+            record = self._tool_approvals.get(tool_call_id)
+            if (
+                record is None
+                or record.used
+                or record.dispatched
+                or record.decision is not None
+                or record.binding_digest != binding_digest
+                or record.binding.principal_id != principal_id
+                or record.binding.session_id != session_id
+                or time.time() >= record.binding.expires_at
+            ):
+                return False
+            decision = ApprovalDecision(approved, False)
+            record.decision = decision
+            record.used = True
+            record.dispatched = True
+            if not await commit():
+                return False
+            future = self._pending.get(tool_call_id)
+            if future is not None and not future.done():
+                future.set_result(decision)
+            return True
 
     async def register_operation(
         self, approval_id: str, binding: dict, expiry: float
