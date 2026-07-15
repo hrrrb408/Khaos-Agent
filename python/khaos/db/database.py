@@ -66,6 +66,7 @@ class Database:
         self.path = str(path)
         self._conn: aiosqlite.Connection | None = None
         self._operation_approval_lock = asyncio.Lock()
+        self._turn_event_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Open the SQLite connection if it is not already open."""
@@ -952,6 +953,138 @@ class Database:
             except Exception:
                 await conn.rollback()
                 raise
+
+    async def start_agent_turn(
+        self,
+        *,
+        turn_id: str,
+        attempt_id: str,
+        session_id: str,
+        task_id: str | None,
+        payload: dict[str, Any],
+        now: float,
+    ) -> None:
+        """Create one durable running turn and its first event atomically."""
+        conn = await self._require_conn()
+        async with self._turn_event_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                await conn.execute(
+                    "INSERT INTO agent_turns(turn_id,attempt_id,session_id,task_id,"
+                    "status,last_sequence,started_at) VALUES(?,?,?,?, 'running',1,?)",
+                    (turn_id, attempt_id, session_id, task_id, now),
+                )
+                await conn.execute(
+                    "INSERT INTO agent_turn_events VALUES(?,1,'turn.started',?,?)",
+                    (turn_id, json.dumps(payload, sort_keys=True), now),
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def append_agent_turn_event(
+        self,
+        *,
+        turn_id: str,
+        expected_sequence: int,
+        event_type: str,
+        payload: dict[str, Any],
+        now: float,
+        terminal_status: str | None = None,
+        error_code: str | None = None,
+    ) -> int:
+        """Append in sequence; terminal status and event commit together."""
+        conn = await self._require_conn()
+        async with self._turn_event_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "SELECT status,last_sequence FROM agent_turns WHERE turn_id=?",
+                    (turn_id,),
+                )
+                row = await cursor.fetchone()
+                if (
+                    row is None
+                    or row["status"] != "running"
+                    or int(row["last_sequence"]) != expected_sequence
+                ):
+                    raise PermissionError(
+                        "turn event is late, replayed, or out of sequence"
+                    )
+                sequence = expected_sequence + 1
+                await conn.execute(
+                    "INSERT INTO agent_turn_events VALUES(?,?,?,?,?)",
+                    (
+                        turn_id, sequence, event_type,
+                        json.dumps(payload, sort_keys=True), now,
+                    ),
+                )
+                if terminal_status is None:
+                    await conn.execute(
+                        "UPDATE agent_turns SET last_sequence=? WHERE turn_id=? "
+                        "AND status='running' AND last_sequence=?",
+                        (sequence, turn_id, expected_sequence),
+                    )
+                else:
+                    if terminal_status not in {"completed", "interrupted", "failed"}:
+                        raise ValueError("invalid terminal turn status")
+                    await conn.execute(
+                        "UPDATE agent_turns SET status=?,last_sequence=?,error_code=?,"
+                        "finished_at=? WHERE turn_id=? AND status='running' "
+                        "AND last_sequence=?",
+                        (
+                            terminal_status, sequence, error_code, now,
+                            turn_id, expected_sequence,
+                        ),
+                    )
+                await conn.commit()
+                return sequence
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def recover_inflight_agent_turns(self, *, now: float) -> int:
+        """Mark crash-left running turns interrupted without inventing success."""
+        conn = await self._require_conn()
+        async with self._turn_event_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "SELECT turn_id,last_sequence FROM agent_turns "
+                    "WHERE status='running' ORDER BY started_at"
+                )
+                rows = await cursor.fetchall()
+                for row in rows:
+                    sequence = int(row["last_sequence"]) + 1
+                    await conn.execute(
+                        "INSERT INTO agent_turn_events VALUES(?,?,?,?,?)",
+                        (
+                            row["turn_id"], sequence, "turn.interrupted",
+                            json.dumps({"reason": "process-restart"}), now,
+                        ),
+                    )
+                    await conn.execute(
+                        "UPDATE agent_turns SET status='interrupted',last_sequence=?,"
+                        "error_code='PROCESS_RESTART',finished_at=? WHERE turn_id=? "
+                        "AND status='running'",
+                        (sequence, now, row["turn_id"]),
+                    )
+                await conn.commit()
+                return len(rows)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def list_agent_turn_events(
+        self, turn_id: str
+    ) -> list[dict[str, Any]]:
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT * FROM agent_turn_events WHERE turn_id=? ORDER BY sequence",
+            (turn_id,),
+        )
+        return [dict(row) for row in await cursor.fetchall()]
 
     async def approve_operation_approval(
         self,

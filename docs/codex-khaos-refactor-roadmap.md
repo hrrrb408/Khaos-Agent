@@ -19,6 +19,12 @@
 
 ## 2. Batch A：Agent Loop 与事件模型
 
+实施进度（2026-07-15）：A1-A5 已完成兼容式切换。每个 turn 获得 server-issued
+TurnId/AttemptId 和 SQLite 单调 sequence；tool call/result 与 approval wait 由
+`TurnCoordinator` 校验，terminal event 与 turn status 同事务提交。重复/迟到/乱序事件
+拒绝，进程重启把遗留 running turn 写为 interrupted，不伪造 completed。旧 `Message`
+stream 作为 adapter 保留，done/error metadata 携带 turn/attempt/sequence。
+
 | 项 | 内容 |
 | --- | --- |
 | 范围 | `agent/core.py`、model streaming、ToolScheduler、TaskManager 状态投影、Gateway/TUI event adapter |

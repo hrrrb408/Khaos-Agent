@@ -192,6 +192,14 @@ class AgentLoop:
                 task = await self.task_manager.get(active_task_id)
                 if task is not None and task.status.value == "blocked":
                     await self.task_manager.update_status(active_task_id, "running")
+        from khaos.agent.events import TurnCoordinator
+
+        turn = await TurnCoordinator.start(
+            self.db,
+            session_id=session_id,
+            task_id=active_task_id,
+            principal_id=self.principal_id,
+        )
         total_tokens = 0
         try:
             messages = await self._build_context(session_id, user_input)
@@ -237,6 +245,10 @@ class AgentLoop:
                         **call_kwargs,
                     ):
                         if chunk.content:
+                            chunk.metadata.update({
+                                "turn_id": turn.turn_id,
+                                "attempt_id": turn.attempt_id,
+                            })
                             chunk.token_count = self.token_engine.count_tokens(chunk.content)
                             chunk.created_at = time.time()
                             assistant_content += chunk.content
@@ -247,12 +259,24 @@ class AgentLoop:
                         if chunk.tool_calls:
                             tool_calls.extend(chunk.tool_calls)
                             for tool_call in chunk.tool_calls:
+                                turn_event = await turn.emit(
+                                    "tool.call",
+                                    {
+                                        "tool_call_id": str(tool_call.get("id") or ""),
+                                        "name": str(tool_call.get("name") or ""),
+                                    },
+                                )
                                 yield Message(
                                     role="assistant",
                                     content="",
                                     tool_calls=[tool_call],
                                     event="tool_call",
-                                    metadata=tool_call,
+                                    metadata={
+                                        **tool_call,
+                                        "turn_id": turn.turn_id,
+                                        "attempt_id": turn.attempt_id,
+                                        "event_sequence": turn_event.sequence,
+                                    },
                                     created_at=time.time(),
                                 )
                         if chunk.stop_reason:
@@ -261,6 +285,11 @@ class AgentLoop:
                     if assistant_content.strip() or tool_calls or stop_reason == StopReason.TOOL_USE.value:
                         break
                     if empty_response_retries >= 1:
+                        terminal = await turn.terminal(
+                            "failed",
+                            reason="empty-model-response",
+                            error_code="EMPTY_MODEL_RESPONSE",
+                        )
                         yield Message(
                             role="system",
                             content="model returned an empty response",
@@ -269,6 +298,9 @@ class AgentLoop:
                             metadata={
                                 "code": "EMPTY_MODEL_RESPONSE",
                                 "message": "Model returned no text or tool calls.",
+                                "turn_id": turn.turn_id,
+                                "attempt_id": turn.attempt_id,
+                                "event_sequence": terminal.sequence,
                             },
                             created_at=time.time(),
                         )
@@ -295,11 +327,21 @@ class AgentLoop:
                     break
 
                 if self.tool_scheduler is None:
+                    terminal = await turn.terminal(
+                        "failed",
+                        reason="tool-scheduler-unavailable",
+                        error_code="TOOL_SCHEDULER_UNAVAILABLE",
+                    )
                     yield Message(
                         role="system",
                         content="error: tool scheduler is not configured",
                         stop_reason="error",
                         event="error",
+                        metadata={
+                            "turn_id": turn.turn_id,
+                            "attempt_id": turn.attempt_id,
+                            "event_sequence": terminal.sequence,
+                        },
                     )
                     return
 
@@ -324,6 +366,14 @@ class AgentLoop:
                 async for event in event_stream:
                     if event.permission_request is not None:
                         request = event.permission_request
+                        turn_event = await turn.emit(
+                            "approval.wait",
+                            {
+                                "tool_call_id": request.tool_call_id,
+                                "binding_digest": request.binding_digest,
+                                "expires_at": request.expires_at,
+                            },
+                        )
                         if self.task_manager is not None and active_task_id:
                             await self.task_manager.update_status(
                                 active_task_id,
@@ -351,6 +401,9 @@ class AgentLoop:
                                 "reason": request.reason,
                                 "binding_digest": request.binding_digest,
                                 "expires_at": request.expires_at,
+                                "turn_id": turn.turn_id,
+                                "attempt_id": turn.attempt_id,
+                                "event_sequence": turn_event.sequence,
                             },
                             created_at=time.time(),
                         )
@@ -383,6 +436,19 @@ class AgentLoop:
                         )
                         messages.append(tool_msg)
                         await self._persist_message(session_id, tool_msg)
+                        turn_event = await turn.emit(
+                            "tool.result",
+                            {
+                                "tool_call_id": result.tool_call_id,
+                                "name": result.name,
+                                "success": result.success,
+                            },
+                        )
+                        tool_msg.metadata.update({
+                            "turn_id": turn.turn_id,
+                            "attempt_id": turn.attempt_id,
+                            "event_sequence": turn_event.sequence,
+                        })
                         if self.cost_tracker is not None:
                             self.cost_tracker.add_tool_tokens(tool_msg.token_count)
                         # Long-task observability: record what this turn touched.
@@ -445,14 +511,7 @@ class AgentLoop:
             if self.task_manager is not None and active_task_id:
                 await self._finalize_task(active_task_id, stop_reason)
 
-            yield Message(
-                role="system",
-                content="done",
-                token_count=total_tokens,
-                stop_reason=stop_reason,
-                created_at=time.time(),
-            )
-            # Phase 6.3: 在结束前 yield 费用摘要（若有 tracker 且有消耗）。
+            # Non-terminal accounting events must precede the durable terminal.
             if self.cost_tracker is not None:
                 summary = self.cost_tracker.format_summary()
                 if summary:
@@ -460,28 +519,85 @@ class AgentLoop:
                         role="system",
                         content=summary,
                         event="cost_summary",
-                        metadata={"cost_report": self.cost_tracker.get_report().__dict__},
+                        metadata={
+                            "cost_report": self.cost_tracker.get_report().__dict__,
+                            "turn_id": turn.turn_id,
+                            "attempt_id": turn.attempt_id,
+                        },
                         created_at=time.time(),
                     )
+            terminal = await turn.terminal(
+                "completed", reason=stop_reason or StopReason.END_TURN.value
+            )
+            yield Message(
+                role="system",
+                content="done",
+                token_count=total_tokens,
+                stop_reason=stop_reason,
+                event="done",
+                metadata={
+                    "turn_id": turn.turn_id,
+                    "attempt_id": turn.attempt_id,
+                    "event_sequence": terminal.sequence,
+                },
+                created_at=time.time(),
+            )
         except asyncio.CancelledError:
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "cancelled", error="task cancelled")
+            if not turn.is_terminal:
+                await turn.terminal(
+                    "interrupted", reason="user-cancelled", error_code="USER_ABORT"
+                )
             raise
         except Exception as exc:
             logger.error("Agent loop error: %s", exc, exc_info=True)
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "failed", error=str(exc))
+            terminal = None
+            if not turn.is_terminal:
+                terminal = await turn.terminal(
+                    "failed", reason=type(exc).__name__, error_code="INTERNAL_ERROR"
+                )
             if self.error_handler is not None:
                 error_event = await self.error_handler.handle(exc, session_id)
-                yield error_event.to_message()
+                message = error_event.to_message()
+                if terminal is not None:
+                    message.metadata.update({
+                        "turn_id": turn.turn_id,
+                        "attempt_id": turn.attempt_id,
+                        "event_sequence": terminal.sequence,
+                    })
+                yield message
             else:
                 yield Message(
                     role="system",
                     content=f"error: {exc}",
                     stop_reason="error",
                     event="error",
-                    metadata={"code": "INTERNAL_ERROR", "message": str(exc)},
+                    metadata={
+                        "code": "INTERNAL_ERROR",
+                        "message": str(exc),
+                        "turn_id": turn.turn_id,
+                        "attempt_id": turn.attempt_id,
+                        "event_sequence": (
+                            terminal.sequence if terminal is not None else turn.sequence
+                        ),
+                    },
                 )
+        finally:
+            if not turn.is_terminal:
+                try:
+                    await turn.terminal(
+                        "interrupted",
+                        reason="consumer-disconnected",
+                        error_code="STREAM_CLOSED",
+                    )
+                except Exception:
+                    logger.error(
+                        "failed to persist interrupted turn: %s", turn.turn_id,
+                        exc_info=True,
+                    )
 
     async def _persist_message(self, session_id: str, message: Message) -> None:
         """Persist and index a message as one logical core-loop operation."""

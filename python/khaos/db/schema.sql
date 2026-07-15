@@ -23,6 +23,30 @@ CREATE TABLE IF NOT EXISTS messages (
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 
+CREATE TABLE IF NOT EXISTS agent_turns (
+    turn_id       TEXT PRIMARY KEY,
+    attempt_id    TEXT NOT NULL,
+    session_id    TEXT NOT NULL REFERENCES sessions(id),
+    task_id       TEXT,
+    status        TEXT NOT NULL CHECK(status IN ('running','completed','interrupted','failed')),
+    last_sequence INTEGER NOT NULL DEFAULT 0,
+    error_code    TEXT,
+    started_at    REAL NOT NULL,
+    finished_at   REAL
+);
+
+CREATE TABLE IF NOT EXISTS agent_turn_events (
+    turn_id      TEXT NOT NULL REFERENCES agent_turns(turn_id),
+    sequence     INTEGER NOT NULL,
+    event_type   TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    created_at   REAL NOT NULL,
+    PRIMARY KEY(turn_id, sequence)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_turns_session
+ON agent_turns(session_id, started_at);
+
 CREATE TABLE IF NOT EXISTS memories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     scope       TEXT NOT NULL,
