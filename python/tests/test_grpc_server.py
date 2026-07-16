@@ -24,6 +24,7 @@ from khaos.grpc_server import (
     TaskService,
 )
 from khaos.memory import MemoryStore
+from khaos.channels import ChannelType, PlatformMessage, Sender
 
 
 async def test_agent_service_chat_streams_events(tmp_path):
@@ -73,6 +74,41 @@ async def test_agent_service_starts_and_stops_cron_engine(tmp_path):
     assert service.cron_engine._running is True
     await service.shutdown()
     assert service.cron_engine._running is False
+    await db.close()
+
+
+async def test_webhook_session_and_principal_are_channel_bound(tmp_path, monkeypatch):
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    requests = []
+
+    async def fake_chat(request):
+        requests.append(request)
+        if False:
+            yield {}
+
+    monkeypatch.setattr(service, "chat", fake_chat)
+    message = PlatformMessage(
+        id="event-1",
+        channel=ChannelType.TELEGRAM,
+        text="hello",
+        sender=Sender(id="sender", platform_id="platform-sender"),
+        target="target",
+    )
+
+    await service._on_webhook_message("channel-a", message)
+    await service._on_webhook_message("channel-b", message)
+
+    assert requests[0].session_id != requests[1].session_id
+    assert requests[0].session_id.startswith("webhook:channel-a:telegram:")
+    assert requests[0].principal_id == (
+        "webhook:channel-a:telegram:platform-sender"
+    )
+    assert requests[1].principal_id == (
+        "webhook:channel-b:telegram:platform-sender"
+    )
     await db.close()
 
 

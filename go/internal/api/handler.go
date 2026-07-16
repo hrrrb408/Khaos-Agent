@@ -434,7 +434,13 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			headers[strings.ToLower(key)] = values[0]
 		}
 	}
-	response, err := client.HandleWebhook(r.Context(), WebhookRequest{Platform: r.PathValue("platform"), ChannelID: r.URL.Query().Get("channel_id"), Headers: headers, Body: json.RawMessage(body)})
+	query := make(map[string]string, len(r.URL.Query()))
+	for key, values := range r.URL.Query() {
+		if len(values) > 0 {
+			query[strings.ToLower(key)] = values[0]
+		}
+	}
+	response, err := client.HandleWebhook(r.Context(), WebhookRequest{Platform: r.PathValue("platform"), ChannelID: r.URL.Query().Get("channel_id"), Headers: headers, Query: query, Body: json.RawMessage(body)})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return

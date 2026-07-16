@@ -252,7 +252,9 @@ class AgentService:
         self.cron_engine = CronEngine(db=db, executor=self._execute_scheduled_prompt)
         set_cron_engine(self.cron_engine)
         self.channel_registry = ChannelRegistry()
-        self._webhook_replay_guard = WebhookReplayGuard()
+        self._webhook_replay_guard = WebhookReplayGuard(
+            consumer=self.db.consume_webhook_event
+        )
         set_channel_registry(self.channel_registry)
         # Security policy loaded once (not per chat call) and cached; rebuild
         # the middleware stack from it for every runtime.
@@ -318,6 +320,7 @@ class AgentService:
         channel_id: str,
         headers: dict[str, str],
         body: str,
+        query: dict[str, str] | None = None,
     ) -> dict[str, str]:
         """Validate and process one inbound platform webhook."""
         channel = self.channel_registry.get(channel_id)
@@ -333,13 +336,33 @@ class AgentService:
             channel_type,
             secret=channel.config.secret,
             on_message=lambda message: self._on_webhook_message(channel_id, message),
+            channel_id=channel_id,
             replay_guard=self._webhook_replay_guard,
         )
-        return await handler.handle(headers, body.encode("utf-8"))
+        return await handler.handle(headers, body.encode("utf-8"), query)
 
     async def _on_webhook_message(self, channel_id: str, message: PlatformMessage) -> None:
-        session_id = f"{message.channel.value}:{message.target or message.sender.id}"
-        async for _event in self.chat(ChatRequest(session_id, message.to_agent_input())):
+        identity = {
+            "channel_id": channel_id,
+            "platform": message.channel.value,
+            "sender": message.sender.platform_id or message.sender.id,
+            "target": message.target,
+        }
+        identity_digest = hashlib.sha256(
+            json.dumps(
+                identity, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            ).encode("utf-8")
+        ).hexdigest()[:24]
+        session_id = f"webhook:{channel_id}:{message.channel.value}:{identity_digest}"
+        principal_id = (
+            f"webhook:{channel_id}:{message.channel.value}:"
+            f"{identity['sender'] or 'unknown'}"
+        )
+        async for _event in self.chat(ChatRequest(
+            session_id,
+            message.to_agent_input(),
+            principal_id=principal_id,
+        )):
             pass
         self.channel_registry.record_success(channel_id, received=True)
 

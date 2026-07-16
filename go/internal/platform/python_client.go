@@ -175,7 +175,8 @@ func canonicalJSON(value any) ([]byte, error) {
 func (c PythonClient) HandleWebhook(ctx context.Context, request api.WebhookRequest) (api.WebhookResponse, error) {
 	response, err := c.callMap(ctx, "AgentService.HandleWebhook", map[string]any{
 		"platform": request.Platform, "channel_id": request.ChannelID,
-		"headers": request.Headers, "body": string(request.Body),
+		"headers": request.Headers, "query": request.Query,
+		"body": string(request.Body),
 	})
 	if err != nil {
 		return api.WebhookResponse{}, err

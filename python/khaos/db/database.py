@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import asyncio
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,10 @@ class _AsyncCursor:
     @property
     def lastrowid(self) -> int | None:
         return self._cursor.lastrowid
+
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
 
     async def fetchall(self) -> list[sqlite3.Row]:
         return self._cursor.fetchall()
@@ -67,6 +72,7 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
         self._operation_approval_lock = asyncio.Lock()
         self._turn_event_lock = asyncio.Lock()
+        self._webhook_replay_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Open the SQLite connection if it is not already open."""
@@ -104,6 +110,36 @@ class Database:
             (session_id, mode),
         )
         await conn.commit()
+
+    async def consume_webhook_event(
+        self,
+        channel_id: str,
+        platform: str,
+        event_id: str,
+        issued_at: float,
+        expires_at: float | None,
+    ) -> bool:
+        """Atomically persist one authenticated webhook event exactly once."""
+        if not channel_id or not platform or not event_id:
+            return False
+        conn = await self._require_conn()
+        async with self._webhook_replay_lock:
+            now = time.time()
+            await conn.execute(
+                "DELETE FROM webhook_replay_events "
+                "WHERE expires_at IS NOT NULL AND expires_at < ?",
+                (now,),
+            )
+            cursor = await conn.execute(
+                """
+                INSERT OR IGNORE INTO webhook_replay_events (
+                    channel_id, platform, event_id, issued_at, expires_at, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (channel_id, platform, event_id, issued_at, expires_at, now),
+            )
+            await conn.commit()
+            return cursor.rowcount == 1
 
     async def insert_message(self, session_id: str, message: Message) -> int:
         """Persist a chat message and return its row id."""

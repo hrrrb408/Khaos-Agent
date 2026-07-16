@@ -67,8 +67,14 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
     assert ("--ro-bind", "/", "/") not in tuple(
         argv[index:index + 3] for index in range(len(argv) - 2)
     )
-    size_index = argv.index("--size")
-    assert int(argv[size_index + 1]) == ResourceBudget().tmpfs_bytes
+    assert argv.count("--size") == 2
+    assert argv.count(str(ResourceBudget().tmpfs_bytes)) == 2
+    assert ("--tmpfs", "/home/khaos") in tuple(
+        argv[index:index + 2] for index in range(len(argv) - 1)
+    )
+    assert ("--bind", str((tmp_path / ".khaos-home").resolve()), "/home/khaos") not in tuple(
+        argv[index:index + 3] for index in range(len(argv) - 2)
+    )
     assert "--clearenv" in argv
 
 
@@ -259,6 +265,43 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
 
 
 @pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux bubblewrap evidence")
+async def test_real_bwrap_home_capacity_and_inode_budget(tmp_path: Path):
+    _require_or_skip("bwrap")
+    backend = LinuxBubblewrapBackend()
+    availability = backend.probe_capability()
+    if not (availability.available and availability.network_enforced):
+        if os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") == "1":
+            pytest.fail(availability.reason)
+        pytest.skip(availability.reason)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    command = (
+        "from pathlib import Path; import time; "
+        "home=Path.home(); "
+        "[(home / f'entry-{i}').write_bytes(b'x' * 4096) for i in range(20)]; "
+        "time.sleep(30)"
+    )
+
+    result = await backend.execute(ExecutionRequest(
+        (sys.executable, "-c", command),
+        workspace,
+        permission_profile=PermissionProfile(
+            filesystem=FileSystemAccess.WORKSPACE_WRITE,
+            resources=ResourceBudget(
+                timeout_seconds=10,
+                tmpfs_bytes=1024 * 1024,
+                filesystem_entries=10,
+            ),
+        ).bind_workspace(workspace),
+    ))
+
+    assert result.status == "resource-exhausted", result.diagnostics
+    assert result.diagnostics["resource_violation"]["kind"] == "filesystem-entries"
+
+
+@pytest.mark.asyncio
 async def test_backend_selector_returns_unsupported_when_bwrap_probe_fails(monkeypatch):
     """Req 9: no security capability → infrastructure-unsupported, not host fallback."""
     from khaos.coding.execution.platform import BackendAvailability
@@ -394,3 +437,48 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
     assert result.status == "passed", result.stderr
     assert (workspace / "inside.txt").read_text(encoding="utf-8") == "ok"
     assert not outside.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec evidence")
+async def test_real_macos_synthetic_home_capacity_is_enforced(tmp_path: Path):
+    _require_or_skip("sandbox-exec")
+    backend = MacOSSandboxBackend()
+    availability = backend.probe_capability()
+    if (
+        not availability.available
+        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+    ):
+        pytest.skip(availability.reason)
+    assert availability.available, availability.reason
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    command = (
+        "from pathlib import Path; import time; "
+        "home=Path.home(); "
+        "[(home / f'payload-{i}').write_bytes(b'x' * 4096) for i in range(4)]; "
+        "time.sleep(30)"
+    )
+    result = await backend.execute(ExecutionRequest(
+        (sys.executable, "-c", command),
+        workspace,
+        permission_profile=PermissionProfile(
+            filesystem=FileSystemAccess.WORKSPACE_WRITE,
+            resources=ResourceBudget(
+                timeout_seconds=10,
+                tmpfs_bytes=10_000,
+                file_bytes=8192,
+            ),
+        ).bind_workspace(workspace),
+    ))
+    if (
+        result.status != "resource-exhausted"
+        and "Operation not permitted" in result.stderr
+        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+    ):
+        pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
+    assert result.status == "resource-exhausted", result.diagnostics
+    assert result.diagnostics["resource_violation"] == {
+        "kind": "tmpfs", "observed": 16_384, "limit": 10_000,
+    }

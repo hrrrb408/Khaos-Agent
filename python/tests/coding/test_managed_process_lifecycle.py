@@ -131,3 +131,42 @@ async def test_managed_process_enforces_aggregate_pid_watchdog(monkeypatch):
         "kind": "pids", "observed": 3, "limit": 2,
     }
     assert supervisor.active_execution_ids == ()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX-only")
+async def test_managed_process_enforces_whole_home_capacity(tmp_path):
+    temporary_home = tmp_path / "managed-home"
+    temporary_home.mkdir()
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "from pathlib import Path; import sys,time; "
+        "root=Path(sys.argv[1]); "
+        "[(root / f'payload-{i}').write_bytes(b'x' * 4096) for i in range(4)]; "
+        "time.sleep(30)",
+        str(temporary_home),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    watchdog = await supervisor.register_process(
+        "managed-home-budget",
+        process,
+        budget=ResourceBudget(tmpfs_bytes=10_000, file_bytes=8192),
+        tmp_root=temporary_home,
+    )
+    handle = ManagedProcessHandle(
+        "managed-home-budget",
+        process,
+        supervisor=supervisor,
+        resource_watchdog=watchdog,
+    )
+
+    await asyncio.wait_for(handle.wait(), timeout=5)
+
+    assert handle.resource_violation == {
+        "kind": "tmpfs", "observed": 16_384, "limit": 10_000,
+    }

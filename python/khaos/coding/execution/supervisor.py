@@ -45,6 +45,7 @@ class ProcessSupervisor:
         env: dict[str, str] | None = None,
         enforce_resource_limits: bool = True,
         tmp_root: Path | None = None,
+        sandbox_storage_paths: tuple[str, ...] = (),
     ) -> ExecutionResult:
         """Run one foreground process with bounded, fairly split output."""
         execution_id = request.correlation_id
@@ -65,11 +66,14 @@ class ProcessSupervisor:
         )
         active = _ActiveProcess(process)
         await self._register(execution_id, active)
+        storage_roots = _storage_roots(
+            process.pid, tmp_root, sandbox_storage_paths
+        )
         watchdog_task = asyncio.create_task(
             _resource_watchdog(
                 process, active, request.permission_profile.resources,
                 self._terminate_active,
-                tmp_root=tmp_root,
+                storage_roots=storage_roots,
             ) if enforce_resource_limits else _no_resource_violation()
         )
         total_limit = request.permission_profile.resources.output_bytes
@@ -160,15 +164,19 @@ class ProcessSupervisor:
         *,
         budget=None,
         tmp_root: Path | None = None,
+        sandbox_storage_paths: tuple[str, ...] = (),
     ) -> asyncio.Task[dict | None] | None:
         """Register and resource-watch a managed stdio process."""
         active = _ActiveProcess(process)
         await self._register(execution_id, active)
         if budget is not None:
+            storage_roots = _storage_roots(
+                process.pid, tmp_root, sandbox_storage_paths
+            )
             active.watchdog_task = asyncio.create_task(
                 _resource_watchdog(
                     process, active, budget, self._terminate_active,
-                    tmp_root=tmp_root,
+                    storage_roots=storage_roots,
                 )
             )
         return active.watchdog_task
@@ -225,7 +233,8 @@ class ProcessSupervisor:
                 )
                 return
             except asyncio.TimeoutError:
-                _signal_process_group(process, signal.SIGKILL)
+                force_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                _signal_process_group(process, force_signal, force=True)
                 await process.wait()
 
 
@@ -252,7 +261,10 @@ async def _drain_bounded(
 
 
 def _signal_process_group(
-    process: asyncio.subprocess.Process, sig: signal.Signals
+    process: asyncio.subprocess.Process,
+    sig: signal.Signals,
+    *,
+    force: bool = False,
 ) -> None:
     if process.returncode is not None:
         return
@@ -264,7 +276,7 @@ def _signal_process_group(
             return
         except OSError:
             pass
-    if sig is signal.SIGKILL:
+    if force:
         process.kill()
     else:
         process.terminate()
@@ -283,7 +295,7 @@ def resource_limit_preexec(budget):
             (resource.RLIMIT_NOFILE, budget.open_files),
             (
                 resource.RLIMIT_CPU,
-                max(1, math.ceil(budget.timeout_seconds * budget.cpu_count)),
+                max(1, math.ceil(budget.cpu_time_seconds)),
             ),
         ]
         # Darwin exposes RLIMIT_AS/RLIMIT_RSS constants but rejects attempts
@@ -312,41 +324,55 @@ def _resource_limit_diagnostics(budget) -> dict[str, object]:
         ),
         "file_bytes": budget.file_bytes,
         "open_files": budget.open_files,
-        "cpu_seconds": max(
-            1, math.ceil(budget.timeout_seconds * budget.cpu_count)
-        ),
+        "cpu_quota_enforced": False,
+        "cpu_time_seconds": max(1, math.ceil(budget.cpu_time_seconds)),
         "tmpfs_bytes": budget.tmpfs_bytes,
+        "filesystem_entries": budget.filesystem_entries,
     }
 
 
 async def _resource_watchdog(
-    process, active, budget, terminate, *, tmp_root: Path | None = None,
+    process, active, budget, terminate, *, storage_roots: tuple[Path, ...] = (),
 ) -> dict | None:
-    """Bound aggregate process count and resident memory for the process group."""
-    if os.name != "posix" or process.pid is None:
+    """Bound process-tree and writable synthetic filesystem resources."""
+    if process.pid is None:
+        return None
+    process_tree_supported = os.name == "posix"
+    if not process_tree_supported and not storage_roots:
         return None
     while process.returncode is None:
-        process_count, resident_bytes = await asyncio.to_thread(
-            _process_group_usage, process.pid
-        )
+        if process_tree_supported:
+            process_count, resident_bytes = await asyncio.to_thread(
+                _process_group_usage, process.pid
+            )
+        else:
+            process_count, resident_bytes = 0, 0
         violation = None
-        if process_count > budget.pids:
+        if process_tree_supported and process_count > budget.pids:
             violation = {
                 "kind": "pids", "observed": process_count,
                 "limit": budget.pids,
             }
-        elif resident_bytes > budget.memory_bytes:
+        elif process_tree_supported and resident_bytes > budget.memory_bytes:
             violation = {
                 "kind": "memory", "observed": resident_bytes,
                 "limit": budget.memory_bytes,
             }
-        elif tmp_root is not None:
-            temporary_bytes = await asyncio.to_thread(_directory_size, tmp_root)
+        elif storage_roots:
+            temporary_bytes, filesystem_entries = await asyncio.to_thread(
+                _directory_usage, storage_roots
+            )
             if temporary_bytes > budget.tmpfs_bytes:
                 violation = {
                     "kind": "tmpfs",
                     "observed": temporary_bytes,
                     "limit": budget.tmpfs_bytes,
+                }
+            elif filesystem_entries > budget.filesystem_entries:
+                violation = {
+                    "kind": "filesystem-entries",
+                    "observed": filesystem_entries,
+                    "limit": budget.filesystem_entries,
                 }
         if violation is not None:
             active.termination_requested = True
@@ -356,10 +382,33 @@ async def _resource_watchdog(
     return None
 
 
-def _directory_size(root: Path) -> int:
+def _storage_roots(
+    process_id: int | None,
+    host_root: Path | None,
+    sandbox_paths: tuple[str, ...],
+) -> tuple[Path, ...]:
+    roots = [host_root] if host_root is not None else []
+    if sys.platform.startswith("linux") and process_id is not None:
+        namespace_root = Path(f"/proc/{process_id}/root")
+        for value in sandbox_paths:
+            path = Path(value)
+            if not path.is_absolute() or ".." in path.parts:
+                raise ValueError("sandbox storage paths must be absolute and normalized")
+            roots.append(namespace_root / str(path).lstrip("/"))
+    return tuple(roots)
+
+
+def _directory_usage(roots: tuple[Path, ...]) -> tuple[int, int]:
     total = 0
-    try:
-        for directory, _subdirectories, files in os.walk(root, followlinks=False):
+    entries = 0
+    seen: set[tuple[int, int]] = set()
+    for root in roots:
+        try:
+            iterator = os.walk(root, followlinks=False)
+        except OSError:
+            continue
+        for directory, subdirectories, files in iterator:
+            entries += len(subdirectories)
             for name in files:
                 try:
                     value = os.stat(
@@ -367,11 +416,14 @@ def _directory_size(root: Path) -> int:
                     )
                 except OSError:
                     continue
+                identity = (value.st_dev, value.st_ino)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                entries += 1
                 if stat.S_ISREG(value.st_mode):
                     total += value.st_size
-    except OSError:
-        return 0
-    return total
+    return total, entries
 
 
 def _process_group_usage(process_group_id: int) -> tuple[int, int]:

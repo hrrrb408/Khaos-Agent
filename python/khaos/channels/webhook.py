@@ -11,6 +11,7 @@ import math
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 from cryptography.exceptions import InvalidSignature
@@ -40,25 +41,43 @@ def is_valid_generic_webhook_secret(secret: str) -> bool:
 
 
 class WebhookReplayGuard:
-    """Bound replay state for timestamped, signature-authenticated webhooks."""
+    """Durable-capable replay state for authenticated webhook events."""
 
     def __init__(
         self,
         *,
         window_seconds: int = WEBHOOK_SIGNATURE_WINDOW_SECONDS,
         max_entries: int = 10_000,
+        consumer: Callable[
+            [str, str, str, float, float | None], Awaitable[bool]
+        ] | None = None,
     ) -> None:
         self.window_seconds = window_seconds
         self.max_entries = max_entries
+        self._consumer = consumer
         self._seen: dict[str, float] = {}
 
-    def consume(self, key: str, *, issued_at: float, now: float) -> bool:
+    async def consume(
+        self,
+        channel_id: str,
+        platform: str,
+        event_id: str,
+        *,
+        issued_at: float,
+        expires_at: float | None,
+        now: float,
+    ) -> bool:
+        if self._consumer is not None:
+            return await self._consumer(
+                channel_id, platform, event_id, issued_at, expires_at
+            )
         cutoff = now - self.window_seconds
         self._seen = {
             item: timestamp
             for item, timestamp in self._seen.items()
             if timestamp >= cutoff
         }
+        key = f"{channel_id}:{platform}:{event_id}"
         if key in self._seen:
             return False
         if len(self._seen) >= self.max_entries:
@@ -68,6 +87,13 @@ class WebhookReplayGuard:
         return True
 
 
+@dataclass(frozen=True)
+class _WebhookVerification:
+    issued_at: float
+    expires_at: float | None
+    replay_hint: str = ""
+
+
 class WebhookHandler:
     def __init__(
         self,
@@ -75,20 +101,31 @@ class WebhookHandler:
         secret: str = "",
         on_message: Callable[[PlatformMessage], Awaitable[None]] | None = None,
         *,
+        channel_id: str = "default",
         replay_guard: WebhookReplayGuard | None = None,
         now: Callable[[], float] = time.time,
     ) -> None:
         self.platform = platform
         self.secret = secret
+        self.channel_id = channel_id
         self._on_message = on_message
         self._replay_guard = replay_guard or WebhookReplayGuard()
         self._now = now
 
-    async def handle(self, headers: Mapping[str, str], body: bytes) -> dict[str, str]:
+    async def handle(
+        self,
+        headers: Mapping[str, str],
+        body: bytes,
+        query: Mapping[str, str] | None = None,
+    ) -> dict[str, str]:
         normalized = {key.lower(): value for key, value in headers.items()}
+        normalized_query = {
+            key.lower(): value for key, value in (query or {}).items()
+        }
         if not self.secret:
             return {"status": "configuration_error", "error": "webhook secret required"}
-        if not self._verify_signature(normalized, body):
+        verification = self._verify_signature(normalized, normalized_query, body)
+        if verification is None:
             return {"status": "signature_error"}
         try:
             raw: Any
@@ -107,6 +144,16 @@ class WebhookHandler:
         ) as exc:
             logger.warning("webhook parse failed for %s: %s", self.platform.value, exc)
             return {"status": "parse_error", "error": str(exc)}
+        replay_id = self._replay_id(raw, msg, verification.replay_hint)
+        if not replay_id or not await self._replay_guard.consume(
+            self.channel_id,
+            self.platform.value,
+            replay_id,
+            issued_at=verification.issued_at,
+            expires_at=verification.expires_at,
+            now=self._now(),
+        ):
+            return {"status": "replay_error"}
         if self._on_message is not None:
             callback_result = self._on_message(msg)
             if inspect.isawaitable(callback_result):
@@ -121,44 +168,74 @@ class WebhookHandler:
             ChannelType.WECHAT: _parse_wechat,
         }.get(self.platform, _parse_generic_webhook)
 
-    def _verify_signature(self, headers: Mapping[str, str], body: bytes) -> bool:
+    def _verify_signature(
+        self,
+        headers: Mapping[str, str],
+        query: Mapping[str, str],
+        body: bytes,
+    ) -> _WebhookVerification | None:
+        now = self._now()
         if self.platform == ChannelType.TELEGRAM:
-            return hmac.compare_digest(
+            if not hmac.compare_digest(
                 headers.get("x-telegram-bot-api-secret-token", ""), self.secret
-            )
+            ):
+                return None
+            return _WebhookVerification(now, None)
         if self.platform == ChannelType.DISCORD:
             timestamp = headers.get("x-signature-timestamp", "")
             signature = headers.get("x-signature-ed25519", "")
-            if not timestamp or not signature:
-                return False
+            issued_at = self._fresh_timestamp(timestamp)
+            if issued_at is None or not signature:
+                return None
             try:
                 public_key = Ed25519PublicKey.from_public_bytes(bytes.fromhex(self.secret))
                 public_key.verify(bytes.fromhex(signature), timestamp.encode() + body)
             except (ValueError, InvalidSignature):
-                return False
-            return True
+                return None
+            return _WebhookVerification(
+                issued_at, issued_at + WEBHOOK_SIGNATURE_WINDOW_SECONDS
+            )
         if self.platform == ChannelType.SLACK:
             timestamp = headers.get("x-slack-request-timestamp", "")
             signature = headers.get("x-slack-signature", "")
             issued_at = self._fresh_timestamp(timestamp)
             if issued_at is None:
-                return False
+                return None
             base = b"v0:" + timestamp.encode() + b":" + body
             expected = "v0=" + hmac.new(
                 self.secret.encode(), base, hashlib.sha256
             ).hexdigest()
-            return (
-                bool(signature)
-                and hmac.compare_digest(signature.encode(), expected.encode())
-                and self._replay_guard.consume(
-                    f"slack:{signature}", issued_at=issued_at, now=self._now()
-                )
+            if not signature or not hmac.compare_digest(
+                signature.encode(), expected.encode()
+            ):
+                return None
+            return _WebhookVerification(
+                issued_at,
+                issued_at + WEBHOOK_SIGNATURE_WINDOW_SECONDS,
+                signature,
             )
         if self.platform == ChannelType.WECHAT:
-            return hmac.compare_digest(headers.get("x-wechat-token", ""), self.secret)
+            timestamp = query.get("timestamp", headers.get("x-wechat-timestamp", ""))
+            nonce = query.get("nonce", headers.get("x-wechat-nonce", ""))
+            signature = query.get(
+                "signature", headers.get("x-wechat-signature", "")
+            )
+            issued_at = self._fresh_timestamp(timestamp)
+            if issued_at is None or not nonce or not signature:
+                return None
+            expected = hashlib.sha1(
+                "".join(sorted((self.secret, timestamp, nonce))).encode("utf-8")
+            ).hexdigest()
+            if not hmac.compare_digest(signature, expected):
+                return None
+            return _WebhookVerification(
+                issued_at,
+                issued_at + WEBHOOK_SIGNATURE_WINDOW_SECONDS,
+                f"{timestamp}:{nonce}",
+            )
         if self.platform == ChannelType.WEBHOOK_IN:
             if not is_valid_generic_webhook_secret(self.secret):
-                return False
+                return None
             timestamp = headers.get("x-khaos-timestamp", "")
             message_id = headers.get("x-khaos-message-id", "")
             body_digest = headers.get("x-khaos-content-sha256", "")
@@ -170,18 +247,33 @@ class WebhookHandler:
                 or len(message_id) < 16
                 or not hmac.compare_digest(body_digest.encode(), actual_digest.encode())
             ):
-                return False
-            signed = f"v1\n{timestamp}\n{message_id}\n{body_digest}".encode("utf-8")
-            expected = "v1=" + hmac.new(
+                return None
+            signed = (
+                f"v2\n{self.platform.value}\n{self.channel_id}\n{timestamp}\n"
+                f"{message_id}\n{body_digest}"
+            ).encode("utf-8")
+            expected = "v2=" + hmac.new(
                 self.secret.encode("utf-8"), signed, hashlib.sha256
             ).hexdigest()
-            return (
-                hmac.compare_digest(signature.encode(), expected.encode())
-                and self._replay_guard.consume(
-                    f"generic:{message_id}", issued_at=issued_at, now=self._now()
-                )
+            if not hmac.compare_digest(signature.encode(), expected.encode()):
+                return None
+            return _WebhookVerification(
+                issued_at,
+                issued_at + WEBHOOK_SIGNATURE_WINDOW_SECONDS,
+                message_id,
             )
-        return False
+        return None
+
+    def _replay_id(
+        self, raw: Any, message: PlatformMessage, replay_hint: str
+    ) -> str:
+        if self.platform == ChannelType.TELEGRAM:
+            return str(raw.get("update_id", "")) if isinstance(raw, dict) else ""
+        if self.platform == ChannelType.DISCORD:
+            return str(raw.get("id", message.id)) if isinstance(raw, dict) else message.id
+        if self.platform == ChannelType.SLACK and isinstance(raw, dict):
+            return str(raw.get("event_id", replay_hint or message.id))
+        return replay_hint or message.id
 
     def _fresh_timestamp(self, value: str) -> float | None:
         try:

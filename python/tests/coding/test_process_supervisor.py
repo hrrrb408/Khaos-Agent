@@ -14,6 +14,12 @@ from khaos.coding.execution import (
 from khaos.coding.execution.supervisor import ProcessSupervisor
 
 
+POSIX_ONLY = pytest.mark.skipif(
+    os.name != "posix",
+    reason="process-group and rlimit enforcement is POSIX-specific",
+)
+
+
 @pytest.mark.asyncio
 async def test_supervisor_bounds_stdout_and_stderr_fairly(tmp_path: Path):
     supervisor = ProcessSupervisor()
@@ -42,6 +48,7 @@ async def test_supervisor_bounds_stdout_and_stderr_fairly(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@POSIX_ONLY
 async def test_supervisor_terminate_kills_complete_process_group(tmp_path: Path):
     supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
     pid_file = tmp_path / "child.pid"
@@ -117,6 +124,7 @@ async def test_timeout_is_terminal_and_registry_is_cleaned(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@POSIX_ONLY
 async def test_supervisor_enforces_file_size_limit(tmp_path: Path):
     supervisor = ProcessSupervisor()
     request = ExecutionRequest(
@@ -156,6 +164,7 @@ async def test_external_backend_can_own_payload_resource_enforcement(tmp_path: P
 
 
 @pytest.mark.asyncio
+@POSIX_ONLY
 async def test_supervisor_terminates_process_tree_on_budget_violation(
     tmp_path: Path, monkeypatch,
 ):
@@ -207,6 +216,33 @@ async def test_supervisor_enforces_synthetic_tmp_capacity(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_supervisor_enforces_synthetic_home_entry_budget(tmp_path: Path):
+    synthetic_home = tmp_path / "synthetic-home"
+    synthetic_home.mkdir()
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    request = ExecutionRequest(
+        (
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys,time; "
+            "root=Path(sys.argv[1]); "
+            "[(root / f'entry-{i}').touch() for i in range(12)]; time.sleep(30)",
+            str(synthetic_home),
+        ),
+        tmp_path,
+        budget=ResourceBudget(filesystem_entries=10),
+        correlation_id="home-entry-capacity",
+    )
+
+    result = await supervisor.run(request, tmp_root=synthetic_home)
+
+    assert result.status == "resource-exhausted"
+    assert result.diagnostics["resource_violation"] == {
+        "kind": "filesystem-entries", "observed": 12, "limit": 10,
+    }
+
+
+@pytest.mark.asyncio
 async def test_execution_service_terminate_reaches_foreground_process(
     tmp_path: Path,
 ):
@@ -249,7 +285,7 @@ async def test_legacy_host_subclass_without_super_init_is_still_supervised(
     )
 
     assert result.status == "passed"
-    assert result.stdout == "ok\n"
+    assert result.stdout.splitlines() == ["ok"]
     assert backend.calls == 1
     assert backend.supervisor.active_execution_ids == ()
 

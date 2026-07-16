@@ -328,6 +328,9 @@ func TestWebhookAndChannelEndpoints(t *testing.T) {
 	if rec.Code != http.StatusOK || agent.webhook.ChannelID != "tg" || agent.webhook.Platform != "telegram" {
 		t.Fatalf("webhook status=%d request=%+v", rec.Code, agent.webhook)
 	}
+	if agent.webhook.Query["channel_id"] != "tg" {
+		t.Fatalf("webhook query was not preserved: %+v", agent.webhook.Query)
+	}
 	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/webhook/telegram?channel_id=tg", `{"message":{"message_id":2}}`); rec.Code != http.StatusOK {
 		t.Fatalf("signed platform ingress should reach Python verifier: status=%d", rec.Code)
 	}

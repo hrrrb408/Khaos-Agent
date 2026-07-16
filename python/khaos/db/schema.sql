@@ -586,3 +586,20 @@ CREATE TABLE IF NOT EXISTS operation_approval_events (
 
 CREATE INDEX IF NOT EXISTS idx_operation_approval_events_approval
     ON operation_approval_events(approval_id, id);
+
+-- Durable one-shot webhook event consumption. Telegram update IDs use a NULL
+-- expiry because the platform has no signed request timestamp; timestamped
+-- platforms may prune entries only after their signature freshness window.
+CREATE TABLE IF NOT EXISTS webhook_replay_events (
+    channel_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    event_id TEXT NOT NULL,
+    issued_at REAL NOT NULL,
+    expires_at REAL,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (channel_id, platform, event_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_webhook_replay_expiry
+    ON webhook_replay_events(expires_at)
+    WHERE expires_at IS NOT NULL;

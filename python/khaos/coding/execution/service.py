@@ -220,7 +220,16 @@ class ExecutionService:
                     execution_id,
                     process,
                     budget=request.budget,
-                    tmp_root=temporary_tmp,
+                    tmp_root=(
+                        temporary_home
+                        if backend.__class__.__name__ == "MacOSSandboxBackend"
+                        else None
+                    ),
+                    sandbox_storage_paths=(
+                        ("/home/khaos", "/tmp")
+                        if backend.__class__.__name__ == "LinuxBubblewrapBackend"
+                        else ()
+                    ),
                 )
                 handle = ManagedProcessHandle(
                     execution_id, process, temporary_home=temporary_home,

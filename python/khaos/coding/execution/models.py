@@ -28,9 +28,13 @@ class ResourceBudget:
     timeout_seconds: float = 120.0
     output_bytes: int = 65536
     pids: int = 256
+    # CPU shares/cores are enforced only by backends with a native quota
+    # controller (currently Docker). Host backends use cpu_time_seconds.
     cpu_count: float = 1.0
+    cpu_time_seconds: float = 120.0
     memory_bytes: int = 512 * 1024 * 1024
     tmpfs_bytes: int = 256 * 1024 * 1024
+    filesystem_entries: int = 100_000
     file_bytes: int = 64 * 1024 * 1024
     open_files: int = 256
 
@@ -164,8 +168,10 @@ class PermissionProfile:
                 "output_bytes": self.resources.output_bytes,
                 "pids": self.resources.pids,
                 "cpu_count": self.resources.cpu_count,
+                "cpu_time_seconds": self.resources.cpu_time_seconds,
                 "memory_bytes": self.resources.memory_bytes,
                 "tmpfs_bytes": self.resources.tmpfs_bytes,
+                "filesystem_entries": self.resources.filesystem_entries,
                 "file_bytes": self.resources.file_bytes,
                 "open_files": self.resources.open_files,
             },
@@ -282,9 +288,13 @@ def _validate_resource_budget(budget: ResourceBudget) -> None:
         raise ValueError("resource timeout must be positive")
     if budget.output_bytes <= 0:
         raise ValueError("resource output limit must be positive")
-    if budget.pids <= 0 or budget.cpu_count <= 0:
+    if budget.pids <= 0 or budget.cpu_count <= 0 or budget.cpu_time_seconds <= 0:
         raise ValueError("resource process and CPU limits must be positive")
-    if budget.memory_bytes <= 0 or budget.tmpfs_bytes <= 0:
+    if (
+        budget.memory_bytes <= 0
+        or budget.tmpfs_bytes <= 0
+        or budget.filesystem_entries <= 0
+    ):
         raise ValueError("resource memory limits must be positive")
     if budget.file_bytes <= 0 or budget.open_files <= 0:
         raise ValueError("resource file and open-file limits must be positive")
