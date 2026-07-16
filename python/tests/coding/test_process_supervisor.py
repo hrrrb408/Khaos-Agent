@@ -176,7 +176,7 @@ async def test_supervisor_terminates_process_tree_on_budget_violation(
     request = ExecutionRequest(
         (sys.executable, "-c", "import time; time.sleep(30)"),
         tmp_path,
-        budget=ResourceBudget(pids=2, memory_bytes=8192),
+        budget=ResourceBudget(pids=2),
         correlation_id="pid-limit",
     )
 
