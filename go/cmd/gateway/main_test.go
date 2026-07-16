@@ -40,6 +40,12 @@ func TestLoadPythonCapabilityUsesProtectedFile(t *testing.T) {
 	t.Setenv("KHAOS_PYTHON_CAPABILITY_FD", "")
 	t.Setenv("KHAOS_PYTHON_CAPABILITY_FILE", path)
 	capability, err := loadPythonCapability()
+	if runtime.GOOS == "windows" {
+		if err == nil {
+			t.Fatal("POSIX mode-based capability file was accepted on Windows")
+		}
+		return
+	}
 	if err != nil || capability != "0123456789abcdef0123456789abcdef" {
 		t.Fatalf("capability=%q err=%v", capability, err)
 	}
