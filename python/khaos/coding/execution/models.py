@@ -9,7 +9,11 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
-from khaos.coding.workspace.storage import WorkspaceStorageSnapshot
+from khaos.coding.workspace.storage import (
+    DEFAULT_WORKSPACE_BYTES,
+    DEFAULT_WORKSPACE_ENTRIES,
+    WorkspaceStorageSnapshot,
+)
 
 
 class NetworkPolicy(str, Enum):
@@ -37,8 +41,8 @@ class ResourceBudget:
     memory_bytes: int = 512 * 1024 * 1024
     tmpfs_bytes: int = 256 * 1024 * 1024
     filesystem_entries: int = 100_000
-    workspace_bytes: int = 512 * 1024 * 1024
-    workspace_entries: int = 100_000
+    workspace_bytes: int = DEFAULT_WORKSPACE_BYTES
+    workspace_entries: int = DEFAULT_WORKSPACE_ENTRIES
     file_bytes: int = 64 * 1024 * 1024
     open_files: int = 256
 

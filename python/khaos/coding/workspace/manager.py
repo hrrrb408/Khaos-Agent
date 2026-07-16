@@ -6,12 +6,21 @@ import asyncio
 import logging
 import tempfile
 import uuid
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, TypeVar
 
 from khaos.coding.workspace.models import ChangeSet, TaskWorkspace, WorkspaceState, WorkspaceTransition
-from khaos.coding.workspace.storage import capture_workspace_snapshot
+from khaos.coding.workspace.storage import (
+    WorkspaceMutation,
+    WorkspaceStorageAuthority,
+    WorkspaceStorageLimits,
+    WorkspaceStorageViolation,
+    capture_workspace_snapshot,
+)
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 
 class WorkspaceError(RuntimeError):
@@ -38,11 +47,20 @@ ALLOWED: dict[WorkspaceState, frozenset[WorkspaceState]] = {
 class WorkspaceManager:
     """Create isolated worktrees and immutable ChangeSets."""
 
-    def __init__(self, root: Path | None = None) -> None:
+    def __init__(
+        self,
+        root: Path | None = None,
+        *,
+        storage_limits: WorkspaceStorageLimits | None = None,
+        storage_authority: WorkspaceStorageAuthority | None = None,
+    ) -> None:
         self.root = (root or Path(tempfile.gettempdir()) / "khaos" / "worktrees").expanduser().resolve()
+        self.storage_limits = storage_limits or WorkspaceStorageLimits()
+        self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._workspaces: dict[str, TaskWorkspace] = {}
         self._task_ids: set[str] = set()
         self._lock = asyncio.Lock()
+        self._storage_mutation_locks: dict[str, asyncio.Lock] = {}
         # Batch 2.5 §4: optional lease invalidation hook. When set
         # (by ApprovalRuntime / WorkspaceExecutionLeaseCoordinator),
         # cleanup() calls it BEFORE removing the worktree so the ACTIVE
@@ -92,6 +110,7 @@ class WorkspaceManager:
             workspace = TaskWorkspace(
                 workspace_id, task_id, repository, path, base_ref, base_sha,
                 branch, WorkspaceState.READY, (path,), recovery_root=recovery_root,
+                storage_limits=self.storage_limits,
             )
             baseline = await asyncio.to_thread(capture_workspace_snapshot, path)
             if not baseline.complete:
@@ -117,6 +136,69 @@ class WorkspaceManager:
     def get(self, workspace_id: str) -> TaskWorkspace | None:
         """Return a workspace without allowing callers to mutate its registry."""
         return self._workspaces.get(workspace_id)
+
+    async def mutate_with_storage_authority(
+        self,
+        workspace_id: str,
+        task_id: str,
+        operation: Callable[[], WorkspaceMutation[T]],
+    ) -> T:
+        """Serialize, account, and if necessary roll back one file-tool write."""
+        async with self._lock:
+            workspace = self._workspaces.get(workspace_id)
+            if workspace is None or workspace.task_id != task_id:
+                raise PermissionError("task/workspace binding is invalid")
+            if workspace.state in {
+                WorkspaceState.FAILED,
+                WorkspaceState.CANCELLED,
+                WorkspaceState.CLEANING,
+                WorkspaceState.CLEANED,
+            }:
+                raise PermissionError("workspace is not writable")
+            mutation_lock = self._storage_mutation_locks.setdefault(
+                workspace_id, asyncio.Lock()
+            )
+
+        try:
+            async with mutation_lock:
+                async with self._lock:
+                    current = self._workspaces.get(workspace_id)
+                    if current is not workspace or current.state in {
+                        WorkspaceState.FAILED,
+                        WorkspaceState.CANCELLED,
+                        WorkspaceState.CLEANING,
+                        WorkspaceState.CLEANED,
+                    }:
+                        raise PermissionError("workspace is not writable")
+                return await asyncio.to_thread(
+                    self.storage_authority.mutate,
+                    workspace_id,
+                    workspace.worktree_path,
+                    workspace.storage_baseline,
+                    workspace.storage_limits,
+                    operation,
+                )
+        except WorkspaceStorageViolation as exc:
+            if exc.quarantine_required:
+                await self.quarantine(workspace_id)
+            raise
+
+    async def quarantine(self, workspace_id: str) -> WorkspaceTransition:
+        """Fail closed and attempt forced cleanup without losing quarantine."""
+        async with self._lock:
+            workspace = self._workspaces.get(workspace_id)
+            if workspace is None:
+                return WorkspaceTransition.NOT_FOUND
+            if workspace.state is WorkspaceState.CLEANED:
+                return WorkspaceTransition.INVALID
+            workspace.state = WorkspaceState.FAILED
+        transition = await self.cleanup(workspace_id, force=True)
+        if transition is not WorkspaceTransition.UPDATED:
+            async with self._lock:
+                workspace = self._workspaces.get(workspace_id)
+                if workspace is not None and workspace.state is not WorkspaceState.CLEANED:
+                    workspace.state = WorkspaceState.FAILED
+        return transition
 
     async def build_changeset(self, workspace_id: str) -> ChangeSet:
         workspace = self._workspaces.get(workspace_id)
@@ -171,6 +253,19 @@ class WorkspaceManager:
     async def _cleanup_impl(self, workspace_id: str, *, force: bool) -> WorkspaceTransition:
         """Internal cleanup — assumes fence (if any) is already held."""
         async with self._lock:
+            storage_lock = self._storage_mutation_locks.setdefault(
+                workspace_id, asyncio.Lock()
+            )
+        async with storage_lock:
+            return await self._cleanup_under_storage_lock(
+                workspace_id, force=force
+            )
+
+    async def _cleanup_under_storage_lock(
+        self, workspace_id: str, *, force: bool
+    ) -> WorkspaceTransition:
+        """Remove a Worktree while file-tool storage mutations are excluded."""
+        async with self._lock:
             workspace = self._workspaces.get(workspace_id)
             if workspace is None:
                 return WorkspaceTransition.NOT_FOUND
@@ -192,10 +287,16 @@ class WorkspaceManager:
                     )
                     return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANING
-            if force:
-                await self._git(workspace.repository_root, "worktree", "remove", "--force", str(workspace.worktree_path))
-            else:
-                await self._git(workspace.repository_root, "worktree", "remove", str(workspace.worktree_path))
+            try:
+                if force:
+                    await self._git(workspace.repository_root, "worktree", "remove", "--force", str(workspace.worktree_path))
+                else:
+                    await self._git(workspace.repository_root, "worktree", "remove", str(workspace.worktree_path))
+            except Exception:
+                workspace.state = WorkspaceState.FAILED
+                return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANED
             self._task_ids.discard(workspace.task_id)
+            self.storage_authority.release(workspace_id)
+            self._storage_mutation_locks.pop(workspace_id, None)
             return WorkspaceTransition.UPDATED

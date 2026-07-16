@@ -41,6 +41,10 @@ from khaos.coding.planning.workspace_mutation import (
 from khaos.coding.planning.safe_workspace_path import WorkspacePathHandle
 from khaos.coding.planning.recovery_directory import RecoveryDirectory
 from khaos.coding.workspace.models import TaskWorkspace, WorkspaceState
+from khaos.coding.workspace.storage import (
+    WorkspaceStorageLimits,
+    capture_workspace_snapshot,
+)
 
 
 def _hash(data: str | bytes) -> str:
@@ -59,6 +63,8 @@ def _workspace(tmp_path, manager, *, workspace_id="ws1", task_id="task1"):
         workspace_id, task_id, repository, worktree, "HEAD", "abc123",
         "task-branch", WorkspaceState.RUNNING, (worktree,),
         recovery_root=tmp_path / "private-recovery",
+        storage_baseline=capture_workspace_snapshot(worktree),
+        storage_limits=manager.storage_limits,
     )
     manager._workspaces[workspace_id] = workspace
     manager._task_ids.add(task_id)
@@ -707,3 +713,22 @@ def test_plan_scope_and_collision_violations_fail_closed(tmp_path, violation):
     with pytest.raises(WorkspaceMutationError):
         _apply(runtime, plan, authorization, _bundle(plan, bundle_edits))
     assert (workspace.worktree_path / "a.txt").read_text() == "old"
+
+
+def test_planned_mutation_uses_workspace_storage_authority(tmp_path):
+    edit = PlannedFileEdit(
+        "e1",
+        "s1",
+        PlannedEditOperation.CREATE,
+        "large.txt",
+        expected_exists=False,
+        new_content="x" * 8192,
+    )
+    runtime, workspace, plan, authorization = _setup(tmp_path, (edit,))
+    workspace.storage_limits = WorkspaceStorageLimits(bytes=1, entries=10)
+
+    with pytest.raises(WorkspaceMutationError) as caught:
+        _apply(runtime, plan, authorization, _bundle(plan, (edit,)))
+
+    assert caught.value.code == "workspace-bytes"
+    assert not (workspace.worktree_path / "large.txt").exists()

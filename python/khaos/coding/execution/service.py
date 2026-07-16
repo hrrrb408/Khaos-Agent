@@ -6,6 +6,7 @@ import asyncio
 import os
 import tempfile
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
 from khaos.coding.execution.managed import ManagedProcessHandle
@@ -23,6 +24,7 @@ from khaos.coding.execution.supervisor import (
 )
 from khaos.coding.workspace.models import WorkspaceState
 from khaos.coding.workspace.storage import capture_workspace_snapshot
+from khaos.coding.workspace.storage import WorkspaceStorageLimits
 
 
 class ExecutionService:
@@ -43,6 +45,12 @@ class ExecutionService:
         self.managed_process_factory = managed_process_factory
         self._active: dict[str, tuple[str, str, object]] = {}
         self._closed = False
+        if self.workspace_manager is not None and hasattr(
+            self.workspace_manager, "storage_authority"
+        ):
+            self.process_supervisor.storage_authority = (
+                self.workspace_manager.storage_authority
+            )
         if self.backend is not None and hasattr(self.backend, "supervisor"):
             self.backend.supervisor = self.process_supervisor
         if self.docker_backend is not None and hasattr(
@@ -87,6 +95,9 @@ class ExecutionService:
             if cwd != root and root not in cwd.parents:
                 raise PermissionError("cwd is outside the task workspace")
             repository_root = workspace.repository_root.expanduser().resolve()
+            storage_limits = getattr(
+                workspace, "storage_limits", WorkspaceStorageLimits()
+            )
             storage_baseline = getattr(workspace, "storage_baseline", None)
             if storage_baseline is None:
                 storage_baseline = await asyncio.to_thread(
@@ -103,7 +114,19 @@ class ExecutionService:
                 if not (root / ".git").is_file():
                     raise PermissionError("workspace is not an active Git Worktree")
             correlation_id = request.correlation_id or uuid.uuid4().hex[:12]
-            profile = profile.bind_workspace(root)
+            profile = replace(
+                profile,
+                resources=replace(
+                    profile.resources,
+                    workspace_bytes=min(
+                        profile.resources.workspace_bytes, storage_limits.bytes
+                    ),
+                    workspace_entries=min(
+                        profile.resources.workspace_entries,
+                        storage_limits.entries,
+                    ),
+                ),
+            ).bind_workspace(root)
             profile.validate_resolved()
             request = ExecutionRequest(
                 argv=request.argv,
@@ -139,21 +162,47 @@ class ExecutionService:
             backend = self.docker_backend
         if request.backend_hint == "docker" and resolved_context is None:
             raise PermissionError("Docker execution requires resolved TaskWorkspace context")
-        if resolved_context is not None and hasattr(backend, "execute_resolved"):
-            self._active[resolved_context.correlation_id] = (
-                resolved_context.task_id, resolved_context.workspace_id, backend
-            )
-            try:
-                result = await backend.execute_resolved(resolved_context)
-            finally:
-                self._active.pop(resolved_context.correlation_id, None)
-        else:
-            result = await backend.execute(request)
+        try:
+            if resolved_context is not None and hasattr(backend, "execute_resolved"):
+                self._active[resolved_context.correlation_id] = (
+                    resolved_context.task_id, resolved_context.workspace_id, backend
+                )
+                try:
+                    result = await backend.execute_resolved(resolved_context)
+                finally:
+                    self._active.pop(resolved_context.correlation_id, None)
+            else:
+                result = await backend.execute(request)
+        except asyncio.CancelledError:
+            if resolved_context is not None:
+                await self._quarantine_cancelled_storage_violation(
+                    resolved_context
+                )
+            raise
         if resolved_context is not None:
             await self._cleanup_workspace_on_storage_violation(
                 resolved_context.workspace_id, result
             )
         return result
+
+    async def _quarantine_cancelled_storage_violation(
+        self, context: ResolvedExecutionContext
+    ) -> None:
+        """Account a cancelled process after its tree has been terminated."""
+        authority = getattr(self.workspace_manager, "storage_authority", None)
+        workspace = self.workspace_manager.get(context.workspace_id)
+        limits = getattr(workspace, "storage_limits", None)
+        if authority is None or limits is None:
+            await self.workspace_manager.quarantine(context.workspace_id)
+            return
+        violation = await asyncio.to_thread(
+            authority.assess,
+            context.worktree_path,
+            context.workspace_baseline,
+            limits,
+        )
+        if violation is not None:
+            await self.workspace_manager.quarantine(context.workspace_id)
 
     async def _cleanup_workspace_on_storage_violation(
         self, workspace_id: str, result: ExecutionResult
@@ -166,12 +215,11 @@ class ExecutionService:
         }:
             return
         try:
-            quarantine = await self.workspace_manager.transition(
-                workspace_id, WorkspaceState.FAILED
-            )
-            result.diagnostics["workspace_quarantine"] = quarantine.value
-            transition = await self.workspace_manager.cleanup(
-                workspace_id, force=True
+            transition = await self.workspace_manager.quarantine(workspace_id)
+            result.diagnostics["workspace_quarantine"] = (
+                "updated"
+                if transition.value == "updated"
+                else "failed"
             )
             result.diagnostics["workspace_cleanup"] = transition.value
         except Exception as exc:

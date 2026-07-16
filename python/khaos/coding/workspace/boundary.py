@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
@@ -15,6 +16,16 @@ from khaos.coding.planning.safe_workspace_path import (
 
 class WorkspaceBoundaryError(PermissionError):
     pass
+
+
+@dataclass(frozen=True)
+class WorkspaceFileSnapshot:
+    """Identity-bound regular-file state used for safe mutation rollback."""
+
+    exists: bool
+    content: bytes = b""
+    mode: int = 0o600
+    identity: tuple[int, int] | None = None
 
 
 PROTECTED_WORKSPACE_NAMES = frozenset({".git", ".agents", ".codex", ".khaos"})
@@ -97,6 +108,32 @@ class SafeWorkspaceFS:
                 raise WorkspaceBoundaryError("hardlinked files are not allowed")
             parent.revalidate()
             return info
+        finally:
+            parent.close()
+
+    def snapshot_file(self, target: str | Path) -> WorkspaceFileSnapshot:
+        """Capture a missing or single-link regular file through fixed dirfds."""
+        relative = self.relative(target)
+        parent = self._parent(relative)
+        try:
+            info = parent.lstat()
+            if info is None:
+                parent.revalidate()
+                return WorkspaceFileSnapshot(False)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise WorkspaceBoundaryError(
+                    "rollback target is not a single-link regular file"
+                )
+            content, final = parent.read_file()
+            parent.revalidate()
+            return WorkspaceFileSnapshot(
+                True,
+                content,
+                stat.S_IMODE(final.st_mode) & 0o666,
+                (final.st_dev, final.st_ino),
+            )
+        except (OSError, SafePathError) as exc:
+            raise WorkspaceBoundaryError(str(exc)) from exc
         finally:
             parent.close()
 
@@ -226,6 +263,39 @@ class SafeWorkspaceFS:
         try:
             self._handle.rename_no_replace(
                 source_relative, destination_relative, inode,
+                lambda *_args, **_kwargs: None,
+            )
+        except (OSError, SafePathError) as exc:
+            raise WorkspaceBoundaryError(str(exc)) from exc
+
+    def delete_file(
+        self,
+        target: str | Path,
+        *,
+        expected: WorkspaceFileSnapshot,
+    ) -> None:
+        """Delete only the exact file state installed by this mutation."""
+        if not expected.exists or expected.identity is None:
+            raise WorkspaceBoundaryError("delete rollback requires existing state")
+        relative = self.relative(target)
+        parent = self._parent(relative)
+        try:
+            current = parent.lstat()
+            if current is None or (
+                current.st_dev, current.st_ino
+            ) != expected.identity:
+                raise WorkspaceBoundaryError("rollback target identity changed")
+            content, final = parent.read_file()
+            if content != expected.content or (
+                final.st_dev, final.st_ino
+            ) != expected.identity:
+                raise WorkspaceBoundaryError("rollback target content changed")
+        finally:
+            parent.close()
+        try:
+            self._handle.delete(
+                relative,
+                expected.identity[1],
                 lambda *_args, **_kwargs: None,
             )
         except (OSError, SafePathError) as exc:

@@ -131,14 +131,22 @@ class ToolInvocationBroker:
                 if service is None:
                     raise PermissionError("process.execute requires ExecutionService")
             if capability.name == "filesystem.write" and mode == "coding":
-                if context.get("workspace_id") is None or context.get("task_id") is None:
+                if (
+                    context.get("workspace_id") is None
+                    or context.get("task_id") is None
+                    or context.get("workspace_manager") is None
+                ):
                     raise PermissionError("filesystem.write requires active TaskWorkspace")
             if (
                 capability.name == "filesystem.read"
                 and mode == "coding"
                 and name in _WORKSPACE_FILE_TOOLS
             ):
-                if context.get("workspace_id") is None or context.get("task_id") is None:
+                if (
+                    context.get("workspace_id") is None
+                    or context.get("task_id") is None
+                    or context.get("workspace_manager") is None
+                ):
                     raise PermissionError("filesystem.read requires active TaskWorkspace")
             if capability.name == "network.access" and context.get("network_policy") != "unrestricted-with-approval":
                 raise PermissionError("network.access requires server-authorized network policy")
