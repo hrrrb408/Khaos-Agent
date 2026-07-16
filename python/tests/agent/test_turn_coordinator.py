@@ -61,6 +61,46 @@ async def test_process_restart_interrupts_inflight_turn(tmp_path):
     await restarted_db.close()
 
 
+async def test_concurrent_turn_starts_wait_for_the_same_recovery():
+    class BlockingRecoveryDatabase:
+        def __init__(self):
+            self.recovery_started = asyncio.Event()
+            self.allow_recovery = asyncio.Event()
+            self.recovery_calls = 0
+            self.started_turns = 0
+
+        async def recover_inflight_agent_turns(self, *, now):
+            self.recovery_calls += 1
+            self.recovery_started.set()
+            await self.allow_recovery.wait()
+
+        async def start_agent_turn(self, **kwargs):
+            assert self.allow_recovery.is_set()
+            self.started_turns += 1
+
+    db = BlockingRecoveryDatabase()
+    first = asyncio.create_task(
+        TurnCoordinator.start(
+            db, session_id="session", task_id=None, principal_id="principal"
+        )
+    )
+    await db.recovery_started.wait()
+    second = asyncio.create_task(
+        TurnCoordinator.start(
+            db, session_id="session", task_id=None, principal_id="principal"
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert not first.done()
+    assert not second.done()
+    db.allow_recovery.set()
+    await asyncio.gather(first, second)
+
+    assert db.recovery_calls == 1
+    assert db.started_turns == 2
+
+
 async def test_database_rejects_sequence_race(tmp_path):
     db = await _database(tmp_path / "khaos.db")
     turn = await TurnCoordinator.start(
