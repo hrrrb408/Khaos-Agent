@@ -28,7 +28,13 @@ from khaos.agent.error_handler import ErrorHandler
 from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
-from khaos.channels import ChannelRegistry, ChannelType, PlatformMessage, WebhookHandler
+from khaos.channels import (
+    ChannelRegistry,
+    ChannelType,
+    PlatformMessage,
+    WebhookHandler,
+    WebhookReplayGuard,
+)
 from khaos.db import Database
 from khaos.memory import (
     Memory,
@@ -169,6 +175,7 @@ class AgentService:
         self.cron_engine = CronEngine(db=db, executor=self._execute_scheduled_prompt)
         set_cron_engine(self.cron_engine)
         self.channel_registry = ChannelRegistry()
+        self._webhook_replay_guard = WebhookReplayGuard()
         set_channel_registry(self.channel_registry)
         # Security policy loaded once (not per chat call) and cached; rebuild
         # the middleware stack from it for every runtime.
@@ -249,6 +256,7 @@ class AgentService:
             channel_type,
             secret=channel.config.secret,
             on_message=lambda message: self._on_webhook_message(channel_id, message),
+            replay_guard=self._webhook_replay_guard,
         )
         return await handler.handle(headers, body.encode("utf-8"))
 

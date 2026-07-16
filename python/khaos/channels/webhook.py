@@ -7,6 +7,8 @@ import hmac
 import inspect
 import json
 import logging
+import math
+import time
 import xml.etree.ElementTree as ET
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
@@ -25,6 +27,46 @@ from khaos.channels.models import (
 
 logger = logging.getLogger(__name__)
 
+WEBHOOK_SIGNATURE_WINDOW_SECONDS = 300
+GENERIC_WEBHOOK_SECRET_MIN_LENGTH = 32
+
+
+def is_valid_generic_webhook_secret(secret: str) -> bool:
+    """Reject missing, short, and trivially low-entropy generic secrets."""
+    return (
+        len(secret) >= GENERIC_WEBHOOK_SECRET_MIN_LENGTH
+        and len(set(secret)) >= 8
+    )
+
+
+class WebhookReplayGuard:
+    """Bound replay state for timestamped, signature-authenticated webhooks."""
+
+    def __init__(
+        self,
+        *,
+        window_seconds: int = WEBHOOK_SIGNATURE_WINDOW_SECONDS,
+        max_entries: int = 10_000,
+    ) -> None:
+        self.window_seconds = window_seconds
+        self.max_entries = max_entries
+        self._seen: dict[str, float] = {}
+
+    def consume(self, key: str, *, issued_at: float, now: float) -> bool:
+        cutoff = now - self.window_seconds
+        self._seen = {
+            item: timestamp
+            for item, timestamp in self._seen.items()
+            if timestamp >= cutoff
+        }
+        if key in self._seen:
+            return False
+        if len(self._seen) >= self.max_entries:
+            oldest = min(self._seen, key=self._seen.__getitem__)
+            del self._seen[oldest]
+        self._seen[key] = issued_at
+        return True
+
 
 class WebhookHandler:
     def __init__(
@@ -32,14 +74,21 @@ class WebhookHandler:
         platform: ChannelType,
         secret: str = "",
         on_message: Callable[[PlatformMessage], Awaitable[None]] | None = None,
+        *,
+        replay_guard: WebhookReplayGuard | None = None,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self.platform = platform
         self.secret = secret
         self._on_message = on_message
+        self._replay_guard = replay_guard or WebhookReplayGuard()
+        self._now = now
 
     async def handle(self, headers: Mapping[str, str], body: bytes) -> dict[str, str]:
         normalized = {key.lower(): value for key, value in headers.items()}
-        if self.secret and not self._verify_signature(normalized, body):
+        if not self.secret:
+            return {"status": "configuration_error", "error": "webhook secret required"}
+        if not self._verify_signature(normalized, body):
             return {"status": "signature_error"}
         try:
             raw: Any
@@ -91,14 +140,60 @@ class WebhookHandler:
         if self.platform == ChannelType.SLACK:
             timestamp = headers.get("x-slack-request-timestamp", "")
             signature = headers.get("x-slack-signature", "")
+            issued_at = self._fresh_timestamp(timestamp)
+            if issued_at is None:
+                return False
             base = b"v0:" + timestamp.encode() + b":" + body
             expected = "v0=" + hmac.new(
                 self.secret.encode(), base, hashlib.sha256
             ).hexdigest()
-            return bool(timestamp and signature) and hmac.compare_digest(signature, expected)
+            return (
+                bool(signature)
+                and hmac.compare_digest(signature.encode(), expected.encode())
+                and self._replay_guard.consume(
+                    f"slack:{signature}", issued_at=issued_at, now=self._now()
+                )
+            )
         if self.platform == ChannelType.WECHAT:
             return hmac.compare_digest(headers.get("x-wechat-token", ""), self.secret)
-        return True
+        if self.platform == ChannelType.WEBHOOK_IN:
+            if not is_valid_generic_webhook_secret(self.secret):
+                return False
+            timestamp = headers.get("x-khaos-timestamp", "")
+            message_id = headers.get("x-khaos-message-id", "")
+            body_digest = headers.get("x-khaos-content-sha256", "")
+            signature = headers.get("x-khaos-signature", "")
+            issued_at = self._fresh_timestamp(timestamp)
+            actual_digest = hashlib.sha256(body).hexdigest()
+            if (
+                issued_at is None
+                or len(message_id) < 16
+                or not hmac.compare_digest(body_digest.encode(), actual_digest.encode())
+            ):
+                return False
+            signed = f"v1\n{timestamp}\n{message_id}\n{body_digest}".encode("utf-8")
+            expected = "v1=" + hmac.new(
+                self.secret.encode("utf-8"), signed, hashlib.sha256
+            ).hexdigest()
+            return (
+                hmac.compare_digest(signature.encode(), expected.encode())
+                and self._replay_guard.consume(
+                    f"generic:{message_id}", issued_at=issued_at, now=self._now()
+                )
+            )
+        return False
+
+    def _fresh_timestamp(self, value: str) -> float | None:
+        try:
+            issued_at = float(value)
+        except (TypeError, ValueError):
+            return None
+        if (
+            not math.isfinite(issued_at)
+            or abs(self._now() - issued_at) > WEBHOOK_SIGNATURE_WINDOW_SECONDS
+        ):
+            return None
+        return issued_at
 
 
 def _parse_telegram(raw: dict[str, Any]) -> PlatformMessage:

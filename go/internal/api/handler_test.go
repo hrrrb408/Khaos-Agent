@@ -328,6 +328,18 @@ func TestWebhookAndChannelEndpoints(t *testing.T) {
 	if rec.Code != http.StatusOK || agent.webhook.ChannelID != "tg" || agent.webhook.Platform != "telegram" {
 		t.Fatalf("webhook status=%d request=%+v", rec.Code, agent.webhook)
 	}
+	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/webhook/telegram?channel_id=tg", `{"message":{"message_id":2}}`); rec.Code != http.StatusOK {
+		t.Fatalf("signed platform ingress should reach Python verifier: status=%d", rec.Code)
+	}
+	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/webhook/generic?channel_id=generic", `{"message":"run"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous generic webhook status=%d", rec.Code)
+	}
+	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/webhook/unknown?channel_id=unknown", `{}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous unknown webhook status=%d", rec.Code)
+	}
+	if rec := serve(handler, http.MethodPost, "/api/webhook/generic?channel_id=generic", `{"message":"run"}`, "gateway-key"); rec.Code != http.StatusOK {
+		t.Fatalf("authenticated generic webhook status=%d", rec.Code)
+	}
 	if rec := serve(handler, http.MethodGet, "/api/channels", "", "gateway-key"); rec.Code != http.StatusOK {
 		t.Fatalf("list status=%d", rec.Code)
 	}

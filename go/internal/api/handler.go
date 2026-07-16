@@ -48,6 +48,13 @@ const (
 	maxWebhookBodyBytes int64 = 2 << 20
 )
 
+var signatureAuthenticatedWebhookPlatforms = map[string]struct{}{
+	"discord":  {},
+	"slack":    {},
+	"telegram": {},
+	"wechat":   {},
+}
+
 // WithTasks attaches the persistent coding task service.
 func (h *Handler) WithTasks(tasks TaskClient) *Handler { h.tasks = tasks; return h }
 
@@ -157,14 +164,28 @@ func (h *Handler) Routes() http.Handler {
 			common.ServeHTTP(w, r)
 			return
 		}
-		// Platform webhooks authenticate with their platform signature in Python.
-		if strings.HasPrefix(r.URL.Path, "/api/webhook/") {
+		// Only platforms with an implemented signature protocol may bypass the
+		// Gateway API key. Generic and unknown webhook paths remain authenticated.
+		if isSignatureAuthenticatedWebhookPath(r.URL.Path) {
 			common.ServeHTTP(w, r)
 			return
 		}
 		secured.ServeHTTP(w, r)
 	})
 	return h.hostGuard(h.originPolicy(h.protocol(h.limitRequestBody(root))))
+}
+
+func isSignatureAuthenticatedWebhookPath(path string) bool {
+	const prefix = "/api/webhook/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	platform := strings.TrimPrefix(path, prefix)
+	if platform == "" || strings.Contains(platform, "/") {
+		return false
+	}
+	_, ok := signatureAuthenticatedWebhookPlatforms[platform]
+	return ok
 }
 
 func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {

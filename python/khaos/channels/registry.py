@@ -11,6 +11,7 @@ from typing import Any
 
 from khaos.channels.dispatcher import Channel
 from khaos.channels.models import ChannelType
+from khaos.channels.webhook import is_valid_generic_webhook_secret
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,7 @@ class ChannelRegistry:
             config = ChannelConfig(channel_type=channel_type)
         elif config.channel_type != channel_type:
             raise ValueError("channel config type does not match registered type")
+        self._validate_config(config)
         registered = RegisteredChannel(channel_id, channel_type, config, channel=channel)
         self._channels[channel_id] = registered
         return registered
@@ -100,10 +102,21 @@ class ChannelRegistry:
         channel = self.get(channel_id)
         if channel is None:
             return False
+        self._validate_config(channel.config)
         channel.config.enabled = True
         channel.health.status = ChannelStatus.ENABLED
         channel.health.consecutive_failures = 0
         return True
+
+    @staticmethod
+    def _validate_config(config: ChannelConfig) -> None:
+        if (
+            config.channel_type == ChannelType.WEBHOOK_IN
+            and not is_valid_generic_webhook_secret(config.secret)
+        ):
+            raise ValueError(
+                "generic webhook requires a high-entropy secret of at least 32 characters"
+            )
 
     def disable(self, channel_id: str) -> bool:
         channel = self.get(channel_id)
