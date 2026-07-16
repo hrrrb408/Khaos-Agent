@@ -51,3 +51,12 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
     assert "-m windows_fail_closed" in platform
     assert "KHAOS_RUN_PRODUCTION_SANDBOX" in docker
     assert "-m docker_sandbox_real" in docker
+
+    for required_contract in (
+        "test_webhook.py",
+        "test_channel_registry.py",
+        "test_m4_batch3_1_6_2_authority.py",
+        "test_process_supervisor.py",
+        "test_managed_process_lifecycle.py",
+    ):
+        assert required_contract in matrix
