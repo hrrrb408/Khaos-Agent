@@ -31,6 +31,7 @@ type WebhookRequest struct {
 	Platform  string            `json:"platform"`
 	ChannelID string            `json:"channel_id"`
 	Headers   map[string]string `json:"headers"`
+	Query     map[string]string `json:"query"`
 	Body      json.RawMessage   `json:"body"`
 }
 
