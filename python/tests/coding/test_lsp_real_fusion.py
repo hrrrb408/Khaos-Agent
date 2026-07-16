@@ -22,6 +22,7 @@ import os
 import shutil
 import sqlite3
 import sys
+from unittest.mock import AsyncMock
 from pathlib import Path
 
 import pytest
@@ -122,7 +123,10 @@ async def test_real_python_lsp_definition_fusion(tmp_path: Path):
         task_id="task", worktree_path=root, repository_root=repository,
         state=WorkspaceState.RUNNING,
     )
-    manager = SimpleNamespace(get=lambda wid: workspace if wid == "workspace" else None)
+    manager = SimpleNamespace(
+        get=lambda wid: workspace if wid == "workspace" else None,
+        verify_git_identity=AsyncMock(),
+    )
 
     async def spawn(context, temporary_home):
         process = await asyncio.create_subprocess_exec(

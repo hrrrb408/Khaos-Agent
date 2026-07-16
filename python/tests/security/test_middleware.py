@@ -1,4 +1,5 @@
 from khaos.security.middleware import SecurityMiddleware
+from khaos.security.sandbox import Sandbox, SandboxMode
 
 
 async def test_pre_check_safe_command():
@@ -80,3 +81,40 @@ async def test_disabled():
     assert pre.allowed is True
     assert post.has_secrets is False
     assert "abcd1234abcd1234" in str(output)
+
+
+async def test_workspace_write_sandbox_blocks_office_write_outside_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    middleware = SecurityMiddleware(
+        sandbox=Sandbox(SandboxMode.WORKSPACE_WRITE, workspace)
+    )
+
+    result = await middleware.pre_check(
+        "write_file", {"path": str(tmp_path / "outside.txt")}
+    )
+
+    assert result.allowed is False
+    assert result.check_type == "sandbox_path"
+
+
+async def test_workspace_write_sandbox_checks_copy_and_move_endpoints(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    middleware = SecurityMiddleware(
+        sandbox=Sandbox(SandboxMode.WORKSPACE_WRITE, workspace)
+    )
+
+    copy_result = await middleware.pre_check(
+        "copy_file", {"src": "inside.txt", "dst": str(tmp_path / "outside")}
+    )
+    move_result = await middleware.pre_check(
+        "move_file", {"src": str(tmp_path / "outside"), "dst": "inside.txt"}
+    )
+    relative_result = await middleware.pre_check(
+        "write_file", {"path": "inside.txt"}
+    )
+
+    assert copy_result.allowed is False
+    assert move_result.allowed is False
+    assert relative_result.allowed is True

@@ -278,6 +278,40 @@ async def test_supervisor_enforces_workspace_relative_entry_budget(tmp_path: Pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.skipif(
+    sys.platform not in {"darwin", "linux"},
+    reason="deleted-open-file accounting is POSIX platform-specific",
+)
+async def test_supervisor_accounts_deleted_but_open_workspace_file(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    baseline = capture_workspace_snapshot(workspace)
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    command = (
+        "import os,time; "
+        "fd=os.open('deleted.bin', os.O_CREAT|os.O_RDWR, 0o600); "
+        "os.unlink('deleted.bin'); os.write(fd, b'x' * 16384); "
+        "os.fsync(fd); time.sleep(30)"
+    )
+    request = ExecutionRequest(
+        (sys.executable, "-c", command),
+        workspace,
+        budget=ResourceBudget(workspace_bytes=4096),
+        correlation_id="workspace-deleted-open",
+    )
+
+    result = await supervisor.run(
+        request,
+        workspace_root=workspace,
+        workspace_baseline=baseline,
+    )
+
+    assert result.status == "resource-exhausted"
+    assert result.diagnostics["resource_violation"]["kind"] == "workspace-bytes"
+    assert not (workspace / "deleted.bin").exists()
+
+
+@pytest.mark.asyncio
 async def test_execution_service_terminate_reaches_foreground_process(
     tmp_path: Path,
 ):

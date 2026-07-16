@@ -44,6 +44,23 @@ def test_platform_profiles_are_network_denying(tmp_path: Path):
     assert "--unshare-net" in LinuxBubblewrapBackend().argv_prefix(tmp_path)
 
 
+def test_writable_platform_profiles_protect_git_pointer(tmp_path: Path):
+    pointer = tmp_path / ".git"
+    pointer.write_text("gitdir: /not-used\n", encoding="utf-8")
+
+    mac_profile = MacOSSandboxBackend().profile(tmp_path)
+    assert (
+        f'(deny file-write* (literal "{pointer.resolve()}"))'
+        in mac_profile
+    )
+    linux_argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
+    mounts = tuple(
+        linux_argv[index:index + 3]
+        for index in range(len(linux_argv) - 2)
+    )
+    assert ("--ro-bind", str(pointer.resolve()), "/workspace/.git") in mounts
+
+
 def test_read_only_platform_profiles_do_not_mount_workspace_writable(tmp_path: Path):
     mac_profile = MacOSSandboxBackend().profile(tmp_path, writable=False)
     assert f'(allow file-write* (subpath "{tmp_path.resolve()}"))' not in mac_profile
@@ -194,6 +211,9 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
     outside = host_root / "outside.txt"
     main_repo = host_root / "repository"
     workspace.mkdir()
+    (workspace / ".git").write_text(
+        "gitdir: /host/repository/.git/worktrees/task\n", encoding="utf-8"
+    )
     secret_root.mkdir()
     secret_file.write_text("host-secret", encoding="utf-8")
     main_repo.mkdir()
@@ -204,6 +224,9 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
         "from pathlib import Path",
         # 2. Worktree writable
         "Path('inside.txt').write_text('ok')",
+        "try: Path('.git').write_text('tampered')",
+        "except OSError: pass",
+        "else: raise SystemExit('.git pointer writable')",
         # 6. /tmp is a fresh controlled tmpfs — writable
         "assert Path('/tmp').is_dir()",
         "Path('/tmp/sandbox.tmp').write_text('tmp-ok')",
@@ -251,6 +274,7 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
 
     # 2. Worktree writable — evidence
     assert (workspace / "inside.txt").read_text(encoding="utf-8") == "ok"
+    assert (workspace / ".git").read_text(encoding="utf-8").startswith("gitdir: ")
     # 4. Outside write blocked
     assert not outside.exists()
     # 3. Main repo untouched
@@ -443,11 +467,23 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
     secret_file = secret_root / "token"
     outside = tmp_path / "outside.txt"
     workspace.mkdir()
+    (workspace / ".git").write_text(
+        "gitdir: /host/repository/.git/worktrees/task\n", encoding="utf-8"
+    )
     secret_root.mkdir()
     secret_file.write_text("host-secret", encoding="utf-8")
+    protected_pointer_names = (
+        (".git", ".GIT")
+        if (workspace / ".GIT").exists()
+        else (".git",)
+    )
     command = (
         "from pathlib import Path; import socket, subprocess; "
         "Path('inside.txt').write_text('ok'); "
+        f"\nfor pointer in tuple(Path(name) for name in {protected_pointer_names!r}):"
+        "\n try: pointer.write_text('tampered')"
+        "\n except OSError: pass"
+        "\n else: raise SystemExit(f'Git pointer writable: {pointer}')"
         f"\ntry: Path({str(outside)!r}).write_text('no')\nexcept OSError: pass\nelse: raise SystemExit('outside write allowed'); "
         "\ntry: socket.create_connection(('1.1.1.1', 53), timeout=1)\nexcept OSError: pass\nelse: raise SystemExit('network allowed')"
         f"\ntry: Path({str(secret_file)!r}).read_text()\nexcept OSError: pass\nelse: raise SystemExit('host secret readable')"
@@ -473,6 +509,7 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
         pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
     assert result.status == "passed", result.stderr
     assert (workspace / "inside.txt").read_text(encoding="utf-8") == "ok"
+    assert (workspace / ".git").read_text(encoding="utf-8").startswith("gitdir: ")
     assert not outside.exists()
 
 
