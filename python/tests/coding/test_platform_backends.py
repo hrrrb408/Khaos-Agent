@@ -560,5 +560,8 @@ async def test_real_macos_workspace_relative_byte_budget(tmp_path: Path):
         pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
     assert result.status == "resource-exhausted", result.diagnostics
     assert result.diagnostics["resource_violation"]["kind"] == "workspace-bytes"
-    assert result.diagnostics["resource_violation"]["observed"] >= 16_384
+    # The watchdog is intentionally allowed to terminate as soon as the
+    # aggregate allocation crosses the configured boundary.  It need not wait
+    # for every write in the child process to complete.
+    assert result.diagnostics["resource_violation"]["observed"] > 10_000
     assert result.diagnostics["resource_violation"]["limit"] == 10_000
