@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import inspect
@@ -30,6 +31,69 @@ logger = logging.getLogger(__name__)
 
 WEBHOOK_SIGNATURE_WINDOW_SECONDS = 300
 GENERIC_WEBHOOK_SECRET_MIN_LENGTH = 32
+
+
+@dataclass
+class _RateBucket:
+    tokens: float
+    last_fill: float
+    last_seen: float
+
+
+class WebhookRateLimiter:
+    """Bound verified webhook dispatch independently per integration."""
+
+    def __init__(
+        self,
+        *,
+        rate_per_minute: int = 60,
+        burst: int = 10,
+        max_integrations: int = 4096,
+        idle_seconds: float = 600.0,
+    ) -> None:
+        if min(rate_per_minute, burst, max_integrations) <= 0 or idle_seconds <= 0:
+            raise ValueError("webhook rate limit values must be positive")
+        self._rate = rate_per_minute / 60.0
+        self._burst = float(burst)
+        self._max_integrations = max_integrations
+        self._idle_seconds = idle_seconds
+        self._buckets: dict[str, _RateBucket] = {}
+        self._lock = asyncio.Lock()
+
+    async def allow(self, channel_id: str, platform: str, now: float) -> bool:
+        key = f"{platform}:{channel_id}"
+        async with self._lock:
+            self._buckets = {
+                item: bucket
+                for item, bucket in self._buckets.items()
+                if now - bucket.last_seen <= self._idle_seconds
+            }
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                if len(self._buckets) >= self._max_integrations:
+                    oldest = min(
+                        self._buckets,
+                        key=lambda item: self._buckets[item].last_seen,
+                    )
+                    del self._buckets[oldest]
+                bucket = _RateBucket(self._burst, now, now)
+                self._buckets[key] = bucket
+            elapsed = max(0.0, now - bucket.last_fill)
+            bucket.tokens = min(self._burst, bucket.tokens + elapsed * self._rate)
+            bucket.last_fill = now
+            bucket.last_seen = now
+            if bucket.tokens < 1.0:
+                return False
+            bucket.tokens -= 1.0
+            return True
+
+    async def refund(self, channel_id: str, platform: str) -> None:
+        """Return a reservation when a signed request is rejected as replay."""
+        key = f"{platform}:{channel_id}"
+        async with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is not None:
+                bucket.tokens = min(self._burst, bucket.tokens + 1.0)
 
 
 def is_valid_generic_webhook_secret(secret: str) -> bool:
@@ -103,6 +167,7 @@ class WebhookHandler:
         *,
         channel_id: str = "default",
         replay_guard: WebhookReplayGuard | None = None,
+        verified_limiter: WebhookRateLimiter | None = None,
         now: Callable[[], float] = time.time,
     ) -> None:
         self.platform = platform
@@ -110,6 +175,7 @@ class WebhookHandler:
         self.channel_id = channel_id
         self._on_message = on_message
         self._replay_guard = replay_guard or WebhookReplayGuard()
+        self._verified_limiter = verified_limiter
         self._now = now
 
     async def handle(
@@ -145,7 +211,16 @@ class WebhookHandler:
             logger.warning("webhook parse failed for %s: %s", self.platform.value, exc)
             return {"status": "parse_error", "error": str(exc)}
         replay_id = self._replay_id(raw, msg, verification.replay_hint)
-        if not replay_id or not await self._replay_guard.consume(
+        if not replay_id:
+            return {"status": "replay_error"}
+        reserved = False
+        if self._verified_limiter is not None:
+            reserved = await self._verified_limiter.allow(
+                self.channel_id, self.platform.value, self._now()
+            )
+            if not reserved:
+                return {"status": "rate_limited"}
+        if not await self._replay_guard.consume(
             self.channel_id,
             self.platform.value,
             replay_id,
@@ -153,6 +228,10 @@ class WebhookHandler:
             expires_at=verification.expires_at,
             now=self._now(),
         ):
+            if reserved and self._verified_limiter is not None:
+                await self._verified_limiter.refund(
+                    self.channel_id, self.platform.value
+                )
             return {"status": "replay_error"}
         if self._on_message is not None:
             callback_result = self._on_message(msg)

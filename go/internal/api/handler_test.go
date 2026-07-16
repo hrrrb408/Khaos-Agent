@@ -311,6 +311,36 @@ func TestRateLimit(t *testing.T) {
 	}
 }
 
+func TestAnonymousWebhookCannotExhaustAuthenticatedOrHealthBuckets(t *testing.T) {
+	agent := &mockChannelAgent{}
+	handler := NewHandler(
+		agent,
+		NewMemoryMap(),
+		NewMapConfig(map[string]any{}),
+		testAPIKey,
+		rate.NewTokenBucket(1, 1),
+	).Routes()
+
+	first := serveUnauthenticated(
+		handler, http.MethodPost, "/api/webhook/slack?channel_id=slack-a", `{}`,
+	)
+	if first.Code != http.StatusOK {
+		t.Fatalf("first webhook status=%d", first.Code)
+	}
+	second := serveUnauthenticated(
+		handler, http.MethodPost, "/api/webhook/slack?channel_id=slack-a", `{}`,
+	)
+	if second.Code != http.StatusTooManyRequests {
+		t.Fatalf("second webhook status=%d", second.Code)
+	}
+	if rec := serve(handler, http.MethodGet, "/api/config", "", testAPIKey); rec.Code != http.StatusOK {
+		t.Fatalf("authenticated API bucket was exhausted by webhook: %d", rec.Code)
+	}
+	if rec := serveUnauthenticated(handler, http.MethodGet, "/api/health", ""); rec.Code != http.StatusOK {
+		t.Fatalf("health bucket was exhausted by webhook: %d", rec.Code)
+	}
+}
+
 func TestAPIKeyIsHeaderOnly(t *testing.T) {
 	handler, _ := newTestHandler("gateway-key")
 	if rec := serveUnauthenticated(handler, http.MethodGet, "/api/config?key=gateway-key", ""); rec.Code != http.StatusUnauthorized {

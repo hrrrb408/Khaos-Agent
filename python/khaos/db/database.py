@@ -18,6 +18,7 @@ from khaos.agent.core import Message
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+TELEGRAM_REPLAY_WINDOW = 4096
 
 
 class _AsyncCursor:
@@ -124,6 +125,10 @@ class Database:
             return False
         conn = await self._require_conn()
         async with self._webhook_replay_lock:
+            if platform == "telegram":
+                return await self._consume_telegram_update(
+                    conn, channel_id, event_id
+                )
             now = time.time()
             await conn.execute(
                 "DELETE FROM webhook_replay_events "
@@ -140,6 +145,74 @@ class Database:
             )
             await conn.commit()
             return cursor.rowcount == 1
+
+    async def _consume_telegram_update(
+        self, conn: aiosqlite.Connection, channel_id: str, event_id: str
+    ) -> bool:
+        try:
+            update_id = int(event_id)
+        except (TypeError, ValueError):
+            return False
+        if update_id < 0:
+            return False
+        now = time.time()
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            cursor = await conn.execute(
+                "SELECT high_water, seen_json FROM webhook_replay_watermarks "
+                "WHERE channel_id = ? AND platform = 'telegram'",
+                (channel_id,),
+            )
+            row = await cursor.fetchone()
+            seen: set[int] = set()
+            high_water = -1
+            if row is not None:
+                high_water = int(row["high_water"])
+                seen = {int(value) for value in json.loads(row["seen_json"])}
+            else:
+                legacy = await conn.execute(
+                    "SELECT event_id FROM webhook_replay_events "
+                    "WHERE channel_id = ? AND platform = 'telegram' "
+                    "ORDER BY CAST(event_id AS INTEGER) DESC LIMIT ?",
+                    (channel_id, TELEGRAM_REPLAY_WINDOW),
+                )
+                for legacy_row in await legacy.fetchall():
+                    try:
+                        seen.add(int(legacy_row["event_id"]))
+                    except (TypeError, ValueError):
+                        continue
+                if seen:
+                    high_water = max(seen)
+            cutoff = high_water - TELEGRAM_REPLAY_WINDOW + 1
+            if update_id in seen or (high_water >= 0 and update_id < cutoff):
+                await conn.commit()
+                return False
+            high_water = max(high_water, update_id)
+            cutoff = high_water - TELEGRAM_REPLAY_WINDOW + 1
+            seen.add(update_id)
+            seen = {value for value in seen if value >= cutoff}
+            await conn.execute(
+                """
+                INSERT INTO webhook_replay_watermarks (
+                    channel_id, platform, high_water, seen_json, updated_at
+                ) VALUES (?, 'telegram', ?, ?, ?)
+                ON CONFLICT(channel_id, platform) DO UPDATE SET
+                    high_water = excluded.high_water,
+                    seen_json = excluded.seen_json,
+                    updated_at = excluded.updated_at
+                """,
+                (channel_id, high_water, json.dumps(sorted(seen)), now),
+            )
+            await conn.execute(
+                "DELETE FROM webhook_replay_events "
+                "WHERE channel_id = ? AND platform = 'telegram'",
+                (channel_id,),
+            )
+            await conn.commit()
+            return True
+        except Exception:
+            await conn.rollback()
+            raise
 
     async def insert_message(self, session_id: str, message: Message) -> int:
         """Persist a chat message and return its row id."""

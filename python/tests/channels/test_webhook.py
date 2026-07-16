@@ -11,6 +11,7 @@ from khaos.channels import (
     ChannelType,
     ContentType,
     WebhookHandler,
+    WebhookRateLimiter,
     WebhookReplayGuard,
 )
 from khaos.db import Database
@@ -278,3 +279,77 @@ async def test_telegram_update_id_replay_survives_runtime_restart(tmp_path):
     )
     assert (await restarted.handle(headers, body))["status"] == "replay_error"
     await restarted_db.close()
+
+
+@pytest.mark.asyncio
+async def test_verified_webhook_rate_limit_is_per_integration():
+    now = 1_700_000_000
+    clock = [now]
+    limiter = WebhookRateLimiter(rate_per_minute=1, burst=1)
+    headers = {"x-telegram-bot-api-secret-token": "telegram-secret"}
+
+    def body(update_id: int) -> bytes:
+        return json.dumps({
+            "update_id": update_id,
+            "message": {"message_id": update_id, "text": "run"},
+        }).encode()
+
+    primary = WebhookHandler(
+        ChannelType.TELEGRAM,
+        "telegram-secret",
+        channel_id="telegram-primary",
+        verified_limiter=limiter,
+        now=lambda: clock[0],
+    )
+    secondary = WebhookHandler(
+        ChannelType.TELEGRAM,
+        "different-secret",
+        channel_id="telegram-secondary",
+        verified_limiter=limiter,
+        now=lambda: clock[0],
+    )
+    assert (await primary.handle(headers, body(1)))["status"] == "ok"
+    assert (await primary.handle(headers, body(2)))["status"] == "rate_limited"
+    assert (
+        await secondary.handle(
+            {"x-telegram-bot-api-secret-token": "different-secret"}, body(3)
+        )
+    )["status"] == "ok"
+    clock[0] += 60
+    assert (await primary.handle(headers, body(2)))["status"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_telegram_replay_watermark_is_bounded(tmp_path, monkeypatch):
+    monkeypatch.setattr("khaos.db.database.TELEGRAM_REPLAY_WINDOW", 4)
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+
+    for update_id in range(10, 20):
+        assert await db.consume_webhook_event(
+            "telegram-primary", "telegram", str(update_id), 0.0, None
+        )
+    assert not await db.consume_webhook_event(
+        "telegram-primary", "telegram", "19", 0.0, None
+    )
+    assert not await db.consume_webhook_event(
+        "telegram-primary", "telegram", "10", 0.0, None
+    )
+
+    conn = await db._require_conn()
+    cursor = await conn.execute(
+        "SELECT high_water, seen_json FROM webhook_replay_watermarks "
+        "WHERE channel_id = ? AND platform = 'telegram'",
+        ("telegram-primary",),
+    )
+    row = await cursor.fetchone()
+    assert row["high_water"] == 19
+    assert json.loads(row["seen_json"]) == [16, 17, 18, 19]
+    legacy = await conn.execute(
+        "SELECT COUNT(*) AS count FROM webhook_replay_events "
+        "WHERE channel_id = ? AND platform = 'telegram'",
+        ("telegram-primary",),
+    )
+    assert (await legacy.fetchone())["count"] == 0
+    await db.close()
