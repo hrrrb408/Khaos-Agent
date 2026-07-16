@@ -35,10 +35,14 @@ bytes 与 filesystem entries，任一超过 `tmpfs_bytes` / `filesystem_entries`
 TaskWorkspace 另有固定创建时 baseline 的 aggregate storage authority。
 `workspace_bytes` 按去重 inode 的 allocated blocks 计算相对增长，`workspace_entries`
 按目录项净增长计算；rename 不增加预算，hardlink 只计算一次数据块但计算新增目录项。
-watchdog 双扫描应对并发写/rename，无法形成完整观察时 fail closed。任何 workspace
-storage violation 都必须终止执行并通过 WorkspaceManager 强制清理 disposable Worktree，
-不能留下超额文件，也不能把下一次执行时的现状重新当成 baseline。Docker 即使使用宿主
-bind mount，也必须启用该 host-side workspace watchdog。
+`WorkspaceStorageAuthority` 是唯一核算实现，由 WorkspaceManager 持有并注入
+ProcessSupervisor。write/patch/multi-edit/copy/move 与 journaled Planned Mutation 必须
+使用同一 authority；文件工具在 authority 下串行执行，
+修改后立即核算；超限时使用 identity-bound rollback，回滚对象被并发替换时不得覆盖，
+而是 quarantine。进程无论运行多久，退出后都必须执行最终 snapshot，快速退出不能绕过。
+snapshot 至少两次完整且 path/inode view 稳定；遍历错误、不可读目录、root identity 漂移
+或持续 rename/delete churn 全部 fail closed。无法安全回滚的 violation 必须强制清理
+disposable Worktree；清理失败时保持 FAILED。Docker bind mount 也必须使用该 authority。
 
 Linux backend 的 capability probe 与真实执行必须使用同一 bwrap mount/namespace
 拓扑：宿主 `/` 只读、独立 `/dev`、新 `/proc`、受控 `/tmp`、唯一 workspace bind，

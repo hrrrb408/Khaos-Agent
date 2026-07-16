@@ -304,17 +304,8 @@ async def test_execution_service_force_cleans_over_budget_workspace():
         def __init__(self) -> None:
             self.cleaned: tuple[str, bool] | None = None
 
-        async def transition(
-            self, workspace_id: str, target
-        ) -> WorkspaceTransition:
-            assert workspace_id == "workspace"
-            assert target.value == "failed"
-            return WorkspaceTransition.UPDATED
-
-        async def cleanup(
-            self, workspace_id: str, *, force: bool = False
-        ) -> WorkspaceTransition:
-            self.cleaned = (workspace_id, force)
+        async def quarantine(self, workspace_id: str) -> WorkspaceTransition:
+            self.cleaned = (workspace_id, True)
             return WorkspaceTransition.UPDATED
 
     manager = WorkspaceManager()

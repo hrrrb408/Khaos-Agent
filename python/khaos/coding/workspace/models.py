@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
-from khaos.coding.workspace.storage import WorkspaceStorageSnapshot
+from khaos.coding.workspace.storage import (
+    WorkspaceStorageLimits,
+    WorkspaceStorageSnapshot,
+)
 
 
 class WorkspaceState(str, Enum):
@@ -48,6 +51,9 @@ class TaskWorkspace:
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     recovery_root: Path | None = None
     storage_baseline: WorkspaceStorageSnapshot | None = None
+    storage_limits: WorkspaceStorageLimits = field(
+        default_factory=WorkspaceStorageLimits
+    )
 
 
 @dataclass(frozen=True)

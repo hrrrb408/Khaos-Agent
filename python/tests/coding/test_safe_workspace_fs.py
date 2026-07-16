@@ -9,6 +9,9 @@ from khaos.coding.workspace.boundary import (
     SafeWorkspaceFS,
     WorkspaceBoundaryError,
 )
+from khaos.coding.workspace.manager import WorkspaceManager
+from khaos.coding.workspace.models import TaskWorkspace, WorkspaceState
+from khaos.coding.workspace.storage import capture_workspace_snapshot
 from khaos.tools.file_tools import (
     copy_file,
     file_search_content,
@@ -27,6 +30,26 @@ pytestmark = pytest.mark.skipif(
     sys.platform == "win32",
     reason="dirfd/O_NOFOLLOW workspace capability is POSIX-only",
 )
+
+
+def _workspace_manager(root):
+    manager = WorkspaceManager(root=root.parent / "managed-worktrees")
+    workspace = TaskWorkspace(
+        id="ws",
+        task_id="task",
+        repository_root=root.parent,
+        worktree_path=root,
+        base_ref="HEAD",
+        base_sha="base",
+        branch_name="task/test",
+        state=WorkspaceState.READY,
+        writable_roots=(root,),
+        storage_baseline=capture_workspace_snapshot(root),
+        storage_limits=manager.storage_limits,
+    )
+    manager._workspaces[workspace.id] = workspace
+    manager._task_ids.add(workspace.task_id)
+    return manager
 
 
 def test_safe_workspace_fs_atomic_create_update_and_read(tmp_path):
@@ -68,8 +91,7 @@ def test_safe_workspace_fs_rejects_traversal_symlink_and_hardlink(tmp_path):
 
 
 async def test_coding_file_tools_share_safe_workspace_capability(tmp_path):
-    workspace = SimpleNamespace(task_id="task", worktree_path=tmp_path)
-    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "ws" else None)
+    manager = _workspace_manager(tmp_path)
     context = {"workspace_manager": manager, "task_id": "task", "workspace_id": "ws"}
 
     assert (await write_file("a.txt", "alpha beta", **context))["bytes"] == 10
@@ -88,8 +110,7 @@ async def test_coding_file_tools_reject_symlink_parent(tmp_path):
     outside = tmp_path.parent / f"{tmp_path.name}-outside-tools"
     outside.mkdir()
     (tmp_path / "link").symlink_to(outside, target_is_directory=True)
-    workspace = SimpleNamespace(task_id="task", worktree_path=tmp_path)
-    manager = SimpleNamespace(get=lambda _workspace_id: workspace)
+    manager = _workspace_manager(tmp_path)
     with pytest.raises(WorkspaceBoundaryError):
         await write_file(
             "link/escape.txt", "blocked", workspace_manager=manager,

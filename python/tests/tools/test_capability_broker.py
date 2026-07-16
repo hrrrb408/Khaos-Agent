@@ -17,3 +17,16 @@ async def test_filesystem_write_requires_task_workspace():
     registry.register(ToolDefinition("write_file", "", {"type": "object"}, ["coding"], "write", False, handler=lambda: None))
     with pytest.raises(PermissionError, match="TaskWorkspace"):
         await ToolInvocationBroker(registry).invoke("write_file", mode="coding", context={})
+
+
+@pytest.mark.asyncio
+async def test_workspace_ids_cannot_replace_workspace_authority():
+    registry = ToolRegistry(enforce_capabilities=True)
+    registry.register(ToolDefinition("write_file", "", {"type": "object"}, ["coding"], "write", False, handler=lambda: None))
+
+    with pytest.raises(PermissionError, match="TaskWorkspace"):
+        await ToolInvocationBroker(registry).invoke(
+            "write_file",
+            mode="coding",
+            context={"task_id": "forged", "workspace_id": "forged"},
+        )

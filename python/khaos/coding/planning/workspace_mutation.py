@@ -159,6 +159,12 @@ class WorkspaceMutationEngine:
             )
 
         plan, workspace = self._validate_scope(context, normalized)
+        initial_storage_violation = self._storage_violation(workspace)
+        if initial_storage_violation is not None:
+            raise WorkspaceMutationError(
+                str(initial_storage_violation["kind"]),
+                "TaskWorkspace storage authority rejected initial state",
+            )
         now = time.time()
         run = PlanExecutionRun(
             execution_run_id=f"per_{uuid.uuid4().hex}",
@@ -249,6 +255,13 @@ class WorkspaceMutationEngine:
                 self._store.update_edit_event(
                     run.execution_run_id, edit.edit_id, status="applied",
                     after_hash=after_hash or "", after_mode=after_mode,
+                )
+
+            storage_violation = self._storage_violation(workspace)
+            if storage_violation is not None:
+                raise WorkspaceMutationError(
+                    str(storage_violation["kind"]),
+                    "planned mutation exceeded TaskWorkspace storage authority",
                 )
 
             self._guard.require_active_execution_context(context)
@@ -342,11 +355,15 @@ class WorkspaceMutationEngine:
                     target="failed", failure_code=code, completed=True,
                 )
                 raise
-            self._rollback(
-                run.execution_run_id, root, recovery,
-                workspace.id, failure_code=code,
-                poison_after=(code == "unexpected-workspace-mutation"),
-            )
+            try:
+                self._rollback(
+                    run.execution_run_id, root, recovery,
+                    workspace.id, failure_code=code,
+                    poison_after=(code == "unexpected-workspace-mutation"),
+                )
+            finally:
+                if self._storage_violation(workspace) is not None:
+                    workspace.state = WorkspaceState.FAILED
             raise
         finally:
             self._active_phase = None
@@ -425,6 +442,23 @@ class WorkspaceMutationEngine:
                         "cross-writable-root", "rename crosses writable roots"
                     )
         return plan, workspace
+
+    def _storage_violation(self, workspace: Any) -> dict[str, object] | None:
+        """Use the WorkspaceManager authority for planned mutations too."""
+        authority = getattr(self._workspaces, "storage_authority", None)
+        baseline = getattr(workspace, "storage_baseline", None)
+        limits = getattr(workspace, "storage_limits", None)
+        if authority is None or baseline is None or limits is None:
+            return {
+                "kind": "workspace-observation",
+                "observed": "authority-unavailable",
+                "limit": "authority-required",
+            }
+        return authority.assess(
+            workspace.worktree_path,
+            baseline,
+            limits,
+        )
 
     def _validate_edit_against_plan(self, plan: Any, edit: PlannedFileEdit) -> None:
         steps = {step.step_id: step for step in plan.steps}
