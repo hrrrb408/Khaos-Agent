@@ -128,7 +128,7 @@ class MacOSSandboxBackend:
                 script = "\n".join(
                     (
                         "from pathlib import Path",
-                        "import socket",
+                        "import socket, subprocess",
                         "Path('inside.txt').write_text('ok')",
                         f"try: Path({str(outside)!r}).write_text('denied')",
                         "except OSError: pass",
@@ -136,6 +136,11 @@ class MacOSSandboxBackend:
                         "try: socket.create_connection(('1.1.1.1', 53), timeout=0.2)",
                         "except OSError: pass",
                         "else: raise SystemExit('network allowed')",
+                        "for command in (('/usr/bin/pbpaste',), "
+                        "('/usr/bin/security', 'list-keychains')):",
+                        "    result = subprocess.run(command, capture_output=True)",
+                        "    if result.returncode == 0:",
+                        "        raise SystemExit(f'host IPC allowed: {command[0]}')",
                     )
                 )
                 completed = subprocess.run(
@@ -227,6 +232,10 @@ class MacOSSandboxBackend:
             f'(allow file-write* (subpath "{_seatbelt_escape(path)}"))'
             for path in write_roots
         )
+        mach_lookup_rules = "".join(
+            f'(allow mach-lookup (global-name "{service}"))'
+            for service in _macos_runtime_mach_services()
+        )
         # unreadable_roots are deliberately not represented as deny exceptions:
         # deny-default plus the positive allowlist makes all non-runtime host
         # paths invisible, including credential roots not known in advance.
@@ -235,12 +244,13 @@ class MacOSSandboxBackend:
             "(version 1)(deny default)(allow process-exec process-fork)",
             "(allow signal (target same-sandbox))",
             "(allow process-info* (target same-sandbox))",
-            "(allow sysctl-read)(allow mach-lookup)(allow file-read-metadata)",
+            "(allow sysctl-read)(allow file-read-metadata)",
             '(allow file-read* (literal "/"))',
             '(allow file-read* file-write-data (literal "/dev/null"))',
             '(allow file-read* (literal "/dev/random"))',
             '(allow file-read* (literal "/dev/urandom"))',
             read_rules, literal_reads, executable_map_rules, write_rules,
+            mach_lookup_rules,
             "(deny network*)",
         ))
 
@@ -275,7 +285,10 @@ class MacOSSandboxBackend:
             supervisor = self.supervisor or ProcessSupervisor()
             self.supervisor = supervisor
             return await supervisor.run(
-                sandboxed, cwd=request.cwd.resolve(), env=environment
+                sandboxed,
+                cwd=request.cwd.resolve(),
+                env=environment,
+                tmp_root=sandbox_tmp,
             )
 
     async def terminate(self, execution_id: str) -> None:
@@ -519,6 +532,11 @@ def _macos_literal_read_files() -> tuple[Path, ...]:
             Path("/etc/localtime"),
         ) if path.exists()
     )
+
+
+def _macos_runtime_mach_services() -> tuple[str, ...]:
+    """Minimal lookup needed for libc account/group resolution."""
+    return ("com.apple.system.opendirectoryd.libinfo",)
 
 
 def _linux_runtime_read_roots(

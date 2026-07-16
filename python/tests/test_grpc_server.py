@@ -16,6 +16,7 @@ from khaos.grpc_server import (
     ChatRequest,
     ConfirmRequest,
     GatewayRPCAuthenticator,
+    _load_rpc_capability,
     _parse_json_line,
     load_router_from_config,
     MemoryService,
@@ -223,13 +224,14 @@ async def test_memory_service_crud_search(tmp_path):
     await db.close()
 
 
-async def test_json_line_server_chat(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="Unix peer credentials require a UDS")
+async def test_json_line_server_authenticates_real_peer_credentials(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
     (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
     import asyncio
 
-    socket_parent = Path("/tmp") / f"khaos-test-{uuid.uuid4().hex}"
+    socket_parent = Path("/tmp") / f"krpc-{uuid.uuid4().hex[:12]}"
     socket_parent.mkdir(mode=0o700)
     socket_path = socket_parent / "agent.sock"
     task = asyncio.create_task(
@@ -238,14 +240,33 @@ async def test_json_line_server_chat(tmp_path):
             project_root=tmp_path, gateway_capability="c" * 48,
         )
     )
-    await asyncio.sleep(0.01)
-    task.cancel()
+    for _ in range(100):
+        if socket_path.exists() or task.done():
+            break
+        await asyncio.sleep(0.01)
     try:
-        await task
-    except PermissionError:
-        pytest.skip("sandbox does not allow binding Unix sockets")
-    except asyncio.CancelledError:
-        pass
+        if task.done():
+            await task
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+        request = _signed_rpc_request("ChannelService.List", {})
+        writer.write((json.dumps(request) + "\n").encode("utf-8"))
+        await writer.drain()
+        response = json.loads((await reader.readline()).decode("utf-8"))
+        assert isinstance(response, dict)
+        assert isinstance(response.get("channels"), list)
+        assert all("id" in channel for channel in response["channels"])
+        writer.close()
+        await writer.wait_closed()
+    except (PermissionError, OSError) as exc:
+        pytest.skip(f"sandbox does not allow a peer-credential UDS: {exc}")
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, OSError, PermissionError):
+            pass
+        if socket_parent.exists():
+            socket_parent.rmdir()
 
 
 def _signed_rpc_request(method: str, payload: dict, *, nonce: str = "n" * 32):
@@ -257,12 +278,17 @@ def _signed_rpc_request(method: str, payload: dict, *, nonce: str = "n" * 32):
     digest = hashlib.sha256(canonical).hexdigest()
     principal = str(payload.get("principal_id") or "gateway")
     signed = f"{method}\n{nonce}\n{issued_at}\n{principal}\n{digest}".encode()
+    method_key = hmac.new(
+        capability.encode(),
+        f"khaos-rpc-method-v1\n{method}".encode(),
+        hashlib.sha256,
+    ).digest()
     return {
         "method": method, "payload": payload,
         "auth": {
             "nonce": nonce, "issued_at": issued_at,
             "principal_id": principal, "payload_digest": digest,
-            "mac": hmac.new(capability.encode(), signed, hashlib.sha256).hexdigest(),
+            "mac": hmac.new(method_key, signed, hashlib.sha256).hexdigest(),
         },
     }
 
@@ -291,6 +317,41 @@ def test_rpc_capability_is_method_payload_principal_and_nonce_bound():
     wrong_method["method"] = "MemoryService.SetMemory"
     with pytest.raises(PermissionError, match="method capability"):
         authenticator.authenticate(wrong_method)
+
+
+def test_rpc_authentication_binds_first_valid_gateway_pid():
+    authenticator = GatewayRPCAuthenticator("c" * 48)
+    first = _signed_rpc_request("TaskService.List", {}, nonce="p" * 32)
+    assert authenticator.authenticate(first, peer_pid=1001) == "gateway"
+    second = _signed_rpc_request("TaskService.List", {}, nonce="q" * 32)
+    with pytest.raises(PermissionError, match="bound Gateway"):
+        authenticator.authenticate(second, peer_pid=1002)
+
+
+def test_rpc_capability_loads_protected_file_and_rejects_default_env(tmp_path, monkeypatch):
+    capability_file = tmp_path / "rpc-capability"
+    capability_file.write_text("0123456789abcdef0123456789abcdef\n", encoding="utf-8")
+    capability_file.chmod(0o600)
+    monkeypatch.setenv("KHAOS_PYTHON_CAPABILITY_FILE", str(capability_file))
+    monkeypatch.setenv("KHAOS_PYTHON_CAPABILITY", "e" * 48)
+    monkeypatch.delenv("KHAOS_ALLOW_LEGACY_CAPABILITY_ENV", raising=False)
+    assert _load_rpc_capability() == "0123456789abcdef0123456789abcdef"
+
+    monkeypatch.delenv("KHAOS_PYTHON_CAPABILITY_FILE")
+    with pytest.raises(PermissionError, match="inherited value or protected"):
+        _load_rpc_capability()
+
+
+def test_rpc_capability_rejects_symlink(tmp_path, monkeypatch):
+    capability_file = tmp_path / "rpc-capability"
+    capability_file.write_text("c" * 48, encoding="utf-8")
+    capability_file.chmod(0o600)
+    capability_link = tmp_path / "rpc-capability-link"
+    capability_link.symlink_to(capability_file)
+    monkeypatch.setenv("KHAOS_PYTHON_CAPABILITY_FILE", str(capability_link))
+
+    with pytest.raises(PermissionError, match="must not be a symlink"):
+        _load_rpc_capability()
 
 
 def test_parse_json_line_accepts_object_request():

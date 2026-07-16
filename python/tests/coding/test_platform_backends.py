@@ -81,6 +81,10 @@ def test_macos_profile_uses_positive_read_allowlist(tmp_path: Path):
     assert "(allow file-read*)" not in profile
     assert str(workspace.resolve()) in profile
     assert str(Path.home()) not in profile
+    assert "(allow mach-lookup)" not in profile
+    assert "com.apple.pboard" not in profile
+    assert "com.apple.securityd" not in profile
+    assert "com.apple.system.opendirectoryd.libinfo" in profile
 
 
 def test_user_home_executable_never_exposes_entire_home(tmp_path: Path):
@@ -362,11 +366,14 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
     secret_root.mkdir()
     secret_file.write_text("host-secret", encoding="utf-8")
     command = (
-        "from pathlib import Path; import socket; "
+        "from pathlib import Path; import socket, subprocess; "
         "Path('inside.txt').write_text('ok'); "
         f"\ntry: Path({str(outside)!r}).write_text('no')\nexcept OSError: pass\nelse: raise SystemExit('outside write allowed'); "
         "\ntry: socket.create_connection(('1.1.1.1', 53), timeout=1)\nexcept OSError: pass\nelse: raise SystemExit('network allowed')"
         f"\ntry: Path({str(secret_file)!r}).read_text()\nexcept OSError: pass\nelse: raise SystemExit('host secret readable')"
+        "\nfor ipc_command in (('/usr/bin/pbpaste',), ('/usr/bin/security', 'list-keychains')):"
+        "\n result = subprocess.run(ipc_command, capture_output=True)"
+        "\n if result.returncode == 0: raise SystemExit(f'host IPC allowed: {ipc_command[0]}')"
     )
     result = await MacOSSandboxBackend().execute(
         ExecutionRequest(

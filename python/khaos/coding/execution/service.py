@@ -216,13 +216,17 @@ class ExecutionService:
                     stderr=asyncio.subprocess.PIPE, start_new_session=True,
                     preexec_fn=resource_limit_preexec(request.budget),
                 )
-                await self.process_supervisor.register_process(
-                    execution_id, process
+                watchdog = await self.process_supervisor.register_process(
+                    execution_id,
+                    process,
+                    budget=request.budget,
+                    tmp_root=temporary_tmp,
                 )
                 handle = ManagedProcessHandle(
                     execution_id, process, temporary_home=temporary_home,
                     stderr_limit=request.budget.output_bytes,
                     supervisor=self.process_supervisor,
+                    resource_watchdog=watchdog,
                 )
         except Exception:
             import shutil

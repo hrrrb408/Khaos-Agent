@@ -181,6 +181,32 @@ async def test_supervisor_terminates_process_tree_on_budget_violation(
 
 
 @pytest.mark.asyncio
+async def test_supervisor_enforces_synthetic_tmp_capacity(tmp_path: Path):
+    sandbox_tmp = tmp_path / "synthetic-tmp"
+    sandbox_tmp.mkdir()
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    request = ExecutionRequest(
+        (
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys,time; "
+            "Path(sys.argv[1]).write_bytes(b'x' * 8192); time.sleep(30)",
+            str(sandbox_tmp / "payload"),
+        ),
+        tmp_path,
+        budget=ResourceBudget(tmpfs_bytes=4096),
+        correlation_id="tmp-capacity",
+    )
+
+    result = await supervisor.run(request, tmp_root=sandbox_tmp)
+
+    assert result.status == "resource-exhausted"
+    assert result.diagnostics["resource_violation"] == {
+        "kind": "tmpfs", "observed": 8192, "limit": 4096,
+    }
+
+
+@pytest.mark.asyncio
 async def test_execution_service_terminate_reaches_foreground_process(
     tmp_path: Path,
 ):

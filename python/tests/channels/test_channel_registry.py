@@ -1,4 +1,6 @@
-from khaos.channels import ChannelRegistry, ChannelStatus, ChannelType
+import pytest
+
+from khaos.channels import ChannelConfig, ChannelRegistry, ChannelStatus, ChannelType
 
 
 def test_registry_lifecycle_and_health():
@@ -19,3 +21,21 @@ def test_registry_lifecycle_and_health():
     assert registry.get_health_report()[0]["healthy"]
     assert registry.unregister("tg")
     assert not registry.unregister("missing")
+
+
+def test_generic_webhook_requires_high_entropy_secret_to_register_or_enable():
+    registry = ChannelRegistry()
+    with pytest.raises(ValueError, match="at least 32"):
+        registry.register("generic", ChannelType.WEBHOOK_IN)
+    channel = registry.register(
+        "generic",
+        ChannelType.WEBHOOK_IN,
+        ChannelConfig(
+            ChannelType.WEBHOOK_IN,
+            enabled=False,
+            secret="0123456789abcdef0123456789abcdef",
+        ),
+    )
+    channel.config.secret = ""
+    with pytest.raises(ValueError, match="at least 32"):
+        registry.enable("generic")

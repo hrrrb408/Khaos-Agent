@@ -15,6 +15,7 @@ import os
 import socket
 import stat
 import struct
+import sys
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -28,7 +29,13 @@ from khaos.agent.error_handler import ErrorHandler
 from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
-from khaos.channels import ChannelRegistry, ChannelType, PlatformMessage, WebhookHandler
+from khaos.channels import (
+    ChannelRegistry,
+    ChannelType,
+    PlatformMessage,
+    WebhookHandler,
+    WebhookReplayGuard,
+)
 from khaos.db import Database
 from khaos.memory import (
     Memory,
@@ -58,23 +65,79 @@ RPC_MAX_REQUEST_BYTES = 1024 * 1024
 RPC_AUTH_WINDOW_SECONDS = 30
 
 
+def _load_rpc_capability() -> str:
+    path_value = os.environ.get("KHAOS_PYTHON_CAPABILITY_FILE", "").strip()
+    if path_value:
+        path = Path(path_value).expanduser()
+        if not path.is_absolute():
+            raise PermissionError("RPC capability file path must be absolute")
+        entry = path.lstat()
+        if stat.S_ISLNK(entry.st_mode):
+            raise PermissionError("RPC capability file must not be a symlink")
+        if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.getuid():
+            raise PermissionError("RPC capability file must be an owner-held regular file")
+        mode = stat.S_IMODE(entry.st_mode)
+        is_container_secret = str(path).startswith("/run/secrets/")
+        if (is_container_secret and mode & 0o222) or (
+            not is_container_secret and mode & 0o077
+        ):
+            raise PermissionError("RPC capability file permissions are unsafe")
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (entry.st_dev, entry.st_ino):
+                raise PermissionError("RPC capability file identity changed")
+            content = os.read(fd, 4097)
+        finally:
+            os.close(fd)
+        final = path.lstat()
+        if (final.st_dev, final.st_ino) != (entry.st_dev, entry.st_ino):
+            raise PermissionError("RPC capability file identity changed")
+        if len(content) > 4096:
+            raise PermissionError("RPC capability file is too large")
+        capability = content.decode("utf-8").strip()
+    elif os.environ.get("KHAOS_ALLOW_LEGACY_CAPABILITY_ENV") == "1":
+        capability = os.environ.get("KHAOS_PYTHON_CAPABILITY", "")
+    else:
+        raise PermissionError(
+            "RPC capability requires an inherited value or protected capability file"
+        )
+    if len(capability) < 32:
+        raise PermissionError("RPC capability must contain at least 32 characters")
+    return capability
+
+
 class GatewayRPCAuthenticator:
     """Verify peer UID and one-shot, method-scoped Gateway capabilities."""
 
-    def __init__(self, capability: str, *, expected_uid: int | None = None) -> None:
+    def __init__(
+        self,
+        capability: str,
+        *,
+        expected_uid: int | None = None,
+        expected_pid: int | None = None,
+    ) -> None:
         if len(capability) < 32:
             raise ValueError("Gateway RPC capability must contain at least 32 characters")
         self._key = capability.encode("utf-8")
         self._expected_uid = os.getuid() if expected_uid is None else expected_uid
+        self._expected_pid = expected_pid
+        self._bound_pid: int | None = None
         self._used_nonces: dict[str, float] = {}
 
-    def verify_peer(self, writer: asyncio.StreamWriter) -> None:
+    def verify_peer(self, writer: asyncio.StreamWriter) -> int:
         peer = writer.get_extra_info("socket")
         if peer is None:
             raise PermissionError("RPC peer socket identity is unavailable")
         peer = getattr(peer, "_sock", peer)
+        peer_pid: int | None = None
         if hasattr(peer, "getpeereid"):
             peer_uid, _peer_gid = peer.getpeereid()
+            if sys.platform == "darwin":
+                peer_pid = struct.unpack(
+                    "=i",
+                    peer.getsockopt(getattr(socket, "SOL_LOCAL", 0), 2, 4),
+                )[0]
         elif hasattr(socket, "LOCAL_PEERCRED"):
             credentials = peer.getsockopt(
                 getattr(socket, "SOL_LOCAL", 0), socket.LOCAL_PEERCRED, 128
@@ -82,17 +145,27 @@ class GatewayRPCAuthenticator:
             if len(credentials) < 8:
                 raise PermissionError("RPC peer credentials are truncated")
             _version, peer_uid = struct.unpack_from("=II", credentials)
+            if sys.platform == "darwin":
+                peer_pid = struct.unpack(
+                    "=i",
+                    peer.getsockopt(getattr(socket, "SOL_LOCAL", 0), 2, 4),
+                )[0]
         elif hasattr(socket, "SO_PEERCRED"):
             credentials = peer.getsockopt(
                 socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
             )
-            _pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
+            peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
         else:
             raise PermissionError("RPC peer credentials are unsupported")
         if peer_uid != self._expected_uid:
             raise PermissionError("RPC peer UID is not the configured Gateway UID")
+        if peer_pid is None or peer_pid <= 0:
+            raise PermissionError("RPC peer PID is unavailable")
+        if self._expected_pid is not None and peer_pid != self._expected_pid:
+            raise PermissionError("RPC peer PID is not the configured Gateway PID")
+        return peer_pid
 
-    def authenticate(self, request: dict) -> str:
+    def authenticate(self, request: dict, *, peer_pid: int | None = None) -> str:
         method = str(request.get("method") or "")
         payload = request.get("payload", {})
         auth = request.get("auth")
@@ -120,12 +193,22 @@ class GatewayRPCAuthenticator:
         signed = (
             f"{method}\n{nonce}\n{issued_at}\n{principal_id}\n{payload_digest}"
         ).encode("utf-8")
-        expected_mac = hmac.new(self._key, signed, hashlib.sha256).hexdigest()
+        method_key = hmac.new(
+            self._key,
+            f"khaos-rpc-method-v1\n{method}".encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+        expected_mac = hmac.new(method_key, signed, hashlib.sha256).hexdigest()
         if not hmac.compare_digest(mac, expected_mac):
             raise PermissionError("RPC method capability is invalid")
         claimed_principal = str(payload.get("principal_id") or "")
         if claimed_principal and claimed_principal != principal_id:
             raise PermissionError("RPC payload principal is not transport-bound")
+        if peer_pid is not None:
+            if self._bound_pid is None:
+                self._bound_pid = peer_pid
+            elif peer_pid != self._bound_pid:
+                raise PermissionError("RPC peer PID does not match the bound Gateway")
         self._used_nonces[nonce] = float(issued_at)
         cutoff = now - RPC_AUTH_WINDOW_SECONDS
         self._used_nonces = {
@@ -169,6 +252,7 @@ class AgentService:
         self.cron_engine = CronEngine(db=db, executor=self._execute_scheduled_prompt)
         set_cron_engine(self.cron_engine)
         self.channel_registry = ChannelRegistry()
+        self._webhook_replay_guard = WebhookReplayGuard()
         set_channel_registry(self.channel_registry)
         # Security policy loaded once (not per chat call) and cached; rebuild
         # the middleware stack from it for every runtime.
@@ -249,6 +333,7 @@ class AgentService:
             channel_type,
             secret=channel.config.secret,
             on_message=lambda message: self._on_webhook_message(channel_id, message),
+            replay_guard=self._webhook_replay_guard,
         )
         return await handler.handle(headers, body.encode("utf-8"))
 
@@ -541,11 +626,14 @@ async def serve_json_lines(
     router=None,
     gateway_capability: str | None = None,
     gateway_uid: int | None = None,
+    gateway_pid: int | None = None,
 ) -> None:
     """Serve the privileged JSON-line control plane over a mode-0600 UDS."""
     uds_path = Path(socket_path).expanduser().resolve()
-    capability = gateway_capability or os.environ.get("KHAOS_PYTHON_CAPABILITY", "")
-    authenticator = GatewayRPCAuthenticator(capability, expected_uid=gateway_uid)
+    capability = gateway_capability or _load_rpc_capability()
+    authenticator = GatewayRPCAuthenticator(
+        capability, expected_uid=gateway_uid, expected_pid=gateway_pid
+    )
     uds_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     parent_stat = uds_path.parent.stat()
     if parent_stat.st_uid != os.getuid() or stat.S_IMODE(parent_stat.st_mode) != 0o700:
@@ -571,7 +659,7 @@ async def serve_json_lines(
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             try:
-                authenticator.verify_peer(writer)
+                peer_pid = authenticator.verify_peer(writer)
             except PermissionError:
                 return
             line = await reader.readline()
@@ -599,7 +687,7 @@ async def serve_json_lines(
                 await writer.drain()
                 return
             try:
-                principal_id = authenticator.authenticate(request)
+                principal_id = authenticator.authenticate(request, peer_pid=peer_pid)
             except PermissionError as exc:
                 writer.write((json.dumps({
                     "error": "unauthenticated", "message": str(exc),

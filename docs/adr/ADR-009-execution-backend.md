@@ -26,6 +26,9 @@ stdout/stderr 必须在进程运行期间并发 drain，各自取得总输出预
 抢占全部内存或 pipe 回压死锁。超限字节只计数并丢弃，返回 dropped-byte diagnostics；
 不得把未截断完整输出写入宿主 artifact 形成配额旁路。Docker backend 仅负责容器策略
 和清理，不再拥有另一套 communicate/截断实现。
+前台与 managed/LSP 进程共用 aggregate process-group PID/memory watchdog；
+macOS 合成 TMP 由同一 watchdog 统计 regular-file bytes，超过 `tmpfs_bytes`
+即终止整个 process group。
 
 Linux backend 的 capability probe 与真实执行必须使用同一 bwrap mount/namespace
 拓扑：宿主 `/` 只读、独立 `/dev`、新 `/proc`、受控 `/tmp`、唯一 workspace bind，
@@ -34,7 +37,9 @@ cwd 相对 worktree 的路径确定，越界直接拒绝。probe 的 timeout、O
 转换为 unavailable；selector 对 read-only 和 workspace-write 一律 fail closed。
 
 macOS selector 同样必须实际启动 `/usr/bin/sandbox-exec`，证明 workspace write 成功、
-workspace 外 write 失败且 network 失败后才返回 backend；只检查可执行文件存在不构成
+workspace 外 write、network、pasteboard 与 Keychain IPC 失败后才返回 backend。
+Seatbelt 不得使用全局 `allow mach-lookup`，只允许显式的最小运行时 service
+allowlist；只检查可执行文件存在不构成
 capability。Windows 在没有受支持的 OS 强制 backend 前显式返回 unsupported，并在错误
 中保留平台原因，未知平台同样拒绝。
 

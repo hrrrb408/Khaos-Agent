@@ -148,7 +148,9 @@ func (c PythonClient) writeRequest(conn net.Conn, method string, payload any) er
 	}
 	payloadDigest := hex.EncodeToString(digest[:])
 	signed := fmt.Sprintf("%s\n%s\n%d\n%s\n%s", method, nonce, issuedAt, principalID, payloadDigest)
-	mac := hmac.New(sha256.New, []byte(c.Capability))
+	methodKey := hmac.New(sha256.New, []byte(c.Capability))
+	_, _ = methodKey.Write([]byte("khaos-rpc-method-v1\n" + method))
+	mac := hmac.New(sha256.New, methodKey.Sum(nil))
 	_, _ = mac.Write([]byte(signed))
 	return json.NewEncoder(conn).Encode(map[string]any{
 		"method": method, "payload": normalized,

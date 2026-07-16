@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,7 +52,6 @@ func main() {
 	if defaultPythonAgent == "" {
 		defaultPythonAgent = fmt.Sprintf("/tmp/khaos-%d/agent.sock", os.Getuid())
 	}
-	pythonCapability := os.Getenv("KHAOS_PYTHON_CAPABILITY")
 	addr := flag.String("addr", "127.0.0.1:8080", "listen address")
 	apiKey := flag.String("api-key", defaultAPIKey, "X-Khaos-Key value")
 	apiKeyFile := flag.String("api-key-file", defaultAPIKeyFile, "path to the mode-0600 local gateway token")
@@ -61,15 +61,20 @@ func main() {
 	mockAgent := flag.Bool("mock-agent", false, "use in-process mock agent")
 	enableSubagents := flag.Bool("subagents", false, "enable subagent proxy")
 	flag.Parse()
+	pythonCapability := ""
+	if !*mockAgent {
+		loadedCapability, capabilityErr := loadPythonCapability()
+		if capabilityErr != nil {
+			log.Fatal(capabilityErr)
+		}
+		pythonCapability = loadedCapability
+	}
 	resolvedKey, tokenPath, err := loadOrCreateAPIKey(*apiKey, *apiKeyFile)
 	if err != nil {
 		log.Fatal(err)
 	}
 	if err := validateListenConfig(*addr, resolvedKey); err != nil {
 		log.Fatal(err)
-	}
-	if !*mockAgent && len(pythonCapability) < 32 {
-		log.Fatal("KHAOS_PYTHON_CAPABILITY must contain at least 32 characters")
 	}
 	var agent api.AgentClient = platform.PythonClient{
 		Address: *pythonAddr, Capability: pythonCapability,
@@ -116,6 +121,66 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 	log.Fatal(server.ListenAndServe())
+}
+
+func loadPythonCapability() (string, error) {
+	var content []byte
+	if rawFD := strings.TrimSpace(os.Getenv("KHAOS_PYTHON_CAPABILITY_FD")); rawFD != "" {
+		fd, err := strconv.Atoi(rawFD)
+		if err != nil || fd < 3 {
+			return "", errors.New("invalid inherited Python capability FD")
+		}
+		file := os.NewFile(uintptr(fd), "khaos-python-capability")
+		if file == nil {
+			return "", errors.New("inherited Python capability FD is unavailable")
+		}
+		defer file.Close()
+		content, err = io.ReadAll(io.LimitReader(file, 4097))
+		if err != nil {
+			return "", fmt.Errorf("read inherited Python capability: %w", err)
+		}
+		_ = os.Unsetenv("KHAOS_PYTHON_CAPABILITY_FD")
+	} else if path := strings.TrimSpace(os.Getenv("KHAOS_PYTHON_CAPABILITY_FILE")); path != "" {
+		entry, err := os.Lstat(path)
+		if err != nil || !entry.Mode().IsRegular() || entry.Mode()&os.ModeSymlink != 0 {
+			return "", errors.New("Python capability file must be a regular file")
+		}
+		containerSecret := strings.HasPrefix(filepath.Clean(path), "/run/secrets/")
+		if (containerSecret && entry.Mode().Perm()&0o222 != 0) || (!containerSecret && entry.Mode().Perm()&0o077 != 0) {
+			return "", errors.New("Python capability file permissions are unsafe")
+		}
+		file, err := os.Open(path)
+		if err != nil {
+			return "", err
+		}
+		opened, statErr := file.Stat()
+		if statErr != nil || !os.SameFile(entry, opened) {
+			file.Close()
+			return "", errors.New("Python capability file identity changed")
+		}
+		content, err = io.ReadAll(io.LimitReader(file, 4097))
+		openedInfo := opened
+		file.Close()
+		if err != nil {
+			return "", err
+		}
+		finalInfo, finalErr := os.Lstat(path)
+		if finalErr != nil || !os.SameFile(openedInfo, finalInfo) {
+			return "", errors.New("Python capability file identity changed")
+		}
+	} else if os.Getenv("KHAOS_ALLOW_LEGACY_CAPABILITY_ENV") == "1" {
+		content = []byte(os.Getenv("KHAOS_PYTHON_CAPABILITY"))
+	} else {
+		return "", errors.New("Python capability requires an inherited FD or protected file")
+	}
+	if len(content) > 4096 {
+		return "", errors.New("Python capability is too large")
+	}
+	capability := strings.TrimSpace(string(content))
+	if len(capability) < 32 {
+		return "", errors.New("Python capability must contain at least 32 characters")
+	}
+	return capability, nil
 }
 
 func validateListenConfig(addr, apiKey string) error {

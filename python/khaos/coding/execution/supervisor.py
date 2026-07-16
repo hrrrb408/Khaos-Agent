@@ -6,6 +6,7 @@ import asyncio
 import math
 import os
 import signal
+import stat
 import sys
 import time
 from dataclasses import dataclass, field
@@ -19,6 +20,7 @@ class _ActiveProcess:
     process: asyncio.subprocess.Process
     termination_requested: bool = False
     termination_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    watchdog_task: asyncio.Task[dict | None] | None = None
 
 
 class ProcessSupervisor:
@@ -42,6 +44,7 @@ class ProcessSupervisor:
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         enforce_resource_limits: bool = True,
+        tmp_root: Path | None = None,
     ) -> ExecutionResult:
         """Run one foreground process with bounded, fairly split output."""
         execution_id = request.correlation_id
@@ -66,6 +69,7 @@ class ProcessSupervisor:
             _resource_watchdog(
                 process, active, request.permission_profile.resources,
                 self._terminate_active,
+                tmp_root=tmp_root,
             ) if enforce_resource_limits else _no_resource_violation()
         )
         total_limit = request.permission_profile.resources.output_bytes
@@ -150,14 +154,34 @@ class ProcessSupervisor:
         )
 
     async def register_process(
-        self, execution_id: str, process: asyncio.subprocess.Process
-    ) -> None:
-        """Register a managed stdio process owned by another I/O adapter."""
-        await self._register(execution_id, _ActiveProcess(process))
+        self,
+        execution_id: str,
+        process: asyncio.subprocess.Process,
+        *,
+        budget=None,
+        tmp_root: Path | None = None,
+    ) -> asyncio.Task[dict | None] | None:
+        """Register and resource-watch a managed stdio process."""
+        active = _ActiveProcess(process)
+        await self._register(execution_id, active)
+        if budget is not None:
+            active.watchdog_task = asyncio.create_task(
+                _resource_watchdog(
+                    process, active, budget, self._terminate_active,
+                    tmp_root=tmp_root,
+                )
+            )
+        return active.watchdog_task
 
     async def unregister_process(self, execution_id: str) -> None:
         async with self._registry_lock:
-            self._active.pop(execution_id, None)
+            active = self._active.pop(execution_id, None)
+        if (
+            active is not None
+            and active.watchdog_task is not None
+            and not active.watchdog_task.done()
+        ):
+            active.watchdog_task.cancel()
 
     async def terminate(self, execution_id: str) -> bool:
         """Terminate one complete process group, returning whether it existed."""
@@ -295,7 +319,9 @@ def _resource_limit_diagnostics(budget) -> dict[str, object]:
     }
 
 
-async def _resource_watchdog(process, active, budget, terminate) -> dict | None:
+async def _resource_watchdog(
+    process, active, budget, terminate, *, tmp_root: Path | None = None,
+) -> dict | None:
     """Bound aggregate process count and resident memory for the process group."""
     if os.name != "posix" or process.pid is None:
         return None
@@ -314,12 +340,38 @@ async def _resource_watchdog(process, active, budget, terminate) -> dict | None:
                 "kind": "memory", "observed": resident_bytes,
                 "limit": budget.memory_bytes,
             }
+        elif tmp_root is not None:
+            temporary_bytes = await asyncio.to_thread(_directory_size, tmp_root)
+            if temporary_bytes > budget.tmpfs_bytes:
+                violation = {
+                    "kind": "tmpfs",
+                    "observed": temporary_bytes,
+                    "limit": budget.tmpfs_bytes,
+                }
         if violation is not None:
             active.termination_requested = True
             await terminate(active)
             return violation
         await asyncio.sleep(0.05)
     return None
+
+
+def _directory_size(root: Path) -> int:
+    total = 0
+    try:
+        for directory, _subdirectories, files in os.walk(root, followlinks=False):
+            for name in files:
+                try:
+                    value = os.stat(
+                        Path(directory) / name, follow_symlinks=False
+                    )
+                except OSError:
+                    continue
+                if stat.S_ISREG(value.st_mode):
+                    total += value.st_size
+    except OSError:
+        return 0
+    return total
 
 
 def _process_group_usage(process_group_id: int) -> tuple[int, int]:

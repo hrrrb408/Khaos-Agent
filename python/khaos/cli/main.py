@@ -168,24 +168,38 @@ def cmd_start(args: argparse.Namespace) -> None:
     except ImportError:
         pass
 
-    gateway_capability = os.environ.get("KHAOS_PYTHON_CAPABILITY", "")
-    if args.gateway and len(gateway_capability) < 32:
-        gateway_capability = secrets.token_urlsafe(48)
-    if len(gateway_capability) < 32:
-        raise RuntimeError(
-            "KHAOS_PYTHON_CAPABILITY must contain at least 32 characters "
-            "when Gateway is managed separately"
-        )
+    gateway_capability: str | None = None
     gateway_process: subprocess.Popen | None = None
+    gateway_pid: int | None = None
     if args.gateway:
-        gateway_cmd = ["go", "run", "./go/cmd/gateway"]
-        gateway_environment = dict(os.environ)
-        gateway_environment["KHAOS_PYTHON_CAPABILITY"] = gateway_capability
-        gateway_environment["KHAOS_PYTHON_AGENT"] = args.socket
-        gateway_process = subprocess.Popen(
-            gateway_cmd, cwd=str(_project_root()), env=gateway_environment,
+        gateway_capability = secrets.token_urlsafe(48)
+        cache = _project_root() / ".cache"
+        cache.mkdir(mode=0o700, exist_ok=True)
+        gateway_binary = cache / "khaos-gateway"
+        subprocess.run(
+            ["go", "build", "-o", str(gateway_binary), "./cmd/gateway"],
+            cwd=str(_project_root() / "go"),
+            check=True,
         )
-        print("Started Go gateway with: go run ./go/cmd/gateway")
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, f"{gateway_capability}\n".encode("utf-8"))
+        os.close(write_fd)
+        gateway_cmd = [str(gateway_binary)]
+        gateway_environment = dict(os.environ)
+        gateway_environment.pop("KHAOS_PYTHON_CAPABILITY", None)
+        gateway_environment["KHAOS_PYTHON_CAPABILITY_FD"] = str(read_fd)
+        gateway_environment["KHAOS_PYTHON_AGENT"] = args.socket
+        try:
+            gateway_process = subprocess.Popen(
+                gateway_cmd,
+                cwd=str(_project_root()),
+                env=gateway_environment,
+                pass_fds=(read_fd,),
+            )
+        finally:
+            os.close(read_fd)
+        gateway_pid = gateway_process.pid
+        print("Started Go gateway with an inherited boot capability")
 
     print(f"Starting Khaos agent on Unix socket {args.socket}")
     print(f"Database: {args.db}")
@@ -200,6 +214,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 project_root=Path.cwd(),
                 config_path=Path(args.config),
                 gateway_capability=gateway_capability,
+                gateway_pid=gateway_pid,
             )
         )
     finally:

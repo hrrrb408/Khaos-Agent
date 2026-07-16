@@ -81,10 +81,17 @@ checks the schema digest. Database, WAL, SHM or parent replacement fails
 closed. Shutdown restores owner write permission through the fixed FDs, not
 through replaceable path strings.
 
-The child authority ledger is created in a private server-selected directory,
-is not revealed to clients, and is writable only through the child process's
-already-open SQLite FD. Its DB/WAL/SHM paths and directory are read-only during
-the boot.
+Each boot creates the child authority ledger with `O_CREAT | O_EXCL | O_NOFOLLOW`
+inside a random server-selected directory under the verification storage parent.
+The directory is owner-only `0o700`; the initial ledger must be a regular,
+single-link, owner-held `0o600` file. Before reporting ready, the child switches
+the ledger to WAL plus `locking_mode=EXCLUSIVE`, forces and retains the exclusive
+lock, then fixes DB/WAL/SHM dev/inode/owner/mode/nlink identities. Existing
+writers either lose the race to the retained lock or make startup fail closed.
+Directory-entry replacement, symlink/FIFO precreation, hardlink creation and
+sidecar appearance are rejected. The fixed DB/WAL/SHM entries are `0o400` while
+the already-open child writer remains active. Each boot ledger remains on disk
+for audit, but proof/success capability is never reused across boot ledgers.
 
 ## Migration and historical success
 

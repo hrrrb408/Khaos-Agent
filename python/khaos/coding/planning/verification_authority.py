@@ -48,6 +48,8 @@ PROTECTED_SCHEMA_OBJECTS: dict[str, str] = {
     "ix_avps_plan": "index",
     "ux_avps_snapshot_digest": "index",
     "ix_vcp_run": "index",
+    "ux_vcp_run": "index",
+    "ix_vsi_kind_state": "index",
     "trg_avps_referenced_update": "trigger",
     "trg_avps_referenced_delete": "trigger",
     "trg_vcp_immutable_update": "trigger",
@@ -171,17 +173,250 @@ def _verify_authority_event_chain(ledger: sqlite3.Connection) -> None:
         previous_hash = str(stored_hash)
 
 
+@dataclass(frozen=True)
+class AuthorityLedgerObjectIdentity:
+    path: Path
+    dev: int
+    ino: int
+    uid: int
+    gid: int
+    mode: int
+    nlink: int
+
+
+def _identity_from_path(path: Path) -> AuthorityLedgerObjectIdentity:
+    value = path.lstat()
+    if not stat.S_ISREG(value.st_mode) and not stat.S_ISDIR(value.st_mode):
+        raise PermissionError("verification authority ledger storage has unsafe type")
+    return AuthorityLedgerObjectIdentity(
+        path=path,
+        dev=value.st_dev,
+        ino=value.st_ino,
+        uid=value.st_uid,
+        gid=value.st_gid,
+        mode=stat.S_IMODE(value.st_mode),
+        nlink=value.st_nlink,
+    )
+
+
+def _create_exclusive_ledger_file(path: Path) -> AuthorityLedgerObjectIdentity:
+    flags = (
+        os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    fd = os.open(path, flags, 0o600)
+    try:
+        value = os.fstat(fd)
+        if (
+            not stat.S_ISREG(value.st_mode)
+            or value.st_uid != os.getuid()
+            or stat.S_IMODE(value.st_mode) != 0o600
+            or value.st_nlink != 1
+        ):
+            raise PermissionError("verification authority ledger file is unsafe")
+        return AuthorityLedgerObjectIdentity(
+            path=path,
+            dev=value.st_dev,
+            ino=value.st_ino,
+            uid=value.st_uid,
+            gid=value.st_gid,
+            mode=stat.S_IMODE(value.st_mode),
+            nlink=value.st_nlink,
+        )
+    finally:
+        os.close(fd)
+
+
+def _prepare_authority_ledger(
+    database_parent: Path,
+) -> tuple[Path, AuthorityLedgerObjectIdentity, AuthorityLedgerObjectIdentity]:
+    directory = database_parent / (
+        f".khaos-verification-authority-{secrets.token_hex(24)}"
+    )
+    os.mkdir(directory, 0o700)
+    database = directory / "authority-ledger.sqlite"
+    database_identity = _create_exclusive_ledger_file(database)
+    directory_identity = _identity_from_path(directory)
+    if directory_identity.uid != os.getuid() or directory_identity.mode != 0o700:
+        raise PermissionError("verification authority ledger directory is unsafe")
+    return database, directory_identity, database_identity
+
+
+def _verify_ledger_identity(
+    expected: AuthorityLedgerObjectIdentity,
+    *,
+    required_mode: int,
+    check_nlink: bool = True,
+) -> None:
+    actual = _identity_from_path(expected.path)
+    if (
+        actual.dev,
+        actual.ino,
+        actual.uid,
+        actual.gid,
+        actual.mode,
+    ) != (
+        expected.dev,
+        expected.ino,
+        expected.uid,
+        expected.gid,
+        required_mode,
+    ) or (check_nlink and actual.nlink != expected.nlink):
+        raise PermissionError("verification authority ledger identity drift")
+
+
+def _open_locked_authority_ledger(
+    database: Path,
+    directory_identity: AuthorityLedgerObjectIdentity,
+    database_identity: AuthorityLedgerObjectIdentity,
+) -> sqlite3.Connection:
+    _verify_ledger_identity(
+        directory_identity, required_mode=0o700, check_nlink=False
+    )
+    _verify_ledger_identity(database_identity, required_mode=0o600)
+    ledger = sqlite3.connect(f"file:{database}?mode=rw", uri=True, timeout=0.1)
+    try:
+        journal_mode = str(ledger.execute("PRAGMA journal_mode=WAL").fetchone()[0])
+        if journal_mode.casefold() != "wal":
+            raise PermissionError("verification authority ledger requires WAL mode")
+        locking_mode = str(
+            ledger.execute("PRAGMA locking_mode=EXCLUSIVE").fetchone()[0]
+        )
+        if locking_mode.casefold() != "exclusive":
+            raise PermissionError("verification authority ledger requires exclusive locking")
+        ledger.execute("PRAGMA synchronous=FULL")
+        ledger.execute("BEGIN EXCLUSIVE")
+        ledger.execute(
+            "CREATE TABLE IF NOT EXISTS _authority_ledger_bootstrap(id INTEGER)"
+        )
+        ledger.commit()
+        ledger.execute("BEGIN EXCLUSIVE")
+        ledger.execute("DROP TABLE _authority_ledger_bootstrap")
+        ledger.commit()
+        return ledger
+    except Exception:
+        ledger.rollback()
+        ledger.close()
+        raise
+
+
+def _pin_authority_ledger_objects(
+    database: Path,
+) -> tuple[int, dict[str, tuple[int, AuthorityLedgerObjectIdentity]], set[str]]:
+    directory_fd = os.open(
+        database.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    )
+    objects: dict[str, tuple[int, AuthorityLedgerObjectIdentity]] = {}
+    absent: set[str] = set()
+    try:
+        for suffix in ("", "-wal", "-shm"):
+            path = Path(f"{database}{suffix}")
+            try:
+                fd = os.open(
+                    path.name,
+                    os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=directory_fd,
+                )
+            except FileNotFoundError:
+                absent.add(suffix)
+                continue
+            value = os.fstat(fd)
+            if (
+                not stat.S_ISREG(value.st_mode)
+                or value.st_uid != os.getuid()
+                or value.st_nlink != 1
+            ):
+                os.close(fd)
+                raise PermissionError("verification authority ledger object is unsafe")
+            os.fchmod(fd, 0o400)
+            objects[suffix] = (
+                fd,
+                AuthorityLedgerObjectIdentity(
+                    path, value.st_dev, value.st_ino, value.st_uid, value.st_gid,
+                    0o400, value.st_nlink,
+                ),
+            )
+        return directory_fd, objects, absent
+    except Exception:
+        for fd, _identity in objects.values():
+            os.close(fd)
+        os.close(directory_fd)
+        raise
+
+
+def _verify_pinned_authority_ledger(
+    database: Path,
+    directory_identity: AuthorityLedgerObjectIdentity,
+    directory_fd: int,
+    objects: dict[str, tuple[int, AuthorityLedgerObjectIdentity]],
+    absent: set[str],
+) -> None:
+    _verify_ledger_identity(
+        directory_identity, required_mode=0o700, check_nlink=False
+    )
+    opened_directory = os.fstat(directory_fd)
+    if (
+        opened_directory.st_dev,
+        opened_directory.st_ino,
+        opened_directory.st_uid,
+        opened_directory.st_gid,
+        stat.S_IMODE(opened_directory.st_mode),
+    ) != (
+        directory_identity.dev,
+        directory_identity.ino,
+        directory_identity.uid,
+        directory_identity.gid,
+        0o700,
+    ):
+        raise PermissionError("verification authority ledger directory drift")
+    for suffix, (fd, expected) in objects.items():
+        opened = os.fstat(fd)
+        entry = os.stat(
+            expected.path.name, dir_fd=directory_fd, follow_symlinks=False
+        )
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or not stat.S_ISREG(entry.st_mode)
+            or entry.st_nlink != 1
+            or (
+                opened.st_dev, opened.st_ino, opened.st_uid, opened.st_gid,
+                entry.st_dev, entry.st_ino, stat.S_IMODE(entry.st_mode),
+            ) != (
+                expected.dev, expected.ino, expected.uid, expected.gid,
+                expected.dev, expected.ino, 0o400,
+            )
+        ):
+            raise PermissionError(
+                f"verification authority ledger {suffix or 'database'} identity drift"
+            )
+    for suffix in absent:
+        try:
+            os.stat(
+                f"{database.name}{suffix}",
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            continue
+        raise PermissionError("verification authority ledger sidecar appeared")
+
+
 def _authority_process_main(
     connection: Any,
     capability: str,
     ledger_path: str,
     runtime_id: str,
     boot_id: str,
+    directory_identity: AuthorityLedgerObjectIdentity,
+    database_identity: AuthorityLedgerObjectIdentity,
 ) -> None:
     """Own the authoritative proof/success ledger behind an inherited pipe."""
     database = Path(ledger_path)
-    ledger = sqlite3.connect(database)
-    ledger.executescript(
+    try:
+        ledger = _open_locked_authority_ledger(
+            database, directory_identity, database_identity
+        )
+        ledger.executescript(
         "CREATE TABLE IF NOT EXISTS proofs(boot_id TEXT NOT NULL,proof_id TEXT NOT NULL,"
         "run_id TEXT NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(boot_id,proof_id),"
         "UNIQUE(boot_id,run_id));"
@@ -191,17 +426,35 @@ def _authority_process_main(
         "runtime_id TEXT NOT NULL,boot_id TEXT NOT NULL,event_type TEXT NOT NULL,"
         "payload_json TEXT NOT NULL,previous_hash TEXT NOT NULL,event_hash TEXT NOT NULL UNIQUE,"
         "created_at REAL NOT NULL);"
-    )
-    ledger.execute("PRAGMA journal_mode=WAL")
-    ledger.execute("PRAGMA synchronous=FULL")
-    _verify_authority_event_chain(ledger)
-    _append_authority_event(
-        ledger, runtime_id, boot_id, "boot-started", {"pid": os.getpid()}
-    )
-    ledger.commit()
-    for path in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
-        if path.exists():
-            os.chmod(path, 0o400)
+        )
+        _verify_authority_event_chain(ledger)
+        _append_authority_event(
+            ledger, runtime_id, boot_id, "boot-started", {"pid": os.getpid()}
+        )
+        ledger.commit()
+        directory_fd, objects, absent = _pin_authority_ledger_objects(database)
+        pinned_database = objects.get("")
+        if pinned_database is None or (
+            pinned_database[1].dev,
+            pinned_database[1].ino,
+            pinned_database[1].uid,
+            pinned_database[1].gid,
+            pinned_database[1].nlink,
+        ) != (
+            database_identity.dev,
+            database_identity.ino,
+            database_identity.uid,
+            database_identity.gid,
+            database_identity.nlink,
+        ):
+            raise PermissionError("verification authority ledger database replaced")
+        _verify_pinned_authority_ledger(
+            database, directory_identity, directory_fd, objects, absent
+        )
+    except Exception as exc:
+        connection.send(("error", f"{type(exc).__name__}: {exc}"))
+        connection.close()
+        return
     connection.send(("ready", os.getpid()))
     expected_sequence = 1
     try:
@@ -211,12 +464,18 @@ def _authority_process_main(
             except EOFError:
                 break
             token, sequence, operation, arguments = request
+            _verify_pinned_authority_ledger(
+                database, directory_identity, directory_fd, objects, absent
+            )
             if token != capability or sequence != expected_sequence:
                 _append_authority_event(
                     ledger, runtime_id, boot_id, "request-rejected",
                     {"operation": str(operation), "reason": "capability-or-sequence"},
                 )
                 ledger.commit()
+                _verify_pinned_authority_ledger(
+                    database, directory_identity, directory_fd, objects, absent
+                )
                 connection.send((False, "invalid authority capability or replay"))
                 continue
             expected_sequence += 1
@@ -225,6 +484,9 @@ def _authority_process_main(
                     ledger, runtime_id, boot_id, "boot-stopped", {}
                 )
                 ledger.commit()
+                _verify_pinned_authority_ledger(
+                    database, directory_identity, directory_fd, objects, absent
+                )
                 connection.send((True, None))
                 break
             try:
@@ -279,6 +541,9 @@ def _authority_process_main(
                     ).hexdigest()},
                 )
                 ledger.commit()
+                _verify_pinned_authority_ledger(
+                    database, directory_identity, directory_fd, objects, absent
+                )
                 connection.send((True, None))
             except Exception as exc:
                 ledger.rollback()
@@ -287,9 +552,15 @@ def _authority_process_main(
                     {"operation": str(operation), "reason": type(exc).__name__},
                 )
                 ledger.commit()
+                _verify_pinned_authority_ledger(
+                    database, directory_identity, directory_fd, objects, absent
+                )
                 connection.send((False, f"{type(exc).__name__}: {exc}"))
     finally:
         ledger.close()
+        for fd, _identity in objects.values():
+            os.close(fd)
+        os.close(directory_fd)
         connection.close()
 
 
@@ -396,9 +667,6 @@ class VerificationWriteAuthority:
         authority._ipc_capability = secrets.token_hex(32)
         authority._ipc_sequence = 0
         authority._database_path = Path(os.path.abspath(database_path))
-        authority._ledger_path = authority._database_path.with_name(
-            f"{authority._database_path.name}.verification-authority.sqlite"
-        )
         journal_mode = str(connection.execute("PRAGMA journal_mode=WAL").fetchone()[0])
         if journal_mode.casefold() != "wal":
             raise PermissionError("verification authority requires SQLite WAL mode")
@@ -428,13 +696,11 @@ class VerificationWriteAuthority:
         except Exception:
             connection.rollback()
             raise
-        for path in (
+        (
             authority._ledger_path,
-            Path(f"{authority._ledger_path}-wal"),
-            Path(f"{authority._ledger_path}-shm"),
-        ):
-            if path.exists():
-                os.chmod(path, 0o600)
+            authority._ledger_directory_identity,
+            authority._ledger_database_identity,
+        ) = _prepare_authority_ledger(authority._database_path.parent)
         process_context = multiprocessing.get_context("spawn")
         parent_connection, child_connection = process_context.Pipe()
         authority._ipc_connection = parent_connection
@@ -446,6 +712,8 @@ class VerificationWriteAuthority:
                 str(authority._ledger_path),
                 runtime_id,
                 boot_id,
+                authority._ledger_directory_identity,
+                authority._ledger_database_identity,
             ),
             name="khaos-verification-authority",
             daemon=True,
@@ -455,9 +723,13 @@ class VerificationWriteAuthority:
         if not parent_connection.poll(10):
             authority._authority_process.terminate()
             raise RuntimeError("verification authority process did not start")
-        ready, authority._authority_process_id = parent_connection.recv()
+        ready, ready_detail = parent_connection.recv()
         if ready != "ready":
-            raise RuntimeError("verification authority process startup failed")
+            authority._authority_process.join(timeout=5)
+            raise RuntimeError(
+                f"verification authority process startup failed: {ready_detail}"
+            )
+        authority._authority_process_id = ready_detail
         authority._schema_digest = authority._compute_schema_digest()
         authority._parent_fd = authority._open_directory_chain(
             authority._database_path.parent,
@@ -517,11 +789,17 @@ class VerificationWriteAuthority:
         )
 
     def _compute_schema_digest(self) -> str:
-        placeholders = ",".join("?" for _ in PROTECTED_SCHEMA_OBJECTS)
+        protected_tables = tuple(
+            name for name, object_type in PROTECTED_SCHEMA_OBJECTS.items()
+            if object_type == "table"
+        )
+        placeholders = ",".join("?" for _ in protected_tables)
         rows = self._connection.execute(
             "SELECT type,name,tbl_name,sql FROM sqlite_master "
-            f"WHERE name IN ({placeholders}) ORDER BY type,name",
-            tuple(PROTECTED_SCHEMA_OBJECTS),
+            "WHERE name NOT LIKE 'sqlite_%' AND "
+            f"(name IN ({placeholders}) OR tbl_name IN ({placeholders})) "
+            "ORDER BY type,name",
+            protected_tables + protected_tables,
         ).fetchall()
         actual = {str(row[1]): str(row[0]) for row in rows}
         if actual != PROTECTED_SCHEMA_OBJECTS:
