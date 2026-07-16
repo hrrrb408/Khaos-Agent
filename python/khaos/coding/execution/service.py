@@ -22,6 +22,7 @@ from khaos.coding.execution.supervisor import (
     resource_limit_preexec,
 )
 from khaos.coding.workspace.models import WorkspaceState
+from khaos.coding.workspace.storage import capture_workspace_snapshot
 
 
 class ExecutionService:
@@ -86,6 +87,16 @@ class ExecutionService:
             if cwd != root and root not in cwd.parents:
                 raise PermissionError("cwd is outside the task workspace")
             repository_root = workspace.repository_root.expanduser().resolve()
+            storage_baseline = getattr(workspace, "storage_baseline", None)
+            if storage_baseline is None:
+                storage_baseline = await asyncio.to_thread(
+                    capture_workspace_snapshot, root
+                )
+                setattr(workspace, "storage_baseline", storage_baseline)
+            if not storage_baseline.complete:
+                raise PermissionError(
+                    "TaskWorkspace storage baseline is incomplete"
+                )
             if request.backend_hint == "docker":
                 if root == repository_root:
                     raise PermissionError("task Worktree cannot be the main repository")
@@ -103,6 +114,7 @@ class ExecutionService:
                 backend_hint=request.backend_hint,
                 correlation_id=correlation_id,
                 permission_profile=profile,
+                workspace_baseline=storage_baseline,
             )
             resolved_context = ResolvedExecutionContext(
                 request.task_id, request.workspace_id, workspace.state.value,
@@ -110,6 +122,7 @@ class ExecutionService:
                 profile.writable_roots, profile.filesystem.value,
                 profile.network, profile.resources, request.environment,
                 profile.environment_keys, request.argv, correlation_id, profile,
+                storage_baseline,
             )
         backend = self.backend_selector.select(
             writable=profile.filesystem is FileSystemAccess.WORKSPACE_WRITE
@@ -136,7 +149,34 @@ class ExecutionService:
                 self._active.pop(resolved_context.correlation_id, None)
         else:
             result = await backend.execute(request)
+        if resolved_context is not None:
+            await self._cleanup_workspace_on_storage_violation(
+                resolved_context.workspace_id, result
+            )
         return result
+
+    async def _cleanup_workspace_on_storage_violation(
+        self, workspace_id: str, result: ExecutionResult
+    ) -> None:
+        violation = result.diagnostics.get("resource_violation")
+        if not isinstance(violation, dict) or violation.get("kind") not in {
+            "workspace-bytes",
+            "workspace-entries",
+            "workspace-observation",
+        }:
+            return
+        try:
+            quarantine = await self.workspace_manager.transition(
+                workspace_id, WorkspaceState.FAILED
+            )
+            result.diagnostics["workspace_quarantine"] = quarantine.value
+            transition = await self.workspace_manager.cleanup(
+                workspace_id, force=True
+            )
+            result.diagnostics["workspace_cleanup"] = transition.value
+        except Exception as exc:
+            result.diagnostics["workspace_cleanup"] = "failed"
+            result.diagnostics["workspace_cleanup_error"] = type(exc).__name__
 
     async def terminate(self, execution_id: str) -> None:
         process_terminated = await self.process_supervisor.terminate(execution_id)

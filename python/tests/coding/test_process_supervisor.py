@@ -7,11 +7,14 @@ import pytest
 
 from khaos.coding.execution import (
     ExecutionRequest,
+    ExecutionResult,
     ExecutionService,
     HostExecutionBackend,
     ResourceBudget,
 )
 from khaos.coding.execution.supervisor import ProcessSupervisor
+from khaos.coding.workspace.storage import capture_workspace_snapshot
+from khaos.coding.workspace.models import WorkspaceTransition
 
 
 POSIX_ONLY = pytest.mark.skipif(
@@ -243,6 +246,38 @@ async def test_supervisor_enforces_synthetic_home_entry_budget(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_supervisor_enforces_workspace_relative_entry_budget(tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "baseline").write_text("existing", encoding="utf-8")
+    baseline = capture_workspace_snapshot(workspace)
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    request = ExecutionRequest(
+        (
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import time; "
+            "[(Path('.') / f'new-{i}').touch() for i in range(12)]; "
+            "time.sleep(30)",
+        ),
+        workspace,
+        budget=ResourceBudget(workspace_entries=10),
+        correlation_id="workspace-entry-capacity",
+    )
+
+    result = await supervisor.run(
+        request,
+        workspace_root=workspace,
+        workspace_baseline=baseline,
+    )
+
+    assert result.status == "resource-exhausted"
+    assert result.diagnostics["resource_violation"] == {
+        "kind": "workspace-entries", "observed": 12, "limit": 10,
+    }
+
+
+@pytest.mark.asyncio
 async def test_execution_service_terminate_reaches_foreground_process(
     tmp_path: Path,
 ):
@@ -261,6 +296,48 @@ async def test_execution_service_terminate_reaches_foreground_process(
 
     assert result.status == "cancelled"
     assert service.process_supervisor.active_execution_ids == ()
+
+
+@pytest.mark.asyncio
+async def test_execution_service_force_cleans_over_budget_workspace():
+    class WorkspaceManager:
+        def __init__(self) -> None:
+            self.cleaned: tuple[str, bool] | None = None
+
+        async def transition(
+            self, workspace_id: str, target
+        ) -> WorkspaceTransition:
+            assert workspace_id == "workspace"
+            assert target.value == "failed"
+            return WorkspaceTransition.UPDATED
+
+        async def cleanup(
+            self, workspace_id: str, *, force: bool = False
+        ) -> WorkspaceTransition:
+            self.cleaned = (workspace_id, force)
+            return WorkspaceTransition.UPDATED
+
+    manager = WorkspaceManager()
+    service = ExecutionService(workspace_manager=manager)
+    result = ExecutionResult(
+        "execution",
+        "resource-exhausted",
+        -1,
+        "",
+        "",
+        1,
+        diagnostics={
+            "resource_violation": {
+                "kind": "workspace-bytes", "observed": 8192, "limit": 4096,
+            }
+        },
+    )
+
+    await service._cleanup_workspace_on_storage_violation("workspace", result)
+
+    assert manager.cleaned == ("workspace", True)
+    assert result.diagnostics["workspace_quarantine"] == "updated"
+    assert result.diagnostics["workspace_cleanup"] == "updated"
 
 
 @pytest.mark.asyncio

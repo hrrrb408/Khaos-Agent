@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from khaos.coding.workspace.storage import WorkspaceStorageSnapshot
+
 
 class NetworkPolicy(str, Enum):
     NONE = "none"
@@ -35,6 +37,8 @@ class ResourceBudget:
     memory_bytes: int = 512 * 1024 * 1024
     tmpfs_bytes: int = 256 * 1024 * 1024
     filesystem_entries: int = 100_000
+    workspace_bytes: int = 512 * 1024 * 1024
+    workspace_entries: int = 100_000
     file_bytes: int = 64 * 1024 * 1024
     open_files: int = 256
 
@@ -172,6 +176,8 @@ class PermissionProfile:
                 "memory_bytes": self.resources.memory_bytes,
                 "tmpfs_bytes": self.resources.tmpfs_bytes,
                 "filesystem_entries": self.resources.filesystem_entries,
+                "workspace_bytes": self.resources.workspace_bytes,
+                "workspace_entries": self.resources.workspace_entries,
                 "file_bytes": self.resources.file_bytes,
                 "open_files": self.resources.open_files,
             },
@@ -197,6 +203,7 @@ class ExecutionRequest:
     backend_hint: str = "default"
     correlation_id: str | None = None
     permission_profile: PermissionProfile | None = None
+    workspace_baseline: WorkspaceStorageSnapshot | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
@@ -238,6 +245,7 @@ class ResolvedExecutionContext:
     argv: tuple[str, ...]
     correlation_id: str
     permission_profile: PermissionProfile | None = None
+    workspace_baseline: WorkspaceStorageSnapshot | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
@@ -294,6 +302,8 @@ def _validate_resource_budget(budget: ResourceBudget) -> None:
         budget.memory_bytes <= 0
         or budget.tmpfs_bytes <= 0
         or budget.filesystem_entries <= 0
+        or budget.workspace_bytes <= 0
+        or budget.workspace_entries <= 0
     ):
         raise ValueError("resource memory limits must be positive")
     if budget.file_bytes <= 0 or budget.open_files <= 0:

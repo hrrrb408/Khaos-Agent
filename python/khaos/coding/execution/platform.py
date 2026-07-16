@@ -289,6 +289,8 @@ class MacOSSandboxBackend:
                 cwd=request.cwd.resolve(),
                 env=environment,
                 tmp_root=home,
+                workspace_root=worktree if writable else None,
+                workspace_baseline=request.workspace_baseline,
             )
 
     async def terminate(self, execution_id: str) -> None:
@@ -447,6 +449,8 @@ class LinuxBubblewrapBackend:
                 sandboxed,
                 cwd=request.cwd.resolve(),
                 sandbox_storage_paths=("/home/khaos", "/tmp"),
+                workspace_root=worktree if writable else None,
+                workspace_baseline=request.workspace_baseline,
             )
 
     async def terminate(self, execution_id: str) -> None:

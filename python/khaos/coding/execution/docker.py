@@ -128,6 +128,9 @@ class DockerBackend:
                 # RLIMIT_AS to the host-side Go Docker CLI can prevent that
                 # control process from starting before a container exists.
                 enforce_resource_limits=False,
+                enforce_resource_watchdog=True,
+                workspace_root=context.worktree_path,
+                workspace_baseline=context.workspace_baseline,
             )
             diagnostics.update(result.diagnostics)
             return ExecutionResult(

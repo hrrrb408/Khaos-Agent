@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from khaos.coding.workspace.storage import WorkspaceStorageSnapshot
+
 
 class WorkspaceState(str, Enum):
     CREATING = "creating"
@@ -45,6 +47,7 @@ class TaskWorkspace:
     writable_roots: tuple[Path, ...] = ()
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     recovery_root: Path | None = None
+    storage_baseline: WorkspaceStorageSnapshot | None = None
 
 
 @dataclass(frozen=True)
