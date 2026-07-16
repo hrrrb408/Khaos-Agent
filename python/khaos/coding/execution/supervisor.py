@@ -233,7 +233,8 @@ class ProcessSupervisor:
                 )
                 return
             except asyncio.TimeoutError:
-                _signal_process_group(process, signal.SIGKILL)
+                force_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
+                _signal_process_group(process, force_signal, force=True)
                 await process.wait()
 
 
@@ -260,7 +261,10 @@ async def _drain_bounded(
 
 
 def _signal_process_group(
-    process: asyncio.subprocess.Process, sig: signal.Signals
+    process: asyncio.subprocess.Process,
+    sig: signal.Signals,
+    *,
+    force: bool = False,
 ) -> None:
     if process.returncode is not None:
         return
@@ -272,7 +276,7 @@ def _signal_process_group(
             return
         except OSError:
             pass
-    if sig is signal.SIGKILL:
+    if force:
         process.kill()
     else:
         process.terminate()
@@ -331,19 +335,25 @@ async def _resource_watchdog(
     process, active, budget, terminate, *, storage_roots: tuple[Path, ...] = (),
 ) -> dict | None:
     """Bound process-tree and writable synthetic filesystem resources."""
-    if os.name != "posix" or process.pid is None:
+    if process.pid is None:
+        return None
+    process_tree_supported = os.name == "posix"
+    if not process_tree_supported and not storage_roots:
         return None
     while process.returncode is None:
-        process_count, resident_bytes = await asyncio.to_thread(
-            _process_group_usage, process.pid
-        )
+        if process_tree_supported:
+            process_count, resident_bytes = await asyncio.to_thread(
+                _process_group_usage, process.pid
+            )
+        else:
+            process_count, resident_bytes = 0, 0
         violation = None
-        if process_count > budget.pids:
+        if process_tree_supported and process_count > budget.pids:
             violation = {
                 "kind": "pids", "observed": process_count,
                 "limit": budget.pids,
             }
-        elif resident_bytes > budget.memory_bytes:
+        elif process_tree_supported and resident_bytes > budget.memory_bytes:
             violation = {
                 "kind": "memory", "observed": resident_bytes,
                 "limit": budget.memory_bytes,
