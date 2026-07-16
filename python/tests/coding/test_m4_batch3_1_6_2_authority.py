@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import uuid
@@ -21,6 +22,9 @@ from khaos.coding.planning.verification_authority import (
     VerificationReadHandle,
     VerificationWriteAuthority,
     VerificationWriteCapability,
+    _create_exclusive_ledger_file,
+    _open_locked_authority_ledger,
+    _prepare_authority_ledger,
 )
 from khaos.coding.planning.verification_execution_models import (
     VerificationRunStatus,
@@ -74,6 +78,25 @@ def test_schema_manifest_explicitly_covers_all_security_trigger_families():
         assert any(name.startswith(prefix) for name in PROTECTED_SCHEMA_OBJECTS)
     assert PROTECTED_SCHEMA_OBJECTS["plan_execution_runs"] == "table"
     assert PROTECTED_SCHEMA_OBJECTS["verification_success_evidence"] == "table"
+    assert PROTECTED_SCHEMA_OBJECTS["ux_vcp_run"] == "index"
+    assert PROTECTED_SCHEMA_OBJECTS["ix_vsi_kind_state"] == "index"
+
+
+def test_schema_manifest_exactly_matches_objects_on_protected_tables(tmp_path):
+    store, _, _ = _finalize_test_store(tmp_path)
+    tables = tuple(
+        name for name, object_type in PROTECTED_SCHEMA_OBJECTS.items()
+        if object_type == "table"
+    )
+    placeholders = ",".join("?" for _ in tables)
+    rows = store._conn.execute(
+        "SELECT type,name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND "
+        f"(name IN ({placeholders}) OR tbl_name IN ({placeholders}))",
+        tables + tables,
+    ).fetchall()
+    actual = {str(row[1]): str(row[0]) for row in rows}
+    assert actual == PROTECTED_SCHEMA_OBJECTS
+    store._conn.close()
 
 
 def test_read_handle_recomputes_all_canonical_success_bindings():
@@ -133,25 +156,87 @@ def test_authority_ledger_is_durable_hash_chained_and_boot_scoped(tmp_path):
     second = VERIFICATION_AUTHORITIES.issue(
         next_connection, runtime_id="runtime-ledger", boot_id="boot-two",
     )
+    second_ledger_path = second.ledger_path
+    assert second_ledger_path != ledger_path
     with pytest.raises(PermissionError, match="not authority-issued"):
         second.require_cleanup_proof("proof", "run", "digest")
     second.close()
 
-    ledger = sqlite3.connect(f"file:{ledger_path}?mode=ro", uri=True)
-    rows = ledger.execute(
-        "SELECT boot_id,payload_json,previous_hash,event_hash "
-        "FROM authority_events ORDER BY sequence"
-    ).fetchall()
-    assert {row[0] for row in rows} == {"boot-one", "boot-two"}
-    previous_hash = "0" * 64
-    for _, payload, stored_previous, stored_hash in rows:
-        assert stored_previous == previous_hash
-        expected = hashlib.sha256(
-            f"{previous_hash}\n{payload}".encode("utf-8")
-        ).hexdigest()
-        assert stored_hash == expected
-        previous_hash = stored_hash
-    ledger.close()
+    for path, expected_boot in (
+        (ledger_path, "boot-one"),
+        (second_ledger_path, "boot-two"),
+    ):
+        ledger = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        rows = ledger.execute(
+            "SELECT boot_id,payload_json,previous_hash,event_hash "
+            "FROM authority_events ORDER BY sequence"
+        ).fetchall()
+        assert {row[0] for row in rows} == {expected_boot}
+        previous_hash = "0" * 64
+        for _, payload, stored_previous, stored_hash in rows:
+            assert stored_previous == previous_hash
+            expected = hashlib.sha256(
+                f"{previous_hash}\n{payload}".encode("utf-8")
+            ).hexdigest()
+            assert stored_hash == expected
+            previous_hash = stored_hash
+        ledger.close()
+
+
+def test_authority_ledger_uses_random_private_directory_and_fixed_identity(tmp_path):
+    _, authority, database_path, _, _ = _authority_store(tmp_path)
+    ledger_path = authority.ledger_path
+    assert ledger_path.parent.parent == database_path.parent
+    assert ledger_path.parent.name.startswith(".khaos-verification-authority-")
+    assert ledger_path.name == "authority-ledger.sqlite"
+    assert stat.S_IMODE(ledger_path.parent.stat().st_mode) == 0o700
+    ledger = ledger_path.stat()
+    assert stat.S_IMODE(ledger.st_mode) == 0o400
+    assert ledger.st_nlink == 1
+    authority.close()
+
+
+def test_preopened_ledger_writer_is_locked_out_or_blocks_startup(tmp_path):
+    database, directory_identity, database_identity = _prepare_authority_ledger(
+        tmp_path
+    )
+    attacker = sqlite3.connect(database, timeout=0.05)
+    authority_ledger = _open_locked_authority_ledger(
+        database, directory_identity, database_identity
+    )
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        attacker.execute("CREATE TABLE forged(value TEXT)")
+        attacker.commit()
+    attacker.rollback()
+    attacker.close()
+    authority_ledger.close()
+
+    second_database, second_directory, second_identity = _prepare_authority_ledger(
+        tmp_path
+    )
+    active = sqlite3.connect(second_database, timeout=0.05)
+    active.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            _open_locked_authority_ledger(
+                second_database, second_directory, second_identity
+            )
+    finally:
+        active.rollback()
+        active.close()
+
+
+@pytest.mark.parametrize("kind", ["file", "symlink", "fifo"])
+def test_authority_ledger_exclusive_create_rejects_precreated_path(tmp_path, kind):
+    path = tmp_path / "authority-ledger.sqlite"
+    if kind == "file":
+        path.write_bytes(b"")
+    elif kind == "symlink":
+        path.symlink_to(tmp_path / "target")
+    else:
+        os.mkfifo(path)
+    with pytest.raises(FileExistsError):
+        _create_exclusive_ledger_file(path)
 
 
 def test_same_boot_authority_cannot_be_issued_twice(tmp_path):

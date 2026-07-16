@@ -7,10 +7,12 @@
 ## 决策
 
 Trusted Verification 的 proof/success authority 继续由独立 spawn 子进程持有，父 Agent
-进程只能通过继承 Pipe 和随机 capability 调用固定 RPC。Authority ledger 不再位于退出时
-删除的临时目录，而是与 verification database 同目录保存为独立 SQLite 文件。
+进程只能通过继承 Pipe 和随机 capability 调用固定 RPC。每个 boot 在
+verification storage parent 下使用随机名 0700 私有目录和
+`O_CREAT | O_EXCL | O_NOFOLLOW` 创建独立 SQLite ledger；退出后保留供审计，
+但不在下一 boot 重用其 writer 或 capability。
 
-Ledger 中的 proof 与 success 全部以 `boot_id` 为 scope；新 boot 可以审计旧记录，但
+Ledger 中的 proof 与 success 全部以 `boot_id` 为 scope；新 boot 可以只读审计保留的旧 ledger，但
 `require-proof`/`require-success` 只查询当前 boot，所以持久化不等于允许跨 boot replay。
 accepted、rejected、boot-started 和 boot-stopped 事件写入 append-only event 表。每条事件
 保存 canonical payload、previous hash 和 SHA-256 event hash；Authority 启动必须从头验证
@@ -23,7 +25,7 @@ hash chain，发现截断后的重写、插入或内容修改即拒绝启动。
 
 - authority ledger process 必须与 Agent PID 不同；
 - proof/success 只在签发 boot 内有效；
-- 旧 boot event 必须保留且 hash chain 可验证；
+- 每个旧 boot ledger 必须保留且其 hash chain 可验证；
 - ledger chain 损坏时不得新发 authority；
 - authority process crash 不得使主 verification DB 推断成功；
 - durable ledger 不替代 CleanupProof、storage identity 或 success CAS 的任一检查。
