@@ -18,7 +18,7 @@ type TokenBucket struct {
 func (b *TokenBucket) Config() (int, int) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return int(b.rate * 60), int(b.burst)
+	return int(b.rate*60 + 0.5), int(b.burst + 0.5)
 }
 
 type keyedBucket struct {
@@ -65,13 +65,15 @@ func (b *KeyedBuckets) Allow(key string) bool {
 	}
 	now := time.Now()
 	b.mu.Lock()
-	for existing, entry := range b.buckets {
-		if now.Sub(entry.lastSeen) > b.idleTTL {
-			delete(b.buckets, existing)
-		}
-	}
 	entry := b.buckets[key]
 	if entry == nil {
+		if len(b.buckets) >= b.maxKeys {
+			for existing, candidate := range b.buckets {
+				if now.Sub(candidate.lastSeen) > b.idleTTL {
+					delete(b.buckets, existing)
+				}
+			}
+		}
 		if len(b.buckets) >= b.maxKeys {
 			oldestKey := ""
 			var oldest time.Time
