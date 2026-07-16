@@ -20,6 +20,7 @@ class ManagedProcessHandle:
         temporary_home: Path | None = None,
         stderr_limit: int = 65536,
         supervisor=None,
+        resource_watchdog: asyncio.Task[dict | None] | None = None,
     ) -> None:
         self.execution_id = execution_id
         self._process = process
@@ -31,6 +32,8 @@ class ManagedProcessHandle:
         self._stderr_truncated = False
         self._closed = False
         self._supervisor = supervisor
+        self._resource_watchdog = resource_watchdog
+        self._resource_violation: dict | None = None
         self._stderr_task = asyncio.create_task(self._collect_stderr())
 
     @property
@@ -45,6 +48,10 @@ class ManagedProcessHandle:
     def stderr_truncated(self) -> bool:
         return self._stderr_truncated
 
+    @property
+    def resource_violation(self) -> dict | None:
+        return self._resource_violation
+
     async def write_stdin(self, payload: bytes) -> None:
         if self._closed or self.stdin is None:
             raise RuntimeError("managed process stdin is closed")
@@ -54,6 +61,7 @@ class ManagedProcessHandle:
     async def wait(self) -> int:
         code = await self._process.wait()
         await self._finish_stderr()
+        await self._finish_resource_watchdog()
         if self._supervisor is not None:
             await self._supervisor.unregister_process(self.execution_id)
         return code
@@ -89,6 +97,7 @@ class ManagedProcessHandle:
                 await self._process.wait()
         finally:
             await self._finish_stderr()
+            await self._finish_resource_watchdog()
             if self._supervisor is not None:
                 await self._supervisor.unregister_process(self.execution_id)
             if self._temporary_home is not None:
@@ -112,6 +121,14 @@ class ManagedProcessHandle:
             await self._stderr_task
             return
         await self._stderr_task
+
+    async def _finish_resource_watchdog(self) -> None:
+        if self._resource_watchdog is None:
+            return
+        try:
+            self._resource_violation = await self._resource_watchdog
+        except asyncio.CancelledError:
+            return
 
 
 def _signal_process_tree(pid: int | None, sig: signal.Signals, fallback) -> None:

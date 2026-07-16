@@ -10,7 +10,14 @@ from pathlib import Path
 
 import pytest
 
-from khaos.coding.execution import ExecutionRequest, ExecutionService, HostExecutionBackend, ManagedProcessHandle, ResourceBudget
+from khaos.coding.execution import (
+    ExecutionRequest,
+    ExecutionService,
+    HostExecutionBackend,
+    ManagedProcessHandle,
+    ProcessSupervisor,
+    ResourceBudget,
+)
 from khaos.coding.workspace.manager import WorkspaceManager
 
 
@@ -88,3 +95,39 @@ async def test_execution_service_shutdown_terminates_parent_child_and_grandchild
             ExecutionRequest((sys.executable, "-c", "pass"), workspace.worktree_path, task_id=workspace.task_id, workspace_id=workspace.id)
         )
 
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(os.name != "posix", reason="process-group semantics are POSIX-only")
+async def test_managed_process_enforces_aggregate_pid_watchdog(monkeypatch):
+    monkeypatch.setattr(
+        "khaos.coding.execution.supervisor._process_group_usage",
+        lambda _process_group: (3, 4096),
+    )
+    process = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import time; time.sleep(30)",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        start_new_session=True,
+    )
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    watchdog = await supervisor.register_process(
+        "managed-pid-budget",
+        process,
+        budget=ResourceBudget(pids=2, memory_bytes=8192),
+    )
+    handle = ManagedProcessHandle(
+        "managed-pid-budget",
+        process,
+        supervisor=supervisor,
+        resource_watchdog=watchdog,
+    )
+
+    await asyncio.wait_for(handle.wait(), timeout=5)
+
+    assert handle.resource_violation == {
+        "kind": "pids", "observed": 3, "limit": 2,
+    }
+    assert supervisor.active_execution_ids == ()
