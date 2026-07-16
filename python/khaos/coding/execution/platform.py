@@ -259,10 +259,10 @@ class MacOSSandboxBackend:
         profile = _validated_profile(request)
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
-        with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value, \
-                tempfile.TemporaryDirectory(prefix="khaos-tmp-") as tmp_value:
+        with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
             home = Path(home_value)
-            sandbox_tmp = Path(tmp_value)
+            sandbox_tmp = home / "tmp"
+            sandbox_tmp.mkdir(mode=0o700)
             sandbox_profile = self.profile(
                 worktree,
                 writable=writable,
@@ -288,7 +288,7 @@ class MacOSSandboxBackend:
                 sandboxed,
                 cwd=request.cwd.resolve(),
                 env=environment,
-                tmp_root=sandbox_tmp,
+                tmp_root=home,
             )
 
     async def terminate(self, execution_id: str) -> None:
@@ -394,8 +394,9 @@ class LinuxBubblewrapBackend:
             "--dev", "/dev",
             "--proc", "/proc",
             "--size", str(budget.tmpfs_bytes),
+            "--tmpfs", "/home/khaos",
+            "--size", str(budget.tmpfs_bytes),
             "--tmpfs", "/tmp",
-            "--bind", str(home), "/home/khaos",
             "--bind" if writable else "--ro-bind", str(canonical_worktree), self.SANDBOX_WORKDIR,
         ]
         for link in (Path("/bin"), Path("/sbin"), Path("/lib"), Path("/lib64")):
@@ -442,7 +443,11 @@ class LinuxBubblewrapBackend:
             sandboxed = replace(request, argv=(*prefix, "--", *request.argv))
             supervisor = self.supervisor or ProcessSupervisor()
             self.supervisor = supervisor
-            return await supervisor.run(sandboxed, cwd=request.cwd.resolve())
+            return await supervisor.run(
+                sandboxed,
+                cwd=request.cwd.resolve(),
+                sandbox_storage_paths=("/home/khaos", "/tmp"),
+            )
 
     async def terminate(self, execution_id: str) -> None:
         if self.supervisor is not None:

@@ -207,6 +207,33 @@ async def test_supervisor_enforces_synthetic_tmp_capacity(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_supervisor_enforces_synthetic_home_entry_budget(tmp_path: Path):
+    synthetic_home = tmp_path / "synthetic-home"
+    synthetic_home.mkdir()
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    request = ExecutionRequest(
+        (
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys,time; "
+            "root=Path(sys.argv[1]); "
+            "[(root / f'entry-{i}').touch() for i in range(12)]; time.sleep(30)",
+            str(synthetic_home),
+        ),
+        tmp_path,
+        budget=ResourceBudget(filesystem_entries=10),
+        correlation_id="home-entry-capacity",
+    )
+
+    result = await supervisor.run(request, tmp_root=synthetic_home)
+
+    assert result.status == "resource-exhausted"
+    assert result.diagnostics["resource_violation"] == {
+        "kind": "filesystem-entries", "observed": 12, "limit": 10,
+    }
+
+
+@pytest.mark.asyncio
 async def test_execution_service_terminate_reaches_foreground_process(
     tmp_path: Path,
 ):

@@ -27,8 +27,10 @@ stdout/stderr 必须在进程运行期间并发 drain，各自取得总输出预
 不得把未截断完整输出写入宿主 artifact 形成配额旁路。Docker backend 仅负责容器策略
 和清理，不再拥有另一套 communicate/截断实现。
 前台与 managed/LSP 进程共用 aggregate process-group PID/memory watchdog；
-macOS 合成 TMP 由同一 watchdog 统计 regular-file bytes，超过 `tmpfs_bytes`
-即终止整个 process group。
+macOS 与 managed/LSP 的整个合成 HOME（包括 TMP）由同一 watchdog 统计 regular-file
+bytes 与 filesystem entries，任一超过 `tmpfs_bytes` / `filesystem_entries` 即终止
+整个 process group。Linux 的 HOME 与 TMP 均使用带 `--size` 的独立 tmpfs，并通过
+`/proc/<pid>/root` 计入同一 entries/总字节 watchdog。
 
 Linux backend 的 capability probe 与真实执行必须使用同一 bwrap mount/namespace
 拓扑：宿主 `/` 只读、独立 `/dev`、新 `/proc`、受控 `/tmp`、唯一 workspace bind，
@@ -49,6 +51,10 @@ Docker allowlist 只接受 `@sha256:` 固定镜像，运行使用 `--pull never`
 防止容器名冲突导致删除宿主现有容器。worktree mount 参数拒绝逗号/换行/NUL，所有
 Docker CLI 进程也由 supervisor 管理。真实 Docker destructive lifecycle 测试只在干净
 CI runner 执行。
+
+`cpu_count` 只在具备 native quota controller 的 Docker backend 表示核心配额；POSIX
+host backend 不伪装成核心数限制，改用独立 `cpu_time_seconds` 驱动 `RLIMIT_CPU`，并在
+diagnostics 明确报告 `cpu_quota_enforced=false`。
 
 ## 原因
 
