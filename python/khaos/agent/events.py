@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 import uuid
+import weakref
 from dataclasses import dataclass
 from typing import Any
 
 
-_RECOVERED_DATABASES: set[int] = set()
+_RECOVERY_TASKS: weakref.WeakKeyDictionary[Any, asyncio.Task[Any]] = (
+    weakref.WeakKeyDictionary()
+)
 
 
 @dataclass(frozen=True)
@@ -122,12 +126,15 @@ class TurnCoordinator:
 
 
 async def _recover_once(db: Any) -> None:
-    key = id(db)
-    if key in _RECOVERED_DATABASES:
-        return
-    _RECOVERED_DATABASES.add(key)
+    task = _RECOVERY_TASKS.get(db)
+    if task is None:
+        task = asyncio.create_task(
+            db.recover_inflight_agent_turns(now=time.time())
+        )
+        _RECOVERY_TASKS[db] = task
     try:
-        await db.recover_inflight_agent_turns(now=time.time())
+        await asyncio.shield(task)
     except Exception:
-        _RECOVERED_DATABASES.discard(key)
+        if _RECOVERY_TASKS.get(db) is task:
+            del _RECOVERY_TASKS[db]
         raise
