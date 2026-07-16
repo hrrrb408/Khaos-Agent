@@ -232,6 +232,12 @@ class MacOSSandboxBackend:
             f'(allow file-write* (subpath "{_seatbelt_escape(path)}"))'
             for path in write_roots
         )
+        git_pointer = workspace / ".git"
+        protected_write_rules = (
+            f'(deny file-write* (literal "{_seatbelt_escape(git_pointer)}"))'
+            if git_pointer.exists()
+            else ""
+        )
         mach_lookup_rules = "".join(
             f'(allow mach-lookup (global-name "{service}"))'
             for service in _macos_runtime_mach_services()
@@ -250,6 +256,7 @@ class MacOSSandboxBackend:
             '(allow file-read* (literal "/dev/random"))',
             '(allow file-read* (literal "/dev/urandom"))',
             read_rules, literal_reads, executable_map_rules, write_rules,
+            protected_write_rules,
             mach_lookup_rules,
             "(deny network*)",
         ))
@@ -401,6 +408,11 @@ class LinuxBubblewrapBackend:
             "--tmpfs", "/tmp",
             "--bind" if writable else "--ro-bind", str(canonical_worktree), self.SANDBOX_WORKDIR,
         ]
+        git_pointer = canonical_worktree / ".git"
+        if writable and git_pointer.is_file():
+            prefix.extend(
+                ("--ro-bind", str(git_pointer), f"{self.SANDBOX_WORKDIR}/.git")
+            )
         for link in (Path("/bin"), Path("/sbin"), Path("/lib"), Path("/lib64")):
             if link.is_symlink():
                 prefix.extend(("--symlink", os.readlink(link), str(link)))

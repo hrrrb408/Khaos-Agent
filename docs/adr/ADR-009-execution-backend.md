@@ -44,6 +44,19 @@ snapshot 至少两次完整且 path/inode view 稳定；遍历错误、不可读
 或持续 rename/delete churn 全部 fail closed。无法安全回滚的 violation 必须强制清理
 disposable Worktree；清理失败时保持 FAILED。Docker bind mount 也必须使用该 authority。
 
+目录 Snapshot 之外，ProcessSupervisor 还必须统计同 process group 中已经 unlink 但仍
+持有 fd 的 regular file；Linux 通过 `/proc/<pid>/fd`，macOS 通过 `lsof +L1`。无法完整
+观察时 fail closed。Docker payload 由固定、不可由调用方覆盖的容器内 supervisor 扫描
+PID namespace 的 deleted fd，并同时设置 fsize/nofile ulimit；超过 Workspace budget
+返回 `resource-exhausted`。这些检查覆盖目录扫描不可见的瞬时磁盘占用。
+
+文件工具 mutation 在线程中执行时，调用方 timeout/cancel 不得释放 Workspace fence。
+Runtime 使用 `shield` 等待 authority 完成 commit 或 rollback 后再传播取消，cleanup 和
+下一次 mutation 在此之前均不可进入。普通文件读取、patch 和 snapshot 具有 16 MiB
+硬上限，读取前检查 `fstat` 且流式读取过程中再次累计；copy 使用 bounded streaming。
+rollback before-state 写入 Workspace 外权限 0700 的 authority recovery root，文件 0600，
+不再把完整原文件保存在 Runtime heap，成功、失败或 rollback 后均删除 recovery artifact。
+
 Linux backend 的 capability probe 与真实执行必须使用同一 bwrap mount/namespace
 拓扑：宿主 `/` 只读、独立 `/dev`、新 `/proc`、受控 `/tmp`、唯一 workspace bind，
 并隔离 network/PID/IPC/UTS，创建新 session 且启用 die-with-parent。sandbox cwd 由请求

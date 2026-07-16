@@ -91,7 +91,12 @@ async def write_file(path: str, content: str, workspace_manager=None, task_id: s
             workspace_manager,
             workspace,
             task_id or "",
-            lambda: _workspace_write_sync(workspace.worktree_path, path, content),
+            lambda: _workspace_write_sync(
+                workspace.worktree_path,
+                workspace_manager.file_recovery_root(workspace.id),
+                path,
+                content,
+            ),
         )
     return await asyncio.to_thread(_write_file_sync, path, content)
 
@@ -123,7 +128,9 @@ async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_man
             workspace,
             task_id or "",
             lambda: _workspace_patch_sync(
-                workspace.worktree_path, path, old, new, fuzzy
+                workspace.worktree_path,
+                workspace_manager.file_recovery_root(workspace.id),
+                path, old, new, fuzzy,
             ),
         )
     return await asyncio.to_thread(_patch_sync, path, old, new, fuzzy)
@@ -159,7 +166,9 @@ async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_
             workspace,
             task_id or "",
             lambda: _workspace_multi_edit_sync(
-                workspace.worktree_path, path, edits
+                workspace.worktree_path,
+                workspace_manager.file_recovery_root(workspace.id),
+                path, edits,
             ),
         )
     return await asyncio.to_thread(_multi_edit_sync, path, edits)
@@ -430,7 +439,11 @@ async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | N
             workspace_manager,
             workspace,
             task_id or "",
-            lambda: _workspace_copy_sync(workspace.worktree_path, src, dst),
+            lambda: _workspace_copy_sync(
+                workspace.worktree_path,
+                workspace_manager.file_recovery_root(workspace.id),
+                src, dst,
+            ),
         )
     return await asyncio.to_thread(_copy_file_sync, src, dst)
 
@@ -672,17 +685,21 @@ async def _workspace_mutate(
 
 
 def _workspace_write_sync(
-    root: Path, path: str, content: str
+    root: Path, recovery_root: Path, path: str, content: str
 ) -> object:
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
 
     with SafeWorkspaceFS(root) as filesystem:
         relative = filesystem.relative(path)
-        before = filesystem.snapshot_file(path)
-        encoded = content.encode("utf-8")
-        filesystem.write_bytes(path, encoded)
-        after = filesystem.snapshot_file(path)
+        before = filesystem.snapshot_file(path, recovery_root=recovery_root)
+        try:
+            encoded = content.encode("utf-8")
+            filesystem.write_bytes(path, encoded)
+            after = filesystem.snapshot_file(path)
+        except Exception:
+            before.cleanup()
+            raise
         value = {
             "path": str(filesystem.root / relative),
             "bytes": len(encoded),
@@ -690,6 +707,7 @@ def _workspace_write_sync(
     return WorkspaceMutation(
         value,
         lambda: _rollback_file(root, path, before, after),
+        before.cleanup,
     )
 
 
@@ -884,14 +902,15 @@ def _workspace_content_search_sync(
 
 
 def _workspace_patch_sync(
-    root: Path, path: str, old: str, new: str, fuzzy: bool
+    root: Path, recovery_root: Path, path: str,
+    old: str, new: str, fuzzy: bool,
 ) -> object:
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
 
     with SafeWorkspaceFS(root) as filesystem:
         relative = filesystem.relative(path)
-        before = filesystem.snapshot_file(path)
+        before = filesystem.snapshot_file(path, recovery_root=recovery_root)
         result: dict[str, Any] = {}
 
         def transform(original: str) -> str:
@@ -907,17 +926,22 @@ def _workspace_patch_sync(
             result.update(replaced=1, fuzzy=True, score=score)
             return original[:start] + new + original[end:]
 
-        filesystem.transform_text(path, transform)
-        after = filesystem.snapshot_file(path)
+        try:
+            filesystem.transform_text(path, transform)
+            after = filesystem.snapshot_file(path)
+        except Exception:
+            before.cleanup()
+            raise
         value = {"path": str(filesystem.root / relative), **result}
     return WorkspaceMutation(
         value,
         lambda: _rollback_file(root, path, before, after),
+        before.cleanup,
     )
 
 
 def _workspace_multi_edit_sync(
-    root: Path, path: str, edits: list[dict]
+    root: Path, recovery_root: Path, path: str, edits: list[dict]
 ) -> object:
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
@@ -930,8 +954,12 @@ def _workspace_multi_edit_sync(
     )
     with SafeWorkspaceFS(root) as filesystem:
         relative = filesystem.relative(path)
-        before = filesystem.snapshot_file(path)
-        original = filesystem.read_bytes(path).decode("utf-8")
+        before = filesystem.snapshot_file(path, recovery_root=recovery_root)
+        try:
+            original = filesystem.read_bytes(path).decode("utf-8")
+        except Exception:
+            before.cleanup()
+            raise
         failures: list[dict[str, Any]] = []
         for original_index, edit in sorted_edits:
             count = original.count(edit["old_text"])
@@ -950,14 +978,18 @@ def _workspace_multi_edit_sync(
                 "path": str(filesystem.root / relative),
                 "applied": 0,
                 "failed": sorted(failures, key=lambda item: int(item["index"])),
-            }, ensure_ascii=False), lambda: None)
+            }, ensure_ascii=False), lambda: None, before.cleanup)
         updated = original
         applied: list[dict[str, Any]] = []
         for original_index, edit in sorted_edits:
             updated = updated.replace(edit["old_text"], edit["new_text"], 1)
             applied.append({"index": original_index, "old_text": edit["old_text"]})
-        filesystem.write_bytes(path, updated.encode("utf-8"))
-        after = filesystem.snapshot_file(path)
+        try:
+            filesystem.write_bytes(path, updated.encode("utf-8"))
+            after = filesystem.snapshot_file(path)
+        except Exception:
+            before.cleanup()
+            raise
         value = json.dumps({
             "path": str(filesystem.root / relative),
             "applied": len(applied),
@@ -967,11 +999,12 @@ def _workspace_multi_edit_sync(
     return WorkspaceMutation(
         value,
         lambda: _rollback_file(root, path, before, after),
+        before.cleanup,
     )
 
 
 def _workspace_copy_sync(
-    root: Path, source: str, destination: str
+    root: Path, recovery_root: Path, source: str, destination: str
 ) -> object:
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
@@ -979,9 +1012,15 @@ def _workspace_copy_sync(
     with SafeWorkspaceFS(root) as filesystem:
         source_relative = filesystem.relative(source)
         destination_relative = filesystem.relative(destination)
-        before = filesystem.snapshot_file(destination)
-        size = filesystem.copy_file(source, destination)
-        after = filesystem.snapshot_file(destination)
+        before = filesystem.snapshot_file(
+            destination, recovery_root=recovery_root
+        )
+        try:
+            size = filesystem.copy_file(source, destination)
+            after = filesystem.snapshot_file(destination)
+        except Exception:
+            before.cleanup()
+            raise
         value = {
             "ok": True,
             "src": str(filesystem.root / source_relative),
@@ -991,6 +1030,7 @@ def _workspace_copy_sync(
     return WorkspaceMutation(
         value,
         lambda: _rollback_file(root, destination, before, after),
+        before.cleanup,
     )
 
 
@@ -1036,7 +1076,7 @@ def _rollback_file(root: Path, path: str, before, after) -> None:
         if current != after:
             raise WorkspaceBoundaryError("rollback target changed concurrently")
         if before.exists:
-            filesystem.write_bytes(path, before.content, mode=before.mode)
+            filesystem.restore_file(path, before, expected=after)
         else:
             filesystem.delete_file(path, expected=after)
 
@@ -1063,7 +1103,7 @@ def _rollback_move(
             raise WorkspaceBoundaryError("move rollback target changed concurrently")
         filesystem.move_file(destination, source)
         restored = filesystem.snapshot_file(source)
-        if restored.content != source_before.content:
+        if restored.digest != source_before.digest:
             raise WorkspaceBoundaryError("move rollback content mismatch")
 
 

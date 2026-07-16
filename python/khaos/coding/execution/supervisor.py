@@ -7,6 +7,7 @@ import math
 import os
 import signal
 import stat
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -399,8 +400,12 @@ async def _resource_watchdog(
             process_count, resident_bytes = await asyncio.to_thread(
                 _process_group_usage, process.pid
             )
+            deleted_bytes, deleted_complete = await asyncio.to_thread(
+                _deleted_open_file_usage, process.pid
+            )
         else:
             process_count, resident_bytes = 0, 0
+            deleted_bytes, deleted_complete = 0, True
         violation = None
         if process_tree_supported and process_count > budget.pids:
             violation = {
@@ -435,12 +440,19 @@ async def _resource_watchdog(
                     "observed": "authority-unavailable",
                     "limit": "authority-required",
                 }
+            elif not deleted_complete:
+                violation = {
+                    "kind": "workspace-observation",
+                    "observed": "deleted-open-files-unobservable",
+                    "limit": "complete-process-fd-accounting",
+                }
             else:
                 violation = await asyncio.to_thread(
                     storage_authority.assess,
                     workspace_root,
                     workspace_baseline,
                     workspace_limits,
+                    extra_allocated_bytes=deleted_bytes,
                 )
         if violation is not None:
             active.termination_requested = True
@@ -500,6 +512,132 @@ def _process_group_usage(process_group_id: int) -> tuple[int, int]:
     if sys.platform == "darwin":
         return _darwin_process_group_usage(process_group_id)
     return 0, 0
+
+
+def _deleted_open_file_usage(process_group_id: int) -> tuple[int, bool]:
+    """Account unlinked files still consuming blocks in a supervised group."""
+    if sys.platform.startswith("linux"):
+        return _linux_deleted_open_file_usage(process_group_id)
+    if sys.platform == "darwin":
+        return _darwin_deleted_open_file_usage(process_group_id)
+    return 0, False
+
+
+def _linux_deleted_open_file_usage(
+    process_group_id: int,
+) -> tuple[int, bool]:
+    total = 0
+    complete = True
+    seen: set[tuple[int, int]] = set()
+    for pid in _linux_process_group_pids(process_group_id):
+        fd_root = Path(f"/proc/{pid}/fd")
+        try:
+            descriptors = tuple(fd_root.iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError:
+            complete = False
+            continue
+        for descriptor in descriptors:
+            try:
+                target = os.readlink(descriptor)
+                if not target.endswith(" (deleted)"):
+                    continue
+                info = os.stat(descriptor)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                complete = False
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            identity = (info.st_dev, info.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            allocated = int(getattr(info, "st_blocks", 0)) * 512
+            total += max(allocated, info.st_size if allocated <= 0 else 0)
+    return total, complete
+
+
+def _darwin_deleted_open_file_usage(
+    process_group_id: int,
+) -> tuple[int, bool]:
+    try:
+        completed = subprocess.run(
+            (
+                "/usr/sbin/lsof", "-nP", "-a", f"-g{process_group_id}",
+                "+L1", "-F", "pfsDi",
+            ),
+            capture_output=True,
+            text=True,
+            timeout=0.5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return 0, False
+    if completed.returncode not in {0, 1}:
+        return 0, False
+    total = 0
+    seen: set[tuple[str, str]] = set()
+    current_pid = ""
+    current_fd = ""
+    current_device = ""
+    current_inode = ""
+    current_size = 0
+
+    def commit() -> None:
+        nonlocal total
+        if not current_fd:
+            return
+        identity = (
+            current_device,
+            current_inode or f"{current_pid}:{current_fd}",
+        )
+        if identity not in seen:
+            seen.add(identity)
+            total += max(0, current_size)
+
+    for line in completed.stdout.splitlines():
+        if not line:
+            continue
+        field, value = line[0], line[1:]
+        if field == "p":
+            commit()
+            current_pid = value
+            current_fd = ""
+            current_device = ""
+            current_inode = ""
+            current_size = 0
+        elif field == "f":
+            commit()
+            current_fd = value
+            current_device = ""
+            current_inode = ""
+            current_size = 0
+        elif field == "D":
+            current_device = value
+        elif field == "i":
+            current_inode = value
+        elif field == "s":
+            try:
+                current_size = int(value)
+            except ValueError:
+                return 0, False
+    commit()
+    return total, True
+
+
+def _linux_process_group_pids(process_group_id: int) -> tuple[int, ...]:
+    values: list[int] = []
+    for stat_path in Path("/proc").glob("[0-9]*/stat"):
+        try:
+            fields = stat_path.read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+            if int(fields[2]) == process_group_id:
+                values.append(int(stat_path.parent.name))
+        except (OSError, ValueError, IndexError):
+            continue
+    return tuple(values)
 
 
 def _darwin_process_group_usage(process_group_id: int) -> tuple[int, int]:

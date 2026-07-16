@@ -84,7 +84,10 @@ def _service(tmp_path, *, task_id="task", state=WorkspaceState.RUNNING, docker_b
         repository_root=repository,
         state=state,
     )
-    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    manager = SimpleNamespace(
+        get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        verify_git_identity=AsyncMock(),
+    )
     backend = docker_backend or _FakeDockerBackend()
     return ExecutionService(HostExecutionBackend(), manager, backend), workspace, backend
 
@@ -278,11 +281,42 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     assert argv[argv.index("--pids-limit") + 1] == "256"
     assert argv[argv.index("--cpus") + 1] == "1.0"
     assert argv[argv.index("--memory") + 1] == str(512 * 1024 * 1024)
-    mount = argv[argv.index("--mount") + 1]
-    assert mount == f"type=bind,src={tmp_path / 'worktree'},dst=/workspace"
+    ulimits = [
+        argv[index + 1]
+        for index, value in enumerate(argv[:-1])
+        if value == "--ulimit"
+    ]
+    assert "fsize=67108864:67108864" in ulimits
+    assert "nofile=256:256" in ulimits
+    mounts = [
+        argv[index + 1]
+        for index, value in enumerate(argv[:-1])
+        if value == "--mount"
+    ]
+    assert mounts == [
+        f"type=bind,src={tmp_path / 'worktree'},dst=/workspace",
+        (
+            f"type=bind,src={tmp_path / 'worktree' / '.git'},"
+            "dst=/workspace/.git,readonly"
+        ),
+    ]
     assert str(tmp_path / "repo") not in " ".join(argv)
     assert "/var/run/docker.sock" not in " ".join(argv)
+    assert argv[-3:] == ("--", "python", "-V")
     assert result.diagnostics["cleanup"] == "removed"
+
+
+async def test_docker_deleted_open_file_watchdog_maps_to_resource_violation(tmp_path):
+    backend = _InspectableDockerBackend()
+    process = _FakeProcess(returncode=173)
+    with patch(
+        "khaos.coding.execution.docker.asyncio.create_subprocess_exec",
+        new=AsyncMock(return_value=process),
+    ):
+        result = await backend.execute_resolved(_resolved(tmp_path))
+
+    assert result.status == "resource-exhausted"
+    assert result.diagnostics["resource_violation"]["kind"] == "workspace-bytes"
 
 
 async def test_docker_backend_rejects_unavailable_or_unapproved_image_without_pull(tmp_path):
@@ -463,7 +497,10 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
         task_id="task", worktree_path=worktree, repository_root=repository,
         state=WorkspaceState.RUNNING,
     )
-    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    manager = SimpleNamespace(
+        get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        verify_git_identity=AsyncMock(),
+    )
     service = ExecutionService(
         HostExecutionBackend(), manager,
         DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE}),
@@ -493,6 +530,35 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
 
 @pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
 @pytest.mark.docker_sandbox_real
+async def test_real_docker_deleted_open_file_budget_is_enforced(tmp_path):
+    context = _resolved(
+        tmp_path,
+        budget=ResourceBudget(
+            workspace_bytes=4096,
+            file_bytes=1024 * 1024,
+            timeout_seconds=10,
+        ),
+    )
+    context.worktree_path.chmod(0o777)
+    command = (
+        "import os,time; "
+        "fd=os.open('/workspace/deleted.bin', os.O_CREAT|os.O_RDWR, 0o600); "
+        "os.unlink('/workspace/deleted.bin'); os.write(fd, b'x'*16384); "
+        "os.fsync(fd); time.sleep(30)"
+    )
+    context = ResolvedExecutionContext(
+        **{**context.__dict__, "argv": ("python", "-c", command)}
+    )
+    backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
+
+    result = await backend.execute_resolved(context)
+
+    assert result.status == "resource-exhausted"
+    assert result.diagnostics["resource_violation"]["kind"] == "workspace-bytes"
+
+
+@pytest.mark.skipif(not _docker_available(), reason="Docker daemon unavailable")
+@pytest.mark.docker_sandbox_real
 @pytest.mark.parametrize("action", ["timeout", "cancel", "shutdown"])
 async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
     repository = tmp_path / "repo"
@@ -513,7 +579,10 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
         task_id="task", worktree_path=worktree, repository_root=repository,
         state=WorkspaceState.RUNNING,
     )
-    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    manager = SimpleNamespace(
+        get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        verify_git_identity=AsyncMock(),
+    )
     backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
     service = ExecutionService(HostExecutionBackend(), manager, backend)
     running = asyncio.create_task(sandbox_exec(
@@ -544,9 +613,9 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
         assert result["timed_out"] is True
         assert result["status"] == "timed-out"
         assert result["cleanup"] == "removed"
-    leftovers = subprocess.run(
-        ["docker", "ps", "-aq", "--filter", "name=khaos-"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    assert leftovers == ""
+    # Do not inspect every ``khaos-*`` container: push and pull_request
+    # workflows can legitimately share one runner/daemon concurrently.  The
+    # per-execution container was checked above, and the backend registry is
+    # the authoritative ownership scope for this test.
+    assert backend._active == {}
     await service.shutdown()

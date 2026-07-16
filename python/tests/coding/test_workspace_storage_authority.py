@@ -1,6 +1,8 @@
 import asyncio
+import threading
 import os
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -17,6 +19,7 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageLimits,
     WorkspaceStorageSnapshot,
     WorkspaceStorageViolation,
+    WorkspaceMutation,
     capture_workspace_snapshot,
 )
 from khaos.tools.file_tools import copy_file, write_file
@@ -75,6 +78,21 @@ async def test_write_file_without_terminal_rolls_back_byte_overage(tmp_path):
     assert caught.value.quarantine_required is False
     assert not (tmp_path / "payload.bin").exists()
     assert workspace.state is WorkspaceState.READY
+
+
+@pytest.mark.asyncio
+async def test_overwrite_overage_stream_restores_from_recovery_file(tmp_path):
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+    manager, workspace = _registered_manager(tmp_path, byte_limit=1)
+
+    with pytest.raises(WorkspaceStorageViolation) as caught:
+        await write_file("target.txt", "x" * 8192, **_context(manager))
+
+    assert caught.value.rollback_succeeded is True
+    assert target.read_text(encoding="utf-8") == "before"
+    recovery = manager.file_recovery_root(workspace.id)
+    assert list(recovery.iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -201,6 +219,11 @@ async def test_cleanup_failure_leaves_workspace_quarantined(tmp_path, monkeypatc
 async def test_cancelled_execution_still_accounts_workspace(tmp_path):
     manager, workspace = _registered_manager(tmp_path, byte_limit=1)
 
+    async def verify_git_identity(_workspace_id):
+        return None
+
+    manager.verify_git_identity = verify_git_identity
+
     class CancelledBackend:
         async def execute(self, request):
             (request.cwd / "cancelled.bin").write_bytes(b"x" * 8192)
@@ -222,3 +245,60 @@ async def test_cancelled_execution_still_accounts_workspace(tmp_path):
         await service.execute(request)
 
     assert workspace.state is WorkspaceState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_cancel_waits_for_mutation_transaction_before_releasing_fence(tmp_path):
+    manager, _workspace = _registered_manager(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_operation():
+        started.set()
+        assert release.wait(2)
+        target = tmp_path / "delayed.txt"
+        target.write_text("committed", encoding="utf-8")
+        return WorkspaceMutation("first", lambda: target.unlink(missing_ok=True))
+
+    first = asyncio.create_task(manager.mutate_with_storage_authority(
+        "workspace", "task", delayed_operation
+    ))
+    assert await asyncio.to_thread(started.wait, 1)
+    first.cancel()
+    second = asyncio.create_task(manager.mutate_with_storage_authority(
+        "workspace", "task", lambda: WorkspaceMutation("second", lambda: None)
+    ))
+    await asyncio.sleep(0.02)
+    assert not first.done()
+    assert not second.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    assert await second == "second"
+    assert (tmp_path / "delayed.txt").read_text(encoding="utf-8") == "committed"
+
+
+@pytest.mark.asyncio
+async def test_timeout_does_not_return_before_delayed_mutation_is_settled(tmp_path):
+    manager, _workspace = _registered_manager(tmp_path)
+    release = threading.Event()
+
+    def delayed_operation():
+        assert release.wait(2)
+        target = tmp_path / "timeout.txt"
+        target.write_text("settled", encoding="utf-8")
+        return WorkspaceMutation("done", lambda: target.unlink(missing_ok=True))
+
+    asyncio.get_running_loop().call_later(0.1, release.set)
+    started_at = time.monotonic()
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            manager.mutate_with_storage_authority(
+                "workspace", "task", delayed_operation
+            ),
+            timeout=0.01,
+        )
+
+    assert time.monotonic() - started_at >= 0.08
+    assert (tmp_path / "timeout.txt").read_text(encoding="utf-8") == "settled"

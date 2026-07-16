@@ -41,7 +41,7 @@ jobs:
       - name: Install contract dependencies
         run: python -m pip install -e ".[test,tui]"
       - name: Run cross-platform security contracts
-        run: python -m pytest python/tests/security/test_ci_security_policy.py python/tests/agent/test_approval_broker.py python/tests/agent/test_operation_approval_ledger.py python/tests/agent/test_turn_coordinator.py python/tests/permissions/test_permission_engine.py python/tests/tools/test_capability_broker.py python/tests/tools/test_tool_scheduler.py python/tests/coding/test_backend_selector.py python/tests/coding/test_permission_profile.py python/tests/coding/test_windows_fail_closed.py python/tests/tui/test_view_model.py python/tests/tui/test_tui_app.py -q
+        run: python -m pytest python/tests/security/test_ci_security_policy.py python/tests/security/test_middleware.py python/tests/security/test_sandbox.py python/tests/agent/test_approval_broker.py python/tests/agent/test_operation_approval_ledger.py python/tests/agent/test_turn_coordinator.py python/tests/permissions/test_permission_engine.py python/tests/tools/test_capability_broker.py python/tests/tools/test_tool_scheduler.py python/tests/coding/test_backend_selector.py python/tests/coding/test_permission_profile.py python/tests/coding/test_windows_fail_closed.py python/tests/tui/test_view_model.py python/tests/tui/test_tui_app.py -q
       - name: Run durable webhook and resource contracts
         run: python -m pytest python/tests/channels/test_webhook.py python/tests/channels/test_channel_registry.py python/tests/coding/test_process_supervisor.py python/tests/coding/test_workspace_storage.py python/tests/coding/test_workspace_storage_authority.py python/tests/coding/test_managed_process_lifecycle.py -q
       - name: Run POSIX verification authority contracts
@@ -52,7 +52,7 @@ jobs:
         run: python -m pytest python/tests/test_grpc_server.py -q
       - name: Run POSIX workspace boundary contracts
         if: runner.os != 'Windows'
-        run: python -m pytest python/tests/coding/test_safe_workspace_fs.py python/tests/coding/test_workspace_boundary.py python/tests/coding/test_m4_batch3_0_workspace_mutation.py -q
+        run: python -m pytest python/tests/coding/test_safe_workspace_fs.py python/tests/coding/test_workspace_boundary.py python/tests/coding/test_workspace_manager.py python/tests/coding/test_execution_binding.py python/tests/coding/test_m4_batch3_0_workspace_mutation.py -q
       - name: Run Go gateway tests
         working-directory: go
         run: go test ./...

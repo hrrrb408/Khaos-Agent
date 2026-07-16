@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from khaos.coding.workspace.boundary import (
+    DEFAULT_FILE_TOOL_BYTES,
     SafeWorkspaceFS,
     WorkspaceBoundaryError,
 )
@@ -63,7 +64,15 @@ def test_safe_workspace_fs_atomic_create_update_and_read(tmp_path):
         assert target.stat().st_ino != first_inode
 
 
-@pytest.mark.parametrize("protected", [".git/config", ".agents/policy", ".codex/config", ".khaos/state"])
+@pytest.mark.parametrize(
+    "protected",
+    [
+        ".git/config", ".GIT/config", ".Git/config",
+        ".agents/policy", ".AGENTS/policy",
+        ".codex/config", ".CODEX/config",
+        ".khaos/state", ".KHAOS/state",
+    ],
+)
 def test_safe_workspace_fs_rejects_protected_metadata(tmp_path, protected):
     with SafeWorkspaceFS(tmp_path) as filesystem:
         with pytest.raises(WorkspaceBoundaryError, match="protected"):
@@ -88,6 +97,56 @@ def test_safe_workspace_fs_rejects_traversal_symlink_and_hardlink(tmp_path):
             filesystem.write_bytes("alias", b"blocked")
     assert (outside / "secret").read_text(encoding="utf-8") == "secret"
     assert original.read_text(encoding="utf-8") == "data"
+
+
+def test_safe_workspace_fs_rejects_oversized_read_snapshot_and_copy(tmp_path):
+    oversized = tmp_path / "oversized.bin"
+    with oversized.open("wb") as stream:
+        stream.truncate(DEFAULT_FILE_TOOL_BYTES + 1)
+
+    with SafeWorkspaceFS(tmp_path) as filesystem:
+        with pytest.raises(WorkspaceBoundaryError, match="bounded|limit"):
+            filesystem.read_bytes("oversized.bin")
+        with pytest.raises(WorkspaceBoundaryError, match="size limit"):
+            filesystem.snapshot_file("oversized.bin")
+        with pytest.raises(WorkspaceBoundaryError, match="bounded"):
+            filesystem.copy_file("oversized.bin", "copy.bin")
+    assert not (tmp_path / "copy.bin").exists()
+
+
+def test_snapshot_uses_private_recovery_file_and_streaming_restore(tmp_path):
+    recovery = tmp_path.parent / f"{tmp_path.name}-recovery"
+    recovery.mkdir(mode=0o700)
+    target = tmp_path / "target.txt"
+    target.write_text("before", encoding="utf-8")
+
+    with SafeWorkspaceFS(tmp_path) as filesystem:
+        before = filesystem.snapshot_file(
+            "target.txt", recovery_root=recovery
+        )
+        assert before.recovery_path is not None
+        assert before.recovery_path.read_bytes() == b"before"
+        filesystem.write_bytes("target.txt", b"after")
+        after = filesystem.snapshot_file("target.txt")
+        filesystem.restore_file("target.txt", before, expected=after)
+        before.cleanup()
+
+    assert target.read_text(encoding="utf-8") == "before"
+    assert list(recovery.iterdir()) == []
+
+
+def test_copy_file_streams_without_read_bytes_heap_buffer(tmp_path, monkeypatch):
+    (tmp_path / "source.bin").write_bytes(b"x" * 1024)
+    with SafeWorkspaceFS(tmp_path) as filesystem:
+        monkeypatch.setattr(
+            filesystem,
+            "read_bytes",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("copy must not buffer source in Runtime heap")
+            ),
+        )
+        assert filesystem.copy_file("source.bin", "copy.bin") == 1024
+    assert (tmp_path / "copy.bin").read_bytes() == b"x" * 1024
 
 
 async def test_coding_file_tools_share_safe_workspace_capability(tmp_path):

@@ -6,6 +6,7 @@ import json
 import os
 import time
 from dataclasses import replace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -50,7 +51,10 @@ class _RecordingLocalRemoteBackend(HostExecutionBackend):
 
 class _RecordingExecutionService:
     def __init__(self, workspace, outputs=None):
-        self.workspace_manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "w" else None)
+        self.workspace_manager = SimpleNamespace(
+            get=lambda workspace_id: workspace if workspace_id == "w" else None,
+            verify_git_identity=AsyncMock(),
+        )
         self.requests = []
         self.outputs = iter(outputs or [""])
 
@@ -91,7 +95,9 @@ async def test_destructive_and_remote_write_require_workspace_context(tmp_path):
 
 async def test_cross_task_and_cancelled_workspace_are_rejected(tmp_path):
     workspace = SimpleNamespace(task_id="task-a", worktree_path=tmp_path, state=WorkspaceState.RUNNING)
-    manager = SimpleNamespace(get=lambda _: workspace)
+    manager = SimpleNamespace(
+        get=lambda _: workspace, verify_git_identity=AsyncMock()
+    )
     service = SimpleNamespace(workspace_manager=manager)
     with pytest.raises(PermissionError, match="binding"):
         await git_commit(str(tmp_path), "message", task_id="task-b", workspace_id="w", execution_service=service)
@@ -199,7 +205,10 @@ async def _destructive_repo(tmp_path):
         branch_name="task/test",
         state=WorkspaceState.RUNNING,
     )
-    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    manager = SimpleNamespace(
+        get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        verify_git_identity=AsyncMock(),
+    )
     service = ExecutionService(HostExecutionBackend(), manager)
     return main, task, workspace, service
 

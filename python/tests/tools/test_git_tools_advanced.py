@@ -6,6 +6,7 @@ import asyncio
 import json
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -38,7 +39,10 @@ def _ctx(repo, access_mode="vcs.destructive-write"):
         branch_name="main",
         state=WorkspaceState.RUNNING,
     )
-    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    manager = SimpleNamespace(
+        get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        verify_git_identity=AsyncMock(),
+    )
     service = ExecutionService(_LocalRemoteBackend(), manager)
     return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}
 

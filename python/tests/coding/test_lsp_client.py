@@ -61,7 +61,10 @@ def _runtime(tmp_path: Path, *, state=WorkspaceState.RUNNING):
     workspace = SimpleNamespace(
         task_id="task", worktree_path=worktree, repository_root=repository, state=state,
     )
-    manager = SimpleNamespace(get=lambda workspace_id: workspace if workspace_id == "workspace" else None)
+    manager = SimpleNamespace(
+        get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        verify_git_identity=AsyncMock(),
+    )
     captured = []
 
     async def spawn(context, temporary_home):

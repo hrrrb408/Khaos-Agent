@@ -1,3 +1,4 @@
+import os
 import subprocess
 from pathlib import Path
 
@@ -53,3 +54,58 @@ async def test_dirty_main_worktree_is_rejected(tmp_path: Path):
     (repository / "README.md").write_text("dirty\n")
     with pytest.raises(WorkspaceError, match="未提交修改"):
         await WorkspaceManager(tmp_path / "worktrees").create(repository, "task-1")
+
+
+@pytest.mark.asyncio
+async def test_git_pointer_redirection_is_rejected_before_host_git(tmp_path: Path):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-git-pointer")
+    main_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip()
+
+    (workspace.worktree_path / ".git").write_text(
+        f"gitdir: {repository / '.git'}\n", encoding="utf-8"
+    )
+    (workspace.worktree_path / "README.md").write_text("attacker\n")
+
+    with pytest.raises(WorkspaceError, match="pointer"):
+        await manager.build_changeset(workspace.id)
+    assert subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repository, check=True,
+        capture_output=True, text=True,
+    ).stdout.strip() == main_head
+
+
+@pytest.mark.asyncio
+async def test_git_pointer_inode_replacement_is_rejected(tmp_path: Path):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-git-inode")
+    pointer = workspace.worktree_path / ".git"
+    content = pointer.read_bytes()
+    replacement = workspace.worktree_path / ".git.replacement"
+    replacement.write_bytes(content)
+    os.replace(replacement, pointer)
+
+    with pytest.raises(WorkspaceError, match="identity"):
+        await manager.build_changeset(workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_workspace_commit_disables_repository_hooks(tmp_path: Path):
+    repository = _repo(tmp_path / "repo")
+    marker = tmp_path / "hook-ran"
+    hook = repository / ".git" / "hooks" / "pre-commit"
+    hook.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+    hook.chmod(0o755)
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-no-hooks")
+    (workspace.worktree_path / "README.md").write_text("safe\n")
+    changeset = await manager.build_changeset(workspace.id)
+
+    await manager.commit_in_worktree(workspace.id, changeset, "safe commit")
+
+    assert not marker.exists()
