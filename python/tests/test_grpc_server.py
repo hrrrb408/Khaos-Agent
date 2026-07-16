@@ -252,9 +252,9 @@ async def test_json_line_server_authenticates_real_peer_credentials(tmp_path):
         writer.write((json.dumps(request) + "\n").encode("utf-8"))
         await writer.drain()
         response = json.loads((await reader.readline()).decode("utf-8"))
-        assert isinstance(response, list)
-        assert response
-        assert all("id" in channel for channel in response)
+        assert isinstance(response, dict)
+        assert isinstance(response.get("channels"), list)
+        assert all("id" in channel for channel in response["channels"])
         writer.close()
         await writer.wait_closed()
     except (PermissionError, OSError) as exc:
