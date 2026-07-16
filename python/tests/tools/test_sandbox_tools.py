@@ -613,9 +613,9 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
         assert result["timed_out"] is True
         assert result["status"] == "timed-out"
         assert result["cleanup"] == "removed"
-    leftovers = subprocess.run(
-        ["docker", "ps", "-aq", "--filter", "name=khaos-"],
-        check=True, capture_output=True, text=True,
-    ).stdout.strip()
-    assert leftovers == ""
+    # Do not inspect every ``khaos-*`` container: push and pull_request
+    # workflows can legitimately share one runner/daemon concurrently.  The
+    # per-execution container was checked above, and the backend registry is
+    # the authoritative ownership scope for this test.
+    assert backend._active == {}
     await service.shutdown()

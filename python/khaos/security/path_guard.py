@@ -6,7 +6,7 @@ import fnmatch
 import logging
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -72,7 +72,7 @@ class PathGuard:
     def check_read(self, path: str) -> PathCheckResult:
         """检查读取权限。"""
         normalized = self._normalize(path)
-        if self._is_sensitive_path(normalized):
+        if self._is_sensitive_path(normalized, raw=path):
             return PathCheckResult(
                 safe=False,
                 risk_level="sensitive",
@@ -92,7 +92,7 @@ class PathGuard:
         """检查写入权限。"""
         raw_path = Path(path).expanduser()
         normalized = self._normalize(path)
-        if self._is_protected_path(normalized):
+        if self._is_protected_path(normalized, raw=path):
             return PathCheckResult(
                 safe=False,
                 risk_level="protected",
@@ -130,12 +130,28 @@ class PathGuard:
             logger.warning("failed to resolve symlink target: %s", path)
             return True
 
-    def _is_protected_path(self, path: Path) -> bool:
-        return any(_is_relative_to(path, Path(protected)) for protected in self._protected)
+    def _is_protected_path(self, path: Path, *, raw: str = "") -> bool:
+        if any(_is_relative_to(path, Path(protected)) for protected in self._protected):
+            return True
+        # Security policies describe POSIX host paths even when contract tests
+        # run on Windows.  ``Path('/etc')`` becomes drive-relative there, so
+        # preserve the lexical POSIX meaning instead of silently allowing it.
+        lexical = raw.replace("\\", "/")
+        if not lexical.startswith("/"):
+            return False
+        candidate = PurePosixPath(lexical)
+        return any(
+            _pure_posix_relative_to(candidate, PurePosixPath(protected))
+            for protected in self._protected
+            if protected.startswith("/")
+        )
 
-    def _is_sensitive_path(self, path: Path) -> bool:
+    def _is_sensitive_path(self, path: Path, *, raw: str = "") -> bool:
         path_text = str(path)
+        lexical = raw.replace("\\", "/")
         for pattern in SENSITIVE_FILES:
+            if lexical.startswith("/") and fnmatch.fnmatch(lexical, pattern):
+                return True
             expanded = os.path.expanduser(pattern)
             candidates = {expanded, os.path.realpath(expanded)}
             if pattern.startswith("/.") and fnmatch.fnmatch(path_text, f"{Path.home()}{pattern}*"):
@@ -150,6 +166,14 @@ class PathGuard:
 
 
 def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+    except ValueError:
+        return False
+    return True
+
+
+def _pure_posix_relative_to(path: PurePosixPath, base: PurePosixPath) -> bool:
     try:
         path.relative_to(base)
     except ValueError:
