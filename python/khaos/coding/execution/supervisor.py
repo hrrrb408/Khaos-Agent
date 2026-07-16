@@ -13,6 +13,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from khaos.coding.execution.models import ExecutionRequest, ExecutionResult
+from khaos.coding.workspace.storage import (
+    WorkspaceStorageSnapshot,
+    capture_workspace_snapshot,
+    workspace_storage_delta,
+)
 
 
 @dataclass
@@ -44,13 +49,27 @@ class ProcessSupervisor:
         cwd: Path | None = None,
         env: dict[str, str] | None = None,
         enforce_resource_limits: bool = True,
+        enforce_resource_watchdog: bool | None = None,
         tmp_root: Path | None = None,
         sandbox_storage_paths: tuple[str, ...] = (),
+        workspace_root: Path | None = None,
+        workspace_baseline: WorkspaceStorageSnapshot | None = None,
     ) -> ExecutionResult:
         """Run one foreground process with bounded, fairly split output."""
         execution_id = request.correlation_id
         if not execution_id:
             raise ValueError("supervised execution requires a correlation id")
+        watchdog_enabled = (
+            enforce_resource_limits
+            if enforce_resource_watchdog is None
+            else enforce_resource_watchdog
+        )
+        if workspace_root is not None and workspace_baseline is None:
+            workspace_baseline = await asyncio.to_thread(
+                capture_workspace_snapshot, workspace_root
+            )
+        if workspace_baseline is not None and not workspace_baseline.complete:
+            raise PermissionError("TaskWorkspace storage baseline is incomplete")
         started = time.monotonic()
         process = await asyncio.create_subprocess_exec(
             *request.argv,
@@ -74,7 +93,9 @@ class ProcessSupervisor:
                 process, active, request.permission_profile.resources,
                 self._terminate_active,
                 storage_roots=storage_roots,
-            ) if enforce_resource_limits else _no_resource_violation()
+                workspace_root=workspace_root,
+                workspace_baseline=workspace_baseline,
+            ) if watchdog_enabled else _no_resource_violation()
         )
         total_limit = request.permission_profile.resources.output_bytes
         stdout_limit = (total_limit + 1) // 2
@@ -328,17 +349,26 @@ def _resource_limit_diagnostics(budget) -> dict[str, object]:
         "cpu_time_seconds": max(1, math.ceil(budget.cpu_time_seconds)),
         "tmpfs_bytes": budget.tmpfs_bytes,
         "filesystem_entries": budget.filesystem_entries,
+        "workspace_bytes": budget.workspace_bytes,
+        "workspace_entries": budget.workspace_entries,
     }
 
 
 async def _resource_watchdog(
-    process, active, budget, terminate, *, storage_roots: tuple[Path, ...] = (),
+    process,
+    active,
+    budget,
+    terminate,
+    *,
+    storage_roots: tuple[Path, ...] = (),
+    workspace_root: Path | None = None,
+    workspace_baseline: WorkspaceStorageSnapshot | None = None,
 ) -> dict | None:
     """Bound process-tree and writable synthetic filesystem resources."""
     if process.pid is None:
         return None
     process_tree_supported = os.name == "posix"
-    if not process_tree_supported and not storage_roots:
+    if not process_tree_supported and not storage_roots and workspace_root is None:
         return None
     while process.returncode is None:
         if process_tree_supported:
@@ -374,6 +404,32 @@ async def _resource_watchdog(
                     "observed": filesystem_entries,
                     "limit": budget.filesystem_entries,
                 }
+        if violation is None and workspace_root is not None:
+            current = await asyncio.to_thread(
+                capture_workspace_snapshot, workspace_root
+            )
+            if not current.complete or workspace_baseline is None:
+                violation = {
+                    "kind": "workspace-observation",
+                    "observed": "incomplete",
+                    "limit": "complete",
+                }
+            else:
+                workspace_bytes, workspace_entries = workspace_storage_delta(
+                    workspace_baseline, current
+                )
+                if workspace_bytes > budget.workspace_bytes:
+                    violation = {
+                        "kind": "workspace-bytes",
+                        "observed": workspace_bytes,
+                        "limit": budget.workspace_bytes,
+                    }
+                elif workspace_entries > budget.workspace_entries:
+                    violation = {
+                        "kind": "workspace-entries",
+                        "observed": workspace_entries,
+                        "limit": budget.workspace_entries,
+                    }
         if violation is not None:
             active.termination_requested = True
             await terminate(active)

@@ -603,3 +603,14 @@ CREATE TABLE IF NOT EXISTS webhook_replay_events (
 CREATE INDEX IF NOT EXISTS idx_webhook_replay_expiry
     ON webhook_replay_events(expires_at)
     WHERE expires_at IS NOT NULL;
+
+-- Telegram has no signed request timestamp. Keep a bounded high-water window
+-- rather than one permanent row per update for the lifetime of the Runtime.
+CREATE TABLE IF NOT EXISTS webhook_replay_watermarks (
+    channel_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    high_water INTEGER NOT NULL,
+    seen_json TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (channel_id, platform)
+);

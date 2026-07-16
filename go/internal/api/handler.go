@@ -22,24 +22,26 @@ import (
 
 // Handler serves Khaos Phase 2 REST and SSE endpoints.
 type Handler struct {
-	agent          AgentClient
-	memory         MemoryClient
-	audit          AuditClient
-	subagents      SubagentClient
-	tasks          TaskClient
-	config         ConfigStore
-	limiter        *rate.TokenBucket
-	metrics        *metrics.Collector
-	apiKey         string
-	allowedHosts   map[string]struct{}
-	allowedOrigins map[string]struct{}
-	startedAt      time.Time
-	mu             sync.Mutex
-	streams        map[string]<-chan ChatEvent
-	sessions       map[string]ChatRequest
-	sessionOwners  map[string]string
-	taskOwners     map[string]string
-	tools          []map[string]any
+	agent                AgentClient
+	memory               MemoryClient
+	audit                AuditClient
+	subagents            SubagentClient
+	tasks                TaskClient
+	config               ConfigStore
+	authenticatedLimiter *rate.KeyedBuckets
+	webhookLimiter       *rate.KeyedBuckets
+	healthLimiter        *rate.TokenBucket
+	metrics              *metrics.Collector
+	apiKey               string
+	allowedHosts         map[string]struct{}
+	allowedOrigins       map[string]struct{}
+	startedAt            time.Time
+	mu                   sync.Mutex
+	streams              map[string]<-chan ChatEvent
+	sessions             map[string]ChatRequest
+	sessionOwners        map[string]string
+	taskOwners           map[string]string
+	tools                []map[string]any
 }
 
 const (
@@ -66,13 +68,19 @@ func (h *Handler) WithAudit(audit AuditClient) *Handler {
 
 // NewHandler creates an API handler.
 func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiKey string, limiter *rate.TokenBucket) *Handler {
+	ratePerMinute, burst := 60, 10
+	if limiter != nil {
+		ratePerMinute, burst = limiter.Config()
+	}
 	return &Handler{
-		agent:   agent,
-		memory:  memory,
-		config:  config,
-		limiter: limiter,
-		metrics: metrics.NewCollector(),
-		apiKey:  apiKey,
+		agent:                agent,
+		memory:               memory,
+		config:               config,
+		authenticatedLimiter: rate.NewKeyedBuckets(ratePerMinute, burst, 4096, 10*time.Minute),
+		webhookLimiter:       rate.NewKeyedBuckets(ratePerMinute, burst, 4096, 10*time.Minute),
+		healthLimiter:        limiter,
+		metrics:              metrics.NewCollector(),
+		apiKey:               apiKey,
 		allowedHosts: map[string]struct{}{
 			"localhost": {}, "127.0.0.1": {}, "::1": {},
 		},
@@ -155,19 +163,26 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/tasks/{id}/reject", h.handleRejectTask)
 	mux.HandleFunc("GET /v1/tasks/{id}/events", h.handleTaskEvents)
 	mux.HandleFunc("GET /v1/tasks/{id}/artifacts", h.handleTaskArtifacts)
-	common := h.rateLimit(h.requestLog(h.metricsMiddleware(mux)))
-	secured := auth.Middleware(h.apiKey, common)
+	common := h.requestLog(h.metricsMiddleware(mux))
+	health := h.rateLimit(h.healthLimiter, common)
+	webhookIngress := h.keyedRateLimit(
+		h.webhookLimiter, webhookSourceIdentity, common,
+	)
+	authenticated := h.keyedRateLimit(
+		h.authenticatedLimiter, authenticatedPrincipalIdentity, common,
+	)
+	secured := auth.Middleware(h.apiKey, authenticated)
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Health is intentionally the only anonymous Khaos endpoint. Platform
 		// webhooks use their own signature authentication in the Python service.
 		if r.URL.Path == "/api/health" {
-			common.ServeHTTP(w, r)
+			health.ServeHTTP(w, r)
 			return
 		}
 		// Only platforms with an implemented signature protocol may bypass the
 		// Gateway API key. Generic and unknown webhook paths remain authenticated.
 		if isSignatureAuthenticatedWebhookPath(r.URL.Path) {
-			common.ServeHTTP(w, r)
+			webhookIngress.ServeHTTP(w, r)
 			return
 		}
 		secured.ServeHTTP(w, r)
@@ -446,7 +461,9 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	status := http.StatusOK
-	if response.Status != "ok" {
+	if response.Status == "rate_limited" {
+		status = http.StatusTooManyRequests
+	} else if response.Status != "ok" {
 		status = http.StatusBadRequest
 	}
 	writeJSON(w, status, response)
@@ -600,14 +617,44 @@ func (h *Handler) authorizeTask(w http.ResponseWriter, r *http.Request) bool {
 	return true
 }
 
-func (h *Handler) rateLimit(next http.Handler) http.Handler {
+func (h *Handler) rateLimit(limiter *rate.TokenBucket, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if h.limiter != nil && !h.limiter.Allow() {
+		if limiter != nil && !limiter.Allow() {
 			writeError(w, http.StatusTooManyRequests, "rate limited")
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (h *Handler) keyedRateLimit(
+	limiter *rate.KeyedBuckets,
+	identity func(*http.Request) string,
+	next http.Handler,
+) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if limiter != nil && !limiter.Allow(identity(r)) {
+			writeError(w, http.StatusTooManyRequests, "rate limited")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func authenticatedPrincipalIdentity(r *http.Request) string {
+	principal, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		return "unauthenticated"
+	}
+	return principal
+}
+
+func webhookSourceIdentity(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err == nil && host != "" {
+		return host
+	}
+	return r.RemoteAddr
 }
 
 func (h *Handler) requestLog(next http.Handler) http.Handler {

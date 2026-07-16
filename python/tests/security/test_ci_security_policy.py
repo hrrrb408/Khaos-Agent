@@ -57,6 +57,7 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
         "test_channel_registry.py",
         "test_m4_batch3_1_6_2_authority.py",
         "test_process_supervisor.py",
+        "test_workspace_storage.py",
         "test_managed_process_lifecycle.py",
     ):
         assert required_contract in matrix

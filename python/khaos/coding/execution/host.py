@@ -60,7 +60,18 @@ class HostExecutionBackend:
                 if key in profile.environment_keys
             }
         )
-        return await self._get_supervisor().run(request, cwd=cwd, env=env)
+        workspace_root = (
+            profile.workspace_roots[0]
+            if profile.filesystem.value == "workspace-write"
+            else None
+        )
+        return await self._get_supervisor().run(
+            request,
+            cwd=cwd,
+            env=env,
+            workspace_root=workspace_root,
+            workspace_baseline=request.workspace_baseline,
+        )
 
     async def terminate(self, execution_id: str) -> None:
         await self._get_supervisor().terminate(execution_id)

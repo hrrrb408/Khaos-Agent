@@ -302,6 +302,43 @@ async def test_real_bwrap_home_capacity_and_inode_budget(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux bubblewrap evidence")
+async def test_real_bwrap_workspace_relative_entry_budget(tmp_path: Path):
+    _require_or_skip("bwrap")
+    backend = LinuxBubblewrapBackend()
+    availability = backend.probe_capability()
+    if not (availability.available and availability.network_enforced):
+        if os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") == "1":
+            pytest.fail(availability.reason)
+        pytest.skip(availability.reason)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    command = (
+        "from pathlib import Path; import time; "
+        "[(Path('.') / f'entry-{i}').touch() for i in range(12)]; "
+        "time.sleep(30)"
+    )
+
+    result = await backend.execute(ExecutionRequest(
+        (sys.executable, "-c", command),
+        workspace,
+        permission_profile=PermissionProfile(
+            filesystem=FileSystemAccess.WORKSPACE_WRITE,
+            resources=ResourceBudget(
+                timeout_seconds=10,
+                workspace_entries=10,
+            ),
+        ).bind_workspace(workspace),
+    ))
+
+    assert result.status == "resource-exhausted", result.diagnostics
+    assert result.diagnostics["resource_violation"] == {
+        "kind": "workspace-entries", "observed": 12, "limit": 10,
+    }
+
+
+@pytest.mark.asyncio
 async def test_backend_selector_returns_unsupported_when_bwrap_probe_fails(monkeypatch):
     """Req 9: no security capability → infrastructure-unsupported, not host fallback."""
     from khaos.coding.execution.platform import BackendAvailability
@@ -482,3 +519,49 @@ async def test_real_macos_synthetic_home_capacity_is_enforced(tmp_path: Path):
     assert result.diagnostics["resource_violation"] == {
         "kind": "tmpfs", "observed": 16_384, "limit": 10_000,
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec evidence")
+async def test_real_macos_workspace_relative_byte_budget(tmp_path: Path):
+    _require_or_skip("sandbox-exec")
+    backend = MacOSSandboxBackend()
+    availability = backend.probe_capability()
+    if (
+        not availability.available
+        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+    ):
+        pytest.skip(availability.reason)
+    assert availability.available, availability.reason
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    command = (
+        "from pathlib import Path; import time; "
+        "[(Path('.') / f'payload-{i}').write_bytes(b'x' * 4096) "
+        "for i in range(4)]; time.sleep(30)"
+    )
+    result = await backend.execute(ExecutionRequest(
+        (sys.executable, "-c", command),
+        workspace,
+        permission_profile=PermissionProfile(
+            filesystem=FileSystemAccess.WORKSPACE_WRITE,
+            resources=ResourceBudget(
+                timeout_seconds=10,
+                workspace_bytes=10_000,
+            ),
+        ).bind_workspace(workspace),
+    ))
+    if (
+        result.status != "resource-exhausted"
+        and "Operation not permitted" in result.stderr
+        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+    ):
+        pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
+    assert result.status == "resource-exhausted", result.diagnostics
+    assert result.diagnostics["resource_violation"]["kind"] == "workspace-bytes"
+    # The watchdog is intentionally allowed to terminate as soon as the
+    # aggregate allocation crosses the configured boundary.  It need not wait
+    # for every write in the child process to complete.
+    assert result.diagnostics["resource_violation"]["observed"] > 10_000
+    assert result.diagnostics["resource_violation"]["limit"] == 10_000

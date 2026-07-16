@@ -9,6 +9,7 @@ import uuid
 from pathlib import Path
 
 from khaos.coding.workspace.models import ChangeSet, TaskWorkspace, WorkspaceState, WorkspaceTransition
+from khaos.coding.workspace.storage import capture_workspace_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ class WorkspaceError(RuntimeError):
 
 ALLOWED: dict[WorkspaceState, frozenset[WorkspaceState]] = {
     WorkspaceState.CREATING: frozenset({WorkspaceState.READY, WorkspaceState.FAILED}),
-    WorkspaceState.READY: frozenset({WorkspaceState.INDEXING, WorkspaceState.RUNNING, WorkspaceState.CANCELLED}),
+    WorkspaceState.READY: frozenset({WorkspaceState.INDEXING, WorkspaceState.RUNNING, WorkspaceState.FAILED, WorkspaceState.CANCELLED}),
     WorkspaceState.INDEXING: frozenset({WorkspaceState.RUNNING, WorkspaceState.FAILED, WorkspaceState.CANCELLED}),
     WorkspaceState.RUNNING: frozenset({WorkspaceState.VERIFYING, WorkspaceState.FAILED, WorkspaceState.CANCELLED}),
     WorkspaceState.VERIFYING: frozenset({WorkspaceState.RUNNING, WorkspaceState.REVIEWING, WorkspaceState.FAILED, WorkspaceState.CANCELLED}),
@@ -92,6 +93,13 @@ class WorkspaceManager:
                 workspace_id, task_id, repository, path, base_ref, base_sha,
                 branch, WorkspaceState.READY, (path,), recovery_root=recovery_root,
             )
+            baseline = await asyncio.to_thread(capture_workspace_snapshot, path)
+            if not baseline.complete:
+                await self._git(
+                    repository, "worktree", "remove", "--force", str(path)
+                )
+                raise WorkspaceError("TaskWorkspace storage baseline is incomplete")
+            workspace.storage_baseline = baseline
             self._workspaces[workspace_id] = workspace
             self._task_ids.add(task_id)
             return workspace

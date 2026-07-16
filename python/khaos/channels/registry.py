@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import time
 from dataclasses import dataclass, field
@@ -78,6 +79,7 @@ class ChannelRegistry:
         elif config.channel_type != channel_type:
             raise ValueError("channel config type does not match registered type")
         self._validate_config(config)
+        self._validate_unique_enabled_secret(channel_id, config)
         registered = RegisteredChannel(channel_id, channel_type, config, channel=channel)
         self._channels[channel_id] = registered
         return registered
@@ -103,6 +105,9 @@ class ChannelRegistry:
         if channel is None:
             return False
         self._validate_config(channel.config)
+        self._validate_unique_enabled_secret(
+            channel_id, channel.config, enabling=True
+        )
         channel.config.enabled = True
         channel.health.status = ChannelStatus.ENABLED
         channel.health.consecutive_failures = 0
@@ -117,6 +122,24 @@ class ChannelRegistry:
             raise ValueError(
                 "generic webhook requires a high-entropy secret of at least 32 characters"
             )
+
+    def _validate_unique_enabled_secret(
+        self,
+        channel_id: str,
+        config: ChannelConfig,
+        *,
+        enabling: bool = False,
+    ) -> None:
+        if (not config.enabled and not enabling) or not config.secret:
+            return
+        fingerprint = _integration_fingerprint(config)
+        for existing_id, existing in self._channels.items():
+            if existing_id == channel_id or not existing.is_enabled:
+                continue
+            if _integration_fingerprint(existing.config) == fingerprint:
+                raise ValueError(
+                    "an enabled platform integration secret may bind only one channel"
+                )
 
     def disable(self, channel_id: str) -> bool:
         channel = self.get(channel_id)
@@ -174,3 +197,8 @@ class ChannelRegistry:
                 if channel.is_enabled and channel.health.last_ping and now - channel.health.last_ping > 120 and channel.health.status == ChannelStatus.ENABLED:
                     channel.health.status = ChannelStatus.DEGRADED
             await asyncio.sleep(self._health_check_interval)
+
+
+def _integration_fingerprint(config: ChannelConfig) -> str:
+    encoded = f"{config.channel_type.value}\0{config.secret}".encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

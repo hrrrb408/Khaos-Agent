@@ -34,6 +34,7 @@ from khaos.channels import (
     ChannelType,
     PlatformMessage,
     WebhookHandler,
+    WebhookRateLimiter,
     WebhookReplayGuard,
 )
 from khaos.db import Database
@@ -255,6 +256,7 @@ class AgentService:
         self._webhook_replay_guard = WebhookReplayGuard(
             consumer=self.db.consume_webhook_event
         )
+        self._verified_webhook_limiter = WebhookRateLimiter()
         set_channel_registry(self.channel_registry)
         # Security policy loaded once (not per chat call) and cached; rebuild
         # the middleware stack from it for every runtime.
@@ -338,6 +340,7 @@ class AgentService:
             on_message=lambda message: self._on_webhook_message(channel_id, message),
             channel_id=channel_id,
             replay_guard=self._webhook_replay_guard,
+            verified_limiter=self._verified_webhook_limiter,
         )
         return await handler.handle(headers, body.encode("utf-8"), query)
 
