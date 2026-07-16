@@ -34,6 +34,57 @@ _DIGEST_PINNED_IMAGE = re.compile(
 )
 _SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _OWNER_LABEL = "io.khaos.owner-nonce"
+_DELETED_FILE_EXIT_CODE = 173
+_DELETED_FILE_WATCHDOG = r'''
+import os, signal, stat, subprocess, sys, time
+limit = int(sys.argv[1])
+command = sys.argv[3:]
+process = subprocess.Popen(command, start_new_session=True)
+while process.poll() is None:
+    total = 0
+    seen = set()
+    complete = True
+    for pid in os.listdir('/proc'):
+        if not pid.isdigit():
+            continue
+        root = f'/proc/{pid}/fd'
+        try:
+            names = os.listdir(root)
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            complete = False
+            continue
+        for name in names:
+            path = f'{root}/{name}'
+            try:
+                target = os.readlink(path)
+                if not target.endswith(' (deleted)'):
+                    continue
+                info = os.stat(path)
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError:
+                complete = False
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            identity = (info.st_dev, info.st_ino)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            blocks = getattr(info, 'st_blocks', 0) * 512
+            total += blocks if blocks > 0 else info.st_size
+    if not complete or total > limit:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        raise SystemExit(173)
+    time.sleep(0.05)
+raise SystemExit(process.returncode)
+'''.strip()
 
 
 @dataclass
@@ -97,14 +148,30 @@ class DockerBackend:
             "--user", "65534:65534", "--cap-drop", "ALL",
             "--security-opt", "no-new-privileges", "--pids-limit", str(context.budget.pids),
             "--cpus", str(context.budget.cpu_count), "--memory", str(context.budget.memory_bytes),
+            "--ulimit", f"fsize={context.budget.file_bytes}:{context.budget.file_bytes}",
+            "--ulimit", f"nofile={context.budget.open_files}:{context.budget.open_files}",
             "--network", "none", "--mount",
             f"type=bind,src={context.worktree_path},dst=/workspace",
+            "--mount",
+            (
+                "type=bind,"
+                f"src={context.worktree_path / '.git'},"
+                "dst=/workspace/.git,readonly"
+            ),
             "--workdir", str(container_cwd),
         ]
         env_file = self._write_env_file(context)
         if env_file is not None:
             argv.extend(["--env-file", str(env_file)])
-        argv.extend([image, *context.argv])
+        argv.extend([
+            image,
+            "python",
+            "-c",
+            _DELETED_FILE_WATCHDOG,
+            str(context.budget.workspace_bytes),
+            "--",
+            *context.argv,
+        ])
 
         async with self._lock:
             self._active[execution_id] = lease
@@ -133,9 +200,17 @@ class DockerBackend:
                 workspace_baseline=context.workspace_baseline,
             )
             diagnostics.update(result.diagnostics)
+            status = result.status
+            if result.return_code == _DELETED_FILE_EXIT_CODE:
+                status = "resource-exhausted"
+                diagnostics["resource_violation"] = {
+                    "kind": "workspace-bytes",
+                    "observed": "deleted-open-file-budget-exceeded",
+                    "limit": context.budget.workspace_bytes,
+                }
             return ExecutionResult(
                 execution_id=execution_id,
-                status=result.status,
+                status=status,
                 return_code=result.return_code,
                 stdout=result.stdout,
                 stderr=result.stderr,

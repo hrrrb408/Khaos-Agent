@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 
+from khaos.coding.workspace.git_identity import GitWorktreeIdentity
 from khaos.coding.workspace.storage import (
     WorkspaceStorageLimits,
     WorkspaceStorageSnapshot,
@@ -54,6 +55,7 @@ class TaskWorkspace:
     storage_limits: WorkspaceStorageLimits = field(
         default_factory=WorkspaceStorageLimits
     )
+    git_identity: GitWorktreeIdentity | None = None
 
 
 @dataclass(frozen=True)

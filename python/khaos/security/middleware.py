@@ -141,6 +141,19 @@ class SecurityMiddleware:
                     reason=sandbox_result.reason,
                     check_type="sandbox",
                 )
+            if tool_name in WRITE_PATH_TOOLS:
+                for param in WRITE_PATH_PARAMS:
+                    path = arguments.get(param, "")
+                    if not path:
+                        continue
+                    sandbox_path = self.sandbox.check_write_path(str(path))
+                    if not sandbox_path.allowed:
+                        return SecurityCheckResult(
+                            allowed=False,
+                            risk_level="blocked",
+                            reason=sandbox_path.reason,
+                            check_type="sandbox_path",
+                        )
 
         # 网络访问检查
         if self.network_guard is not None:

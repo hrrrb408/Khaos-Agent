@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import tempfile
 import uuid
 from collections.abc import Callable
@@ -11,6 +12,12 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from khaos.coding.workspace.models import ChangeSet, TaskWorkspace, WorkspaceState, WorkspaceTransition
+from khaos.coding.workspace.git_identity import (
+    GitIdentityError,
+    capture_git_worktree_identity,
+    restore_git_pointer_for_cleanup,
+    verify_git_worktree_identity,
+)
 from khaos.coding.workspace.storage import (
     WorkspaceMutation,
     WorkspaceStorageAuthority,
@@ -81,14 +88,46 @@ class WorkspaceManager:
         self._mutation_fence = fence
 
     async def _git(self, repository: Path, *args: str, preserve_output: bool = False) -> str:
+        environment = os.environ.copy()
+        environment.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        })
         process = await asyncio.create_subprocess_exec(
-            "git", *args, cwd=str(repository), stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+            "git", *args, cwd=str(repository), env=environment,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await process.communicate()
         if process.returncode != 0:
             raise WorkspaceError(stderr.decode("utf-8", errors="replace").strip() or "git command failed")
         output = stdout.decode("utf-8", errors="replace")
         return output if preserve_output else output.strip()
+
+    async def _workspace_git(
+        self,
+        workspace: TaskWorkspace,
+        *args: str,
+        preserve_output: bool = False,
+    ) -> str:
+        """Run Git only against the pinned admin dir and worktree."""
+        identity = workspace.git_identity
+        if identity is None:
+            raise WorkspaceError("TaskWorkspace Git identity is missing")
+        try:
+            await asyncio.to_thread(verify_git_worktree_identity, identity)
+        except GitIdentityError as exc:
+            raise WorkspaceError(str(exc)) from exc
+        return await self._git(
+            workspace.worktree_path,
+            f"--git-dir={identity.admin_dir}",
+            f"--work-tree={workspace.worktree_path}",
+            "-c", f"core.hooksPath={os.devnull}",
+            "-c", "core.fsmonitor=false",
+            "-c", "core.untrackedCache=false",
+            *args,
+            preserve_output=preserve_output,
+        )
 
     async def create(self, repository_root: Path, task_id: str, *, base_ref: str = "HEAD") -> TaskWorkspace:
         repository = repository_root.resolve()
@@ -106,11 +145,21 @@ class WorkspaceManager:
             path = (self.root / workspace_id).resolve()
             path.parent.mkdir(parents=True, exist_ok=True)
             await self._git(repository, "worktree", "add", "-b", branch, str(path), base_sha)
+            try:
+                git_identity = await asyncio.to_thread(
+                    capture_git_worktree_identity, repository, path
+                )
+            except GitIdentityError:
+                await self._git(
+                    repository, "worktree", "remove", "--force", str(path)
+                )
+                raise
             recovery_root = (self.root.parent / ".khaos-recovery").resolve()
             workspace = TaskWorkspace(
                 workspace_id, task_id, repository, path, base_ref, base_sha,
                 branch, WorkspaceState.READY, (path,), recovery_root=recovery_root,
                 storage_limits=self.storage_limits,
+                git_identity=git_identity,
             )
             baseline = await asyncio.to_thread(capture_workspace_snapshot, path)
             if not baseline.complete:
@@ -136,6 +185,35 @@ class WorkspaceManager:
     def get(self, workspace_id: str) -> TaskWorkspace | None:
         """Return a workspace without allowing callers to mutate its registry."""
         return self._workspaces.get(workspace_id)
+
+    def file_recovery_root(self, workspace_id: str) -> Path:
+        """Return a private, authority-owned rollback directory."""
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceError("workspace not found")
+        base = workspace.recovery_root or (self.root.parent / ".khaos-recovery")
+        root = (base / workspace.id / "file-tools").resolve()
+        worktree = workspace.worktree_path.resolve()
+        if root == worktree or worktree in root.parents or root in worktree.parents:
+            raise WorkspaceError("file recovery root overlaps TaskWorkspace")
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        root.chmod(0o700)
+        info = root.stat()
+        if info.st_uid != os.getuid() or info.st_nlink < 1:
+            raise WorkspaceError("file recovery root identity is invalid")
+        return root
+
+    async def verify_git_identity(self, workspace_id: str) -> None:
+        """Fail closed when a TaskWorkspace Git pointer/admin inode drifts."""
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None or workspace.git_identity is None:
+            raise WorkspaceError("TaskWorkspace Git identity is unavailable")
+        try:
+            await asyncio.to_thread(
+                verify_git_worktree_identity, workspace.git_identity
+            )
+        except GitIdentityError as exc:
+            raise WorkspaceError(str(exc)) from exc
 
     async def mutate_with_storage_authority(
         self,
@@ -170,14 +248,28 @@ class WorkspaceManager:
                         WorkspaceState.CLEANED,
                     }:
                         raise PermissionError("workspace is not writable")
-                return await asyncio.to_thread(
+                worker = asyncio.create_task(asyncio.to_thread(
                     self.storage_authority.mutate,
                     workspace_id,
                     workspace.worktree_path,
                     workspace.storage_baseline,
                     workspace.storage_limits,
                     operation,
-                )
+                ))
+                cancelled = False
+                while not worker.done():
+                    try:
+                        await asyncio.shield(worker)
+                    except asyncio.CancelledError:
+                        # ``to_thread`` cannot be force-cancelled.  Keep the
+                        # Workspace mutation/cleanup fence held until the
+                        # authority has committed or rolled back, then
+                        # propagate cancellation to the caller.
+                        cancelled = True
+                result = worker.result()
+                if cancelled:
+                    raise asyncio.CancelledError
+                return result
         except WorkspaceStorageViolation as exc:
             if exc.quarantine_required:
                 await self.quarantine(workspace_id)
@@ -204,9 +296,9 @@ class WorkspaceManager:
         workspace = self._workspaces.get(workspace_id)
         if workspace is None:
             raise WorkspaceError("workspace not found")
-        patch = await self._git(workspace.worktree_path, "diff", "--binary", workspace.base_sha, preserve_output=True)
-        stat = await self._git(workspace.worktree_path, "diff", "--stat", workspace.base_sha)
-        names = await self._git(workspace.worktree_path, "diff", "--name-only", workspace.base_sha)
+        patch = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--binary", workspace.base_sha, preserve_output=True)
+        stat = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--stat", workspace.base_sha)
+        names = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--name-only", workspace.base_sha)
         changeset = ChangeSet.create(id=uuid.uuid4().hex[:12], workspace_id=workspace_id, base_sha=workspace.base_sha, head_sha=None, patch=patch, diff_stat=stat, changed_files=tuple(line for line in names.splitlines() if line))
         artifact = workspace.worktree_path.parent / f"{changeset.id}.patch"
         artifact.write_text(patch, encoding="utf-8")
@@ -216,12 +308,12 @@ class WorkspaceManager:
         workspace = self._workspaces.get(workspace_id)
         if workspace is None or changeset.workspace_id != workspace_id:
             raise WorkspaceError("workspace or changeset not found")
-        current = await self._git(workspace.worktree_path, "diff", "--binary", workspace.base_sha, preserve_output=True)
+        current = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--binary", workspace.base_sha, preserve_output=True)
         if current.encode("utf-8") != changeset.patch.encode("utf-8"):
             raise WorkspaceError("changeset content changed; approval is stale")
-        await self._git(workspace.worktree_path, "add", "--", *changeset.changed_files)
-        await self._git(workspace.worktree_path, "commit", "-m", message)
-        return await self._git(workspace.worktree_path, "rev-parse", "HEAD")
+        await self._workspace_git(workspace, "add", "--", *changeset.changed_files)
+        await self._workspace_git(workspace, "commit", "-m", message)
+        return await self._workspace_git(workspace, "rev-parse", "HEAD")
 
     async def cleanup(self, workspace_id: str, *, force: bool = False) -> WorkspaceTransition:
         """Clean up a workspace worktree.
@@ -288,6 +380,11 @@ class WorkspaceManager:
                     return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANING
             try:
+                if workspace.git_identity is not None:
+                    await asyncio.to_thread(
+                        restore_git_pointer_for_cleanup,
+                        workspace.git_identity,
+                    )
                 if force:
                     await self._git(workspace.repository_root, "worktree", "remove", "--force", str(workspace.worktree_path))
                 else:
@@ -298,5 +395,13 @@ class WorkspaceManager:
             workspace.state = WorkspaceState.CLEANED
             self._task_ids.discard(workspace.task_id)
             self.storage_authority.release(workspace_id)
+            recovery_root = (
+                workspace.recovery_root / workspace.id / "file-tools"
+                if workspace.recovery_root is not None else None
+            )
+            if recovery_root is not None:
+                import shutil
+
+                shutil.rmtree(recovery_root, ignore_errors=True)
             self._storage_mutation_locks.pop(workspace_id, None)
             return WorkspaceTransition.UPDATED

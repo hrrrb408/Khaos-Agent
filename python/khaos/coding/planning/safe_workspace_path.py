@@ -88,19 +88,25 @@ class SafeParentDirectory:
         finally:
             os.close(descriptor)
 
-    def read_file(self) -> tuple[bytes, os.stat_result]:
+    def read_file(self, *, max_bytes: int | None = None) -> tuple[bytes, os.stat_result]:
         info = self.lstat()
         if info is None or not stat.S_ISREG(info.st_mode):
             raise SafePathError("target is not a regular file")
+        if max_bytes is not None and info.st_size > max_bytes:
+            raise SafePathError("target exceeds the bounded file size")
         descriptor = os.open(
             self.leaf, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=self.parent_fd
         )
         try:
             chunks: list[bytes] = []
+            total = 0
             while True:
                 chunk = os.read(descriptor, 1024 * 1024)
                 if not chunk:
                     break
+                total += len(chunk)
+                if max_bytes is not None and total > max_bytes:
+                    raise SafePathError("target grew beyond the bounded file size")
                 chunks.append(chunk)
             final = os.fstat(descriptor)
             if (final.st_dev, final.st_ino, final.st_size) != (

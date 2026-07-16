@@ -153,7 +153,10 @@ class Sandbox:
             )
 
         # workspace-write: 只允许写 workspace 内
-        resolved = Path(path).expanduser().resolve()
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace_root / candidate
+        resolved = candidate.resolve()
         try:
             resolved.relative_to(self.workspace_root)
             return SandboxCheckResult(allowed=True, mode=self.mode.value)

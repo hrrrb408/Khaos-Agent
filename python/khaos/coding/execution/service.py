@@ -90,6 +90,7 @@ class ExecutionService:
                 WorkspaceState.FAILED,
             }:
                 raise PermissionError("workspace is not executable")
+            await self.workspace_manager.verify_git_identity(request.workspace_id)
             root = workspace.worktree_path.resolve()
             cwd = request.cwd.expanduser().resolve()
             if cwd != root and root not in cwd.parents:
@@ -175,15 +176,33 @@ class ExecutionService:
                 result = await backend.execute(request)
         except asyncio.CancelledError:
             if resolved_context is not None:
+                await self._verify_or_quarantine_git_identity(
+                    resolved_context.workspace_id
+                )
                 await self._quarantine_cancelled_storage_violation(
                     resolved_context
                 )
             raise
         if resolved_context is not None:
+            await self._verify_or_quarantine_git_identity(
+                resolved_context.workspace_id
+            )
             await self._cleanup_workspace_on_storage_violation(
                 resolved_context.workspace_id, result
             )
         return result
+
+    async def _verify_or_quarantine_git_identity(
+        self, workspace_id: str
+    ) -> None:
+        """Never return from execution after linked-worktree metadata drift."""
+        try:
+            await self.workspace_manager.verify_git_identity(workspace_id)
+        except Exception as exc:
+            await self.workspace_manager.quarantine(workspace_id)
+            raise PermissionError(
+                "TaskWorkspace Git identity changed during execution"
+            ) from exc
 
     async def _quarantine_cancelled_storage_violation(
         self, context: ResolvedExecutionContext
@@ -255,6 +274,7 @@ class ExecutionService:
             raise PermissionError("task/workspace binding is invalid")
         if workspace.state not in {WorkspaceState.READY, WorkspaceState.RUNNING, WorkspaceState.VERIFYING}:
             raise PermissionError("workspace is not available for managed process")
+        await self.workspace_manager.verify_git_identity(request.workspace_id)
         root = workspace.worktree_path.expanduser().resolve()
         cwd = request.cwd.expanduser().resolve()
         if cwd != root and root not in cwd.parents:

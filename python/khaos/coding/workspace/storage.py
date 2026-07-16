@@ -49,6 +49,7 @@ class WorkspaceMutation(Generic[T]):
 
     value: T
     rollback: Callable[[], None]
+    finalize: Callable[[], None] = lambda: None
 
 
 class WorkspaceStorageViolation(PermissionError):
@@ -89,6 +90,8 @@ class WorkspaceStorageAuthority:
         root: Path,
         baseline: WorkspaceStorageSnapshot | None,
         limits: WorkspaceStorageLimits,
+        *,
+        extra_allocated_bytes: int = 0,
     ) -> dict[str, object] | None:
         """Return a violation diagnostic, failing closed on any uncertainty."""
         if baseline is None or not baseline.complete:
@@ -97,6 +100,7 @@ class WorkspaceStorageAuthority:
         if not current.complete or current.root_identity != baseline.root_identity:
             return _observation_violation()
         allocated_bytes, entries = workspace_storage_delta(baseline, current)
+        allocated_bytes += max(0, extra_allocated_bytes)
         if allocated_bytes > limits.bytes:
             return {
                 "kind": "workspace-bytes",
@@ -127,7 +131,10 @@ class WorkspaceStorageAuthority:
             mutation = operation()
             violation = self.assess(root, baseline, limits)
             if violation is None:
-                return mutation.value
+                try:
+                    return mutation.value
+                finally:
+                    mutation.finalize()
 
             rollback_succeeded = False
             try:
@@ -135,6 +142,8 @@ class WorkspaceStorageAuthority:
                 rollback_succeeded = True
             except Exception:
                 rollback_succeeded = False
+            finally:
+                mutation.finalize()
             remaining = self.assess(root, baseline, limits)
             quarantine_required = not rollback_succeeded or remaining is not None
             raise WorkspaceStorageViolation(
