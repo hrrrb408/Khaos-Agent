@@ -88,9 +88,15 @@ class SandboxPolicy:
         H3: unknown top-level / section keys raise ``ValueError`` so a typo in
         ``khaos_policy.yaml`` fails closed at parse time rather than being
         silently ignored.  Empty input still yields the safe default policy.
+
+        H1: non-mapping input (e.g. a YAML list or scalar) raises
+        ``ValueError`` instead of silently returning the default policy.
         """
         if not isinstance(data, dict):
-            return cls()
+            raise ValueError(
+                "policy must be a mapping at the top level, "
+                f"got {type(data).__name__}"
+            )
         _reject_unknown_keys(data)
         sandbox = data.get("sandbox", {}) or {}
         commands = data.get("commands", {}) or {}
@@ -151,13 +157,15 @@ def load_policy(path: Path | None = None) -> SandboxPolicy:
         logger.info("Loading sandbox policy from %s", resolved)
         # Let yaml.YAMLError propagate (fail closed on malformed YAML).
         with open(resolved, encoding="utf-8") as handle:
-            data = yaml.safe_load(handle) or {}
-        if not isinstance(data, dict):
+            data = yaml.safe_load(handle)
+        if data is None:
             data = {}
-        # H5: strict type validation before construction.  Lazy import to
-        # avoid a circular dependency: ``effective_policy`` imports
-        # ``SandboxPolicy`` / ``load_policy`` from this module, so we cannot
-        # import it at module load time.
+        # H1: a valid-but-non-mapping YAML (e.g. a bare list or scalar like
+        # ``read-only``) must fail closed.  Previously it silently degraded
+        # to the default ``workspace-write`` policy, so a user who mistyped
+        # the structure while trying to lock down to read-only would
+        # silently gain write and terminal access.  ``validate_policy_dict``
+        # raises ``PolicyCompilationError`` for non-dict input.
         from khaos.security.effective_policy import validate_policy_dict
 
         validate_policy_dict(data, source=str(resolved))
