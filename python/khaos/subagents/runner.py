@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from khaos.agent.core import AgentConfig, AgentLoop, Message, SimpleTokenEngine
@@ -26,6 +27,12 @@ class SubAgentRunner:
     - 独立工具集（限定为子集或全部）
     - 独立 token 预算（默认比主 agent 低）
     - 独立记忆空间（不与主 agent 共享，但可选择性继承）
+
+    B1: ``project_root`` / ``config_path`` 是不可变的——它们必须与
+    主 AgentService 完全相同，否则子代理会重新加载另一份
+    ``khaos_policy.yaml`` / ``config.yaml``，形成第二套安全权威。
+    生产入口（``_build_subagent_service``）必须显式传入，不得回退到
+    ``Path.cwd()``。
     """
 
     def __init__(
@@ -46,6 +53,8 @@ class SubAgentRunner:
         approval_broker: Optional[Any] = None,   # B1: 继承主 AgentService 的审批 broker
         principal_id: str = "",                  # B1: 继承 principal
         audit_logger: Optional[Any] = None,      # B1: 继承审计 logger
+        project_root: Optional[Path] = None,     # B1: 继承项目根（不可变）
+        config_path: Optional[Path] = None,      # B1: 继承 config 路径
     ):
         self.router = router
         self.db = db
@@ -74,6 +83,14 @@ class SubAgentRunner:
         self.approval_broker = approval_broker
         self.principal_id = principal_id
         self.audit_logger = audit_logger
+        # B1: project_root / config_path MUST be inherited verbatim from the
+        # AgentService so the subagent loads the SAME ``khaos_policy.yaml``
+        # and compiles the SAME EffectivePolicy as the main AgentLoop.
+        # When ``None`` (legacy callers), fall back to ``Path.cwd()`` — but
+        # the production path (``_build_subagent_service``) always supplies
+        # the server's project root, never the process cwd.
+        self.project_root = project_root
+        self.config_path = config_path
 
     async def run(self, task: SubAgentTask) -> str:
         """执行子任务并返回结果字符串。
@@ -122,6 +139,15 @@ class SubAgentRunner:
             approval_broker=self.approval_broker,
             principal_id=self.principal_id or f"local-uid:{os.getuid()}",
             audit_logger=self.audit_logger,
+            # B1: inherit the server's project_root / config_path so the
+            # subagent loads the SAME ``khaos_policy.yaml`` and compiles the
+            # SAME EffectivePolicy as the main AgentLoop.  Without this, a
+            # server launched with ``--project-root /project/A`` from a
+            # different cwd would have the main runtime under
+            # ``/project/A/khaos_policy.yaml`` but the subagent under
+            # ``$CWD/khaos_policy.yaml`` — two security authorities.
+            project_root=self.project_root or Path.cwd(),
+            config_path=self.config_path,
         ))
         try:
             logger.info(
