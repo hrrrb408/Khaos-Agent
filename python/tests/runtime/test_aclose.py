@@ -181,8 +181,9 @@ async def test_closed_field_is_not_bound_by_positional_construction():
     is not in the generated ``__init__`` signature, so positional args can
     never bind into it.  The init signature must include the eight real
     components plus the optional components (``execution_service``,
-    ``office_authority``, ``owns_office_authority``, ``principal_id``) —
-    but NOT ``_closed``, ``_close_task`` or ``_close_failed``.
+    ``office_authority``, ``owns_office_authority``, ``principal_id``,
+    ``session_id``, ``runtime_id``) — but NOT ``_closed``, ``_close_task``
+    or ``_close_failed``.
     """
     import inspect
 
@@ -203,6 +204,8 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "_close_failed must be init=False (H3 regression)"
     )
     # The init signature must still accept the real components in order.
+    # H5: ``session_id`` + ``runtime_id`` extend the per-session
+    # BrowserContext key and must be in the init signature.
     assert init_params == [
         "self",
         "loop",
@@ -217,6 +220,8 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "office_authority",
         "owns_office_authority",
         "principal_id",
+        "session_id",
+        "runtime_id",
     ]
 
 
