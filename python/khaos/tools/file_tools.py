@@ -7,7 +7,6 @@ import fnmatch
 import json
 import mimetypes
 import os
-import re
 import stat
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
@@ -801,10 +800,12 @@ def _workspace_content_search_sync(
 
     if max_results < 1:
         raise ValueError("max_results must be >= 1")
-    try:
-        regex = re.compile(pattern)
-    except re.error:
-        regex = None
+    # H2: compile through the linear-time engine (RE2).  A pattern that would
+    # require catastrophic backtracking is rejected at compile time; an
+    # invalid/unavailable pattern falls back to a literal substring match.
+    # Python's ``re`` is never used here, so a hostile pattern cannot pin a
+    # worker thread past the scheduler timeout.
+    regex = _compile_search_pattern(pattern)
     with SafeWorkspaceFS(workspace_root) as filesystem:
         try:
             candidates = filesystem.iter_files(path)
@@ -826,6 +827,9 @@ def _workspace_content_search_sync(
                 continue
             searched += 1
             for line_number, line in enumerate(lines, start=1):
+                # Cap per-line work to bound memory/CPU on pathological inputs.
+                if len(line) > _SEARCH_MAX_LINE_LEN:
+                    line = line[:_SEARCH_MAX_LINE_LEN]
                 matched = regex.search(line) is not None if regex else pattern in line
                 if matched:
                     matches.append({
@@ -836,6 +840,35 @@ def _workspace_content_search_sync(
                     if len(matches) >= max_results:
                         return {"ok": True, "pattern": pattern, "matches": matches, "match_count": len(matches), "files_searched": searched}
         return {"ok": True, "pattern": pattern, "matches": matches, "match_count": len(matches), "files_searched": searched}
+
+
+# H2: bounds that protect the content-search worker from ReDoS and oversized
+# inputs.  ``re2`` already guarantees linear matching time and rejects
+# backtracking patterns at compile time; these limits are defense in depth.
+_SEARCH_MAX_PATTERN_LEN = 256
+_SEARCH_MAX_LINE_LEN = 64 * 1024
+
+
+def _compile_search_pattern(pattern: str):
+    """Compile a search pattern with the linear-time RE2 engine.
+
+    Returns ``None`` when the pattern is invalid or RE2 is unavailable, in
+    which case the caller falls back to a literal substring match.  Python's
+    backtracking ``re`` is deliberately never used for user-supplied patterns.
+    """
+    if not isinstance(pattern, str) or len(pattern) > _SEARCH_MAX_PATTERN_LEN:
+        raise ValueError("search pattern is missing or exceeds the length limit")
+    try:
+        import re2
+    except ImportError:
+        # Defensive: re2 is a declared dependency.  If it is somehow missing,
+        # fall back to literal substring search rather than the unsafe Python
+        # re engine.
+        return None
+    try:
+        return re2.compile(pattern)
+    except re2.error:
+        return None
 
 
 def _workspace_patch_sync(

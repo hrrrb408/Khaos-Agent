@@ -563,8 +563,10 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ToolDefinition(
             name="file_search_content",
             description=(
-                "Search file contents for a pattern (substring or regex). "
-                "Returns matching lines with file paths and line numbers."
+                "Search file contents for a pattern (literal substring or "
+                "RE2-linear regular expression). Patterns that would require "
+                "catastrophic backtracking are rejected. Returns matching "
+                "lines with file paths and line numbers."
             ),
             parameters={
                 "type": "object",

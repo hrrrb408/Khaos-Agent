@@ -12,6 +12,7 @@ dependencies = [
     "httpx>=0.28",
     "cryptography>=42",
     "PyYAML>=6",
+    "google-re2>=1",
 ]
 
 [project.optional-dependencies]
