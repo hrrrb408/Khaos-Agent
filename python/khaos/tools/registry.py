@@ -17,6 +17,11 @@ _OFFICE_WORKSPACE_FILE_TOOLS = frozenset({
     "read_file", "search_files", "list_directory", "file_info", "tree_view",
     "file_search_content", "write_file", "patch", "multi_edit", "copy_file",
     "move_file",
+    # B1: browser_file_upload reads a host file and uploads it to a web page;
+    # listing it here makes the broker inject ``workspace_root`` so the
+    # handler can validate the file path is contained within the workspace
+    # root (no symlink escape, no arbitrary host file exfiltration).
+    "browser_file_upload",
 })
 from dataclasses import field
 
@@ -93,6 +98,33 @@ class ToolRegistry:
 
     def capabilities_for(self, name: str) -> tuple[ToolCapability, ...]:
         return self.get(name).capabilities
+
+    def prune(self, tool_names: list[str]) -> "ToolRegistry":
+        """Return a new registry containing only ``tool_names``.
+
+        B1: SubAgent tasks declare a tool subset (``task.tools``); the
+        spawner previously only *validated* that those names existed in the
+        full registry, then handed the subagent a scheduler wired to the
+        *full* registry — so a subagent could invoke any registered tool
+        regardless of its declared subset.  This method produces a genuine
+        pruned view: a fresh ``ToolRegistry`` (same ``enforce_capabilities``
+        flag) carrying only the requested tool definitions with their
+        handlers and capabilities intact.
+
+        Unknown names are silently skipped — callers are expected to
+        validate names beforehand via :meth:`get` / :meth:`_validate_tools`
+        so the prune step never silently drops a requested tool.
+        """
+        pruned = ToolRegistry(enforce_capabilities=self.enforce_capabilities)
+        for name in tool_names:
+            definition = self._tools.get(name)
+            if definition is None:
+                continue
+            # Re-register by writing directly to the internal dict so the
+            # ``enforce_capabilities`` inference path does not re-infer
+            # capabilities for a definition that already declares them.
+            pruned._tools[name] = definition
+        return pruned
 
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:
         expected = schema.get("type")
@@ -177,6 +209,22 @@ class ToolInvocationBroker:
         if any(capability.name == "network.access" for capability in capabilities):
             handler_params["network_policy"] = context.get("network_policy", "none")
             handler_params["credential_context"] = context.get("credential_context")
+            # H1: pass principal_id so browser tools can select a per-principal
+            # BrowserContext (cookie / DOM isolation between principals).
+            handler_params["principal_id"] = context.get("principal_id", "")
+        # H1: per-principal BrowserContext isolation applies to ALL browser
+        # tools that touch a Page, not just network.access ones.  Read-only
+        # browser tools (snapshot / screenshot / scroll / vision) declare
+        # ``filesystem.read``; without principal_id here they would all
+        # share the "default" BrowserContext, leaking one principal's DOM /
+        # cookies to another.  ``browser_launch`` / ``browser_close`` are
+        # process-global lifecycle operations and don't accept principal_id.
+        if (
+            name.startswith("browser_")
+            and name not in {"browser_launch", "browser_close"}
+            and "principal_id" not in handler_params
+        ):
+            handler_params["principal_id"] = context.get("principal_id", "")
         if any(capability.name in {"remote.write", "remote.destructive-write"} for capability in capabilities):
             handler_params["approval_context"] = context.get("approval_context")
             handler_params["principal_id"] = context.get("principal_id")
@@ -1128,8 +1176,20 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         )
     )
     # ── Phase 6 browser tools (Playwright-backed, mock fallback) ──
+    # B1/H1: browser tools now declare explicit capabilities so the
+    # capability broker gates them correctly:
+    #   * navigation / click / type / evaluate / upload carry
+    #     ``network.access`` (they can trigger navigation or form
+    #     submission, which is a network side effect);
+    #   * ``browser_file_upload`` also carries ``filesystem.read`` (it
+    #     reads a host file) and is added to
+    #     ``_OFFICE_WORKSPACE_FILE_TOOLS`` so the broker injects
+    #     ``workspace_root`` for path containment validation;
+    #   * snapshot / screenshot / scroll / vision are read-only page
+    #     inspection (``filesystem.read`` — no network side effect).
+    _BROWSER_MODES = frozenset({"office", "coding"})
     # read-permission tools
-    for name, description, parameters in [
+    for name, description, parameters, capabilities in [
         (
             "browser_launch",
             "Launch a browser instance (Chromium/Firefox/WebKit). Must be called before other browser tools.",
@@ -1149,11 +1209,13 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                     },
                 },
             },
+            (ToolCapability("host.integration", _BROWSER_MODES, frozenset({"app-data"})),),
         ),
         (
             "browser_close",
             "Close the browser instance and release resources.",
             {"type": "object", "properties": {}},
+            (ToolCapability("host.integration", _BROWSER_MODES, frozenset({"app-data"})),),
         ),
         (
             "browser_navigate",
@@ -1163,6 +1225,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 "properties": {"url": {"type": "string", "description": "URL to navigate to"}},
                 "required": ["url"],
             },
+            (ToolCapability("network.access", _BROWSER_MODES, frozenset({"user-selected"})),),
         ),
         (
             "browser_click",
@@ -1177,11 +1240,14 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 },
                 "required": ["selector"],
             },
+            # B1/H1: click can trigger navigation / form submission → network.
+            (ToolCapability("network.access", _BROWSER_MODES, frozenset({"user-selected"})),),
         ),
         (
             "browser_snapshot",
             "Get the current page DOM content (HTML).",
             {"type": "object", "properties": {}},
+            (ToolCapability("filesystem.read", _BROWSER_MODES, frozenset({"app-data"})),),
         ),
         (
             "browser_screenshot",
@@ -1195,6 +1261,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                     }
                 },
             },
+            (ToolCapability("filesystem.read", _BROWSER_MODES, frozenset({"app-data"})),),
         ),
         (
             "browser_scroll",
@@ -1211,11 +1278,13 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 },
                 "required": ["direction"],
             },
+            (ToolCapability("filesystem.read", _BROWSER_MODES, frozenset({"app-data"})),),
         ),
         (
             "browser_vision",
             "Get a text description of the current page state (URL, title).",
             {"type": "object", "properties": {}},
+            (ToolCapability("filesystem.read", _BROWSER_MODES, frozenset({"app-data"})),),
         ),
     ]:
         registry.register(
@@ -1226,10 +1295,11 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 modes=["office", "coding"],
                 permission_level="read",
                 parallel=False,
+                capabilities=capabilities,
             )
         )
     # write-permission browser tools
-    for name, description, parameters in [
+    for name, description, parameters, capabilities in [
         (
             "browser_type",
             "Type text into an input field (clears existing text first).",
@@ -1246,6 +1316,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 },
                 "required": ["selector", "text"],
             },
+            # B1/H1: press_enter can submit a form → network.
+            (ToolCapability("network.access", _BROWSER_MODES, frozenset({"user-selected"})),),
         ),
         (
             "browser_evaluate",
@@ -1260,6 +1332,10 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 },
                 "required": ["expression"],
             },
+            # B1/H1: arbitrary JS can issue network requests, change location,
+            # submit forms — gate behind network.access.  The regex block on
+            # fetch/XHR/WebSocket/sendBeacon remains as defense in depth.
+            (ToolCapability("network.access", _BROWSER_MODES, frozenset({"user-selected"})),),
         ),
         (
             "browser_file_upload",
@@ -1270,11 +1346,20 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                     "selector": {"type": "string"},
                     "file_path": {
                         "type": "string",
-                        "description": "Absolute path to file",
+                        "description": "Absolute path to file (must be within workspace root)",
                     },
                 },
                 "required": ["selector", "file_path"],
             },
+            # B1: reads a host file (filesystem.read) AND uploads it to a web
+            # page (network.access).  The broker injects ``workspace_root``
+            # because browser_file_upload is in ``_OFFICE_WORKSPACE_FILE_TOOLS``;
+            # the handler validates the path is contained within the workspace
+            # root (no symlink escape, no arbitrary host file exfiltration).
+            (
+                ToolCapability("filesystem.read", _BROWSER_MODES, frozenset({"user-selected"})),
+                ToolCapability("network.access", _BROWSER_MODES, frozenset({"user-selected"})),
+            ),
         ),
     ]:
         registry.register(
@@ -1285,6 +1370,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 modes=["office", "coding"],
                 permission_level="write",
                 parallel=False,
+                capabilities=capabilities,
             )
         )
     # ── Phase 6 web content tools (HTML→Markdown, tables, metadata) ──

@@ -60,8 +60,16 @@ def test_url_blocked() -> None:
 
 
 def test_domain_allowlist() -> None:
-    """An allowlisted domain is allowed even with network off."""
-    guard = NetworkGuard(allowed_domains=["pypi.org"])
+    """H1: an allowlisted domain is allowed when network is enabled.
+
+    The previous semantics (allowlist bypasses ``network_enabled=False``)
+    was a fail-open: an allowlist like ``[pypi.org]`` silently granted
+    unrestricted network access because the first line of ``check_tool``
+    was ``if self.network_enabled: return allowed``.  ``network_enabled``
+    is now a TOTAL SWITCH — when off, all network access is blocked;
+    when on, the allowlist narrows what's permitted.
+    """
+    guard = NetworkGuard(network_enabled=True, allowed_domains=["pypi.org"])
     result = guard.check_tool("terminal", {"command": "curl https://pypi.org/simple"})
 
     assert result.allowed is True
@@ -69,8 +77,9 @@ def test_domain_allowlist() -> None:
 
 
 def test_domain_wildcard() -> None:
-    """Subdomain matching: allowlisting github.com allows api.github.com."""
-    guard = NetworkGuard(allowed_domains=["github.com"])
+    """H1: subdomain matching — allowlisting github.com allows api.github.com
+    when network is enabled."""
+    guard = NetworkGuard(network_enabled=True, allowed_domains=["github.com"])
     result = guard.check_tool("terminal", {"command": "curl https://api.github.com"})
 
     assert result.allowed is True

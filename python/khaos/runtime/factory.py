@@ -64,6 +64,14 @@ class RuntimeConfig:
     principal_id: str = field(
         default_factory=lambda: f"local-uid:{os.getuid()}"
     )
+    # B1: when set, ``build_runtime`` constructs the ToolScheduler's registry
+    # by pruning the full runtime registry down to exactly these tool names.
+    # SubAgent tasks declare a tool subset (``task.tools``); without this
+    # field the subagent would receive a scheduler wired to the *full*
+    # registry and could invoke any registered tool regardless of its
+    # declared subset.  ``None`` (the default) means "no pruning" — the
+    # full runtime registry is installed (the main AgentLoop path).
+    tool_allowlist: list[str] | None = None
 
 
 @dataclass
@@ -84,68 +92,143 @@ class RuntimeResult:
     # must NOT shut it down — the owner (AgentService / SubAgentService)
     # manages its lifecycle.  Defaults to True for ad-hoc constructions.
     owns_office_authority: bool = True
+    # H1: the principal that owns this runtime.  ``aclose`` uses it to
+    # release the principal's per-session ``BrowserContext`` so cookies /
+    # DOM / page state cannot leak into a subsequent run by a different
+    # principal sharing the same process-wide ``BrowserManager``.
+    principal_id: str = ""
     # B1: ``init=False`` so positional construction can never accidentally
     # bind a real component into ``_closed`` (which previously made
     # ``aclose()`` a no-op because the truthy component short-circuited it).
-    # H3: ``_closing`` prevents concurrent invocation; ``_closed`` is set
-    # only after every safety-critical component has reached a terminal
-    # state, so a cancelled aclose can be retried by the caller.
-    _closing: bool = field(default=False, init=False)
+    # H3: a shared ``_close_task`` guarantees:
+    #   * the first ``aclose`` creates and ``shield``s the cleanup task;
+    #   * concurrent / retried ``aclose`` callers await the SAME task (they
+    #     don't return immediately while cleanup is still in flight);
+    #   * ``_closed`` is set ONLY when every safety-critical component has
+    #     reached a terminal state — a cancelled or partially-failed aclose
+    #     leaves ``_closed=False`` so the caller can retry;
+    #   * a component shutdown failure marks the runtime ``_close_failed``
+    #     (also ``_closed=False``) so the caller can observe and retry.
+    _close_task: Any = field(default=None, init=False)
     _closed: bool = field(default=False, init=False)
+    _close_failed: bool = field(default=False, init=False)
 
     async def aclose(self) -> None:
         """Release runtime-owned resources; database ownership stays with caller.
 
-        H3: uses ``_closing`` + ``_closed`` so a cancelled cleanup can be
-        retried.  ``_closed`` is set ONLY at the end — if we are cancelled
-        mid-cleanup (e.g. event-loop shutdown), ``_closed`` stays False and
-        ``_closing`` resets in the ``finally`` block, so the caller can call
-        ``aclose`` again to finish the remaining steps.  Each component's
-        shutdown is expected to be idempotent.
+        H3: uses a shared ``_close_task`` so:
+
+        * the first ``aclose`` creates and ``shield``s the cleanup task;
+        * concurrent callers (and a retried aclose after cancellation)
+          await the SAME task — they don't return immediately while
+          cleanup is still in flight;
+        * ``_closed`` is set ONLY after every safety-critical component
+          has reached a terminal state.  A cancelled or partially-failed
+          aclose leaves ``_closed=False`` so the caller can retry; a
+          component shutdown failure sets ``_close_failed=True`` (also
+          ``_closed=False``) so the caller can observe and retry.
+
+        H1: releases the principal's per-session ``BrowserContext`` so
+        cookies / DOM / page state cannot leak into a subsequent run by a
+        different principal sharing the same process-wide BrowserManager.
         """
-        if self._closed or self._closing:
+        import asyncio as _asyncio
+
+        # Already fully closed — nothing to do.
+        if self._closed:
             return
-        self._closing = True
+        # A close task is already in flight — wait on the SAME task so
+        # concurrent callers don't return before cleanup finishes.
+        if self._close_task is not None:
+            await _asyncio.shield(self._close_task)
+            return
+        # Create the shared cleanup task and shield it so a cancellation
+        # of the *caller* does not abort the cleanup itself.
+        self._close_task = _asyncio.ensure_future(self._run_close())
         try:
-            # H3: fence Office mutations FIRST — wait for every in-flight
-            # copy/move worker to settle (commit or roll back) and mark every
-            # Office workspace read-only before any other component shuts down.
-            # Without this, a mutation thread could keep writing to the
-            # filesystem after the runtime has already closed.
-            # B1: only close if owned — a shared/injected authority is managed
-            # by the server (AgentService.shutdown).
-            if (
-                self.office_authority is not None
-                and self.owns_office_authority
-            ):
+            await _asyncio.shield(self._close_task)
+        except _asyncio.CancelledError:
+            # The caller was cancelled, but the cleanup task keeps running.
+            # Re-raise so the caller's cancellation propagates; a subsequent
+            # aclose() will await the still-running task.
+            raise
+
+    async def _run_close(self) -> None:
+        """Run the actual cleanup; idempotent and failure-tolerant.
+
+        H3: ``_closed`` is set ONLY when every safety-critical component
+        has reached a terminal state.  A component failure sets
+        ``_close_failed=True`` and leaves ``_closed=False`` so the caller
+        can retry (each component's shutdown is expected to be idempotent).
+        """
+        if self._closed:
+            return
+        failed = False
+        # H3: fence Office mutations FIRST — wait for every in-flight
+        # copy/move worker to settle (commit or roll back) and mark every
+        # Office workspace read-only before any other component shuts down.
+        # Without this, a mutation thread could keep writing to the
+        # filesystem after the runtime has already closed.
+        # B1: only close if owned — a shared/injected authority is managed
+        # by the server (AgentService.shutdown).
+        if (
+            self.office_authority is not None
+            and self.owns_office_authority
+        ):
+            try:
+                await self.office_authority.shutdown()
+            except Exception:
+                failed = True
+                logger.debug(
+                    "office authority shutdown failed", exc_info=True
+                )
+        if self.memory_manager is not None:
+            close = getattr(self.memory_manager, "aclose", None)
+            if close is not None:
                 try:
-                    await self.office_authority.shutdown()
+                    await close()
                 except Exception:
+                    failed = True
                     logger.debug(
-                        "office authority shutdown failed", exc_info=True
+                        "memory manager close failed", exc_info=True
                     )
-            if self.memory_manager is not None:
-                close = getattr(self.memory_manager, "aclose", None)
-                if close is not None:
-                    try:
-                        await close()
-                    except Exception:
-                        logger.debug(
-                            "memory manager close failed", exc_info=True
-                        )
-            if self.execution_service is not None:
-                try:
-                    await self.execution_service.shutdown()
-                except Exception:
-                    logger.debug(
-                        "execution service close failed", exc_info=True
-                    )
-            # H3: only mark closed after all safety-critical components have
-            # reached a terminal state.  A cancelled aclose leaves _closed
-            # False so the caller can retry.
-            self._closed = True
-        finally:
-            self._closing = False
+        if self.execution_service is not None:
+            try:
+                await self.execution_service.shutdown()
+            except Exception:
+                failed = True
+                logger.debug(
+                    "execution service close failed", exc_info=True
+                )
+        # H1: release this principal's per-session BrowserContext so its
+        # cookies / DOM / page state cannot leak into a subsequent run by
+        # a different principal.  Best-effort — the BrowserManager is a
+        # process-wide singleton, and a failure here must not block the
+        # rest of cleanup.
+        if self.principal_id:
+            try:
+                from khaos.tools.browser_tools import _manager as _browser_manager
+                await _browser_manager.close_context(self.principal_id)
+            except Exception:
+                # Browser context close is best-effort — do NOT mark the
+                # runtime as failed-close just because the browser cleanup
+                # raised (Playwright may not even be installed).
+                logger.debug(
+                    "browser context close failed for principal %s",
+                    self.principal_id,
+                    exc_info=True,
+                )
+        # H3: only mark closed when every safety-critical component reached
+        # a terminal state.  A component failure sets ``_close_failed`` so
+        # the caller can observe and retry; ``_closed`` stays False so a
+        # subsequent ``aclose`` will run the cleanup again (each component's
+        # shutdown is expected to be idempotent).
+        if failed:
+            self._close_failed = True
+            # Reset ``_close_task`` so a retry actually re-runs cleanup.
+            self._close_task = None
+            return
+        self._closed = True
 
 
 async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
@@ -239,15 +322,29 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
             allowed_domains=list(effective_policy.network_allowed_domains),
             blocked_domains=list(effective_policy.network_blocked_domains),
         )
-    scheduler = cfg.tool_scheduler or ToolScheduler(
-        create_runtime_registry(), permission_engine,
-        security_middleware=SecurityMiddleware(
-            sandbox=sandbox,
-            network_guard=network_guard,
-            audit_logger=cfg.audit_logger,
-            effective_policy=effective_policy,
-        ),
-    )
+    scheduler = cfg.tool_scheduler
+    if scheduler is None:
+        # B1: when a tool allowlist is configured (SubAgent path), prune the
+        # full runtime registry down to exactly the declared tool subset so
+        # the subagent cannot invoke tools outside its declared scope.  The
+        # pruned registry is wired into a fresh ToolScheduler whose
+        # SecurityMiddleware carries the same EffectivePolicy / Sandbox /
+        # NetworkGuard / AuditLogger as the main runtime — closing the
+        # parallel-scheduler bypass where a subagent ran without any
+        # security stack at all.
+        if cfg.tool_allowlist is not None:
+            registry = create_runtime_registry().prune(cfg.tool_allowlist)
+        else:
+            registry = create_runtime_registry()
+        scheduler = ToolScheduler(
+            registry, permission_engine,
+            security_middleware=SecurityMiddleware(
+                sandbox=sandbox,
+                network_guard=network_guard,
+                audit_logger=cfg.audit_logger,
+                effective_policy=effective_policy,
+            ),
+        )
     scheduler.set_office_authority(office_authority)
     # B1: register the authority on the scheduler only (instance attribute).
     # The previous module-global ``file_tools._office_authority`` was removed
@@ -284,4 +381,5 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         execution_service=execution_service,
         office_authority=office_authority,
         owns_office_authority=owns_office_authority,
+        principal_id=cfg.principal_id,
     )

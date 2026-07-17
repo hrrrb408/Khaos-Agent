@@ -137,7 +137,14 @@ async def test_aclose_shuts_down_office_before_memory_and_execution():
 
 
 async def test_aclose_tolerates_component_shutdown_failures():
-    """A failing component must not prevent the others from closing."""
+    """A failing component must not prevent the others from closing.
+
+    H3: a component failure sets ``_close_failed=True`` and leaves
+    ``_closed=False`` so the caller can observe and retry.  Each
+    component's shutdown is expected to be idempotent — a retry will
+    re-invoke them, and a component that already reached a terminal
+    state on the first attempt should ideally not raise again.
+    """
     office = MagicMock()
     office.shutdown = AsyncMock(side_effect=RuntimeError("office boom"))
     memory = MagicMock()
@@ -161,6 +168,9 @@ async def test_aclose_tolerates_component_shutdown_failures():
     office.shutdown.assert_awaited_once()
     memory.aclose.assert_awaited_once()
     execution.shutdown.assert_awaited_once()
+    # H3: a component failure marks the runtime as failed-close, NOT closed.
+    assert result._close_failed is True
+    assert result._closed is False
 
 
 async def test_closed_field_is_not_bound_by_positional_construction():
@@ -170,21 +180,27 @@ async def test_closed_field_is_not_bound_by_positional_construction():
     ``init=False`` makes this impossible at the dataclass level: ``_closed``
     is not in the generated ``__init__`` signature, so positional args can
     never bind into it.  The init signature must include the eight real
-    components plus the three optional components (``execution_service``,
-    ``office_authority``, ``owns_office_authority``) — but NOT ``_closed``
-    or ``_closing``.
+    components plus the optional components (``execution_service``,
+    ``office_authority``, ``owns_office_authority``, ``principal_id``) —
+    but NOT ``_closed``, ``_close_task`` or ``_close_failed``.
     """
     import inspect
 
     init_params = list(inspect.signature(RuntimeResult.__init__).parameters)
-    # ``_closed`` / ``_closing`` must NOT be in the init signature — that's
-    # the B1 / H3 fix.
+    # ``_closed`` / ``_close_task`` / ``_close_failed`` must NOT be in the
+    # init signature — that's the B1 / H3 fix.
     assert "_closed" not in init_params, (
         "_closed must be init=False so positional construction can never "
         "bind a component into it (B1 regression)"
     )
     assert "_closing" not in init_params, (
         "_closing must be init=False (H3 regression)"
+    )
+    assert "_close_task" not in init_params, (
+        "_close_task must be init=False (H3 regression)"
+    )
+    assert "_close_failed" not in init_params, (
+        "_close_failed must be init=False (H3 regression)"
     )
     # The init signature must still accept the real components in order.
     assert init_params == [
@@ -200,6 +216,7 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "execution_service",
         "office_authority",
         "owns_office_authority",
+        "principal_id",
     ]
 
 

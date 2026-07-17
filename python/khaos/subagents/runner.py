@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING, Any, Optional
 
 from khaos.agent.core import AgentConfig, AgentLoop, Message, SimpleTokenEngine
@@ -32,7 +33,7 @@ class SubAgentRunner:
         router,                          # ModelRouter 实例
         db,                              # Database 实例
         mode_manager,                    # ModeManager 实例
-        tool_scheduler,                  # ToolScheduler 实例
+        tool_scheduler=None,             # B1: 不再接收裸 scheduler；默认 None
         memory_manager: Optional["MemoryManager"] = None,  # 可选，默认不共享记忆
         skill_manager: Optional["SkillManager"] = None,    # 可选
         coding_context_builder: Optional["CodingContextBuilder"] = None,  # 可选
@@ -42,10 +43,18 @@ class SubAgentRunner:
         stream_timeout: int = 60,        # 子代理超时（比主 agent 低）
         inherit_memory: bool = False,    # 是否从父会话继承记忆
         office_authority: Optional[Any] = None,  # B1: 共享 Office authority
+        approval_broker: Optional[Any] = None,   # B1: 继承主 AgentService 的审批 broker
+        principal_id: str = "",                  # B1: 继承 principal
+        audit_logger: Optional[Any] = None,      # B1: 继承审计 logger
     ):
         self.router = router
         self.db = db
         self.mode_manager = mode_manager
+        # B1: ``tool_scheduler`` 保留为可选向后兼容字段，但生产路径
+        # （``_build_subagent_service``）不再传入裸 scheduler。当为 ``None``
+        # 时，``build_runtime`` 会按 ``task.tools`` 裁剪出带完整
+        # SecurityMiddleware（Sandbox / NetworkGuard / EffectivePolicy /
+        # AuditLogger）的全新 ToolScheduler，与主 AgentLoop 共享同一安全栈。
         self.tool_scheduler = tool_scheduler
         self.memory_manager = memory_manager
         self.skill_manager = skill_manager
@@ -59,6 +68,12 @@ class SubAgentRunner:
         # run — keeps the aggregate storage baseline stable and prevents
         # build_runtime from silently replacing the scheduler's authority.
         self.office_authority = office_authority
+        # B1: inherit the server-level approval broker / principal / audit
+        # logger so the subagent's security decisions are bound to the same
+        # authority as the main AgentLoop, not a parallel unsupervised path.
+        self.approval_broker = approval_broker
+        self.principal_id = principal_id
+        self.audit_logger = audit_logger
 
     async def run(self, task: SubAgentTask) -> str:
         """执行子任务并返回结果字符串。
@@ -87,11 +102,26 @@ class SubAgentRunner:
         from khaos.runtime import RuntimeConfig, build_runtime
         runtime = await build_runtime(RuntimeConfig(
             db=self.db, mode_manager=self.mode_manager, router=self.router,
+            # B1: pass ``tool_scheduler=None`` (the default) so build_runtime
+            # constructs a fresh ToolScheduler with the full SecurityMiddleware
+            # stack (Sandbox / NetworkGuard / EffectivePolicy / AuditLogger).
+            # The previous path passed a bare scheduler without any security
+            # middleware, giving the subagent an unsupervised execution path.
             tool_scheduler=self.tool_scheduler,
+            # B1: prune the runtime registry down to exactly the tools the
+            # task declared, so the subagent cannot invoke tools outside its
+            # scope even if they are registered globally.
+            tool_allowlist=(task.tools if self.tool_scheduler is None else None),
             memory_manager=self.memory_manager if self.inherit_memory else None,
             skill_manager=self.skill_manager, agent_config=config,
             coding_context_builder=self.coding_context_builder,
             office_authority=self.office_authority,
+            # B1: inherit the server-level approval broker / principal /
+            # audit logger so approvals and audit events are bound to the
+            # same authority as the main AgentLoop.
+            approval_broker=self.approval_broker,
+            principal_id=self.principal_id or f"local-uid:{os.getuid()}",
+            audit_logger=self.audit_logger,
         ))
         try:
             logger.info(
