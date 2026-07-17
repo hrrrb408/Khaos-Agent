@@ -245,13 +245,18 @@ class Sandbox:
     def from_policy_mode(
         cls, mode_str: str, workspace_root: Path | None = None
     ) -> "Sandbox":
-        """从策略字符串构建沙箱。未知模式回退到 workspace-write。"""
+        """Build a sandbox from a policy mode string.
+
+        H3: an unknown mode now fails closed (raises ``ValueError``) instead
+        of silently degrading to the more-permissive ``workspace-write``.  A
+        typo in ``khaos_policy.yaml``'s ``sandbox.mode`` must surface at
+        startup, not grant unintended write/terminal access.
+        """
         try:
             mode = SandboxMode(mode_str)
-        except ValueError:
-            logger.warning(
-                "Unknown sandbox mode '%s', falling back to workspace-write",
-                mode_str,
-            )
-            mode = SandboxMode.WORKSPACE_WRITE
+        except ValueError as exc:
+            valid = [m.value for m in SandboxMode]
+            raise ValueError(
+                f"Unknown sandbox mode '{mode_str}'; expected one of {valid}"
+            ) from exc
         return cls(mode=mode, workspace_root=workspace_root)

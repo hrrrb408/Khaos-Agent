@@ -83,9 +83,15 @@ class SandboxPolicy:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SandboxPolicy":
-        """从字典构建策略，未知字段忽略。"""
+        """从字典构建策略。
+
+        H3: unknown top-level / section keys raise ``ValueError`` so a typo in
+        ``khaos_policy.yaml`` fails closed at parse time rather than being
+        silently ignored.  Empty input still yields the safe default policy.
+        """
         if not isinstance(data, dict):
             return cls()
+        _reject_unknown_keys(data)
         sandbox = data.get("sandbox", {}) or {}
         commands = data.get("commands", {}) or {}
         secrets = data.get("secrets", {}) or {}
@@ -114,12 +120,16 @@ class SandboxPolicy:
 
 
 def load_policy(path: Path | None = None) -> SandboxPolicy:
-    """从文件加载策略。如果 path 为 None，按优先级搜索默认路径。
+    """Load a policy from a YAML file.
 
-    优先级：显式指定路径 > 项目根 khaos_policy.yaml > ~/.khaos/policy.yaml > 默认值。
+    Priority: explicit path > khaos_policy.yaml > ~/.khaos/policy.yaml > default.
 
-    Any read/parse error falls back to the default policy rather than raising,
-    so a malformed policy file never prevents Khaos from starting.
+    H3: a missing or empty file still yields the safe default policy, but a
+    *malformed* YAML file or a file with *unknown keys* now raises rather
+    than silently degrading to the more-permissive workspace-write default.
+    A user who mistypes the mode field or breaks YAML while trying to lock
+    down to read-only must see the failure at startup, not silently gain
+    write/terminal access.
     """
     candidates: list[Path] = [path] if path else DEFAULT_POLICY_PATHS
     for candidate in candidates:
@@ -132,18 +142,43 @@ def load_policy(path: Path | None = None) -> SandboxPolicy:
             continue
         if not resolved.is_file():
             continue
-        try:
-            logger.info("Loading sandbox policy from %s", resolved)
-            with open(resolved, encoding="utf-8") as handle:
-                data = yaml.safe_load(handle) or {}
-            return SandboxPolicy.from_dict(data if isinstance(data, dict) else {})
-        except (OSError, yaml.YAMLError) as exc:
-            # Malformed YAML must not crash startup — fall back to defaults.
-            logger.warning(
-                "Failed to parse policy %s (%s); using default policy",
-                resolved,
-                exc,
-            )
-            return SandboxPolicy()
+        logger.info("Loading sandbox policy from %s", resolved)
+        # Let yaml.YAMLError propagate (fail closed on malformed YAML).
+        with open(resolved, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle) or {}
+        return SandboxPolicy.from_dict(data if isinstance(data, dict) else {})
     logger.info("No policy file found, using defaults")
     return SandboxPolicy()
+
+
+# Valid keys at each nesting level.  Used to fail closed on typos.
+_ALLOWED_TOP_LEVEL = frozenset({"sandbox", "commands", "secrets", "audit"})
+_ALLOWED_SANDBOX_KEYS = frozenset({
+    "mode", "network", "allowed_domains", "blocked_domains",
+    "allowed_paths", "denied_paths",
+})
+_ALLOWED_COMMANDS_KEYS = frozenset({"allow", "require_approval", "block"})
+_ALLOWED_SECRETS_KEYS = frozenset({
+    "scan_on_output", "scan_before_tool_result", "block_env_dump",
+})
+_ALLOWED_AUDIT_KEYS = frozenset({"enabled", "log_path"})
+
+
+def _reject_unknown_keys(data: dict[str, Any]) -> None:
+    """Raise ValueError if ``data`` has any unknown top-level or section keys."""
+    _check_section(data, _ALLOWED_TOP_LEVEL, "policy")
+    _check_section(data.get("sandbox") or {}, _ALLOWED_SANDBOX_KEYS, "sandbox")
+    _check_section(data.get("commands") or {}, _ALLOWED_COMMANDS_KEYS, "commands")
+    _check_section(data.get("secrets") or {}, _ALLOWED_SECRETS_KEYS, "secrets")
+    _check_section(data.get("audit") or {}, _ALLOWED_AUDIT_KEYS, "audit")
+
+
+def _check_section(mapping: object, allowed: frozenset[str], where: str) -> None:
+    if not isinstance(mapping, dict):
+        return
+    unknown = set(mapping) - allowed
+    if unknown:
+        raise ValueError(
+            f"unknown {where} key(s): {sorted(unknown)}; "
+            f"allowed: {sorted(allowed)}"
+        )

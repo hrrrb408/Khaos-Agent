@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+import yaml
+
 from khaos.security.policy import SandboxPolicy, load_policy
 
 
@@ -21,7 +24,7 @@ sandbox:
   mode: read-only
   network: true
   allowed_domains: [example.com]
-denied_paths: []
+  denied_paths: []
 commands:
   require_approval: [rm]
 secrets:
@@ -112,17 +115,18 @@ commands:
     assert policy.commands_blocked == []
 
 
-def test_invalid_yaml_fallback(tmp_path: Path) -> None:
-    """Malformed YAML falls back to the default policy instead of raising."""
+def test_invalid_yaml_fails_closed(tmp_path: Path) -> None:
+    """H3: malformed YAML raises rather than degrading to workspace-write.
+
+    A user who breaks YAML while trying to lock down to read-only must see
+    the failure at startup, not silently gain write/terminal access.
+    """
     policy_file = _write_policy(
         tmp_path / "khaos_policy.yaml",
         "sandbox: [this is : not valid : yaml\n  - broken",
     )
-    policy = load_policy(policy_file)
-
-    # Must not raise — returns the safe default.
-    assert policy.mode == "workspace-write"
-    assert policy.network_enabled is False
+    with pytest.raises(yaml.YAMLError):
+        load_policy(policy_file)
 
 
 def test_empty_yaml_file_uses_defaults(tmp_path: Path) -> None:
@@ -133,10 +137,15 @@ def test_empty_yaml_file_uses_defaults(tmp_path: Path) -> None:
     assert policy.mode == "workspace-write"
 
 
-def test_from_dict_ignores_unknown_keys() -> None:
-    """Unknown top-level keys are silently ignored, not errors."""
-    policy = SandboxPolicy.from_dict(
-        {"unknown_section": {"foo": 1}, "sandbox": {"mode": "read-only"}}
-    )
+def test_from_dict_rejects_unknown_keys() -> None:
+    """H3: unknown top-level keys raise rather than being silently ignored."""
+    with pytest.raises(ValueError, match="unknown"):
+        SandboxPolicy.from_dict(
+            {"unknown_section": {"foo": 1}, "sandbox": {"mode": "read-only"}}
+        )
 
-    assert policy.mode == "read-only"
+
+def test_from_dict_rejects_unknown_sandbox_key() -> None:
+    """H3: a typo in a sandbox sub-key fails closed."""
+    with pytest.raises(ValueError, match="unknown"):
+        SandboxPolicy.from_dict({"sandbox": {"mode": "read-only", "colour": "red"}})

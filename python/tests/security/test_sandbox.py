@@ -69,10 +69,12 @@ def test_yolo_allows_all() -> None:
 
 
 def test_from_policy_mode_invalid() -> None:
-    """An unknown mode string falls back to workspace-write."""
-    sandbox = Sandbox.from_policy_mode("not-a-real-mode")
+    """H3: an unknown mode string fails closed (raises) instead of silently
+    degrading to the more-permissive workspace-write."""
+    import pytest
 
-    assert sandbox.mode == SandboxMode.WORKSPACE_WRITE
+    with pytest.raises(ValueError, match="Unknown sandbox mode"):
+        Sandbox.from_policy_mode("not-a-real-mode")
 
 
 def test_from_policy_mode_valid() -> None:
