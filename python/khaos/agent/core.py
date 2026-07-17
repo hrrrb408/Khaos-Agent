@@ -99,6 +99,12 @@ class AgentLoop:
         execution_service=None,
         approval_broker=None,
         principal_id: str | None = None,
+        # H5: runtime_id + session_id extend the per-session BrowserContext
+        # key so two concurrent local sessions under the same UID get
+        # independent BrowserContexts.  Propagated into ``tool_context`` so
+        # the broker can inject them into browser tools.
+        runtime_id: str = "",
+        session_id: str = "",
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -140,6 +146,11 @@ class AgentLoop:
             approval_broker = ApprovalBroker(db=db)
         self.approval_broker = approval_broker
         self.principal_id = principal_id or f"local-uid:{os.getuid()}"
+        # H5: per-runtime + per-session identifiers propagated to the
+        # browser tools via the broker so concurrent sessions under the
+        # same UID get independent BrowserContexts.
+        self.runtime_id = runtime_id
+        self.session_id = session_id
         self._active_context_facts: list[Message] = []
         if self.execution_service is None:
             from khaos.coding.execution import ExecutionService, UnsupportedBackend
@@ -375,6 +386,12 @@ class AgentLoop:
                         "requester": session_id,
                         "principal_id": self.principal_id,
                         "turn_id": f"{session_id}:{turn_count}",
+                        # H5: pass session_id + runtime_id so browser tools
+                        # key their BrowserContext by (principal, session,
+                        # runtime) — concurrent local sessions under the
+                        # same UID get independent contexts.
+                        "session_id": session_id,
+                        "runtime_id": self.runtime_id,
                     },
                 }
                 if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:

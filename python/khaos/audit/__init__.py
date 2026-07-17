@@ -1,8 +1,20 @@
 """Structured audit logging on top of the audit_log table."""
 
-from khaos.audit.logger import AuditEntry, AuditLogger, parse_detail
+from khaos.audit.logger import (
+    AUDIT_LOG_TRUSTED_DIR,
+    AuditEntry,
+    AuditLogger,
+    parse_detail,
+    resolve_safe_audit_log_path,
+)
 
-__all__ = ["AuditEntry", "AuditLogger", "parse_detail"]
+__all__ = [
+    "AUDIT_LOG_TRUSTED_DIR",
+    "AuditEntry",
+    "AuditLogger",
+    "parse_detail",
+    "resolve_safe_audit_log_path",
+]
 
 
 def __getattr__(name: str):

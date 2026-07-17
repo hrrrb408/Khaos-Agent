@@ -49,19 +49,36 @@ def test_policy_to_sandbox_chain(tmp_path: Path) -> None:
 
 
 def test_policy_to_network_guard_chain(tmp_path: Path) -> None:
-    """A policy's network config maps to the right NetworkGuard state."""
-    policy = SandboxPolicy(
+    """A policy's network config maps to the right NetworkGuard state.
+
+    H1: ``network_enabled`` is a TOTAL SWITCH — when off, ALL network
+    access is blocked regardless of the allowlist.  The allowlist can
+    only TIGHTEN an enabled network, not RELAX a disabled one.  To test
+    the allowlist we therefore enable network and verify deny-by-default.
+    """
+    # network off → ALL curl blocked (even allowlisted domains).
+    policy_off = SandboxPolicy(
         network_enabled=False,
         network_allowed_domains=["pypi.org"],
     )
-    guard = NetworkGuard(
-        network_enabled=policy.network_enabled,
-        allowed_domains=policy.network_allowed_domains,
+    guard_off = NetworkGuard(
+        network_enabled=policy_off.network_enabled,
+        allowed_domains=policy_off.network_allowed_domains,
     )
+    assert guard_off.check_tool("terminal", {"command": "curl https://example.com"}).allowed is False
+    assert guard_off.check_tool("terminal", {"command": "curl https://pypi.org"}).allowed is False
 
-    # network off → curl blocked, but allowlisted domain allowed.
-    assert guard.check_tool("terminal", {"command": "curl https://example.com"}).allowed is False
-    assert guard.check_tool("terminal", {"command": "curl https://pypi.org"}).allowed is True
+    # network on + allowlist → only allowlisted domains pass.
+    policy_on = SandboxPolicy(
+        network_enabled=True,
+        network_allowed_domains=["pypi.org"],
+    )
+    guard_on = NetworkGuard(
+        network_enabled=policy_on.network_enabled,
+        allowed_domains=policy_on.network_allowed_domains,
+    )
+    assert guard_on.check_tool("terminal", {"command": "curl https://example.com"}).allowed is False
+    assert guard_on.check_tool("terminal", {"command": "curl https://pypi.org"}).allowed is True
 
 
 def test_policy_to_middleware_chain(tmp_path: Path) -> None:
@@ -118,10 +135,13 @@ async def test_workspace_write_mode_full_flow(tmp_path: Path) -> None:
     assert curl.allowed is False
     assert curl.check_type == "network"
 
-    # env → blocked by command guard
+    # env → blocked by M1 env_dump guard (runs before the command guard
+    # because environment-dump commands are the most common source of
+    # API key / token leakage).  The check_type is ``env_dump``, not
+    # ``command``.
     env = await middleware.pre_check("terminal", {"command": "env"})
     assert env.allowed is False
-    assert env.check_type == "command"
+    assert env.check_type == "env_dump"
 
     # Blocks were recorded as security events.
     events = await audit.query()

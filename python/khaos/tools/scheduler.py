@@ -91,11 +91,18 @@ class ToolScheduler:
         budget: ToolBudget | None = None,
         use_rust_executor: bool = False,
         security_middleware: SecurityMiddleware | None = None,
+        # H5: identifies this scheduler's runtime to the BrowserManager so
+        # two concurrent local sessions under the same UID get independent
+        # BrowserContexts (keyed by principal_id + session_id + runtime_id).
+        runtime_id: str = "",
     ):
         self.registry = registry
         self.permission_engine = permission_engine
         self.budget = budget or ToolBudget()
         self.security_middleware = security_middleware or SecurityMiddleware()
+        # H5: per-runtime identifier propagated to the broker so browser
+        # tools can key their BrowserContext by (principal, session, runtime).
+        self.runtime_id = runtime_id
         # When True and the Rust bridge is importable, read-only file reads in
         # the parallel group are offloaded to the Rust executor for the bulk
         # I/O; the result still flows through the normal Python handler so
@@ -144,6 +151,21 @@ class ToolScheduler:
             if network_guard is not None and network_guard.network_enabled
             else "none"
         )
+        # B2 + H5: propagate the NetworkGuard + session_id + runtime_id so
+        # the broker can inject them into browser tools.  ``network_guard``
+        # is installed on every BrowserContext via ``context.route("**/*")``
+        # to gate EVERY request, redirect and subresource — not just the
+        # initial URL passed to ``browser_navigate``.  ``session_id`` +
+        # ``runtime_id`` extend the per-session context key so two
+        # concurrent local sessions under the same UID get independent
+        # BrowserContexts (closing one runtime's context does NOT close a
+        # concurrent runtime's page).
+        if network_guard is not None and "network_guard" not in tool_context:
+            tool_context["network_guard"] = network_guard
+        if session_id and "session_id" not in tool_context:
+            tool_context["session_id"] = session_id
+        if self.runtime_id and "runtime_id" not in tool_context:
+            tool_context["runtime_id"] = self.runtime_id
         # M1: propagate the effective policy digest so the approval
         # ``profile_digest`` can bind the decision to the exact policy under
         # which it was made.  Without this, two runtimes with different

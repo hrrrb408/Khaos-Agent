@@ -27,7 +27,7 @@ from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.approval import ApprovalBroker
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.error_handler import ErrorHandler
-from khaos.audit import AuditLogger
+from khaos.audit import AuditLogger, resolve_safe_audit_log_path
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
@@ -109,6 +109,14 @@ def _load_rpc_capability() -> str:
     if len(capability) < 32:
         raise PermissionError("RPC capability must contain at least 32 characters")
     return capability
+
+
+# H2: ``resolve_safe_audit_log_path`` and ``AUDIT_LOG_TRUSTED_DIR`` live in
+# ``khaos.audit`` so the runtime factory (used by CLI / TUI / tests) shares
+# the same trust boundary as the gRPC server path (M1).  The effective
+# policy compiler drops the project layer's ``audit_log_path`` entirely;
+# only the user layer may set it, and even then it MUST resolve under
+# ``~/.khaos/audit/`` (validated with ``O_NOFOLLOW`` + owner/mode checks).
 
 
 class GatewayRPCAuthenticator:
@@ -282,6 +290,23 @@ class AgentService:
         # RuntimeConfig.office_authority); RuntimeResult.aclose does NOT close
         # it — AgentService.shutdown does.
         self._office_authority = OfficeMutationAuthority()
+        # H1: a single server-lifecycle AuditLogger shared by the main runtime
+        # AND every SubAgent run, so security events from both paths land in
+        # the same audit trail.  ``log_path`` comes from the effective policy
+        # (user ∩ project, OR semantics — an untrusted project cannot disable
+        # audit).  H2: ``resolve_safe_audit_log_path`` constrains the path
+        # to a trusted directory so an untrusted project cannot point audit
+        # at an arbitrary host file (symlink / FIFO / device attacks).
+        self._audit_logger = (
+            AuditLogger(
+                self.db,
+                log_path=resolve_safe_audit_log_path(
+                    self._effective_policy.audit_log_path
+                ),
+            )
+            if self._effective_policy.audit_enabled
+            else None
+        )
 
     async def start(self) -> None:
         """Start process-scoped background services."""
@@ -422,22 +447,18 @@ class AgentService:
         in ``finally``.  The shared ``self._office_authority`` is injected so
         the aggregate storage baseline persists across turns (closing the
         cross-turn quota bypass).
+
+        H1: reuses the server-lifecycle ``self._audit_logger`` so security
+        events from the main AgentLoop and every SubAgent run land in the
+        SAME audit trail (no parallel unsupervised audit path).
         """
         await self.db.create_session(session_id, mode or "office")
         from khaos.runtime import RuntimeConfig, build_runtime
 
-        # H2: audit decision comes from the *effective* policy (OR semantics
-        # across user ∩ project), not the raw project policy — an untrusted
-        # repo can no longer disable audit by setting audit.enabled: false.
-        audit_logger = (
-            AuditLogger(self.db)
-            if self._effective_policy.audit_enabled
-            else None
-        )
         return await build_runtime(RuntimeConfig(
             project_root=self.project_root, config_path=self.config_path,
             mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
-            db=self.db, audit_logger=audit_logger,
+            db=self.db, audit_logger=self._audit_logger,
             task_manager=self.task_manager,
             approval_broker=self.approval_broker,
             router=self._router,
@@ -488,12 +509,19 @@ class AgentService:
 
             network_guard = NetworkGuard(
                 network_enabled=eff.network_enabled,
-                allowed_domains=list(eff.network_allowed_domains),
+                # H3: three-state — pass None through so NetworkGuard
+                # distinguishes "no allowlist" (unrestricted) from "empty
+                # allowlist" (deny all).
+                allowed_domains=(
+                    list(eff.network_allowed_domains)
+                    if eff.network_allowed_domains is not None
+                    else None
+                ),
                 blocked_domains=list(eff.network_blocked_domains),
             )
         except ImportError:
             pass
-        audit_logger = AuditLogger(self.db) if eff.audit_enabled else None
+        audit_logger = self._audit_logger
         return SecurityMiddleware(
             effective_policy=eff,
             sandbox=sandbox,
@@ -741,12 +769,21 @@ async def serve_json_lines(
     task_service = TaskService(agent.task_manager, agent.approval_broker)
     subagent_service: SubAgentService | None = None
     if enable_subagents:
-        # B1: share the AgentService's office authority so subagent runs reuse
-        # the same aggregate storage baseline (no cross-run quota bypass) and
-        # the runtime borrows it instead of creating a fresh authority.
+        # B1: share the AgentService's office authority AND approval broker so
+        # subagent runs reuse the same aggregate storage baseline (no
+        # cross-run quota bypass) and the same approval authority (no parallel
+        # unsupervised permission path).  The runtime borrows these instead of
+        # creating fresh instances; build_runtime constructs the per-run
+        # ToolScheduler with the full SecurityMiddleware stack.
         subagent_service = await _build_subagent_service(
             db, project_root, config_path,
             office_authority=agent._office_authority,
+            approval_broker=agent.approval_broker,
+            principal_id=f"local-uid:{os.getuid()}",
+            # H1: inherit the server-lifecycle AuditLogger so SubAgent
+            # security events land in the SAME audit trail as the main
+            # AgentLoop — no parallel unsupervised audit path.
+            audit_logger=agent._audit_logger,
         )
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -913,14 +950,29 @@ async def _build_subagent_service(
     config_path: Path | None,
     *,
     office_authority: OfficeMutationAuthority | None = None,
+    approval_broker: Any = None,
+    principal_id: str = "",
+    audit_logger: Any = None,
 ) -> SubAgentService:
+    """Build the SubAgent service bound to the server's shared security stack.
+
+    B1: previously this function constructed a *bare* ``ToolScheduler(
+    create_runtime_registry(), permission_engine)`` with no
+    ``SecurityMiddleware`` — so the subagent ran on a parallel, unsupervised
+    execution path that bypassed EffectivePolicy / Sandbox / NetworkGuard /
+    AuditLogger.  Now the runner receives ``tool_scheduler=None`` and
+    ``build_runtime`` constructs a fresh scheduler per run with the full
+    security stack compiled from the same layered effective policy as the
+    main AgentLoop.  The server-level ``approval_broker`` /
+    ``principal_id`` / ``audit_logger`` / ``office_authority`` are inherited
+    so approvals, audit events and the Office storage baseline are shared
+    with the main runtime, not forked.
+    """
     root = project_root or Path.cwd()
     resolved_config = config_path or root / "config.yaml"
     mode_manager = ModeManager(db, project_root=root)
     await mode_manager.load()
     router = load_router_from_config(resolved_config, project_root=root)
-    permission_engine = PermissionEngine(db)
-    await permission_engine.load_rules()
     memory_store = MemoryStore(db)
     memory_manager = MemoryManager(
         memory_store,
@@ -936,11 +988,23 @@ async def _build_subagent_service(
         router=router,
         db=db,
         mode_manager=mode_manager,
-        tool_scheduler=ToolScheduler(create_runtime_registry(), permission_engine),
+        # B1: do NOT pass a bare ToolScheduler — let build_runtime construct
+        # one per run with the full SecurityMiddleware stack and a registry
+        # pruned to ``task.tools``.
+        tool_scheduler=None,
         memory_manager=memory_manager,
         skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
         token_engine=get_token_engine(),
         office_authority=office_authority,
+        approval_broker=approval_broker,
+        principal_id=principal_id,
+        audit_logger=audit_logger,
+        # B1: inherit the server's project_root / config_path so the subagent
+        # loads the SAME ``khaos_policy.yaml`` and compiles the SAME
+        # EffectivePolicy as the main AgentLoop — no second security
+        # authority rooted at the process cwd.
+        project_root=root,
+        config_path=resolved_config,
     )
     spawner = SubAgentSpawner(
         SubAgentConfig(max_concurrent=3, max_spawn_depth=1, allow_nesting=False),

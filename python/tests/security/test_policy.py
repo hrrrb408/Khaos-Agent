@@ -71,11 +71,21 @@ def test_mode_workspace_write(tmp_path: Path) -> None:
 
 
 def test_network_disabled_by_default(tmp_path: Path) -> None:
-    """Network access is off by default for safety."""
+    """Network access is off by default for safety.
+
+    H3: ``network_allowed_domains`` defaults to ``None`` (unset) rather
+    than ``[]`` so the effective-policy compiler can distinguish "this
+    layer did not configure a domain allowlist" (``None`` → unrestricted
+    subject to blocklist) from "this layer explicitly denies all
+    domains" (``frozenset()``).  An empty list previously erased a
+    user-level allowlist through set intersection (fail-open); ``None``
+    lets the user-layer allowlist survive when the project layer is
+    silent.
+    """
     policy = load_policy(tmp_path / "none.yaml")
 
     assert policy.network_enabled is False
-    assert policy.network_allowed_domains == []
+    assert policy.network_allowed_domains is None
 
 
 def test_denied_paths_expansion(tmp_path: Path) -> None:
@@ -111,7 +121,11 @@ commands:
     policy = load_policy(policy_file)
 
     assert policy.commands_require_approval == ["rm", "docker"]
-    assert policy.commands_allowed == []
+    # H2: when ``commands.allow`` is absent, ``commands_allowed`` is ``None``
+    # (three-state: None = unset, [] = deny all, non-empty = whitelist).
+    # Previously it defaulted to ``[]`` which collided with "deny all" and
+    # caused the production layer-merge to erase project whitelists.
+    assert policy.commands_allowed is None
     assert policy.commands_blocked == []
 
 

@@ -137,9 +137,25 @@ async def test_browser_scroll_defaults():
     assert result["direction"] == "up"
 
 
-async def test_browser_file_upload_records_in_mock():
-    result = await browser_file_upload("input[type=file]", "/tmp/x.txt")
-    assert result == {"ok": True, "selector": "input[type=file]", "file": "/tmp/x.txt"}
+async def test_browser_file_upload_records_in_mock(tmp_path):
+    """B1: ``browser_file_upload`` requires ``network_policy`` and a
+    ``workspace_root`` for path containment validation.  The handler
+    rejects when network is not authorised (defense in depth on top of
+    the capability broker) and when the file is outside the workspace
+    root (no arbitrary host file exfiltration).
+    """
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    f = workspace / "upload.txt"
+    f.write_text("hello", encoding="utf-8")
+    # Must pass network_policy + workspace_root to reach the mock upload path.
+    result = await browser_file_upload(
+        "input[type=file]",
+        str(f),
+        workspace_root=str(workspace),
+        network_policy="unrestricted-with-approval",
+    )
+    assert result == {"ok": True, "selector": "input[type=file]", "file": str(f)}
 
 
 # ---------------------------------------------------------------------------
