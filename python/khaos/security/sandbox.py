@@ -115,6 +115,8 @@ class Sandbox:
         self,
         mode: SandboxMode = SandboxMode.WORKSPACE_WRITE,
         workspace_root: Path | None = None,
+        *,
+        root_capabilities: "set[Path] | frozenset[Path] | None" = None,
     ):
         self.mode = mode
         self.workspace_root = (
@@ -123,6 +125,14 @@ class Sandbox:
             else Path.cwd().resolve()
         )
         self._allowed_tools = CAPABILITIES.get(mode, set())
+        # H3: when set, reads/writes are confined to these compiled root
+        # capabilities (from the effective policy's allowed_paths) rather than
+        # the whole workspace_root.  This is the real enforcement of
+        # allowed_paths that was previously parsed-but-ignored.  When unset,
+        # behaviour is unchanged (confine to workspace_root).
+        self._root_capabilities: frozenset[Path] = (
+            frozenset(root_capabilities) if root_capabilities else frozenset()
+        )
 
     def check_tool(self, tool_name: str) -> SandboxCheckResult:
         """检查工具是否在当前沙箱模式的 capability 集合内。
@@ -161,13 +171,22 @@ class Sandbox:
         resolved = candidate.resolve()
         try:
             resolved.relative_to(self.workspace_root)
-            return SandboxCheckResult(allowed=True, mode=self.mode.value)
         except ValueError:
             return SandboxCheckResult(
                 allowed=False,
                 reason=f"path '{resolved}' outside workspace '{self.workspace_root}'",
                 mode=self.mode.value,
             )
+        # H3: when root_capabilities are compiled from allowed_paths, further
+        # confine writes to those capabilities.  Empty set = unconstrained
+        # within the workspace (legacy behaviour).
+        if self._root_capabilities:
+            denied_reason = self._capability_denial_reason(resolved, "write")
+            if denied_reason is not None:
+                return SandboxCheckResult(
+                    allowed=False, reason=denied_reason, mode=self.mode.value
+                )
+        return SandboxCheckResult(allowed=True, mode=self.mode.value)
 
     def check_read_path(self, path: str) -> SandboxCheckResult:
         """Constrain default reads to the fixed Workspace root.
@@ -185,7 +204,6 @@ class Sandbox:
         resolved = candidate.resolve()
         try:
             resolved.relative_to(self.workspace_root)
-            return SandboxCheckResult(allowed=True, mode=self.mode.value)
         except ValueError:
             return SandboxCheckResult(
                 allowed=False,
@@ -195,6 +213,33 @@ class Sandbox:
                 ),
                 mode=self.mode.value,
             )
+        # H3: confine reads to compiled root_capabilities when present.
+        if self._root_capabilities:
+            denied_reason = self._capability_denial_reason(resolved, "read")
+            if denied_reason is not None:
+                return SandboxCheckResult(
+                    allowed=False, reason=denied_reason, mode=self.mode.value
+                )
+        return SandboxCheckResult(allowed=True, mode=self.mode.value)
+
+    def _capability_denial_reason(
+        self, resolved: Path, op: str
+    ) -> str | None:
+        """Return a denial reason if ``resolved`` is outside all capabilities.
+
+        A capability is a directory; a path under any capability is allowed.
+        Returns ``None`` when the path is permitted.
+        """
+        for capability in self._root_capabilities:
+            try:
+                resolved.relative_to(capability)
+                return None
+            except ValueError:
+                continue
+        return (
+            f"{op} path '{resolved}' outside allowed_paths capabilities "
+            f"({', '.join(sorted(str(c) for c in self._root_capabilities))})"
+        )
 
     @classmethod
     def from_policy_mode(

@@ -24,6 +24,7 @@ from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
 from khaos.rust_bridge import get_token_engine
 from khaos.security.middleware import SecurityMiddleware
+from khaos.security.effective_policy import compile_effective_policy
 from khaos.security.network_guard import NetworkGuard
 from khaos.security.policy import load_policy
 from khaos.security.sandbox import Sandbox
@@ -111,7 +112,16 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         except (OSError, ValueError, KeyError):
             logger.warning("runtime config router unavailable; using default", exc_info=True)
             router = create_default_router()
-    permission_engine = PermissionEngine(cfg.db)
+    # H3: load + compile the effective policy up front so its
+    # commands_require_approval list can be wired into the permission engine
+    # (pre-rule gate that overrides persistent auto-approve).
+    policy = load_policy(root / "khaos_policy.yaml")
+    effective_policy = compile_effective_policy(policy, workspace_root=root)
+    logger.info("effective security policy digest: %s", effective_policy.digest)
+    permission_engine = PermissionEngine(
+        cfg.db,
+        commands_require_approval=effective_policy.commands_require_approval,
+    )
     await permission_engine.load_rules()
     memory_manager = cfg.memory_manager or MemoryManager(
         MemoryStore(cfg.db), budget=MemoryBudget(),
@@ -139,8 +149,12 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     office_authority = OfficeMutationAuthority()
     from khaos.tools import file_tools as _file_tools
     _file_tools.set_office_authority(office_authority)
-    policy = load_policy(root / "khaos_policy.yaml")
     sandbox = cfg.sandbox or Sandbox.from_policy_mode(policy.mode, root)
+    # H3: tighten the sandbox to the effective policy's compiled root
+    # capabilities (from allowed_paths) — the real enforcement of a field
+    # that was previously parsed but ignored.
+    if not cfg.sandbox and effective_policy.root_capabilities:
+        sandbox._root_capabilities = effective_policy.root_capabilities
     network_guard = cfg.network_guard or NetworkGuard(
         network_enabled=policy.network_enabled,
         allowed_domains=policy.network_allowed_domains,
