@@ -86,16 +86,15 @@ class PermissionEngine:
     ) -> PermissionDecision:
         """Check whether a tool call is approved, denied, or needs confirmation."""
         target = self.normalize_target(tool_name, params)
-        if tool_name == "terminal" and _is_read_only_terminal_call(params):
-            return PermissionDecision(
-                approved=ApprovalMode.AUTO_APPROVE,
-                reason="Read-only terminal command",
-                target=target,
-                requires_user_confirm=False,
-            )
-        # H3: policy-level required-approval list.  This runs BEFORE the
-        # persistent-rule loop, so a remembered auto-approve rule cannot
-        # bypass a command the effective policy demands confirmation for.
+        # H4: policy-level required-approval list runs BEFORE every other
+        # shortcut, including the read-only terminal shortcut.  Otherwise a
+        # command classified as read-only (cat / grep / ls / rg / head /
+        # tail …) would be AUTO_APPROVE'd even when the effective policy
+        # explicitly requires confirmation for it, contradicting the
+        # "policy approval requirement covers automatic approval" contract.
+        # H3 (preserved): this also runs before the persistent-rule loop, so
+        # a remembered auto-approve rule cannot bypass a command the
+        # effective policy demands confirmation for.
         if self._commands_require_approval and tool_name in {"terminal", "process"}:
             command_text = str(params.get("command") or params.get("id") or "")
             if _matches_required_approval(command_text, self._commands_require_approval):
@@ -105,6 +104,13 @@ class PermissionEngine:
                     target=target,
                     requires_user_confirm=True,
                 )
+        if tool_name == "terminal" and _is_read_only_terminal_call(params):
+            return PermissionDecision(
+                approved=ApprovalMode.AUTO_APPROVE,
+                reason="Read-only terminal command",
+                target=target,
+                requires_user_confirm=False,
+            )
         for rule in self._rules:
             if rule.mode != "all" and rule.mode != mode:
                 continue

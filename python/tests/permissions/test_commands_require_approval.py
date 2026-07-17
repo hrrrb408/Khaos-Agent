@@ -113,3 +113,40 @@ async def test_process_tool_also_gated(tmp_path):
         "process", {"command": "curl http://example.com"}, "write", "coding"
     )
     assert decision.requires_user_confirm is True
+
+
+async def test_policy_required_approval_beats_read_only_shortcut(tmp_path):
+    """H4: a read-only command on the approval list must still require confirm.
+
+    Without the H4 fix, ``cat`` would be AUTO_APPROVE'd by the read-only
+    terminal shortcut before the policy-required-approval gate ever ran,
+    silently bypassing the user's ``commands: require_approval: [cat]``
+    declaration.  The policy gate must run FIRST.
+    """
+    engine = await _engine_with(
+        tmp_path, approval_list=frozenset({"cat", "grep", "ls"})
+    )
+    for command in ("cat /etc/passwd", "grep root /etc/passwd", "ls -la"):
+        decision = await engine.check(
+            "terminal", {"command": command}, "write", "coding"
+        )
+        assert decision.requires_user_confirm is True, (
+            f"policy commands_require_approval must override read-only "
+            f"shortcut for {command!r}"
+        )
+        assert decision.approved is ApprovalMode.ASK_EVERY
+        assert "Policy requires approval" in decision.reason
+
+
+async def test_unlisted_read_only_command_still_auto_approved(tmp_path):
+    """H4 regression guard: read-only commands NOT on the approval list
+    are still AUTO_APPROVE'd.  The policy gate only tightens, never loosens."""
+    engine = await _engine_with(
+        tmp_path, approval_list=frozenset({"cat"})
+    )
+    decision = await engine.check(
+        "terminal", {"command": "ls -la"}, "write", "coding"
+    )
+    # ls is read-only AND not on the approval list → shortcut still applies.
+    assert decision.approved is ApprovalMode.AUTO_APPROVE
+    assert not decision.requires_user_confirm
