@@ -104,7 +104,11 @@ class EffectiveSecurityPolicy:
 
     mode: SandboxMode
     network_enabled: bool
-    network_allowed_domains: frozenset[str]
+    # H3: three-state — ``None`` means no layer configured an allowlist
+    # (unrestricted subject to blocklist when network is on); an empty
+    # frozenset means a layer explicitly denied all domains; a non-empty
+    # frozenset is the whitelist.
+    network_allowed_domains: frozenset[str] | None
     network_blocked_domains: frozenset[str]
     root_capabilities: frozenset[Path]
     denied_paths: frozenset[str]
@@ -195,16 +199,42 @@ def compile_effective_policy(
         )
 
     # --- network: enabled only if BOTH layers enable it; domains merged.
+    # H3: ``network_allowed_domains`` uses three-state semantics, identical
+    # to ``commands_allowed``:
+    #   * None       = this layer does not configure an allowlist;
+    #   * empty set  = this layer explicitly denies all domains;
+    #   * non-empty  = this layer whitelists these domains.
+    # Only intersect when BOTH layers configure an allowlist; if only one
+    # layer configures it, use that layer's list; if neither does, the
+    # result is None (no whitelist — network is unrestricted subject to the
+    # blocklist when enabled).  This closes the fail-open hole where a
+    # project layer with NO ``allowed_domains`` (parsed as ``[]``)
+    # intersected with a user allowlist like ``[pypi.org]`` produced an
+    # empty set, which NetworkGuard then treated as "unrestricted".
     network_enabled = bool(project_policy.network_enabled) and (
         user is None or bool(user.network_enabled)
     )
-    network_allowed_domains = _frozen(project_policy.network_allowed_domains)
+    project_domains_allowed = project_policy.network_allowed_domains
+    user_domains_allowed = (
+        user.network_allowed_domains if user is not None else None
+    )
+    if project_domains_allowed is not None and user_domains_allowed is not None:
+        # Both layers configure an allowlist — intersect (stricter).
+        network_allowed_domains: frozenset[str] | None = (
+            _frozen(project_domains_allowed) & _frozen(user_domains_allowed)
+        )
+    elif project_domains_allowed is not None:
+        network_allowed_domains = _frozen(project_domains_allowed)
+    elif user_domains_allowed is not None:
+        network_allowed_domains = _frozen(user_domains_allowed)
+    else:
+        # H3: neither layer configures an allowlist — None (not empty),
+        # so NetworkGuard treats it as "no whitelist" (unrestricted subject
+        # to the blocklist when network is enabled).
+        network_allowed_domains = None
     network_blocked_domains = _frozen(project_policy.network_blocked_domains)
     if user is not None:
-        # allowed_domains: intersection (both must permit); blocked: union.
-        network_allowed_domains = network_allowed_domains & _frozen(
-            user.network_allowed_domains
-        )
+        # blocked_domains: union (any source blocking wins).
         network_blocked_domains = network_blocked_domains | _frozen(
             user.network_blocked_domains
         )
@@ -240,16 +270,24 @@ def compile_effective_policy(
     # H2: audit uses OR semantics — if the user OR project layer requires
     # audit, the project layer cannot disable it.  This closes the hole
     # where an untrusted repo could submit ``audit.enabled: false`` and
-    # silently turn off production audit.  ``audit_log_path``: the user
-    # layer's path wins if set (user is the trust root), otherwise the
-    # project layer's path, otherwise None (default db-backed audit).
+    # silently turn off production audit.
+    #
+    # ``audit_log_path``: ONLY the user layer is allowed to set this.  The
+    # project layer is untrusted and could point audit at an arbitrary host
+    # file (``~/.ssh/authorized_keys``, a FIFO that blocks the event loop,
+    # a device file, …) to gain write access outside the sandbox under the
+    # guise of "audit".  The runtime's ``_resolve_safe_audit_log_path``
+    # further constrains even the user-supplied path to ``~/.khaos/audit/``.
     audit_enabled = bool(project_policy.audit_enabled) or (
         user is None or bool(user.audit_enabled)
     )
     if user is not None and user.audit_log_path:
         audit_log_path = user.audit_log_path
     else:
-        audit_log_path = project_policy.audit_log_path
+        # H2: project-supplied ``audit_log_path`` is dropped — the project
+        # layer is untrusted and cannot be allowed to redirect audit writes
+        # to an arbitrary host path.
+        audit_log_path = None
 
     return EffectiveSecurityPolicy(
         mode=mode,
@@ -558,7 +596,14 @@ def _canonical_dict(policy: EffectiveSecurityPolicy) -> dict:
     return {
         "mode": policy.mode.value,
         "network_enabled": policy.network_enabled,
-        "network_allowed_domains": sorted(policy.network_allowed_domains),
+        # H3: three-state — preserve None vs empty vs non-empty in the digest
+        # so an approval made under "no allowlist" is invalidated if the
+        # policy later adds an explicit deny-all.
+        "network_allowed_domains": (
+            sorted(policy.network_allowed_domains)
+            if policy.network_allowed_domains is not None
+            else None
+        ),
         "network_blocked_domains": sorted(policy.network_blocked_domains),
         "root_capabilities": sorted(str(p) for p in policy.root_capabilities),
         "denied_paths": sorted(policy.denied_paths),

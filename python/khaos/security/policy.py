@@ -58,7 +58,14 @@ class SandboxPolicy:
 
     # 网络控制
     network_enabled: bool = False
-    network_allowed_domains: list[str] = field(default_factory=list)
+    # H3: three-state — ``None`` means "this layer does not configure an
+    # allowlist" (unrestricted subject to blocklist when network is on);
+    # an empty list means "this layer explicitly denies all domains"; a
+    # non-empty list is the whitelist.  This mirrors ``commands_allowed``
+    # and closes the fail-open hole where the default empty list collided
+    # with "deny all" and silently erased the other layer's whitelist
+    # during intersection.
+    network_allowed_domains: list[str] | None = None
     network_blocked_domains: list[str] = field(default_factory=list)
 
     # 文件系统控制
@@ -111,7 +118,12 @@ class SandboxPolicy:
         return cls(
             mode=sandbox.get("mode", "workspace-write"),
             network_enabled=sandbox.get("network", False),
-            network_allowed_domains=sandbox.get("allowed_domains", []),
+            # H3: ``sandbox.get("allowed_domains")`` returns None when the
+            # key is absent (layer does not configure an allowlist) or the
+            # list when present (including an explicitly empty list = deny
+            # all).  This is the same three-state pattern as
+            # ``commands_allowed``.
+            network_allowed_domains=sandbox.get("allowed_domains"),
             network_blocked_domains=sandbox.get("blocked_domains", []),
             allowed_paths=sandbox.get("allowed_paths", ["."]),
             denied_paths=sandbox.get("denied_paths", list(_DEFAULT_DENIED_PATHS)),

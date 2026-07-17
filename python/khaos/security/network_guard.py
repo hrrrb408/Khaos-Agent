@@ -83,7 +83,17 @@ class NetworkGuard:
         blocked_domains: list[str] | None = None,
     ):
         self.network_enabled = network_enabled
-        self._allowed = set(allowed_domains or [])
+        # H3: three-state — ``None`` means "no allowlist configured"
+        # (unrestricted subject to blocklist when network is on); an empty
+        # set means "explicitly deny all domains"; a non-empty set is the
+        # whitelist.  The previous code did ``set(allowed_domains or [])``
+        # which collapsed None and [] into the same empty set, then treated
+        # both as "no allowlist" — so an explicit ``allowed_domains: []``
+        # (deny all) silently became "unrestricted".
+        if allowed_domains is None:
+            self._allowed: set[str] | None = None
+        else:
+            self._allowed = set(allowed_domains)
         self._blocked = set(blocked_domains or [])
 
     def check_tool(self, tool_name: str, arguments: dict) -> NetworkCheckResult:
@@ -147,10 +157,10 @@ class NetworkGuard:
                     return self._check_domain(domain)
                 # Can't extract the remote URL (e.g. ``git push`` without an
                 # explicit URL uses the configured remote).  When an
-                # allowlist is configured we cannot verify the destination,
-                # so deny; when no allowlist, allow (network is on, no
-                # domain restriction).
-                if self._allowed:
+                # allowlist is configured (including empty = deny all) we
+                # cannot verify the destination, so deny; when no allowlist
+                # (None), allow (network is on, no domain restriction).
+                if self._allowed is not None:
                     return NetworkCheckResult(
                         allowed=False,
                         reason=(
@@ -185,9 +195,9 @@ class NetworkGuard:
         if domain:
             return self._check_domain(domain)
         # No domain extractable (e.g. ``ssh user@host`` without a URL
-        # scheme).  When an allowlist is configured, deny (can't verify);
-        # when no allowlist, allow.
-        if self._allowed:
+        # scheme).  When an allowlist is configured (including empty = deny
+        # all), deny (can't verify); when no allowlist (None), allow.
+        if self._allowed is not None:
             return NetworkCheckResult(
                 allowed=False,
                 reason=(
@@ -215,19 +225,21 @@ class NetworkGuard:
         )
 
     def _check_domain(self, domain: str) -> NetworkCheckResult:
-        """Check a domain against the blocklist + allowlist (H1).
+        """Check a domain against the blocklist + allowlist (H1, H3).
 
         Priority: blocked > allowed > network_enabled.
 
         * ``blocked_domains`` always wins — a blocked domain is rejected
           even when network is on and even when it appears in the
           allowlist.
-        * When ``allowed_domains`` is non-empty, only allowlisted domains
-          pass (deny-by-default).
-        * When ``allowed_domains`` is empty and network is enabled, all
-          domains pass (no allowlist = unrestricted, still subject to the
-          blocklist).
-        * When network is disabled, all domains are blocked.
+        * H3 three-state ``allowed_domains``:
+          * ``None`` (no allowlist configured) — allow when network is on
+            (subject to blocklist), block when off;
+          * empty set (explicit deny-all) — block every domain regardless
+            of network state;
+          * non-empty — only allowlisted domains pass (deny-by-default).
+        * When network is disabled, all domains are blocked (the allowlist
+          can only TIGHTEN an enabled network, not RELAX a disabled one).
         """
         if not domain:
             return NetworkCheckResult(allowed=True, reason="empty domain")
@@ -239,8 +251,16 @@ class NetworkGuard:
                     reason=f"domain {domain} is blocked by policy",
                     domain=domain,
                 )
-        # Allowlist: when configured, only allowlisted domains pass.
-        if self._allowed:
+        # H3: three-state allowlist.
+        if self._allowed is not None:
+            # An explicit allowlist is configured (possibly empty = deny all).
+            if not self._allowed:
+                # Explicit deny-all.
+                return NetworkCheckResult(
+                    allowed=False,
+                    reason=f"domain {domain} blocked by empty allowlist (deny all)",
+                    domain=domain,
+                )
             for allowed in self._allowed:
                 if domain == allowed or domain.endswith(f".{allowed}"):
                     return NetworkCheckResult(
@@ -253,8 +273,8 @@ class NetworkGuard:
                 reason=f"domain {domain} not in allowlist",
                 domain=domain,
             )
-        # No allowlist configured — allow when network is enabled, block
-        # when disabled.
+        # No allowlist configured (None) — allow when network is enabled,
+        # block when disabled.
         if self.network_enabled:
             return NetworkCheckResult(
                 allowed=True,

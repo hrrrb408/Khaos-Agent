@@ -379,14 +379,21 @@ def test_audit_log_path_user_wins_over_project(tmp_path):
 
 
 def test_audit_log_path_falls_back_to_project(tmp_path):
-    """H2: when the user layer has no ``audit_log_path``, the project's path
-    is used."""
+    """H2: the project layer is UNTRUSTED for audit_log_path — only the
+    user / platform layer may pin a host audit path.  When the user
+    layer has no ``audit_log_path``, the project layer's path is DROPPED
+    (not inherited) so a malicious project cannot write to arbitrary
+    host files via the audit channel.  ``effective.audit_log_path`` is
+    ``None`` in that case; the runtime then falls back to db-only audit.
+    """
     eff = compile_effective_policy(
         _full_policy(audit_log_path="/var/log/project-audit.log"),
         workspace_root=tmp_path,
         user_policy=_full_policy(audit_log_path=None),
     )
-    assert eff.audit_log_path == "/var/log/project-audit.log"
+    # Project layer's audit_log_path is dropped — only user/platform may
+    # pin a host path.  Effective is None (db-only audit fallback).
+    assert eff.audit_log_path is None
 
 
 def test_audit_fields_are_part_of_digest(tmp_path):
