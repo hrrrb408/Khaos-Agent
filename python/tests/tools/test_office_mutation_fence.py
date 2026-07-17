@@ -55,8 +55,13 @@ async def test_cancel_during_recursive_copy_settles_before_return(
 ):
     """Cancelling mid-copy never produces 'failed-but-file-landed'.
 
-    The fence holds until the copy settles (commit or rollback); the caller
-    receives CancelledError, and the filesystem is in a consistent state.
+    H1 semantics: the fence holds until the copy settles (commit or
+    rollback).  If the worker committed *before* cancellation propagated,
+    the caller receives the success result — a call must never report
+    failure while the side effect has already landed.  If the worker had
+    not committed yet, the caller receives ``CancelledError``.  In both
+    cases the filesystem is left in a consistent state (no partial temp
+    tree).
     """
     source = tmp_path / "bundle"
     source.mkdir()
@@ -68,38 +73,60 @@ async def test_cancel_during_recursive_copy_settles_before_return(
     )
     await asyncio.sleep(0.05)
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
+    # H1: the worker is shielded, so it will settle.  Whether the caller
+    # sees CancelledError (worker didn't commit) or the success result
+    # (worker committed despite the cancel) depends on timing — both are
+    # valid.  The invariant is that no partial temp tree is leaked and any
+    # published tree is intact.
+    outcome = None
+    try:
+        outcome = await task
+    except asyncio.CancelledError:
+        outcome = "cancelled"
 
     # Either the copy committed (consistent) or it was rolled back.  Crucially
     # there is no leftover half-built temp tree, and the published state
-    # matches the result the caller observed (cancellation).
+    # matches the result the caller observed.
+    await office_authority.wait_for_inflight()
     leftovers = list(tmp_path.glob(".khaos-tree-*"))
     assert leftovers == [], f"leaked temp tree: {leftovers}"
-    # The copied dir either fully exists (commit) or doesn't (rollback) — never
-    # a partial tree.
     copied = tmp_path / "copied"
     if copied.exists():
+        # If the file landed, the caller must NOT have seen cancellation —
+        # that's the H1 invariant: never "failed-but-file-landed".
+        assert outcome != "cancelled", (
+            "caller observed CancelledError but the copy committed — "
+            "H1 violated: failed-but-file-landed"
+        )
         assert (copied / "a.txt").read_text() == "a"
 
 
 async def test_timeout_before_final_rename_no_partial_tree(
     tmp_path, office_authority, monkeypatch
 ):
-    """A scheduler-style timeout leaves no half-built temp tree behind."""
+    """A scheduler-style timeout leaves no half-built temp tree behind.
+
+    H1: a ``to_thread`` worker cannot be force-cancelled, so the worker
+    may commit despite the timeout.  The caller observes either
+    ``TimeoutError`` (worker hadn't committed yet) or the success result
+    (worker committed despite the timeout).  In both cases no partial
+    temp tree is leaked.
+    """
     source = tmp_path / "bundle"
     source.mkdir()
     (source / "a.txt").write_text("a", encoding="utf-8")
     _patch_slow_copy(monkeypatch, 0.15)
 
-    with pytest.raises(asyncio.TimeoutError):
+    try:
         await asyncio.wait_for(
             copy_file("bundle", "copied", workspace_root=tmp_path), timeout=0.03
         )
+    except asyncio.TimeoutError:
+        pass
 
     # Give the shielded worker a moment to finish settling, then assert no
     # partial temp tree was leaked.  (The authority guarantees the worker is
-    # not abandoned, but the caller already saw TimeoutError.)
+    # not abandoned.)
     await office_authority.wait_for_inflight()
     leftovers = list(tmp_path.glob(".khaos-tree-*"))
     assert leftovers == []
@@ -112,7 +139,12 @@ async def test_cancel_during_move_tree_validation_no_side_effect(
 
     The fence shields the worker, so the move either fully commits or is
     rolled back — never a half-moved tree where neither source nor
-    destination is intact.
+    destination is intact.  H1: a ``to_thread`` worker cannot be force-
+    cancelled, so when the cancellation arrives during validation the
+    worker may still go on to commit; the caller observes either
+    ``CancelledError`` (worker hadn't committed yet) or the success
+    result (worker committed despite the cancel).  In both cases the
+    filesystem is left with exactly one intact tree.
     """
     source = tmp_path / "bundle"
     source.mkdir()
@@ -137,8 +169,15 @@ async def test_cancel_during_move_tree_validation_no_side_effect(
     )
     await asyncio.sleep(0.05)
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    # H1: the worker is shielded, so it will settle.  Whether the caller
+    # sees CancelledError (worker didn't commit) or the success result
+    # (worker committed despite the cancel) depends on timing — both are
+    # valid.  The invariant is that exactly one of source/destination
+    # holds the intact tree.
+    try:
         await task
+    except asyncio.CancelledError:
+        pass
 
     # Invariant: exactly one of source/destination holds the intact tree.
     # Never both, never neither (no half-moved state).
@@ -188,10 +227,14 @@ async def test_shutdown_waits_for_active_copy_thread(
 async def test_cancelled_call_cannot_mutate_after_result_event(
     tmp_path, office_authority, monkeypatch
 ):
-    """After a cancelled call returns, no further mutation occurs.
+    """After a cancelled/committed call returns, no further mutation occurs.
 
     This is the core 'cannot mutate after result event' guarantee: once the
-    caller has observed cancellation, the filesystem does not change again.
+    caller has observed the result (whether ``CancelledError`` or the
+    success value), the filesystem does not change again.  H1: the worker
+    may have committed despite the cancellation, in which case the caller
+    sees the success result; either way, no further mutation happens
+    after the result is observed.
     """
     source = tmp_path / "bundle"
     source.mkdir()
@@ -203,10 +246,14 @@ async def test_cancelled_call_cannot_mutate_after_result_event(
     )
     await asyncio.sleep(0.04)
     task.cancel()
-    with pytest.raises(asyncio.CancelledError):
+    # H1: accept either CancelledError (worker hadn't committed) or the
+    # success result (worker committed despite the cancel).
+    try:
         await task
+    except asyncio.CancelledError:
+        pass
 
-    # Snapshot the filesystem state right after the caller saw cancellation.
+    # Snapshot the filesystem state right after the caller saw the result.
     await office_authority.wait_for_inflight()
     state_before = sorted(p.name for p in tmp_path.iterdir())
 

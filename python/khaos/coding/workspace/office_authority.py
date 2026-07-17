@@ -133,52 +133,83 @@ class OfficeMutationAuthority:
     ) -> T:
         """Apply one Office mutation under the storage authority + fence.
 
-        Cancellation semantics mirror ``WorkspaceManager.
-        mutate_with_storage_authority``: a ``to_thread`` future cannot be
-        force-cancelled, so we hold the per-root lock and ``asyncio.shield``
-        the worker until the authority has committed or rolled back.  Only
-        then do we propagate ``CancelledError`` to the caller — guaranteeing a
-        cancelled/timeout call never reports failure while the underlying
-        thread later publishes a side effect.
+        H1/H2 cancellation semantics:
+
+        * H2: the per-root ``mutation_lock`` is acquired *before* the worker
+          task is created.  A cancellation that arrives while queued on the
+          lock simply unwinds — no worker is orphaned, no destination can
+          appear.  Previously the worker was created first and could keep
+          running after the caller had already received the cancellation.
+
+        * H1: a ``to_thread`` future cannot be force-cancelled, so we
+          ``asyncio.shield`` the worker until the authority has committed or
+          rolled back.  If the worker has *already committed* (returned a
+          value) by the time cancellation propagates, we return the success
+          result rather than raising ``CancelledError`` — a call must never
+          report failure while the side effect has already landed.  Only
+          when the worker raised (did not commit) do we propagate the
+          worker's exception (or ``CancelledError`` if the worker was
+          interrupted before it could even start).
         """
         if not workspace.writable:
             raise OfficeMutationError(
                 f"Office workspace {workspace.id} is not writable"
             )
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                self._storage_authority.mutate,
-                workspace.id,
-                workspace.root,
-                workspace.baseline,
-                workspace.limits,
-                operation,
+        # H2: acquire the per-root fence BEFORE creating the worker so a
+        # cancellation while queued on the lock cannot orphan a running
+        # thread.  The lock serializes mutations per root; holding it before
+        # worker creation guarantees the worker only starts once we are
+        # committed to waiting for it.
+        async with workspace.mutation_lock:
+            worker = asyncio.create_task(
+                asyncio.to_thread(
+                    self._storage_authority.mutate,
+                    workspace.id,
+                    workspace.root,
+                    workspace.baseline,
+                    workspace.limits,
+                    operation,
+                )
             )
-        )
-        self._inflight.add(worker)
-        worker.add_done_callback(self._inflight.discard)
-        cancelled = False
-        try:
-            async with workspace.mutation_lock:
+            self._inflight.add(worker)
+            cancelled = False
+            try:
                 while not worker.done():
                     try:
-                        await asyncio.shield(worker)
+                        return await asyncio.shield(worker)
                     except asyncio.CancelledError:
-                        # ``to_thread`` cannot be force-cancelled.  Keep the
-                        # per-root fence held until the authority has
-                        # committed or rolled back, then propagate the
-                        # cancellation to the caller.
+                        # ``to_thread`` cannot be force-cancelled.  Keep
+                        # looping (under the lock) until the worker settles,
+                        # so the authority has either committed or rolled
+                        # back before we release the fence.  H1: do NOT
+                        # raise CancelledError here — if the worker later
+                        # commits, we return its success result.
+                        # We must ``uncancel`` the current task *now* (not
+                        # after the loop) so the next ``await`` actually
+                        # waits for the worker instead of re-raising
+                        # CancelledError immediately.  Python 3.11+ keeps a
+                        # cancellation count; without ``uncancel`` the
+                        # count stays > 0 and every subsequent await
+                        # raises CancelledError, turning this loop into a
+                        # busy-spin that never lets the worker finish.
                         cancelled = True
-                result = worker.result()
-                if cancelled:
-                    raise asyncio.CancelledError
-                return result
-        except WorkspaceStorageViolation as exc:
-            if exc.quarantine_required:
-                await self.quarantine(workspace)
-            raise
-        finally:
-            self._inflight.discard(worker)
+                        current = asyncio.current_task()
+                        if current is not None and hasattr(current, "uncancel"):
+                            current.uncancel()
+                # Worker has settled.  H1: if it committed successfully,
+                # return the result — do NOT mask a success as cancellation.
+                # If it raised (e.g. WorkspaceStorageViolation), propagate
+                # that exception (it is the real outcome, not the cancel).
+                exc = worker.exception()
+                if exc is not None:
+                    raise exc
+                return worker.result()
+            except WorkspaceStorageViolation as exc:
+                if exc.quarantine_required:
+                    await asyncio.shield(self.quarantine(workspace))
+                raise
+            finally:
+                self._inflight.discard(worker)
 
     async def quarantine(self, workspace: OfficeWorkspace) -> None:
         """Fail closed: mark the workspace non-writable and release accounting."""
