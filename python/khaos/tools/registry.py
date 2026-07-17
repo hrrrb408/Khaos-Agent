@@ -195,6 +195,10 @@ class ToolInvocationBroker:
                     "Office filesystem access requires a Sandbox root capability"
                 )
             handler_params["workspace_root"] = workspace_root
+            # H1: mutations (copy/move) are fenced through the shared authority
+            # so cancellation/timeout cannot abandon a running thread.
+            if name in {"copy_file", "move_file"}:
+                handler_params["office_authority"] = context.get("office_authority")
         return await definition.handler(**handler_params)
 
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:

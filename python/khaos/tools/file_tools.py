@@ -26,6 +26,23 @@ TREE_EXCLUDE_DIRS = {
     "build",
 }
 
+# H1: the runtime (factory.py) registers the shared OfficeMutationAuthority
+# here so Office file mutations can be fenced against cancellation/timeout.
+# When unset (e.g. ad-hoc tool calls in tests), copy_file/move_file fall back
+# to the legacy bare to_thread path — which is only safe for trusted inputs.
+_office_authority: Any = None
+
+
+def set_office_authority(authority: Any) -> None:
+    """Register the shared OfficeMutationAuthority (called once at startup)."""
+    global _office_authority
+    _office_authority = authority
+
+
+def _get_office_authority() -> Any:
+    """Return the registered OfficeMutationAuthority, or None if unset."""
+    return _office_authority
+
 async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Read a file page with one-based line numbers."""
     if workspace_manager is not None:
@@ -203,7 +220,7 @@ async def tree_view(path: str = ".", max_depth: int = 3, workspace_manager=None,
     raise PermissionError("tree_view requires a Workspace root capability")
 
 
-async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
+async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None, office_authority=None) -> dict[str, Any]:
     """Copy a file or directory."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -220,13 +237,24 @@ async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | N
             ),
         )
     if workspace_root is not None:
+        if office_authority is None:
+            office_authority = _get_office_authority()
+        if office_authority is not None:
+            # H1: route through the mutation fence so cancellation / timeout
+            # cannot abandon a running copy thread that later commits a side
+            # effect via the final atomic rename.
+            workspace = await office_authority.workspace_for_root(workspace_root)
+            return await office_authority.mutate(
+                workspace,
+                lambda: _office_copy_mutation(workspace_root, src, dst),
+            )
         return await asyncio.to_thread(
             _office_copy_sync, workspace_root, src, dst
         )
     raise PermissionError("copy_file requires a Workspace root capability")
 
 
-async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
+async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None, office_authority=None) -> dict[str, Any]:
     """Move or rename a file or directory."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -239,6 +267,14 @@ async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | N
             lambda: _workspace_move_sync(workspace.worktree_path, src, dst),
         )
     if workspace_root is not None:
+        if office_authority is None:
+            office_authority = _get_office_authority()
+        if office_authority is not None:
+            workspace = await office_authority.workspace_for_root(workspace_root)
+            return await office_authority.mutate(
+                workspace,
+                lambda: _office_move_mutation(workspace_root, src, dst),
+            )
         return await asyncio.to_thread(
             _office_move_sync, workspace_root, src, dst
         )
@@ -457,6 +493,73 @@ def _office_move_sync(
             "src": str(filesystem.root / source_relative),
             "dst": str(filesystem.root / destination_relative),
         }
+
+
+def _office_copy_mutation(
+    root: Path, source: str, destination: str
+) -> object:
+    """Office copy wrapped as a WorkspaceMutation for storage accounting.
+
+    The copy itself goes through the existing ``copy_path`` atomic-publish
+    path.  The rollback closure removes the published destination if a
+    post-mutation storage violation is raised (e.g. aggregate budget blown),
+    and the fence's ``asyncio.shield`` guarantees cancellation waits for the
+    atomic rename to settle before propagating.
+    """
+    from khaos.coding.workspace.storage import WorkspaceMutation
+
+    value = _office_copy_sync(root, source, destination)
+    destination_path = root / _destination_relative(root, destination)
+
+    def rollback() -> None:
+        if value.get("ok"):
+            import shutil
+
+            if destination_path.is_dir():
+                shutil.rmtree(destination_path, ignore_errors=True)
+            else:
+                destination_path.unlink(missing_ok=True)
+
+    return WorkspaceMutation(value=value, rollback=rollback, finalize=lambda: None)
+
+
+def _office_move_mutation(
+    root: Path, source: str, destination: str
+) -> object:
+    """Office move wrapped as a WorkspaceMutation for storage accounting.
+
+    Rollback moves the tree back to the source path.  If the source no longer
+    exists (e.g. a concurrent change), rollback is a no-op rather than raising
+    — the storage authority already flags ``quarantine_required`` from the
+    residual violation.
+    """
+    from khaos.coding.workspace.storage import WorkspaceMutation
+
+    value = _office_move_sync(root, source, destination)
+    source_path = root / _destination_relative(root, source)
+    destination_path = root / _destination_relative(root, destination)
+
+    def rollback() -> None:
+        if not value.get("ok"):
+            return
+        try:
+            import shutil
+
+            if destination_path.exists():
+                shutil.move(str(destination_path), str(source_path))
+        except OSError:
+            # Best-effort; the authority will quarantine on residual violation.
+            pass
+
+    return WorkspaceMutation(value=value, rollback=rollback, finalize=lambda: None)
+
+
+def _destination_relative(root: Path, target: str) -> str:
+    """Resolve an office target to its root-relative posix path."""
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        return filesystem.relative(target)
 
 
 def _office_list_sync(

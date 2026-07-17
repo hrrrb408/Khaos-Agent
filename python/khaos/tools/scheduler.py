@@ -103,6 +103,13 @@ class ToolScheduler:
         # any tool without a Rust fast path keep using the asyncio handler.
         self.use_rust_executor = use_rust_executor
         self.invocation_broker = ToolInvocationBroker(registry)
+        # H1: optional shared OfficeMutationAuthority. Set by the runtime
+        # factory so Office copy/move are fenced against cancellation/timeout.
+        self.office_authority: Any = None
+
+    def set_office_authority(self, authority: Any) -> None:
+        """Register the shared OfficeMutationAuthority (called at startup)."""
+        self.office_authority = authority
 
     async def execute_batch(
         self,
@@ -439,6 +446,11 @@ class ToolScheduler:
             if mode == "office" and sandbox is not None:
                 # Internal capability: never sourced from model arguments.
                 invocation_context["office_workspace_root"] = sandbox.workspace_root
+            # H1: the OfficeMutationAuthority (registered at startup) fences
+            # office mutations against cancellation/timeout side effects.
+            office_authority = getattr(self, "office_authority", None)
+            if mode == "office" and office_authority is not None:
+                invocation_context["office_authority"] = office_authority
             if call.get("_approval_context") is not None:
                 invocation_context["approval_context"] = call["_approval_context"]
             output = await asyncio.wait_for(

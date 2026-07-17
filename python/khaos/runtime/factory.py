@@ -16,6 +16,7 @@ from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
+from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
@@ -130,6 +131,14 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         workspace_manager=workspace_manager,
         backend_selector=BackendSelector(),
     )
+    # H1: a single shared OfficeMutationAuthority fences every Office
+    # copy/move against cancellation/timeout side effects.  Registered on the
+    # scheduler (for tool dispatch) and on the file_tools module (for any
+    # direct call path).  The storage authority + limits also give Office the
+    # aggregate byte/entry accounting it previously lacked (M1).
+    office_authority = OfficeMutationAuthority()
+    from khaos.tools import file_tools as _file_tools
+    _file_tools.set_office_authority(office_authority)
     policy = load_policy(root / "khaos_policy.yaml")
     sandbox = cfg.sandbox or Sandbox.from_policy_mode(policy.mode, root)
     network_guard = cfg.network_guard or NetworkGuard(
@@ -144,6 +153,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
             audit_logger=cfg.audit_logger,
         ),
     )
+    scheduler.set_office_authority(office_authority)
     compressor = ContextCompressor(router, memory_manager=memory_manager)
     verify_factory = VerifyFixLoop
     skill_generator = SkillGenerator()
