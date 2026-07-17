@@ -8,16 +8,11 @@ import json
 import mimetypes
 import os
 import re
-import shutil
 import stat
-import tempfile
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from khaos.security.path_guard import PathGuard
-
 
 TREE_EXCLUDE_DIRS = {
     ".git",
@@ -31,17 +26,7 @@ TREE_EXCLUDE_DIRS = {
     "build",
 }
 
-_SECURITY_ENABLED = True
-_PATH_GUARD = PathGuard()
-
-
-def enable_security(enabled: bool = True) -> None:
-    """启用/禁用安全检查（测试用）。"""
-    global _SECURITY_ENABLED
-    _SECURITY_ENABLED = enabled
-
-
-async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Read a file page with one-based line numbers."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -50,38 +35,14 @@ async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_mana
         return await asyncio.to_thread(
             _workspace_read_sync, workspace.worktree_path, path, offset, limit
         )
-    return await asyncio.to_thread(_read_file_sync, path, offset, limit)
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _workspace_read_sync, workspace_root, path, offset, limit
+        )
+    raise PermissionError("read_file requires a Workspace root capability")
 
 
-def _read_file_sync(path: str, offset: int, limit: int) -> dict[str, Any]:
-    if _SECURITY_ENABLED:
-        check = _PATH_GUARD.check_read(path)
-        if not check.safe:
-            return {
-                "ok": False,
-                "path": check.normalized_path,
-                "error": f"File read blocked: {check.reason}",
-                "risk_level": check.risk_level,
-            }
-    file_path = Path(path).expanduser().resolve()
-    if offset < 1:
-        raise ValueError("offset must be >= 1")
-    if limit < 1:
-        raise ValueError("limit must be >= 1")
-    lines = file_path.read_text(encoding="utf-8").splitlines()
-    start = offset - 1
-    selected = lines[start : start + limit]
-    numbered = [f"{start + index + 1}: {line}" for index, line in enumerate(selected)]
-    return {
-        "path": str(file_path),
-        "offset": offset,
-        "limit": limit,
-        "total_lines": len(lines),
-        "content": "\n".join(numbered),
-    }
-
-
-async def write_file(path: str, content: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+async def write_file(path: str, content: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Overwrite a file, creating parent directories as needed."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -98,26 +59,14 @@ async def write_file(path: str, content: str, workspace_manager=None, task_id: s
                 content,
             ),
         )
-    return await asyncio.to_thread(_write_file_sync, path, content)
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _office_write_sync, workspace_root, path, content
+        )
+    raise PermissionError("write_file requires a Workspace root capability")
 
 
-def _write_file_sync(path: str, content: str) -> dict[str, Any]:
-    if _SECURITY_ENABLED:
-        check = _PATH_GUARD.check_write(path)
-        if not check.safe:
-            return {
-                "ok": False,
-                "path": check.normalized_path,
-                "error": f"File write blocked: {check.reason}",
-                "risk_level": check.risk_level,
-            }
-    file_path = Path(path).expanduser().resolve()
-    file_path.parent.mkdir(parents=True, exist_ok=True)
-    _atomic_write(file_path, content)
-    return {"path": str(file_path), "bytes": len(content.encode("utf-8"))}
-
-
-async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Atomically replace text in a file, with optional fuzzy block matching."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -133,29 +82,14 @@ async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_man
                 path, old, new, fuzzy,
             ),
         )
-    return await asyncio.to_thread(_patch_sync, path, old, new, fuzzy)
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _office_patch_sync, workspace_root, path, old, new, fuzzy
+        )
+    raise PermissionError("patch requires a Workspace root capability")
 
 
-def _patch_sync(path: str, old: str, new: str, fuzzy: bool) -> dict[str, Any]:
-    file_path = Path(path).expanduser().resolve()
-    original = file_path.read_text(encoding="utf-8")
-    if old in original:
-        updated = original.replace(old, new, 1)
-        _atomic_write(file_path, updated)
-        return {"path": str(file_path), "replaced": 1, "fuzzy": False}
-    if not fuzzy:
-        raise ValueError("old text not found")
-
-    match = _find_fuzzy_block(original, old)
-    if match is None:
-        raise ValueError("old text not found")
-    start, end, score = match
-    updated = original[:start] + new + original[end:]
-    _atomic_write(file_path, updated)
-    return {"path": str(file_path), "replaced": 1, "fuzzy": True, "score": score}
-
-
-async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> str:
+async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> str:
     """Apply multiple exact search-and-replace edits to one file atomically."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -171,58 +105,11 @@ async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_
                 path, edits,
             ),
         )
-    return await asyncio.to_thread(_multi_edit_sync, path, edits)
-
-
-def _multi_edit_sync(path: str, edits: list[dict]) -> str:
-    file_path = Path(path).expanduser().resolve()
-    original = file_path.read_text(encoding="utf-8")
-    normalized_edits = _normalize_multi_edits(edits)
-    sorted_edits = sorted(
-        enumerate(normalized_edits),
-        key=lambda item: len(item[1]["old_text"]),
-        reverse=True,
-    )
-
-    failures: list[dict[str, Any]] = []
-    for original_index, edit in sorted_edits:
-        count = original.count(edit["old_text"])
-        if count != 1:
-            failures.append(
-                {
-                    "index": original_index,
-                    "old_text": edit["old_text"],
-                    "matches": count,
-                    "error": "old_text not found" if count == 0 else "old_text is not unique",
-                }
-            )
-
-    if failures:
-        return json.dumps(
-            {
-                "path": str(file_path),
-                "applied": 0,
-                "failed": sorted(failures, key=lambda item: int(item["index"])),
-            },
-            ensure_ascii=False,
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _office_multi_edit_sync, workspace_root, path, edits
         )
-
-    updated = original
-    applied: list[dict[str, Any]] = []
-    for original_index, edit in sorted_edits:
-        updated = updated.replace(edit["old_text"], edit["new_text"], 1)
-        applied.append({"index": original_index, "old_text": edit["old_text"]})
-
-    _atomic_write(file_path, updated)
-    return json.dumps(
-        {
-            "path": str(file_path),
-            "applied": len(applied),
-            "failed": [],
-            "message": "All edits applied.",
-        },
-        ensure_ascii=False,
-    )
+    raise PermissionError("multi_edit requires a Workspace root capability")
 
 
 def _normalize_multi_edits(edits: list[dict]) -> list[dict[str, str]]:
@@ -251,6 +138,7 @@ async def search_files(
     workspace_manager=None,
     task_id: str | None = None,
     workspace_id: str | None = None,
+    workspace_root: Path | None = None,
 ) -> dict[str, Any]:
     """Search file paths by glob or file contents by text."""
     if workspace_manager is not None:
@@ -261,48 +149,15 @@ async def search_files(
             _workspace_search_sync, workspace.worktree_path, root, query,
             glob, content, limit,
         )
-    return await asyncio.to_thread(_search_files_sync, root, query, glob, content, limit)
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _workspace_search_sync, workspace_root, root, query, glob,
+            content, limit,
+        )
+    raise PermissionError("search_files requires a Workspace root capability")
 
 
-def _search_files_sync(
-    root: str,
-    query: str,
-    glob: str,
-    content: bool,
-    limit: int,
-) -> dict[str, Any]:
-    root_path = Path(root).expanduser().resolve()
-    if limit < 1:
-        raise ValueError("limit must be >= 1")
-    matches: list[dict[str, Any]] = []
-    for file_path in sorted(path for path in root_path.rglob("*") if path.is_file()):
-        relative = str(file_path.relative_to(root_path))
-        if not fnmatch.fnmatch(relative, glob):
-            continue
-        if not content:
-            if not query or query in relative:
-                matches.append({"path": str(file_path)})
-        else:
-            try:
-                lines = file_path.read_text(encoding="utf-8").splitlines()
-            except UnicodeDecodeError:
-                continue
-            for line_number, line in enumerate(lines, start=1):
-                if query in line:
-                    matches.append(
-                        {
-                            "path": str(file_path),
-                            "line": line_number,
-                            "text": line,
-                        }
-                    )
-                    break
-        if len(matches) >= limit:
-            break
-    return {"root": str(root_path), "matches": matches, "count": len(matches)}
-
-
-async def list_directory(path: str = ".", include_hidden: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+async def list_directory(path: str = ".", include_hidden: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """List directory contents with structured metadata."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -311,54 +166,14 @@ async def list_directory(path: str = ".", include_hidden: bool = True, workspace
         return await asyncio.to_thread(
             _workspace_list_sync, workspace.worktree_path, path, include_hidden
         )
-    return await asyncio.to_thread(_list_directory_sync, path, include_hidden)
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _office_list_sync, workspace_root, path, include_hidden
+        )
+    raise PermissionError("list_directory requires a Workspace root capability")
 
 
-def _list_directory_sync(path: str, include_hidden: bool) -> dict[str, Any]:
-    dir_path = Path(path).expanduser().resolve()
-    if not dir_path.exists():
-        return {"ok": False, "path": str(dir_path), "error": "path does not exist"}
-    if not dir_path.is_dir():
-        return {"ok": False, "path": str(dir_path), "error": "path is not a directory"}
-
-    dirs: list[dict[str, Any]] = []
-    files: list[dict[str, Any]] = []
-    try:
-        entries = list(dir_path.iterdir())
-    except OSError as exc:
-        return {"ok": False, "path": str(dir_path), "error": str(exc)}
-
-    for entry in entries:
-        if not include_hidden and entry.name.startswith("."):
-            continue
-        if entry.name == ".git":
-            continue
-        try:
-            if entry.is_dir():
-                dirs.append({"name": entry.name, "item_count": _count_directory_items(entry)})
-            elif entry.is_file():
-                files.append(
-                    {
-                        "name": entry.name,
-                        "size_bytes": entry.stat().st_size,
-                        "extension": entry.suffix,
-                    }
-                )
-        except OSError:
-            continue
-
-    dirs.sort(key=lambda item: str(item["name"]).lower())
-    files.sort(key=lambda item: str(item["name"]).lower())
-    return {
-        "ok": True,
-        "path": str(dir_path),
-        "dirs": dirs,
-        "files": files,
-        "total_items": len(dirs) + len(files),
-    }
-
-
-async def file_info(path: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+async def file_info(path: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Get detailed file or directory metadata."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -367,36 +182,12 @@ async def file_info(path: str, workspace_manager=None, task_id: str | None = Non
         return await asyncio.to_thread(
             _workspace_info_sync, workspace.worktree_path, path
         )
-    return await asyncio.to_thread(_file_info_sync, path)
+    if workspace_root is not None:
+        return await asyncio.to_thread(_office_info_sync, workspace_root, path)
+    raise PermissionError("file_info requires a Workspace root capability")
 
 
-def _file_info_sync(path: str) -> dict[str, Any]:
-    item_path = Path(path).expanduser().resolve()
-    if not item_path.exists():
-        return {"ok": False, "path": str(item_path), "error": "path does not exist"}
-
-    try:
-        stat_result = item_path.stat()
-    except OSError as exc:
-        return {"ok": False, "path": str(item_path), "error": str(exc)}
-
-    item_type = "directory" if item_path.is_dir() else "file"
-    modified = datetime.fromtimestamp(stat_result.st_mtime, tz=timezone.utc).isoformat()
-    mime_type, _ = mimetypes.guess_type(str(item_path))
-    return {
-        "ok": True,
-        "path": str(item_path),
-        "type": item_type,
-        "size_bytes": stat_result.st_size,
-        "extension": item_path.suffix if item_path.is_file() else "",
-        "modified": modified,
-        "is_hidden": item_path.name.startswith("."),
-        "is_symlink": item_path.is_symlink(),
-        "mime_type": mime_type,
-    }
-
-
-async def tree_view(path: str = ".", max_depth: int = 3, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+async def tree_view(path: str = ".", max_depth: int = 3, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Generate a formatted directory tree view."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -405,31 +196,14 @@ async def tree_view(path: str = ".", max_depth: int = 3, workspace_manager=None,
         return await asyncio.to_thread(
             _workspace_tree_sync, workspace.worktree_path, path, max_depth
         )
-    return await asyncio.to_thread(_tree_view_sync, path, max_depth)
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _office_tree_sync, workspace_root, path, max_depth
+        )
+    raise PermissionError("tree_view requires a Workspace root capability")
 
 
-def _tree_view_sync(path: str, max_depth: int) -> dict[str, Any]:
-    root_path = Path(path).expanduser().resolve()
-    if max_depth < 0:
-        return {"ok": False, "path": str(root_path), "error": "max_depth must be >= 0"}
-    if not root_path.exists():
-        return {"ok": False, "path": str(root_path), "error": "path does not exist"}
-    if not root_path.is_dir():
-        return {"ok": False, "path": str(root_path), "error": "path is not a directory"}
-
-    lines: list[str] = []
-    counts = {"files": 0, "dirs": 0}
-    _build_tree_lines(root_path, max_depth, "", lines, counts)
-    return {
-        "ok": True,
-        "path": str(root_path),
-        "tree": "\n".join(lines),
-        "total_files": counts["files"],
-        "total_dirs": counts["dirs"],
-    }
-
-
-async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Copy a file or directory."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -445,41 +219,14 @@ async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | N
                 src, dst,
             ),
         )
-    return await asyncio.to_thread(_copy_file_sync, src, dst)
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _office_copy_sync, workspace_root, src, dst
+        )
+    raise PermissionError("copy_file requires a Workspace root capability")
 
 
-def _copy_file_sync(src: str, dst: str) -> dict[str, Any]:
-    src_path = Path(src).expanduser().resolve()
-    dst_path = Path(dst).expanduser().resolve()
-    if not src_path.exists():
-        return {
-            "ok": False,
-            "src": str(src_path),
-            "dst": str(dst_path),
-            "error": "source does not exist",
-        }
-    if not dst_path.parent.exists():
-        return {
-            "ok": False,
-            "src": str(src_path),
-            "dst": str(dst_path),
-            "error": "destination parent does not exist",
-        }
-
-    try:
-        if src_path.is_dir():
-            shutil.copytree(src_path, dst_path)
-            size_bytes = _directory_size(dst_path)
-        else:
-            shutil.copy2(src_path, dst_path)
-            size_bytes = dst_path.stat().st_size
-    except OSError as exc:
-        return {"ok": False, "src": str(src_path), "dst": str(dst_path), "error": str(exc)}
-
-    return {"ok": True, "src": str(src_path), "dst": str(dst_path), "size_bytes": size_bytes}
-
-
-async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None) -> dict[str, Any]:
+async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Move or rename a file or directory."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -491,32 +238,11 @@ async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | N
             task_id or "",
             lambda: _workspace_move_sync(workspace.worktree_path, src, dst),
         )
-    return await asyncio.to_thread(_move_file_sync, src, dst)
-
-
-def _move_file_sync(src: str, dst: str) -> dict[str, Any]:
-    src_path = Path(src).expanduser().resolve()
-    dst_path = Path(dst).expanduser().resolve()
-    if not src_path.exists():
-        return {
-            "ok": False,
-            "src": str(src_path),
-            "dst": str(dst_path),
-            "error": "source does not exist",
-        }
-    if not dst_path.parent.exists():
-        return {
-            "ok": False,
-            "src": str(src_path),
-            "dst": str(dst_path),
-            "error": "destination parent does not exist",
-        }
-
-    try:
-        shutil.move(str(src_path), str(dst_path))
-    except OSError as exc:
-        return {"ok": False, "src": str(src_path), "dst": str(dst_path), "error": str(exc)}
-    return {"ok": True, "src": str(src_path), "dst": str(dst_path)}
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _office_move_sync, workspace_root, src, dst
+        )
+    raise PermissionError("move_file requires a Workspace root capability")
 
 
 async def file_search_content(
@@ -526,6 +252,7 @@ async def file_search_content(
     workspace_manager=None,
     task_id: str | None = None,
     workspace_id: str | None = None,
+    workspace_root: Path | None = None,
 ) -> dict[str, Any]:
     """Search text file contents for a substring or basic regular expression."""
     if workspace_manager is not None:
@@ -539,136 +266,17 @@ async def file_search_content(
             pattern,
             max_results,
         )
-    return await asyncio.to_thread(_file_search_content_sync, path, pattern, max_results)
-
-
-def _file_search_content_sync(path: str, pattern: str, max_results: int) -> dict[str, Any]:
-    root_path = Path(path).expanduser().resolve()
-    if max_results < 1:
-        return {
-            "ok": False,
-            "path": str(root_path),
-            "pattern": pattern,
-            "error": "max_results must be >= 1",
-        }
-    if not root_path.exists():
-        return {
-            "ok": False,
-            "path": str(root_path),
-            "pattern": pattern,
-            "error": "path does not exist",
-        }
-
-    try:
-        regex = re.compile(pattern)
-    except re.error:
-        regex = None
-
-    matches: list[dict[str, Any]] = []
-    files_searched = 0
-    file_paths = [root_path] if root_path.is_file() else _iter_searchable_files(root_path)
-    for file_path in file_paths:
-        try:
-            lines = file_path.read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeDecodeError):
-            continue
-
-        files_searched += 1
-        for line_number, line in enumerate(lines, start=1):
-            matched = regex.search(line) is not None if regex is not None else pattern in line
-            if not matched:
-                continue
-            matches.append(
-                {
-                    "file": str(file_path),
-                    "line_number": line_number,
-                    "line": line,
-                }
-            )
-            if len(matches) >= max_results:
-                return {
-                    "ok": True,
-                    "pattern": pattern,
-                    "matches": matches,
-                    "match_count": len(matches),
-                    "files_searched": files_searched,
-                }
-
-    return {
-        "ok": True,
-        "pattern": pattern,
-        "matches": matches,
-        "match_count": len(matches),
-        "files_searched": files_searched,
-    }
-
-
-def _count_directory_items(path: Path) -> int:
-    try:
-        return sum(1 for item in path.iterdir() if item.name != ".git")
-    except OSError:
-        return 0
-
-
-def _directory_size(path: Path) -> int:
-    if path.is_file():
-        return path.stat().st_size
-    total = 0
-    for file_path in path.rglob("*"):
-        if file_path.is_file():
-            try:
-                total += file_path.stat().st_size
-            except OSError:
-                continue
-    return total
-
-
-def _build_tree_lines(
-    path: Path,
-    max_depth: int,
-    prefix: str,
-    lines: list[str],
-    counts: dict[str, int],
-    depth: int = 1,
-) -> None:
-    if depth > max_depth:
-        return
-
-    entries = _sorted_tree_entries(path)
-    for index, entry in enumerate(entries):
-        connector = "└── " if index == len(entries) - 1 else "├── "
-        is_dir = entry.is_dir()
-        lines.append(f"{prefix}{connector}{entry.name}{'/' if is_dir else ''}")
-        if is_dir:
-            counts["dirs"] += 1
-            extension = "    " if index == len(entries) - 1 else "│   "
-            _build_tree_lines(entry, max_depth, prefix + extension, lines, counts, depth + 1)
-        else:
-            counts["files"] += 1
-
-
-def _sorted_tree_entries(path: Path) -> list[Path]:
-    try:
-        entries = [
-            item
-            for item in path.iterdir()
-            if not (item.is_dir() and item.name in TREE_EXCLUDE_DIRS)
-        ]
-    except OSError:
-        return []
-    return sorted(entries, key=lambda item: (not item.is_dir(), item.name.lower()))
-
-
-def _iter_searchable_files(root_path: Path) -> list[Path]:
-    files: list[Path] = []
-    for dir_path, dir_names, file_names in os.walk(root_path):
-        dir_names[:] = sorted(
-            [name for name in dir_names if name not in TREE_EXCLUDE_DIRS],
-            key=str.lower,
+    if workspace_root is not None:
+        return await asyncio.to_thread(
+            _workspace_content_search_sync,
+            workspace_root,
+            path,
+            pattern,
+            max_results,
         )
-        for file_name in sorted(file_names, key=str.lower):
-            files.append(Path(dir_path) / file_name)
-    return files
+    raise PermissionError(
+        "file_search_content requires a Workspace root capability"
+    )
 
 
 async def _workspace_mutate(
@@ -711,6 +319,183 @@ def _workspace_write_sync(
     )
 
 
+def _office_write_sync(root: Path, path: str, content: str) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    encoded = content.encode("utf-8")
+    with SafeWorkspaceFS(root) as filesystem:
+        relative = filesystem.relative(path)
+        filesystem.ensure_parent_directories(path)
+        filesystem.write_bytes(path, encoded)
+        return {
+            "path": str(filesystem.root / relative),
+            "bytes": len(encoded),
+        }
+
+
+def _office_patch_sync(
+    root: Path, path: str, old: str, new: str, fuzzy: bool
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    result: dict[str, Any] = {}
+    with SafeWorkspaceFS(root) as filesystem:
+        relative = filesystem.relative(path)
+
+        def transform(original: str) -> str:
+            if old in original:
+                result.update(replaced=1, fuzzy=False)
+                return original.replace(old, new, 1)
+            if not fuzzy:
+                raise ValueError("old text not found")
+            match = _find_fuzzy_block(original, old)
+            if match is None:
+                raise ValueError("old text not found")
+            start, end, score = match
+            result.update(replaced=1, fuzzy=True, score=score)
+            return original[:start] + new + original[end:]
+
+        filesystem.transform_text(path, transform)
+        return {"path": str(filesystem.root / relative), **result}
+
+
+def _office_multi_edit_sync(
+    root: Path, path: str, edits: list[dict]
+) -> str:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    normalized_edits = _normalize_multi_edits(edits)
+    sorted_edits = sorted(
+        enumerate(normalized_edits),
+        key=lambda item: len(item[1]["old_text"]),
+        reverse=True,
+    )
+    with SafeWorkspaceFS(root) as filesystem:
+        relative = filesystem.relative(path)
+        original = filesystem.read_bytes(path).decode("utf-8")
+        failures: list[dict[str, Any]] = []
+        for original_index, edit in sorted_edits:
+            count = original.count(edit["old_text"])
+            if count != 1:
+                failures.append({
+                    "index": original_index,
+                    "old_text": edit["old_text"],
+                    "matches": count,
+                    "error": (
+                        "old_text not found" if count == 0
+                        else "old_text is not unique"
+                    ),
+                })
+        if failures:
+            return json.dumps({
+                "path": str(filesystem.root / relative),
+                "applied": 0,
+                "failed": sorted(
+                    failures, key=lambda item: int(item["index"])
+                ),
+            }, ensure_ascii=False)
+        updated = original
+        for _, edit in sorted_edits:
+            updated = updated.replace(edit["old_text"], edit["new_text"], 1)
+        filesystem.write_bytes(path, updated.encode("utf-8"))
+        return json.dumps({
+            "path": str(filesystem.root / relative),
+            "applied": len(sorted_edits),
+            "failed": [],
+            "message": "All edits applied.",
+        }, ensure_ascii=False)
+
+
+def _office_copy_sync(
+    root: Path, source: str, destination: str
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        source_relative = filesystem.relative(source)
+        destination_relative = filesystem.relative(destination)
+        try:
+            size = filesystem.copy_path(source, destination)
+        except (FileNotFoundError, OSError) as exc:
+            return {
+                "ok": False,
+                "src": str(filesystem.root / source_relative),
+                "dst": str(filesystem.root / destination_relative),
+                "error": "source does not exist" if isinstance(
+                    exc, FileNotFoundError
+                ) else str(exc),
+            }
+        return {
+            "ok": True,
+            "src": str(filesystem.root / source_relative),
+            "dst": str(filesystem.root / destination_relative),
+            "size_bytes": size,
+        }
+
+
+def _office_move_sync(
+    root: Path, source: str, destination: str
+) -> dict[str, Any]:
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        source_relative = filesystem.relative(source)
+        destination_relative = filesystem.relative(destination)
+        try:
+            filesystem.move_path(source, destination)
+        except (FileNotFoundError, OSError) as exc:
+            return {
+                "ok": False,
+                "src": str(filesystem.root / source_relative),
+                "dst": str(filesystem.root / destination_relative),
+                "error": "source does not exist" if isinstance(
+                    exc, FileNotFoundError
+                ) else str(exc),
+            }
+        return {
+            "ok": True,
+            "src": str(filesystem.root / source_relative),
+            "dst": str(filesystem.root / destination_relative),
+        }
+
+
+def _office_list_sync(
+    root: Path, path: str, include_hidden: bool
+) -> dict[str, Any]:
+    try:
+        return _workspace_list_sync(root, path, include_hidden)
+    except (FileNotFoundError, NotADirectoryError, OSError) as exc:
+        display = Path(path) if Path(path).is_absolute() else root / path
+        return {"ok": False, "path": str(display), "error": (
+            "path does not exist" if isinstance(exc, FileNotFoundError)
+            else str(exc)
+        )}
+
+
+def _office_info_sync(root: Path, path: str) -> dict[str, Any]:
+    try:
+        return _workspace_info_sync(root, path)
+    except (FileNotFoundError, OSError) as exc:
+        display = Path(path) if Path(path).is_absolute() else root / path
+        return {"ok": False, "path": str(display), "error": (
+            "path does not exist" if isinstance(exc, FileNotFoundError)
+            else str(exc)
+        )}
+
+
+def _office_tree_sync(
+    root: Path, path: str, max_depth: int
+) -> dict[str, Any]:
+    try:
+        return _workspace_tree_sync(root, path, max_depth)
+    except (FileNotFoundError, NotADirectoryError, OSError) as exc:
+        display = Path(path) if Path(path).is_absolute() else root / path
+        return {"ok": False, "path": str(display), "error": (
+            "path does not exist" if isinstance(exc, FileNotFoundError)
+            else str(exc)
+        )}
+
+
 def _workspace_read_sync(
     root: Path, path: str, offset: int, limit: int
 ) -> dict[str, Any]:
@@ -746,6 +531,7 @@ def _workspace_search_sync(
     with SafeWorkspaceFS(workspace_root) as filesystem:
         base = filesystem._directory_relative(root)
         matches: list[dict[str, Any]] = []
+        bytes_examined = 0
         for relative in filesystem.iter_files(root):
             display = relative[len(base) + 1:] if base else relative
             if not fnmatch.fnmatch(display, glob):
@@ -755,6 +541,12 @@ def _workspace_search_sync(
                     matches.append({"path": str(filesystem.root / relative)})
             else:
                 try:
+                    info = filesystem.stat(relative)
+                    bytes_examined += info.st_size
+                    if bytes_examined > 64 * 1024 * 1024:
+                        raise PermissionError(
+                            "content search exceeds the aggregate byte limit"
+                        )
                     lines = filesystem.read_bytes(relative).decode("utf-8").splitlines()
                 except UnicodeDecodeError:
                     continue
@@ -783,14 +575,18 @@ def _workspace_list_sync(
     with SafeWorkspaceFS(workspace_root) as filesystem:
         base = filesystem._directory_relative(path)
         direct_files: dict[str, dict[str, Any]] = {}
-        directories: set[str] = set()
-        for relative in filesystem.iter_files(path):
+        directories: dict[str, int] = {}
+        for relative, is_directory in filesystem.iter_entries(
+            path, max_depth=2
+        ):
             display = relative[len(base) + 1:] if base else relative
             first, separator, remainder = display.partition("/")
             if not include_hidden and first.startswith("."):
                 continue
             if separator:
-                directories.add(first)
+                directories[first] = directories.get(first, 0) + 1
+            elif is_directory:
+                directories.setdefault(first, 0)
             else:
                 info = filesystem.stat(relative)
                 direct_files[first] = {
@@ -798,7 +594,10 @@ def _workspace_list_sync(
                     "size_bytes": info.st_size,
                     "extension": Path(first).suffix,
                 }
-        dirs = [{"name": name, "item_count": 0} for name in sorted(directories, key=str.lower)]
+        dirs = [
+            {"name": name, "item_count": directories[name]}
+            for name in sorted(directories, key=str.lower)
+        ]
         files = [direct_files[name] for name in sorted(direct_files, key=str.lower)]
         return {
             "ok": True,
@@ -845,22 +644,50 @@ def _workspace_tree_sync(
         raise ValueError("max_depth must be >= 0")
     with SafeWorkspaceFS(workspace_root) as filesystem:
         base = filesystem._directory_relative(path)
-        visible: list[str] = []
-        directories: set[str] = set()
-        for relative in filesystem.iter_files(path):
+        if max_depth == 0:
+            return {
+                "ok": True,
+                "path": str(filesystem.root / base),
+                "tree": "",
+                "total_files": 0,
+                "total_dirs": 0,
+            }
+        entries: list[tuple[str, bool]] = []
+        for relative, is_directory in filesystem.iter_entries(
+            path, max_depth=max_depth
+        ):
             display = relative[len(base) + 1:] if base else relative
-            parts = display.split("/")
-            for depth in range(1, min(len(parts), max_depth + 1)):
-                directories.add("/".join(parts[:depth]))
-            if len(parts) <= max_depth:
-                visible.append(display)
-        lines = [f"{entry}/" for entry in sorted(directories)] + sorted(visible)
+            if any(part in TREE_EXCLUDE_DIRS for part in display.split("/")):
+                continue
+            entries.append((display, is_directory))
+        children: dict[str, list[tuple[str, bool]]] = {}
+        for relative, is_directory in entries:
+            parent, _, name = relative.rpartition("/")
+            children.setdefault(parent, []).append((name, is_directory))
+        lines: list[str] = []
+
+        def render(parent: str, prefix: str) -> None:
+            items = sorted(
+                children.get(parent, []),
+                key=lambda item: (not item[1], item[0].lower()),
+            )
+            for index, (name, is_directory) in enumerate(items):
+                last = index == len(items) - 1
+                connector = "└── " if last else "├── "
+                lines.append(
+                    f"{prefix}{connector}{name}{'/' if is_directory else ''}"
+                )
+                if is_directory:
+                    child_path = f"{parent}/{name}" if parent else name
+                    render(child_path, prefix + ("    " if last else "│   "))
+
+        render("", "")
         return {
             "ok": True,
             "path": str(filesystem.root / base),
             "tree": "\n".join(lines),
-            "total_files": len(visible),
-            "total_dirs": len(directories),
+            "total_files": sum(not is_dir for _, is_dir in entries),
+            "total_dirs": sum(is_dir for _, is_dir in entries),
         }
 
 
@@ -882,8 +709,15 @@ def _workspace_content_search_sync(
             candidates = [filesystem.relative(path)]
         matches: list[dict[str, Any]] = []
         searched = 0
+        bytes_examined = 0
         for relative in candidates:
             try:
+                info = filesystem.stat(relative)
+                bytes_examined += info.st_size
+                if bytes_examined > 64 * 1024 * 1024:
+                    raise PermissionError(
+                        "content search exceeds the aggregate byte limit"
+                    )
                 lines = filesystem.read_bytes(relative).decode("utf-8").splitlines()
             except UnicodeDecodeError:
                 continue
@@ -1105,17 +939,6 @@ def _rollback_move(
         restored = filesystem.snapshot_file(source)
         if restored.digest != source_before.digest:
             raise WorkspaceBoundaryError("move rollback content mismatch")
-
-
-def _atomic_write(path: Path, content: str) -> None:
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(temp_name, path)
-    finally:
-        if os.path.exists(temp_name):
-            os.unlink(temp_name)
 
 
 def _find_fuzzy_block(content: str, old: str) -> tuple[int, int, float] | None:

@@ -52,7 +52,7 @@ jobs:
         run: python -m pytest python/tests/test_grpc_server.py -q
       - name: Run POSIX workspace boundary contracts
         if: runner.os != 'Windows'
-        run: python -m pytest python/tests/coding/test_safe_workspace_fs.py python/tests/coding/test_workspace_boundary.py python/tests/coding/test_workspace_manager.py python/tests/coding/test_execution_binding.py python/tests/coding/test_m4_batch3_0_workspace_mutation.py -q
+        run: python -m pytest python/tests/coding/test_safe_workspace_fs.py python/tests/coding/test_workspace_boundary.py python/tests/coding/test_workspace_manager.py python/tests/coding/test_execution_binding.py python/tests/coding/test_m4_batch3_0_workspace_mutation.py python/tests/tools/test_office_workspace_fs_security.py -q
       - name: Run Go gateway tests
         working-directory: go
         run: go test ./...

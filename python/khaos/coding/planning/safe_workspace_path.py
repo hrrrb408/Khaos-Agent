@@ -208,6 +208,37 @@ class WorkspacePathHandle:
             error = ctypes.get_errno()
             raise OSError(error, os.strerror(error))
 
+    @staticmethod
+    def _rename_no_replace(
+        source_parent_fd: int,
+        source: str,
+        destination_parent_fd: int,
+        destination: str,
+    ) -> None:
+        """Atomically rename any filesystem object without replacement."""
+        libc = ctypes.CDLL(None, use_errno=True)
+        if hasattr(libc, "renameatx_np"):
+            result = libc.renameatx_np(
+                source_parent_fd,
+                source.encode(),
+                destination_parent_fd,
+                destination.encode(),
+                0x00000004,  # RENAME_EXCL
+            )
+        elif hasattr(libc, "renameat2"):
+            result = libc.renameat2(
+                source_parent_fd,
+                source.encode(),
+                destination_parent_fd,
+                destination.encode(),
+                0x1,  # RENAME_NOREPLACE
+            )
+        else:
+            raise SafePathError("platform lacks atomic rename no-replace")
+        if result != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
     def create(
         self, relative: str, content: bytes, mode: int,
         phase: Callable[..., None],

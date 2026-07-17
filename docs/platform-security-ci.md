@@ -7,7 +7,7 @@
 
 | Check | Runner | 证明内容 | 不证明的内容 |
 | --- | --- | --- | --- |
-| `Security Contract Matrix / contract` | Ubuntu 24.04、Windows 2025、macOS 14 | Approval、turn、permission profile、Office Sandbox path、durable webhook replay/限流隔离、workspace mutation-wide storage authority、mutation cancel fence、deleted fd accounting、Git identity、快速退出最终核算、遍历错误/churn fail-closed、Gateway/RPC、managed resource、TUI、Go/Rust；POSIX 额外验证 Verification Authority 与 dirfd workspace boundary | 真实 OS 隔离 |
+| `Security Contract Matrix / contract` | Ubuntu 24.04、Windows 2025、macOS 14 | Approval、turn、permission profile、Office read/write Sandbox path、durable webhook replay/限流隔离、workspace mutation-wide storage authority、mutation cancel fence、deleted fd accounting、Git identity、快速退出最终核算、遍历错误/churn fail-closed、Gateway/RPC、managed resource、TUI、Go/Rust；POSIX 额外验证 Verification Authority、Office nested-object rejection 与 dirfd workspace boundary | 真实 OS 隔离 |
 | `Platform Sandbox Security E2E / linux-bwrap-security` | Ubuntu hosted runner | bwrap workspace-write/read-only、`.git` pointer read-only、禁网、secret root、PID/process tree、HOME/TMP size 与 entry budget、TaskWorkspace 相对 entry budget、无 Host fallback | Windows sandbox |
 | `Platform Sandbox Security E2E / macos-sandbox-security` | macOS hosted runner | sandbox-exec workspace-write、`.git`/case alias write denial、外部写拒绝、禁网、secret root、pasteboard/Keychain IPC、whole-HOME 与 TaskWorkspace 相对 byte budget 拒绝 | Linux namespace |
 | `Platform Sandbox Security E2E / windows-fail-closed-security` | Windows hosted runner | 未实现 native backend 时明确 Unsupported，执行和 dirfd mutation 都拒绝 | Windows 可执行 sandbox；当前产品不宣称支持 |
