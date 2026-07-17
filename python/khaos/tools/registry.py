@@ -195,6 +195,10 @@ class ToolInvocationBroker:
                     "Office filesystem access requires a Sandbox root capability"
                 )
             handler_params["workspace_root"] = workspace_root
+            # H1: mutations (copy/move) are fenced through the shared authority
+            # so cancellation/timeout cannot abandon a running thread.
+            if name in {"copy_file", "move_file"}:
+                handler_params["office_authority"] = context.get("office_authority")
         return await definition.handler(**handler_params)
 
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:
@@ -559,8 +563,10 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ToolDefinition(
             name="file_search_content",
             description=(
-                "Search file contents for a pattern (substring or regex). "
-                "Returns matching lines with file paths and line numbers."
+                "Search file contents for a pattern (literal substring or "
+                "RE2-linear regular expression). Patterns that would require "
+                "catastrophic backtracking are rejected. Returns matching "
+                "lines with file paths and line numbers."
             ),
             parameters={
                 "type": "object",

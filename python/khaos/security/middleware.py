@@ -8,6 +8,11 @@ existing guards so behaviour stays backward-compatible: policy-denied paths
 extend PathGuard's protected set, policy-blocked commands extend
 CommandGuard's blocked set, and ``secrets_scan_on_output`` gates the
 post-execution secret scan.
+
+B1/M1: when an ``EffectiveSecurityPolicy`` is supplied (the production
+path), it is the single source of truth — its denied_paths, commands_blocked,
+secrets_scan_on_output and ``digest`` drive the middleware, and the digest
+is exposed so the scheduler can bind it into every approval decision.
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ from khaos.security.secret_scanner import ScanResult, SecretScanner
 
 if TYPE_CHECKING:
     from khaos.audit.logger import AuditLogger
+    from khaos.security.effective_policy import EffectiveSecurityPolicy
     from khaos.security.network_guard import NetworkGuard
     from khaos.security.policy import SandboxPolicy
     from khaos.security.sandbox import Sandbox
@@ -63,6 +69,8 @@ class SecurityMiddleware:
         sandbox: "Sandbox | None" = None,
         network_guard: "NetworkGuard | None" = None,
         audit_logger: "AuditLogger | None" = None,
+        *,
+        effective_policy: "EffectiveSecurityPolicy | None" = None,
     ):
         self.command_guard = command_guard or CommandGuard()
         self.path_guard = path_guard or PathGuard()
@@ -72,15 +80,55 @@ class SecurityMiddleware:
         self.sandbox = sandbox
         self.network_guard = network_guard
         self.audit_logger = audit_logger
-        # secrets_scan_on_output: when a policy is present, defer to it so a
-        # user can disable output scanning in trusted setups.
-        self._scan_on_output = (
-            policy.secrets_scan_on_output if policy is not None else True
-        )
+        # B1: the effective policy is the compiled user ∩ project ∩ platform
+        # intersection.  When present, it (not the raw project policy) drives
+        # denied_paths / commands_blocked / secrets_scan_on_output, and its
+        # digest is exposed for approval binding (M1).
+        self.effective_policy = effective_policy
+        # secrets_scan_on_output: prefer the effective policy, then the raw
+        # policy, then the default (True).
+        if effective_policy is not None:
+            self._scan_on_output = effective_policy.secrets_scan_on_output
+        elif policy is not None:
+            self._scan_on_output = policy.secrets_scan_on_output
+        else:
+            self._scan_on_output = True
         # Merge policy lists into the existing guards so the detection layer
         # also enforces the policy's extra denials (defense in depth).
-        if policy is not None:
-            self._apply_policy(policy)
+        # B1: prefer effective_policy; fall back to raw policy for callers
+        # that haven't been migrated yet.
+        source_policy = self._merge_source_policy()
+        if source_policy is not None:
+            self._apply_policy(source_policy)
+
+    @property
+    def effective_policy_digest(self) -> str:
+        """Stable digest of the effective policy (M1).
+
+        Empty string when no effective policy is compiled (e.g. ad-hoc
+        middleware in tests).  The scheduler includes this in every
+        approval ``profile_digest`` so an approval is provably bound to the
+        exact policy under which it was made.
+        """
+        if self.effective_policy is not None:
+            return self.effective_policy.digest
+        return ""
+
+    def _merge_source_policy(self) -> "SandboxPolicy | None":
+        """Return the policy whose denied_paths / commands_blocked to merge.
+
+        B1: when an effective policy is present, we synthesise a lightweight
+        ``SandboxPolicy`` view from its fields so ``_apply_policy`` can
+        reuse its existing merge logic without needing a separate code path.
+        """
+        if self.effective_policy is not None:
+            from khaos.security.policy import SandboxPolicy
+
+            return SandboxPolicy(
+                denied_paths=list(self.effective_policy.denied_paths),
+                commands_blocked=list(self.effective_policy.commands_blocked),
+            )
+        return self.policy
 
     def _apply_policy(self, policy: "SandboxPolicy") -> None:
         """Merge policy lists into the existing guards (additive, instance-level)."""

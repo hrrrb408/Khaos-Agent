@@ -53,8 +53,8 @@ khaos/
 │   │   │   └── adapter.py          # Telegram/Discord/Slack/WeChat 适配器
 │   │   ├── cli/             # CLI 入口点
 │   │   ├── tui/             # 全屏 TUI（Phase 4：Textual + Rich，斜杠命令）
-│   │   ├── permissions/     # 权限引擎
-│   │   ├── security/        # 安全模块：命令、路径、敏感信息防护
+│   │   ├── permissions/     # 权限引擎（含 commands_require_approval 前置闸门）
+│   │   ├── security/        # 安全模块：命令、路径、敏感信息防护、EffectiveSecurityPolicy 编译
 │   │   ├── subagents/       # 子代理（Runner、Planner、Service）
 │   │   ├── routing/         # 模型路由（Phase 3：MoA；Phase 4：多 provider 架构）
 │   │   ├── rust_bridge.py   # PyO3 桥接（Phase 3：token；Phase 4：file_ops/exec）
@@ -506,11 +506,14 @@ scope:
 ## 关键约束
 
 1. **不复制 Claude Code 源码**：自定义非开源许可证，可学习架构设计但不可复制粘贴
-2. **不引入重量级依赖**：Python 层用标准库 + 少量精选依赖（httpx, aiosqlite, aiofiles），Go 层用标准库 + gin/echo，Rust 层用 tokio + rusqlite + tiktoken
+2. **不引入重量级依赖**：Python 层用标准库 + 少量精选依赖（httpx, aiosqlite, aiofiles, google-re2），Go 层用标准库 + gin/echo，Rust 层用 tokio + rusqlite + tiktoken
 3. **所有写操作必须记录审计日志**：audit_log 表记录所有写操作
 4. **环境变量中不出现明文 API Key**：日志脱敏，配置文件支持 `${ENV_VAR}` 引用
 5. **错误可恢复优先**：工具执行失败不算致命错误，返回模型重决策；模型超时自动 fallback
 6. **测试先行**：新代码必须有对应测试，覆盖率不低于 60%
+7. **Office 变更必须经过 Mutation Authority**：Office `copy_file`/`move_file` 通过 `OfficeMutationAuthority`（复用 `WorkspaceStorageAuthority` + mutation fence + `asyncio.shield`），取消/超时不会在"调用失败"后继续提交副作用。Office Workspace 拥有 baseline + 总量限制 + quarantine。
+8. **file_search_content 使用线性时间正则**：用户提供的 pattern 通过 google-re2 编译（线性时间、拒绝灾难性回溯），绝不使用 Python `re`；pattern 长度 ≤ 256，单行 ≤ 64 KiB。
+9. **khaos_policy.yaml 是唯一安全权威**：启动时编译为不可变 `EffectiveSecurityPolicy`（user ∩ project ∩ platform，只能收紧）。`allowed_paths` 编译为 root capabilities；`commands_require_approval` 是 PermissionEngine 的前置闸门，覆盖持久 auto-approve rule；未知 mode / malformed YAML / 未知字段 → **fail closed**（启动失败或 read-only，绝不静默回退到 workspace-write）。审批绑定包含 effective policy digest。
 
 ---
 

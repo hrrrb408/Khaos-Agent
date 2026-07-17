@@ -47,10 +47,20 @@ class PermissionDecision:
 class PermissionEngine:
     """Rule matching and audit logging for tool calls."""
 
-    def __init__(self, db, default_mode: ApprovalMode = ApprovalMode.ASK_EVERY):
+    def __init__(
+        self,
+        db,
+        default_mode: ApprovalMode = ApprovalMode.ASK_EVERY,
+        *,
+        commands_require_approval: "frozenset[str] | None" = None,
+    ):
         self.db = db
         self._default_mode = default_mode
         self._rules: list[PermissionRule] = []
+        # H3: policy-level command approval list.  Checked BEFORE persistent
+        # rules so an auto-approve rule can never bypass a policy that
+        # requires explicit confirmation for a command.
+        self._commands_require_approval = commands_require_approval or frozenset()
 
     async def load_rules(self) -> None:
         """Load persisted rules from SQLite."""
@@ -76,6 +86,24 @@ class PermissionEngine:
     ) -> PermissionDecision:
         """Check whether a tool call is approved, denied, or needs confirmation."""
         target = self.normalize_target(tool_name, params)
+        # H4: policy-level required-approval list runs BEFORE every other
+        # shortcut, including the read-only terminal shortcut.  Otherwise a
+        # command classified as read-only (cat / grep / ls / rg / head /
+        # tail …) would be AUTO_APPROVE'd even when the effective policy
+        # explicitly requires confirmation for it, contradicting the
+        # "policy approval requirement covers automatic approval" contract.
+        # H3 (preserved): this also runs before the persistent-rule loop, so
+        # a remembered auto-approve rule cannot bypass a command the
+        # effective policy demands confirmation for.
+        if self._commands_require_approval and tool_name in {"terminal", "process"}:
+            command_text = str(params.get("command") or params.get("id") or "")
+            if _matches_required_approval(command_text, self._commands_require_approval):
+                return PermissionDecision(
+                    approved=ApprovalMode.ASK_EVERY,
+                    reason=f"Policy requires approval for command: {target}",
+                    target=target,
+                    requires_user_confirm=True,
+                )
         if tool_name == "terminal" and _is_read_only_terminal_call(params):
             return PermissionDecision(
                 approved=ApprovalMode.AUTO_APPROVE,
@@ -240,3 +268,32 @@ def _is_read_only_terminal_call(params: dict) -> bool:
     from khaos.tools.terminal_tools import is_read_only_command
 
     return is_read_only_command(str(params.get("command") or ""))
+
+
+def _matches_required_approval(command_text: str, approval_list: "frozenset[str]") -> bool:
+    """Whether any segment of ``command_text`` triggers required approval.
+
+    Each shell segment is normalized to ``base_cmd args`` and matched against
+    the approval list.  An entry matches when the normalized segment equals it
+    (e.g. ``rm``), starts with it followed by a space (e.g. ``git push origin``
+    matches ``git push``), or matches it via fnmatch.  Every segment of a
+    pipeline/chain is checked so ``ls; rm x`` is caught.
+    """
+    if not command_text or not approval_list:
+        return False
+    segments = split_command_segments(command_text)
+    for raw in segments:
+        normalized = normalize_command_target(raw)
+        if not normalized:
+            continue
+        for entry in approval_list:
+            entry = entry.strip()
+            if not entry:
+                continue
+            if (
+                normalized == entry
+                or normalized.startswith(entry + " ")
+                or fnmatch.fnmatch(normalized, entry)
+            ):
+                return True
+    return False

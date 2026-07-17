@@ -7,7 +7,6 @@ import fnmatch
 import json
 import mimetypes
 import os
-import re
 import stat
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
@@ -25,6 +24,23 @@ TREE_EXCLUDE_DIRS = {
     "dist",
     "build",
 }
+
+# H1: the runtime (factory.py) registers the shared OfficeMutationAuthority
+# here so Office file mutations can be fenced against cancellation/timeout.
+# When unset (e.g. ad-hoc tool calls in tests), copy_file/move_file fall back
+# to the legacy bare to_thread path — which is only safe for trusted inputs.
+_office_authority: Any = None
+
+
+def set_office_authority(authority: Any) -> None:
+    """Register the shared OfficeMutationAuthority (called once at startup)."""
+    global _office_authority
+    _office_authority = authority
+
+
+def _get_office_authority() -> Any:
+    """Return the registered OfficeMutationAuthority, or None if unset."""
+    return _office_authority
 
 async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Read a file page with one-based line numbers."""
@@ -203,7 +219,7 @@ async def tree_view(path: str = ".", max_depth: int = 3, workspace_manager=None,
     raise PermissionError("tree_view requires a Workspace root capability")
 
 
-async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
+async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None, office_authority=None) -> dict[str, Any]:
     """Copy a file or directory."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -220,13 +236,24 @@ async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | N
             ),
         )
     if workspace_root is not None:
+        if office_authority is None:
+            office_authority = _get_office_authority()
+        if office_authority is not None:
+            # H1: route through the mutation fence so cancellation / timeout
+            # cannot abandon a running copy thread that later commits a side
+            # effect via the final atomic rename.
+            workspace = await office_authority.workspace_for_root(workspace_root)
+            return await office_authority.mutate(
+                workspace,
+                lambda: _office_copy_mutation(workspace_root, src, dst),
+            )
         return await asyncio.to_thread(
             _office_copy_sync, workspace_root, src, dst
         )
     raise PermissionError("copy_file requires a Workspace root capability")
 
 
-async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
+async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None, office_authority=None) -> dict[str, Any]:
     """Move or rename a file or directory."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -239,6 +266,14 @@ async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | N
             lambda: _workspace_move_sync(workspace.worktree_path, src, dst),
         )
     if workspace_root is not None:
+        if office_authority is None:
+            office_authority = _get_office_authority()
+        if office_authority is not None:
+            workspace = await office_authority.workspace_for_root(workspace_root)
+            return await office_authority.mutate(
+                workspace,
+                lambda: _office_move_mutation(workspace_root, src, dst),
+            )
         return await asyncio.to_thread(
             _office_move_sync, workspace_root, src, dst
         )
@@ -457,6 +492,119 @@ def _office_move_sync(
             "src": str(filesystem.root / source_relative),
             "dst": str(filesystem.root / destination_relative),
         }
+
+
+def _office_copy_mutation(
+    root: Path, source: str, destination: str
+) -> object:
+    """Office copy wrapped as a WorkspaceMutation for storage accounting.
+
+    The copy itself goes through the existing ``copy_path`` atomic-publish
+    path.  The rollback closure removes the published destination if a
+    post-mutation storage violation is raised (e.g. aggregate budget blown),
+    and the fence's ``asyncio.shield`` guarantees cancellation waits for the
+    atomic rename to settle before propagating.
+
+    M2: rollback is now *identity-bound*.  Immediately after the atomic
+    publish we capture the destination's ``(st_dev, st_ino, st_mode)`` via
+    fixed dirfds.  The rollback closure then uses ``remove_published`` —
+    which re-opens the parent through ``O_NOFOLLOW`` dirfds, ``lstat`` s
+    the leaf *without* following it, verifies the identity still matches,
+    and only then removes it (recursively for directories via the
+    ``_remove_tree_at`` dirfd primitive, or ``os.unlink`` for files) and
+    ``fsync`` s the parent.  This replaces the previous
+    ``shutil.rmtree(ignore_errors=True)`` / ``unlink(missing_ok=True)``,
+    which would happily remove any object an attacker had swapped in at
+    the destination path after our publish.
+    """
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+    from khaos.coding.workspace.storage import WorkspaceMutation
+
+    value = _office_copy_sync(root, source, destination)
+    destination_relative = _destination_relative(root, destination)
+
+    # M2: capture the published destination's identity right after the
+    # atomic publish, while we still hold the storage-authority mutation
+    # lock.  ``None`` means the publish did not actually land (e.g. the
+    # sync helper rolled back); rollback then becomes a no-op.
+    published_identity: "tuple[int, int, int] | None" = None
+    if value.get("ok"):
+        with SafeWorkspaceFS(root) as filesystem:
+            published_identity = filesystem.capture_path_identity(
+                destination_relative
+            )
+
+    def rollback() -> None:
+        if not value.get("ok") or published_identity is None:
+            return
+        # Re-open the filesystem through fixed dirfds and remove the
+        # published path *only if* its identity still matches what we
+        # captured.  A mismatch (concurrent replacement, symlink swap, …)
+        # raises ``WorkspaceBoundaryError``; the storage authority catches
+        # that and quarantines the workspace rather than removing the wrong
+        # object.
+        with SafeWorkspaceFS(root) as filesystem:
+            filesystem.remove_published(destination_relative, published_identity)
+
+    return WorkspaceMutation(value=value, rollback=rollback, finalize=lambda: None)
+
+
+def _office_move_mutation(
+    root: Path, source: str, destination: str
+) -> object:
+    """Office move wrapped as a WorkspaceMutation for storage accounting.
+
+    Rollback moves the tree back to the source path.  If the source no longer
+    exists (e.g. a concurrent change), rollback is a no-op rather than raising
+    — the storage authority already flags ``quarantine_required`` from the
+    residual violation.
+
+    M2: rollback is now *identity-bound*.  Immediately after the atomic
+    move we capture the destination's ``(st_dev, st_ino, st_mode)`` via
+    fixed dirfds.  The rollback closure uses ``move_published_back`` —
+    which re-opens the parent through ``O_NOFOLLOW`` dirfds, verifies the
+    leaf's identity still matches, and only then performs an
+    identity-bound ``move_path`` back to the source.  This replaces the
+    previous ``shutil.move(destination, source)``, which would move any
+    object that happened to be at the destination path — including one an
+    attacker had swapped in after our publish.
+    """
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+    from khaos.coding.workspace.storage import WorkspaceMutation
+
+    value = _office_move_sync(root, source, destination)
+    source_relative = _destination_relative(root, source)
+    destination_relative = _destination_relative(root, destination)
+
+    # M2: capture the published destination's identity right after the
+    # atomic move, while we still hold the storage-authority mutation lock.
+    published_identity: "tuple[int, int, int] | None" = None
+    if value.get("ok"):
+        with SafeWorkspaceFS(root) as filesystem:
+            published_identity = filesystem.capture_path_identity(
+                destination_relative
+            )
+
+    def rollback() -> None:
+        if not value.get("ok") or published_identity is None:
+            return
+        # Identity-bound move-back: only move the object we published, never
+        # a concurrently-replaced leaf.  A mismatch raises
+        # ``WorkspaceBoundaryError``; the storage authority quarantines.
+        with SafeWorkspaceFS(root) as filesystem:
+            filesystem.move_published_back(
+                destination_relative, source_relative, published_identity
+            )
+
+    return WorkspaceMutation(value=value, rollback=rollback, finalize=lambda: None)
+
+
+def _destination_relative(root: Path, target: str) -> str:
+    """Resolve an office target to its root-relative posix path."""
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+    with SafeWorkspaceFS(root) as filesystem:
+        return filesystem.relative(target)
 
 
 def _office_list_sync(
@@ -698,10 +846,12 @@ def _workspace_content_search_sync(
 
     if max_results < 1:
         raise ValueError("max_results must be >= 1")
-    try:
-        regex = re.compile(pattern)
-    except re.error:
-        regex = None
+    # H2: compile through the linear-time engine (RE2).  A pattern that would
+    # require catastrophic backtracking is rejected at compile time; an
+    # invalid/unavailable pattern falls back to a literal substring match.
+    # Python's ``re`` is never used here, so a hostile pattern cannot pin a
+    # worker thread past the scheduler timeout.
+    regex = _compile_search_pattern(pattern)
     with SafeWorkspaceFS(workspace_root) as filesystem:
         try:
             candidates = filesystem.iter_files(path)
@@ -723,6 +873,9 @@ def _workspace_content_search_sync(
                 continue
             searched += 1
             for line_number, line in enumerate(lines, start=1):
+                # Cap per-line work to bound memory/CPU on pathological inputs.
+                if len(line) > _SEARCH_MAX_LINE_LEN:
+                    line = line[:_SEARCH_MAX_LINE_LEN]
                 matched = regex.search(line) is not None if regex else pattern in line
                 if matched:
                     matches.append({
@@ -733,6 +886,35 @@ def _workspace_content_search_sync(
                     if len(matches) >= max_results:
                         return {"ok": True, "pattern": pattern, "matches": matches, "match_count": len(matches), "files_searched": searched}
         return {"ok": True, "pattern": pattern, "matches": matches, "match_count": len(matches), "files_searched": searched}
+
+
+# H2: bounds that protect the content-search worker from ReDoS and oversized
+# inputs.  ``re2`` already guarantees linear matching time and rejects
+# backtracking patterns at compile time; these limits are defense in depth.
+_SEARCH_MAX_PATTERN_LEN = 256
+_SEARCH_MAX_LINE_LEN = 64 * 1024
+
+
+def _compile_search_pattern(pattern: str):
+    """Compile a search pattern with the linear-time RE2 engine.
+
+    Returns ``None`` when the pattern is invalid or RE2 is unavailable, in
+    which case the caller falls back to a literal substring match.  Python's
+    backtracking ``re`` is deliberately never used for user-supplied patterns.
+    """
+    if not isinstance(pattern, str) or len(pattern) > _SEARCH_MAX_PATTERN_LEN:
+        raise ValueError("search pattern is missing or exceeds the length limit")
+    try:
+        import re2
+    except ImportError:
+        # Defensive: re2 is a declared dependency.  If it is somehow missing,
+        # fall back to literal substring search rather than the unsafe Python
+        # re engine.
+        return None
+    try:
+        return re2.compile(pattern)
+    except re2.error:
+        return None
 
 
 def _workspace_patch_sync(

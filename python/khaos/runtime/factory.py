@@ -16,6 +16,7 @@ from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
+from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
@@ -24,7 +25,6 @@ from khaos.routing.router import create_default_router
 from khaos.rust_bridge import get_token_engine
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_guard import NetworkGuard
-from khaos.security.policy import load_policy
 from khaos.security.sandbox import Sandbox
 from khaos.skills import SkillGenerator, SkillManager
 from khaos.tools import create_runtime_registry
@@ -71,12 +71,25 @@ class RuntimeResult:
     new_verify_fix_loop: Callable[[], VerifyFixLoop] | None
     _closed: bool = False
     execution_service: ExecutionService | None = None
+    # H3: the OfficeMutationAuthority is owned by the runtime so aclose()
+    # can fence every in-flight Office mutation before the process exits.
+    office_authority: OfficeMutationAuthority | None = None
 
     async def aclose(self) -> None:
         """Release runtime-owned resources; database ownership stays with caller."""
         if self._closed:
             return
         self._closed = True
+        # H3: fence Office mutations FIRST — wait for every in-flight
+        # copy/move worker to settle (commit or roll back) and mark every
+        # Office workspace read-only before any other component shuts down.
+        # Without this, a mutation thread could keep writing to the
+        # filesystem after the runtime has already closed.
+        if self.office_authority is not None:
+            try:
+                await self.office_authority.shutdown()
+            except Exception:
+                logger.debug("office authority shutdown failed", exc_info=True)
         if self.memory_manager is not None:
             close = getattr(self.memory_manager, "aclose", None)
             if close is not None:
@@ -110,7 +123,17 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         except (OSError, ValueError, KeyError):
             logger.warning("runtime config router unavailable; using default", exc_info=True)
             router = create_default_router()
-    permission_engine = PermissionEngine(cfg.db)
+    # B1: load and compile the *layered* effective policy — user (∼/.khaos/
+    # policy.yaml) ∩ project (<repo>/khaos_policy.yaml) ∩ platform — so it is
+    # the single source of truth that every runtime component is built from.
+    # No component may consult the raw project policy for enforcement.
+    from khaos.security.effective_policy import load_effective_policy
+    effective_policy = load_effective_policy(root)
+    logger.info("effective security policy digest: %s", effective_policy.digest)
+    permission_engine = PermissionEngine(
+        cfg.db,
+        commands_require_approval=effective_policy.commands_require_approval,
+    )
     await permission_engine.load_rules()
     memory_manager = cfg.memory_manager or MemoryManager(
         MemoryStore(cfg.db), budget=MemoryBudget(),
@@ -130,20 +153,43 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         workspace_manager=workspace_manager,
         backend_selector=BackendSelector(),
     )
-    policy = load_policy(root / "khaos_policy.yaml")
-    sandbox = cfg.sandbox or Sandbox.from_policy_mode(policy.mode, root)
-    network_guard = cfg.network_guard or NetworkGuard(
-        network_enabled=policy.network_enabled,
-        allowed_domains=policy.network_allowed_domains,
-        blocked_domains=policy.network_blocked_domains,
-    )
+    # H1: a single shared OfficeMutationAuthority fences every Office
+    # copy/move against cancellation/timeout side effects.  Registered on the
+    # scheduler (for tool dispatch) and on the file_tools module (for any
+    # direct call path).  The storage authority + limits also give Office the
+    # aggregate byte/entry accounting it previously lacked (M1).
+    office_authority = OfficeMutationAuthority()
+    from khaos.tools import file_tools as _file_tools
+    _file_tools.set_office_authority(office_authority)
+    # B1: every security component is built from the *effective* policy,
+    # not the raw project policy.  B2: root_capabilities is always installed
+    # (even when empty) so an empty set means "deny all", not "no restriction".
+    if cfg.sandbox is not None:
+        sandbox = cfg.sandbox
+    else:
+        sandbox = Sandbox(
+            mode=effective_policy.mode,
+            workspace_root=root,
+            root_capabilities=effective_policy.root_capabilities,
+        )
+    if cfg.network_guard is not None:
+        network_guard = cfg.network_guard
+    else:
+        network_guard = NetworkGuard(
+            network_enabled=effective_policy.network_enabled,
+            allowed_domains=list(effective_policy.network_allowed_domains),
+            blocked_domains=list(effective_policy.network_blocked_domains),
+        )
     scheduler = cfg.tool_scheduler or ToolScheduler(
         create_runtime_registry(), permission_engine,
         security_middleware=SecurityMiddleware(
-            policy=policy, sandbox=sandbox, network_guard=network_guard,
+            sandbox=sandbox,
+            network_guard=network_guard,
             audit_logger=cfg.audit_logger,
+            effective_policy=effective_policy,
         ),
     )
+    scheduler.set_office_authority(office_authority)
     compressor = ContextCompressor(router, memory_manager=memory_manager)
     verify_factory = VerifyFixLoop
     skill_generator = SkillGenerator()
@@ -163,4 +209,8 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         approval_broker=cfg.approval_broker,
         principal_id=cfg.principal_id,
     )
-    return RuntimeResult(loop, mode_manager, task_manager, skill_generator, scheduler, memory_manager, skill_manager, verify_factory, execution_service)
+    return RuntimeResult(
+        loop, mode_manager, task_manager, skill_generator, scheduler,
+        memory_manager, skill_manager, verify_factory, execution_service,
+        office_authority,
+    )

@@ -103,6 +103,13 @@ class ToolScheduler:
         # any tool without a Rust fast path keep using the asyncio handler.
         self.use_rust_executor = use_rust_executor
         self.invocation_broker = ToolInvocationBroker(registry)
+        # H1: optional shared OfficeMutationAuthority. Set by the runtime
+        # factory so Office copy/move are fenced against cancellation/timeout.
+        self.office_authority: Any = None
+
+    def set_office_authority(self, authority: Any) -> None:
+        """Register the shared OfficeMutationAuthority (called at startup)."""
+        self.office_authority = authority
 
     async def execute_batch(
         self,
@@ -137,6 +144,20 @@ class ToolScheduler:
             if network_guard is not None and network_guard.network_enabled
             else "none"
         )
+        # M1: propagate the effective policy digest so the approval
+        # ``profile_digest`` can bind the decision to the exact policy under
+        # which it was made.  Without this, two runtimes with different
+        # ``allowed_paths`` / ``commands_require_approval`` would produce
+        # identical ``profile_digest`` for the same (permission_level,
+        # target, network_policy) tuple, contradicting the claim that an
+        # approval was issued "under exactly this policy".
+        if "effective_policy_digest" not in tool_context:
+            # ``effective_policy_digest`` is a @property on the middleware;
+            # getattr returns the string digest (or "" if no effective
+            # policy was installed).
+            tool_context["effective_policy_digest"] = getattr(
+                self.security_middleware, "effective_policy_digest", ""
+            ) or ""
 
         approved_calls: list[dict] = []
         for call in tool_calls:
@@ -278,6 +299,15 @@ class ToolScheduler:
                             "permission_level": tool.permission_level,
                             "target": approval_target,
                             "network_policy": tool_context["network_policy"],
+                            # M1: bind the approval to the exact effective
+                            # policy under which it was issued.  A different
+                            # policy (different allowed_paths, commands_require_
+                            # approval, network_allowed_domains, …) yields a
+                            # different digest, so an approval cannot be
+                            # replayed under a loosened policy.
+                            "effective_policy_digest": tool_context.get(
+                                "effective_policy_digest", ""
+                            ),
                         }
                     ),
                     expires_at=expires_at,
@@ -439,6 +469,11 @@ class ToolScheduler:
             if mode == "office" and sandbox is not None:
                 # Internal capability: never sourced from model arguments.
                 invocation_context["office_workspace_root"] = sandbox.workspace_root
+            # H1: the OfficeMutationAuthority (registered at startup) fences
+            # office mutations against cancellation/timeout side effects.
+            office_authority = getattr(self, "office_authority", None)
+            if mode == "office" and office_authority is not None:
+                invocation_context["office_authority"] = office_authority
             if call.get("_approval_context") is not None:
                 invocation_context["approval_context"] = call["_approval_context"]
             output = await asyncio.wait_for(

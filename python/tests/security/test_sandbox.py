@@ -69,10 +69,12 @@ def test_yolo_allows_all() -> None:
 
 
 def test_from_policy_mode_invalid() -> None:
-    """An unknown mode string falls back to workspace-write."""
-    sandbox = Sandbox.from_policy_mode("not-a-real-mode")
+    """H3: an unknown mode string fails closed (raises) instead of silently
+    degrading to the more-permissive workspace-write."""
+    import pytest
 
-    assert sandbox.mode == SandboxMode.WORKSPACE_WRITE
+    with pytest.raises(ValueError, match="Unknown sandbox mode"):
+        Sandbox.from_policy_mode("not-a-real-mode")
 
 
 def test_from_policy_mode_valid() -> None:
@@ -126,3 +128,45 @@ def test_default_mode_is_workspace_write() -> None:
     sandbox = Sandbox()
 
     assert sandbox.mode == SandboxMode.WORKSPACE_WRITE
+
+
+# ---------------------------------------------------------------------------
+# root_capabilities (H3: allowed_paths enforcement)
+# ---------------------------------------------------------------------------
+
+
+def test_root_capabilities_confine_reads_and_writes(tmp_path) -> None:
+    """allowed_paths compiled to root_capabilities tightens the sandbox."""
+    workspace = tmp_path / "workspace"
+    src = workspace / "src"
+    docs = workspace / "docs"
+    secret = workspace / "secret"
+    for d in (src, docs, secret):
+        d.mkdir(parents=True)
+
+    sandbox = Sandbox(
+        mode=SandboxMode.WORKSPACE_WRITE,
+        workspace_root=workspace,
+        root_capabilities={src, docs},
+    )
+    # Inside a capability → allowed.
+    assert sandbox.check_read_path("src/a.txt").allowed is True
+    assert sandbox.check_write_path("docs/b.txt").allowed is True
+    # Inside workspace_root but OUTSIDE any capability → blocked.
+    read_denied = sandbox.check_read_path("secret/leak.txt")
+    write_denied = sandbox.check_write_path("secret/leak.txt")
+    assert read_denied.allowed is False
+    assert "allowed_paths" in read_denied.reason
+    assert write_denied.allowed is False
+    assert "allowed_paths" in write_denied.reason
+
+
+def test_no_root_capabilities_keeps_legacy_workspace_behavior(tmp_path) -> None:
+    """When root_capabilities is unset, the whole workspace_root is allowed."""
+    workspace = tmp_path / "workspace"
+    anywhere = workspace / "anywhere"
+    anywhere.mkdir(parents=True)
+
+    sandbox = Sandbox(mode=SandboxMode.WORKSPACE_WRITE, workspace_root=workspace)
+    assert sandbox.check_read_path("anywhere/x").allowed is True
+    assert sandbox.check_write_path("anywhere/x").allowed is True

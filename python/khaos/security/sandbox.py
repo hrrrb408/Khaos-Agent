@@ -115,6 +115,8 @@ class Sandbox:
         self,
         mode: SandboxMode = SandboxMode.WORKSPACE_WRITE,
         workspace_root: Path | None = None,
+        *,
+        root_capabilities: "set[Path] | frozenset[Path] | None" = None,
     ):
         self.mode = mode
         self.workspace_root = (
@@ -123,6 +125,15 @@ class Sandbox:
             else Path.cwd().resolve()
         )
         self._allowed_tools = CAPABILITIES.get(mode, set())
+        # B2: distinguish ``None`` (not set → confine to workspace_root, the
+        # legacy default) from an empty frozenset (explicitly no path is
+        # allowed → deny all).  Previously an empty set was treated as
+        # "no restriction", which fail-opened when ``allowed_paths: []`` or
+        # ``allowed_paths: [../outside]`` compiled to an empty set.
+        if root_capabilities is None:
+            self._root_capabilities: "frozenset[Path] | None" = None
+        else:
+            self._root_capabilities = frozenset(root_capabilities)
 
     def check_tool(self, tool_name: str) -> SandboxCheckResult:
         """检查工具是否在当前沙箱模式的 capability 集合内。
@@ -161,13 +172,23 @@ class Sandbox:
         resolved = candidate.resolve()
         try:
             resolved.relative_to(self.workspace_root)
-            return SandboxCheckResult(allowed=True, mode=self.mode.value)
         except ValueError:
             return SandboxCheckResult(
                 allowed=False,
                 reason=f"path '{resolved}' outside workspace '{self.workspace_root}'",
                 mode=self.mode.value,
             )
+        # B2: when root_capabilities are compiled from allowed_paths, confine
+        # writes to those capabilities.  ``None`` = not set (legacy: confine
+        # to workspace_root only).  An empty frozenset = explicitly no path
+        # allowed → deny all (fail closed, not fail open).
+        if self._root_capabilities is not None:
+            denied_reason = self._capability_denial_reason(resolved, "write")
+            if denied_reason is not None:
+                return SandboxCheckResult(
+                    allowed=False, reason=denied_reason, mode=self.mode.value
+                )
+        return SandboxCheckResult(allowed=True, mode=self.mode.value)
 
     def check_read_path(self, path: str) -> SandboxCheckResult:
         """Constrain default reads to the fixed Workspace root.
@@ -185,7 +206,6 @@ class Sandbox:
         resolved = candidate.resolve()
         try:
             resolved.relative_to(self.workspace_root)
-            return SandboxCheckResult(allowed=True, mode=self.mode.value)
         except ValueError:
             return SandboxCheckResult(
                 allowed=False,
@@ -195,18 +215,52 @@ class Sandbox:
                 ),
                 mode=self.mode.value,
             )
+        # B2: confine reads to compiled root_capabilities when present.
+        # ``None`` = not set (legacy: workspace_root only).  Empty frozenset
+        # = deny all reads (fail closed).
+        if self._root_capabilities is not None:
+            denied_reason = self._capability_denial_reason(resolved, "read")
+            if denied_reason is not None:
+                return SandboxCheckResult(
+                    allowed=False, reason=denied_reason, mode=self.mode.value
+                )
+        return SandboxCheckResult(allowed=True, mode=self.mode.value)
+
+    def _capability_denial_reason(
+        self, resolved: Path, op: str
+    ) -> str | None:
+        """Return a denial reason if ``resolved`` is outside all capabilities.
+
+        A capability is a directory; a path under any capability is allowed.
+        Returns ``None`` when the path is permitted.
+        """
+        for capability in self._root_capabilities:
+            try:
+                resolved.relative_to(capability)
+                return None
+            except ValueError:
+                continue
+        return (
+            f"{op} path '{resolved}' outside allowed_paths capabilities "
+            f"({', '.join(sorted(str(c) for c in self._root_capabilities))})"
+        )
 
     @classmethod
     def from_policy_mode(
         cls, mode_str: str, workspace_root: Path | None = None
     ) -> "Sandbox":
-        """从策略字符串构建沙箱。未知模式回退到 workspace-write。"""
+        """Build a sandbox from a policy mode string.
+
+        H3: an unknown mode now fails closed (raises ``ValueError``) instead
+        of silently degrading to the more-permissive ``workspace-write``.  A
+        typo in ``khaos_policy.yaml``'s ``sandbox.mode`` must surface at
+        startup, not grant unintended write/terminal access.
+        """
         try:
             mode = SandboxMode(mode_str)
-        except ValueError:
-            logger.warning(
-                "Unknown sandbox mode '%s', falling back to workspace-write",
-                mode_str,
-            )
-            mode = SandboxMode.WORKSPACE_WRITE
+        except ValueError as exc:
+            valid = [m.value for m in SandboxMode]
+            raise ValueError(
+                f"Unknown sandbox mode '{mode_str}'; expected one of {valid}"
+            ) from exc
         return cls(mode=mode, workspace_root=workspace_root)
