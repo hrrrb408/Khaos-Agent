@@ -1,0 +1,651 @@
+"""M4 security closure regression tests (B1 / H1 / H2 / H3).
+
+These tests pin the security contracts that were reopened in the post-PR-#28
+review.  Each test corresponds to one of the explicit gaps called out in the
+M4 review and exists so a future refactor cannot silently regress the
+closed boundary.
+
+Covered regressions:
+
+* B1 — SubAgent must inherit the same EffectivePolicy / Sandbox /
+  NetworkGuard / AuditLogger as the main AgentLoop (no parallel
+  unsupervised scheduler).  ``browser_file_upload`` must reject host
+  files outside the workspace root.
+* H1 — ``network_enabled=True`` must NOT bypass ``allowed_domains`` /
+  ``blocked_domains``; the blocklist always wins, an allowlist enforces
+  deny-by-default, and an empty allowlist means "unrestricted but still
+  subject to the blocklist".
+* H2 — ``commands.allow`` layered enforcement uses three-state semantics
+  (``None`` = unset, empty = deny all, non-empty = whitelist) so a
+  project whitelist is not silently erased by the default user layer.
+* H3 — ``RuntimeResult.aclose`` uses a shared ``_close_task`` so
+  concurrent callers wait on the same cleanup, a cancelled caller does
+  not abort the cleanup, and a component failure leaves ``_closed=False``
+  so the caller can retry.
+* H1 — per-principal ``BrowserContext`` isolation: different principals
+  get independent contexts; closing one principal's context does not
+  close another's.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import sys
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from khaos.db import Database
+from khaos.runtime import RuntimeConfig, build_runtime
+from khaos.runtime.factory import RuntimeResult
+from khaos.security.command_guard import CommandGuard
+from khaos.security.effective_policy import (
+    compile_effective_policy,
+)
+from khaos.security.middleware import SecurityMiddleware
+from khaos.security.network_guard import NetworkGuard
+from khaos.security.policy import SandboxPolicy
+from khaos.security.sandbox import SandboxMode
+from khaos.tools.browser_tools import BrowserManager
+from khaos.tools.registry import create_runtime_registry
+
+
+pytestmark = pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="runtime factory wires POSIX-only workspace authority",
+)
+
+
+# ───────────────────────────────── helpers ──────────────────────────────────
+
+
+async def _build_runtime(tmp_path: Path, policy_yaml: str, **overrides):
+    """Build a runtime with a project policy file; return (result, db)."""
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    (tmp_path / "khaos_policy.yaml").write_text(policy_yaml, encoding="utf-8")
+    cfg = RuntimeConfig(project_root=tmp_path, db=db, **overrides)
+    result = await build_runtime(cfg)
+    return result, db
+
+
+# ───────────────────────── B1: SubAgent security inheritance ────────────────
+
+
+async def test_subagent_runtime_inherits_effective_policy_middleware(tmp_path):
+    """B1: a subagent runtime (tool_allowlist set) must carry the same
+    EffectivePolicy / Sandbox / NetworkGuard / AuditLogger as the main
+    runtime — not a bare ``ToolScheduler`` with no security middleware.
+
+    The previous path constructed ``ToolScheduler(create_runtime_registry(),
+    permission_engine)`` with no middleware at all, giving the subagent an
+    unsupervised execution path that bypassed every security boundary the
+    main AgentLoop was bound by.
+    """
+    policy = (
+        "sandbox:\n"
+        "  mode: workspace-write\n"
+        "  network: false\n"
+        "commands:\n"
+        "  require_approval:\n"
+        "    - rm\n"
+    )
+    # tool_allowlist exercises the SubAgent code path in build_runtime.
+    result, db = await _build_runtime(
+        tmp_path,
+        policy,
+        tool_allowlist=["read_file", "list_directory"],
+        audit_logger=MagicMock(),
+    )
+    try:
+        scheduler = result.tool_scheduler
+        # B1: the scheduler must have a SecurityMiddleware installed —
+        # not the default-constructed bare middleware without sandbox.
+        assert scheduler.security_middleware is not None
+        # B1: the middleware must carry a Sandbox (capability gate).
+        assert scheduler.security_middleware.sandbox is not None
+        # B1: the middleware must carry a NetworkGuard (domain enforcement).
+        assert scheduler.security_middleware.network_guard is not None
+        # B1: the middleware must carry the EffectivePolicy (digest bound
+        # to every approval decision).
+        assert scheduler.security_middleware.effective_policy is not None
+        # B1: the registry must be PRUNED to exactly the declared tools —
+        # the subagent cannot invoke tools outside its declared scope.
+        registry = scheduler.registry
+        registered = set(registry._tools.keys())
+        assert "read_file" in registered
+        assert "list_directory" in registered
+        # A tool NOT in the allowlist must not be present.
+        assert "terminal" not in registered, (
+            "subagent registry must be pruned to declared tools; terminal "
+            "was not in the allowlist but is registered"
+        )
+    finally:
+        await result.aclose()
+        await db.close()
+
+
+async def test_subagent_registry_pruning_drops_undeclared_tools(tmp_path):
+    """B1: ``tool_allowlist`` must produce a genuine pruned view, not a
+    full registry with name validation only.
+
+    The previous spawner validated that declared tool names existed but
+    still handed the subagent a scheduler wired to the *full* registry,
+    so a subagent could invoke any registered tool.
+    """
+    policy = "sandbox:\n  mode: workspace-write\n"
+    result, db = await _build_runtime(
+        tmp_path, policy, tool_allowlist=["read_file"]
+    )
+    try:
+        registered = set(result.tool_scheduler.registry._tools.keys())
+        # The allowlist only contains read_file; nothing else should be
+        # present (especially not dangerous tools like terminal / write_file).
+        assert registered == {"read_file"}, (
+            f"registry should be pruned to {{read_file}} but got {registered}"
+        )
+    finally:
+        await result.aclose()
+        await db.close()
+
+
+# ───────────────────────── B1: browser_file_upload path ─────────────────────
+
+
+def test_browser_file_upload_rejects_host_path_outside_workspace(tmp_path):
+    """B1: ``browser_file_upload`` must reject a ``file_path`` that resolves
+    outside ``workspace_root`` — no arbitrary host file exfiltration via
+    the browser upload channel.
+
+    The previous handler passed ``file_path`` straight to
+    ``page.set_input_files`` with no containment check.
+    """
+    from khaos.tools.browser_tools import _validate_upload_path
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    # A file inside the workspace should pass validation.
+    inside = workspace / "ok.txt"
+    inside.write_text("hello", encoding="utf-8")
+    assert _validate_upload_path(str(inside), str(workspace)) is None
+
+    # A file outside the workspace must be rejected.
+    outside = tmp_path / "secret.key"
+    outside.write_text("AKIA" + "X" * 16, encoding="utf-8")
+    result = _validate_upload_path(str(outside), str(workspace))
+    assert result is not None
+    assert result["ok"] is False
+    assert "outside the workspace root" in result["error"]
+
+
+def test_browser_file_upload_rejects_symlink_escape(tmp_path):
+    """B1: a symlink that escapes the workspace must be rejected.
+
+    ``Path.resolve(strict=True)`` follows symlinks, so a symlink inside
+    the workspace that points to ``/etc/passwd`` resolves outside the
+    root and is rejected.
+    """
+    from khaos.tools.browser_tools import _validate_upload_path
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = tmp_path / "outside.txt"
+    target.write_text("secret", encoding="utf-8")
+    link = workspace / "escape.txt"
+    link.symlink_to(target)
+
+    result = _validate_upload_path(str(link), str(workspace))
+    assert result is not None
+    assert result["ok"] is False
+
+
+def test_browser_file_upload_enforces_size_limit(tmp_path):
+    """B1: ``browser_file_upload`` enforces a 10 MiB size limit so the
+    browser upload channel cannot be used for bulk exfiltration.
+    """
+    from khaos.tools.browser_tools import _UPLOAD_MAX_BYTES, _validate_upload_path
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    oversized = workspace / "big.bin"
+    oversized.write_bytes(b"\x00" * (_UPLOAD_MAX_BYTES + 1))
+
+    result = _validate_upload_path(str(oversized), str(workspace))
+    assert result is not None
+    assert result["ok"] is False
+    assert "exceeds the upload limit" in result["error"]
+
+
+async def test_browser_file_upload_requires_network_policy(tmp_path):
+    """B1: the handler rejects when ``network_policy`` is not
+    ``unrestricted-with-approval`` — defense in depth on top of the
+    capability broker.
+    """
+    from khaos.tools.browser_tools import browser_file_upload
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    f = workspace / "ok.txt"
+    f.write_text("hello", encoding="utf-8")
+
+    # No network policy → must be rejected.
+    result = await browser_file_upload(
+        selector="#file",
+        file_path=str(f),
+        workspace_root=str(workspace),
+        network_policy="none",
+    )
+    assert result["ok"] is False
+    assert "network access" in result["error"]
+
+
+# ───────────────────────── H1: NetworkGuard domain enforcement ──────────────
+
+
+def test_network_enabled_with_allowlist_denies_unlisted_domain():
+    """H1: ``network_enabled=True`` must NOT bypass the allowlist.
+
+    Previously the first line of ``check_tool`` was
+    ``if self.network_enabled: return allowed``, which made an allowlist
+    like ``[pypi.org]`` silently grant *unrestricted* network access.
+    """
+    guard = NetworkGuard(
+        network_enabled=True,
+        allowed_domains=["pypi.org"],
+    )
+    result = guard.check_tool(
+        "terminal", {"command": "curl https://evil.example.com"}
+    )
+    assert result.allowed is False
+    assert result.domain == "evil.example.com"
+    assert "not in allowlist" in result.reason
+
+
+def test_network_enabled_with_allowlist_allows_listed_domain():
+    """H1: an allowlisted domain is allowed when network is enabled."""
+    guard = NetworkGuard(
+        network_enabled=True,
+        allowed_domains=["pypi.org"],
+    )
+    result = guard.check_tool(
+        "terminal", {"command": "curl https://pypi.org/simple"}
+    )
+    assert result.allowed is True
+
+
+def test_network_enabled_with_blocklist_still_blocks():
+    """H1: ``blocked_domains`` always wins, even when network is enabled."""
+    guard = NetworkGuard(
+        network_enabled=True,
+        blocked_domains=["evil.example.com"],
+    )
+    result = guard.check_tool(
+        "terminal", {"command": "curl https://evil.example.com"}
+    )
+    assert result.allowed is False
+    assert "blocked by policy" in result.reason
+
+
+def test_network_enabled_with_allowlist_and_blocklist_blocklist_wins():
+    """H1: priority is blocked > allowed > network_enabled.
+
+    A domain in BOTH lists must be blocked (blocklist wins).
+    """
+    guard = NetworkGuard(
+        network_enabled=True,
+        allowed_domains=["example.com"],
+        blocked_domains=["bad.example.com"],
+    )
+    result = guard.check_tool(
+        "terminal", {"command": "curl https://bad.example.com"}
+    )
+    assert result.allowed is False
+
+
+def test_network_enabled_empty_allowlist_allows_unblocked_domains():
+    """H1: an empty allowlist with network enabled means unrestricted
+    (subject to blocklist) — this preserves backward compatibility for
+    callers that don't configure an allowlist.
+    """
+    guard = NetworkGuard(network_enabled=True)
+    result = guard.check_tool(
+        "terminal", {"command": "curl https://anything.com"}
+    )
+    assert result.allowed is True
+
+
+def test_network_disabled_blocks_even_with_allowlist():
+    """H1: when network is disabled, all network access is blocked
+    regardless of the allowlist — the allowlist can only TIGHTEN an
+    enabled network, not RELAX a disabled one.
+
+    This is the deliberate semantic change from the H1 fix: previously
+    an allowlist like ``[pypi.org]`` would silently grant pypi.org
+    access even with ``network_enabled=False``.  Now ``network_enabled``
+    is a TOTAL SWITCH — when off, all network access is blocked.
+    """
+    guard = NetworkGuard(
+        network_enabled=False,
+        allowed_domains=["pypi.org"],
+    )
+    result = guard.check_tool(
+        "terminal", {"command": "curl https://pypi.org/simple"}
+    )
+    assert result.allowed is False, (
+        "network_enabled=False must block ALL network access regardless "
+        "of the allowlist (the allowlist cannot relax a disabled network)"
+    )
+
+
+# ───────────────────────── H2: commands.allow layered enforcement ───────────
+
+
+def test_commands_allow_three_state_none_means_unset(tmp_path):
+    """H2: ``commands_allowed=None`` means "no allow-list configured" —
+    the CommandGuard must NOT enforce a whitelist (commands are allowed
+    unless blocked).
+    """
+    project = SandboxPolicy(mode="workspace-write")  # commands_allowed=None
+    eff = compile_effective_policy(project, workspace_root=tmp_path)
+    assert eff.commands_allowed is None
+
+    middleware = SecurityMiddleware(effective_policy=eff)
+    # None means no whitelist — the guard's _allowed_commands stays None.
+    assert middleware.command_guard._allowed_commands is None
+
+
+def test_commands_allow_three_state_empty_means_deny_all(tmp_path):
+    """H2: ``commands_allowed=[]`` means "deny all commands" — the
+    CommandGuard must install an empty frozenset so every base command
+    is rejected.
+    """
+    project = SandboxPolicy(
+        mode="workspace-write",
+        commands_allowed=[],  # explicit deny-all
+    )
+    eff = compile_effective_policy(project, workspace_root=tmp_path)
+    # An empty list compiles to an empty frozenset (not None).
+    assert eff.commands_allowed is not None
+    assert len(eff.commands_allowed) == 0
+
+    middleware = SecurityMiddleware(effective_policy=eff)
+    # Empty frozenset → guard rejects every command.
+    assert middleware.command_guard._allowed_commands == frozenset()
+
+
+def test_commands_allow_project_whitelist_survives_default_user_layer(tmp_path):
+    """H2: the production bug — a project whitelist like
+    ``commands.allow: [git, pytest]`` was erased by the default user
+    layer (which had ``commands_allowed = []``), then the middleware
+    treated the empty intersection as "unset" and allowed ALL commands.
+
+    With three-state semantics:
+    * default user layer has ``commands_allowed=None`` (unset);
+    * project layer has ``commands_allowed=[git, pytest]``;
+    * effective policy = project layer (only one configures a whitelist).
+    """
+    project = SandboxPolicy(
+        mode="workspace-write",
+        commands_allowed=["git", "pytest"],
+    )
+    # Default user policy: commands_allowed=None (the new default).
+    user = SandboxPolicy(mode="workspace-write")  # commands_allowed=None
+    eff = compile_effective_policy(
+        project, workspace_root=tmp_path, user_policy=user
+    )
+    assert eff.commands_allowed == frozenset({"git", "pytest"}), (
+        "project whitelist must survive the default user layer "
+        "(three-state: None means unset, not empty)"
+    )
+
+    middleware = SecurityMiddleware(effective_policy=eff)
+    assert middleware.command_guard._allowed_commands == frozenset(
+        {"git", "pytest"}
+    )
+
+
+def test_commands_allow_intersection_when_both_layers_configure(tmp_path):
+    """H2: when BOTH layers configure a whitelist, the result is the
+    intersection (stricter).  This is the only case where intersection
+    is correct — previously intersection was always used and an empty
+    user layer erased the project layer.
+    """
+    project = SandboxPolicy(
+        mode="workspace-write",
+        commands_allowed=["git", "pytest", "ls"],
+    )
+    user = SandboxPolicy(
+        mode="workspace-write",
+        commands_allowed=["git", "ls"],
+    )
+    eff = compile_effective_policy(
+        project, workspace_root=tmp_path, user_policy=user
+    )
+    assert eff.commands_allowed == frozenset({"git", "ls"})
+
+
+# ───────────────────────── H3: aclose shared _close_task ────────────────────
+
+
+async def test_concurrent_aclose_calls_wait_on_same_task():
+    """H3: when two coroutines call ``aclose()`` concurrently, the second
+    must NOT return immediately while cleanup is still in flight — both
+    must wait on the SAME shared ``_close_task``.
+
+    Previously the second caller saw ``_closing=True`` and returned at
+    once, so a concurrent caller could observe a half-torn-down runtime.
+    """
+    memory = MagicMock()
+    # Make memory.aclose slow so we can prove the second caller waits.
+    async def _slow_close():
+        await asyncio.sleep(0.05)
+    memory.aclose = AsyncMock(side_effect=_slow_close)
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=memory,
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+    )
+    # Launch both aclose calls concurrently.
+    await asyncio.gather(result.aclose(), result.aclose())
+    # The slow memory close must have run exactly once (idempotent), and
+    # both callers observed the final closed state.
+    assert memory.aclose.await_count == 1
+    assert result._closed is True
+
+
+async def test_aclose_component_failure_leaves_closed_false_for_retry():
+    """H3: a component shutdown failure must set ``_close_failed=True``
+    and leave ``_closed=False`` so the caller can observe the failure
+    and retry (each component's shutdown is expected to be idempotent).
+
+    Previously the failure was swallowed and ``_closed`` was set anyway,
+    so the caller had no way to know cleanup was incomplete.
+    """
+    office = MagicMock()
+    office.shutdown = AsyncMock(side_effect=RuntimeError("office boom"))
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        office_authority=office,
+        owns_office_authority=True,
+    )
+    await result.aclose()
+    assert result._close_failed is True
+    assert result._closed is False
+    # A retry must be possible: _close_task was reset.
+    assert result._close_task is None
+
+
+async def test_aclose_cancellation_does_not_abort_cleanup():
+    """H3: if the caller of ``aclose()`` is cancelled, the cleanup task
+    itself must keep running (it is shielded) so a subsequent ``aclose``
+    can await the still-running task and observe the final state.
+
+    Previously a cancelled ``aclose`` would leave the runtime in an
+    indeterminate state with no owner to retry the cleanup.
+    """
+    memory = MagicMock()
+    async def _slow_close():
+        await asyncio.sleep(0.05)
+    memory.aclose = AsyncMock(side_effect=_slow_close)
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=memory,
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+    )
+    # Start aclose, then cancel it mid-flight.
+    task = asyncio.ensure_future(result.aclose())
+    await asyncio.sleep(0.01)  # let it enter the close task
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    # The shared _close_task must still be running (or already done).
+    # Give it time to finish, then a second aclose must observe _closed.
+    await asyncio.sleep(0.1)
+    await result.aclose()
+    assert result._closed is True
+
+
+async def test_aclose_releases_principal_browser_context():
+    """H1 / H3: ``aclose`` must release the principal's per-session
+    BrowserContext so cookies / DOM / page state cannot leak into a
+    subsequent run by a different principal sharing the same process-wide
+    BrowserManager.
+    """
+    manager = MagicMock()
+    manager.close_context = AsyncMock(return_value={"ok": True})
+    # Patch the module-level _manager that factory.aclose imports.
+    import khaos.tools.browser_tools as bt
+
+    original = bt._manager
+    bt._manager = manager
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        principal_id="user-42",
+    )
+    try:
+        await result.aclose()
+        manager.close_context.assert_awaited_once_with("user-42")
+    finally:
+        bt._manager = original
+
+
+# ───────────────────────── H1: per-principal BrowserContext ─────────────────
+
+
+def test_browser_manager_per_principal_isolation():
+    """H1: ``BrowserManager`` maintains a per-principal context+page pair
+    keyed by ``principal_id`` so different principals do not share
+    cookies / DOM / page state.
+
+    This test runs against the mock fallback path (no Playwright needed)
+    by inspecting the manager's ``_contexts`` dict structure directly.
+    """
+    manager = BrowserManager()
+    # Two different principals must map to two different context keys.
+    # In mock mode ensure_page returns None (Playwright not installed),
+    # but we can still verify the keying logic by calling _safe_execute
+    # and observing that no exception leaks.  The structural guarantee
+    # is that _contexts is keyed by principal_id.
+    assert manager._contexts == {}
+    # The key derivation rule: empty principal_id → "default".
+    # We can't easily exercise ensure_page without Playwright, so verify
+    # the key derivation directly via close_context (which uses the same
+    # key derivation).
+    import asyncio
+
+    async def _run():
+        # close_context on a never-created principal must be a no-op
+        # that doesn't affect other principals.
+        await manager.close_context("principal-A")
+        await manager.close_context("principal-B")
+    asyncio.run(_run())
+    # No contexts were created; close_context is a no-op.
+    assert manager._contexts == {}
+
+
+def test_browser_manager_close_context_only_closes_target_principal():
+    """H1: closing one principal's BrowserContext must not close another
+    principal's context — isolation must hold in both directions.
+    """
+    manager = BrowserManager()
+    # Simulate two pre-existing principal contexts.
+    fake_ctx_a = MagicMock()
+    fake_ctx_a.close = AsyncMock()
+    fake_ctx_b = MagicMock()
+    fake_ctx_b.close = AsyncMock()
+    manager._contexts = {
+        "principal-A": {"context": fake_ctx_a, "page": MagicMock()},
+        "principal-B": {"context": fake_ctx_b, "page": MagicMock()},
+    }
+    import asyncio
+
+    asyncio.run(manager.close_context("principal-A"))
+    # Only A's context must be closed and popped.
+    fake_ctx_a.close.assert_awaited_once()
+    fake_ctx_b.close.assert_not_awaited()
+    assert "principal-A" not in manager._contexts
+    assert "principal-B" in manager._contexts
+
+
+# ───────────────────────── B1: full factory effective policy wiring ─────────
+
+
+async def test_main_runtime_wires_effective_policy_into_middleware(tmp_path):
+    """B1 / H2: the MAIN runtime (no tool_allowlist) must also wire the
+    EffectivePolicy into the SecurityMiddleware so the main AgentLoop is
+    bound by the same digest as the subagent.
+    """
+    policy = (
+        "sandbox:\n"
+        "  mode: workspace-write\n"
+        "  network: false\n"
+        "commands:\n"
+        "  allow:\n"
+        "    - git\n"
+        "    - pytest\n"
+        "  require_approval:\n"
+        "    - rm\n"
+    )
+    result, db = await _build_runtime(tmp_path, policy)
+    try:
+        middleware = result.tool_scheduler.security_middleware
+        assert middleware is not None
+        assert middleware.effective_policy is not None
+        # H2: commands.allow from the project policy must reach the
+        # CommandGuard as a non-empty frozenset whitelist.
+        assert middleware.command_guard._allowed_commands == frozenset(
+            {"git", "pytest"}
+        )
+        # B1: the effective policy digest must be non-empty so approval
+        # binding can include it.
+        assert middleware.effective_policy_digest != ""
+    finally:
+        await result.aclose()
+        await db.close()

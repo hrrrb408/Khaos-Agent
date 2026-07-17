@@ -72,5 +72,10 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
         "test_file_search_redos.py",
         "test_effective_policy.py",
         "test_commands_require_approval.py",
+        # M2: runtime lifecycle / factory / RPC peer-identity contracts
+        # must stay in the matrix so they cannot be silently removed.
+        "test_aclose.py",
+        "test_factory_effective_policy.py",
+        "test_grpc_server.py",
     ):
         assert required_contract in matrix
