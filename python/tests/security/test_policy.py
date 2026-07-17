@@ -137,6 +137,38 @@ def test_empty_yaml_file_uses_defaults(tmp_path: Path) -> None:
     assert policy.mode == "workspace-write"
 
 
+def test_top_level_list_yaml_fails_closed(tmp_path: Path) -> None:
+    """H1: a valid-but-non-mapping YAML (list at top level) must fail closed.
+
+    Previously ``if not isinstance(data, dict): data = {}`` silently
+    degraded to the default ``workspace-write`` policy, so a user who
+    mistyped the structure while trying to lock down to read-only would
+    silently gain write and terminal access.
+    """
+    from khaos.security.effective_policy import PolicyCompilationError
+
+    policy_file = _write_policy(
+        tmp_path / "khaos_policy.yaml",
+        "- sandbox:\n    mode: read-only\n",
+    )
+    with pytest.raises(PolicyCompilationError, match="mapping"):
+        load_policy(policy_file)
+
+
+def test_top_level_scalar_yaml_fails_closed(tmp_path: Path) -> None:
+    """H1: a bare scalar YAML (e.g. ``read-only``) must fail closed.
+
+    A user might write just ``read-only`` intending it as the mode, but
+    YAML parses this as a string, not a mapping.  Previously this silently
+    degraded to ``workspace-write``.
+    """
+    from khaos.security.effective_policy import PolicyCompilationError
+
+    policy_file = _write_policy(tmp_path / "khaos_policy.yaml", "read-only\n")
+    with pytest.raises(PolicyCompilationError, match="mapping"):
+        load_policy(policy_file)
+
+
 def test_from_dict_rejects_unknown_keys() -> None:
     """H3: unknown top-level keys raise rather than being silently ignored."""
     with pytest.raises(ValueError, match="unknown"):

@@ -216,3 +216,56 @@ def test_validate_accepts_well_formed_policy():
             "audit": {"enabled": True},
         }
     )  # no raise
+
+
+def test_missing_user_policy_installs_safe_default_layer(tmp_path):
+    """B2: a missing user policy file must NOT let the project self-elevate.
+
+    Previously ``load_effective_policy`` set ``user_policy = None`` when
+    ``~/.khaos/policy.yaml`` did not exist, and ``PlatformCapability``
+    defaulted to ``YOLO`` — so an untrusted repo with ``mode: yolo`` became
+    its own security authority.  Now the safe ``default_user_policy()``
+    baseline is installed as the user layer, and ``PlatformCapability``
+    defaults to ``WORKSPACE_WRITE``.
+    """
+    from khaos.security.effective_policy import (
+        default_user_policy,
+        load_effective_policy,
+    )
+    from khaos.security.sandbox import SandboxMode
+
+    # Project tries to elevate to yolo + network.
+    project_policy = tmp_path / "khaos_policy.yaml"
+    project_policy.write_text(
+        "sandbox:\n  mode: yolo\n  network: true\n", encoding="utf-8"
+    )
+    # User policy path does not exist — B2 must install the safe default.
+    eff = load_effective_policy(
+        tmp_path,
+        user_policy_path=tmp_path / "nonexistent_user_policy.yaml",
+    )
+    # The effective mode must be clamped to WORKSPACE_WRITE (the platform
+    # default), NOT yolo — the project cannot self-elevate.
+    assert eff.mode == SandboxMode.WORKSPACE_WRITE
+    # Network must be off — the default user layer has network off, and
+    # network requires BOTH layers to enable it.
+    assert eff.network_enabled is False
+
+
+def test_default_platform_capability_is_workspace_write():
+    """B2: ``PlatformCapability`` defaults to WORKSPACE_WRITE, not YOLO.
+
+    This prevents an untrusted project from elevating to YOLO/FULL_ACCESS
+    when no explicit platform capability is provided.
+    """
+    cap = PlatformCapability()
+    assert cap.max_mode == SandboxMode.WORKSPACE_WRITE
+
+
+def test_default_user_policy_is_safe_baseline():
+    """B2: ``default_user_policy()`` returns a workspace-write, network-off policy."""
+    from khaos.security.effective_policy import default_user_policy
+
+    policy = default_user_policy()
+    assert policy.mode == "workspace-write"
+    assert policy.network_enabled is False

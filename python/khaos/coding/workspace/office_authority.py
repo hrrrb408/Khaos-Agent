@@ -32,11 +32,13 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generic, TypeVar
 
+from khaos.coding.workspace.boundary import MutationCancelled
 from khaos.coding.workspace.storage import (
     WorkspaceMutation,
     WorkspaceStorageAuthority,
@@ -94,6 +96,11 @@ class OfficeMutationAuthority:
         # Track in-flight mutation tasks so shutdown can wait for them to
         # settle — see ``wait_for_inflight`` / ``shutdown``.
         self._inflight: set[asyncio.Task] = set()
+        # H3: once ``_closing`` is set, no new mutation may register a
+        # worker.  ``shutdown()`` sets this atomically with ``writable=False``
+        # so a queued mutation that passed the outer writable check is
+        # caught by the re-check inside the lock.
+        self._closing: bool = False
 
     async def workspace_for_root(self, root: Path) -> OfficeWorkspace:
         """Return (creating if necessary) the Office workspace for ``root``.
@@ -129,38 +136,57 @@ class OfficeMutationAuthority:
     async def mutate(
         self,
         workspace: OfficeWorkspace,
-        operation: Callable[[], WorkspaceMutation[T]],
+        operation: Callable[[threading.Event], WorkspaceMutation[T]],
     ) -> T:
         """Apply one Office mutation under the storage authority + fence.
 
-        H1/H2 cancellation semantics:
+        H2 cooperative cancellation:
 
-        * H2: the per-root ``mutation_lock`` is acquired *before* the worker
-          task is created.  A cancellation that arrives while queued on the
-          lock simply unwinds — no worker is orphaned, no destination can
-          appear.  Previously the worker was created first and could keep
-          running after the caller had already received the cancellation.
+        * A ``threading.Event`` is created per mutation and passed to the
+          operation.  The operation checks it just before the final atomic
+          rename/link; if set, ``MutationCancelled`` is raised, the temp
+          tree is cleaned up, and no side effect lands.
 
-        * H1: a ``to_thread`` future cannot be force-cancelled, so we
-          ``asyncio.shield`` the worker until the authority has committed or
-          rolled back.  If the worker has *already committed* (returned a
-          value) by the time cancellation propagates, we return the success
-          result rather than raising ``CancelledError`` — a call must never
-          report failure while the side effect has already landed.  Only
-          when the worker raised (did not commit) do we propagate the
-          worker's exception (or ``CancelledError`` if the worker was
-          interrupted before it could even start).
+        * When the caller cancels (``CancelledError``), the event is set
+          *and* we keep waiting (under the lock) for the worker to settle —
+          a ``to_thread`` future cannot be force-cancelled.  If the worker
+          already committed (returned a value) before checking the event,
+          we return the success result (H1 invariant: a call must never
+          report failure while the side effect has landed).  If the worker
+          aborted (``MutationCancelled``) or raised, we propagate
+          ``CancelledError``.
+
+        H3 concurrency:
+
+        * ``writable`` and ``_closing`` are checked *outside* the lock for
+          fast-path rejection, then *re-checked inside* the lock so a
+          quarantine or shutdown that landed while we were queued on the
+          lock is caught before any worker is created.
         """
-        if not workspace.writable:
+        # H3: fast-path check outside the lock.
+        if self._closing or not workspace.writable:
             raise OfficeMutationError(
                 f"Office workspace {workspace.id} is not writable"
             )
         # H2: acquire the per-root fence BEFORE creating the worker so a
         # cancellation while queued on the lock cannot orphan a running
-        # thread.  The lock serializes mutations per root; holding it before
-        # worker creation guarantees the worker only starts once we are
-        # committed to waiting for it.
+        # thread.
         async with workspace.mutation_lock:
+            # H3: re-check inside the lock — a previous mutation may have
+            # quarantined the workspace, or shutdown may have started,
+            # while we were queued.
+            if self._closing or not workspace.writable:
+                raise OfficeMutationError(
+                    f"Office workspace {workspace.id} became non-writable "
+                    f"while waiting for the mutation lock"
+                )
+            # H2: cooperative cancel flag — checked by the operation just
+            # before the atomic publish.
+            cancel_event = threading.Event()
+
+            def wrapped_operation() -> WorkspaceMutation[T]:
+                return operation(cancel_event)
+
             worker = asyncio.create_task(
                 asyncio.to_thread(
                     self._storage_authority.mutate,
@@ -168,7 +194,7 @@ class OfficeMutationAuthority:
                     workspace.root,
                     workspace.baseline,
                     workspace.limits,
-                    operation,
+                    wrapped_operation,
                 )
             )
             self._inflight.add(worker)
@@ -178,31 +204,53 @@ class OfficeMutationAuthority:
                     try:
                         return await asyncio.shield(worker)
                     except asyncio.CancelledError:
-                        # ``to_thread`` cannot be force-cancelled.  Keep
-                        # looping (under the lock) until the worker settles,
-                        # so the authority has either committed or rolled
-                        # back before we release the fence.  H1: do NOT
-                        # raise CancelledError here — if the worker later
-                        # commits, we return its success result.
-                        # We must ``uncancel`` the current task *now* (not
-                        # after the loop) so the next ``await`` actually
-                        # waits for the worker instead of re-raising
-                        # CancelledError immediately.  Python 3.11+ keeps a
-                        # cancellation count; without ``uncancel`` the
-                        # count stays > 0 and every subsequent await
-                        # raises CancelledError, turning this loop into a
-                        # busy-spin that never lets the worker finish.
+                        # H2: signal the worker to abort before publish.
+                        # ``to_thread`` cannot be force-cancelled, so we
+                        # keep looping (under the lock) until the worker
+                        # settles.  H1: if the worker already committed,
+                        # the next ``await asyncio.shield(worker)`` returns
+                        # its success result — a call must never report
+                        # failure while the side effect has landed.
                         cancelled = True
+                        cancel_event.set()
+                        # ``uncancel`` *now* (not after the loop) so the
+                        # next ``await`` actually waits for the worker
+                        # instead of re-raising CancelledError immediately.
                         current = asyncio.current_task()
                         if current is not None and hasattr(current, "uncancel"):
                             current.uncancel()
-                # Worker has settled.  H1: if it committed successfully,
-                # return the result — do NOT mask a success as cancellation.
-                # If it raised (e.g. WorkspaceStorageViolation), propagate
-                # that exception (it is the real outcome, not the cancel).
+                    except MutationCancelled:
+                        # H2: the worker cooperatively aborted before the
+                        # atomic publish (it checked ``cancel_event`` and
+                        # raised).  This is re-raised by ``asyncio.shield``
+                        # directly — NOT as ``CancelledError`` — so without
+                        # this catch it would bypass the conversion below
+                        # and propagate as ``MutationCancelled`` to the
+                        # caller.  If the caller cancelled, propagate
+                        # ``CancelledError`` (the side effect did not land,
+                        # so the H1 invariant is not violated).  If the
+                        # caller did NOT cancel, re-raise as-is (shouldn't
+                        # happen in practice — ``cancel_event`` is only set
+                        # by this method when ``CancelledError`` is caught).
+                        if cancelled:
+                            raise asyncio.CancelledError()
+                        raise
+                # Worker settled without returning (it raised).
                 exc = worker.exception()
                 if exc is not None:
+                    # H2: if the worker raised ``MutationCancelled`` (or
+                    # any non-violation exception) and the caller cancelled,
+                    # propagate ``CancelledError`` — the side effect did
+                    # not land.  ``WorkspaceStorageViolation`` is propagated
+                    # as-is so the outer except can quarantine.
+                    if not isinstance(exc, WorkspaceStorageViolation) and cancelled:
+                        raise asyncio.CancelledError()
                     raise exc
+                if cancelled:
+                    # Defensive: worker returned a value but we were
+                    # cancelled — shouldn't happen (we'd have returned
+                    # inside the while loop), but fail safe.
+                    raise asyncio.CancelledError()
                 return worker.result()
             except WorkspaceStorageViolation as exc:
                 if exc.quarantine_required:
@@ -225,19 +273,32 @@ class OfficeMutationAuthority:
 
         Called at turn end / shutdown / mode-switch so a cancelled call cannot
         keep mutating the filesystem after its result event has been emitted.
+
+        H3: loops until ``_inflight`` is stably empty.  With ``_closing=True``
+        no new workers can be registered, so the loop normally executes once;
+        the repetition is defensive against any race in the registration path.
         """
-        if not self._inflight:
-            return
-        pending = list(self._inflight)
-        # Shield: we are *waiting* for them to settle, not trying to cancel.
-        await asyncio.gather(*pending, return_exceptions=True)
+        while self._inflight:
+            pending = list(self._inflight)
+            # Shield: we are *waiting* for them to settle, not trying to cancel.
+            await asyncio.gather(*pending, return_exceptions=True)
 
     async def shutdown(self) -> None:
-        """Wait for in-flight mutations, then mark every workspace read-only."""
-        await self.wait_for_inflight()
+        """Wait for in-flight mutations, then mark every workspace read-only.
+
+        H3: ``_closing`` and ``writable=False`` are set *atomically* (under
+        ``_registry_lock``) *before* waiting for in-flight workers.  This
+        closes the race where a mutation that passed the outer writable
+        check could create a new worker after ``wait_for_inflight`` snapshotted
+        the set but before ``writable`` was flipped.  With ``_closing=True``,
+        any mutation that reaches the lock re-check will fail closed without
+        creating a worker.
+        """
         async with self._registry_lock:
+            self._closing = True
             for workspace in self._workspaces.values():
                 workspace.writable = False
+        await self.wait_for_inflight()
 
     @staticmethod
     def _workspace_id(root: Path) -> str:

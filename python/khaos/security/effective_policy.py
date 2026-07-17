@@ -67,13 +67,14 @@ _MODE_INDEX = {mode: idx for idx, mode in enumerate(_MODE_STRICTNESS)}
 class PlatformCapability:
     """Runtime/platform-imposed upper bound on what a policy may permit.
 
-    Defaults to the most permissive capability set so that, in the absence of
-    platform limits, the effective policy is the pure user∩project
-    intersection.  Real deployments narrow this (e.g. a read-only filesystem
-    image sets ``max_mode=READ_ONLY``).
+    B2: defaults to ``WORKSPACE_WRITE`` — the safe baseline — so that in the
+    absence of an explicit platform capability, a project policy cannot
+    elevate to ``YOLO`` or ``FULL_ACCESS``.  Real deployments that need a
+    wider envelope (e.g. a trusted CI runner) must pass an explicit
+    ``PlatformCapability(max_mode=SandboxMode.YOLO)``.
     """
 
-    max_mode: SandboxMode = SandboxMode.YOLO
+    max_mode: SandboxMode = SandboxMode.WORKSPACE_WRITE
 
 
 @dataclass(frozen=True)
@@ -211,6 +212,24 @@ def compile_effective_policy(
     )
 
 
+def default_user_policy() -> SandboxPolicy:
+    """Return the trusted default user/global policy layer (B2).
+
+    When ``~/.khaos/policy.yaml`` does not exist, this safe baseline is used
+    as the *user* layer instead of ``None``.  It enforces:
+
+    * ``workspace-write`` mode (no YOLO / FULL_ACCESS elevation);
+    * network off;
+    * the default denied-paths list (``~/.ssh``, ``~/.aws``, …);
+    * the default require-approval command list (``git push``, ``rm``, …).
+
+    A project policy can only *tighten* this baseline (intersection), never
+    relax it.  This closes the hole where an untrusted repository could set
+    ``mode: yolo`` and become its own security authority.
+    """
+    return SandboxPolicy()
+
+
 def load_effective_policy(
     workspace_root: Path,
     *,
@@ -226,18 +245,25 @@ def load_effective_policy(
     a single ``EffectiveSecurityPolicy`` that drives every runtime component.
 
     Both layers are validated (``validate_policy_dict``) and fail closed on
-    unknown fields / wrong types.  A missing user policy file is fine — the
-    effective policy degrades to the project-only intersection.
+    unknown fields / wrong types.
+
+    B2: a missing user policy file does **not** degrade to the project-only
+    intersection — that would let an untrusted project elevate to ``yolo``.
+    Instead, the safe ``default_user_policy()`` baseline is installed as the
+    user layer, so the project can only tighten it.
     """
     project_path = project_policy_path or (workspace_root / "khaos_policy.yaml")
     user_path = user_policy_path or USER_POLICY_PATH
 
     project_policy = load_policy(project_path)
-    user_policy: SandboxPolicy | None = None
     expanded_user = user_path.expanduser()
     if expanded_user.is_file():
         logger.info("Loading user policy from %s", expanded_user)
-        user_policy = load_policy(expanded_user)
+        user_policy: SandboxPolicy = load_policy(expanded_user)
+    else:
+        # B2: install the trusted default user layer so the project policy
+        # cannot elevate beyond ``workspace-write`` / network-off.
+        user_policy = default_user_policy()
 
     return compile_effective_policy(
         project_policy,

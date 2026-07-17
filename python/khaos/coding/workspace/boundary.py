@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import hashlib
 import stat
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -17,6 +18,16 @@ from khaos.coding.planning.safe_workspace_path import (
 
 class WorkspaceBoundaryError(PermissionError):
     pass
+
+
+class MutationCancelled(RuntimeError):
+    """Cooperative cancellation: a mutation was aborted before atomic publish.
+
+    H2: raised by ``copy_path`` / ``copy_file`` / ``move_path`` when the
+    caller-provided ``cancel_event`` is set just before the final atomic
+    rename/link.  The temporary tree is cleaned up by the caller's
+    ``finally`` block; the side effect never becomes visible.
+    """
 
 
 @dataclass(frozen=True)
@@ -464,8 +475,21 @@ class SafeWorkspaceFS:
         max_bytes: int = DEFAULT_TREE_BYTES,
         max_entries: int = DEFAULT_TREE_ENTRIES,
         max_depth: int = DEFAULT_TREE_DEPTH,
+        cancel_event: threading.Event | None = None,
+        identity_out: list | None = None,
     ) -> int:
-        """Copy a file or tree using only fixed dirfds and no-follow opens."""
+        """Copy a file or tree using only fixed dirfds and no-follow opens.
+
+        H2: if ``cancel_event`` is provided and set just before the final
+        atomic rename, ``MutationCancelled`` is raised and the temporary
+        tree is cleaned up — the side effect never becomes visible.
+
+        H4: if ``identity_out`` is provided, the published destination's
+        ``(st_dev, st_ino, st_mode)`` is appended *inside the same dirfd
+        critical section* as the atomic rename, eliminating the post-publish
+        TOCTOU window that a separate ``capture_path_identity`` call would
+        introduce.
+        """
         source_relative = self.relative(source)
         destination_relative = self.relative(destination)
         source_parent = self._parent(source_relative)
@@ -478,7 +502,10 @@ class SafeWorkspaceFS:
             if source_info is None:
                 raise FileNotFoundError(source_relative)
             if stat.S_ISREG(source_info.st_mode):
-                return self.copy_file(source, destination)
+                return self.copy_file(
+                    source, destination,
+                    cancel_event=cancel_event, identity_out=identity_out,
+                )
             if not stat.S_ISDIR(source_info.st_mode):
                 raise WorkspaceBoundaryError("copy source type is unsafe")
             if destination_relative.startswith(f"{source_relative}/"):
@@ -537,6 +564,14 @@ class SafeWorkspaceFS:
                 os.close(source_descriptor)
             source_parent.revalidate()
             destination_parent.revalidate()
+            # H2: cooperative cancel — check just before the atomic publish.
+            # If cancelled, ``temporary`` is still set so the ``finally``
+            # block below cleans up the temp tree; the destination never
+            # appears.
+            if cancel_event is not None and cancel_event.is_set():
+                raise MutationCancelled(
+                    "copy cancelled before atomic publish"
+                )
             self._handle._rename_no_replace(
                 destination_parent.parent_fd,
                 temporary,
@@ -544,6 +579,17 @@ class SafeWorkspaceFS:
                 destination_parent.leaf,
             )
             temporary = ""
+            # H4: capture the published identity through the same dirfds
+            # (still open), before releasing them — no re-open window.
+            if identity_out is not None:
+                published = os.stat(
+                    destination_parent.leaf,
+                    dir_fd=destination_parent.parent_fd,
+                    follow_symlinks=False,
+                )
+                identity_out.append(
+                    (published.st_dev, published.st_ino, published.st_mode)
+                )
             destination_parent.fsync()
             return budget["bytes"]
         finally:
@@ -556,8 +602,20 @@ class SafeWorkspaceFS:
         self,
         source: str | Path,
         destination: str | Path,
+        *,
+        cancel_event: threading.Event | None = None,
+        identity_out: list | None = None,
     ) -> None:
-        """Move one validated file/tree atomically within the fixed root."""
+        """Move one validated file/tree atomically within the fixed root.
+
+        H2: if ``cancel_event`` is provided and set just before the final
+        atomic rename, ``MutationCancelled`` is raised — the source is
+        untouched and no side effect lands.
+
+        H4: if ``identity_out`` is provided, the published destination's
+        ``(st_dev, st_ino, st_mode)`` is appended inside the same dirfd
+        critical section as the atomic rename.
+        """
         source_relative = self.relative(source)
         destination_relative = self.relative(destination)
         source_parent = self._parent(source_relative)
@@ -602,12 +660,29 @@ class SafeWorkspaceFS:
                 source_info.st_ino,
             ):
                 raise WorkspaceBoundaryError("move source identity changed")
+            # H2: cooperative cancel — check just before the atomic rename.
+            # The source is still in place; no side effect has landed.
+            if cancel_event is not None and cancel_event.is_set():
+                raise MutationCancelled(
+                    "move cancelled before atomic publish"
+                )
             self._handle._rename_no_replace(
                 source_parent.parent_fd,
                 source_parent.leaf,
                 destination_parent.parent_fd,
                 destination_parent.leaf,
             )
+            # H4: capture the published identity through the same dirfds
+            # (still open), before releasing them — no re-open window.
+            if identity_out is not None:
+                published = os.stat(
+                    destination_parent.leaf,
+                    dir_fd=destination_parent.parent_fd,
+                    follow_symlinks=False,
+                )
+                identity_out.append(
+                    (published.st_dev, published.st_ino, published.st_mode)
+                )
             source_parent.fsync()
             if source_parent.identity != destination_parent.identity:
                 destination_parent.fsync()
@@ -849,7 +924,14 @@ class SafeWorkspaceFS:
         self.write_bytes(target, updated.encode("utf-8"))
         return updated
 
-    def copy_file(self, source: str | Path, destination: str | Path) -> int:
+    def copy_file(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        cancel_event: threading.Event | None = None,
+        identity_out: list | None = None,
+    ) -> int:
         source_relative = self.relative(source)
         relative = self.relative(destination)
         source_parent = self._parent(source_relative)
@@ -909,6 +991,11 @@ class SafeWorkspaceFS:
                 raise WorkspaceBoundaryError("copy source changed while reading")
             source_parent.revalidate()
             parent.revalidate()
+            # H2: cooperative cancel — check just before the atomic link.
+            if cancel_event is not None and cancel_event.is_set():
+                raise MutationCancelled(
+                    "copy cancelled before atomic publish"
+                )
             os.link(
                 temporary,
                 parent.leaf,
@@ -918,6 +1005,16 @@ class SafeWorkspaceFS:
             )
             os.unlink(temporary, dir_fd=parent.parent_fd)
             temporary = ""
+            # H4: capture identity inside the same dirfd critical section.
+            if identity_out is not None:
+                published = os.stat(
+                    parent.leaf,
+                    dir_fd=parent.parent_fd,
+                    follow_symlinks=False,
+                )
+                identity_out.append(
+                    (published.st_dev, published.st_ino, published.st_mode)
+                )
             parent.fsync()
             return total
         finally:
