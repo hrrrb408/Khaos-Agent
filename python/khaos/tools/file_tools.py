@@ -504,20 +504,47 @@ def _office_copy_mutation(
     post-mutation storage violation is raised (e.g. aggregate budget blown),
     and the fence's ``asyncio.shield`` guarantees cancellation waits for the
     atomic rename to settle before propagating.
+
+    M2: rollback is now *identity-bound*.  Immediately after the atomic
+    publish we capture the destination's ``(st_dev, st_ino, st_mode)`` via
+    fixed dirfds.  The rollback closure then uses ``remove_published`` —
+    which re-opens the parent through ``O_NOFOLLOW`` dirfds, ``lstat`` s
+    the leaf *without* following it, verifies the identity still matches,
+    and only then removes it (recursively for directories via the
+    ``_remove_tree_at`` dirfd primitive, or ``os.unlink`` for files) and
+    ``fsync`` s the parent.  This replaces the previous
+    ``shutil.rmtree(ignore_errors=True)`` / ``unlink(missing_ok=True)``,
+    which would happily remove any object an attacker had swapped in at
+    the destination path after our publish.
     """
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
 
     value = _office_copy_sync(root, source, destination)
-    destination_path = root / _destination_relative(root, destination)
+    destination_relative = _destination_relative(root, destination)
+
+    # M2: capture the published destination's identity right after the
+    # atomic publish, while we still hold the storage-authority mutation
+    # lock.  ``None`` means the publish did not actually land (e.g. the
+    # sync helper rolled back); rollback then becomes a no-op.
+    published_identity: "tuple[int, int, int] | None" = None
+    if value.get("ok"):
+        with SafeWorkspaceFS(root) as filesystem:
+            published_identity = filesystem.capture_path_identity(
+                destination_relative
+            )
 
     def rollback() -> None:
-        if value.get("ok"):
-            import shutil
-
-            if destination_path.is_dir():
-                shutil.rmtree(destination_path, ignore_errors=True)
-            else:
-                destination_path.unlink(missing_ok=True)
+        if not value.get("ok") or published_identity is None:
+            return
+        # Re-open the filesystem through fixed dirfds and remove the
+        # published path *only if* its identity still matches what we
+        # captured.  A mismatch (concurrent replacement, symlink swap, …)
+        # raises ``WorkspaceBoundaryError``; the storage authority catches
+        # that and quarantines the workspace rather than removing the wrong
+        # object.
+        with SafeWorkspaceFS(root) as filesystem:
+            filesystem.remove_published(destination_relative, published_identity)
 
     return WorkspaceMutation(value=value, rollback=rollback, finalize=lambda: None)
 
@@ -531,24 +558,43 @@ def _office_move_mutation(
     exists (e.g. a concurrent change), rollback is a no-op rather than raising
     — the storage authority already flags ``quarantine_required`` from the
     residual violation.
+
+    M2: rollback is now *identity-bound*.  Immediately after the atomic
+    move we capture the destination's ``(st_dev, st_ino, st_mode)`` via
+    fixed dirfds.  The rollback closure uses ``move_published_back`` —
+    which re-opens the parent through ``O_NOFOLLOW`` dirfds, verifies the
+    leaf's identity still matches, and only then performs an
+    identity-bound ``move_path`` back to the source.  This replaces the
+    previous ``shutil.move(destination, source)``, which would move any
+    object that happened to be at the destination path — including one an
+    attacker had swapped in after our publish.
     """
+    from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
 
     value = _office_move_sync(root, source, destination)
-    source_path = root / _destination_relative(root, source)
-    destination_path = root / _destination_relative(root, destination)
+    source_relative = _destination_relative(root, source)
+    destination_relative = _destination_relative(root, destination)
+
+    # M2: capture the published destination's identity right after the
+    # atomic move, while we still hold the storage-authority mutation lock.
+    published_identity: "tuple[int, int, int] | None" = None
+    if value.get("ok"):
+        with SafeWorkspaceFS(root) as filesystem:
+            published_identity = filesystem.capture_path_identity(
+                destination_relative
+            )
 
     def rollback() -> None:
-        if not value.get("ok"):
+        if not value.get("ok") or published_identity is None:
             return
-        try:
-            import shutil
-
-            if destination_path.exists():
-                shutil.move(str(destination_path), str(source_path))
-        except OSError:
-            # Best-effort; the authority will quarantine on residual violation.
-            pass
+        # Identity-bound move-back: only move the object we published, never
+        # a concurrently-replaced leaf.  A mismatch raises
+        # ``WorkspaceBoundaryError``; the storage authority quarantines.
+        with SafeWorkspaceFS(root) as filesystem:
+            filesystem.move_published_back(
+                destination_relative, source_relative, published_identity
+            )
 
     return WorkspaceMutation(value=value, rollback=rollback, finalize=lambda: None)
 

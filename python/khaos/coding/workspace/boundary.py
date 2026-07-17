@@ -990,6 +990,159 @@ class SafeWorkspaceFS:
         except (OSError, SafePathError) as exc:
             raise WorkspaceBoundaryError(str(exc)) from exc
 
+    def capture_path_identity(
+        self, target: str | Path
+    ) -> tuple[int, int, int] | None:
+        """Return ``(st_dev, st_ino, st_mode)`` of ``target`` via fixed dirfds.
+
+        Used by Office rollback (M2) to capture the identity of a path
+        *immediately after* the atomic publish, so the rollback closure can
+        later verify the leaf has not been replaced by a concurrent
+        operation before removing it.  Returns ``None`` if the path does not
+        exist (e.g. the publish was rolled back by a deeper layer).
+        """
+        relative = self.relative(target)
+        parent = self._parent(relative)
+        try:
+            info = parent.lstat()
+            if info is None:
+                return None
+            # Reject symlinks outright — a published Office destination must
+            # be a real directory or regular file we just created, never a
+            # symlink.  This also blocks a TOCTOU where an attacker replaces
+            # the leaf with a symlink between publish and capture.
+            if stat.S_ISLNK(info.st_mode):
+                raise WorkspaceBoundaryError(
+                    "captured path is a symlink; refusing to bind identity"
+                )
+            parent.revalidate()
+            return (info.st_dev, info.st_ino, info.st_mode)
+        finally:
+            parent.close()
+
+    def remove_published(
+        self,
+        target: str | Path,
+        expected_identity: tuple[int, int, int] | None,
+    ) -> bool:
+        """Identity-bound removal of a path this authority just published.
+
+        M2: replaces the previous ``shutil.rmtree(ignore_errors=True)`` /
+        ``unlink(missing_ok=True)`` rollback, which would happily remove any
+        file/symlink that happened to be at the destination path — including
+        one an attacker or concurrent process had swapped in after our
+        publish.  This method:
+
+        * resolves the parent directory through fixed dirfds (``O_NOFOLLOW``
+          at every level, so a symlink in the path cannot redirect the
+          removal);
+        * ``lstat`` s the leaf *without* following it, and verifies
+          ``(st_dev, st_ino)`` matches the identity captured right after the
+          publish;
+        * only then removes the leaf (recursively for directories via the
+          ``_remove_tree_at`` dirfd primitive, or ``os.unlink`` for regular
+          files), and ``fsync`` s the parent so the removal survives a
+          crash.
+
+        Returns ``True`` if the path was removed, ``False`` if it was
+        already gone (no-op), and raises ``WorkspaceBoundaryError`` if the
+        leaf exists but its identity does not match — the caller (storage
+        authority) then quarantines the workspace rather than risking
+        removal of the wrong object.
+        """
+        if expected_identity is None:
+            return False
+        relative = self.relative(target)
+        parent = self._parent(relative)
+        try:
+            current = parent.lstat()
+            if current is None:
+                # Already gone — nothing to roll back.  This is the
+                # "someone else already cleaned up" case; treat as success.
+                return False
+            expected_dev, expected_ino, _expected_mode = expected_identity
+            if (current.st_dev, current.st_ino) != (expected_dev, expected_ino):
+                raise WorkspaceBoundaryError(
+                    "rollback target identity changed; refusing to remove a "
+                    "concurrently-replaced path"
+                )
+            if stat.S_ISLNK(current.st_mode):
+                # We never publish symlinks; a symlink here means the leaf
+                # was replaced between publish and rollback.
+                raise WorkspaceBoundaryError(
+                    "rollback target became a symlink; refusing to follow"
+                )
+            parent.revalidate()
+            if stat.S_ISDIR(current.st_mode):
+                self._remove_tree_at(parent.parent_fd, parent.leaf)
+            else:
+                os.unlink(parent.leaf, dir_fd=parent.parent_fd)
+            parent.revalidate()
+            parent.fsync()
+            return True
+        finally:
+            parent.close()
+
+    def move_published_back(
+        self,
+        target: str | Path,
+        source: str | Path,
+        expected_identity: tuple[int, int, int] | None,
+    ) -> bool:
+        """Identity-bound move-back of a path this authority just published.
+
+        M2: replaces the previous ``shutil.move(destination, source)``
+        rollback for Office ``move_file``, which would move any object that
+        happened to be at the destination path — including one an attacker
+        had swapped in after our publish.  This method:
+
+        * captures the current identity of ``target`` (the move's
+          destination, which now holds the published tree);
+        * verifies it matches ``expected_identity`` (captured right after
+          the original move committed);
+        * only then performs an identity-bound ``move_path(target, source)``
+          to put the tree back where it came from.
+
+        Returns ``True`` if the move-back happened, ``False`` if ``target``
+        was already gone (no-op), and raises ``WorkspaceBoundaryError`` if
+        the leaf exists but its identity does not match — the caller then
+        quarantines the workspace rather than risking moving the wrong
+        object back to ``source``.
+        """
+        if expected_identity is None:
+            return False
+        target_relative = self.relative(target)
+        source_relative = self.relative(source)
+        # Pre-verify the target's identity so we never move a
+        # concurrently-replaced object back.  ``move_path`` does its own
+        # identity check *during* the move, but that only guards against
+        # mid-move replacement; it does not compare against the identity we
+        # captured at publish time.
+        parent = self._parent(target_relative)
+        try:
+            current = parent.lstat()
+            if current is None:
+                return False
+            expected_dev, expected_ino, _expected_mode = expected_identity
+            if (current.st_dev, current.st_ino) != (expected_dev, expected_ino):
+                raise WorkspaceBoundaryError(
+                    "move-back target identity changed; refusing to move a "
+                    "concurrently-replaced path back to source"
+                )
+            if stat.S_ISLNK(current.st_mode):
+                raise WorkspaceBoundaryError(
+                    "move-back target became a symlink; refusing to follow"
+                )
+            parent.revalidate()
+        finally:
+            parent.close()
+        # ``move_path`` re-validates the source identity during the move and
+        # uses ``_rename_no_replace`` so the destination (the original
+        # source) must not exist — which it cannot, since the original move
+        # removed it.
+        self.move_path(target_relative, source_relative)
+        return True
+
 
 def resolve_write_target(worktree: Path, target: str | Path) -> Path:
     root = worktree.expanduser().resolve()
