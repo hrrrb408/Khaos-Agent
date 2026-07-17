@@ -232,6 +232,72 @@ async def test_scheduler_consumes_bound_approval_before_dispatch(tmp_path):
     await db.close()
 
 
+async def test_profile_digest_binds_effective_policy(tmp_path):
+    """M1: ``profile_digest`` includes the effective policy digest so an
+    approval cannot be replayed under a different (loosened) policy.
+
+    Two schedulers with the same ``(permission_level, target, network_policy)``
+    but different effective policies must produce different profile digests.
+    """
+    from khaos.security.effective_policy import (
+        EffectiveSecurityPolicy,
+        compile_effective_policy,
+    )
+    from khaos.security.policy import SandboxPolicy
+
+    async def _capture_profile_digest(effective_policy) -> str:
+        db = Database(tmp_path / f"khaos-{id(effective_policy)}.db")
+        await db.connect()
+        await db.run_migrations()
+        await db.create_session("test-session", mode="coding")
+        middleware = SecurityMiddleware(
+            sandbox=Sandbox(mode=SandboxMode.WORKSPACE_WRITE, workspace_root=tmp_path),
+            effective_policy=effective_policy,
+        )
+        scheduler = ToolScheduler(_registry(), PermissionEngine(db), security_middleware=middleware)
+        captured = {}
+
+        def approve(request):
+            captured.update(request)
+            return {"approved": True, "remember": False}
+
+        context = _approval_context()
+        context["approval_broker"] = ApprovalBroker()
+        await scheduler.execute_batch(
+            [{"id": "call-1", "name": "write", "arguments": {"value": "b"}}],
+            mode="coding",
+            session_id="test-session",
+            confirm_callback=approve,
+            tool_context=context,
+        )
+        await db.close()
+        return captured["profile_digest"]
+
+    # Two policies that differ only in commands_require_approval → different digests.
+    policy_a = SandboxPolicy(
+        mode="workspace-write",
+        commands_require_approval=["rm"],
+        allowed_paths=["."],
+    )
+    policy_b = SandboxPolicy(
+        mode="workspace-write",
+        commands_require_approval=["rm", "git push"],
+        allowed_paths=["."],
+    )
+    eff_a = compile_effective_policy(policy_a, workspace_root=tmp_path)
+    eff_b = compile_effective_policy(policy_b, workspace_root=tmp_path)
+    assert eff_a.digest != eff_b.digest, "test setup: policies must differ"
+
+    digest_a = await _capture_profile_digest(eff_a)
+    digest_b = await _capture_profile_digest(eff_b)
+
+    assert digest_a != digest_b, (
+        "profile_digest must change when effective_policy_digest changes; "
+        "otherwise approvals can be replayed across policy boundaries"
+    )
+    assert len(digest_a) == 64 and len(digest_b) == 64
+
+
 async def test_scheduler_denies_when_bound_approval_cannot_be_resolved(tmp_path):
     class RejectingBroker(ApprovalBroker):
         async def consume_for_dispatch(self, *args, **kwargs):

@@ -144,6 +144,20 @@ class ToolScheduler:
             if network_guard is not None and network_guard.network_enabled
             else "none"
         )
+        # M1: propagate the effective policy digest so the approval
+        # ``profile_digest`` can bind the decision to the exact policy under
+        # which it was made.  Without this, two runtimes with different
+        # ``allowed_paths`` / ``commands_require_approval`` would produce
+        # identical ``profile_digest`` for the same (permission_level,
+        # target, network_policy) tuple, contradicting the claim that an
+        # approval was issued "under exactly this policy".
+        if "effective_policy_digest" not in tool_context:
+            # ``effective_policy_digest`` is a @property on the middleware;
+            # getattr returns the string digest (or "" if no effective
+            # policy was installed).
+            tool_context["effective_policy_digest"] = getattr(
+                self.security_middleware, "effective_policy_digest", ""
+            ) or ""
 
         approved_calls: list[dict] = []
         for call in tool_calls:
@@ -285,6 +299,15 @@ class ToolScheduler:
                             "permission_level": tool.permission_level,
                             "target": approval_target,
                             "network_policy": tool_context["network_policy"],
+                            # M1: bind the approval to the exact effective
+                            # policy under which it was issued.  A different
+                            # policy (different allowed_paths, commands_require_
+                            # approval, network_allowed_domains, …) yields a
+                            # different digest, so an approval cannot be
+                            # replayed under a loosened policy.
+                            "effective_policy_digest": tool_context.get(
+                                "effective_policy_digest", ""
+                            ),
                         }
                     ),
                     expires_at=expires_at,
