@@ -125,14 +125,15 @@ class Sandbox:
             else Path.cwd().resolve()
         )
         self._allowed_tools = CAPABILITIES.get(mode, set())
-        # H3: when set, reads/writes are confined to these compiled root
-        # capabilities (from the effective policy's allowed_paths) rather than
-        # the whole workspace_root.  This is the real enforcement of
-        # allowed_paths that was previously parsed-but-ignored.  When unset,
-        # behaviour is unchanged (confine to workspace_root).
-        self._root_capabilities: frozenset[Path] = (
-            frozenset(root_capabilities) if root_capabilities else frozenset()
-        )
+        # B2: distinguish ``None`` (not set → confine to workspace_root, the
+        # legacy default) from an empty frozenset (explicitly no path is
+        # allowed → deny all).  Previously an empty set was treated as
+        # "no restriction", which fail-opened when ``allowed_paths: []`` or
+        # ``allowed_paths: [../outside]`` compiled to an empty set.
+        if root_capabilities is None:
+            self._root_capabilities: "frozenset[Path] | None" = None
+        else:
+            self._root_capabilities = frozenset(root_capabilities)
 
     def check_tool(self, tool_name: str) -> SandboxCheckResult:
         """检查工具是否在当前沙箱模式的 capability 集合内。
@@ -177,10 +178,11 @@ class Sandbox:
                 reason=f"path '{resolved}' outside workspace '{self.workspace_root}'",
                 mode=self.mode.value,
             )
-        # H3: when root_capabilities are compiled from allowed_paths, further
-        # confine writes to those capabilities.  Empty set = unconstrained
-        # within the workspace (legacy behaviour).
-        if self._root_capabilities:
+        # B2: when root_capabilities are compiled from allowed_paths, confine
+        # writes to those capabilities.  ``None`` = not set (legacy: confine
+        # to workspace_root only).  An empty frozenset = explicitly no path
+        # allowed → deny all (fail closed, not fail open).
+        if self._root_capabilities is not None:
             denied_reason = self._capability_denial_reason(resolved, "write")
             if denied_reason is not None:
                 return SandboxCheckResult(
@@ -213,8 +215,10 @@ class Sandbox:
                 ),
                 mode=self.mode.value,
             )
-        # H3: confine reads to compiled root_capabilities when present.
-        if self._root_capabilities:
+        # B2: confine reads to compiled root_capabilities when present.
+        # ``None`` = not set (legacy: workspace_root only).  Empty frozenset
+        # = deny all reads (fail closed).
+        if self._root_capabilities is not None:
             denied_reason = self._capability_denial_reason(resolved, "read")
             if denied_reason is not None:
                 return SandboxCheckResult(

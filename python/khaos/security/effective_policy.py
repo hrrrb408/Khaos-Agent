@@ -21,17 +21,31 @@ Unknown modes, unknown fields, type errors and malformed YAML fail closed
 
 The compiled policy carries a ``digest`` so it can be bound to an approval
 decision, proving the approval was made under exactly this policy.
+
+B2: ``allowed_paths`` intersection uses *directory containment*, not plain
+set ``&``.  ``intersection(/repo, /repo/src) = /repo/src`` (the stricter
+subdirectory wins); ``intersection(/repo/src, /repo/docs) = empty`` (deny).
+An empty intersection is treated as "deny all" by the Sandbox, never as
+"no restriction" — closing the fail-open hole where ``allowed_paths: []``
+or ``allowed_paths: [../outside]`` silently granted the whole workspace.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from khaos.security.policy import SandboxPolicy
+from khaos.security.policy import SandboxPolicy, load_policy
 from khaos.security.sandbox import SandboxMode
+
+logger = logging.getLogger(__name__)
+
+# Default user/global policy path.  Loaded as a separate layer so the
+# effective policy is the true ``user ∩ project ∩ platform`` intersection.
+USER_POLICY_PATH = Path("~/.khaos/policy.yaml")
 
 
 class PolicyCompilationError(ValueError):
@@ -69,6 +83,13 @@ class EffectiveSecurityPolicy:
     All collection fields are frozen sets so the policy cannot be mutated
     after compilation.  ``digest`` is a stable sha256 of the canonical
     representation, suitable for binding to an approval decision.
+
+    ``root_capabilities`` is ``frozenset[Path]`` — possibly empty.  An empty
+    set means "explicitly no path is allowed" (deny all).  The Sandbox
+    distinguishes this from ``None`` (unset → use workspace default) via
+    the factory wiring: when the effective policy is compiled, its
+    ``root_capabilities`` (even empty) is always installed on the Sandbox,
+    so an empty set becomes a hard deny rather than a fail-open.
     """
 
     mode: SandboxMode
@@ -109,6 +130,9 @@ def compile_effective_policy(
     mode, unknown top-level field, or wrong field type.  The caller is
     expected to fail startup (or drop to read-only) rather than silently
     relax the policy.
+
+    B2: ``root_capabilities`` uses directory-containment intersection, not
+    plain set ``&``.  An empty result means "deny all", not "no restriction".
     """
     user = user_policy  # None means "no user/global layer"
     platform = platform_capability or PlatformCapability()
@@ -154,13 +178,19 @@ def compile_effective_policy(
         )
 
     # --- allowed_paths → root_capabilities (resolved against workspace_root).
-    root_capabilities = _compile_root_capabilities(
+    # B2: use directory-containment intersection so intersection(/repo,
+    # /repo/src) = /repo/src (the stricter subdirectory wins), and an empty
+    # intersection means "deny all" (not "no restriction").
+    project_caps = _compile_root_capabilities(
         project_policy.allowed_paths, workspace_root
     )
     if user is not None:
-        root_capabilities = root_capabilities & _compile_root_capabilities(
+        user_caps = _compile_root_capabilities(
             user.allowed_paths, workspace_root
         )
+        root_capabilities = _intersect_path_capabilities(project_caps, user_caps)
+    else:
+        root_capabilities = project_caps
 
     # --- secrets: scan stays on unless BOTH layers disable it.
     secrets_scan_on_output = bool(project_policy.secrets_scan_on_output) or (
@@ -178,6 +208,42 @@ def compile_effective_policy(
         commands_require_approval=commands_require_approval,
         commands_blocked=commands_blocked,
         secrets_scan_on_output=secrets_scan_on_output,
+    )
+
+
+def load_effective_policy(
+    workspace_root: Path,
+    *,
+    project_policy_path: Path | None = None,
+    user_policy_path: Path | None = None,
+    platform_capability: PlatformCapability | None = None,
+) -> EffectiveSecurityPolicy:
+    """Load and compile the layered effective policy (B1).
+
+    This is the production entry point: it loads the *project* policy from
+    ``<workspace_root>/khaos_policy.yaml`` and the *user/global* policy from
+    ``~/.khaos/policy.yaml`` as independent layers, then compiles them into
+    a single ``EffectiveSecurityPolicy`` that drives every runtime component.
+
+    Both layers are validated (``validate_policy_dict``) and fail closed on
+    unknown fields / wrong types.  A missing user policy file is fine — the
+    effective policy degrades to the project-only intersection.
+    """
+    project_path = project_policy_path or (workspace_root / "khaos_policy.yaml")
+    user_path = user_policy_path or USER_POLICY_PATH
+
+    project_policy = load_policy(project_path)
+    user_policy: SandboxPolicy | None = None
+    expanded_user = user_path.expanduser()
+    if expanded_user.is_file():
+        logger.info("Loading user policy from %s", expanded_user)
+        user_policy = load_policy(expanded_user)
+
+    return compile_effective_policy(
+        project_policy,
+        workspace_root=workspace_root,
+        user_policy=user_policy,
+        platform_capability=platform_capability,
     )
 
 
@@ -203,6 +269,13 @@ def validate_policy_dict(data: object, *, source: str = "policy") -> None:
     Called by the compiler on the *raw* parsed YAML before ``SandboxPolicy``
     construction, so unknown keys do not get silently dropped by
     ``SandboxPolicy.from_dict``.
+
+    H5: also enforces strict scalar types — booleans must be actual booleans
+    (not the string ``"false"``, which is truthy in Python and would silently
+    enable network), ``mode`` must be a string, and ``log_path`` must be a
+    string.  Production ``load_policy()`` now calls this so the strict checks
+    reach every real ``khaos_policy.yaml``, not just direct callers of the
+    compiler.
     """
     if not isinstance(data, dict):
         raise PolicyCompilationError(
@@ -217,6 +290,10 @@ def validate_policy_dict(data: object, *, source: str = "policy") -> None:
     if sandbox is None:
         sandbox = {}
     _check_keys(sandbox, _ALLOWED_SANDBOX_KEYS, f"{source}.sandbox")
+    _check_str(sandbox.get("mode"), "sandbox.mode", source)
+    # H5: ``network: "false"`` is a string and is truthy in Python — without
+    # this check it would silently enable network access.
+    _check_bool(sandbox.get("network"), "sandbox.network", source)
     _check_list_of_str(sandbox.get("allowed_paths"), "sandbox.allowed_paths", source)
     _check_list_of_str(sandbox.get("denied_paths"), "sandbox.denied_paths", source)
     _check_list_of_str(sandbox.get("allowed_domains"), "sandbox.allowed_domains", source)
@@ -234,11 +311,20 @@ def validate_policy_dict(data: object, *, source: str = "policy") -> None:
     if secrets is None:
         secrets = {}
     _check_keys(secrets, _ALLOWED_SECRETS_KEYS, f"{source}.secrets")
+    _check_bool(secrets.get("scan_on_output"), "secrets.scan_on_output", source)
+    _check_bool(
+        secrets.get("scan_before_tool_result"),
+        "secrets.scan_before_tool_result",
+        source,
+    )
+    _check_bool(secrets.get("block_env_dump"), "secrets.block_env_dump", source)
 
     audit = data.get("audit", {})
     if audit is None:
         audit = {}
     _check_keys(audit, _ALLOWED_AUDIT_KEYS, f"{source}.audit")
+    _check_bool(audit.get("enabled"), "audit.enabled", source)
+    _check_str(audit.get("log_path"), "audit.log_path", source)
 
 
 def _check_keys(mapping: object, allowed: frozenset[str], where: str) -> None:
@@ -254,6 +340,34 @@ def _check_list_of_str(value: object, where: str, source: str) -> None:
         return
     if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
         raise PolicyCompilationError(f"{source}.{where} must be a list of strings")
+
+
+def _check_bool(value: object, where: str, source: str) -> None:
+    """Reject anything that is not a real Python bool.
+
+    YAML ``true`` / ``false`` parse to ``bool``; the strings ``"true"`` /
+    ``"false"`` parse to ``str`` and would be silently truthy.  ``None`` means
+    the key was omitted, which is fine (the default applies).
+    """
+    if value is None:
+        return
+    # NOTE: ``bool`` is a subclass of ``int``; the explicit ``type`` check
+    # rejects ``int`` (e.g. ``0`` / ``1``) which YAML would never produce
+    # for a real boolean field but a careless hand-edit might.
+    if type(value) is not bool:
+        raise PolicyCompilationError(
+            f"{source}.{where} must be a boolean (true/false), "
+            f"got {type(value).__name__}: {value!r}"
+        )
+
+
+def _check_str(value: object, where: str, source: str) -> None:
+    if value is None:
+        return
+    if not isinstance(value, str):
+        raise PolicyCompilationError(
+            f"{source}.{where} must be a string, got {type(value).__name__}: {value!r}"
+        )
 
 
 def _resolve_mode(mode_str: str, *, source: str) -> SandboxMode:
@@ -286,6 +400,11 @@ def _compile_root_capabilities(
     entries are kept as-is.  Entries that would escape ``workspace_root`` are
     dropped (the project policy cannot grant access outside the workspace —
     that would be a relaxation the runtime forbids).
+
+    B2: an explicit empty ``allowed_paths`` (``[]``) returns an empty
+    frozenset, which the Sandbox treats as "deny all".  An entry list where
+    *every* entry is dropped (e.g. all outside the workspace) likewise
+    returns an empty frozenset — deny all, not fail-open.
     """
     if not allowed_paths:
         return frozenset()
@@ -306,6 +425,50 @@ def _compile_root_capabilities(
             continue
         capabilities.add(resolved)
     return frozenset(capabilities)
+
+
+def _is_under_or_equal(child: Path, parent: Path) -> bool:
+    """Return True if ``child == parent`` or ``parent`` is an ancestor of ``child``."""
+    if child == parent:
+        return True
+    try:
+        child.relative_to(parent)
+        return True
+    except ValueError:
+        return False
+
+
+def _intersect_path_capabilities(
+    project_caps: frozenset[Path], user_caps: frozenset[Path]
+) -> frozenset[Path]:
+    """Intersect two path-capability sets by directory containment (B2).
+
+    Unlike plain set ``&``, this understands that ``/repo`` *contains*
+    ``/repo/src``.  The intersection of ``{/repo}`` and ``{/repo/src}`` is
+    ``{/repo/src}`` (the stricter subdirectory wins).  The intersection of
+    ``{/repo/src}`` and ``{/repo/docs}`` is empty (disjoint → deny).
+
+    For each pair ``(p, u)`` where one contains the other, the deeper
+    (more restrictive) path is kept.  Disjoint pairs contribute nothing.
+    The result may contain redundant entries (e.g. both ``/repo`` and
+    ``/repo/src``), but the Sandbox's ``_capability_denial_reason`` accepts
+    any containing capability, so redundancy is harmless.
+    """
+    if not project_caps or not user_caps:
+        # If either side is empty (explicit deny), the intersection is empty
+        # (deny all).  This is the key fix for B2: empty ∩ anything = empty.
+        return frozenset()
+    result: set[Path] = set()
+    for p in project_caps:
+        for u in user_caps:
+            if _is_under_or_equal(p, u):
+                # p is under u (or equal) → p is the stricter (or equal) cap.
+                result.add(p)
+            elif _is_under_or_equal(u, p):
+                # u is under p → u is the stricter cap.
+                result.add(u)
+            # else: disjoint — neither contributes.
+    return frozenset(result)
 
 
 def _canonical_dict(policy: EffectiveSecurityPolicy) -> dict:

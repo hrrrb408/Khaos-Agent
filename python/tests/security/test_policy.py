@@ -149,3 +149,88 @@ def test_from_dict_rejects_unknown_sandbox_key() -> None:
     """H3: a typo in a sandbox sub-key fails closed."""
     with pytest.raises(ValueError, match="unknown"):
         SandboxPolicy.from_dict({"sandbox": {"mode": "read-only", "colour": "red"}})
+
+
+# ---- H5: strict scalar type validation through load_policy() ---- #
+
+
+def test_load_policy_rejects_string_network_value(tmp_path: Path) -> None:
+    """H5: ``network: "false"`` is a string and would be truthy in Python.
+
+    Without strict bool validation this would silently enable network
+    access.  ``load_policy`` must fail closed at startup.
+    """
+    from khaos.security.effective_policy import PolicyCompilationError
+
+    policy_file = _write_policy(
+        tmp_path / "khaos_policy.yaml",
+        'sandbox:\n  mode: read-only\n  network: "false"\n',
+    )
+    with pytest.raises(PolicyCompilationError, match="sandbox.network must be a boolean"):
+        load_policy(policy_file)
+
+
+def test_load_policy_rejects_string_allowed_paths(tmp_path: Path) -> None:
+    """H5: ``allowed_paths: "src"`` is a bare string, not a list of strings.
+
+    Without strict type validation Python would iterate the string
+    character-by-character.  ``load_policy`` must fail closed.
+    """
+    from khaos.security.effective_policy import PolicyCompilationError
+
+    policy_file = _write_policy(
+        tmp_path / "khaos_policy.yaml",
+        'sandbox:\n  mode: read-only\n  allowed_paths: "src"\n',
+    )
+    with pytest.raises(PolicyCompilationError, match="must be a list of strings"):
+        load_policy(policy_file)
+
+
+def test_load_policy_rejects_int_audit_enabled(tmp_path: Path) -> None:
+    """H5: ``audit.enabled: 1`` is an int, not a bool.
+
+    YAML ``true``/``false`` parse to bool; ``1``/``0`` parse to int.  Reject
+    ints so a careless hand-edit cannot silently flip audit state.
+    """
+    from khaos.security.effective_policy import PolicyCompilationError
+
+    policy_file = _write_policy(
+        tmp_path / "khaos_policy.yaml",
+        "audit:\n  enabled: 1\n",
+    )
+    with pytest.raises(PolicyCompilationError, match="audit.enabled must be a boolean"):
+        load_policy(policy_file)
+
+
+def test_load_policy_rejects_string_secrets_flag(tmp_path: Path) -> None:
+    """H5: ``secrets.scan_on_output: "true"`` is a string, not a bool."""
+    from khaos.security.effective_policy import PolicyCompilationError
+
+    policy_file = _write_policy(
+        tmp_path / "khaos_policy.yaml",
+        'secrets:\n  scan_on_output: "true"\n',
+    )
+    with pytest.raises(PolicyCompilationError, match="secrets.scan_on_output must be a boolean"):
+        load_policy(policy_file)
+
+
+def test_load_policy_accepts_well_formed_booleans(tmp_path: Path) -> None:
+    """H5 regression guard: real YAML booleans are accepted unchanged."""
+    policy_file = _write_policy(
+        tmp_path / "khaos_policy.yaml",
+        """
+sandbox:
+  mode: read-only
+  network: false
+secrets:
+  scan_on_output: true
+  block_env_dump: false
+audit:
+  enabled: true
+""",
+    )
+    policy = load_policy(policy_file)
+    assert policy.network_enabled is False
+    assert policy.secrets_scan_on_output is True
+    assert policy.secrets_block_env_dump is False
+    assert policy.audit_enabled is True

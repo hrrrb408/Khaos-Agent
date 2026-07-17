@@ -130,6 +130,12 @@ def load_policy(path: Path | None = None) -> SandboxPolicy:
     A user who mistypes the mode field or breaks YAML while trying to lock
     down to read-only must see the failure at startup, not silently gain
     write/terminal access.
+
+    H5: the parsed YAML is run through ``validate_policy_dict`` *before*
+    ``SandboxPolicy.from_dict`` so strict scalar type checks (booleans must
+    be real booleans, not the truthy string ``"false"``; lists of paths
+    must be lists, not bare strings; etc.) reach every production
+    ``khaos_policy.yaml`` load, not just direct callers of the compiler.
     """
     candidates: list[Path] = [path] if path else DEFAULT_POLICY_PATHS
     for candidate in candidates:
@@ -146,7 +152,16 @@ def load_policy(path: Path | None = None) -> SandboxPolicy:
         # Let yaml.YAMLError propagate (fail closed on malformed YAML).
         with open(resolved, encoding="utf-8") as handle:
             data = yaml.safe_load(handle) or {}
-        return SandboxPolicy.from_dict(data if isinstance(data, dict) else {})
+        if not isinstance(data, dict):
+            data = {}
+        # H5: strict type validation before construction.  Lazy import to
+        # avoid a circular dependency: ``effective_policy`` imports
+        # ``SandboxPolicy`` / ``load_policy`` from this module, so we cannot
+        # import it at module load time.
+        from khaos.security.effective_policy import validate_policy_dict
+
+        validate_policy_dict(data, source=str(resolved))
+        return SandboxPolicy.from_dict(data)
     logger.info("No policy file found, using defaults")
     return SandboxPolicy()
 
