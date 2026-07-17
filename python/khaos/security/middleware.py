@@ -120,12 +120,20 @@ class SecurityMiddleware:
         B1: when an effective policy is present, we synthesise a lightweight
         ``SandboxPolicy`` view from its fields so ``_apply_policy`` can
         reuse its existing merge logic without needing a separate code path.
+
+        M1: ``commands_allowed`` is also threaded through so the production
+        CommandGuard actually receives the policy's command allow-list —
+        previously the effective policy compiled it into its digest but
+        SecurityMiddleware dropped it on the floor, leaving
+        ``CommandGuard._allowed_commands`` at its default ``None`` (no
+        whitelist enforcement at all).
         """
         if self.effective_policy is not None:
             from khaos.security.policy import SandboxPolicy
 
             return SandboxPolicy(
                 denied_paths=list(self.effective_policy.denied_paths),
+                commands_allowed=list(self.effective_policy.commands_allowed),
                 commands_blocked=list(self.effective_policy.commands_blocked),
             )
         return self.policy
@@ -142,15 +150,28 @@ class SecurityMiddleware:
             if extra:
                 existing = getattr(self.path_guard, "_protected", frozenset())
                 self.path_guard._protected = existing | extra
-        # Extend CommandGuard's blocked commands with policy-blocked ones.
-        # Done instance-level (extra_blocked) — never mutates the module
-        # global, so one middleware's policy can't leak into another guard.
-        if policy.commands_blocked:
+        # Rebuild CommandGuard when the policy introduces an allow-list OR
+        # a block-list.  Done instance-level (extra_blocked) — never mutates
+        # the module global, so one middleware's policy can't leak into
+        # another guard.
+        #
+        # M1: ``allowed_commands=None`` means "no whitelist" (allow anything
+        # not blocked); a non-empty frozenset means "only these base
+        # commands are permitted".  An empty ``commands_allowed`` list is
+        # treated as "unset" so a policy that only configures blocks does
+        # not accidentally lock the runtime down to zero commands.
+        allowed_list = [c for c in (policy.commands_allowed or []) if c]
+        blocked_list = [c for c in (policy.commands_blocked or []) if c]
+        if allowed_list or blocked_list:
+            existing_allowed = self.command_guard._allowed_commands
+            new_allowed = (
+                frozenset(allowed_list) if allowed_list else existing_allowed
+            )
             self.command_guard = CommandGuard(
                 block_dangerous=self.command_guard.block_dangerous,
                 confirm_risky=self.command_guard.confirm_risky,
-                allowed_commands=self.command_guard._allowed_commands,
-                extra_blocked=frozenset(policy.commands_blocked),
+                allowed_commands=new_allowed,
+                extra_blocked=frozenset(blocked_list),
             )
 
     async def pre_check(self, tool_name: str, arguments: dict) -> SecurityCheckResult:

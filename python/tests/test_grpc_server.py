@@ -498,14 +498,21 @@ async def test_build_runtime_wires_token_engine_and_skills(tmp_path):
     await db.run_migrations()
     service = AgentService(db, project_root=tmp_path)
 
-    _, loop = await service._build_runtime("s1", "office")
+    # B1: ``_build_runtime`` now returns the full ``RuntimeResult``; the
+    # caller owns it and must close it.  The loop is the same instance
+    # carried by the result.
+    runtime = await service._build_runtime("s1", "office")
+    loop = runtime.loop
 
-    # Token engine works for ASCII text either way.
-    assert loop.token_engine.count_tokens("hello world") == 2
-    # Skill was loaded and matched the planted trigger.
-    assert loop.skill_manager is not None
-    matched = loop.skill_manager.match("office", "help with python")
-    assert any(s.name == "py" for s in matched)
+    try:
+        # Token engine works for ASCII text either way.
+        assert loop.token_engine.count_tokens("hello world") == 2
+        # Skill was loaded and matched the planted trigger.
+        assert loop.skill_manager is not None
+        matched = loop.skill_manager.match("office", "help with python")
+        assert any(s.name == "py" for s in matched)
+    finally:
+        await runtime.aclose()
     await db.close()
 
 

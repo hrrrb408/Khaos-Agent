@@ -139,3 +139,104 @@ async def test_sandbox_blocks_every_office_read_tool_outside_root(tmp_path):
         result = await middleware.pre_check(tool_name, arguments)
         assert result.allowed is False, tool_name
         assert result.check_type == "sandbox_path"
+
+
+# ---- M1: EffectiveSecurityPolicy.commands_allowed reaches CommandGuard ---- #
+
+
+async def test_effective_policy_commands_allowed_enforced(tmp_path):
+    """M1: ``EffectiveSecurityPolicy.commands_allowed`` threads into the
+    production CommandGuard as a real whitelist.
+
+    Previously ``_merge_source_policy()`` synthesised a ``SandboxPolicy``
+    view with only ``denied_paths`` + ``commands_blocked`` and dropped
+    ``commands_allowed`` on the floor, leaving
+    ``CommandGuard._allowed_commands`` at its default ``None`` (no
+    whitelist). A policy like::
+
+        commands:
+          allow: [git, pytest]
+
+    therefore had no effect — any command not in ``DANGEROUS_COMMANDS``
+    would pass. This test proves the allow-list now reaches the guard and
+    blocks commands outside it.
+    """
+    from khaos.security.effective_policy import compile_effective_policy
+    from khaos.security.policy import SandboxPolicy
+
+    project = SandboxPolicy(
+        mode="workspace-write",
+        commands_allowed=["git", "pytest"],
+    )
+    eff = compile_effective_policy(project, workspace_root=tmp_path)
+    middleware = SecurityMiddleware(effective_policy=eff)
+
+    # Command in the allow-list → allowed.
+    ok = await middleware.pre_check("terminal", {"command": "git status"})
+    assert ok.allowed, f"git should be allowed: {ok.reason}"
+
+    # Another allow-listed command → allowed.
+    ok2 = await middleware.pre_check("terminal", {"command": "pytest -x"})
+    assert ok2.allowed, f"pytest should be allowed: {ok2.reason}"
+
+    # Command NOT in the allow-list → blocked by the whitelist.
+    blocked = await middleware.pre_check("terminal", {"command": "ls"})
+    assert blocked.allowed is False
+    assert blocked.risk_level == "blocked"
+    assert blocked.check_type == "command"
+    assert "allowlist" in blocked.reason
+
+
+async def test_effective_policy_empty_commands_allowed_does_not_lock_down(
+    tmp_path,
+):
+    """M1: an empty ``commands_allowed`` must NOT enforce an empty whitelist.
+
+    A policy that only configures ``commands.block`` (or nothing at all)
+    must leave the guard in "no whitelist" mode so ordinary commands like
+    ``ls`` still pass. An empty frozenset would otherwise block every
+    command, which is not the intended semantics of "unset" — the guard
+    treats ``None`` as "no whitelist" and only engages the whitelist when
+    the list is non-empty.
+    """
+    from khaos.security.effective_policy import compile_effective_policy
+    from khaos.security.policy import SandboxPolicy
+
+    project = SandboxPolicy(mode="workspace-write")  # no commands.allow
+    eff = compile_effective_policy(project, workspace_root=tmp_path)
+    middleware = SecurityMiddleware(effective_policy=eff)
+
+    # ``ls`` is not in any allow-list, but with commands_allowed empty the
+    # whitelist is NOT engaged, so it should pass.
+    result = await middleware.pre_check("terminal", {"command": "ls"})
+    assert result.allowed, (
+        f"empty commands_allowed must not lock down: {result.reason}"
+    )
+
+
+async def test_effective_policy_commands_allowed_with_blocked_list(tmp_path):
+    """M1: ``commands_allowed`` and ``commands_blocked`` compose correctly.
+
+    A command in the allow-list that is also in the block-list is blocked
+    (block-list wins — defense in depth). A command in the allow-list but
+    not the block-list is allowed.
+    """
+    from khaos.security.effective_policy import compile_effective_policy
+    from khaos.security.policy import SandboxPolicy
+
+    project = SandboxPolicy(
+        mode="workspace-write",
+        commands_allowed=["git", "pytest"],
+        commands_blocked=["git"],  # git is both allowed AND blocked
+    )
+    eff = compile_effective_policy(project, workspace_root=tmp_path)
+    middleware = SecurityMiddleware(effective_policy=eff)
+
+    # git is in both lists — block-list wins.
+    blocked = await middleware.pre_check("terminal", {"command": "git status"})
+    assert blocked.allowed is False
+    assert blocked.risk_level == "blocked"
+
+    # pytest is allowed and not blocked → passes.
+    ok = await middleware.pre_check("terminal", {"command": "pytest -x"})
+    assert ok.allowed, f"pytest should be allowed: {ok.reason}"
