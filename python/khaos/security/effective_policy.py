@@ -108,7 +108,11 @@ class EffectiveSecurityPolicy:
     network_blocked_domains: frozenset[str]
     root_capabilities: frozenset[Path]
     denied_paths: frozenset[str]
-    commands_allowed: frozenset[str]
+    # H2: three-state — ``None`` means no layer configured an allow-list
+    # (no whitelist enforced); an empty frozenset means a layer explicitly
+    # set ``commands.allow: []`` (deny all commands); a non-empty frozenset
+    # is the whitelist.
+    commands_allowed: frozenset[str] | None
     commands_require_approval: frozenset[str]
     commands_blocked: frozenset[str]
     secrets_scan_on_output: bool
@@ -168,16 +172,27 @@ def compile_effective_policy(
     denied_paths = _frozen(project_policy.denied_paths)
     commands_blocked = _frozen(project_policy.commands_blocked)
     commands_require_approval = _frozen(project_policy.commands_require_approval)
-    commands_allowed = _frozen(project_policy.commands_allowed)
+    # H2: three-state commands_allowed — None means "this layer does not
+    # configure an allow-list".  Only intersect when BOTH layers configure
+    # one; if only one layer configures it, use that layer's list; if
+    # neither does, the result is None (no whitelist enforced).
+    project_allowed = project_policy.commands_allowed
+    user_allowed = user.commands_allowed if user is not None else None
+    if project_allowed is not None and user_allowed is not None:
+        # Both layers configure a whitelist — intersect (stricter).
+        commands_allowed: frozenset[str] | None = _frozen(project_allowed) & _frozen(user_allowed)
+    elif project_allowed is not None:
+        commands_allowed = _frozen(project_allowed)
+    elif user_allowed is not None:
+        commands_allowed = _frozen(user_allowed)
+    else:
+        commands_allowed = None
     if user is not None:
         denied_paths = denied_paths | _frozen(user.denied_paths)
         commands_blocked = commands_blocked | _frozen(user.commands_blocked)
         commands_require_approval = commands_require_approval | _frozen(
             user.commands_require_approval
         )
-        # commands_allowed is intersected: a command must be allowed by BOTH
-        # layers to remain allowed (otherwise the stricter layer denies).
-        commands_allowed = commands_allowed & _frozen(user.commands_allowed)
 
     # --- network: enabled only if BOTH layers enable it; domains merged.
     network_enabled = bool(project_policy.network_enabled) and (
@@ -547,7 +562,7 @@ def _canonical_dict(policy: EffectiveSecurityPolicy) -> dict:
         "network_blocked_domains": sorted(policy.network_blocked_domains),
         "root_capabilities": sorted(str(p) for p in policy.root_capabilities),
         "denied_paths": sorted(policy.denied_paths),
-        "commands_allowed": sorted(policy.commands_allowed),
+        "commands_allowed": sorted(policy.commands_allowed) if policy.commands_allowed is not None else None,
         "commands_require_approval": sorted(policy.commands_require_approval),
         "commands_blocked": sorted(policy.commands_blocked),
         "secrets_scan_on_output": policy.secrets_scan_on_output,

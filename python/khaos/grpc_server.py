@@ -429,8 +429,15 @@ class AgentService:
         # H2: audit decision comes from the *effective* policy (OR semantics
         # across user ∩ project), not the raw project policy — an untrusted
         # repo can no longer disable audit by setting audit.enabled: false.
+        # M1: ``audit_log_path`` is threaded through so the AuditLogger
+        # appends every record to the configured file (in addition to the
+        # SQLite database) — an operator has an append-only, tamper-evident
+        # trail outside the database.
         audit_logger = (
-            AuditLogger(self.db)
+            AuditLogger(
+                self.db,
+                log_path=self._effective_policy.audit_log_path,
+            )
             if self._effective_policy.audit_enabled
             else None
         )
@@ -493,7 +500,11 @@ class AgentService:
             )
         except ImportError:
             pass
-        audit_logger = AuditLogger(self.db) if eff.audit_enabled else None
+        audit_logger = (
+            AuditLogger(self.db, log_path=eff.audit_log_path)
+            if eff.audit_enabled
+            else None
+        )
         return SecurityMiddleware(
             effective_policy=eff,
             sandbox=sandbox,
@@ -741,12 +752,17 @@ async def serve_json_lines(
     task_service = TaskService(agent.task_manager, agent.approval_broker)
     subagent_service: SubAgentService | None = None
     if enable_subagents:
-        # B1: share the AgentService's office authority so subagent runs reuse
-        # the same aggregate storage baseline (no cross-run quota bypass) and
-        # the runtime borrows it instead of creating a fresh authority.
+        # B1: share the AgentService's office authority AND approval broker so
+        # subagent runs reuse the same aggregate storage baseline (no
+        # cross-run quota bypass) and the same approval authority (no parallel
+        # unsupervised permission path).  The runtime borrows these instead of
+        # creating fresh instances; build_runtime constructs the per-run
+        # ToolScheduler with the full SecurityMiddleware stack.
         subagent_service = await _build_subagent_service(
             db, project_root, config_path,
             office_authority=agent._office_authority,
+            approval_broker=agent.approval_broker,
+            principal_id=f"local-uid:{os.getuid()}",
         )
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -913,14 +929,29 @@ async def _build_subagent_service(
     config_path: Path | None,
     *,
     office_authority: OfficeMutationAuthority | None = None,
+    approval_broker: Any = None,
+    principal_id: str = "",
+    audit_logger: Any = None,
 ) -> SubAgentService:
+    """Build the SubAgent service bound to the server's shared security stack.
+
+    B1: previously this function constructed a *bare* ``ToolScheduler(
+    create_runtime_registry(), permission_engine)`` with no
+    ``SecurityMiddleware`` — so the subagent ran on a parallel, unsupervised
+    execution path that bypassed EffectivePolicy / Sandbox / NetworkGuard /
+    AuditLogger.  Now the runner receives ``tool_scheduler=None`` and
+    ``build_runtime`` constructs a fresh scheduler per run with the full
+    security stack compiled from the same layered effective policy as the
+    main AgentLoop.  The server-level ``approval_broker`` /
+    ``principal_id`` / ``audit_logger`` / ``office_authority`` are inherited
+    so approvals, audit events and the Office storage baseline are shared
+    with the main runtime, not forked.
+    """
     root = project_root or Path.cwd()
     resolved_config = config_path or root / "config.yaml"
     mode_manager = ModeManager(db, project_root=root)
     await mode_manager.load()
     router = load_router_from_config(resolved_config, project_root=root)
-    permission_engine = PermissionEngine(db)
-    await permission_engine.load_rules()
     memory_store = MemoryStore(db)
     memory_manager = MemoryManager(
         memory_store,
@@ -936,11 +967,17 @@ async def _build_subagent_service(
         router=router,
         db=db,
         mode_manager=mode_manager,
-        tool_scheduler=ToolScheduler(create_runtime_registry(), permission_engine),
+        # B1: do NOT pass a bare ToolScheduler — let build_runtime construct
+        # one per run with the full SecurityMiddleware stack and a registry
+        # pruned to ``task.tools``.
+        tool_scheduler=None,
         memory_manager=memory_manager,
         skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
         token_engine=get_token_engine(),
         office_authority=office_authority,
+        approval_broker=approval_broker,
+        principal_id=principal_id,
+        audit_logger=audit_logger,
     )
     spawner = SubAgentSpawner(
         SubAgentConfig(max_concurrent=3, max_spawn_depth=1, allow_nesting=False),

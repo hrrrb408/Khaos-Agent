@@ -111,7 +111,11 @@ commands:
     policy = load_policy(policy_file)
 
     assert policy.commands_require_approval == ["rm", "docker"]
-    assert policy.commands_allowed == []
+    # H2: when ``commands.allow`` is absent, ``commands_allowed`` is ``None``
+    # (three-state: None = unset, [] = deny all, non-empty = whitelist).
+    # Previously it defaulted to ``[]`` which collided with "deny all" and
+    # caused the production layer-merge to erase project whitelists.
+    assert policy.commands_allowed is None
     assert policy.commands_blocked == []
 
 

@@ -66,7 +66,12 @@ class SandboxPolicy:
     denied_paths: list[str] = field(default_factory=lambda: list(_DEFAULT_DENIED_PATHS))
 
     # 命令控制
-    commands_allowed: list[str] = field(default_factory=list)
+    # H2: ``commands_allowed`` uses ``None`` to mean "this layer does not
+    # configure an allow-list" (distinct from an empty list which means
+    # "this layer explicitly denies all commands").  The effective policy
+    # compiler uses three-state semantics: None = unset, empty = deny all,
+    # non-empty = whitelist.
+    commands_allowed: list[str] | None = None
     commands_require_approval: list[str] = field(
         default_factory=lambda: list(_DEFAULT_REQUIRE_APPROVAL)
     )
@@ -110,7 +115,10 @@ class SandboxPolicy:
             network_blocked_domains=sandbox.get("blocked_domains", []),
             allowed_paths=sandbox.get("allowed_paths", ["."]),
             denied_paths=sandbox.get("denied_paths", list(_DEFAULT_DENIED_PATHS)),
-            commands_allowed=commands.get("allow", []),
+            # H2: ``commands.get("allow")`` returns None when the key is
+            # absent (layer does not configure an allow-list) or the list
+            # when present (including an explicitly empty list = deny all).
+            commands_allowed=commands.get("allow"),
             commands_require_approval=commands.get(
                 "require_approval", list(_DEFAULT_REQUIRE_APPROVAL)
             ),
