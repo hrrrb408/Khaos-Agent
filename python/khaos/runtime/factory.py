@@ -54,6 +54,13 @@ class RuntimeConfig:
     workspace_manager: WorkspaceManager | None = None
     execution_service: ExecutionService | None = None
     approval_broker: Any = None
+    # B1: an externally-owned OfficeMutationAuthority (e.g. the server-level
+    # authority shared across every chat / webhook / cron turn) can be
+    # injected here.  When set, ``build_runtime`` reuses it instead of
+    # creating a new one, so the aggregate storage baseline persists across
+    # turns (closing the cross-turn quota bypass) and the lifecycle is owned
+    # by the caller — ``RuntimeResult.aclose`` will NOT shut it down.
+    office_authority: OfficeMutationAuthority | None = None
     principal_id: str = field(
         default_factory=lambda: f"local-uid:{os.getuid()}"
     )
@@ -73,38 +80,72 @@ class RuntimeResult:
     # H3: the OfficeMutationAuthority is owned by the runtime so aclose()
     # can fence every in-flight Office mutation before the process exits.
     office_authority: OfficeMutationAuthority | None = None
+    # B1: when False, ``office_authority`` was injected (shared) and aclose
+    # must NOT shut it down — the owner (AgentService / SubAgentService)
+    # manages its lifecycle.  Defaults to True for ad-hoc constructions.
+    owns_office_authority: bool = True
     # B1: ``init=False`` so positional construction can never accidentally
     # bind a real component into ``_closed`` (which previously made
     # ``aclose()`` a no-op because the truthy component short-circuited it).
+    # H3: ``_closing`` prevents concurrent invocation; ``_closed`` is set
+    # only after every safety-critical component has reached a terminal
+    # state, so a cancelled aclose can be retried by the caller.
+    _closing: bool = field(default=False, init=False)
     _closed: bool = field(default=False, init=False)
 
     async def aclose(self) -> None:
-        """Release runtime-owned resources; database ownership stays with caller."""
-        if self._closed:
+        """Release runtime-owned resources; database ownership stays with caller.
+
+        H3: uses ``_closing`` + ``_closed`` so a cancelled cleanup can be
+        retried.  ``_closed`` is set ONLY at the end — if we are cancelled
+        mid-cleanup (e.g. event-loop shutdown), ``_closed`` stays False and
+        ``_closing`` resets in the ``finally`` block, so the caller can call
+        ``aclose`` again to finish the remaining steps.  Each component's
+        shutdown is expected to be idempotent.
+        """
+        if self._closed or self._closing:
             return
-        self._closed = True
-        # H3: fence Office mutations FIRST — wait for every in-flight
-        # copy/move worker to settle (commit or roll back) and mark every
-        # Office workspace read-only before any other component shuts down.
-        # Without this, a mutation thread could keep writing to the
-        # filesystem after the runtime has already closed.
-        if self.office_authority is not None:
-            try:
-                await self.office_authority.shutdown()
-            except Exception:
-                logger.debug("office authority shutdown failed", exc_info=True)
-        if self.memory_manager is not None:
-            close = getattr(self.memory_manager, "aclose", None)
-            if close is not None:
+        self._closing = True
+        try:
+            # H3: fence Office mutations FIRST — wait for every in-flight
+            # copy/move worker to settle (commit or roll back) and mark every
+            # Office workspace read-only before any other component shuts down.
+            # Without this, a mutation thread could keep writing to the
+            # filesystem after the runtime has already closed.
+            # B1: only close if owned — a shared/injected authority is managed
+            # by the server (AgentService.shutdown).
+            if (
+                self.office_authority is not None
+                and self.owns_office_authority
+            ):
                 try:
-                    await close()
+                    await self.office_authority.shutdown()
                 except Exception:
-                    logger.debug("memory manager close failed", exc_info=True)
-        if self.execution_service is not None:
-            try:
-                await self.execution_service.shutdown()
-            except Exception:
-                logger.debug("execution service close failed", exc_info=True)
+                    logger.debug(
+                        "office authority shutdown failed", exc_info=True
+                    )
+            if self.memory_manager is not None:
+                close = getattr(self.memory_manager, "aclose", None)
+                if close is not None:
+                    try:
+                        await close()
+                    except Exception:
+                        logger.debug(
+                            "memory manager close failed", exc_info=True
+                        )
+            if self.execution_service is not None:
+                try:
+                    await self.execution_service.shutdown()
+                except Exception:
+                    logger.debug(
+                        "execution service close failed", exc_info=True
+                    )
+            # H3: only mark closed after all safety-critical components have
+            # reached a terminal state.  A cancelled aclose leaves _closed
+            # False so the caller can retry.
+            self._closed = True
+        finally:
+            self._closing = False
 
 
 async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
@@ -156,14 +197,29 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         workspace_manager=workspace_manager,
         backend_selector=BackendSelector(),
     )
-    # H1: a single shared OfficeMutationAuthority fences every Office
-    # copy/move against cancellation/timeout side effects.  Registered on the
-    # scheduler (for tool dispatch) and on the file_tools module (for any
-    # direct call path).  The storage authority + limits also give Office the
-    # aggregate byte/entry accounting it previously lacked (M1).
-    office_authority = OfficeMutationAuthority()
-    from khaos.tools import file_tools as _file_tools
-    _file_tools.set_office_authority(office_authority)
+    # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
+    # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
+    # share one across every turn), reuse it so the aggregate storage baseline
+    # persists across turns (closing the cross-turn quota bypass) and the
+    # lifecycle is owned by the caller.  When not injected, create a new one
+    # owned by this RuntimeResult (closed in aclose).
+    # B1: when a shared ToolScheduler is passed in that already holds an
+    # authority, reuse that authority too — never silently replace it.
+    owns_office_authority = True
+    if cfg.office_authority is not None:
+        office_authority = cfg.office_authority
+        owns_office_authority = False
+    elif (
+        cfg.tool_scheduler is not None
+        and getattr(cfg.tool_scheduler, "office_authority", None) is not None
+    ):
+        # B1: shared scheduler already has an authority — reuse it rather
+        # than silently replacing it with a fresh instance (which would
+        # both lose the baseline and race with concurrent runtimes).
+        office_authority = cfg.tool_scheduler.office_authority
+        owns_office_authority = False
+    else:
+        office_authority = OfficeMutationAuthority()
     # B1: every security component is built from the *effective* policy,
     # not the raw project policy.  B2: root_capabilities is always installed
     # (even when empty) so an empty set means "deny all", not "no restriction".
@@ -193,6 +249,10 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         ),
     )
     scheduler.set_office_authority(office_authority)
+    # B1: register the authority on the scheduler only (instance attribute).
+    # The previous module-global ``file_tools._office_authority`` was removed
+    # — direct callers must pass ``office_authority`` explicitly or fall back
+    # to the legacy unfenced path (only safe for trusted inputs in tests).
     compressor = ContextCompressor(router, memory_manager=memory_manager)
     verify_factory = VerifyFixLoop
     skill_generator = SkillGenerator()
@@ -223,4 +283,5 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         new_verify_fix_loop=verify_factory,
         execution_service=execution_service,
         office_authority=office_authority,
+        owns_office_authority=owns_office_authority,
     )

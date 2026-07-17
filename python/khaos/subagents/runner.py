@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from khaos.agent.core import AgentConfig, AgentLoop, Message, SimpleTokenEngine
 from khaos.subagents.spawner import SubAgentTask
@@ -41,6 +41,7 @@ class SubAgentRunner:
         max_budget_tokens: int = 100000,  # 子代理 token 预算（比主 agent 低）
         stream_timeout: int = 60,        # 子代理超时（比主 agent 低）
         inherit_memory: bool = False,    # 是否从父会话继承记忆
+        office_authority: Optional[Any] = None,  # B1: 共享 Office authority
     ):
         self.router = router
         self.db = db
@@ -54,6 +55,10 @@ class SubAgentRunner:
         self.max_budget_tokens = max_budget_tokens
         self.stream_timeout = stream_timeout
         self.inherit_memory = inherit_memory
+        # B1: server-lifecycle Office authority shared across every subagent
+        # run — keeps the aggregate storage baseline stable and prevents
+        # build_runtime from silently replacing the scheduler's authority.
+        self.office_authority = office_authority
 
     async def run(self, task: SubAgentTask) -> str:
         """执行子任务并返回结果字符串。
@@ -65,6 +70,10 @@ class SubAgentRunner:
         4. 创建 AgentLoop 实例（共享 router/db/mode_manager，独立 config）
         5. 执行 run(task.goal, session_id) 并收集所有消息
         6. 提取最终 assistant 回复作为结果
+
+        B1: 在 ``finally`` 中调用 ``runtime.aclose()``，确保 ExecutionService /
+        MemoryManager 即使在 ``loop.run`` 抛错或被取消时也能被释放。注入的
+        共享 ``office_authority`` 是借用的，``aclose`` 不会关闭它。
         """
         session_id = f"{task.parent_session_id}/{task.id}"
         config = AgentConfig(
@@ -82,21 +91,25 @@ class SubAgentRunner:
             memory_manager=self.memory_manager if self.inherit_memory else None,
             skill_manager=self.skill_manager, agent_config=config,
             coding_context_builder=self.coding_context_builder,
+            office_authority=self.office_authority,
         ))
-        loop = runtime.loop
+        try:
+            logger.info(
+                "SubAgentRunner starting: task=%s session=%s goal=%r",
+                task.id,
+                session_id,
+                task.goal,
+            )
 
-        logger.info(
-            "SubAgentRunner starting: task=%s session=%s goal=%r",
-            task.id,
-            session_id,
-            task.goal,
-        )
+            messages: list[Message] = []
+            async for message in runtime.loop.run(task.goal, session_id):
+                messages.append(message)
 
-        messages: list[Message] = []
-        async for message in loop.run(task.goal, session_id):
-            messages.append(message)
-
-        return await self._collect_result(messages)
+            return await self._collect_result(messages)
+        finally:
+            # B1: release per-run resources (ExecutionService / MemoryManager).
+            # The shared office_authority (if injected) is borrowed, not owned.
+            await runtime.aclose()
 
     def _build_subagent_system_prompt(self, task: SubAgentTask) -> str:
         """构建子代理专用的 system prompt。

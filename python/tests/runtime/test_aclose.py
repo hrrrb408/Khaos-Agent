@@ -170,16 +170,21 @@ async def test_closed_field_is_not_bound_by_positional_construction():
     ``init=False`` makes this impossible at the dataclass level: ``_closed``
     is not in the generated ``__init__`` signature, so positional args can
     never bind into it.  The init signature must include the eight real
-    components plus the two optional components (``execution_service``,
-    ``office_authority``) — but NOT ``_closed``.
+    components plus the three optional components (``execution_service``,
+    ``office_authority``, ``owns_office_authority``) — but NOT ``_closed``
+    or ``_closing``.
     """
     import inspect
 
     init_params = list(inspect.signature(RuntimeResult.__init__).parameters)
-    # ``_closed`` must NOT be in the init signature — that's the B1 fix.
+    # ``_closed`` / ``_closing`` must NOT be in the init signature — that's
+    # the B1 / H3 fix.
     assert "_closed" not in init_params, (
         "_closed must be init=False so positional construction can never "
         "bind a component into it (B1 regression)"
+    )
+    assert "_closing" not in init_params, (
+        "_closing must be init=False (H3 regression)"
     )
     # The init signature must still accept the real components in order.
     assert init_params == [
@@ -194,6 +199,7 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "new_verify_fix_loop",
         "execution_service",
         "office_authority",
+        "owns_office_authority",
     ]
 
 

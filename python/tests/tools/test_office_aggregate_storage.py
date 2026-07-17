@@ -20,7 +20,6 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageLimits,
     WorkspaceStorageViolation,
 )
-from khaos.tools import file_tools
 from khaos.tools.file_tools import copy_file
 
 
@@ -38,6 +37,10 @@ def bounded_authority():
     to 4 KiB counts as 4 KiB of allocated bytes.  The authority deliberately
     accounts for block allocation.  A 8 KiB budget allows exactly two 4 KiB
     allocations; a third pushes the *cumulative* total over and is rolled back.
+
+    B1: the previous ``file_tools.set_office_authority`` module global has
+    been removed; tests now pass the authority explicitly to ``copy_file`` /
+    ``move_file`` via the ``office_authority`` parameter.
     """
     authority = OfficeMutationAuthority(
         storage_limits=WorkspaceStorageLimits(
@@ -45,9 +48,7 @@ def bounded_authority():
             entries=10_000,
         )
     )
-    file_tools.set_office_authority(authority)
     yield authority
-    file_tools.set_office_authority(None)
 
 
 async def test_repeated_copy_accumulates_and_violates_aggregate_budget(
@@ -70,7 +71,8 @@ async def test_repeated_copy_accumulates_and_violates_aggregate_budget(
     for i in range(1, 20):
         try:
             result = await copy_file(
-                "payload", f"copy{i}", workspace_root=tmp_path
+                "payload", f"copy{i}", workspace_root=tmp_path,
+                office_authority=bounded_authority,
             )
             if result.get("ok"):
                 succeeded += 1
@@ -113,7 +115,10 @@ async def test_aggregate_limit_is_per_workspace_not_per_call(
     for i in range(3):
         (source / f"f{i}.txt").write_bytes(b"z" * 100)
     with pytest.raises(WorkspaceStorageViolation):
-        await copy_file("data", "moredata", workspace_root=tmp_path)
+        await copy_file(
+            "data", "moredata", workspace_root=tmp_path,
+            office_authority=bounded_authority,
+        )
 
     # The violating copy's destination must not exist (rolled back).
     assert not (tmp_path / "moredata").exists()

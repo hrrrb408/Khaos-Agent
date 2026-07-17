@@ -90,8 +90,6 @@ async def test_factory_aclose_actually_shuts_down_components(tmp_path):
     and *none* of the shutdown bodies ran.  This test pins the contract
     that ``aclose()`` flips ``_closed`` and reaches every component.
     """
-    from khaos.tools import file_tools as _file_tools
-
     policy = "sandbox:\n  mode: workspace-write\n"
     result, db = await _build(tmp_path, policy)
     office_authority = result.office_authority
@@ -110,18 +108,14 @@ async def test_factory_aclose_actually_shuts_down_components(tmp_path):
         # introspect its private state across all backends, but we can
         # confirm ``aclose()`` did not raise and ``_closed`` flipped.
     finally:
-        # ``aclose()`` already ran; ``db.close()`` is the caller's job per
-        # the factory contract (db ownership stays with the caller).
-        # ``file_tools`` still holds the authority — clear it so it does
-        # not leak into subsequent tests in the same process.
-        _file_tools.set_office_authority(None)
+        # B1: the office authority is now owned by the RuntimeResult and
+        # closed via ``aclose()``; there is no module global to clear.
+        # ``db.close()`` is the caller's job per the factory contract.
         await db.close()
 
 
 async def test_factory_aclose_is_idempotent(tmp_path):
     """B1: second ``aclose()`` must short-circuit without re-entering shutdown."""
-    from khaos.tools import file_tools as _file_tools
-
     policy = "sandbox:\n  mode: workspace-write\n"
     result, db = await _build(tmp_path, policy)
     try:
@@ -131,5 +125,4 @@ async def test_factory_aclose_is_idempotent(tmp_path):
         await result.aclose()
         assert result._closed is True
     finally:
-        _file_tools.set_office_authority(None)
         await db.close()
