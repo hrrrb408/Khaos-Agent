@@ -77,5 +77,9 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
         "test_aclose.py",
         "test_factory_effective_policy.py",
         "test_grpc_server.py",
+        # M2: the M4 security regression suite (B1 / H1 / H2 / H3 / B2 /
+        # H4 / H5 / H6 closures) must stay in the matrix so a future
+        # refactor cannot silently regress the closed boundaries.
+        "test_m4_security_regression.py",
     ):
         assert required_contract in matrix
