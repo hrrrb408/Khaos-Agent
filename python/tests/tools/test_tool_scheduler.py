@@ -5,6 +5,9 @@ from khaos.db import Database
 from khaos.permissions import ApprovalMode, PermissionEngine
 from khaos.tools.registry import ToolDefinition, ToolRegistry
 from khaos.tools.scheduler import ToolBudget, ToolScheduler
+from khaos.security.middleware import SecurityMiddleware
+from khaos.security.sandbox import Sandbox, SandboxMode
+from khaos.tools.registry import create_runtime_registry
 
 
 async def _ok(value: str = "ok") -> str:
@@ -87,6 +90,38 @@ async def test_scheduler_executes_parallel_and_serial(tmp_path):
         {"value": "a"},
         {"value": "b"},
     ]
+    await db.close()
+
+
+async def test_office_scheduler_injects_non_model_workspace_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "inside.txt").write_text("inside", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    db = Database(tmp_path / "office.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        create_runtime_registry(),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+        security_middleware=SecurityMiddleware(
+            sandbox=Sandbox(SandboxMode.WORKSPACE_WRITE, workspace)
+        ),
+    )
+
+    inside = await scheduler.execute_batch(
+        [{"id": "1", "name": "read_file", "arguments": {"path": "inside.txt"}}],
+        mode="office",
+    )
+    escaped = await scheduler.execute_batch(
+        [{"id": "2", "name": "read_file", "arguments": {"path": str(outside)}}],
+        mode="office",
+    )
+
+    assert inside[0].success is True
+    assert escaped[0].success is False
+    assert "outside workspace" in escaped[0].error
     await db.close()
 
 

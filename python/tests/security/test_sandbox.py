@@ -111,6 +111,16 @@ def test_read_only_blocks_write_path() -> None:
     assert "read-only" in result.reason
 
 
+def test_read_only_and_workspace_write_block_reads_outside_root(tmp_path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    for mode in (SandboxMode.READ_ONLY, SandboxMode.WORKSPACE_WRITE):
+        sandbox = Sandbox(mode=mode, workspace_root=workspace)
+        assert sandbox.check_read_path("inside.txt").allowed is True
+        assert sandbox.check_read_path(str(tmp_path / "outside.txt")).allowed is False
+
+
 def test_default_mode_is_workspace_write() -> None:
     """The default Sandbox() is workspace-write."""
     sandbox = Sandbox()

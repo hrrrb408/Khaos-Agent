@@ -118,3 +118,24 @@ async def test_workspace_write_sandbox_checks_copy_and_move_endpoints(tmp_path):
     assert copy_result.allowed is False
     assert move_result.allowed is False
     assert relative_result.allowed is True
+
+
+async def test_sandbox_blocks_every_office_read_tool_outside_root(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    middleware = SecurityMiddleware(
+        sandbox=Sandbox(SandboxMode.WORKSPACE_WRITE, workspace)
+    )
+
+    calls = (
+        ("read_file", {"path": str(tmp_path / "outside.txt")}),
+        ("file_info", {"path": str(tmp_path / "outside.txt")}),
+        ("tree_view", {"path": str(tmp_path)}),
+        ("list_directory", {"path": str(tmp_path)}),
+        ("file_search_content", {"path": str(tmp_path)}),
+        ("search_files", {"root": str(tmp_path)}),
+    )
+    for tool_name, arguments in calls:
+        result = await middleware.pre_check(tool_name, arguments)
+        assert result.allowed is False, tool_name
+        assert result.check_type == "sandbox_path"

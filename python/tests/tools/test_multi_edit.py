@@ -14,6 +14,7 @@ async def test_multi_edit_applies_multiple_exact_edits_atomically(tmp_path):
                 {"old_text": "gamma delta", "new_text": "gamma epsilon"},
                 {"old_text": "alpha", "new_text": "omega"},
             ],
+            workspace_root=tmp_path,
         )
     )
 
@@ -34,6 +35,7 @@ async def test_multi_edit_does_not_write_when_any_edit_is_missing(tmp_path):
                 {"old_text": "alpha", "new_text": "omega"},
                 {"old_text": "missing", "new_text": "new"},
             ],
+            workspace_root=tmp_path,
         )
     )
 
@@ -55,7 +57,11 @@ async def test_multi_edit_requires_unique_match(tmp_path):
     file_path.write_text(original, encoding="utf-8")
 
     result = json.loads(
-        await multi_edit(str(file_path), [{"old_text": "alpha", "new_text": "omega"}])
+        await multi_edit(
+            str(file_path),
+            [{"old_text": "alpha", "new_text": "omega"}],
+            workspace_root=tmp_path,
+        )
     )
 
     assert result["applied"] == 0
@@ -75,6 +81,7 @@ async def test_multi_edit_replaces_longer_text_first(tmp_path):
                 {"old_text": "suffix", "new_text": "tail"},
                 {"old_text": "prefix-middle", "new_text": "head"},
             ],
+            workspace_root=tmp_path,
         )
     )
 
