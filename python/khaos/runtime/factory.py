@@ -69,11 +69,14 @@ class RuntimeResult:
     memory_manager: MemoryManager
     skill_manager: SkillManager
     new_verify_fix_loop: Callable[[], VerifyFixLoop] | None
-    _closed: bool = False
     execution_service: ExecutionService | None = None
     # H3: the OfficeMutationAuthority is owned by the runtime so aclose()
     # can fence every in-flight Office mutation before the process exits.
     office_authority: OfficeMutationAuthority | None = None
+    # B1: ``init=False`` so positional construction can never accidentally
+    # bind a real component into ``_closed`` (which previously made
+    # ``aclose()`` a no-op because the truthy component short-circuited it).
+    _closed: bool = field(default=False, init=False)
 
     async def aclose(self) -> None:
         """Release runtime-owned resources; database ownership stays with caller."""
@@ -210,7 +213,14 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         principal_id=cfg.principal_id,
     )
     return RuntimeResult(
-        loop, mode_manager, task_manager, skill_generator, scheduler,
-        memory_manager, skill_manager, verify_factory, execution_service,
-        office_authority,
+        loop=loop,
+        mode_manager=mode_manager,
+        task_manager=task_manager,
+        skill_generator=skill_generator,
+        tool_scheduler=scheduler,
+        memory_manager=memory_manager,
+        skill_manager=skill_manager,
+        new_verify_fix_loop=verify_factory,
+        execution_service=execution_service,
+        office_authority=office_authority,
     )
