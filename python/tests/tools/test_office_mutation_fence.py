@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
-from khaos.tools import file_tools
 from khaos.tools.file_tools import copy_file, move_file
 
 
@@ -28,11 +27,14 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture
 def office_authority():
-    """Register a fresh authority for each test and clear it afterwards."""
+    """Provide a fresh authority for each test.
+
+    B1: the previous ``file_tools.set_office_authority`` module global has
+    been removed — tests now pass the authority explicitly to ``copy_file``
+    / ``move_file`` via the ``office_authority`` parameter.
+    """
     authority = OfficeMutationAuthority()
-    file_tools.set_office_authority(authority)
     yield authority
-    file_tools.set_office_authority(None)
 
 
 def _patch_slow_copy(monkeypatch, delay: float):
@@ -69,7 +71,8 @@ async def test_cancel_during_recursive_copy_settles_before_return(
     _patch_slow_copy(monkeypatch, 0.15)
 
     task = asyncio.create_task(
-        copy_file("bundle", "copied", workspace_root=tmp_path)
+        copy_file("bundle", "copied", workspace_root=tmp_path,
+                  office_authority=office_authority)
     )
     await asyncio.sleep(0.05)
     task.cancel()
@@ -119,7 +122,9 @@ async def test_timeout_before_final_rename_no_partial_tree(
 
     try:
         await asyncio.wait_for(
-            copy_file("bundle", "copied", workspace_root=tmp_path), timeout=0.03
+            copy_file("bundle", "copied", workspace_root=tmp_path,
+                      office_authority=office_authority),
+            timeout=0.03,
         )
     except asyncio.TimeoutError:
         pass
@@ -165,7 +170,8 @@ async def test_cancel_during_move_tree_validation_no_side_effect(
     )
 
     task = asyncio.create_task(
-        move_file("bundle", "moved", workspace_root=tmp_path)
+        move_file("bundle", "moved", workspace_root=tmp_path,
+                  office_authority=office_authority)
     )
     await asyncio.sleep(0.05)
     task.cancel()
@@ -212,7 +218,8 @@ async def test_shutdown_waits_for_active_copy_thread(
     monkeypatch.setattr(boundary.SafeWorkspaceFS, "copy_path", gated_copy)
 
     task = asyncio.create_task(
-        copy_file("bundle", "copied", workspace_root=tmp_path)
+        copy_file("bundle", "copied", workspace_root=tmp_path,
+                  office_authority=office_authority)
     )
     await started.wait()
     # shutdown must wait for the in-flight mutation to settle.
@@ -242,7 +249,8 @@ async def test_cancelled_call_cannot_mutate_after_result_event(
     _patch_slow_copy(monkeypatch, 0.12)
 
     task = asyncio.create_task(
-        copy_file("bundle", "copied", workspace_root=tmp_path)
+        copy_file("bundle", "copied", workspace_root=tmp_path,
+                  office_authority=office_authority)
     )
     await asyncio.sleep(0.04)
     task.cancel()
@@ -264,3 +272,129 @@ async def test_cancelled_call_cannot_mutate_after_result_event(
     assert state_before == state_after, (
         "filesystem mutated after the cancelled call reported its result"
     )
+
+
+# ---- H4: cancel_event is checked during traversal / chunk loops ---- #
+
+
+def test_cancel_event_set_before_traversal_aborts_immediately(tmp_path):
+    """H4: a pre-set ``cancel_event`` aborts the copy at the FIRST traversal
+    loop iteration, not after the full temp tree is built.
+
+    Without H4, ``cancel_event`` was only checked just before the final
+    atomic rename — so the full recursive scan + temp tree copy ran even
+    after the caller had already cancelled.  With H4, the check at the top
+    of every directory entry makes the cancel effective immediately.
+    """
+    import threading
+
+    from khaos.coding.workspace.boundary import (
+        MutationCancelled,
+        SafeWorkspaceFS,
+    )
+
+    source = tmp_path / "tree"
+    source.mkdir()
+    for i in range(5):
+        (source / f"f{i}.txt").write_text("x" * 100, encoding="utf-8")
+
+    safe_fs = SafeWorkspaceFS(tmp_path)
+    cancel_event = threading.Event()
+    cancel_event.set()  # pre-set: cancel before any work
+
+    with pytest.raises(MutationCancelled):
+        safe_fs.copy_path(
+            source, tmp_path / "copied",
+            cancel_event=cancel_event,
+        )
+    # No destination was published.
+    assert not (tmp_path / "copied").exists()
+    # No leftover temp tree.
+    assert list(tmp_path.glob(".khaos-tree-*")) == []
+
+
+def test_cancel_event_set_mid_traversal_aborts_promptly(
+    tmp_path, monkeypatch
+):
+    """H4: setting ``cancel_event`` during the recursive traversal aborts
+    the copy at the next directory entry, not after the full tree is built
+    and validated.
+
+    A tree with many entries is created; the first entry copies normally,
+    then the cancel_event is set.  Without H4, the remaining entries would
+    all be copied before the cancel was checked at the final rename.  With
+    H4, the next iteration's top-of-loop check raises ``MutationCancelled``
+    and the temp tree is cleaned up.
+    """
+    import threading
+
+    from khaos.coding.workspace import boundary
+    from khaos.coding.workspace.boundary import (
+        MutationCancelled,
+        SafeWorkspaceFS,
+    )
+
+    source = tmp_path / "tree"
+    source.mkdir()
+    for i in range(20):
+        (source / f"f{i:02d}.txt").write_text("x" * 100, encoding="utf-8")
+
+    cancel_event = threading.Event()
+    call_count = {"n": 0}
+    original_listdir = os.listdir
+
+    def counting_listdir(fd):
+        result = original_listdir(fd)
+        # After the first listdir call (the root of the source tree), set
+        # the cancel event.  The traversal will process the first entry,
+        # then the H4 check at the top of the next iteration fires.
+        call_count["n"] += 1
+        if call_count["n"] >= 1:
+            cancel_event.set()
+        return result
+
+    monkeypatch.setattr(boundary.os, "listdir", counting_listdir)
+
+    safe_fs = SafeWorkspaceFS(tmp_path)
+    with pytest.raises(MutationCancelled):
+        safe_fs.copy_path(
+            source, tmp_path / "copied",
+            cancel_event=cancel_event,
+        )
+    # No destination was published.
+    assert not (tmp_path / "copied").exists()
+    # No leftover temp tree.
+    assert list(tmp_path.glob(".khaos-tree-*")) == []
+
+
+def test_cancel_event_set_during_chunk_read_aborts_file_copy(tmp_path):
+    """H4: setting ``cancel_event`` during the chunk read loop aborts a
+    large file copy mid-stream, not just at the final publish.
+
+    Without H4, a large file would be fully copied to the temp file before
+    the cancel was checked at the link step.  With H4, the check before
+    each chunk read makes the cancel effective within one chunk (1 MiB)
+    of I/O.
+    """
+    import threading
+
+    from khaos.coding.workspace.boundary import (
+        MutationCancelled,
+        SafeWorkspaceFS,
+    )
+
+    source = tmp_path / "big.bin"
+    # Write enough data to require multiple chunk reads (each chunk is 1 MiB).
+    source.write_bytes(b"x" * (3 * 1024 * 1024))
+
+    safe_fs = SafeWorkspaceFS(tmp_path)
+    cancel_event = threading.Event()
+    cancel_event.set()  # pre-set: cancel before any chunk read
+
+    with pytest.raises(MutationCancelled):
+        safe_fs.copy_file(
+            source, tmp_path / "copied.bin",
+            cancel_event=cancel_event,
+        )
+    # No destination was published.
+    assert not (tmp_path / "copied.bin").exists()
