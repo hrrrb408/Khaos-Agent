@@ -538,6 +538,7 @@ class SafeWorkspaceFS:
                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                     dir_fd=destination_parent.parent_fd,
                 )
+                pre_publish_identity = None
                 try:
                     budget = {"bytes": 0, "entries": 0}
                     self._copy_tree_dirfd(
@@ -548,8 +549,23 @@ class SafeWorkspaceFS:
                         max_bytes=max_bytes,
                         max_entries=max_entries,
                         max_depth=max_depth,
+                        cancel_event=cancel_event,
                     )
                     os.fsync(destination_descriptor)
+                    # H1: capture the temp directory's identity NOW via
+                    # fstat on the open fd.  ``rename`` does not change the
+                    # inode, so this IS the published destination's identity.
+                    # Capturing it before the rename eliminates the post-
+                    # publish ``os.stat`` that could fail (and leave the
+                    # published object落地 with an empty identity_out and a
+                    # no-op rollback) or race with a concurrent replacement.
+                    if identity_out is not None:
+                        temp_stat = os.fstat(destination_descriptor)
+                        pre_publish_identity = (
+                            temp_stat.st_dev,
+                            temp_stat.st_ino,
+                            temp_stat.st_mode,
+                        )
                 finally:
                     os.close(destination_descriptor)
                 final_source = os.fstat(source_descriptor)
@@ -579,17 +595,12 @@ class SafeWorkspaceFS:
                 destination_parent.leaf,
             )
             temporary = ""
-            # H4: capture the published identity through the same dirfds
-            # (still open), before releasing them — no re-open window.
-            if identity_out is not None:
-                published = os.stat(
-                    destination_parent.leaf,
-                    dir_fd=destination_parent.parent_fd,
-                    follow_symlinks=False,
-                )
-                identity_out.append(
-                    (published.st_dev, published.st_ino, published.st_mode)
-                )
+            # H1: the published destination's identity was captured via
+            # fstat on the temp fd BEFORE the atomic rename.  No post-
+            # publish stat — eliminate the TOCTOU window and the failure
+            # mode where rename succeeds but stat raises.
+            if identity_out is not None and pre_publish_identity is not None:
+                identity_out.append(pre_publish_identity)
             destination_parent.fsync()
             return budget["bytes"]
         finally:
@@ -647,6 +658,7 @@ class SafeWorkspaceFS:
                         max_bytes=DEFAULT_TREE_BYTES,
                         max_entries=DEFAULT_TREE_ENTRIES,
                         max_depth=DEFAULT_TREE_DEPTH,
+                        cancel_event=cancel_event,
                     )
                 finally:
                     os.close(descriptor)
@@ -660,6 +672,17 @@ class SafeWorkspaceFS:
                 source_info.st_ino,
             ):
                 raise WorkspaceBoundaryError("move source identity changed")
+            # H1: the source identity is already validated above; ``rename``
+            # preserves the inode, so ``current`` IS the published destina-
+            # tion's identity.  Capture it now — no post-publish ``os.stat``
+            # that could fail (and leave the published object with an empty
+            # identity_out and a no-op rollback) or race with a concurrent
+            # replacement of the destination path.
+            pre_publish_identity = (
+                (current.st_dev, current.st_ino, current.st_mode)
+                if identity_out is not None
+                else None
+            )
             # H2: cooperative cancel — check just before the atomic rename.
             # The source is still in place; no side effect has landed.
             if cancel_event is not None and cancel_event.is_set():
@@ -672,17 +695,11 @@ class SafeWorkspaceFS:
                 destination_parent.parent_fd,
                 destination_parent.leaf,
             )
-            # H4: capture the published identity through the same dirfds
-            # (still open), before releasing them — no re-open window.
-            if identity_out is not None:
-                published = os.stat(
-                    destination_parent.leaf,
-                    dir_fd=destination_parent.parent_fd,
-                    follow_symlinks=False,
-                )
-                identity_out.append(
-                    (published.st_dev, published.st_ino, published.st_mode)
-                )
+            # H1: use the pre-captured source identity — rename preserves
+            # the inode, so this is the published destination's identity.
+            # No post-publish stat.
+            if identity_out is not None and pre_publish_identity is not None:
+                identity_out.append(pre_publish_identity)
             source_parent.fsync()
             if source_parent.identity != destination_parent.identity:
                 destination_parent.fsync()
@@ -700,10 +717,20 @@ class SafeWorkspaceFS:
         max_bytes: int,
         max_entries: int,
         max_depth: int,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         if depth > max_depth:
             raise WorkspaceBoundaryError("copy source exceeds the depth limit")
         for name in sorted(os.listdir(source_fd), key=str.casefold):
+            # H4: cooperative cancel — check at the top of every directory
+            # entry so a slow recursive scan, a huge temp tree copy, or slow
+            # filesystem I/O can be interrupted promptly rather than only
+            # at the final atomic publish.  This makes the scheduler timeout
+            # a real wall-clock deadline.
+            if cancel_event is not None and cancel_event.is_set():
+                raise MutationCancelled(
+                    "copy cancelled during recursive directory traversal"
+                )
             if name.casefold() in {
                 protected.casefold() for protected in PROTECTED_WORKSPACE_NAMES
             }:
@@ -733,6 +760,7 @@ class SafeWorkspaceFS:
                         max_bytes=max_bytes,
                         max_entries=max_entries,
                         max_depth=max_depth,
+                        cancel_event=cancel_event,
                     )
                     os.fsync(child_destination)
                 finally:
@@ -765,6 +793,13 @@ class SafeWorkspaceFS:
             try:
                 copied = 0
                 while True:
+                    # H4: check before each chunk read so a large file copy
+                    # can be cancelled mid-stream, not just at the final
+                    # publish.
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise MutationCancelled(
+                            "copy cancelled during file copy"
+                        )
                     chunk = os.read(source_file, 1024 * 1024)
                     if not chunk:
                         break
@@ -795,10 +830,18 @@ class SafeWorkspaceFS:
         max_bytes: int,
         max_entries: int,
         max_depth: int,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         if depth > max_depth:
             raise WorkspaceBoundaryError("tree exceeds the depth limit")
         for name in sorted(os.listdir(descriptor), key=str.casefold):
+            # H4: cooperative cancel — check at the top of every directory
+            # entry so a slow recursive validation can be interrupted
+            # promptly rather than only at the final atomic rename.
+            if cancel_event is not None and cancel_event.is_set():
+                raise MutationCancelled(
+                    "move cancelled during recursive tree validation"
+                )
             if name.casefold() in {
                 protected.casefold() for protected in PROTECTED_WORKSPACE_NAMES
             }:
@@ -821,6 +864,7 @@ class SafeWorkspaceFS:
                         max_bytes=max_bytes,
                         max_entries=max_entries,
                         max_depth=max_depth,
+                        cancel_event=cancel_event,
                     )
                 finally:
                     os.close(child)
@@ -959,8 +1003,17 @@ class SafeWorkspaceFS:
             )
             temporary_descriptor, temporary = parent.temporary(mode=0o600)
             total = 0
+            pre_publish_identity = None
             try:
                 while True:
+                    # H4: check before each chunk read so a large file copy
+                    # can be cancelled mid-stream, not just at the final
+                    # publish.  This makes the scheduler timeout a real
+                    # wall-clock deadline.
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise MutationCancelled(
+                            "copy cancelled during file copy"
+                        )
                     chunk = os.read(source_descriptor, 1024 * 1024)
                     if not chunk:
                         break
@@ -971,6 +1024,20 @@ class SafeWorkspaceFS:
                         )
                     self._write_all(temporary_descriptor, chunk)
                 os.fsync(temporary_descriptor)
+                # H1: capture the temp file's identity NOW via fstat on the
+                # open fd.  ``os.link`` creates a hard link to the same
+                # inode, so this IS the published destination's identity.
+                # Capturing it before the link eliminates the post-publish
+                # ``os.stat`` that could fail (and leave the published file
+                # with an empty identity_out and a no-op rollback) or race
+                # with a concurrent replacement of the destination path.
+                if identity_out is not None:
+                    temp_stat = os.fstat(temporary_descriptor)
+                    pre_publish_identity = (
+                        temp_stat.st_dev,
+                        temp_stat.st_ino,
+                        temp_stat.st_mode,
+                    )
             finally:
                 if temporary_descriptor is not None:
                     os.close(temporary_descriptor)
@@ -1005,16 +1072,12 @@ class SafeWorkspaceFS:
             )
             os.unlink(temporary, dir_fd=parent.parent_fd)
             temporary = ""
-            # H4: capture identity inside the same dirfd critical section.
-            if identity_out is not None:
-                published = os.stat(
-                    parent.leaf,
-                    dir_fd=parent.parent_fd,
-                    follow_symlinks=False,
-                )
-                identity_out.append(
-                    (published.st_dev, published.st_ino, published.st_mode)
-                )
+            # H1: the published destination's identity was captured via
+            # fstat on the temp fd BEFORE the atomic link.  No post-publish
+            # stat — eliminate the TOCTOU window and the failure mode where
+            # link succeeds but stat raises.
+            if identity_out is not None and pre_publish_identity is not None:
+                identity_out.append(pre_publish_identity)
             parent.fsync()
             return total
         finally:

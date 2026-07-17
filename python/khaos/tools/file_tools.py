@@ -25,22 +25,16 @@ TREE_EXCLUDE_DIRS = {
     "build",
 }
 
-# H1: the runtime (factory.py) registers the shared OfficeMutationAuthority
-# here so Office file mutations can be fenced against cancellation/timeout.
-# When unset (e.g. ad-hoc tool calls in tests), copy_file/move_file fall back
-# to the legacy bare to_thread path — which is only safe for trusted inputs.
-_office_authority: Any = None
-
-
-def set_office_authority(authority: Any) -> None:
-    """Register the shared OfficeMutationAuthority (called once at startup)."""
-    global _office_authority
-    _office_authority = authority
-
-
-def _get_office_authority() -> Any:
-    """Return the registered OfficeMutationAuthority, or None if unset."""
-    return _office_authority
+# B1: the previous module-global ``_office_authority`` (set by
+# ``set_office_authority``) has been REMOVED.  Concurrent ``build_runtime``
+# calls overwrote it without coordination, so a ``copy_file`` direct call
+# could land on an unrelated runtime's authority — losing the baseline and
+# the fence.  The authority is now injected explicitly through the
+# ToolScheduler's ``office_authority`` instance attribute (set in
+# ``build_runtime``) and threaded into ``copy_file`` / ``move_file`` via the
+# scheduler's ``invocation_context``.  Direct callers that do not pass
+# ``office_authority=...`` fall back to the legacy bare ``to_thread`` path
+# (only safe for trusted inputs in tests).
 
 async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Read a file page with one-based line numbers."""
@@ -236,8 +230,6 @@ async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | N
             ),
         )
     if workspace_root is not None:
-        if office_authority is None:
-            office_authority = _get_office_authority()
         if office_authority is not None:
             # H1: route through the mutation fence so cancellation / timeout
             # cannot abandon a running copy thread that later commits a side
@@ -249,6 +241,9 @@ async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | N
                     workspace_root, src, dst, cancel_event=cancel_event,
                 ),
             )
+        # B1: no authority injected — legacy unfenced path (only safe for
+        # trusted inputs in tests; production paths always inject via the
+        # scheduler's invocation_context).
         return await asyncio.to_thread(
             _office_copy_sync, workspace_root, src, dst
         )
@@ -268,8 +263,6 @@ async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | N
             lambda: _workspace_move_sync(workspace.worktree_path, src, dst),
         )
     if workspace_root is not None:
-        if office_authority is None:
-            office_authority = _get_office_authority()
         if office_authority is not None:
             workspace = await office_authority.workspace_for_root(workspace_root)
             return await office_authority.mutate(
@@ -278,6 +271,9 @@ async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | N
                     workspace_root, src, dst, cancel_event=cancel_event,
                 ),
             )
+        # B1: no authority injected — legacy unfenced path (only safe for
+        # trusted inputs in tests; production paths always inject via the
+        # scheduler's invocation_context).
         return await asyncio.to_thread(
             _office_move_sync, workspace_root, src, dst
         )

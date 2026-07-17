@@ -91,6 +91,15 @@ class EffectiveSecurityPolicy:
     the factory wiring: when the effective policy is compiled, its
     ``root_capabilities`` (even empty) is always installed on the Sandbox,
     so an empty set becomes a hard deny rather than a fail-open.
+
+    H2: ``audit_enabled`` / ``audit_log_path`` /
+    ``secrets_scan_before_tool_result`` / ``secrets_block_env_dump`` are
+    compiled here (OR semantics — if user OR project requires audit / scan,
+    the project cannot disable it) so an untrusted project can no longer
+    silently turn off production audit or secret scanning by setting
+    ``audit.enabled: false`` in its ``khaos_policy.yaml``.  The AgentService
+    consumes these fields from the *effective* policy, never from the raw
+    project policy.
     """
 
     mode: SandboxMode
@@ -103,6 +112,13 @@ class EffectiveSecurityPolicy:
     commands_require_approval: frozenset[str]
     commands_blocked: frozenset[str]
     secrets_scan_on_output: bool
+    # H2: audit + secret-scan fields compiled from the layered policies.
+    # ``audit_enabled`` uses OR semantics: if the user OR project layer
+    # requires audit, the project layer cannot disable it.
+    audit_enabled: bool = True
+    audit_log_path: str | None = None
+    secrets_scan_before_tool_result: bool = True
+    secrets_block_env_dump: bool = True
     digest: str = ""
 
     def __post_init__(self) -> None:
@@ -197,6 +213,28 @@ def compile_effective_policy(
     secrets_scan_on_output = bool(project_policy.secrets_scan_on_output) or (
         user is None or bool(user.secrets_scan_on_output)
     )
+    # H2: the other secret-scan toggles use the same OR semantics — if
+    # either layer requires scanning, the project cannot disable it.
+    secrets_scan_before_tool_result = bool(
+        project_policy.secrets_scan_before_tool_result
+    ) or (user is None or bool(user.secrets_scan_before_tool_result))
+    secrets_block_env_dump = bool(project_policy.secrets_block_env_dump) or (
+        user is None or bool(user.secrets_block_env_dump)
+    )
+
+    # H2: audit uses OR semantics — if the user OR project layer requires
+    # audit, the project layer cannot disable it.  This closes the hole
+    # where an untrusted repo could submit ``audit.enabled: false`` and
+    # silently turn off production audit.  ``audit_log_path``: the user
+    # layer's path wins if set (user is the trust root), otherwise the
+    # project layer's path, otherwise None (default db-backed audit).
+    audit_enabled = bool(project_policy.audit_enabled) or (
+        user is None or bool(user.audit_enabled)
+    )
+    if user is not None and user.audit_log_path:
+        audit_log_path = user.audit_log_path
+    else:
+        audit_log_path = project_policy.audit_log_path
 
     return EffectiveSecurityPolicy(
         mode=mode,
@@ -209,6 +247,10 @@ def compile_effective_policy(
         commands_require_approval=commands_require_approval,
         commands_blocked=commands_blocked,
         secrets_scan_on_output=secrets_scan_on_output,
+        audit_enabled=audit_enabled,
+        audit_log_path=audit_log_path,
+        secrets_scan_before_tool_result=secrets_scan_before_tool_result,
+        secrets_block_env_dump=secrets_block_env_dump,
     )
 
 
@@ -509,6 +551,13 @@ def _canonical_dict(policy: EffectiveSecurityPolicy) -> dict:
         "commands_require_approval": sorted(policy.commands_require_approval),
         "commands_blocked": sorted(policy.commands_blocked),
         "secrets_scan_on_output": policy.secrets_scan_on_output,
+        # H2: audit + secret-scan fields are part of the binding digest so
+        # an approval made under one audit configuration is invalidated if
+        # the project later tries to disable audit.
+        "audit_enabled": policy.audit_enabled,
+        "audit_log_path": policy.audit_log_path,
+        "secrets_scan_before_tool_result": policy.secrets_scan_before_tool_result,
+        "secrets_block_env_dump": policy.secrets_block_env_dump,
     }
 
 

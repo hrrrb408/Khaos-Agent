@@ -269,3 +269,145 @@ def test_default_user_policy_is_safe_baseline():
     policy = default_user_policy()
     assert policy.mode == "workspace-write"
     assert policy.network_enabled is False
+
+
+# ---- H2: audit + secret-scan fields use OR semantics (project cannot disable) ---- #
+
+
+def _full_policy(**kw) -> SandboxPolicy:
+    """Build a SandboxPolicy with all H2 fields overridable."""
+    base = SandboxPolicy()
+    return SandboxPolicy(
+        mode=kw.get("mode", base.mode),
+        network_enabled=kw.get("network_enabled", base.network_enabled),
+        allowed_paths=kw.get("allowed_paths", base.allowed_paths),
+        denied_paths=kw.get("denied_paths", base.denied_paths),
+        commands_allowed=kw.get("commands_allowed", base.commands_allowed),
+        commands_require_approval=kw.get(
+            "commands_require_approval", base.commands_require_approval
+        ),
+        commands_blocked=kw.get("commands_blocked", base.commands_blocked),
+        secrets_scan_on_output=kw.get(
+            "secrets_scan_on_output", base.secrets_scan_on_output
+        ),
+        secrets_scan_before_tool_result=kw.get(
+            "secrets_scan_before_tool_result",
+            base.secrets_scan_before_tool_result,
+        ),
+        secrets_block_env_dump=kw.get(
+            "secrets_block_env_dump", base.secrets_block_env_dump
+        ),
+        audit_enabled=kw.get("audit_enabled", base.audit_enabled),
+        audit_log_path=kw.get("audit_log_path", base.audit_log_path),
+    )
+
+
+def test_project_cannot_disable_audit_when_user_requires_it(tmp_path):
+    """H2: ``audit.enabled: false`` in the project policy cannot disable
+    audit when the user layer requires it (OR semantics)."""
+    eff = compile_effective_policy(
+        _full_policy(audit_enabled=False),  # project tries to disable
+        workspace_root=tmp_path,
+        user_policy=_full_policy(audit_enabled=True),  # user requires it
+    )
+    assert eff.audit_enabled is True, (
+        "project must not be able to disable audit when the user layer "
+        "requires it (H2 OR semantics)"
+    )
+
+
+def test_project_can_disable_audit_when_user_also_disables(tmp_path):
+    """H2: audit is disabled only when BOTH layers disable it."""
+    eff = compile_effective_policy(
+        _full_policy(audit_enabled=False),
+        workspace_root=tmp_path,
+        user_policy=_full_policy(audit_enabled=False),
+    )
+    assert eff.audit_enabled is False
+
+
+def test_audit_enabled_defaults_to_true_without_user_layer(tmp_path):
+    """H2: with no user layer, the safe default applies — audit stays on
+    even if the project tries to disable it.  ``user_policy=None`` is
+    treated as "user requires audit" (fail-safe), matching the production
+    wiring where a missing ``~/.khaos/policy.yaml`` installs the safe
+    ``default_user_policy()`` baseline."""
+    eff = compile_effective_policy(
+        _full_policy(audit_enabled=False),  # project tries to disable
+        workspace_root=tmp_path,
+        user_policy=None,  # no user layer → safe default (audit on)
+    )
+    assert eff.audit_enabled is True, (
+        "a missing user layer must not let the project disable audit "
+        "(H2 fail-safe)"
+    )
+    # When the project explicitly enables audit, it stays on too.
+    eff_default = compile_effective_policy(
+        _full_policy(),  # audit_enabled=True by default
+        workspace_root=tmp_path,
+        user_policy=None,
+    )
+    assert eff_default.audit_enabled is True
+
+
+def test_project_cannot_disable_secret_scan_when_user_requires_it(tmp_path):
+    """H2: ``secrets.scan_before_tool_result: false`` in the project policy
+    cannot disable scanning when the user layer requires it."""
+    eff = compile_effective_policy(
+        _full_policy(secrets_scan_before_tool_result=False),
+        workspace_root=tmp_path,
+        user_policy=_full_policy(secrets_scan_before_tool_result=True),
+    )
+    assert eff.secrets_scan_before_tool_result is True
+
+    eff2 = compile_effective_policy(
+        _full_policy(secrets_block_env_dump=False),
+        workspace_root=tmp_path,
+        user_policy=_full_policy(secrets_block_env_dump=True),
+    )
+    assert eff2.secrets_block_env_dump is True
+
+
+def test_audit_log_path_user_wins_over_project(tmp_path):
+    """H2: the user layer's ``audit_log_path`` takes precedence (trust root)."""
+    eff = compile_effective_policy(
+        _full_policy(audit_log_path="/var/log/project-audit.log"),
+        workspace_root=tmp_path,
+        user_policy=_full_policy(audit_log_path="/var/log/user-audit.log"),
+    )
+    assert eff.audit_log_path == "/var/log/user-audit.log"
+
+
+def test_audit_log_path_falls_back_to_project(tmp_path):
+    """H2: when the user layer has no ``audit_log_path``, the project's path
+    is used."""
+    eff = compile_effective_policy(
+        _full_policy(audit_log_path="/var/log/project-audit.log"),
+        workspace_root=tmp_path,
+        user_policy=_full_policy(audit_log_path=None),
+    )
+    assert eff.audit_log_path == "/var/log/project-audit.log"
+
+
+def test_audit_fields_are_part_of_digest(tmp_path):
+    """H2: changing ``audit_enabled`` changes the digest, so an approval
+    made under one audit config is invalidated if the project later
+    tries to disable audit.  Both layers must agree to disable audit for
+    the effective ``audit_enabled`` to actually flip to False."""
+    # Both layers disable audit → effective audit_enabled = False.
+    eff_off = compile_effective_policy(
+        _full_policy(audit_enabled=False),
+        workspace_root=tmp_path,
+        user_policy=_full_policy(audit_enabled=False),
+    )
+    assert eff_off.audit_enabled is False
+    # Project enables audit → effective audit_enabled = True.
+    eff_on = compile_effective_policy(
+        _full_policy(audit_enabled=True),
+        workspace_root=tmp_path,
+        user_policy=_full_policy(audit_enabled=False),
+    )
+    assert eff_on.audit_enabled is True
+    assert eff_on.digest != eff_off.digest, (
+        "audit_enabled must be part of the binding digest (H2)"
+    )

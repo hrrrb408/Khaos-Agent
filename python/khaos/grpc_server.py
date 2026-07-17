@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import socket
 import stat
@@ -29,6 +30,7 @@ from khaos.agent.error_handler import ErrorHandler
 from khaos.audit import AuditLogger
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
+from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.channels import (
     ChannelRegistry,
     ChannelType,
@@ -53,13 +55,14 @@ from khaos.routing.router import create_default_router
 from khaos.routing import ModelRouter
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
-from khaos.security.policy import load_policy
 from khaos.skills import SkillGenerator, SkillManager
 from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
 from khaos.tools import create_runtime_registry
 from khaos.tools.channel_tools import set_channel_registry
 from khaos.tools.cron_tools import set_cron_engine
 from khaos.tools.scheduler import ToolScheduler
+
+logger = logging.getLogger(__name__)
 
 
 RPC_MAX_REQUEST_BYTES = 1024 * 1024
@@ -258,9 +261,27 @@ class AgentService:
         )
         self._verified_webhook_limiter = WebhookRateLimiter()
         set_channel_registry(self.channel_registry)
-        # Security policy loaded once (not per chat call) and cached; rebuild
-        # the middleware stack from it for every runtime.
-        self._policy = load_policy(project_root / "khaos_policy.yaml")
+        # H2: compile the *layered* effective policy (user ∩ project ∩
+        # platform) once at startup — never consult the raw project policy
+        # for enforcement decisions.  An untrusted repo can no longer
+        # silently disable audit by setting ``audit.enabled: false`` in
+        # its ``khaos_policy.yaml``: the effective policy's ``audit_enabled``
+        # uses OR semantics (if the user layer requires audit, the project
+        # cannot disable it).
+        from khaos.security.effective_policy import load_effective_policy
+        self._effective_policy = load_effective_policy(self.project_root)
+        logger.info(
+            "effective security policy digest: %s (audit_enabled=%s)",
+            self._effective_policy.digest,
+            self._effective_policy.audit_enabled,
+        )
+        # B1: the OfficeMutationAuthority is a server-lifecycle object shared
+        # across every chat / webhook / cron turn.  Reusing one instance keeps
+        # the aggregate storage baseline stable across turns (closing the
+        # cross-turn quota bypass).  Per-turn runtimes borrow it (via
+        # RuntimeConfig.office_authority); RuntimeResult.aclose does NOT close
+        # it — AgentService.shutdown does.
+        self._office_authority = OfficeMutationAuthority()
 
     async def start(self) -> None:
         """Start process-scoped background services."""
@@ -269,6 +290,13 @@ class AgentService:
 
     async def shutdown(self) -> None:
         """Stop process-scoped background services."""
+        # B1: fence every in-flight Office mutation before shutting down cron.
+        # The authority is shared across all turns, so only the server owns
+        # its lifecycle.
+        try:
+            await self._office_authority.shutdown()
+        except Exception:
+            logger.debug("office authority shutdown failed", exc_info=True)
         await self.cron_engine.stop()
 
     async def _execute_scheduled_prompt(self, task_id: str, prompt: str) -> str:
@@ -282,16 +310,25 @@ class AgentService:
         return "\n".join(contents)
 
     async def chat(self, request: ChatRequest) -> AsyncIterator[dict]:
-        """Stream chat events."""
+        """Stream chat events.
+
+        B1: hold the full RuntimeResult and close it in ``finally`` so the
+        per-turn ExecutionService / MemoryManager are released even when
+        ``loop.run`` raises or the client disconnects.  The shared
+        OfficeMutationAuthority is borrowed (not owned), so ``aclose`` does
+        NOT shut it down — ``AgentService.shutdown`` does.
+        """
         session_id = request.session_id or str(uuid.uuid4())
-        mode_manager, loop = await self._build_runtime(
+        runtime = await self._build_runtime(
             session_id,
             request.mode,
             request.principal_id or f"local-uid:{os.getuid()}",
         )
-        del mode_manager
-        async for message in loop.run(request.message, session_id):
-            yield _message_to_event(message)
+        try:
+            async for message in runtime.loop.run(request.message, session_id):
+                yield _message_to_event(message)
+        finally:
+            await runtime.aclose()
 
     async def switch_mode(self, session_id: str, target_mode: str) -> dict:
         mode_manager = ModeManager(self.db, project_root=self.project_root)
@@ -378,20 +415,35 @@ class AgentService:
 
     async def _build_runtime(
         self, session_id: str, mode: str, principal_id: str = ""
-    ) -> tuple[ModeManager, AgentLoop]:
+    ):
+        """Build a per-turn runtime that borrows the shared Office authority.
+
+        B1: returns the full ``RuntimeResult`` so ``chat`` can ``aclose`` it
+        in ``finally``.  The shared ``self._office_authority`` is injected so
+        the aggregate storage baseline persists across turns (closing the
+        cross-turn quota bypass).
+        """
         await self.db.create_session(session_id, mode or "office")
         from khaos.runtime import RuntimeConfig, build_runtime
 
-        result = await build_runtime(RuntimeConfig(
+        # H2: audit decision comes from the *effective* policy (OR semantics
+        # across user ∩ project), not the raw project policy — an untrusted
+        # repo can no longer disable audit by setting audit.enabled: false.
+        audit_logger = (
+            AuditLogger(self.db)
+            if self._effective_policy.audit_enabled
+            else None
+        )
+        return await build_runtime(RuntimeConfig(
             project_root=self.project_root, config_path=self.config_path,
             mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
-            db=self.db, audit_logger=AuditLogger(self.db) if self._policy.audit_enabled else None,
+            db=self.db, audit_logger=audit_logger,
             task_manager=self.task_manager,
             approval_broker=self.approval_broker,
             router=self._router,
+            office_authority=self._office_authority,
             principal_id=principal_id or f"local-uid:{os.getuid()}",
         ))
-        return result.mode_manager, result.loop
 
     async def _wait_for_confirmation(self, request: dict) -> dict:
         return await self.approval_broker.wait(
@@ -401,24 +453,33 @@ class AgentService:
         )
 
     def _build_security_middleware(self) -> SecurityMiddleware:
-        """Build the full security stack from the policy file.
+        """Build the full security stack from the effective policy.
 
         Wiring chain (see 批次 5 of the Codex-alignment doc):
         policy → Sandbox(mode) + NetworkGuard(network_*) + policy-extended
         guards + audit_logger → SecurityMiddleware → ToolScheduler.pre_check.
 
+        H2: every enforcement decision is made from the *effective* policy
+        (user ∩ project ∩ platform), not the raw project policy — an
+        untrusted repo can no longer disable audit or relax network by
+        editing its own ``khaos_policy.yaml``.
+
         Components are optional and imported lazily so the server starts even
         before all batches are present; a missing class simply means that
         layer is not enforced yet.
         """
-        policy = self._policy
+        eff = self._effective_policy
         sandbox = None
         network_guard = None
         # Sandbox: capability constraint layer.
         try:
             from khaos.security.sandbox import Sandbox
 
-            sandbox = Sandbox.from_policy_mode(policy.mode, self.project_root)
+            sandbox = Sandbox(
+                mode=eff.mode,
+                workspace_root=self.project_root,
+                root_capabilities=eff.root_capabilities,
+            )
         except ImportError:
             pass
         # NetworkGuard: network access control.
@@ -426,15 +487,15 @@ class AgentService:
             from khaos.security.network_guard import NetworkGuard
 
             network_guard = NetworkGuard(
-                network_enabled=policy.network_enabled,
-                allowed_domains=policy.network_allowed_domains,
-                blocked_domains=policy.network_blocked_domains,
+                network_enabled=eff.network_enabled,
+                allowed_domains=list(eff.network_allowed_domains),
+                blocked_domains=list(eff.network_blocked_domains),
             )
         except ImportError:
             pass
-        audit_logger = AuditLogger(self.db) if policy.audit_enabled else None
+        audit_logger = AuditLogger(self.db) if eff.audit_enabled else None
         return SecurityMiddleware(
-            policy=policy,
+            effective_policy=eff,
             sandbox=sandbox,
             network_guard=network_guard,
             audit_logger=audit_logger,
@@ -680,7 +741,13 @@ async def serve_json_lines(
     task_service = TaskService(agent.task_manager, agent.approval_broker)
     subagent_service: SubAgentService | None = None
     if enable_subagents:
-        subagent_service = await _build_subagent_service(db, project_root, config_path)
+        # B1: share the AgentService's office authority so subagent runs reuse
+        # the same aggregate storage baseline (no cross-run quota bypass) and
+        # the runtime borrows it instead of creating a fresh authority.
+        subagent_service = await _build_subagent_service(
+            db, project_root, config_path,
+            office_authority=agent._office_authority,
+        )
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
@@ -844,6 +911,8 @@ async def _build_subagent_service(
     db: Database,
     project_root: Path | None,
     config_path: Path | None,
+    *,
+    office_authority: OfficeMutationAuthority | None = None,
 ) -> SubAgentService:
     root = project_root or Path.cwd()
     resolved_config = config_path or root / "config.yaml"
@@ -871,6 +940,7 @@ async def _build_subagent_service(
         memory_manager=memory_manager,
         skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
         token_engine=get_token_engine(),
+        office_authority=office_authority,
     )
     spawner = SubAgentSpawner(
         SubAgentConfig(max_concurrent=3, max_spawn_depth=1, allow_nesting=False),
