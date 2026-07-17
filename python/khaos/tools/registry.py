@@ -219,12 +219,24 @@ class ToolInvocationBroker:
         # share the "default" BrowserContext, leaking one principal's DOM /
         # cookies to another.  ``browser_launch`` / ``browser_close`` are
         # process-global lifecycle operations and don't accept principal_id.
+        # B2 + H5: also propagate ``session_id`` + ``runtime_id`` +
+        # ``network_guard`` so browser tools key their BrowserContext by
+        # (principal, session, runtime) AND install a Playwright
+        # ``context.route("**/*")`` interceptor that gates every request,
+        # redirect and subresource against the NetworkGuard's domain check
+        # (closing the bypass where click / type / evaluate / upload could
+        # reach a blocked domain because they don't carry a ``url`` arg).
         if (
             name.startswith("browser_")
             and name not in {"browser_launch", "browser_close"}
-            and "principal_id" not in handler_params
         ):
-            handler_params["principal_id"] = context.get("principal_id", "")
+            if "principal_id" not in handler_params:
+                handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params.setdefault("session_id", context.get("session_id", ""))
+            handler_params.setdefault("runtime_id", context.get("runtime_id", ""))
+            handler_params.setdefault(
+                "network_guard", context.get("network_guard")
+            )
         if any(capability.name in {"remote.write", "remote.destructive-write"} for capability in capabilities):
             handler_params["approval_context"] = context.get("approval_context")
             handler_params["principal_id"] = context.get("principal_id")

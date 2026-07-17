@@ -548,10 +548,18 @@ async def test_aclose_releases_principal_browser_context():
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
         principal_id="user-42",
+        # H5: aclose passes session_id + runtime_id through to close_context
+        # so the per-session context key is matched correctly.
+        session_id="sess-1",
+        runtime_id="rt-1",
     )
     try:
         await result.aclose()
-        manager.close_context.assert_awaited_once_with("user-42")
+        # H5: close_context is called with (principal_id, session_id=...,
+        # runtime_id=...) so the per-session context key is matched.
+        manager.close_context.assert_awaited_once_with(
+            "user-42", session_id="sess-1", runtime_id="rt-1",
+        )
     finally:
         bt._manager = original
 
@@ -593,16 +601,26 @@ def test_browser_manager_per_principal_isolation():
 def test_browser_manager_close_context_only_closes_target_principal():
     """H1: closing one principal's BrowserContext must not close another
     principal's context — isolation must hold in both directions.
+
+    H5: the context key is now ``f"{principal_id}:{session_id}:{runtime_id}"``
+    (not just ``principal_id``) so two concurrent local sessions under the
+    same UID get independent contexts.  This test uses the default
+    session_id / runtime_id (which collapse to ``"default"``) so the key
+    for ``principal-A`` is ``"principal-A:default:default"``.
     """
     manager = BrowserManager()
-    # Simulate two pre-existing principal contexts.
+    # Simulate two pre-existing principal contexts (H5 key format).
     fake_ctx_a = MagicMock()
     fake_ctx_a.close = AsyncMock()
     fake_ctx_b = MagicMock()
     fake_ctx_b.close = AsyncMock()
     manager._contexts = {
-        "principal-A": {"context": fake_ctx_a, "page": MagicMock()},
-        "principal-B": {"context": fake_ctx_b, "page": MagicMock()},
+        "principal-A:default:default": {
+            "context": fake_ctx_a, "page": MagicMock(), "refcount": 1,
+        },
+        "principal-B:default:default": {
+            "context": fake_ctx_b, "page": MagicMock(), "refcount": 1,
+        },
     }
     import asyncio
 
@@ -610,8 +628,8 @@ def test_browser_manager_close_context_only_closes_target_principal():
     # Only A's context must be closed and popped.
     fake_ctx_a.close.assert_awaited_once()
     fake_ctx_b.close.assert_not_awaited()
-    assert "principal-A" not in manager._contexts
-    assert "principal-B" in manager._contexts
+    assert "principal-A:default:default" not in manager._contexts
+    assert "principal-B:default:default" in manager._contexts
 
 
 # ───────────────────────── B1: full factory effective policy wiring ─────────
