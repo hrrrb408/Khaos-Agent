@@ -18,6 +18,13 @@ file so an operator has an append-only, tamper-evident trail outside the
 SQLite database (which a compromised process could otherwise rewrite).  The
 file write is best-effort — a failure to append to the file does NOT suppress
 the database write or break the calling flow.
+
+H2: ``resolve_safe_audit_log_path`` (exported below) is the single trusted
+resolver for ``audit_log_path`` — it constrains the path to
+``~/.khaos/audit/``, opens it with ``O_APPEND | O_CREAT | O_NOFOLLOW`` and
+validates owner / mode / regular-file.  Both the gRPC server path and the
+runtime factory (used by CLI / TUI / tests) call it so the audit trust
+boundary is uniform across every entry point (M1).
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import stat as _stat
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -39,6 +47,103 @@ RESULT_DENIED = "denied"
 RESULT_ERROR = "error"
 RESULT_APPROVED = "approved"
 RESULT_EXPIRED = "expired"
+
+
+# H2: trusted directory for audit log files.  Project-supplied
+# ``audit.log_path`` values MUST resolve under this directory (after symlink
+# resolution) or they are rejected — an untrusted repo cannot point audit at
+# an arbitrary host file (``~/.ssh/authorized_keys``, a FIFO that blocks the
+# event loop, a device file, …).  Only the user layer (``~/.khaos/policy.yaml``)
+# is allowed to set ``audit.log_path``; the effective policy compiler drops
+# the project layer's ``audit_log_path`` entirely.
+AUDIT_LOG_TRUSTED_DIR = Path.home() / ".khaos" / "audit"
+
+
+def resolve_safe_audit_log_path(
+    log_path: str | os.PathLike[str] | None,
+) -> Path | None:
+    """Resolve ``log_path`` to a safe, trusted-directory audit file (H2).
+
+    Rules:
+
+    * ``None`` / empty → ``None`` (no file audit; db-only audit remains).
+    * Path resolves outside ``~/.khaos/audit/`` → rejected (``None``).
+    * The trusted directory is created 0700 (best-effort).
+    * The final path is opened ``O_APPEND | O_CREAT | O_NOFOLLOW`` and its
+      ``(st_dev, st_ino, st_mode, st_uid)`` are validated: must be a regular
+      file owned by the current user with no group/other write bits.
+
+    Returns the resolved ``Path`` (inside the trusted dir) when safe, or
+    ``None`` when the input was empty / unsafe (in which case audit falls
+    back to db-only — never raises, because audit must never block startup).
+    """
+    if not log_path:
+        return None
+    trusted = AUDIT_LOG_TRUSTED_DIR.expanduser().resolve()
+    try:
+        trusted.mkdir(parents=True, exist_ok=True, mode=0o700)
+    except OSError:
+        # If we can't create the trusted dir, fall back to db-only audit
+        # rather than disabling audit entirely.
+        logger.warning(
+            "failed to create trusted audit dir %s; falling back to db-only audit",
+            trusted, exc_info=True,
+        )
+        return None
+    raw = Path(str(log_path)).expanduser()
+    # If the caller gave a relative path, anchor it under the trusted dir.
+    if not raw.is_absolute():
+        candidate = trusted / raw
+    else:
+        candidate = raw
+    try:
+        # ``resolve(strict=False)`` follows symlinks; if the resolved path
+        # is outside the trusted dir, reject.
+        resolved = candidate.resolve(strict=False)
+        resolved.relative_to(trusted)
+    except (OSError, ValueError):
+        logger.warning(
+            "audit log path %s resolves outside the trusted dir %s; "
+            "falling back to db-only audit", log_path, trusted,
+        )
+        return None
+    # Open with O_NOFOLLOW so a symlink at the target is rejected; create
+    # if missing.  Validate owner / mode / regular-file after open.
+    try:
+        fd = os.open(
+            resolved,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+            0o600,
+        )
+    except OSError:
+        logger.warning(
+            "failed to open audit log path %s; falling back to db-only audit",
+            resolved, exc_info=True,
+        )
+        return None
+    try:
+        st = os.fstat(fd)
+    finally:
+        os.close(fd)
+    if not _stat.S_ISREG(st.st_mode):
+        logger.warning(
+            "audit log path %s is not a regular file; falling back to db-only audit",
+            resolved,
+        )
+        return None
+    if st.st_uid != os.getuid():
+        logger.warning(
+            "audit log path %s is not owned by the current user; "
+            "falling back to db-only audit", resolved,
+        )
+        return None
+    if st.st_mode & 0o077:
+        logger.warning(
+            "audit log path %s has unsafe permissions %o; "
+            "falling back to db-only audit", resolved, _stat.S_IMODE(st.st_mode),
+        )
+        return None
+    return resolved
 
 
 @dataclass
