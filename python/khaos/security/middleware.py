@@ -30,7 +30,11 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 COMMAND_TOOLS = frozenset({"terminal", "process", "test_run"})
-READ_PATH_TOOLS = frozenset({"read_file", "search_files", "file_info", "list_directory", "tree_view"})
+READ_PATH_TOOLS = frozenset({
+    "read_file", "search_files", "file_info", "list_directory", "tree_view",
+    "file_search_content",
+})
+READ_PATH_PARAMS = frozenset({"path", "root"})
 WRITE_PATH_TOOLS = frozenset({"write_file", "patch", "multi_edit", "copy_file", "move_file"})
 WRITE_PATH_PARAMS = frozenset({"path", "file_path", "src", "dst"})
 
@@ -147,6 +151,19 @@ class SecurityMiddleware:
                     if not path:
                         continue
                     sandbox_path = self.sandbox.check_write_path(str(path))
+                    if not sandbox_path.allowed:
+                        return SecurityCheckResult(
+                            allowed=False,
+                            risk_level="blocked",
+                            reason=sandbox_path.reason,
+                            check_type="sandbox_path",
+                        )
+            if tool_name in READ_PATH_TOOLS:
+                for param in READ_PATH_PARAMS:
+                    path = arguments.get(param, "")
+                    if not path:
+                        continue
+                    sandbox_path = self.sandbox.check_read_path(str(path))
                     if not sandbox_path.allowed:
                         return SecurityCheckResult(
                             allowed=False,

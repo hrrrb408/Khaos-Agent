@@ -37,6 +37,9 @@ class WorkspaceFileSnapshot:
 
 PROTECTED_WORKSPACE_NAMES = frozenset({".git", ".agents", ".codex", ".khaos"})
 DEFAULT_FILE_TOOL_BYTES = 16 * 1024 * 1024
+DEFAULT_TREE_BYTES = 64 * 1024 * 1024
+DEFAULT_TREE_ENTRIES = 4096
+DEFAULT_TREE_DEPTH = 32
 
 
 class SafeWorkspaceFS:
@@ -310,18 +313,33 @@ class SafeWorkspaceFS:
                 raise OSError("short write")
             offset += written
 
-    def iter_files(self, target: str | Path = ".") -> list[str]:
+    def iter_files(
+        self,
+        target: str | Path = ".",
+        *,
+        max_entries: int = DEFAULT_TREE_ENTRIES,
+        max_depth: int = DEFAULT_TREE_DEPTH,
+    ) -> list[str]:
         directory = self._open_directory(target)
         base = self._directory_relative(target)
         files: list[str] = []
-        stack: list[tuple[int, tuple[str, ...]]] = [(directory, tuple(base.split("/")) if base else ())]
+        root_parts = tuple(base.split("/")) if base else ()
+        stack: list[tuple[int, tuple[str, ...], int]] = [
+            (directory, root_parts, 0)
+        ]
+        observed = 0
         try:
             while stack:
-                descriptor, prefix = stack.pop()
+                descriptor, prefix, depth = stack.pop()
                 try:
                     names = sorted(os.listdir(descriptor), key=str.lower)
                     for name in names:
-                        if not prefix and name.casefold() in {
+                        observed += 1
+                        if observed > max_entries:
+                            raise WorkspaceBoundaryError(
+                                "directory exceeds the entry limit"
+                            )
+                        if name.casefold() in {
                             protected.casefold()
                             for protected in PROTECTED_WORKSPACE_NAMES
                         }:
@@ -329,21 +347,439 @@ class SafeWorkspaceFS:
                         info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
                         relative_parts = (*prefix, name)
                         if stat.S_ISDIR(info.st_mode):
+                            if depth >= max_depth:
+                                raise WorkspaceBoundaryError(
+                                    "directory exceeds the depth limit"
+                                )
                             child = os.open(
                                 name,
                                 os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                                 dir_fd=descriptor,
                             )
-                            stack.append((child, relative_parts))
+                            stack.append((child, relative_parts, depth + 1))
                         elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
                             files.append("/".join(relative_parts))
+                        else:
+                            # Reads skip symlink/hardlink/special entries. Copy
+                            # and move use the stricter validators below and
+                            # reject the complete operation.
+                            continue
                 finally:
                     os.close(descriptor)
         except Exception:
-            for descriptor, _ in stack:
+            for descriptor, _, _ in stack:
                 os.close(descriptor)
             raise
         return sorted(files)
+
+    def iter_entries(
+        self,
+        target: str | Path = ".",
+        *,
+        max_entries: int = DEFAULT_TREE_ENTRIES,
+        max_depth: int = DEFAULT_TREE_DEPTH,
+    ) -> list[tuple[str, bool]]:
+        """Return safe regular files and directories below ``target``."""
+        directory = self._open_directory(target)
+        base = self._directory_relative(target)
+        root_parts = tuple(base.split("/")) if base else ()
+        stack: list[tuple[int, tuple[str, ...], int]] = [
+            (directory, root_parts, 0)
+        ]
+        entries: list[tuple[str, bool]] = []
+        observed = 0
+        try:
+            while stack:
+                descriptor, prefix, depth = stack.pop()
+                try:
+                    names = sorted(os.listdir(descriptor), key=str.casefold)
+                    children: list[tuple[int, tuple[str, ...], int]] = []
+                    for name in names:
+                        if name.casefold() in {
+                            protected.casefold()
+                            for protected in PROTECTED_WORKSPACE_NAMES
+                        }:
+                            continue
+                        observed += 1
+                        if observed > max_entries:
+                            raise WorkspaceBoundaryError(
+                                "directory exceeds the entry limit"
+                            )
+                        info = os.stat(
+                            name, dir_fd=descriptor, follow_symlinks=False
+                        )
+                        relative_parts = (*prefix, name)
+                        relative = "/".join(relative_parts)
+                        if stat.S_ISDIR(info.st_mode):
+                            entries.append((relative, True))
+                            if depth + 1 < max_depth:
+                                child = os.open(
+                                    name,
+                                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=descriptor,
+                                )
+                                children.append((child, relative_parts, depth + 1))
+                        elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                            entries.append((relative, False))
+                    stack.extend(reversed(children))
+                finally:
+                    os.close(descriptor)
+        except Exception:
+            for descriptor, _, _ in stack:
+                os.close(descriptor)
+            raise
+        return entries
+
+    def ensure_parent_directories(self, target: str | Path) -> None:
+        """Create missing parents through the fixed root without symlinks."""
+        relative = self.relative(target)
+        parts = Path(relative).parts[:-1]
+        descriptor = os.dup(self._handle.root_fd)
+        try:
+            for part in parts:
+                try:
+                    child = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                except FileNotFoundError:
+                    os.mkdir(part, mode=0o700, dir_fd=descriptor)
+                    os.fsync(descriptor)
+                    child = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=descriptor,
+                    )
+                os.close(descriptor)
+                descriptor = child
+        finally:
+            os.close(descriptor)
+
+    def copy_path(
+        self,
+        source: str | Path,
+        destination: str | Path,
+        *,
+        max_bytes: int = DEFAULT_TREE_BYTES,
+        max_entries: int = DEFAULT_TREE_ENTRIES,
+        max_depth: int = DEFAULT_TREE_DEPTH,
+    ) -> int:
+        """Copy a file or tree using only fixed dirfds and no-follow opens."""
+        source_relative = self.relative(source)
+        destination_relative = self.relative(destination)
+        source_parent = self._parent(source_relative)
+        destination_parent = self._parent(destination_relative)
+        temporary = ""
+        try:
+            if destination_parent.lstat() is not None:
+                raise FileExistsError(destination_relative)
+            source_info = source_parent.lstat()
+            if source_info is None:
+                raise FileNotFoundError(source_relative)
+            if stat.S_ISREG(source_info.st_mode):
+                return self.copy_file(source, destination)
+            if not stat.S_ISDIR(source_info.st_mode):
+                raise WorkspaceBoundaryError("copy source type is unsafe")
+            if destination_relative.startswith(f"{source_relative}/"):
+                raise WorkspaceBoundaryError(
+                    "copy destination cannot be inside the source tree"
+                )
+            source_descriptor = os.open(
+                source_parent.leaf,
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=source_parent.parent_fd,
+            )
+            try:
+                for _ in range(32):
+                    temporary = f".khaos-tree-{os.urandom(16).hex()}"
+                    try:
+                        os.mkdir(
+                            temporary,
+                            mode=0o700,
+                            dir_fd=destination_parent.parent_fd,
+                        )
+                        break
+                    except FileExistsError:
+                        temporary = ""
+                if not temporary:
+                    raise WorkspaceBoundaryError(
+                        "could not allocate temporary copy directory"
+                    )
+                destination_descriptor = os.open(
+                    temporary,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=destination_parent.parent_fd,
+                )
+                try:
+                    budget = {"bytes": 0, "entries": 0}
+                    self._copy_tree_dirfd(
+                        source_descriptor,
+                        destination_descriptor,
+                        depth=0,
+                        budget=budget,
+                        max_bytes=max_bytes,
+                        max_entries=max_entries,
+                        max_depth=max_depth,
+                    )
+                    os.fsync(destination_descriptor)
+                finally:
+                    os.close(destination_descriptor)
+                final_source = os.fstat(source_descriptor)
+                if (final_source.st_dev, final_source.st_ino) != (
+                    source_info.st_dev,
+                    source_info.st_ino,
+                ):
+                    raise WorkspaceBoundaryError(
+                        "copy source directory identity changed"
+                    )
+            finally:
+                os.close(source_descriptor)
+            source_parent.revalidate()
+            destination_parent.revalidate()
+            self._handle._rename_no_replace(
+                destination_parent.parent_fd,
+                temporary,
+                destination_parent.parent_fd,
+                destination_parent.leaf,
+            )
+            temporary = ""
+            destination_parent.fsync()
+            return budget["bytes"]
+        finally:
+            if temporary:
+                self._remove_tree_at(destination_parent.parent_fd, temporary)
+            source_parent.close()
+            destination_parent.close()
+
+    def move_path(
+        self,
+        source: str | Path,
+        destination: str | Path,
+    ) -> None:
+        """Move one validated file/tree atomically within the fixed root."""
+        source_relative = self.relative(source)
+        destination_relative = self.relative(destination)
+        source_parent = self._parent(source_relative)
+        destination_parent = self._parent(destination_relative)
+        try:
+            source_info = source_parent.lstat()
+            if source_info is None:
+                raise FileNotFoundError(source_relative)
+            if destination_parent.lstat() is not None:
+                raise FileExistsError(destination_relative)
+            if stat.S_ISREG(source_info.st_mode):
+                if source_info.st_nlink != 1:
+                    raise WorkspaceBoundaryError("hardlinked files are not movable")
+            elif stat.S_ISDIR(source_info.st_mode):
+                if destination_relative.startswith(f"{source_relative}/"):
+                    raise WorkspaceBoundaryError(
+                        "move destination cannot be inside the source tree"
+                    )
+                descriptor = os.open(
+                    source_parent.leaf,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=source_parent.parent_fd,
+                )
+                try:
+                    self._validate_tree_dirfd(
+                        descriptor,
+                        depth=0,
+                        budget={"bytes": 0, "entries": 0},
+                        max_bytes=DEFAULT_TREE_BYTES,
+                        max_entries=DEFAULT_TREE_ENTRIES,
+                        max_depth=DEFAULT_TREE_DEPTH,
+                    )
+                finally:
+                    os.close(descriptor)
+            else:
+                raise WorkspaceBoundaryError("move source type is unsafe")
+            source_parent.revalidate()
+            destination_parent.revalidate()
+            current = source_parent.lstat()
+            if current is None or (current.st_dev, current.st_ino) != (
+                source_info.st_dev,
+                source_info.st_ino,
+            ):
+                raise WorkspaceBoundaryError("move source identity changed")
+            self._handle._rename_no_replace(
+                source_parent.parent_fd,
+                source_parent.leaf,
+                destination_parent.parent_fd,
+                destination_parent.leaf,
+            )
+            source_parent.fsync()
+            if source_parent.identity != destination_parent.identity:
+                destination_parent.fsync()
+        finally:
+            source_parent.close()
+            destination_parent.close()
+
+    def _copy_tree_dirfd(
+        self,
+        source_fd: int,
+        destination_fd: int,
+        *,
+        depth: int,
+        budget: dict[str, int],
+        max_bytes: int,
+        max_entries: int,
+        max_depth: int,
+    ) -> None:
+        if depth > max_depth:
+            raise WorkspaceBoundaryError("copy source exceeds the depth limit")
+        for name in sorted(os.listdir(source_fd), key=str.casefold):
+            if name.casefold() in {
+                protected.casefold() for protected in PROTECTED_WORKSPACE_NAMES
+            }:
+                raise WorkspaceBoundaryError("copy source contains protected metadata")
+            budget["entries"] += 1
+            if budget["entries"] > max_entries:
+                raise WorkspaceBoundaryError("copy source exceeds the entry limit")
+            before = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+            if stat.S_ISDIR(before.st_mode):
+                os.mkdir(name, mode=0o700, dir_fd=destination_fd)
+                child_source = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=source_fd,
+                )
+                child_destination = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=destination_fd,
+                )
+                try:
+                    self._copy_tree_dirfd(
+                        child_source,
+                        child_destination,
+                        depth=depth + 1,
+                        budget=budget,
+                        max_bytes=max_bytes,
+                        max_entries=max_entries,
+                        max_depth=max_depth,
+                    )
+                    os.fsync(child_destination)
+                finally:
+                    os.close(child_source)
+                    os.close(child_destination)
+                after = os.stat(name, dir_fd=source_fd, follow_symlinks=False)
+                if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino):
+                    raise WorkspaceBoundaryError("copy source directory changed")
+                continue
+            if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+                raise WorkspaceBoundaryError(
+                    "copy source contains symlink, hardlink, or special file"
+                )
+            if before.st_size > DEFAULT_FILE_TOOL_BYTES:
+                raise WorkspaceBoundaryError("copy source file exceeds the limit")
+            budget["bytes"] += before.st_size
+            if budget["bytes"] > max_bytes:
+                raise WorkspaceBoundaryError("copy source exceeds the byte limit")
+            source_file = os.open(
+                name,
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=source_fd,
+            )
+            destination_file = os.open(
+                name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                stat.S_IMODE(before.st_mode) & 0o666,
+                dir_fd=destination_fd,
+            )
+            try:
+                copied = 0
+                while True:
+                    chunk = os.read(source_file, 1024 * 1024)
+                    if not chunk:
+                        break
+                    copied += len(chunk)
+                    if copied > DEFAULT_FILE_TOOL_BYTES:
+                        raise WorkspaceBoundaryError(
+                            "copy source file grew beyond the limit"
+                        )
+                    self._write_all(destination_file, chunk)
+                os.fsync(destination_file)
+                final = os.fstat(source_file)
+                if (final.st_dev, final.st_ino, final.st_size) != (
+                    before.st_dev,
+                    before.st_ino,
+                    before.st_size,
+                ):
+                    raise WorkspaceBoundaryError("copy source file changed")
+            finally:
+                os.close(source_file)
+                os.close(destination_file)
+
+    def _validate_tree_dirfd(
+        self,
+        descriptor: int,
+        *,
+        depth: int,
+        budget: dict[str, int],
+        max_bytes: int,
+        max_entries: int,
+        max_depth: int,
+    ) -> None:
+        if depth > max_depth:
+            raise WorkspaceBoundaryError("tree exceeds the depth limit")
+        for name in sorted(os.listdir(descriptor), key=str.casefold):
+            if name.casefold() in {
+                protected.casefold() for protected in PROTECTED_WORKSPACE_NAMES
+            }:
+                raise WorkspaceBoundaryError("tree contains protected metadata")
+            budget["entries"] += 1
+            if budget["entries"] > max_entries:
+                raise WorkspaceBoundaryError("tree exceeds the entry limit")
+            info = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=descriptor,
+                )
+                try:
+                    self._validate_tree_dirfd(
+                        child,
+                        depth=depth + 1,
+                        budget=budget,
+                        max_bytes=max_bytes,
+                        max_entries=max_entries,
+                        max_depth=max_depth,
+                    )
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                if info.st_size > DEFAULT_FILE_TOOL_BYTES:
+                    raise WorkspaceBoundaryError("tree file exceeds the limit")
+                budget["bytes"] += info.st_size
+                if budget["bytes"] > max_bytes:
+                    raise WorkspaceBoundaryError("tree exceeds the byte limit")
+            else:
+                raise WorkspaceBoundaryError(
+                    "tree contains symlink, hardlink, or special file"
+                )
+
+    @classmethod
+    def _remove_tree_at(cls, parent_fd: int, name: str) -> None:
+        """Remove only a no-follow temporary tree created by this authority."""
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+            dir_fd=parent_fd,
+        )
+        try:
+            for child_name in os.listdir(descriptor):
+                info = os.stat(
+                    child_name, dir_fd=descriptor, follow_symlinks=False
+                )
+                if stat.S_ISDIR(info.st_mode):
+                    cls._remove_tree_at(descriptor, child_name)
+                else:
+                    os.unlink(child_name, dir_fd=descriptor)
+        finally:
+            os.close(descriptor)
+        os.rmdir(name, dir_fd=parent_fd)
 
     def _directory_relative(self, target: str | Path) -> str:
         candidate = Path(target).expanduser()

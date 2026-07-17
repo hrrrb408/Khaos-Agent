@@ -13,6 +13,11 @@ _WORKSPACE_FILE_TOOLS = frozenset({
     "file_search_content", "write_file", "patch", "multi_edit", "copy_file",
     "move_file", "code_search", "code_symbols",
 })
+_OFFICE_WORKSPACE_FILE_TOOLS = frozenset({
+    "read_file", "search_files", "list_directory", "file_info", "tree_view",
+    "file_search_content", "write_file", "patch", "multi_edit", "copy_file",
+    "move_file",
+})
 from dataclasses import field
 
 
@@ -183,6 +188,13 @@ class ToolInvocationBroker:
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
+        if mode == "office" and name in _OFFICE_WORKSPACE_FILE_TOOLS:
+            workspace_root = context.get("office_workspace_root")
+            if workspace_root is None:
+                raise PermissionError(
+                    "Office filesystem access requires a Sandbox root capability"
+                )
+            handler_params["workspace_root"] = workspace_root
         return await definition.handler(**handler_params)
 
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:

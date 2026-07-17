@@ -41,6 +41,7 @@ CAPABILITIES: dict[SandboxMode, set[str]] = {
     SandboxMode.READ_ONLY: {
         "read_file",
         "search_files",
+        "file_search_content",
         "list_directory",
         "tree_view",
         "file_info",
@@ -53,6 +54,7 @@ CAPABILITIES: dict[SandboxMode, set[str]] = {
     SandboxMode.WORKSPACE_WRITE: {
         "read_file",
         "search_files",
+        "file_search_content",
         "list_directory",
         "tree_view",
         "file_info",
@@ -164,6 +166,33 @@ class Sandbox:
             return SandboxCheckResult(
                 allowed=False,
                 reason=f"path '{resolved}' outside workspace '{self.workspace_root}'",
+                mode=self.mode.value,
+            )
+
+    def check_read_path(self, path: str) -> SandboxCheckResult:
+        """Constrain default reads to the fixed Workspace root.
+
+        External files are deliberately not inferred from an approval or a
+        path string.  A future user-selected file capability must be passed as
+        a separate, one-shot authority; until then external reads fail closed.
+        """
+        if self.mode in (SandboxMode.FULL_ACCESS, SandboxMode.YOLO):
+            return SandboxCheckResult(allowed=True, mode=self.mode.value)
+
+        candidate = Path(path).expanduser()
+        if not candidate.is_absolute():
+            candidate = self.workspace_root / candidate
+        resolved = candidate.resolve()
+        try:
+            resolved.relative_to(self.workspace_root)
+            return SandboxCheckResult(allowed=True, mode=self.mode.value)
+        except ValueError:
+            return SandboxCheckResult(
+                allowed=False,
+                reason=(
+                    f"read path '{resolved}' outside workspace "
+                    f"'{self.workspace_root}'"
+                ),
                 mode=self.mode.value,
             )
 

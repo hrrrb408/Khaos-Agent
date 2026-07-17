@@ -435,6 +435,10 @@ class ToolScheduler:
                     arguments=call["arguments"],
                 )
             invocation_context = dict(tool_context)
+            sandbox = self.security_middleware.sandbox
+            if mode == "office" and sandbox is not None:
+                # Internal capability: never sourced from model arguments.
+                invocation_context["office_workspace_root"] = sandbox.workspace_root
             if call.get("_approval_context") is not None:
                 invocation_context["approval_context"] = call["_approval_context"]
             output = await asyncio.wait_for(
