@@ -83,3 +83,55 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
         "test_m4_security_regression.py",
     ):
         assert required_contract in matrix
+
+
+def test_browser_e2e_workflow_is_mandatory():
+    """M4: ``browser-e2e.yml`` must exist and actually run the real
+    Playwright security E2E suite.
+
+    The existing ``test_platform_matrix_and_real_sandbox_jobs_are_mandatory``
+    asserts that the security-contract-matrix, platform-sandbox and
+    docker-security workflows exist and are mandatory — but it does NOT
+    check ``browser-e2e.yml``.  Someone could delete the browser E2E
+    workflow and the CI policy test would still pass.
+
+    This test closes that gap by asserting:
+
+    * ``.github/workflows/browser-e2e.yml`` exists;
+    * it declares the ``KHAOS_RUN_BROWSER_E2E=1`` env-var gate (proving
+      it actually runs the real E2E tests, not a mock);
+    * it installs the ``browser`` extra (proving Playwright is shipped
+      rather than the install being skipped);
+    * it runs the real E2E test file with the ``browser_real`` marker
+      filter (so a future refactor cannot silently swap it for the mock
+      test file).
+    """
+    workflow = WORKFLOWS / "browser-e2e.yml"
+    assert workflow.exists(), (
+        "browser-e2e.yml workflow is missing — the real Playwright "
+        "security E2E suite is no longer enforced in CI"
+    )
+    text = workflow.read_text(encoding="utf-8")
+    # Env-var gate: proves the workflow actually runs the real E2E tests
+    # (the e2e test file skips when this is unset).
+    assert "KHAOS_RUN_BROWSER_E2E" in text, (
+        "browser-e2e.yml is missing the KHAOS_RUN_BROWSER_E2E env-var "
+        "gate — the E2E tests would skip"
+    )
+    assert '"1"' in text or "=1" in text, (
+        "KHAOS_RUN_BROWSER_E2E is not set to 1 in browser-e2e.yml"
+    )
+    # Installs the ``browser`` extra — proves Playwright is shipped
+    # rather than the install being skipped.
+    assert "browser]" in text, (
+        "browser-e2e.yml does not install the browser extra — "
+        "Playwright would not be available"
+    )
+    # The workflow runs the real E2E test file with the real marker.
+    assert "test_browser_tools_e2e.py" in text, (
+        "browser-e2e.yml does not run test_browser_tools_e2e.py"
+    )
+    assert "-m browser_real" in text, (
+        "browser-e2e.yml does not filter on the browser_real marker — "
+        "the real E2E tests would not run"
+    )
