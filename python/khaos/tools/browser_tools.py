@@ -133,11 +133,11 @@ class BrowserManager:
         # "Browser not available" message.  Reset on every ``ensure_page``
         # call so a transient failure doesn't poison subsequent calls.
         self._last_ensure_error: str = ""
-        # M2: serialize process-wide Playwright/Browser/context-map mutation.
-        # Per-key locks additionally coalesce concurrent first use of one
-        # session so it cannot create duplicate BrowserContexts.
+        # M2: one lifecycle lock serializes process-wide Playwright/Browser/
+        # context-map mutation.  A previous per-key lock table never evicted
+        # keys and grew for the lifetime of the server.
         self._lifecycle_lock = asyncio.Lock()
-        self._context_locks: dict[str, asyncio.Lock] = {}
+        self._context_close_failures: dict[str, int] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -192,6 +192,12 @@ class BrowserManager:
                     "browser_type": browser_type,
                     "headless": headless,
                 }
+            # Close the old generation before launching a replacement.  A
+            # failed Context close retains ownership and aborts the switch.
+            await self._close_all_contexts()
+            if self._browser is not None:
+                await self._browser.close()
+                self._browser = None
             self._headless = headless
             self._browser_type = browser_type
             if self._playwright is None:
@@ -203,13 +209,6 @@ class BrowserManager:
                 browser = await pw.webkit.launch(headless=headless)
             else:
                 browser = await pw.chromium.launch(headless=headless)
-            # 关闭旧的 browser 和所有 per-session contexts（若切换了引擎）。
-            await self._close_all_contexts()
-            if self._browser is not None:
-                try:
-                    await self._browser.close()
-                except Exception:  # noqa: BLE001 — best-effort cleanup
-                    pass
             self._browser = browser
             logger.info("Browser launched: %s (headless=%s)", browser_type, headless)
             return {"ok": True, "browser_type": browser_type, "headless": headless}
@@ -218,7 +217,7 @@ class BrowserManager:
             return {"ok": False, "error": str(exc)}
 
     async def _close_all_contexts(self) -> None:
-        """Close every per-session BrowserContext (best-effort)."""
+        """Close every owned context, propagating the first failure."""
         for key in list(self._contexts.keys()):
             await self._close_one_context(key, force=True)
 
@@ -236,13 +235,19 @@ class BrowserManager:
             if entry["refcount"] > 0:
                 # Still in use by another runtime — do NOT close.
                 return
-        self._contexts.pop(key, None)
         ctx = entry.get("context")
         if ctx is not None:
             try:
                 await ctx.close()
-            except Exception:  # noqa: BLE001 — best-effort cleanup
-                pass
+            except Exception:
+                if not force:
+                    entry["refcount"] = max(1, int(entry.get("refcount", 0)))
+                self._context_close_failures[key] = (
+                    self._context_close_failures.get(key, 0) + 1
+                )
+                raise
+        self._contexts.pop(key, None)
+        self._context_close_failures.pop(key, None)
 
     async def close_context(
         self,
@@ -302,12 +307,35 @@ class BrowserManager:
                 owners = entry.get("_runtime_owners", set())
                 if runtime_id not in owners:
                     continue
-                owners.discard(runtime_id)
-                # Decrement refcount and close if it reaches zero.  We
-                # already removed ``runtime_id`` from the owner set above so
-                # a subsequent close is a no-op for this entry.
-                await self._close_one_context(key, force=False)
+                if int(entry.get("refcount", 0)) > 1:
+                    owners.discard(runtime_id)
+                    entry["refcount"] = int(entry["refcount"]) - 1
+                    continue
+                # Last owner: retain the owner/ref until ctx.close succeeds.
+                try:
+                    await self._close_one_context(key, force=True)
+                except Exception:
+                    failures = self._context_close_failures.get(key, 0)
+                    if failures >= 3 and self._browser is not None:
+                        await self._force_close_browser_locked()
+                        return {
+                            "ok": True,
+                            "runtime_id": runtime_id,
+                            "forced_browser_close": True,
+                        }
+                    raise
         return {"ok": True, "runtime_id": runtime_id}
+
+    async def _force_close_browser_locked(self) -> None:
+        """Force the browser generation closed after repeated Context failure."""
+        if self._browser is not None:
+            await self._browser.close()
+        if self._playwright is not None:
+            await self._playwright.stop()
+        self._browser = None
+        self._playwright = None
+        self._contexts.clear()
+        self._context_close_failures.clear()
 
     @staticmethod
     def _context_key(
@@ -337,7 +365,7 @@ class BrowserManager:
                     await self._playwright.stop()
                 self._browser = None
                 self._playwright = None
-                self._context_locks.clear()
+                self._context_close_failures.clear()
                 return {"ok": True}
             except Exception as exc:  # noqa: BLE001 — surfaced as error dict
                 logger.error("Failed to close browser: %s", exc)
@@ -385,18 +413,16 @@ class BrowserManager:
         subsequent click / type / evaluate / upload from reaching a
         blocked domain).
         """
-        # Coalesce concurrent first-use for the same key, then hold the global
-        # lifecycle lock while consulting/mutating Browser and context state.
+        # The process-wide lifecycle lock coalesces concurrent first use and
+        # avoids an unbounded per-key lock registry.
         self._last_ensure_error = ""
         key = self._context_key(principal_id, session_id, runtime_id)
-        key_lock = self._context_locks.setdefault(key, asyncio.Lock())
-        async with key_lock:
-            async with self._lifecycle_lock:
-                return await self._ensure_page_locked(
-                    key,
-                    runtime_id=runtime_id,
-                    network_guard=network_guard,
-                )
+        async with self._lifecycle_lock:
+            return await self._ensure_page_locked(
+                key,
+                runtime_id=runtime_id,
+                network_guard=network_guard,
+            )
 
     async def _ensure_page_locked(
         self,
@@ -1069,66 +1095,10 @@ _UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 # payload API closes that window entirely.
 
 
-def _validate_upload_path(file_path: str, workspace_root: str) -> dict[str, Any] | None:
-    """Validate ``file_path`` is within ``workspace_root`` and within size limit.
-
-    B1: returns an error dict when validation fails, or ``None`` when the
-    path is safe to upload.  Uses ``Path.resolve(strict=True)`` so symlink
-    escape is rejected — the resolved path must be a real file inside the
-    resolved workspace root.  This is the *fast* validation path; the
-    actual upload path uses ``_read_upload_bytes`` (M1) which re-validates
-    AND reads the bytes into memory with fd-based identity binding.
-    """
-    from pathlib import Path
-
-    try:
-        root_resolved = Path(workspace_root).expanduser().resolve(strict=True)
-        target_resolved = Path(file_path).expanduser().resolve(strict=True)
-    except (OSError, ValueError) as exc:
-        return {
-            "ok": False,
-            "error": f"file path validation failed: {exc}",
-            "file": file_path,
-        }
-    # Containment check: target must be the root itself or a descendant.
-    try:
-        target_resolved.relative_to(root_resolved)
-    except ValueError:
-        return {
-            "ok": False,
-            "error": (
-                "file_path is outside the workspace root; "
-                "browser_file_upload may only upload files within the workspace"
-            ),
-            "file": file_path,
-            "workspace_root": str(root_resolved),
-        }
-    # B1: file must be a regular file (no dirs, devices, pipes).
-    if not target_resolved.is_file():
-        return {
-            "ok": False,
-            "error": "file_path is not a regular file",
-            "file": file_path,
-        }
-    # B1: size limit + identity capture.
-    stat = target_resolved.stat()
-    if stat.st_size > _UPLOAD_MAX_BYTES:
-        return {
-            "ok": False,
-            "error": (
-                f"file size {stat.st_size} exceeds the upload limit "
-                f"of {_UPLOAD_MAX_BYTES} bytes"
-            ),
-            "file": file_path,
-            "size": stat.st_size,
-        }
-    return None
-
-
 def _read_upload_bytes(
     file_path: str, workspace_root: str
 ) -> "tuple[bytes, str] | dict[str, Any]":
-    """M1: validate the upload path AND read the bytes into memory.
+    """M1: read one Workspace file through a fixed no-follow dirfd chain.
 
     The previous flow (``_materialize_upload``) copied the bytes into a
     runtime-private temp file in ``~/.khaos/uploads/`` (0700) and handed
@@ -1142,12 +1112,16 @@ def _read_upload_bytes(
     (``files=[{"name": ..., "mimeType": ..., "buffer": bytes}]``), so
     no temp file is ever created and there is no TOCTOU window.
 
-    The function:
+    The function opens every Workspace-root and file-parent component with
+    ``O_DIRECTORY | O_NOFOLLOW`` relative to the already-open parent.  It
+    never resolves the target and later reopens it by absolute path, so a
+    same-UID rename/symlink replacement of an intermediate parent cannot
+    redirect the final read outside the fixed Workspace root.
 
-    * reuses ``_validate_upload_path`` for fast containment / size checks;
-    * re-resolves the target path;
-    * opens it with ``O_RDONLY | O_NOFOLLOW`` (rejects symlinks, pins
-      the inode for the duration of the read);
+    It then:
+
+    * opens the final basename relative to the fixed parent dirfd with
+      ``O_RDONLY | O_NOFOLLOW``;
     * validates with ``fstat`` that it is a regular file owned by the
       current user and under the size limit;
     * reads the bytes in chunks, enforcing the size limit DURING the
@@ -1164,7 +1138,11 @@ def _read_upload_bytes(
     # identity contract by silently following reparse points; the native
     # backend remains explicitly unavailable until it has a real no-follow
     # implementation and runner coverage.
-    if not hasattr(_os, "O_NOFOLLOW"):
+    if (
+        not hasattr(_os, "O_NOFOLLOW")
+        or not hasattr(_os, "O_DIRECTORY")
+        or _os.open not in _os.supports_dir_fd
+    ):
         return {
             "ok": False,
             "error": (
@@ -1173,33 +1151,68 @@ def _read_upload_bytes(
             "file": file_path,
         }
 
-    # Reuse the fast validation path for the early containment / size
-    # checks (so the error dicts match the test expectations).
-    fast_error = _validate_upload_path(file_path, workspace_root)
-    if fast_error is not None:
-        return fast_error
-
-    # Re-resolve the target path (the fast path already validated it, but
-    # we need the resolved Path to open it).
+    root = Path(_os.path.abspath(_os.path.expanduser(workspace_root)))
+    raw_target = Path(_os.path.expanduser(file_path))
     try:
-        target_resolved = Path(file_path).expanduser().resolve(strict=True)
-    except (OSError, ValueError) as exc:
+        relative = (
+            raw_target.relative_to(root)
+            if raw_target.is_absolute()
+            else raw_target
+        )
+    except ValueError:
         return {
             "ok": False,
-            "error": f"file path re-resolution failed: {exc}",
+            "error": (
+                "file_path is outside the workspace root; "
+                "browser_file_upload may only upload files within the workspace"
+            ),
+            "file": file_path,
+            "workspace_root": str(root),
+        }
+    parts = relative.parts
+    if not parts or any(part in {"", ".", ".."} for part in parts):
+        return {
+            "ok": False,
+            "error": "file_path contains an unsafe path component",
             "file": file_path,
         }
 
-    # M1: open with O_RDONLY | O_NOFOLLOW so a symlink at the target is
-    # rejected and the file's identity is pinned for the read.
+    directory_flags = _os.O_RDONLY | _os.O_DIRECTORY | _os.O_NOFOLLOW
+    dirfds: list[int] = []
     try:
-        src_fd = _os.open(str(target_resolved), _os.O_RDONLY | _os.O_NOFOLLOW)
+        current_fd = _os.open(_os.path.sep, directory_flags)
+        dirfds.append(current_fd)
+        for component in root.parts[1:]:
+            next_fd = _os.open(component, directory_flags, dir_fd=current_fd)
+            dirfds.append(next_fd)
+            current_fd = next_fd
+        root_stat = _os.fstat(current_fd)
+        if not _stat.S_ISDIR(root_stat.st_mode):
+            raise OSError("workspace root is not a directory")
+        for component in parts[:-1]:
+            next_fd = _os.open(component, directory_flags, dir_fd=current_fd)
+            dirfds.append(next_fd)
+            current_fd = next_fd
+        src_fd = _os.open(
+            parts[-1], _os.O_RDONLY | _os.O_NOFOLLOW, dir_fd=current_fd,
+        )
     except OSError as exc:
+        for descriptor in reversed(dirfds):
+            try:
+                _os.close(descriptor)
+            except OSError:
+                pass
         return {
             "ok": False,
-            "error": f"failed to open file for upload: {exc}",
+            "error": f"secure workspace-relative open failed: {exc}",
             "file": file_path,
         }
+    finally:
+        for descriptor in reversed(dirfds):
+            try:
+                _os.close(descriptor)
+            except OSError:
+                pass
 
     try:
         st = _os.fstat(src_fd)
@@ -1249,7 +1262,7 @@ def _read_upload_bytes(
         file_bytes = b"".join(chunks)
     finally:
         _os.close(src_fd)
-    return file_bytes, target_resolved.name
+    return file_bytes, parts[-1]
 
 
 def _make_file_upload_real(

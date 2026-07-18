@@ -30,6 +30,7 @@ Covered regressions:
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -155,6 +156,7 @@ async def test_subagent_registry_pruning_drops_undeclared_tools(tmp_path):
 # ───────────────────────── B1: browser_file_upload path ─────────────────────
 
 
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX dirfd contract")
 def test_browser_file_upload_rejects_host_path_outside_workspace(tmp_path):
     """B1: ``browser_file_upload`` must reject a ``file_path`` that resolves
     outside ``workspace_root`` — no arbitrary host file exfiltration via
@@ -163,24 +165,25 @@ def test_browser_file_upload_rejects_host_path_outside_workspace(tmp_path):
     The previous handler passed ``file_path`` straight to
     ``page.set_input_files`` with no containment check.
     """
-    from khaos.tools.browser_tools import _validate_upload_path
+    from khaos.tools.browser_tools import _read_upload_bytes
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     # A file inside the workspace should pass validation.
     inside = workspace / "ok.txt"
     inside.write_text("hello", encoding="utf-8")
-    assert _validate_upload_path(str(inside), str(workspace)) is None
+    assert _read_upload_bytes(str(inside), str(workspace)) == (b"hello", "ok.txt")
 
     # A file outside the workspace must be rejected.
     outside = tmp_path / "secret.key"
     outside.write_text("AKIA" + "X" * 16, encoding="utf-8")
-    result = _validate_upload_path(str(outside), str(workspace))
+    result = _read_upload_bytes(str(outside), str(workspace))
     assert result is not None
     assert result["ok"] is False
     assert "outside the workspace root" in result["error"]
 
 
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX dirfd contract")
 def test_browser_file_upload_rejects_symlink_escape(tmp_path):
     """B1: a symlink that escapes the workspace must be rejected.
 
@@ -188,7 +191,7 @@ def test_browser_file_upload_rejects_symlink_escape(tmp_path):
     the workspace that points to ``/etc/passwd`` resolves outside the
     root and is rejected.
     """
-    from khaos.tools.browser_tools import _validate_upload_path
+    from khaos.tools.browser_tools import _read_upload_bytes
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -197,23 +200,24 @@ def test_browser_file_upload_rejects_symlink_escape(tmp_path):
     link = workspace / "escape.txt"
     link.symlink_to(target)
 
-    result = _validate_upload_path(str(link), str(workspace))
+    result = _read_upload_bytes(str(link), str(workspace))
     assert result is not None
     assert result["ok"] is False
 
 
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="POSIX dirfd contract")
 def test_browser_file_upload_enforces_size_limit(tmp_path):
     """B1: ``browser_file_upload`` enforces a 10 MiB size limit so the
     browser upload channel cannot be used for bulk exfiltration.
     """
-    from khaos.tools.browser_tools import _UPLOAD_MAX_BYTES, _validate_upload_path
+    from khaos.tools.browser_tools import _UPLOAD_MAX_BYTES, _read_upload_bytes
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     oversized = workspace / "big.bin"
     oversized.write_bytes(b"\x00" * (_UPLOAD_MAX_BYTES + 1))
 
-    result = _validate_upload_path(str(oversized), str(workspace))
+    result = _read_upload_bytes(str(oversized), str(workspace))
     assert result is not None
     assert result["ok"] is False
     assert "exceeds the upload limit" in result["error"]
