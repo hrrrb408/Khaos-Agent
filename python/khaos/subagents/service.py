@@ -12,22 +12,38 @@ logger = logging.getLogger(__name__)
 
 
 class SubAgentService:
-    """Handle SubAgent RPC requests from the Go gateway."""
+    """Handle SubAgent RPC requests from the Go gateway.
+
+    B1: every method reads ``principal_id`` from the authenticated RPC
+    payload and scopes results to that principal.  A different principal
+    cannot observe another's goal / result / error / status — closing
+    the cross-tenant data leakage.
+    """
 
     def __init__(self, spawner: SubAgentSpawner, runner: SubAgentRunner | None):
         self.spawner = spawner
         self.runner = runner
 
     async def handle_spawn(self, payload: dict) -> dict[str, Any]:
-        """Handle a Spawn request."""
+        """Handle a Spawn request.
+
+        B1: ``principal_id`` is read from the authenticated payload and
+        stamped onto the task so ``collect`` / ``status`` can filter by
+        it.  When absent (legacy callers), the task is unscoped — but
+        the Go gateway always forwards the authenticated principal.
+        """
+        principal_id = str(payload.get("principal_id") or "")
         task = SubAgentTask(
             id="",
             goal=payload.get("goal", ""),
             context=payload.get("context", ""),
             tools=payload.get("tools", []),
             timeout=payload.get("timeout", 300),
-            parent_session_id="gateway",
+            # B1: derive a per-principal parent session so tasks from
+            # different principals don't share a session namespace.
+            parent_session_id=f"subagent:{principal_id}" if principal_id else "gateway",
             depth=1,
+            principal_id=principal_id,
         )
         try:
             result = await self.spawner.spawn(task)
@@ -37,10 +53,13 @@ class SubAgentService:
             return {"ok": False, "error": str(exc)}
 
     async def handle_collect(self, payload: dict) -> dict[str, Any]:
-        """Handle a Collect request."""
-        del payload
+        """Handle a Collect request.
+
+        B1: only returns tasks owned by the authenticated principal.
+        """
+        principal_id = str(payload.get("principal_id") or "")
         try:
-            tasks = await self.spawner.wait_all(timeout=600)
+            tasks = await self.spawner.wait_all(timeout=600, principal_id=principal_id)
             results = []
             completed = 0
             failed = 0
@@ -70,6 +89,9 @@ class SubAgentService:
             return {"ok": False, "error": str(exc)}
 
     async def handle_status(self, payload: dict) -> dict[str, Any]:
-        """Handle a Status request."""
-        del payload
-        return {"ok": True, "stats": self.spawner.stats()}
+        """Handle a Status request.
+
+        B1: only counts tasks owned by the authenticated principal.
+        """
+        principal_id = str(payload.get("principal_id") or "")
+        return {"ok": True, "stats": self.spawner.stats(principal_id=principal_id)}

@@ -25,7 +25,12 @@ class SubAgentConfig:
 
 @dataclass
 class SubAgentTask:
-    """One subagent task."""
+    """One subagent task.
+
+    B1: ``principal_id`` binds the task to the authenticated caller so
+    ``collect`` / ``status`` only return the caller's own tasks — a
+    different principal cannot observe another's goal / result / error.
+    """
 
     id: str
     goal: str
@@ -37,6 +42,10 @@ class SubAgentTask:
     error: Optional[str] = None
     parent_session_id: str = "root"
     depth: int = 1
+    # B1: the principal that owns this task.  Set by the service from
+    # the authenticated RPC payload; used by ``wait_all`` / ``stats`` /
+    # ``collect_results`` to filter results.
+    principal_id: str = ""
 
 
 Runner = Callable[[SubAgentTask], Awaitable[str]]
@@ -121,6 +130,9 @@ class SubAgentSpawner:
             task.context,
             json.dumps(task.tools),
             task.status,
+            # B1: persist the principal so list_subagent_tasks(principal_id)
+            # can filter rows on disk, not just in-memory.
+            task.principal_id,
         )
         async_task = asyncio.create_task(self._run_task(task))
         self._active_tasks[task.id] = async_task
@@ -163,24 +175,59 @@ class SubAgentSpawner:
                 logger.warning("spawn_batch skipped task due to unknown tool: %s", exc)
         return spawned
 
-    def stats(self) -> dict[str, int]:
-        """返回当前统计：active/total/completed/failed/pending。"""
-        completed = sum(1 for t in self._tasks.values() if t.status == "completed")
-        failed = sum(1 for t in self._tasks.values() if t.status == "failed")
-        pending = sum(1 for t in self._tasks.values() if t.status == "pending")
+    def stats(self, principal_id: str = "") -> dict[str, int]:
+        """返回当前统计：active/total/completed/failed/pending。
+
+        B1: when ``principal_id`` is set, only tasks owned by that
+        principal are counted — a different principal cannot observe
+        another's task counts.
+        """
+        tasks = self._tasks_for_principal(principal_id)
+        completed = sum(1 for t in tasks if t.status == "completed")
+        failed = sum(1 for t in tasks if t.status == "failed")
+        pending = sum(1 for t in tasks if t.status == "pending")
+        active = sum(
+            1 for t in tasks if t.id in self._active_tasks
+        )
         return {
-            "active": self.active_count,
-            "total": len(self._tasks),
+            "active": active,
+            "total": len(tasks),
             "completed": completed,
             "failed": failed,
             "pending": pending,
         }
 
-    async def wait_all(self, timeout: int = 600) -> list[SubAgentTask]:
-        """Wait for all active tasks."""
-        if self._active_tasks:
-            await asyncio.wait_for(asyncio.gather(*self._active_tasks.values()), timeout=timeout)
-        return list(self._tasks.values())
+    def _tasks_for_principal(self, principal_id: str) -> list[SubAgentTask]:
+        """B1: return tasks owned by ``principal_id``.
+
+        When ``principal_id`` is empty (legacy / test callers), return
+        ALL tasks — this preserves backward compatibility for callers
+        that haven't been updated.  Production callers always pass a
+        non-empty principal_id.
+        """
+        if not principal_id:
+            return list(self._tasks.values())
+        return [t for t in self._tasks.values() if t.principal_id == principal_id]
+
+    async def wait_all(self, timeout: int = 600, principal_id: str = "") -> list[SubAgentTask]:
+        """Wait for active tasks owned by ``principal_id`` (B1).
+
+        When ``principal_id`` is empty, waits for ALL tasks (legacy
+        behavior).  Production callers always pass a non-empty principal.
+        """
+        if not principal_id:
+            # Legacy path — wait for all active tasks.
+            if self._active_tasks:
+                await asyncio.wait_for(asyncio.gather(*self._active_tasks.values()), timeout=timeout)
+            return list(self._tasks.values())
+        # B1: only wait for tasks owned by this principal.
+        owned_active = {
+            tid: task for tid, task in self._active_tasks.items()
+            if tid in self._tasks and self._tasks[tid].principal_id == principal_id
+        }
+        if owned_active:
+            await asyncio.wait_for(asyncio.gather(*owned_active.values()), timeout=timeout)
+        return self._tasks_for_principal(principal_id)
 
     async def cancel(self, task_id: str) -> None:
         """Cancel one active task."""
@@ -196,9 +243,10 @@ class SubAgentSpawner:
         subtask.error = "cancelled"
         await self.db.update_subagent_task(task_id, "failed", subtask.result, subtask.error, finished=True)
 
-    async def collect_results(self) -> list[str]:
-        """Collect completed task results."""
-        return [task.result or "" for task in self._tasks.values() if task.status == "completed"]
+    async def collect_results(self, principal_id: str = "") -> list[str]:
+        """Collect completed task results (B1: filtered by principal)."""
+        tasks = self._tasks_for_principal(principal_id)
+        return [task.result or "" for task in tasks if task.status == "completed"]
 
     async def _run_task(self, task: SubAgentTask) -> None:
         try:
