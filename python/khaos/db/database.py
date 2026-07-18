@@ -523,20 +523,28 @@ class Database:
         context: str,
         tools: str,
         status: str = "pending",
+        principal_id: str = "",
     ) -> None:
-        """Insert or replace a subagent task row."""
+        """Insert or replace a subagent task row.
+
+        B1: ``principal_id`` is persisted so collect / status queries
+        can filter tasks by the authenticated caller.  Empty string is
+        the legacy default (rows written before the column existed).
+        """
         conn = await self._require_conn()
+        await self._ensure_subagent_tasks_principal_column()
         await conn.execute(
             """
-            INSERT INTO subagent_tasks (id, parent_session_id, goal, context, tools, status)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO subagent_tasks (id, parent_session_id, goal, context, tools, status, principal_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 goal = excluded.goal,
                 context = excluded.context,
                 tools = excluded.tools,
-                status = excluded.status
+                status = excluded.status,
+                principal_id = excluded.principal_id
             """,
-            (task_id, parent_session_id, goal, context, tools, status),
+            (task_id, parent_session_id, goal, context, tools, status, principal_id),
         )
         await conn.commit()
 
@@ -561,17 +569,51 @@ class Database:
         )
         await conn.commit()
 
-    async def list_subagent_tasks(self) -> list[dict[str, Any]]:
-        """List subagent tasks."""
+    async def list_subagent_tasks(self, principal_id: str | None = None) -> list[dict[str, Any]]:
+        """List subagent tasks.
+
+        B1: when ``principal_id`` is set, only rows owned by that
+        principal are returned.  ``None`` preserves the legacy
+        "return everything" behaviour.
+        """
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT id, parent_session_id, goal, context, tools, status, result, error
-            FROM subagent_tasks
-            ORDER BY created_at, id
-            """
-        )
+        await self._ensure_subagent_tasks_principal_column()
+        if principal_id is None:
+            cursor = await conn.execute(
+                """
+                SELECT id, parent_session_id, goal, context, tools, status, result, error, principal_id
+                FROM subagent_tasks
+                ORDER BY created_at, id
+                """
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT id, parent_session_id, goal, context, tools, status, result, error, principal_id
+                FROM subagent_tasks
+                WHERE principal_id = ?
+                ORDER BY created_at, id
+                """,
+                (principal_id,),
+            )
         return [dict(row) for row in await cursor.fetchall()]
+
+    async def _ensure_subagent_tasks_principal_column(self) -> None:
+        """B1: idempotently add the ``principal_id`` column to existing
+        ``subagent_tasks`` tables (legacy DBs created before this column
+        existed).  Fresh DBs get the column from ``schema.sql``.
+
+        Uses PRAGMA table_info to detect the column so the ALTER only
+        fires once per database lifetime.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(subagent_tasks)")
+        existing = {str(row["name"]) for row in await cursor.fetchall()}
+        if "principal_id" not in existing:
+            await conn.execute(
+                "ALTER TABLE subagent_tasks ADD COLUMN principal_id TEXT NOT NULL DEFAULT ''"
+            )
+            await conn.commit()
 
     # ------------------------------------------------------------------
     # Phase 6: session bookmarks + session summary / changed files

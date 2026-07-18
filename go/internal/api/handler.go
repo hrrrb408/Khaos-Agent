@@ -889,6 +889,11 @@ func (h *Handler) handleSubagentSpawn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "subagents not configured")
 		return
 	}
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
 	var body struct {
 		Goal    string   `json:"goal"`
 		Context string   `json:"context"`
@@ -899,7 +904,7 @@ func (h *Handler) handleSubagentSpawn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	result, err := h.subagents.Spawn(r.Context(), body.Goal, body.Context, body.Tools, body.Timeout)
+	result, err := h.subagents.Spawn(r.Context(), principalID, body.Goal, body.Context, body.Tools, body.Timeout)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -912,7 +917,12 @@ func (h *Handler) handleSubagentCollect(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotImplemented, "subagents not configured")
 		return
 	}
-	result, err := h.subagents.CollectResults(r.Context())
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	result, err := h.subagents.CollectResults(r.Context(), principalID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -925,7 +935,12 @@ func (h *Handler) handleSubagentStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotImplemented, "subagents not configured")
 		return
 	}
-	result, err := h.subagents.Status(r.Context())
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	result, err := h.subagents.Status(r.Context(), principalID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return

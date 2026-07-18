@@ -82,9 +82,9 @@ type TaskClient interface {
 
 // SubagentClient forwards subagent lifecycle calls to the Python service.
 type SubagentClient interface {
-	Spawn(ctx context.Context, goal string, context string, tools []string, timeout int) (map[string]any, error)
-	CollectResults(ctx context.Context) (map[string]any, error)
-	Status(ctx context.Context) (map[string]any, error)
+	Spawn(ctx context.Context, principalID string, goal string, context string, tools []string, timeout int) (map[string]any, error)
+	CollectResults(ctx context.Context, principalID string) (map[string]any, error)
+	Status(ctx context.Context, principalID string) (map[string]any, error)
 }
 
 // Memory represents one memory record.

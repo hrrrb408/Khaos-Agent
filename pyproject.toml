@@ -24,6 +24,13 @@ tui = [
     "textual>=0.47",
     "rich>=13",
 ]
+# M2: browser E2E extra.  Pulls in Playwright so the security route guard,
+# BrowserContext lifecycle and concurrent-session isolation tests can run
+# against a real Chromium instance.  The matching browser binaries must
+# still be downloaded separately via ``playwright install chromium``.
+browser = [
+    "playwright>=1.40",
+]
 tree-sitter = [
     "tree-sitter==0.26.0",
     "tree-sitter-python==0.25.0",
@@ -56,4 +63,11 @@ markers = [
     "tree_sitter_real: requires locked Tree-sitter optional dependencies",
     "lsp_real: requires a trusted pre-installed Language Server (never downloaded at test time)",
     "production_sandbox_real: requires a supported production sandbox daemon and pinned image",
+    # M2: real Playwright + Chromium binaries.  Tests marked with this
+    # exercise the live ``context.route`` route guard, BrowserContext
+    # lifecycle / refcount, scheme allowlist and concurrent-session
+    # isolation.  Skipped automatically when Playwright or the browser
+    # binary is missing, and gated by ``KHAOS_RUN_BROWSER_E2E=1`` so
+    # local ``pytest`` runs don't require the heavy dependency.
+    "browser_real: requires Playwright and downloaded browser binaries",
 ]

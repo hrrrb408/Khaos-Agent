@@ -133,11 +133,16 @@ class SubAgentRunner:
             skill_manager=self.skill_manager, agent_config=config,
             coding_context_builder=self.coding_context_builder,
             office_authority=self.office_authority,
-            # B1: inherit the server-level approval broker / principal /
-            # audit logger so approvals and audit events are bound to the
-            # same authority as the main AgentLoop.
+            # B1: inherit the server-level approval broker / audit logger
+            # so approvals and audit events are bound to the same authority
+            # as the main AgentLoop.
             approval_broker=self.approval_broker,
-            principal_id=self.principal_id or f"local-uid:{os.getuid()}",
+            # B1: use the TASK's principal_id (set from the authenticated
+            # RPC payload), NOT the server-fixed self.principal_id.  This
+            # ensures the subagent's BrowserContext / Memory scope /
+            # audit events are bound to the CALLING principal, not the
+            # server's local UID.
+            principal_id=task.principal_id or self.principal_id or f"local-uid:{os.getuid()}",
             audit_logger=self.audit_logger,
             # B1: inherit the server's project_root / config_path so the
             # subagent loads the SAME ``khaos_policy.yaml`` and compiles the

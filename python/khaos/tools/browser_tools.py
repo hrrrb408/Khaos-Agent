@@ -125,6 +125,12 @@ class BrowserManager:
         # contexts.  Each entry is a dict with "context", "page", "refcount"
         # and "network_guard" keys.
         self._contexts: dict[str, dict[str, Any]] = {}
+        # H2: when ``ensure_page`` returns ``None`` because the route guard
+        # failed to install, the failure reason is stashed here so
+        # ``_safe_execute`` can surface it instead of the generic
+        # "Browser not available" message.  Reset on every ``ensure_page``
+        # call so a transient failure doesn't poison subsequent calls.
+        self._last_ensure_error: str = ""
 
     @property
     def is_ready(self) -> bool:
@@ -227,10 +233,56 @@ class BrowserManager:
         runtime sharing it releases.  Called by ``RuntimeResult.aclose`` so
         a runtime's cookies / DOM / page are released when it ends — but
         a concurrent runtime sharing the same session is NOT affected.
+
+        Note: this API guesses a single context key from
+        ``principal_id`` + ``session_id`` + ``runtime_id``.  If a runtime
+        acquired contexts under multiple keys (e.g. by calling
+        ``ensure_page`` with different ``session_id``s),
+        ``close_context`` only releases ONE of them — the rest leak.
+        ``close_runtime(runtime_id)`` is the robust alternative and is
+        what ``RuntimeResult._run_close`` now calls.
         """
         key = self._context_key(principal_id, session_id, runtime_id)
         await self._close_one_context(key, force=False)
         return {"ok": True, "principal_id": principal_id or "default"}
+
+    async def close_runtime(self, runtime_id: str) -> dict[str, Any]:
+        """H1 (lifecycle): close ALL contexts owned by ``runtime_id``.
+
+        More robust than ``close_context`` which guesses a single key.
+        When a runtime calls ``ensure_page`` (potentially under multiple
+        principal / session keys), every context it acquired lists
+        ``runtime_id`` in its ``_runtime_owners`` set.  This method
+        iterates every entry, discards ``runtime_id`` from the owner set
+        and decrements the refcount; the context is only closed when the
+        refcount reaches zero (so a concurrent runtime sharing the same
+        context is NOT affected).
+
+        Called by ``RuntimeResult._run_close`` so a runtime's cookies /
+        DOM / page state cannot leak into a subsequent run by a different
+        runtime sharing the same process-wide ``BrowserManager`` —
+        regardless of which (principal, session, runtime) key the
+        context was originally acquired under.
+        """
+        if not runtime_id:
+            # Nothing to do — callers without a runtime_id never bumped
+            # any refcount (see ``ensure_page``: empty runtime_id records
+            # an empty ``_runtime_owners`` set on context creation).
+            return {"ok": True, "runtime_id": runtime_id or "default"}
+        for key in list(self._contexts.keys()):
+            entry = self._contexts.get(key)
+            if entry is None:
+                continue
+            owners = entry.get("_runtime_owners", set())
+            if runtime_id not in owners:
+                continue
+            owners.discard(runtime_id)
+            # Decrement refcount and close if it reaches zero.  We
+            # already removed ``runtime_id`` from the owner set above so
+            # a subsequent ``close_runtime`` for the same runtime is a
+            # no-op for this entry.
+            await self._close_one_context(key, force=False)
+        return {"ok": True, "runtime_id": runtime_id}
 
     @staticmethod
     def _context_key(
@@ -285,15 +337,42 @@ class BrowserManager:
         share a context; ``close_context`` only closes when the last
         runtime releases.
 
+        H1 (lifecycle): refcount must only bump for NEW runtimes, not
+        every tool call.  A sequence of ``browser_navigate`` /
+        ``browser_snapshot`` / ``browser_click`` under the SAME
+        ``runtime_id`` returns the page WITHOUT bumping refcount; only a
+        NEW ``runtime_id`` sharing the context bumps refcount and is
+        recorded in ``_runtime_owners`` so ``close_runtime`` can release
+        it.  Without this, every tool call bumped refcount but
+        ``RuntimeResult.aclose`` only decremented once, leaking
+        BrowserContexts / pages / cookies / DOM state.
+
         B2: when ``network_guard`` is supplied, a Playwright
         ``context.route("**/*", ...)`` handler is installed that runs the
         guard's domain check on EVERY request, redirect and subresource —
         not just the initial URL passed to ``browser_navigate``.
+
+        H2: if the route guard fails to install, the context is closed
+        immediately and ``None`` is returned — never continue with an
+        unguarded context (the route guard is the only thing preventing
+        subsequent click / type / evaluate / upload from reaching a
+        blocked domain).
         """
+        # H2: reset per-call failure reason so a transient failure on a
+        # previous call doesn't poison this one.
+        self._last_ensure_error = ""
         key = self._context_key(principal_id, session_id, runtime_id)
         entry = self._contexts.get(key)
         if entry is not None and entry.get("page") is not None:
-            # H5: bump refcount for the new runtime sharing this context.
+            # H1 (lifecycle): only bump refcount for a NEW runtime_id.
+            # The SAME runtime_id re-entering (e.g. navigate → snapshot →
+            # click within one runtime) returns the page WITHOUT bumping,
+            # so ``close_runtime(runtime_id)`` decrementing once actually
+            # releases the context.
+            owners = entry.setdefault("_runtime_owners", set())
+            if runtime_id in owners:
+                return entry["page"]
+            owners.add(runtime_id)
             entry["refcount"] = int(entry.get("refcount", 0)) + 1
             return entry["page"]
         # Need to create a new context for this session.
@@ -313,8 +392,29 @@ class BrowserManager:
         # subresource — closing the bypass where browser_click / type /
         # evaluate / upload could reach a blocked domain because they
         # don't carry a ``url`` argument the broker could inspect.
+        # H2: if installation fails, close the context immediately and
+        # return None — never continue with an unguarded context.  The
+        # caller (``_safe_execute``) translates ``None`` into
+        # ``{"ok": False, "error": "Browser security guard installation failed"}``.
         if network_guard is not None:
-            await self._install_route_guard(context, network_guard)
+            try:
+                await self._install_route_guard(context, network_guard)
+            except Exception as exc:  # noqa: BLE001 — surfaced as None
+                logger.error(
+                    "B2 route guard installation failed; closing context: %s",
+                    exc,
+                )
+                try:
+                    await context.close()
+                except Exception:  # noqa: BLE001 — best-effort cleanup
+                    pass
+                # H2: stash the specific failure reason so ``_safe_execute``
+                # can surface it instead of the generic "Browser not
+                # available" message.
+                self._last_ensure_error = (
+                    "Browser security guard installation failed"
+                )
+                return None
         page = await context.new_page()
         page.set_default_timeout(30000)  # 30s default
         self._contexts[key] = {
@@ -322,6 +422,11 @@ class BrowserManager:
             "page": page,
             "refcount": 1,
             "network_guard": network_guard,
+            # H1 (lifecycle): track which runtime_ids have acquired this
+            # context so ``ensure_page`` only bumps refcount for NEW
+            # runtimes, and ``close_runtime`` can release ALL contexts a
+            # runtime owns (across principals / sessions).
+            "_runtime_owners": {runtime_id} if runtime_id else set(),
         }
         logger.info("Browser context created for session: %s", key)
         return page
@@ -337,11 +442,53 @@ class BrowserManager:
         request.  ``context.route`` covers main-frame navigations,
         redirects, iframes, fetch/XHR, images, scripts, stylesheets —
         everything Playwright sees.
+
+        H2: this method MUST NOT catch exceptions from
+        ``context.route(...)`` — if route registration fails, the
+        exception propagates to ``ensure_page`` which closes the
+        context immediately and returns ``None``.  Continuing with an
+        unguarded context would let subsequent click / type / evaluate /
+        upload operations bypass the domain allowlist.
+
+        H2: the handler also restricts the URL scheme.  Only ``http``,
+        ``https``, ``about:blank``, ``blob:`` and ``data:`` are allowed;
+        ``file:`` and custom / unknown schemes are aborted
+        ``blockedbyclient`` so the page cannot reach local files or
+        exotic transports the NetworkGuard's domain check does not
+        understand.
         """
+        # H2: allowed URL schemes.  ``about:blank`` is matched explicitly
+        # below because ``urlparse("about:blank").scheme`` returns
+        # ``"about"`` (not in the set) but it is a safe non-network
+        # placeholder that pages can navigate to freely.
+        _ALLOWED_SCHEMES = frozenset({"http", "https", "blob", "data"})
+
         async def _route_handler(route: "Route", request: "Request") -> None:
             try:
                 url = request.url
+                # H2: scheme allowlist.  ``file:`` and custom / unknown
+                # schemes are rejected before the domain check runs —
+                # ``file:///etc/passwd`` has no domain so the domain
+                # check would pass it through, and custom schemes
+                # (``chrome-extension://``, ``javascript:``, ...) bypass
+                # the NetworkGuard entirely.
+                lower_url = url.lower()
+                if (
+                    lower_url == "about:blank"
+                    or lower_url.startswith("about:blank")
+                ):
+                    await route.continue_()
+                    return
                 parsed = urlparse(url)
+                scheme = (parsed.scheme or "").lower()
+                if scheme not in _ALLOWED_SCHEMES:
+                    await route.abort("blockedbyclient")
+                    logger.info(
+                        "B2 route guard blocked request with disallowed "
+                        "scheme %r: %s",
+                        scheme or "<empty>", url,
+                    )
+                    return
                 domain = parsed.hostname or ""
                 if domain:
                     # Use the guard's domain check (handles blocked /
@@ -364,10 +511,11 @@ class BrowserManager:
                 except Exception:  # noqa: BLE001
                     pass
 
-        try:
-            await context.route("**/*", _route_handler)
-        except Exception as exc:  # noqa: BLE001 — best-effort
-            logger.warning("failed to install B2 route guard: %s", exc)
+        # H2: do NOT catch exceptions — if ``context.route(...)`` fails
+        # to register the handler, the exception propagates to
+        # ``ensure_page`` which closes the context immediately and
+        # returns None.  Never continue with an unguarded context.
+        await context.route("**/*", _route_handler)
 
     async def _safe_execute(
         self,
@@ -402,7 +550,12 @@ class BrowserManager:
             network_guard=network_guard,
         )
         if page is None:
-            return {"ok": False, "error": "Browser not available"}
+            # H2: if ``ensure_page`` stashed a specific failure reason
+            # (e.g. route guard installation failed), surface it; otherwise
+            # fall back to the generic "Browser not available" message.
+            error = self._last_ensure_error or "Browser not available"
+            self._last_ensure_error = ""
+            return {"ok": False, "error": error}
         try:
             result = real(page)
             # real 可能是协程，统一 await。
@@ -794,6 +947,60 @@ async def browser_file_upload(
 # channel.
 _UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 
+# M1: runtime-private directory for materialized upload temp files.
+# ``tempfile.mkstemp()`` defaults to the system ``/tmp`` which is
+# world-writable on the same UID — a same-UID process can swap the file
+# between ``close(temp_fd)`` and Playwright's ``open()`` (TOCTOU).  Using
+# a 0700 dir under the user's home closes that window: only the current
+# user can access the temp file.  ``_ensure_upload_trusted_dir`` validates
+# this directory (not a symlink, owned by current UID, mode 0700) before
+# any temp file is created in it.
+UPLOAD_TRUSTED_DIR = Path.home() / ".khaos" / "uploads"
+
+
+def _ensure_upload_trusted_dir() -> Path:
+    """M1: ensure ``UPLOAD_TRUSTED_DIR`` exists and is a 0700 directory
+    owned by the current user.
+
+    Validates the directory is:
+
+    * not a symlink (so an attacker cannot point ``~/.khaos/uploads`` at
+      ``/etc`` or another world-readable location);
+    * a real directory (not a regular file, device, etc.);
+    * owned by the current UID (so another user's directory cannot be
+      used to leak or substitute temp files);
+    * mode 0700 (no group / other access — only the owner can read,
+      write or list the directory).
+
+    The directory is created with mode 0700 if it does not exist, and
+    ``chmod(0o700)`` is applied unconditionally (idempotent) to close
+    any umask leak (e.g. ``mkdir`` under umask 022 would create 0755).
+    Returns the validated ``Path`` on success; raises ``OSError`` on
+    validation failure.
+    """
+    import os as _os
+    import stat as _stat
+
+    path = UPLOAD_TRUSTED_DIR
+    path.mkdir(parents=True, exist_ok=True)
+    # lstat (not stat / follow) so a symlink at ``path`` is detected
+    # rather than transparently followed.
+    st = path.lstat()
+    if _stat.S_ISLNK(st.st_mode):
+        raise OSError(f"upload trusted dir is a symlink: {path}")
+    if not _stat.S_ISDIR(st.st_mode):
+        raise OSError(f"upload trusted dir is not a directory: {path}")
+    if st.st_uid != _os.getuid():
+        raise OSError(
+            f"upload trusted dir not owned by current user (uid="
+            f"{_os.getuid()}): {path}"
+        )
+    # Force 0700 (idempotent) — closes any umask leak from a prior
+    # ``mkdir`` under a permissive umask.  This is safe because chmod
+    # follows symlinks and we already rejected symlinks above.
+    _os.chmod(path, 0o700)
+    return path
+
 
 def _validate_upload_path(file_path: str, workspace_root: str) -> dict[str, Any] | None:
     """Validate ``file_path`` is within ``workspace_root`` and within size limit.
@@ -876,6 +1083,19 @@ def _materialize_upload(
     * returning the temp ``Path`` — Playwright reads from this temp file,
       so a subsequent swap of the original cannot affect the upload.
 
+    M1: the temp file is created inside ``UPLOAD_TRUSTED_DIR`` (a 0700
+    directory under ``~/.khaos/uploads/``), NOT the system ``/tmp``.
+    ``/tmp`` is world-writable on the same UID, so a same-UID process
+    could swap the temp file between ``close(temp_fd)`` and Playwright's
+    ``open()``.  The 0700 dir closes that window: only the current user
+    can access the temp file.
+
+    M1: on ANY error path that returns a dict (after the temp file has
+    been created), the temp file is unlinked in the ``finally`` block so
+    partial / failed materializations do not leak runtime-private temp
+    files into ``~/.khaos/uploads/``.  On the success path the caller is
+    responsible for unlinking after Playwright finishes.
+
     Returns the temp ``Path`` on success, or an error dict on failure.
     """
     import os as _os
@@ -911,6 +1131,12 @@ def _materialize_upload(
         }
 
     temp_path_str: str | None = None
+    # M1: ``temp_handed_off`` is set to True ONLY on the success path,
+    # so the ``finally`` block can unlink the temp file when we are
+    # about to return an error dict (i.e. the temp file was created but
+    # is partial / failed validation and the caller will never receive
+    # the Path to clean up themselves).
+    temp_handed_off = False
     try:
         st = _os.fstat(src_fd)
         if not _stat.S_ISREG(st.st_mode):
@@ -935,12 +1161,27 @@ def _materialize_upload(
                 "file": file_path,
                 "size": st.st_size,
             }
-        # Create the runtime-private temp file (0600, current user).
-        # mkstemp opens the file with O_RDWR | O_CREAT | O_EXCL, so the
-        # temp path is unique and not pre-existing.
+        # M1: validate the trusted upload dir before creating any temp
+        # file in it.  Raises OSError on validation failure — propagated
+        # to the caller as an error dict below.
+        try:
+            trusted_dir = _ensure_upload_trusted_dir()
+        except OSError as exc:
+            return {
+                "ok": False,
+                "error": f"upload trusted dir validation failed: {exc}",
+                "file": file_path,
+            }
+        # Create the runtime-private temp file (0600, current user) in
+        # the validated 0700 trusted dir.  mkstemp opens the file with
+        # O_RDWR | O_CREAT | O_EXCL, so the temp path is unique and not
+        # pre-existing.  M1: passing ``dir=str(trusted_dir)`` ensures
+        # the temp file lands in the 0700 dir, NOT in the world-writable
+        # system /tmp.
         temp_fd, temp_path_str = _tempfile.mkstemp(
             prefix="khaos_upload_",
             suffix=target_resolved.suffix or ".bin",
+            dir=str(trusted_dir),
         )
         try:
             _os.fchmod(temp_fd, 0o600)
@@ -953,7 +1194,8 @@ def _materialize_upload(
                 chunk = _os.read(src_fd, min(chunk_size, remaining))
                 if not chunk:
                     # File shrank between fstat and read — abort.  The
-                    # temp file is partial; we'll unlink it below.
+                    # temp file is partial; ``temp_handed_off`` is still
+                    # False so the ``finally`` block below will unlink it.
                     return {
                         "ok": False,
                         "error": "file shrank during upload materialization",
@@ -983,16 +1225,24 @@ def _materialize_upload(
                 }
         finally:
             _os.close(temp_fd)
+        # Success — mark the temp file as handed off so the outer
+        # ``finally`` does NOT unlink it (the caller unlinks after
+        # Playwright finishes).
+        temp_handed_off = True
         return Path(temp_path_str)
     finally:
         _os.close(src_fd)
-        # If we created a temp file but failed mid-copy, unlink it.
-        # (On success, the caller is responsible for unlinking after
-        # Playwright finishes.)
-        # We can't easily tell here whether we returned success or an
-        # error, so the caller's ``finally`` block handles the cleanup
-        # unconditionally — this is just a safety net for the early-return
-        # error paths above where we never returned the Path to the caller.
+        # M1: unlink the temp file on EVERY error path.  If we created a
+        # temp file but returned an error dict (validation failure mid-
+        # copy, identity check failure, etc.), the caller never received
+        # the Path and cannot clean it up themselves — so we unlink here.
+        # On the success path ``temp_handed_off`` is True and the temp
+        # file is left for the caller to unlink after Playwright finishes.
+        if temp_path_str is not None and not temp_handed_off:
+            try:
+                _os.unlink(temp_path_str)
+            except OSError:  # noqa: BLE001 — best-effort cleanup
+                pass
 
 
 def _make_file_upload_real(

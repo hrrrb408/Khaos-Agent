@@ -183,13 +183,123 @@ class AuditLogger:
     line to that file (in addition to the SQLite database) so an operator
     has an append-only trail outside the database.  The file write is
     best-effort.
+
+    H3: the log file is opened ONCE at construction time with
+    ``O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW`` and the fd is held for
+    the logger's lifetime.  Every ``_append_to_file`` call writes via
+    ``os.write(self._fd, ...)`` — no per-event path resolution, no
+    ``open(path, "a")`` that could follow a symlink substituted after
+    startup.  The trusted directory is also validated (not a symlink,
+    owned by the current UID, mode 0700) before the file is opened.
     """
 
     def __init__(self, db, *, log_path: str | os.PathLike[str] | None = None):
         self.db = db
-        self.log_path: Path | None = (
-            Path(log_path).expanduser() if log_path else None
-        )
+        self.log_path: Path | None = None
+        # H3: long-lived fd opened at construction; None when file audit
+        # is disabled or the path failed safety validation.
+        self._fd: int | None = None
+        if log_path is not None:
+            self._open_log_fd(log_path)
+
+    def _open_log_fd(self, log_path: str | os.PathLike[str]) -> None:
+        """H3: open and validate the audit log file, holding the fd.
+
+        * Validates the trusted dir (``~/.khaos/audit/``) is not a symlink,
+          is owned by the current UID, and has mode 0700.
+        * Resolves the file path under the trusted dir.
+        * Opens with ``O_NOFOLLOW`` so a symlink at the target is rejected.
+        * Validates the opened fd is a regular file owned by the current
+          user with no group/other permission bits.
+        * Holds the fd for the logger's lifetime; ``_append_to_file`` uses
+          ``os.write(self._fd, ...)`` — no per-event ``open(path, "a")``.
+        """
+        trusted = AUDIT_LOG_TRUSTED_DIR.expanduser().resolve()
+        try:
+            trusted.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError:
+            logger.warning(
+                "failed to create trusted audit dir %s; db-only audit",
+                trusted, exc_info=True,
+            )
+            return
+        # H3: validate the trusted directory itself — not a symlink,
+        # owned by the current UID, mode 0700.
+        try:
+            dir_fd = os.open(str(trusted), os.O_DIRECTORY | os.O_NOFOLLOW)
+        except OSError:
+            logger.warning(
+                "failed to open trusted audit dir %s for validation; "
+                "db-only audit", trusted, exc_info=True,
+            )
+            return
+        try:
+            dst = os.fstat(dir_fd)
+            if not _stat.S_ISDIR(dst.st_mode):
+                logger.warning("trusted audit dir %s is not a directory; db-only audit", trusted)
+                return
+            if dst.st_uid != os.getuid():
+                logger.warning("trusted audit dir %s not owned by current UID; db-only audit", trusted)
+                return
+            if dst.st_mode & 0o077:
+                logger.warning("trusted audit dir %s has unsafe mode %o; db-only audit", trusted, _stat.S_IMODE(dst.st_mode))
+                return
+        finally:
+            os.close(dir_fd)
+        # Resolve the file path under the trusted dir.
+        raw = Path(str(log_path)).expanduser()
+        candidate = trusted / raw if not raw.is_absolute() else raw
+        try:
+            resolved = candidate.resolve(strict=False)
+            resolved.relative_to(trusted)
+        except (OSError, ValueError):
+            logger.warning(
+                "audit log path %s resolves outside trusted dir %s; db-only audit",
+                log_path, trusted,
+            )
+            return
+        # H3: open with O_NOFOLLOW and HOLD the fd for the logger's lifetime.
+        try:
+            fd = os.open(
+                str(resolved),
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError:
+            logger.warning(
+                "failed to open audit log path %s; db-only audit",
+                resolved, exc_info=True,
+            )
+            return
+        try:
+            st = os.fstat(fd)
+            if not _stat.S_ISREG(st.st_mode):
+                logger.warning("audit log path %s is not a regular file; db-only audit", resolved)
+                os.close(fd)
+                return
+            if st.st_uid != os.getuid():
+                logger.warning("audit log path %s not owned by current UID; db-only audit", resolved)
+                os.close(fd)
+                return
+            if st.st_mode & 0o077:
+                logger.warning("audit log path %s has unsafe mode %o; db-only audit", resolved, _stat.S_IMODE(st.st_mode))
+                os.close(fd)
+                return
+        except OSError:
+            os.close(fd)
+            return
+        self._fd = fd
+        self.log_path = resolved
+        logger.info("audit log file opened (fd=%d): %s", fd, resolved)
+
+    def close(self) -> None:
+        """Close the held audit log fd (idempotent)."""
+        if self._fd is not None:
+            try:
+                os.close(self._fd)
+            except OSError:
+                pass
+            self._fd = None
 
     async def log(
         self,
@@ -247,15 +357,16 @@ class AuditLogger:
         detail_json: str,
         session_id: str | None,
     ) -> None:
-        """Append one audit record as a JSON line to ``self.log_path``.
+        """Append one audit record as a JSON line to the held fd.
 
-        M1: synchronous file I/O is acceptable here because audit is on the
-        hot path of every tool call but the write is a single small append;
-        using ``aiofiles`` would add a dependency for negligible gain.  The
-        file is opened in append mode so concurrent processes can safely
-        append.
+        H3: writes via ``os.write(self._fd, ...)`` using the fd opened at
+        construction time — no per-event ``open(path, "a")`` that could
+        follow a symlink substituted after startup.  The fd was validated
+        (regular file, owner, mode) when opened and is held for the
+        logger's lifetime, so the write target cannot be swapped.
         """
-        assert self.log_path is not None
+        if self._fd is None:
+            return  # file audit disabled or path failed validation
         record = {
             "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "action": action,
@@ -264,11 +375,13 @@ class AuditLogger:
             "detail": json.loads(detail_json),
             "session_id": session_id,
         }
-        line = json.dumps(record, ensure_ascii=False, sort_keys=True)
-        # Ensure parent directory exists (best-effort).
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.log_path, "a", encoding="utf-8") as handle:
-            handle.write(line + "\n")
+        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        try:
+            os.write(self._fd, line.encode("utf-8"))
+        except OSError:
+            logger.debug(
+                "audit log fd write failed (fd=%s)", self._fd, exc_info=True
+            )
 
     async def log_permission(
         self,
