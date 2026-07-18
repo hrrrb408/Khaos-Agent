@@ -14,8 +14,10 @@ regardless of source.
 
 M1: when ``log_path`` is configured (from the effective policy's
 ``audit_log_path``), every record is *also* appended as one JSON line to that
-file so an operator has an append-only, tamper-evident trail outside the
-SQLite database (which a compromised process could otherwise rewrite).  The
+file so an operator has a path-stable secondary trail outside the SQLite
+database.  The long-lived fd prevents path/symlink substitution, but this is
+not cryptographic tamper evidence against another process running as the same
+UID.  The
 file write is best-effort — a failure to append to the file does NOT suppress
 the database write or break the calling flow.
 
@@ -376,12 +378,27 @@ class AuditLogger:
             os.close(fd)
             return None
         if st.st_mode & 0o077:
-            logger.warning(
-                "%s under %s has unsafe mode %o; db-only audit",
-                name, parent_label, _stat.S_IMODE(st.st_mode),
-            )
-            os.close(fd)
-            return None
+            # A normal first-run config created by an older Khaos build may
+            # have inherited umask 022 and produced ~/.khaos as 0755.  The
+            # directory is already pinned by fd, is a real directory, and is
+            # owned by this UID, so tightening that exact inode is safe.
+            try:
+                os.fchmod(fd, 0o700)
+                st = os.fstat(fd)
+            except OSError:
+                logger.warning(
+                    "failed to tighten %s under %s; db-only audit",
+                    name, parent_label, exc_info=True,
+                )
+                os.close(fd)
+                return None
+            if _stat.S_IMODE(st.st_mode) != 0o700:
+                logger.warning(
+                    "%s under %s remains unsafe mode %o; db-only audit",
+                    name, parent_label, _stat.S_IMODE(st.st_mode),
+                )
+                os.close(fd)
+                return None
         return fd
 
     def close(self) -> None:

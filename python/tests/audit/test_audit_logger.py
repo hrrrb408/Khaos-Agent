@@ -10,6 +10,7 @@ import pytest
 
 import khaos.audit.logger as logger_module
 from khaos.audit import AuditLogger, resolve_safe_audit_log_path
+from khaos.config import set_user_config_value
 from khaos.db import Database
 
 
@@ -160,6 +161,38 @@ async def test_file_audit_uses_standard_cpython_dirfd_api(tmp_path, monkeypatch)
     record = json.loads((trusted / "events.jsonl").read_text().strip())
     assert record["action"] == "terminal"
     assert record["detail"] == {"bounded": True}
+    await db.close()
+
+
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd,
+    reason="platform has no dirfd-relative open/mkdir support",
+)
+async def test_first_config_under_umask_022_keeps_file_audit_enabled(
+    tmp_path, monkeypatch
+):
+    """H1: normal first-run config must not poison file-audit startup."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setattr(
+        logger_module, "AUDIT_LOG_TRUSTED_DIR", home / ".khaos" / "audit"
+    )
+    previous_umask = os.umask(0o022)
+    try:
+        set_user_config_value("models.default_model", "test-model")
+    finally:
+        os.umask(previous_umask)
+
+    assert (home / ".khaos").stat().st_mode & 0o777 == 0o700
+    db = await _db(tmp_path)
+    audit = AuditLogger(db, log_path="events.jsonl")
+    assert audit._fd is not None
+    await audit.log("config", "first-run", "success")
+    audit.close()
+    assert '"action": "config"' in (
+        home / ".khaos" / "audit" / "events.jsonl"
+    ).read_text(encoding="utf-8")
     await db.close()
 
 
