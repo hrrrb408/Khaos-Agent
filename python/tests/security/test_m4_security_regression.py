@@ -723,7 +723,7 @@ async def test_subagent_service_spawn_stamps_principal_onto_task(tmp_path):
         assert task.principal_id == "user-alice"
         # B1: parent_session_id is namespaced per principal.
         assert task.parent_session_id == "subagent:user-alice"
-        await spawner.wait_all()
+        await spawner.wait_all(principal_id="user-alice")
     finally:
         await db.close()
 
@@ -799,7 +799,7 @@ async def test_subagent_service_status_filters_by_principal(tmp_path):
         await service.handle_spawn(
             {"principal_id": "user-alice", "goal": "g2", "context": "", "tools": [], "timeout": 1}
         )
-        await spawner.wait_all()
+        await spawner.wait_all(principal_id="user-alice")
 
         a_status = await service.handle_status({"principal_id": "user-alice"})
         assert a_status["stats"]["total"] == 2
@@ -826,12 +826,15 @@ async def test_subagent_spawner_stats_filters_by_principal(tmp_path):
         await spawner.spawn(SubAgentTask("t1", "g", "c", [], principal_id="alice"))
         await spawner.spawn(SubAgentTask("t2", "g", "c", [], principal_id="alice"))
         await spawner.spawn(SubAgentTask("t3", "g", "c", [], principal_id="bob"))
-        await spawner.wait_all()
+        await spawner.wait_all(principal_id="alice")
+        await spawner.wait_all(principal_id="bob")
 
         assert spawner.stats(principal_id="alice")["total"] == 2
         assert spawner.stats(principal_id="bob")["total"] == 1
-        # Empty principal_id is the legacy "return everything" path.
-        assert spawner.stats()["total"] == 3
+        # M2: empty principal_id now returns NOTHING (fail-closed), not
+        # all tasks.  A caller bypassing the service with an empty
+        # principal must not observe every principal's tasks.
+        assert spawner.stats()["total"] == 0
     finally:
         await db.close()
 
@@ -852,7 +855,8 @@ async def test_subagent_spawner_collect_results_filters_by_principal(tmp_path):
         spawner = SubAgentSpawner(SubAgentConfig(max_concurrent=4), db, runner=_runner)
         await spawner.spawn(SubAgentTask("t1", "g", "c", [], principal_id="alice"))
         await spawner.spawn(SubAgentTask("t2", "g", "c", [], principal_id="bob"))
-        await spawner.wait_all()
+        await spawner.wait_all(principal_id="alice")
+        await spawner.wait_all(principal_id="bob")
 
         alice_results = await spawner.collect_results(principal_id="alice")
         assert alice_results == ["secret-alice"]
