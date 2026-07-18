@@ -110,17 +110,17 @@ func (m *mockChannelAgent) SetChannelEnabled(_ context.Context, _ string, enable
 	return nil
 }
 
-func (m *mockSubagentClient) Spawn(ctx context.Context, goal string, taskContext string, tools []string, timeout int) (map[string]any, error) {
+func (m *mockSubagentClient) Spawn(ctx context.Context, principalID string, goal string, taskContext string, tools []string, timeout int) (map[string]any, error) {
 	m.goal = goal
-	return map[string]any{"id": "sub-1", "status": "running", "goal": goal}, nil
+	return map[string]any{"id": "sub-1", "status": "running", "goal": goal, "principal_id": principalID}, nil
 }
 
-func (m *mockSubagentClient) CollectResults(ctx context.Context) (map[string]any, error) {
-	return map[string]any{"results": []any{}}, nil
+func (m *mockSubagentClient) CollectResults(ctx context.Context, principalID string) (map[string]any, error) {
+	return map[string]any{"results": []any{}, "principal_id": principalID}, nil
 }
 
-func (m *mockSubagentClient) Status(ctx context.Context) (map[string]any, error) {
-	return map[string]any{"active": 0}, nil
+func (m *mockSubagentClient) Status(ctx context.Context, principalID string) (map[string]any, error) {
+	return map[string]any{"active": 0, "principal_id": principalID}, nil
 }
 
 func newTestHandler(apiKey string) (http.Handler, *mockAgent) {
