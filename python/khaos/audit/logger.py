@@ -19,12 +19,11 @@ SQLite database (which a compromised process could otherwise rewrite).  The
 file write is best-effort — a failure to append to the file does NOT suppress
 the database write or break the calling flow.
 
-H2: ``resolve_safe_audit_log_path`` (exported below) is the single trusted
-resolver for ``audit_log_path`` — it constrains the path to
-``~/.khaos/audit/``, opens it with ``O_APPEND | O_CREAT | O_NOFOLLOW`` and
-validates owner / mode / regular-file.  Both the gRPC server path and the
-runtime factory (used by CLI / TUI / tests) call it so the audit trust
-boundary is uniform across every entry point (M1).
+H2: ``resolve_safe_audit_log_path`` only validates the configured filename.
+It deliberately performs no filesystem I/O.  ``AuditLogger`` is the single
+filesystem authority: it creates/opens the trusted directory chain with
+dirfd-relative, no-follow operations and holds the final append fd for its
+entire lifetime.
 """
 
 from __future__ import annotations
@@ -62,88 +61,46 @@ AUDIT_LOG_TRUSTED_DIR = Path.home() / ".khaos" / "audit"
 def resolve_safe_audit_log_path(
     log_path: str | os.PathLike[str] | None,
 ) -> Path | None:
-    """Resolve ``log_path`` to a safe, trusted-directory audit file (H2).
+    """Validate ``log_path`` and return only its safe basename (H2).
 
     Rules:
 
     * ``None`` / empty → ``None`` (no file audit; db-only audit remains).
-    * Path resolves outside ``~/.khaos/audit/`` → rejected (``None``).
-    * The trusted directory is created 0700 (best-effort).
-    * The final path is opened ``O_APPEND | O_CREAT | O_NOFOLLOW`` and its
-      ``(st_dev, st_ino, st_mode, st_uid)`` are validated: must be a regular
-      file owned by the current user with no group/other write bits.
+    * Relative paths must be a single basename (no parent components).
+    * Absolute paths are accepted only when their lexical parent is exactly
+      ``~/.khaos/audit``; symlinks are not resolved here.
+    * No directory or file is created/opened.  All filesystem effects belong
+      exclusively to :class:`AuditLogger`'s dirfd authority.
 
-    Returns the resolved ``Path`` (inside the trusted dir) when safe, or
-    ``None`` when the input was empty / unsafe (in which case audit falls
-    back to db-only — never raises, because audit must never block startup).
+    Returns a one-component relative ``Path`` on success, otherwise ``None``.
     """
     if not log_path:
         return None
-    trusted = AUDIT_LOG_TRUSTED_DIR.expanduser().resolve()
-    try:
-        trusted.mkdir(parents=True, exist_ok=True, mode=0o700)
-    except OSError:
-        # If we can't create the trusted dir, fall back to db-only audit
-        # rather than disabling audit entirely.
-        logger.warning(
-            "failed to create trusted audit dir %s; falling back to db-only audit",
-            trusted, exc_info=True,
-        )
-        return None
     raw = Path(str(log_path)).expanduser()
-    # If the caller gave a relative path, anchor it under the trusted dir.
-    if not raw.is_absolute():
-        candidate = trusted / raw
+    trusted = AUDIT_LOG_TRUSTED_DIR.expanduser()
+    if raw.is_absolute():
+        if raw.parent != trusted:
+            logger.warning(
+                "audit log path %s is not directly under trusted dir %s; "
+                "falling back to db-only audit", log_path, trusted,
+            )
+            return None
+        filename = raw.name
     else:
-        candidate = raw
-    try:
-        # ``resolve(strict=False)`` follows symlinks; if the resolved path
-        # is outside the trusted dir, reject.
-        resolved = candidate.resolve(strict=False)
-        resolved.relative_to(trusted)
-    except (OSError, ValueError):
+        if len(raw.parts) != 1:
+            logger.warning(
+                "audit log path %s contains parent components; "
+                "falling back to db-only audit", log_path,
+            )
+            return None
+        filename = raw.name
+    if not filename or filename in {".", ".."}:
         logger.warning(
-            "audit log path %s resolves outside the trusted dir %s; "
-            "falling back to db-only audit", log_path, trusted,
+            "audit log path %s has no safe basename; falling back to db-only audit",
+            log_path,
         )
         return None
-    # Open with O_NOFOLLOW so a symlink at the target is rejected; create
-    # if missing.  Validate owner / mode / regular-file after open.
-    try:
-        fd = os.open(
-            resolved,
-            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
-            0o600,
-        )
-    except OSError:
-        logger.warning(
-            "failed to open audit log path %s; falling back to db-only audit",
-            resolved, exc_info=True,
-        )
-        return None
-    try:
-        st = os.fstat(fd)
-    finally:
-        os.close(fd)
-    if not _stat.S_ISREG(st.st_mode):
-        logger.warning(
-            "audit log path %s is not a regular file; falling back to db-only audit",
-            resolved,
-        )
-        return None
-    if st.st_uid != os.getuid():
-        logger.warning(
-            "audit log path %s is not owned by the current user; "
-            "falling back to db-only audit", resolved,
-        )
-        return None
-    if st.st_mode & 0o077:
-        logger.warning(
-            "audit log path %s has unsafe permissions %o; "
-            "falling back to db-only audit", resolved, _stat.S_IMODE(st.st_mode),
-        )
-        return None
-    return resolved
+    return Path(filename)
 
 
 @dataclass
@@ -232,12 +189,18 @@ class AuditLogger:
           ``open(path, "a")`` that could follow a symlink substituted
           after startup.
 
-        H1: if ``os.openat`` is unavailable (Python < 3.11 or non-POSIX
-        platform), falls back to db-only audit — no ``self._fd`` is set.
+        H1: CPython exposes openat semantics as ``os.open(..., dir_fd=...)``.
+        If the platform does not advertise dirfd support for both ``open``
+        and ``mkdir``, file audit fails closed to db-only mode.
         """
-        if not hasattr(os, "openat"):
+        if (
+            os.open not in os.supports_dir_fd
+            or os.mkdir not in os.supports_dir_fd
+            or not hasattr(os, "O_DIRECTORY")
+            or not hasattr(os, "O_NOFOLLOW")
+        ):
             logger.warning(
-                "os.openat unavailable on this platform; "
+                "dirfd/no-follow operations unavailable on this platform; "
                 "falling back to db-only audit"
             )
             return
@@ -258,8 +221,12 @@ class AuditLogger:
             #    O_NOFOLLOW on the home path rejects a symlink at the home
             #    level (defense in depth).
             try:
+                trusted = AUDIT_LOG_TRUSTED_DIR.expanduser()
+                if trusted.name != "audit" or trusted.parent.name != ".khaos":
+                    raise OSError("invalid trusted audit directory layout")
                 home_fd = os.open(
-                    str(Path.home()), os.O_DIRECTORY | os.O_NOFOLLOW,
+                    str(trusted.parent.parent),
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                 )
             except OSError:
                 logger.warning(
@@ -288,10 +255,11 @@ class AuditLogger:
 
             # 4. Open the log file relative to the audit dirfd.
             try:
-                fd = os.openat(
-                    audit_fd, filename,
+                fd = os.open(
+                    filename,
                     os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
                     0o600,
+                    dir_fd=audit_fd,
                 )
             except OSError:
                 logger.warning(
@@ -329,7 +297,7 @@ class AuditLogger:
             # ``log_path`` as the audit dir + filename for logging / display
             # (the original input may have been an absolute path).
             self._fd = fd
-            self.log_path = AUDIT_LOG_TRUSTED_DIR / filename
+            self.log_path = AUDIT_LOG_TRUSTED_DIR.expanduser() / filename
             logger.info("audit log file opened (fd=%d): %s", fd, self.log_path)
         finally:
             # Close every directory fd in reverse order; the held file fd
@@ -353,8 +321,9 @@ class AuditLogger:
         (a warning is logged and the caller falls back to db-only audit).
         """
         try:
-            fd = os.openat(
-                parent_fd, name, os.O_DIRECTORY | os.O_NOFOLLOW,
+            fd = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                dir_fd=parent_fd,
             )
         except OSError:
             # Component may not exist yet — create it 0700 (mkdirat
@@ -370,8 +339,9 @@ class AuditLogger:
                 )
                 return None
             try:
-                fd = os.openat(
-                    parent_fd, name, os.O_DIRECTORY | os.O_NOFOLLOW,
+                fd = os.open(
+                    name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd,
                 )
             except OSError:
                 logger.warning(

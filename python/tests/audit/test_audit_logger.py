@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from khaos.audit import AuditLogger
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+import khaos.audit.logger as logger_module
+from khaos.audit import AuditLogger, resolve_safe_audit_log_path
 from khaos.db import Database
 
 
@@ -130,4 +137,66 @@ async def test_log_failure_does_not_raise(tmp_path):
     row_id = await audit.log("a", "t", "success")  # must not raise
 
     assert row_id == -1
+    await db.close()
+
+
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd,
+    reason="platform has no dirfd-relative open/mkdir support",
+)
+async def test_file_audit_uses_standard_cpython_dirfd_api(tmp_path, monkeypatch):
+    """H1: standard CPython must activate file audit without os.openat."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    trusted = home / ".khaos" / "audit"
+    monkeypatch.setattr(logger_module, "AUDIT_LOG_TRUSTED_DIR", trusted)
+    db = await _db(tmp_path)
+
+    audit = AuditLogger(db, log_path=Path("events.jsonl"))
+    assert audit._fd is not None
+    await audit.log("terminal", "pwd", "success", {"bounded": True})
+    audit.close()
+
+    record = json.loads((trusted / "events.jsonl").read_text().strip())
+    assert record["action"] == "terminal"
+    assert record["detail"] == {"bounded": True}
+    await db.close()
+
+
+def test_audit_path_resolver_is_syntax_only_and_has_no_side_effects(
+    tmp_path, monkeypatch
+):
+    """H2: resolver must never create/open the trusted path."""
+    trusted = tmp_path / "home" / ".khaos" / "audit"
+    monkeypatch.setattr(logger_module, "AUDIT_LOG_TRUSTED_DIR", trusted)
+
+    assert resolve_safe_audit_log_path(trusted / "events.jsonl") == Path(
+        "events.jsonl"
+    )
+    assert resolve_safe_audit_log_path("nested/events.jsonl") is None
+    assert not trusted.exists()
+
+
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd,
+    reason="platform has no dirfd-relative open/mkdir support",
+)
+async def test_file_audit_rejects_symlinked_directory_before_side_effect(
+    tmp_path, monkeypatch
+):
+    """H2: a symlink in the trusted chain cannot receive an audit file."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    attacker = tmp_path / "attacker"
+    attacker.mkdir(mode=0o700)
+    (home / ".khaos").symlink_to(attacker, target_is_directory=True)
+    monkeypatch.setattr(
+        logger_module, "AUDIT_LOG_TRUSTED_DIR", home / ".khaos" / "audit"
+    )
+    db = await _db(tmp_path)
+
+    audit = AuditLogger(db, log_path="events.jsonl")
+
+    assert audit._fd is None
+    assert not (attacker / "audit" / "events.jsonl").exists()
     await db.close()
