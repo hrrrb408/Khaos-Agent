@@ -138,6 +138,12 @@ class BrowserManager:
         # keys and grew for the lifetime of the server.
         self._lifecycle_lock = asyncio.Lock()
         self._context_close_failures: dict[str, int] = {}
+        # H1: once ``close()`` has run, the manager is permanently closed.
+        # A detached subagent task whose cancellation races with server
+        # teardown cannot relaunch a fresh Browser generation via
+        # ``launch()`` / ``ensure_page()`` after the shared authority has
+        # already been dismantled.
+        self._closed: bool = False
 
     @property
     def is_ready(self) -> bool:
@@ -161,6 +167,9 @@ class BrowserManager:
         self, headless: bool = True, browser_type: str = "chromium"
     ) -> dict[str, Any]:
         """Start the process browser under the singleton lifecycle lock."""
+        # H1: a permanently-closed manager never relaunches.
+        if self._closed:
+            return {"ok": False, "error": "browser manager is permanently closed"}
         async with self._lifecycle_lock:
             return await self._launch_locked(headless, browser_type)
 
@@ -356,6 +365,9 @@ class BrowserManager:
 
     async def close(self) -> dict[str, Any]:
         """关闭浏览器和 Playwright runtime（幂等）。"""
+        # H1: once closed, the manager stays closed — a detached task
+        # cannot relaunch a fresh Browser generation after teardown.
+        self._closed = True
         async with self._lifecycle_lock:
             try:
                 await self._close_all_contexts()
@@ -415,6 +427,10 @@ class BrowserManager:
         """
         # The process-wide lifecycle lock coalesces concurrent first use and
         # avoids an unbounded per-key lock registry.
+        # H1: a permanently-closed manager never serves a new page.
+        if self._closed:
+            self._last_ensure_error = "browser manager is permanently closed"
+            return None
         self._last_ensure_error = ""
         key = self._context_key(principal_id, session_id, runtime_id)
         async with self._lifecycle_lock:
@@ -1227,6 +1243,23 @@ def _read_upload_bytes(
                 "ok": False,
                 "error": "file_path is not owned by the current user",
                 "file": file_path,
+            }
+        # M1: reject hard-linked files.  The no-follow dirfd chain defeats
+        # symlink and parent-replacement races, but a same-UID process can
+        # still hard-link ``workspace/upload.txt`` to ``~/.ssh/id_rsa``;
+        # every path component is legitimate and the final inode is an
+        # owner-held regular file, so without this check we would read and
+        # upload an arbitrary host secret.  Require a link count of exactly
+        # one before any bytes leave the process.
+        if st.st_nlink != 1:
+            return {
+                "ok": False,
+                "error": (
+                    "file_path has multiple hard links and may escape the "
+                    "workspace"
+                ),
+                "file": file_path,
+                "nlink": st.st_nlink,
             }
         if st.st_size > _UPLOAD_MAX_BYTES:
             return {

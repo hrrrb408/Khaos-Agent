@@ -465,3 +465,70 @@ def test_browser_screenshot_has_no_filesystem_write_argument():
     tool = create_runtime_registry().get("browser_screenshot")
     assert tool.permission_level == "read"
     assert "save_path" not in tool.parameters.get("properties", {})
+
+
+# ---------------------------------------------------------------------------
+# M1: upload hard-link inode escape
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "link"),
+    reason="requires POSIX no-follow and hard-link support",
+)
+def test_upload_rejects_hardlink_to_outside_file(tmp_path):
+    """M1: a Workspace file hard-linked to an outside secret must be rejected.
+
+    The dirfd chain defeats symlinks and parent-replacement races, but a
+    same-UID process can still ``link(~/.ssh/id_rsa, workspace/upload.txt)``.
+    Every component is legitimate and the final inode is an owner-held
+    regular file, so without an explicit link-count check we would read and
+    upload the linked secret.  ``st_nlink != 1`` must fail the upload BEFORE
+    any bytes leave the process.
+    """
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    secret = outside / "id_rsa"
+    secret.write_text("HOST-PRIVATE-KEY", encoding="utf-8")
+    upload = workspace / "upload.txt"
+    os.link(str(secret), str(upload))
+
+    result = browser_tools._read_upload_bytes(str(upload), str(workspace))
+
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert "hard link" in result["error"]
+    assert result["nlink"] == 2
+
+
+# ---------------------------------------------------------------------------
+# H1: BrowserManager.close() is a permanent terminal state
+# ---------------------------------------------------------------------------
+
+
+async def test_browser_manager_close_is_permanent():
+    """H1: after ``close()`` the manager must never relaunch or serve a page.
+
+    A detached subagent task whose cancellation races with server teardown
+    must not be able to spin up a fresh Browser generation after the shared
+    authority has been dismantled.
+    """
+    manager = BrowserManager()
+    closed = await manager.close()
+    assert closed["ok"] is True
+
+    # launch() must refuse with an explicit closed-state error.
+    launch_result = await manager.launch()
+    assert launch_result["ok"] is False
+    assert "permanently closed" in launch_result["error"]
+
+    # ensure_page() must return None and surface the same reason.
+    page = await manager.ensure_page("p1", session_id="s1", runtime_id="r1")
+    assert page is None
+    assert "permanently closed" in manager._last_ensure_error
+
+    # A second close() is still idempotent.
+    again = await manager.close()
+    assert again["ok"] is True
