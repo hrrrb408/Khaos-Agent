@@ -1159,6 +1159,20 @@ def _read_upload_bytes(
     import os as _os
     import stat as _stat
 
+    # Windows' stdlib does not expose O_NOFOLLOW or an equivalent
+    # handle-relative no-reparse-point open.  Do not weaken the upload
+    # identity contract by silently following reparse points; the native
+    # backend remains explicitly unavailable until it has a real no-follow
+    # implementation and runner coverage.
+    if not hasattr(_os, "O_NOFOLLOW"):
+        return {
+            "ok": False,
+            "error": (
+                "secure no-follow file upload is unavailable on this platform"
+            ),
+            "file": file_path,
+        }
+
     # Reuse the fast validation path for the early containment / size
     # checks (so the error dicts match the test expectations).
     fast_error = _validate_upload_path(file_path, workspace_root)

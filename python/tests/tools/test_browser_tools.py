@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 
 import pytest
 
@@ -156,7 +157,15 @@ async def test_browser_file_upload_records_in_mock(tmp_path):
         workspace_root=str(workspace),
         network_policy="unrestricted-with-approval",
     )
-    assert result == {"ok": True, "selector": "input[type=file]", "file": str(f)}
+    if hasattr(os, "O_NOFOLLOW"):
+        assert result == {
+            "ok": True,
+            "selector": "input[type=file]",
+            "file": str(f),
+        }
+    else:
+        assert result["ok"] is False
+        assert "no-follow" in result["error"]
 
 
 # ---------------------------------------------------------------------------
