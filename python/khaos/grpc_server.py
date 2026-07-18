@@ -315,14 +315,24 @@ class AgentService:
 
     async def shutdown(self) -> None:
         """Stop process-scoped background services."""
-        # B1: fence every in-flight Office mutation before shutting down cron.
-        # The authority is shared across all turns, so only the server owns
-        # its lifecycle.
+        # Stop producers first, then give quarantined per-turn runtimes a
+        # bounded retry window while shared authorities are still alive.
+        await self.cron_engine.stop()
+        from khaos.runtime import drain_orphan_runtimes
+        remaining = await drain_orphan_runtimes(timeout_seconds=5.0)
+        if remaining:
+            logger.error(
+                "server shutdown retaining %d quarantined runtime(s)", remaining
+            )
+        # Fence every in-flight Office mutation after runtimes have settled.
         try:
             await self._office_authority.shutdown()
         except Exception:
             logger.debug("office authority shutdown failed", exc_info=True)
-        await self.cron_engine.stop()
+        # The shared AuditLogger is process-owned and is closed exactly once,
+        # after all runtime/authority shutdown events had a chance to log.
+        if self._audit_logger is not None:
+            self._audit_logger.close()
 
     async def _execute_scheduled_prompt(self, task_id: str, prompt: str) -> str:
         """Run a scheduled prompt through the normal office-mode agent path."""
@@ -353,7 +363,8 @@ class AgentService:
             async for message in runtime.loop.run(request.message, session_id):
                 yield _message_to_event(message)
         finally:
-            await runtime.aclose()
+            from khaos.runtime import close_runtime_or_register
+            await close_runtime_or_register(runtime)
 
     async def switch_mode(self, session_id: str, target_mode: str) -> dict:
         mode_manager = ModeManager(self.db, project_root=self.project_root)

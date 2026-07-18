@@ -8,7 +8,9 @@ host happens to have Playwright installed.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import os
 
 import pytest
 
@@ -155,7 +157,15 @@ async def test_browser_file_upload_records_in_mock(tmp_path):
         workspace_root=str(workspace),
         network_policy="unrestricted-with-approval",
     )
-    assert result == {"ok": True, "selector": "input[type=file]", "file": str(f)}
+    if hasattr(os, "O_NOFOLLOW"):
+        assert result == {
+            "ok": True,
+            "selector": "input[type=file]",
+            "file": str(f),
+        }
+    else:
+        assert result["ok"] is False
+        assert "no-follow" in result["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -200,6 +210,88 @@ async def test_browser_manager_ensure_page_returns_none_without_playwright(monke
     manager = BrowserManager()
     page = await manager.ensure_page()
     assert page is None
+
+
+async def test_browser_manager_concurrent_first_use_creates_one_context(monkeypatch):
+    """M2: concurrent first use of one key must coalesce under its lock."""
+    monkeypatch.setattr(browser_tools, "_HAS_PLAYWRIGHT", True)
+
+    class FakePage:
+        url = "about:blank"
+
+        def set_default_timeout(self, timeout):
+            self.timeout = timeout
+
+    class FakeContext:
+        def __init__(self):
+            self.page = FakePage()
+
+        async def new_page(self):
+            await asyncio.sleep(0)
+            return self.page
+
+        async def close(self):
+            return None
+
+    class FakeBrowser:
+        def __init__(self):
+            self.calls = 0
+            self.context = FakeContext()
+
+        async def new_context(self, **kwargs):
+            self.calls += 1
+            await asyncio.sleep(0)
+            return self.context
+
+    manager = BrowserManager()
+    manager._browser = FakeBrowser()
+
+    first, second = await asyncio.gather(
+        manager.ensure_page("p", session_id="s", runtime_id="r"),
+        manager.ensure_page("p", session_id="s", runtime_id="r"),
+    )
+
+    assert first is second
+    assert manager._browser.calls == 1
+    assert len(manager._contexts) == 1
+
+
+async def test_browser_manager_concurrent_launch_starts_one_browser(monkeypatch):
+    """M2: the lifecycle lock turns concurrent launch into one launch task."""
+    monkeypatch.setattr(browser_tools, "_HAS_PLAYWRIGHT", True)
+
+    class FakeBrowser:
+        async def close(self):
+            return None
+
+    class FakeChromium:
+        def __init__(self):
+            self.calls = 0
+            self.browser = FakeBrowser()
+
+        async def launch(self, *, headless):
+            self.calls += 1
+            await asyncio.sleep(0)
+            return self.browser
+
+    class FakePlaywright:
+        def __init__(self):
+            self.chromium = FakeChromium()
+
+    fake_playwright = FakePlaywright()
+
+    class FakeStarter:
+        async def start(self):
+            await asyncio.sleep(0)
+            return fake_playwright
+
+    monkeypatch.setattr(browser_tools, "async_playwright", lambda: FakeStarter())
+    manager = BrowserManager()
+
+    first, second = await asyncio.gather(manager.launch(), manager.launch())
+
+    assert first["ok"] and second["ok"]
+    assert fake_playwright.chromium.calls == 1
 
 
 # ---------------------------------------------------------------------------
@@ -291,3 +383,10 @@ def test_runtime_registry_browser_permission_levels():
         assert registry.get(name).permission_level == "read", name
     for name in write_tools:
         assert registry.get(name).permission_level == "write", name
+
+
+def test_browser_screenshot_has_no_filesystem_write_argument():
+    """M3: screenshot is read-only because it can only return base64."""
+    tool = create_runtime_registry().get("browser_screenshot")
+    assert tool.permission_level == "read"
+    assert "save_path" not in tool.parameters.get("properties", {})

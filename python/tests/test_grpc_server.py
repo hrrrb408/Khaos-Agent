@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -75,6 +76,84 @@ async def test_agent_service_starts_and_stops_cron_engine(tmp_path):
     await service.shutdown()
     assert service.cron_engine._running is False
     await db.close()
+
+
+async def test_agent_service_owns_shared_audit_logger_across_turns(tmp_path):
+    """H3: a turn borrows the logger; only server shutdown closes it."""
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    shared = MagicMock()
+    service._audit_logger = shared
+
+    runtime = await service._build_runtime("s1", "office")
+    assert runtime.audit_logger is shared
+    assert runtime.owns_audit_logger is False
+    await runtime.aclose()
+    shared.close.assert_not_called()
+
+    await service.shutdown()
+    shared.close.assert_called_once()
+    await db.close()
+
+
+async def test_agent_service_chat_quarantines_failed_runtime_close(
+    tmp_path, monkeypatch
+):
+    """H4: production chat teardown registers an orphan before raising."""
+    from khaos.exceptions import RuntimeCloseError
+    from khaos.runtime.factory import (
+        RuntimeResult,
+        _orphan_runtimes,
+        cleanup_orphan_runtimes,
+    )
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    office = MagicMock()
+    office.shutdown = AsyncMock(side_effect=RuntimeError("stuck"))
+    loop = MagicMock()
+
+    async def empty_run(*args, **kwargs):
+        if False:
+            yield None
+
+    loop.run = empty_run
+    runtime = RuntimeResult(
+        loop=loop,
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        office_authority=office,
+        principal_id="principal",
+        session_id="session",
+        runtime_id="runtime",
+    )
+
+    async def fake_build(*args, **kwargs):
+        return runtime
+
+    monkeypatch.setattr(service, "_build_runtime", fake_build)
+    try:
+        with pytest.raises(RuntimeCloseError):
+            [event async for event in service.chat(ChatRequest("s1", "hi", "office"))]
+        assert any(item is runtime for item in _orphan_runtimes)
+        assert runtime.quarantined is True
+    finally:
+        office.shutdown = AsyncMock()
+        await cleanup_orphan_runtimes()
+        await service.shutdown()
+        await db.close()
 
 
 async def test_webhook_session_and_principal_are_channel_bound(tmp_path, monkeypatch):

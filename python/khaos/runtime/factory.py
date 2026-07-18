@@ -119,6 +119,13 @@ class RuntimeResult:
     # (after every other component) because audit logging may be needed
     # during component shutdown (e.g. to record the shutdown itself).
     audit_logger: AuditLogger | None = None
+    # H3: injected loggers are process/server-owned and must survive every
+    # turn.  Only a logger constructed by ``build_runtime`` is runtime-owned.
+    owns_audit_logger: bool = True
+    # H4: persistent close failure quarantines the runtime in the orphan
+    # registry.  The flag is observable and is cleared only after a later
+    # cleanup succeeds.
+    quarantined: bool = field(default=False, init=False)
     # B1: ``init=False`` so positional construction can never accidentally
     # bind a real component into ``_closed`` (which previously made
     # ``aclose()`` a no-op because the truthy component short-circuited it).
@@ -378,7 +385,7 @@ class RuntimeResult:
             # other component has settled.  Best-effort: a close failure
             # does NOT set ``_close_failed`` (audit logger close is not
             # safety-critical — the OS reclaims the fd on process exit).
-            if self.audit_logger is not None:
+            if self.audit_logger is not None and self.owns_audit_logger:
                 try:
                     close_method = getattr(self.audit_logger, "close", None)
                     if close_method is not None:
@@ -517,6 +524,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     # the variable was only assigned inside the ``if scheduler is None``
     # block, so RuntimeResult couldn't reference it — the fd leaked.
     audit_logger = cfg.audit_logger
+    owns_audit_logger = audit_logger is None
     scheduler = cfg.tool_scheduler
     if scheduler is None:
         # B1: when a tool allowlist is configured (SubAgent path), prune the
@@ -612,6 +620,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # without this, configuring a file audit path would leak the fd
         # for the process's lifetime.
         audit_logger=audit_logger,
+        owns_audit_logger=owns_audit_logger,
     )
 
 
@@ -643,6 +652,7 @@ def register_orphan_runtime(runtime: RuntimeResult) -> None:
     Idempotent: registering the same runtime twice is a no-op (the
     registry deduplicates by identity).
     """
+    runtime.quarantined = True
     for existing in _orphan_runtimes:
         if existing is runtime:
             return
@@ -682,5 +692,52 @@ async def cleanup_orphan_runtimes() -> int:
             # — shouldn't happen after the reset above, but keep the
             # orphan so a future retry can pick it up).
             remaining.append(runtime)
+        else:
+            runtime.quarantined = False
     _orphan_runtimes[:] = remaining
     return len(_orphan_runtimes)
+
+
+async def close_runtime_or_register(runtime: RuntimeResult) -> None:
+    """Close a production-owned runtime and retain persistent failures.
+
+    Every runtime owner must use this helper instead of calling ``aclose``
+    directly.  A failed close is registered before the exception escapes, so
+    request teardown cannot discard the only references to live resources.
+    """
+    try:
+        await runtime.aclose()
+    except RuntimeCloseError:
+        register_orphan_runtime(runtime)
+        logger.error(
+            "runtime cleanup failed; quarantined for bounded shutdown retry: "
+            "principal=%s session=%s runtime=%s",
+            runtime.principal_id,
+            runtime.session_id,
+            runtime.runtime_id,
+        )
+        raise
+
+
+async def drain_orphan_runtimes(
+    *, timeout_seconds: float = 5.0, retry_interval: float = 0.05,
+) -> int:
+    """Retry quarantined runtimes until empty or a bounded deadline.
+
+    Returns the remaining count.  The caller must surface a non-zero result;
+    this function never silently drops a runtime that still owns resources.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(0.0, timeout_seconds)
+    remaining = len(_orphan_runtimes)
+    while remaining and loop.time() <= deadline:
+        remaining = await cleanup_orphan_runtimes()
+        if remaining and loop.time() < deadline:
+            await asyncio.sleep(max(0.0, retry_interval))
+    if remaining:
+        logger.error(
+            "%d quarantined runtime(s) remain after %.2fs shutdown deadline",
+            remaining,
+            timeout_seconds,
+        )
+    return remaining

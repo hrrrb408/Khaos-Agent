@@ -201,7 +201,8 @@ class KhaosApp(App):
     async def on_unmount(self) -> None:  # type: ignore[override]
         """Await TUI runtime and database cleanup before the loop exits."""
         if self._runtime is not None:
-            await self._runtime.aclose()
+            from khaos.runtime import close_runtime_or_register
+            await close_runtime_or_register(self._runtime)
         if self.db is not None:
             await self.db.close()
 

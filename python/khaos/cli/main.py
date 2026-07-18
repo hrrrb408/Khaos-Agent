@@ -50,7 +50,7 @@ async def run_once(args: argparse.Namespace) -> int:
     session_id = args.session_id or str(uuid.uuid4())
     await db.create_session(session_id, mode_manager.current_mode.value)
 
-    from khaos.runtime import RuntimeConfig, build_runtime
+    from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
         runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args)))
@@ -59,7 +59,7 @@ async def run_once(args: argparse.Namespace) -> int:
             print(encode_sse(message), end="", flush=True)
     finally:
         if runtime is not None:
-            await runtime.aclose()
+            await close_runtime_or_register(runtime)
         await db.close()
     return 0
 
@@ -74,7 +74,7 @@ async def run_repl(args: argparse.Namespace) -> int:
     await mode_manager.load()
     session_id = args.session_id or str(uuid.uuid4())
     await db.create_session(session_id, mode_manager.current_mode.value)
-    from khaos.runtime import RuntimeConfig, build_runtime
+    from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
         runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args)))
@@ -103,7 +103,7 @@ async def run_repl(args: argparse.Namespace) -> int:
                 print(encode_sse(message), end="", flush=True)
     finally:
         if runtime is not None:
-            await runtime.aclose()
+            await close_runtime_or_register(runtime)
         await db.close()
     return 0
 

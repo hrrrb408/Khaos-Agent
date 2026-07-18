@@ -116,7 +116,11 @@ class SubAgentRunner:
         # 保证子代理 session 已持久化（与 spawn() 的 create_session 对齐）。
         await self.db.create_session(session_id)
 
-        from khaos.runtime import RuntimeConfig, build_runtime
+        from khaos.runtime import (
+            RuntimeConfig,
+            build_runtime,
+            close_runtime_or_register,
+        )
         runtime = await build_runtime(RuntimeConfig(
             db=self.db, mode_manager=self.mode_manager, router=self.router,
             # B1: pass ``tool_scheduler=None`` (the default) so build_runtime
@@ -170,7 +174,7 @@ class SubAgentRunner:
         finally:
             # B1: release per-run resources (ExecutionService / MemoryManager).
             # The shared office_authority (if injected) is borrowed, not owned.
-            await runtime.aclose()
+            await close_runtime_or_register(runtime)
 
     def _build_subagent_system_prompt(self, task: SubAgentTask) -> str:
         """构建子代理专用的 system prompt。

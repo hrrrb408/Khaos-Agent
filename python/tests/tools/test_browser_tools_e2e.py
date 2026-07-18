@@ -37,7 +37,10 @@ dependency-free, while CI runs the full E2E matrix in a dedicated job
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import os
+import struct
 import sys
 from typing import Any
 from urllib.parse import urlparse
@@ -125,6 +128,68 @@ async def fresh_manager(monkeypatch):
             await asyncio.wait_for(mgr.close(), timeout=10)
         except asyncio.TimeoutError:
             pass  # best-effort — don't mask the original test failure.
+
+
+@pytest.fixture
+async def websocket_echo_server():
+    """Run a dependency-free RFC6455 text echo server for real WS routing."""
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        try:
+            request = await reader.readuntil(b"\r\n\r\n")
+            headers: dict[str, str] = {}
+            for line in request.decode("latin-1").split("\r\n")[1:]:
+                if ":" in line:
+                    name, value = line.split(":", 1)
+                    headers[name.lower()] = value.strip()
+            key = headers["sec-websocket-key"]
+            accept = base64.b64encode(
+                hashlib.sha1(
+                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
+                ).digest()
+            ).decode()
+            writer.write(
+                (
+                    "HTTP/1.1 101 Switching Protocols\r\n"
+                    "Upgrade: websocket\r\n"
+                    "Connection: Upgrade\r\n"
+                    f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+                ).encode()
+            )
+            await writer.drain()
+
+            header = await reader.readexactly(2)
+            length = header[1] & 0x7F
+            if length == 126:
+                length = struct.unpack("!H", await reader.readexactly(2))[0]
+            elif length == 127:
+                length = struct.unpack("!Q", await reader.readexactly(8))[0]
+            mask = await reader.readexactly(4)
+            payload = await reader.readexactly(length)
+            decoded = bytes(
+                byte ^ mask[index % 4] for index, byte in enumerate(payload)
+            )
+            echoed = b"echo:" + decoded
+            if len(echoed) < 126:
+                response_header = bytes((0x81, len(echoed)))
+            else:
+                response_header = bytes((0x81, 126)) + struct.pack(
+                    "!H", len(echoed)
+                )
+            writer.write(response_header + echoed)
+            await writer.drain()
+        except (asyncio.IncompleteReadError, KeyError):
+            pass
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        yield f"ws://127.0.0.1:{port}/echo"
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.fixture
@@ -542,16 +607,28 @@ async def test_concurrent_sessions_get_independent_contexts(fresh_manager, http_
     host = urlparse(http_server.url).hostname or "127.0.0.1"
     guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
 
-    # Session A navigates and sets a cookie via evaluate.
-    await browser_navigate(http_server.url, principal_id="p1", session_id="A", runtime_id="rA", network_guard=guard)
+    # First use is genuinely concurrent; lifecycle serialization must still
+    # create one independent context per key without corrupting manager state.
+    result_a, result_b = await asyncio.gather(
+        browser_navigate(
+            http_server.url, principal_id="p1", session_id="A",
+            runtime_id="rA", network_guard=guard,
+        ),
+        browser_navigate(
+            http_server.url, principal_id="p1", session_id="B",
+            runtime_id="rB", network_guard=guard,
+        ),
+    )
+    assert result_a["ok"] and result_b["ok"]
+
+    # Session A sets a cookie via evaluate.
     ev_a = await browser_evaluate(
         "document.cookie = 'marker=A'; document.cookie",
         principal_id="p1", session_id="A", runtime_id="rA", network_guard=guard,
     )
     assert ev_a["ok"]
 
-    # Session B navigates to the same URL — its cookie jar is empty.
-    await browser_navigate(http_server.url, principal_id="p1", session_id="B", runtime_id="rB", network_guard=guard)
+    # Session B's cookie jar is independent.
     ev_b = await browser_evaluate(
         "document.cookie",
         principal_id="p1", session_id="B", runtime_id="rB", network_guard=guard,
@@ -812,12 +889,9 @@ async def test_websocket_to_unlisted_domain_is_blocked(fresh_manager, http_serve
 
 
 async def test_websocket_to_allowlisted_domain_is_not_aborted_by_guard(
-    fresh_manager, http_server, tmp_path
+    fresh_manager, http_server, websocket_echo_server, tmp_path
 ):
-    """B2: a WebSocket to an allowlisted host is NOT aborted by the
-    route guard (it may still fail because the test HTTP server
-    doesn't speak WebSocket, but the failure must come from the server
-    / network, not from ``route_web_socket()`` aborting the upgrade).
+    """M1: an allowlisted WebSocket completes a real echo round-trip.
 
     The WS code is embedded in the HTML page for the same reason as
     the blocked-domain test — ``browser_evaluate``'s blocklist rejects
@@ -826,7 +900,6 @@ async def test_websocket_to_allowlisted_domain_is_not_aborted_by_guard(
     host = urlparse(http_server.url).hostname or "127.0.0.1"
     guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
 
-    ws_url = http_server.url.replace("http://", "ws://")
     (tmp_path / "index.html").write_text(
         f"""
         <html><body>
@@ -834,10 +907,15 @@ async def test_websocket_to_allowlisted_domain_is_not_aborted_by_guard(
           <script>
             window.__ws_ok_result = 'pending';
             try {{
-              const ws = new WebSocket('{ws_url}');
-              ws.onopen = () => {{ window.__ws_ok_result = 'opened'; }};
-              ws.onerror = () => {{ window.__ws_ok_result = 'error'; }};
-              ws.onclose = () => {{ window.__ws_ok_result = 'closed'; }};
+              const ws = new WebSocket('{websocket_echo_server}');
+              ws.onopen = () => {{ ws.send('ping'); }};
+              ws.onmessage = (event) => {{ window.__ws_ok_result = event.data; }};
+              ws.onerror = () => {{
+                if (window.__ws_ok_result === 'pending') window.__ws_ok_result = 'error';
+              }};
+              ws.onclose = () => {{
+                if (window.__ws_ok_result === 'pending') window.__ws_ok_result = 'closed';
+              }};
             }} catch (err) {{
               window.__ws_ok_result = 'exception: ' + err.message;
             }}
@@ -877,12 +955,6 @@ async def test_websocket_to_allowlisted_domain_is_not_aborted_by_guard(
         network_guard=guard,
     )
     assert ev["ok"], f"evaluate failed: {ev}"
-    # The connection should error, close, or timeout (server doesn't
-    # speak WS) — but it must NOT have been aborted by the route guard.
-    # The key assertion is that the evaluate succeeded and returned a
-    # result (the page didn't crash).  We don't assert the specific
-    # result value because the http.server's behavior on a WS upgrade
-    # attempt is implementation-dependent.
-    assert ev["result"] in ("error", "closed", "timeout", "opened", "exception: ..."), (
-        f"unexpected WS result to allowlisted host: {ev['result']!r}"
+    assert ev["result"] == "echo:ping", (
+        f"allowlisted WebSocket did not complete echo round-trip: {ev}"
     )

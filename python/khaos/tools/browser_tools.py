@@ -34,6 +34,7 @@ to substitute different bytes between validation and upload.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import logging
 import os
@@ -132,6 +133,11 @@ class BrowserManager:
         # "Browser not available" message.  Reset on every ``ensure_page``
         # call so a transient failure doesn't poison subsequent calls.
         self._last_ensure_error: str = ""
+        # M2: serialize process-wide Playwright/Browser/context-map mutation.
+        # Per-key locks additionally coalesce concurrent first use of one
+        # session so it cannot create duplicate BrowserContexts.
+        self._lifecycle_lock = asyncio.Lock()
+        self._context_locks: dict[str, asyncio.Lock] = {}
 
     @property
     def is_ready(self) -> bool:
@@ -154,6 +160,13 @@ class BrowserManager:
     async def launch(
         self, headless: bool = True, browser_type: str = "chromium"
     ) -> dict[str, Any]:
+        """Start the process browser under the singleton lifecycle lock."""
+        async with self._lifecycle_lock:
+            return await self._launch_locked(headless, browser_type)
+
+    async def _launch_locked(
+        self, headless: bool = True, browser_type: str = "chromium"
+    ) -> dict[str, Any]:
         """启动浏览器。
 
         Returns:
@@ -169,6 +182,16 @@ class BrowserManager:
                 ),
             }
         try:
+            if (
+                self._browser is not None
+                and self._headless == headless
+                and self._browser_type == browser_type
+            ):
+                return {
+                    "ok": True,
+                    "browser_type": browser_type,
+                    "headless": headless,
+                }
             self._headless = headless
             self._browser_type = browser_type
             if self._playwright is None:
@@ -244,7 +267,8 @@ class BrowserManager:
         what ``RuntimeResult._run_close`` now calls.
         """
         key = self._context_key(principal_id, session_id, runtime_id)
-        await self._close_one_context(key, force=False)
+        async with self._lifecycle_lock:
+            await self._close_one_context(key, force=False)
         return {"ok": True, "principal_id": principal_id or "default"}
 
     async def close_runtime(self, runtime_id: str) -> dict[str, Any]:
@@ -270,19 +294,19 @@ class BrowserManager:
             # any refcount (see ``ensure_page``: empty runtime_id records
             # an empty ``_runtime_owners`` set on context creation).
             return {"ok": True, "runtime_id": runtime_id or "default"}
-        for key in list(self._contexts.keys()):
-            entry = self._contexts.get(key)
-            if entry is None:
-                continue
-            owners = entry.get("_runtime_owners", set())
-            if runtime_id not in owners:
-                continue
-            owners.discard(runtime_id)
-            # Decrement refcount and close if it reaches zero.  We
-            # already removed ``runtime_id`` from the owner set above so
-            # a subsequent ``close_runtime`` for the same runtime is a
-            # no-op for this entry.
-            await self._close_one_context(key, force=False)
+        async with self._lifecycle_lock:
+            for key in list(self._contexts.keys()):
+                entry = self._contexts.get(key)
+                if entry is None:
+                    continue
+                owners = entry.get("_runtime_owners", set())
+                if runtime_id not in owners:
+                    continue
+                owners.discard(runtime_id)
+                # Decrement refcount and close if it reaches zero.  We
+                # already removed ``runtime_id`` from the owner set above so
+                # a subsequent close is a no-op for this entry.
+                await self._close_one_context(key, force=False)
         return {"ok": True, "runtime_id": runtime_id}
 
     @staticmethod
@@ -304,18 +328,20 @@ class BrowserManager:
 
     async def close(self) -> dict[str, Any]:
         """关闭浏览器和 Playwright runtime（幂等）。"""
-        try:
-            await self._close_all_contexts()
-            if self._browser:
-                await self._browser.close()
-            if self._playwright:
-                await self._playwright.stop()
-            self._browser = None
-            self._playwright = None
-            return {"ok": True}
-        except Exception as exc:  # noqa: BLE001 — surfaced as error dict
-            logger.error("Failed to close browser: %s", exc)
-            return {"ok": False, "error": str(exc)}
+        async with self._lifecycle_lock:
+            try:
+                await self._close_all_contexts()
+                if self._browser:
+                    await self._browser.close()
+                if self._playwright:
+                    await self._playwright.stop()
+                self._browser = None
+                self._playwright = None
+                self._context_locks.clear()
+                return {"ok": True}
+            except Exception as exc:  # noqa: BLE001 — surfaced as error dict
+                logger.error("Failed to close browser: %s", exc)
+                return {"ok": False, "error": str(exc)}
 
     async def ensure_page(
         self,
@@ -359,10 +385,27 @@ class BrowserManager:
         subsequent click / type / evaluate / upload from reaching a
         blocked domain).
         """
-        # H2: reset per-call failure reason so a transient failure on a
-        # previous call doesn't poison this one.
+        # Coalesce concurrent first-use for the same key, then hold the global
+        # lifecycle lock while consulting/mutating Browser and context state.
         self._last_ensure_error = ""
         key = self._context_key(principal_id, session_id, runtime_id)
+        key_lock = self._context_locks.setdefault(key, asyncio.Lock())
+        async with key_lock:
+            async with self._lifecycle_lock:
+                return await self._ensure_page_locked(
+                    key,
+                    runtime_id=runtime_id,
+                    network_guard=network_guard,
+                )
+
+    async def _ensure_page_locked(
+        self,
+        key: str,
+        *,
+        runtime_id: str,
+        network_guard: Any,
+    ) -> Optional[Page]:
+        """Create or reuse a page while ``_lifecycle_lock`` is held."""
         entry = self._contexts.get(key)
         if entry is not None and entry.get("page") is not None:
             # H1 (lifecycle): only bump refcount for a NEW runtime_id.
@@ -378,7 +421,7 @@ class BrowserManager:
             return entry["page"]
         # Need to create a new context for this session.
         if self._browser is None:
-            result = await self.launch()
+            result = await self._launch_locked()
             if not result.get("ok"):
                 return None
         if self._browser is None:
@@ -539,7 +582,7 @@ class BrowserManager:
         # NOTE: ``route_web_socket``'s handler signature is
         # ``(websocket_route)`` — NOT ``(route, request)`` like
         # ``context.route()``.  The ``WebSocketRoute`` object exposes
-        # ``.request`` (with ``.url``) and ``.abort()`` / ``.continue_()``.
+        # ``.url``, ``.close()`` and ``.connect_to_server()``.
         if not hasattr(context, "route_web_socket"):
             raise RuntimeError(
                 "Playwright build is too old to enforce the WebSocket "
@@ -574,7 +617,9 @@ class BrowserManager:
                             domain, result.reason,
                         )
                         return
-                await ws_route.continue_()
+                # WebSocketRoute is not an HTTP Route and has no continue_().
+                # Connecting to the real server enables forwarding.
+                ws_route.connect_to_server()
             except Exception as exc:  # noqa: BLE001 — never let the
                 # handler raise into Playwright.
                 logger.warning("B2 ws route guard error: %s", exc)
@@ -842,17 +887,17 @@ def _snapshot_mock() -> dict[str, Any]:
 
 
 async def browser_screenshot(
-    save_path: str = "", *, principal_id: str = "",
+    *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", network_guard: Any = None,
 ) -> dict[str, Any]:
-    """截图。``save_path`` 非空时存盘，否则返回 base64 编码。
+    """Capture a screenshot and return base64 without filesystem writes.
 
     H1: ``principal_id`` selects the per-principal ``BrowserContext``.
     H5: ``session_id`` + ``runtime_id`` extend the context key.
     B2: ``network_guard`` is installed on the context.
     """
     return await _manager._safe_execute(
-        real=_make_screenshot_real(save_path),
+        real=_make_screenshot_real(),
         mock=_screenshot_mock,
         principal_id=principal_id,
         session_id=session_id,
@@ -861,15 +906,9 @@ async def browser_screenshot(
     )
 
 
-def _make_screenshot_real(save_path: str):
-    """B1: factory that binds ``save_path`` into the real handler's closure."""
+def _make_screenshot_real():
+    """Build the in-memory screenshot handler."""
     async def _run(page: Page) -> dict[str, Any]:
-        if save_path:
-            await page.screenshot(path=save_path, full_page=False)
-            import os
-
-            size = os.path.getsize(save_path)
-            return {"ok": True, "path": save_path, "size_bytes": size}
         image_bytes = await page.screenshot(full_page=False)
         encoded = base64.b64encode(image_bytes).decode("ascii")
         return {"ok": True, "base64": encoded, "size_bytes": len(image_bytes)}
@@ -1119,6 +1158,20 @@ def _read_upload_bytes(
     """
     import os as _os
     import stat as _stat
+
+    # Windows' stdlib does not expose O_NOFOLLOW or an equivalent
+    # handle-relative no-reparse-point open.  Do not weaken the upload
+    # identity contract by silently following reparse points; the native
+    # backend remains explicitly unavailable until it has a real no-follow
+    # implementation and runner coverage.
+    if not hasattr(_os, "O_NOFOLLOW"):
+        return {
+            "ok": False,
+            "error": (
+                "secure no-follow file upload is unavailable on this platform"
+            ),
+            "file": file_path,
+        }
 
     # Reuse the fast validation path for the early containment / size
     # checks (so the error dicts match the test expectations).

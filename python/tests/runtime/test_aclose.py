@@ -237,9 +237,10 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "owns_office_authority",
         "principal_id",
         "session_id",
-        "runtime_id",
-        "audit_logger",
-    ]
+            "runtime_id",
+            "audit_logger",
+            "owns_audit_logger",
+        ]
 
 
 # ───────────────────────── H2: audit logger close ──────────────────────────
@@ -295,6 +296,27 @@ async def test_aclose_audit_logger_close_is_best_effort():
     assert result._close_failed is False
 
 
+async def test_aclose_does_not_close_borrowed_audit_logger():
+    """H3: a per-turn runtime cannot close the server's shared logger."""
+    audit = MagicMock()
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        audit_logger=audit,
+        owns_audit_logger=False,
+    )
+
+    await result.aclose()
+
+    audit.close.assert_not_called()
+
+
 # ───────────────────────── H3: orphan-cleanup registry ────────────────────
 
 
@@ -338,6 +360,39 @@ async def test_orphan_cleanup_registry_retries_failed_runtime():
     office.shutdown = AsyncMock()
     remaining = await cleanup_orphan_runtimes()
     assert remaining == 0
+    assert result.quarantined is False
+
+
+async def test_production_close_registers_failed_runtime_before_raising():
+    """H4: the production close helper retains a persistently failed owner."""
+    from khaos.exceptions import RuntimeCloseError
+    from khaos.runtime.factory import (
+        _orphan_runtimes,
+        close_runtime_or_register,
+    )
+
+    office = MagicMock()
+    office.shutdown = AsyncMock(side_effect=RuntimeError("persistent failure"))
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        office_authority=office,
+    )
+    try:
+        with pytest.raises(RuntimeCloseError):
+            await close_runtime_or_register(result)
+        assert any(item is result for item in _orphan_runtimes)
+        assert result.quarantined is True
+    finally:
+        office.shutdown = AsyncMock()
+        from khaos.runtime.factory import cleanup_orphan_runtimes
+        await cleanup_orphan_runtimes()
 
 
 # ───────────────────────── H4: concurrent aclose lock ──────────────────────
@@ -374,6 +429,4 @@ async def test_concurrent_aclose_callers_do_not_create_multiple_close_tasks():
     # Each retry attempt called office.shutdown ONCE (3 attempts total),
     # NOT 6 (which would happen if both callers created separate tasks).
     assert office.shutdown.await_count == 3
-
-
 
