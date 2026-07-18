@@ -252,11 +252,7 @@ def _read_yaml_file(path: Path) -> dict[str, Any]:
 
 
 def _write_yaml_file(path: Path, config: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    parent_fd = os.open(
-        path.parent,
-        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
-    )
+    parent_fd = _open_config_parent(path)
     temporary = f".khaos-config-{secrets.token_hex(16)}"
     descriptor = -1
     try:
@@ -297,6 +293,64 @@ def _write_yaml_file(path: Path, config: dict[str, Any]) -> None:
         except FileNotFoundError:
             pass
         os.close(parent_fd)
+
+
+def _open_config_parent(path: Path) -> int:
+    """Open the config parent with an owner-only, no-follow authority.
+
+    The normal user config lives directly under ``~/.khaos``.  Creating that
+    directory with ``Path.mkdir`` inherited umask (commonly producing 0755),
+    which later made the file-audit authority reject the same directory and
+    silently fall back to database-only audit.  For the user path, create/open
+    ``.khaos`` relative to a fixed home dirfd, verify ownership/type, and
+    safely tighten an existing owner-held directory to 0700 via ``fchmod``.
+
+    Explicit non-user paths remain supported for tests and deployments, but
+    their final parent is still created owner-only and opened no-follow.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+    target = path.expanduser()
+    canonical_user = user_config_path()
+    if target == canonical_user:
+        if (
+            os.open not in os.supports_dir_fd
+            or os.mkdir not in os.supports_dir_fd
+            or not hasattr(os, "O_NOFOLLOW")
+        ):
+            raise ConfigError(
+                "secure user config directory creation requires dirfd/no-follow support"
+            )
+        home = canonical_user.parent.parent
+        home_fd = os.open(home, flags)
+        try:
+            try:
+                os.mkdir(".khaos", 0o700, dir_fd=home_fd)
+            except FileExistsError:
+                pass
+            parent_fd = os.open(".khaos", flags, dir_fd=home_fd)
+        finally:
+            os.close(home_fd)
+        try:
+            info = os.fstat(parent_fd)
+            if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+                raise ConfigError("user config directory must be owner-held")
+            if stat.S_IMODE(info.st_mode) != 0o700:
+                os.fchmod(parent_fd, 0o700)
+                tightened = os.fstat(parent_fd)
+                if stat.S_IMODE(tightened.st_mode) != 0o700:
+                    raise ConfigError("failed to secure user config directory")
+            return parent_fd
+        except BaseException:
+            os.close(parent_fd)
+            raise
+
+    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    parent_fd = os.open(target.parent, flags)
+    info = os.fstat(parent_fd)
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+        os.close(parent_fd)
+        raise ConfigError("config directory must be owner-held")
+    return parent_fd
 
 
 def _is_configured_secret(value: str) -> bool:

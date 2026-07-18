@@ -352,8 +352,9 @@ class RuntimeResult:
             # H1: release EVERY BrowserContext this runtime acquired so its
             # cookies / DOM / page state cannot leak into a subsequent run by
             # a different runtime sharing the same process-wide
-            # BrowserManager.  Best-effort — a failure here must not block
-            # the rest of cleanup.
+            # BrowserManager.  A close failure is safety-critical: the
+            # manager retains the live Context so this runtime must enter the
+            # same retry/quarantine path as other owned resources.
             #
             # H1 (lifecycle): we use ``close_runtime(runtime_id)`` (not
             # ``close_context(principal_id, session_id, runtime_id)``)
@@ -371,9 +372,7 @@ class RuntimeResult:
                     from khaos.tools.browser_tools import _manager as _browser_manager
                     await _browser_manager.close_runtime(self.runtime_id)
                 except Exception:
-                    # Browser context close is best-effort — do NOT mark the
-                    # runtime as failed-close just because the browser cleanup
-                    # raised (Playwright may not even be installed).
+                    failed = True
                     logger.debug(
                         "browser runtime close failed for runtime %s",
                         self.runtime_id,
@@ -705,18 +704,45 @@ async def close_runtime_or_register(runtime: RuntimeResult) -> None:
     directly.  A failed close is registered before the exception escapes, so
     request teardown cannot discard the only references to live resources.
     """
-    try:
-        await runtime.aclose()
-    except RuntimeCloseError:
+    cancellation_requested = False
+    while True:
+        try:
+            await runtime.aclose()
+            break
+        except asyncio.CancelledError:
+            # ``RuntimeResult.aclose`` shields its inner close task, but a
+            # cancelled owner used to leave immediately.  If that inner task
+            # then failed, nobody completed the retry loop or retained the
+            # runtime.  Temporarily consume this task's cancellation, finish
+            # cleanup (or quarantine), then restore cancellation below.
+            cancellation_requested = True
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
+            continue
+        except RuntimeCloseError:
+            register_orphan_runtime(runtime)
+            logger.error(
+                "runtime cleanup failed; quarantined for bounded shutdown retry: "
+                "principal=%s session=%s runtime=%s",
+                runtime.principal_id,
+                runtime.session_id,
+                runtime.runtime_id,
+            )
+            if cancellation_requested:
+                raise asyncio.CancelledError
+            raise
+    if not runtime._closed:
         register_orphan_runtime(runtime)
         logger.error(
-            "runtime cleanup failed; quarantined for bounded shutdown retry: "
+            "runtime cleanup returned without terminal state; quarantined: "
             "principal=%s session=%s runtime=%s",
             runtime.principal_id,
             runtime.session_id,
             runtime.runtime_id,
         )
-        raise
+    if cancellation_requested:
+        raise asyncio.CancelledError
 
 
 async def drain_orphan_runtimes(

@@ -70,6 +70,29 @@ async def test_aclose_invokes_execution_service_shutdown():
     execution.shutdown.assert_awaited_once()
 
 
+async def test_browser_context_close_failure_marks_runtime_failed(monkeypatch):
+    """H4: Browser ownership failure participates in quarantine retries."""
+    from khaos.exceptions import RuntimeCloseError
+    from khaos.tools import browser_tools
+
+    manager = MagicMock()
+    manager.close_runtime = AsyncMock(side_effect=RuntimeError("browser live"))
+    monkeypatch.setattr(browser_tools, "_manager", manager)
+    result = RuntimeResult(
+        loop=MagicMock(), mode_manager=MagicMock(), task_manager=None,
+        skill_generator=None, tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(), new_verify_fix_loop=None,
+        runtime_id="runtime-browser",
+    )
+
+    with pytest.raises(RuntimeCloseError):
+        await result.aclose()
+    assert result._close_failed is True
+    assert result._closed is False
+    assert manager.close_runtime.await_count == 3
+
+
 async def test_aclose_is_idempotent():
     """B1: second ``aclose()`` must short-circuit via ``_closed``.
 
@@ -395,6 +418,47 @@ async def test_production_close_registers_failed_runtime_before_raising():
         await cleanup_orphan_runtimes()
 
 
+async def test_production_close_delays_cancellation_until_terminal_or_quarantine():
+    """H2: owner cancellation cannot escape before cleanup is retained."""
+    import asyncio
+    from khaos.runtime.factory import (
+        _orphan_runtimes,
+        cleanup_orphan_runtimes,
+        close_runtime_or_register,
+    )
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def failing_shutdown():
+        started.set()
+        await release.wait()
+        raise RuntimeError("persistent close failure")
+
+    office = MagicMock()
+    office.shutdown = AsyncMock(side_effect=failing_shutdown)
+    result = RuntimeResult(
+        loop=MagicMock(), mode_manager=MagicMock(), task_manager=None,
+        skill_generator=None, tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(), new_verify_fix_loop=None,
+        office_authority=office,
+    )
+    owner = asyncio.create_task(close_runtime_or_register(result))
+    await started.wait()
+    owner.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await owner
+    assert result._closed or result.quarantined
+    assert result.quarantined
+    assert any(runtime is result for runtime in _orphan_runtimes)
+
+    office.shutdown = AsyncMock()
+    await cleanup_orphan_runtimes()
+
+
 # ───────────────────────── H4: concurrent aclose lock ──────────────────────
 
 
@@ -429,4 +493,3 @@ async def test_concurrent_aclose_callers_do_not_create_multiple_close_tasks():
     # Each retry attempt called office.shutdown ONCE (3 attempts total),
     # NOT 6 (which would happen if both callers created separate tasks).
     assert office.shutdown.await_count == 3
-

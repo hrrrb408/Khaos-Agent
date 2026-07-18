@@ -40,6 +40,7 @@ from khaos.channels import (
     WebhookReplayGuard,
 )
 from khaos.db import Database
+from khaos.exceptions import ServiceShutdownError
 from khaos.memory import (
     Memory,
     MemoryBudget,
@@ -307,32 +308,111 @@ class AgentService:
             if self._effective_policy.audit_enabled
             else None
         )
+        self._accepting_work = True
+        self._active_chat_tasks: set[asyncio.Task] = set()
+        self._active_runtimes: dict[int, object] = {}
+        self._office_shutdown_task: asyncio.Task | None = None
+        self.shutdown_failed = False
 
     async def start(self) -> None:
         """Start process-scoped background services."""
         await self.task_manager.load()
         await self.cron_engine.start()
 
+    async def stop_producers(self) -> None:
+        """Reject new turns and stop background producers before teardown."""
+        self._accepting_work = False
+        await self.cron_engine.stop()
+
     async def shutdown(self) -> None:
         """Stop process-scoped background services."""
-        # Stop producers first, then give quarantined per-turn runtimes a
-        # bounded retry window while shared authorities are still alive.
-        await self.cron_engine.stop()
+        # Stop producers, then cancel/wait every active turn while shared
+        # authorities and the database are still available.
+        await self.stop_producers()
+        current = asyncio.current_task()
+        active_tasks = [
+            task for task in self._active_chat_tasks
+            if task is not current and not task.done()
+        ]
+        for task in active_tasks:
+            task.cancel()
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
+
+        # Defensive ownership pass: a handler cancellation must normally run
+        # chat's finally block, but retain/close anything still registered.
+        from khaos.runtime import close_runtime_or_register
+        for runtime in list(self._active_runtimes.values()):
+            try:
+                await close_runtime_or_register(runtime)
+            except Exception:
+                # close_runtime_or_register already quarantines terminal
+                # failures.  Continue so drain can retry all retained owners.
+                logger.error("active runtime teardown failed", exc_info=True)
+
         from khaos.runtime import drain_orphan_runtimes
         remaining = await drain_orphan_runtimes(timeout_seconds=5.0)
         if remaining:
             logger.error(
                 "server shutdown retaining %d quarantined runtime(s)", remaining
             )
+            self.shutdown_failed = True
+            raise ServiceShutdownError(
+                f"{remaining} runtime(s) did not reach a terminal state"
+            )
         # Fence every in-flight Office mutation after runtimes have settled.
-        try:
-            await self._office_authority.shutdown()
-        except Exception:
-            logger.debug("office authority shutdown failed", exc_info=True)
+        await self._shutdown_office_authority()
+        # BrowserManager is process-scoped.  Its close contract retains
+        # failed Context owners and returns an observable error; do not close
+        # Audit/DB state if the browser generation is still live.
+        from khaos.tools.browser_tools import _manager as browser_manager
+        browser_result = await browser_manager.close()
+        if not browser_result.get("ok"):
+            self.shutdown_failed = True
+            raise ServiceShutdownError(
+                f"shared BrowserManager shutdown failed: "
+                f"{browser_result.get('error', 'unknown error')}"
+            )
         # The shared AuditLogger is process-owned and is closed exactly once,
         # after all runtime/authority shutdown events had a chance to log.
         if self._audit_logger is not None:
             self._audit_logger.close()
+        self.shutdown_failed = False
+
+    async def _shutdown_office_authority(
+        self, *, attempts: int = 3, timeout_seconds: float = 5.0,
+    ) -> None:
+        """Close the shared mutation authority with bounded observable retry."""
+        last_error: BaseException | None = None
+        for attempt in range(1, attempts + 1):
+            if self._office_shutdown_task is None:
+                self._office_shutdown_task = asyncio.create_task(
+                    self._office_authority.shutdown()
+                )
+            try:
+                await asyncio.wait_for(
+                    asyncio.shield(self._office_shutdown_task),
+                    timeout=timeout_seconds,
+                )
+                self._office_shutdown_task = None
+                return
+            except asyncio.TimeoutError as exc:
+                # The shielded task still owns the mutation fence.  Do not
+                # start a concurrent retry or tear down audit/database state.
+                last_error = exc
+                break
+            except Exception as exc:
+                last_error = exc
+                self._office_shutdown_task = None
+                logger.warning(
+                    "office authority shutdown attempt %d/%d failed",
+                    attempt, attempts, exc_info=True,
+                )
+        self.shutdown_failed = True
+        logger.error("shared Office authority did not reach terminal state")
+        raise ServiceShutdownError(
+            "shared Office mutation authority shutdown failed"
+        ) from last_error
 
     async def _execute_scheduled_prompt(self, task_id: str, prompt: str) -> str:
         """Run a scheduled prompt through the normal office-mode agent path."""
@@ -353,18 +433,29 @@ class AgentService:
         OfficeMutationAuthority is borrowed (not owned), so ``aclose`` does
         NOT shut it down — ``AgentService.shutdown`` does.
         """
+        if not self._accepting_work:
+            raise ServiceShutdownError("AgentService is shutting down")
         session_id = request.session_id or str(uuid.uuid4())
         runtime = await self._build_runtime(
             session_id,
             request.mode,
             request.principal_id or f"local-uid:{os.getuid()}",
         )
+        owner_task = asyncio.current_task()
+        if owner_task is not None:
+            self._active_chat_tasks.add(owner_task)
+        self._active_runtimes[id(runtime)] = runtime
         try:
             async for message in runtime.loop.run(request.message, session_id):
                 yield _message_to_event(message)
         finally:
             from khaos.runtime import close_runtime_or_register
-            await close_runtime_or_register(runtime)
+            try:
+                await close_runtime_or_register(runtime)
+            finally:
+                self._active_runtimes.pop(id(runtime), None)
+                if owner_task is not None:
+                    self._active_chat_tasks.discard(owner_task)
 
     async def switch_mode(self, session_id: str, target_mode: str) -> dict:
         mode_manager = ModeManager(self.db, project_root=self.project_root)
@@ -918,21 +1009,62 @@ async def serve_json_lines(
             await writer.drain()
         finally:
             writer.close()
-            await writer.wait_closed()
+            try:
+                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+            except (asyncio.TimeoutError, ConnectionError, OSError):
+                pass
+
+    # ``asyncio.start_unix_server`` otherwise creates handler tasks without
+    # giving the application an ownership registry.  Keep every connection
+    # task so shutdown can cancel and await it before shared authorities and
+    # the database are dismantled.
+    handler_tasks: set[asyncio.Task] = set()
+
+    def accept_connection(
+        reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+    ) -> None:
+        task = asyncio.create_task(handle(reader, writer))
+        handler_tasks.add(task)
+        task.add_done_callback(handler_tasks.discard)
 
     try:
         server = await asyncio.start_unix_server(
-            handle, path=str(uds_path), limit=RPC_MAX_REQUEST_BYTES,
+            accept_connection, path=str(uds_path), limit=RPC_MAX_REQUEST_BYTES,
         )
         os.chmod(uds_path, 0o600)
         socket_stat = uds_path.lstat()
         if socket_stat.st_uid != os.getuid() or not stat.S_ISSOCK(socket_stat.st_mode):
             raise PermissionError("RPC socket inode ownership/type validation failed")
-        async with server:
-            await server.serve_forever()
+        # Wait until the owner cancels this service.  Do not use
+        # ``Server.serve_forever()`` here: on Python 3.13 its cancellation
+        # path waits for active client connections before returning, while
+        # Khaos must cancel those handlers itself before shared-authority
+        # teardown.  That ordering forms a shutdown deadlock.
+        await asyncio.Future()
     finally:
+        if "server" in locals():
+            server.close()
         if uds_path.exists() and stat.S_ISSOCK(uds_path.lstat().st_mode):
             uds_path.unlink()
+        # 1. Server context has stopped accepting new connections.
+        # 2. Stop cron/webhook producers before cancelling active handlers.
+        # 3. Await handler cancellation; Chat finally blocks close/quarantine
+        #    their RuntimeResult while shared authorities are still alive.
+        await agent.stop_producers()
+        current = asyncio.current_task()
+        active_handlers = [
+            task for task in handler_tasks
+            if task is not current and not task.done()
+        ]
+        for task in active_handlers:
+            task.cancel()
+        if active_handlers:
+            await asyncio.gather(*active_handlers, return_exceptions=True)
+        if "server" in locals():
+            await server.wait_closed()
+        # Only after every handler/runtime is terminal may the service close
+        # Office/Audit ownership.  A shutdown failure intentionally prevents
+        # premature database close and remains observable to the caller.
         await agent.shutdown()
         await db.close()
 

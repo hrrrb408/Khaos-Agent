@@ -256,6 +256,62 @@ async def test_browser_manager_concurrent_first_use_creates_one_context(monkeypa
     assert len(manager._contexts) == 1
 
 
+async def test_context_close_failure_retains_owner_for_retry():
+    """H4: a failed ctx.close cannot delete the lifecycle owner."""
+    class FailingContext:
+        async def close(self):
+            raise RuntimeError("context still running")
+
+    manager = BrowserManager()
+    key = manager._context_key("p", "s", "r")
+    manager._contexts[key] = {
+        "context": FailingContext(), "page": object(), "refcount": 1,
+        "_runtime_owners": {"r"},
+    }
+
+    with pytest.raises(RuntimeError, match="still running"):
+        await manager.close_runtime("r")
+    assert key in manager._contexts
+    assert "r" in manager._contexts[key]["_runtime_owners"]
+
+
+async def test_repeated_context_close_failure_forces_browser_generation_closed():
+    """H4: the third Context failure may terminate the owning Browser."""
+    class FailingContext:
+        async def close(self):
+            raise RuntimeError("context still running")
+
+    class Browser:
+        def __init__(self):
+            self.closed = 0
+
+        async def close(self):
+            self.closed += 1
+
+    manager = BrowserManager()
+    browser = Browser()
+    manager._browser = browser
+    key = manager._context_key("p", "s", "r")
+    manager._contexts[key] = {
+        "context": FailingContext(), "page": object(), "refcount": 1,
+        "_runtime_owners": {"r"},
+    }
+
+    for _ in range(2):
+        with pytest.raises(RuntimeError, match="still running"):
+            await manager.close_runtime("r")
+    result = await manager.close_runtime("r")
+    assert result["forced_browser_close"] is True
+    assert browser.closed == 1
+    assert not manager._contexts
+
+
+async def test_context_lifecycle_has_no_unbounded_per_key_lock_table():
+    """M2: completed Context keys must not accumulate lock objects."""
+    manager = BrowserManager()
+    assert not hasattr(manager, "_context_locks")
+
+
 async def test_browser_manager_concurrent_launch_starts_one_browser(monkeypatch):
     """M2: the lifecycle lock turns concurrent launch into one launch task."""
     monkeypatch.setattr(browser_tools, "_HAS_PLAYWRIGHT", True)
@@ -292,6 +348,25 @@ async def test_browser_manager_concurrent_launch_starts_one_browser(monkeypatch)
 
     assert first["ok"] and second["ok"]
     assert fake_playwright.chromium.calls == 1
+
+
+@pytest.mark.skipif(not hasattr(os, "O_NOFOLLOW"), reason="requires POSIX no-follow")
+def test_upload_dirfd_chain_rejects_nested_parent_symlink(tmp_path):
+    """M1: every parent below the fixed Workspace root is no-follow."""
+    workspace = tmp_path / "workspace"
+    outside = tmp_path / "outside"
+    workspace.mkdir()
+    outside.mkdir()
+    (outside / "secret.txt").write_text("host-secret", encoding="utf-8")
+    (workspace / "bundle").symlink_to(outside, target_is_directory=True)
+
+    result = browser_tools._read_upload_bytes(
+        str(workspace / "bundle" / "secret.txt"), str(workspace)
+    )
+
+    assert isinstance(result, dict)
+    assert result["ok"] is False
+    assert "secure workspace-relative open failed" in result["error"]
 
 
 # ---------------------------------------------------------------------------

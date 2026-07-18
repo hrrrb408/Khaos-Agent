@@ -1,3 +1,4 @@
+import asyncio
 import subprocess
 import os
 import hashlib
@@ -319,6 +320,169 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
     assert (Path(target_path) / target).read_text(encoding="utf-8") == "hello"
     assert not (project / target).exists()
     await db.close()
+
+
+async def test_agent_service_shutdown_waits_for_active_chat_runtime(
+    tmp_path, monkeypatch
+):
+    """H3: shared authorities cannot close ahead of an active Chat runtime."""
+    from unittest.mock import AsyncMock, MagicMock
+    from khaos.runtime.factory import RuntimeResult
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    service.cron_engine.stop = AsyncMock()
+    started = asyncio.Event()
+    never = asyncio.Event()
+
+    class BlockingLoop:
+        async def run(self, message, session_id):
+            del message, session_id
+            started.set()
+            await never.wait()
+            if False:
+                yield None
+
+    memory = MagicMock(aclose=AsyncMock())
+    runtime = RuntimeResult(
+        loop=BlockingLoop(), mode_manager=MagicMock(), task_manager=None,
+        skill_generator=None, tool_scheduler=MagicMock(),
+        memory_manager=memory, skill_manager=MagicMock(),
+        new_verify_fix_loop=None, owns_office_authority=False,
+    )
+    monkeypatch.setattr(
+        service, "_build_runtime", AsyncMock(return_value=runtime)
+    )
+
+    async def consume():
+        async for _ in service.chat(ChatRequest("active", "wait", "office")):
+            pass
+
+    chat_task = asyncio.create_task(consume())
+    await asyncio.wait_for(started.wait(), timeout=5.0)
+    await service.shutdown()
+
+    assert chat_task.done()
+    assert runtime._closed is True
+    memory.aclose.assert_awaited()
+    assert not service._active_runtimes
+    await db.close()
+
+
+async def test_agent_service_shutdown_keeps_audit_open_when_office_fails(
+    tmp_path,
+):
+    """H5: an unterminated shared mutation authority blocks later teardown."""
+    from unittest.mock import AsyncMock, MagicMock
+    from khaos.exceptions import ServiceShutdownError
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    service.cron_engine.stop = AsyncMock()
+    service._office_authority = MagicMock()
+    service._office_authority.shutdown = AsyncMock(
+        side_effect=RuntimeError("worker still active")
+    )
+    service._audit_logger = MagicMock()
+
+    with pytest.raises(ServiceShutdownError):
+        await service.shutdown()
+    assert service.shutdown_failed is True
+    assert service._office_authority.shutdown.await_count == 3
+    service._audit_logger.close.assert_not_called()
+    await db.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix server lifecycle requires UDS")
+async def test_json_line_server_shutdown_closes_active_chat_before_database(
+    tmp_path, monkeypatch
+):
+    """H3: cancelling the real Server waits for Chat Runtime finalization."""
+    from unittest.mock import AsyncMock, MagicMock
+    from khaos.runtime.factory import RuntimeResult
+
+    started = asyncio.Event()
+    never = asyncio.Event()
+    database_closed = asyncio.Event()
+    runtimes = []
+    original_close = Database.close
+
+    async def tracked_close(database):
+        await original_close(database)
+        database_closed.set()
+
+    monkeypatch.setattr(Database, "close", tracked_close)
+
+    class BlockingLoop:
+        async def run(self, message, session_id):
+            del message, session_id
+            started.set()
+            await never.wait()
+            if False:
+                yield None
+
+    async def fake_build(self, *args, **kwargs):
+        del self, args, kwargs
+        runtime = RuntimeResult(
+            loop=BlockingLoop(), mode_manager=MagicMock(), task_manager=None,
+            skill_generator=None, tool_scheduler=MagicMock(),
+            memory_manager=MagicMock(aclose=AsyncMock()),
+            skill_manager=MagicMock(), new_verify_fix_loop=None,
+            owns_office_authority=False,
+        )
+        runtimes.append(runtime)
+        return runtime
+
+    monkeypatch.setattr(AgentService, "_build_runtime", fake_build)
+    socket_parent = Path("/tmp") / f"kshutdown-{uuid.uuid4().hex[:10]}"
+    socket_parent.mkdir(mode=0o700)
+    socket_path = socket_parent / "agent.sock"
+    server_task = asyncio.create_task(
+        serve_json_lines(
+            str(socket_path), str(tmp_path / "server.db"),
+            project_root=tmp_path, gateway_capability="c" * 48,
+        )
+    )
+    for _ in range(200):
+        if socket_path.exists() or server_task.done():
+            break
+        await asyncio.sleep(0.01)
+    if server_task.done():
+        try:
+            await server_task
+        except (PermissionError, OSError) as exc:
+            socket_parent.rmdir()
+            pytest.skip(f"sandbox does not allow lifecycle UDS: {exc}")
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+    except (PermissionError, OSError) as exc:
+        server_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await server_task
+        pytest.skip(f"sandbox does not allow lifecycle UDS: {exc}")
+    request = _signed_rpc_request(
+        "AgentService.Chat",
+        {"session_id": "active", "message": "wait", "mode": "office"},
+    )
+    writer.write((json.dumps(request) + "\n").encode("utf-8"))
+    await writer.drain()
+    await asyncio.wait_for(started.wait(), timeout=5.0)
+    server_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(server_task, timeout=10.0)
+    writer.close()
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+    except (asyncio.TimeoutError, ConnectionError, OSError):
+        pass
+    assert runtimes and all(runtime._closed for runtime in runtimes)
+    assert database_closed.is_set()
+    assert not socket_path.exists()
+    socket_parent.rmdir()
 
 
 async def test_memory_service_crud_search(tmp_path):

@@ -71,6 +71,7 @@ def test_set_user_config_value(monkeypatch, tmp_path):
 
     assert data["models"]["default_model"] == "test-model"
     assert target.stat().st_mode & 0o777 == 0o600
+    assert target.parent.stat().st_mode & 0o777 == 0o700
 
 
 def test_config_writer_rejects_symlink_and_hardlink_targets(monkeypatch, tmp_path):
