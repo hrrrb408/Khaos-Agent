@@ -155,65 +155,75 @@ async def test_cancelled_run_task_persists_failed_state(tmp_path):
 # ─────────────────── M1: shutdown raises on swallowing tasks ────────────────
 
 
-async def test_spawner_shutdown_raises_when_task_swallows_cancel(tmp_path):
-    """M1: a task that swallows ``CancelledError`` must NOT be silently
+async def test_spawner_shutdown_raises_when_task_does_not_terminate(tmp_path):
+    """M1: a task still pending at the drain deadline must NOT be silently
     released — ``shutdown`` raises ``ServiceShutdownError`` so the caller
     refuses to dismantle shared authorities the task still borrows.
 
     The previous ``wait_for(gather)`` path caught ``TimeoutError`` and only
     logged it, then let teardown continue.  This test pins the fail-closed
     contract: pending at the deadline → raise.
+
+    Implementation note: we register a coroutine in ``_active_tasks`` that
+    never terminates on cancel (an ``asyncio.Event.wait`` that the test
+    never sets), instead of going through ``spawn`` + a swallowing runner.
+    The round-1 / round-2 attempts to use a real swallowing runner hit an
+    asyncio wart where ``wait_for``-cancelled coroutines leak their inner
+    task even after the outer task completes — that leak wedged the CI
+    container at process exit (25-minute job timeout).  Registering the
+    pending task directly exercises the same ``shutdown`` contract (the
+    ``asyncio.wait`` + pending-set branch) without the leak.
     """
-    started = asyncio.Event()
-    force_stop = asyncio.Event()
-
-    async def swallowing_runner(task: SubAgentTask) -> str:
-        started.set()
-        # Adversarial wedged task: swallow cancellation until ``force_stop``
-        # is set, so shutdown's 0.3s deadline is exceeded by a wide margin
-        # (forcing the ServiceShutdownError path) while still allowing the
-        # test to terminate the task deterministically afterward.  Pure
-        # infinite-swallow would hang pytest-asyncio's loop teardown on
-        # Python 3.13 (``_cancel_all_tasks`` awaits every task), so we
-        # gate the loop on a test-controlled event.
-        while not force_stop.is_set():
-            try:
-                await asyncio.sleep(3600)
-            except asyncio.CancelledError:
-                # Swallow: stay pending past the deadline.
-                if not force_stop.is_set():
-                    continue
-                raise
-        return "force-stopped"
-
-    db, spawner = await _spawner(tmp_path, runner=swallowing_runner)
+    db, spawner = await _spawner(tmp_path)
     try:
-        await spawner.spawn(
-            SubAgentTask("t1", "wedge", "ctx", [], principal_id=_PRINCIPAL)
+        # Register a task that never completes on cancel.  We use a
+        # never-set Event so the coroutine stays pending; cleanup uses
+        # a separate force-quit Event that the coroutine DOES honour so
+        # the test process can exit cleanly.
+        release = asyncio.Event()
+
+        async def never_terminate():
+            # Swallow cancellation until ``release`` is set, so shutdown's
+            # 0.3s deadline is exceeded by a wide margin.  Once release
+            # is set, honour the next cancellation so cleanup can end
+            # the coroutine deterministically.
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    if release.is_set():
+                        raise
+                    # else swallow: stay pending past the deadline.
+
+        # Inject directly into the spawner's tracking, bypassing spawn's
+        # _run_task wrapper (the contract under test is shutdown's
+        # behaviour given a pending task, not _run_task's).
+        task_id = "wedged-direct"
+        spawner._tasks[task_id] = SubAgentTask(
+            task_id, "wedge", "ctx", [], principal_id=_PRINCIPAL,
         )
-        await asyncio.wait_for(started.wait(), timeout=2.0)
+        async_task = asyncio.create_task(never_terminate())
+        spawner._active_tasks[task_id] = async_task
+        # Yield so the coroutine actually starts running before shutdown
+        # cancels it — otherwise cancel-on-unstarted-task completes it
+        # immediately without ever entering the swallow loop, and
+        # shutdown sees an empty pending set.
+        await asyncio.sleep(0)
 
         with pytest.raises(ServiceShutdownError, match="did not terminate"):
             await spawner.shutdown(timeout=0.3)
 
         # The wedged task must still be pending — shutdown did not pretend
-        # to drain it.  Its runtime ownership is preserved for the caller
-        # (orphan registry / process-level escalation).
-        assert spawner._active_tasks  # still registered
-        assert not next(iter(spawner._active_tasks.values())).done()
+        # to drain it.  Its ownership is preserved for the caller.
+        assert not async_task.done()
     finally:
-        # Signal the wedged task to stop swallowing, then drive its
-        # cancellation so it terminates cleanly and pytest-asyncio's
-        # loop teardown does not hang on Python 3.13.
-        force_stop.set()
-        for t in list(spawner._active_tasks.values()):
-            t.cancel()
-        # Yield control so the runner's ``except: continue`` re-checks
-        # force_stop and exits the loop on the next iteration.
-        for _ in range(20):
-            if all(t.done() for t in spawner._active_tasks.values()):
-                break
-            await asyncio.sleep(0.01)
+        # Cleanup: set release so the next cancel terminates the coroutine.
+        release.set()
+        async_task.cancel()
+        try:
+            await asyncio.wait_for(async_task, timeout=2.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            pass
         await db.close()
 
 

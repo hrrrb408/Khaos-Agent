@@ -29,7 +29,6 @@ import pytest
 from khaos.agent.core import AgentConfig
 from khaos.db import Database
 from khaos.modes import ModeManager
-from khaos.routing.router import create_default_router
 from khaos.subagents.runner import SubAgentRunner
 from khaos.subagents.spawner import SubAgentConfig, SubAgentSpawner, SubAgentTask
 
@@ -46,15 +45,35 @@ async def _build_runner(
     message so ``AgentLoop.run`` terminates after one turn without external
     API calls.  The runtime factory is the production
     ``khaos.runtime.build_runtime`` — no mocking of the lifecycle path.
+
+    Note: we deliberately avoid ``create_default_router`` / loading any
+    real ``config.yaml`` here — the production repo's config references
+    provider API keys via ``${ENV_VAR}``, and CI does not have those set.
+    The router stub below satisfies the ``ModelRouter`` contract without
+    any I/O.
     """
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
     mode_manager = ModeManager(db, project_root=tmp_path)
     await mode_manager.load()
-    router = create_default_router(honor_no_config=False)
+
+    class _StubRouter:
+        """Minimal ModelRouter stub: emits one assistant message and stops.
+
+        ``AgentLoop.run`` calls ``router.complete`` once per turn; returning
+        a message with no ``tool_calls`` ends the loop after one turn,
+        which is all this regression needs to exercise the real
+        ``SubAgentRunner.run`` finally-block path.
+        """
+
+        async def complete(self, messages, **kwargs):  # noqa: ANN001
+            del kwargs
+            from khaos.agent.core import Message
+            return [Message(role="assistant", content="stub-done")]
+
     runner = SubAgentRunner(
-        router=router,
+        router=_StubRouter(),
         db=db,
         mode_manager=mode_manager,
         tool_scheduler=None,
