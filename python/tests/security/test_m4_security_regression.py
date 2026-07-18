@@ -466,9 +466,17 @@ async def test_aclose_component_failure_leaves_closed_false_for_retry():
     and leave ``_closed=False`` so the caller can observe the failure
     and retry (each component's shutdown is expected to be idempotent).
 
-    Previously the failure was swallowed and ``_closed`` was set anyway,
-    so the caller had no way to know cleanup was incomplete.
+    H4: ``aclose`` now retries 3 times and then raises
+    ``RuntimeCloseError`` so the production caller is forced to observe
+    the failure.  Previously the failure was swallowed silently and the
+    caller had no way to know cleanup was incomplete.
+
+    After the exception, the runtime state must still allow a retry:
+    ``_close_failed`` is True, ``_closed`` is False, and
+    ``_close_task`` is None.
     """
+    from khaos.exceptions import RuntimeCloseError
+
     office = MagicMock()
     office.shutdown = AsyncMock(side_effect=RuntimeError("office boom"))
     result = RuntimeResult(
@@ -483,7 +491,9 @@ async def test_aclose_component_failure_leaves_closed_false_for_retry():
         office_authority=office,
         owns_office_authority=True,
     )
-    await result.aclose()
+    # H4: aclose raises after exhausting retries.
+    with pytest.raises(RuntimeCloseError):
+        await result.aclose()
     assert result._close_failed is True
     assert result._closed is False
     # A retry must be possible: _close_task was reset.
@@ -532,7 +542,7 @@ async def test_aclose_releases_principal_browser_context():
     BrowserManager.
     """
     manager = MagicMock()
-    manager.close_context = AsyncMock(return_value={"ok": True})
+    manager.close_runtime = AsyncMock(return_value={"ok": True})
     # Patch the module-level _manager that factory.aclose imports.
     import khaos.tools.browser_tools as bt
 
@@ -548,18 +558,20 @@ async def test_aclose_releases_principal_browser_context():
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
         principal_id="user-42",
-        # H5: aclose passes session_id + runtime_id through to close_context
-        # so the per-session context key is matched correctly.
+        # H5: aclose passes session_id + runtime_id through so the
+        # per-session context key is matched correctly.
         session_id="sess-1",
         runtime_id="rt-1",
     )
     try:
         await result.aclose()
-        # H5: close_context is called with (principal_id, session_id=...,
-        # runtime_id=...) so the per-session context key is matched.
-        manager.close_context.assert_awaited_once_with(
-            "user-42", session_id="sess-1", runtime_id="rt-1",
-        )
+        # H1 (lifecycle): ``close_runtime(runtime_id)`` is called (not
+        # ``close_context(principal_id, ...)``) so ALL contexts the
+        # runtime acquired — regardless of which (principal, session,
+        # runtime) key they were originally created under — are released.
+        # This closes the leak where a runtime acquired contexts under
+        # multiple keys and ``close_context`` only released one of them.
+        manager.close_runtime.assert_awaited_once_with("rt-1")
     finally:
         bt._manager = original
 
@@ -667,3 +679,352 @@ async def test_main_runtime_wires_effective_policy_into_middleware(tmp_path):
     finally:
         await result.aclose()
         await db.close()
+
+
+# ───────────────────────── B1: SubAgent principal ownership ──────────────────
+#
+# B1 (M4 reopen): the SubAgent RPC service previously had NO tenant / principal
+# isolation.  ``spawn`` / ``collect`` / ``status`` did not read the
+# authenticated principal from the RPC payload, so any authenticated user
+# could call global ``collect`` and observe another user's goal / result /
+# error.  These tests pin the contract that the service stamps the
+# principal onto the task, the spawner filters by it, and the DB persists
+# it so a process restart cannot leak stale cross-principal data.
+
+
+async def test_subagent_service_spawn_stamps_principal_onto_task(tmp_path):
+    """B1: ``handle_spawn`` reads ``principal_id`` from the payload and
+    stamps it onto the created task.  The parent session is namespaced
+    by principal so tasks from different principals don't share a
+    session namespace.
+    """
+    from khaos.subagents.service import SubAgentService
+    from khaos.subagents.spawner import SubAgentSpawner, SubAgentConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        spawner = SubAgentSpawner(SubAgentConfig(), db)
+        service = SubAgentService(spawner, runner=None)
+        result = await service.handle_spawn(
+            {
+                "principal_id": "user-alice",
+                "goal": "secret-A",
+                "context": "ctx",
+                "tools": [],
+                "timeout": 1,
+            }
+        )
+        assert result["ok"] is True
+        task_id = result["task_id"]
+        task = spawner._tasks[task_id]
+        # B1: principal_id is stamped from the authenticated payload.
+        assert task.principal_id == "user-alice"
+        # B1: parent_session_id is namespaced per principal.
+        assert task.parent_session_id == "subagent:user-alice"
+        await spawner.wait_all()
+    finally:
+        await db.close()
+
+
+async def test_subagent_service_collect_filters_by_principal(tmp_path):
+    """B1: ``handle_collect`` only returns tasks owned by the calling
+    principal.  Principal A spawns; principal B collects — B must
+    receive ZERO results (not A's goal / result / error).
+    """
+    from khaos.subagents.service import SubAgentService
+    from khaos.subagents.spawner import SubAgentSpawner, SubAgentConfig
+
+    async def _runner(task):
+        return f"result-for-{task.goal}"
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        spawner = SubAgentSpawner(SubAgentConfig(max_concurrent=4), db, runner=_runner)
+        service = SubAgentService(spawner, runner=None)
+
+        # Principal A spawns two tasks.
+        for goal in ("A-secret-1", "A-secret-2"):
+            await service.handle_spawn(
+                {
+                    "principal_id": "user-alice",
+                    "goal": goal,
+                    "context": "",
+                    "tools": [],
+                    "timeout": 5,
+                }
+            )
+        await spawner.wait_all(principal_id="user-alice")
+
+        # Principal B collects — must see ZERO tasks.
+        b_result = await service.handle_collect({"principal_id": "user-bob"})
+        assert b_result["ok"] is True
+        assert b_result["total"] == 0
+        assert b_result["completed"] == 0
+        assert b_result["results"] == []
+
+        # Principal A collects — must see both tasks.
+        a_result = await service.handle_collect({"principal_id": "user-alice"})
+        assert a_result["ok"] is True
+        assert a_result["total"] == 2
+        assert a_result["completed"] == 2
+        goals = {r["goal"] for r in a_result["results"]}
+        assert goals == {"A-secret-1", "A-secret-2"}
+        # B never observed A's goals.
+        for r in a_result["results"]:
+            assert "A-secret" in r["goal"]
+    finally:
+        await db.close()
+
+
+async def test_subagent_service_status_filters_by_principal(tmp_path):
+    """B1: ``handle_status`` only counts tasks owned by the calling
+    principal.  Principal A has 2 tasks; principal B sees 0.
+    """
+    from khaos.subagents.service import SubAgentService
+    from khaos.subagents.spawner import SubAgentSpawner, SubAgentConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        spawner = SubAgentSpawner(SubAgentConfig(), db)
+        service = SubAgentService(spawner, runner=None)
+        await service.handle_spawn(
+            {"principal_id": "user-alice", "goal": "g1", "context": "", "tools": [], "timeout": 1}
+        )
+        await service.handle_spawn(
+            {"principal_id": "user-alice", "goal": "g2", "context": "", "tools": [], "timeout": 1}
+        )
+        await spawner.wait_all()
+
+        a_status = await service.handle_status({"principal_id": "user-alice"})
+        assert a_status["stats"]["total"] == 2
+        assert a_status["stats"]["completed"] == 2
+
+        b_status = await service.handle_status({"principal_id": "user-bob"})
+        assert b_status["stats"]["total"] == 0
+        assert b_status["stats"]["completed"] == 0
+    finally:
+        await db.close()
+
+
+async def test_subagent_spawner_stats_filters_by_principal(tmp_path):
+    """B1: ``SubAgentSpawner.stats`` only counts tasks owned by the
+    given principal.  Cross-principal leakage must not appear in stats.
+    """
+    from khaos.subagents.spawner import SubAgentSpawner, SubAgentConfig, SubAgentTask
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        spawner = SubAgentSpawner(SubAgentConfig(max_concurrent=4), db)
+        await spawner.spawn(SubAgentTask("t1", "g", "c", [], principal_id="alice"))
+        await spawner.spawn(SubAgentTask("t2", "g", "c", [], principal_id="alice"))
+        await spawner.spawn(SubAgentTask("t3", "g", "c", [], principal_id="bob"))
+        await spawner.wait_all()
+
+        assert spawner.stats(principal_id="alice")["total"] == 2
+        assert spawner.stats(principal_id="bob")["total"] == 1
+        # Empty principal_id is the legacy "return everything" path.
+        assert spawner.stats()["total"] == 3
+    finally:
+        await db.close()
+
+
+async def test_subagent_spawner_collect_results_filters_by_principal(tmp_path):
+    """B1: ``collect_results`` only returns results owned by the given
+    principal.  Principal B must not observe principal A's result text.
+    """
+    from khaos.subagents.spawner import SubAgentSpawner, SubAgentConfig, SubAgentTask
+
+    async def _runner(task):
+        return f"secret-{task.principal_id}"
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        spawner = SubAgentSpawner(SubAgentConfig(max_concurrent=4), db, runner=_runner)
+        await spawner.spawn(SubAgentTask("t1", "g", "c", [], principal_id="alice"))
+        await spawner.spawn(SubAgentTask("t2", "g", "c", [], principal_id="bob"))
+        await spawner.wait_all()
+
+        alice_results = await spawner.collect_results(principal_id="alice")
+        assert alice_results == ["secret-alice"]
+        bob_results = await spawner.collect_results(principal_id="bob")
+        assert bob_results == ["secret-bob"]
+        # Bob must never see Alice's secret.
+        assert "secret-alice" not in bob_results
+    finally:
+        await db.close()
+
+
+async def test_database_persists_subagent_principal_id(tmp_path):
+    """B1: ``insert_subagent_task`` persists ``principal_id`` and
+    ``list_subagent_tasks(principal_id)`` filters on disk.  This pins
+    the DB-level isolation so a process restart cannot surface stale
+    cross-principal rows.
+    """
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        await db.create_session("sess-alice")
+        await db.create_session("sess-bob")
+        await db.insert_subagent_task(
+            "t1", "sess-alice", "A-goal", "ctx", "[]", "completed",
+            principal_id="user-alice",
+        )
+        await db.insert_subagent_task(
+            "t2", "sess-bob", "B-goal", "ctx", "[]", "completed",
+            principal_id="user-bob",
+        )
+
+        # Unfiltered — both rows are visible.
+        all_rows = await db.list_subagent_tasks()
+        assert len(all_rows) == 2
+        assert {r["principal_id"] for r in all_rows} == {"user-alice", "user-bob"}
+
+        # Principal-scoped — only the caller's rows are visible.
+        alice_rows = await db.list_subagent_tasks(principal_id="user-alice")
+        assert len(alice_rows) == 1
+        assert alice_rows[0]["principal_id"] == "user-alice"
+        assert alice_rows[0]["goal"] == "A-goal"
+
+        bob_rows = await db.list_subagent_tasks(principal_id="user-bob")
+        assert len(bob_rows) == 1
+        assert bob_rows[0]["principal_id"] == "user-bob"
+
+        # Principal with no tasks sees nothing.
+        empty = await db.list_subagent_tasks(principal_id="user-carol")
+        assert empty == []
+    finally:
+        await db.close()
+
+
+async def test_database_subagent_principal_column_migration_is_idempotent(tmp_path):
+    """B1: ``_ensure_subagent_tasks_principal_column`` is idempotent.
+    Calling it multiple times must not raise.  A legacy DB (column
+    missing) gets the column added; a fresh DB (column present from
+    schema.sql) is a no-op.
+    """
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        # First call — fresh DB has the column already (from schema.sql).
+        await db._ensure_subagent_tasks_principal_column()
+        # Second call — still a no-op.
+        await db._ensure_subagent_tasks_principal_column()
+
+        cursor = await db._conn.execute("PRAGMA table_info(subagent_tasks)")
+        cols = {row["name"] for row in await cursor.fetchall()}
+        assert "principal_id" in cols
+    finally:
+        await db.close()
+
+
+async def test_subagent_runner_uses_task_principal_not_server_principal():
+    """B1: ``SubAgentRunner.run`` passes ``task.principal_id`` (from the
+    authenticated RPC payload) to ``build_runtime``, NOT the server-fixed
+    ``self.principal_id``.  This ensures BrowserContext / Memory scope /
+    audit events bind to the CALLING principal, not the server's UID.
+    """
+    from khaos.subagents.runner import SubAgentRunner
+    from khaos.subagents.spawner import SubAgentTask
+
+    captured: dict = {}
+
+    async def _fake_build_runtime(cfg):
+        captured["principal_id"] = cfg.principal_id
+        # Return a minimal mock runtime whose aclose is a no-op and whose
+        # loop.run yields no messages.
+        runtime = MagicMock()
+        runtime.aclose = AsyncMock()
+        runtime.loop = MagicMock()
+
+        async def _empty_run(*args, **kwargs):
+            return
+            yield  # pragma: no cover - generator marker
+
+        runtime.loop.run = _empty_run
+        return runtime
+
+    # ``build_runtime`` is imported lazily inside ``run`` via
+    # ``from khaos.runtime import build_runtime`` — so patch it on the
+    # ``khaos.runtime`` module where the name is actually looked up.
+    import khaos.runtime as runtime_mod
+
+    original = runtime_mod.build_runtime
+    runtime_mod.build_runtime = _fake_build_runtime
+    try:
+        # ``db`` must be an async mock — ``create_session`` is awaited.
+        db = MagicMock()
+        db.create_session = AsyncMock()
+        runner = SubAgentRunner(
+            router=MagicMock(),
+            db=db,
+            mode_manager=MagicMock(),
+            principal_id="server-fixed-uid",
+        )
+        # The task carries the CALLING principal (set from RPC payload).
+        task = SubAgentTask(
+            id="t1", goal="g", context="c", tools=[],
+            principal_id="user-alice",
+        )
+        await runner.run(task)
+    finally:
+        runtime_mod.build_runtime = original
+
+    # The runtime was built with the TASK's principal, not the server's.
+    assert captured["principal_id"] == "user-alice"
+    assert captured["principal_id"] != "server-fixed-uid"
+
+
+async def test_subagent_runner_falls_back_to_server_principal_when_task_unscoped():
+    """B1: when the task has no principal (legacy / internal callers),
+    the runner falls back to ``self.principal_id`` so the runtime still
+    gets a non-empty principal.
+    """
+    from khaos.subagents.runner import SubAgentRunner
+    from khaos.subagents.spawner import SubAgentTask
+
+    captured: dict = {}
+
+    async def _fake_build_runtime(cfg):
+        captured["principal_id"] = cfg.principal_id
+        runtime = MagicMock()
+        runtime.aclose = AsyncMock()
+        runtime.loop = MagicMock()
+
+        async def _empty_run(*args, **kwargs):
+            return
+            yield  # pragma: no cover - generator marker
+
+        runtime.loop.run = _empty_run
+        return runtime
+
+    import khaos.runtime as runtime_mod
+
+    original = runtime_mod.build_runtime
+    runtime_mod.build_runtime = _fake_build_runtime
+    try:
+        db = MagicMock()
+        db.create_session = AsyncMock()
+        runner = SubAgentRunner(
+            router=MagicMock(),
+            db=db,
+            mode_manager=MagicMock(),
+            principal_id="server-fixed-uid",
+        )
+        task = SubAgentTask(id="t1", goal="g", context="c", tools=[], principal_id="")
+        await runner.run(task)
+    finally:
+        runtime_mod.build_runtime = original
+
+    assert captured["principal_id"] == "server-fixed-uid"
