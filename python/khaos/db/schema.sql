@@ -132,7 +132,12 @@ CREATE TABLE IF NOT EXISTS subagent_tasks (
     result            TEXT,
     error             TEXT,
     created_at        TEXT NOT NULL DEFAULT (datetime('now')),
-    finished_at       TEXT
+    finished_at       TEXT,
+    -- B1: principal that owns this task. Empty for legacy rows; the
+    -- spawner / service stamps the authenticated principal here so
+    -- collect / status can filter by it.  NOT NULL DEFAULT '' keeps
+    -- backward compatibility with rows written before the column existed.
+    principal_id      TEXT NOT NULL DEFAULT ''
 );
 
 -- Phase 6: Session bookmarks for task persistence across sessions
