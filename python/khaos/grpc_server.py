@@ -345,7 +345,7 @@ class AgentService:
         for runtime in list(self._active_runtimes.values()):
             try:
                 await close_runtime_or_register(runtime)
-            except (asyncio.CancelledError, Exception):
+            except Exception:
                 # close_runtime_or_register already quarantines terminal
                 # failures.  Continue so drain can retry all retained owners.
                 logger.error("active runtime teardown failed", exc_info=True)

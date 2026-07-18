@@ -140,8 +140,9 @@ class AuditLogger:
     M1: ``log_path`` is the optional file path from the effective policy's
     ``audit_log_path``.  When set, every record is appended as one JSON
     line to that file (in addition to the SQLite database) so an operator
-    has an append-only trail outside the database.  The file write is
-    best-effort.
+    has a path-stable secondary trail outside the database.  This protects
+    the writer from path substitution; it is not cryptographic tamper
+    evidence against the same UID.  The file write is best-effort.
 
     H3: the log file is opened ONCE at construction time with
     ``O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW`` and the fd is held for
