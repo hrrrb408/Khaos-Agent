@@ -19,6 +19,7 @@ from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.coding.execution import BackendSelector, ExecutionService
+from khaos.exceptions import RuntimeCloseError
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
@@ -148,55 +149,90 @@ class RuntimeResult:
         retry creates a FRESH task instead of re-awaiting the
         cancelled/failed task forever.
 
+        H4: when a safety-critical component fails to shut down, ``aclose``
+        raises ``RuntimeCloseError`` instead of silently returning.  The
+        production callers (Chat / SubAgent) previously called ``aclose``
+        once and discarded the result — now they are forced to observe
+        the failure and retry.  A limited auto-retry (3 attempts) is
+        built in so transient component failures don't propagate to the
+        user.
+
         H1: releases the principal's per-session ``BrowserContext`` so
-        cookies / DOM / page state cannot leak into a subsequent run by a
-        different principal sharing the same process-wide BrowserManager.
+        cookies / DOM / page state cannot leak into a subsequent run by
+        a different principal sharing the same process-wide BrowserManager.
         """
         import asyncio as _asyncio
 
         # Already fully closed — nothing to do.
         if self._closed:
             return
-        # A close task is already in flight — wait on the SAME task so
-        # concurrent callers don't return before cleanup finishes.
-        # H4: if the task was cancelled/raised, ``_run_close``'s finally
-        # clears ``_close_task`` (so a retry creates a fresh task).  In
-        # that case we fall through to the create-task path below.
-        if self._close_task is not None:
+        # H4: limited auto-retry so transient component failures are
+        # retried in-line; only persistent failures surface to the caller.
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            # A close task is already in flight — wait on the SAME task so
+            # concurrent callers don't return before cleanup finishes.
+            # H4: if the task was cancelled/raised, ``_run_close``'s finally
+            # clears ``_close_task`` (so a retry creates a fresh task).  In
+            # that case we fall through to the create-task path below.
+            if self._close_task is not None:
+                try:
+                    await _asyncio.shield(self._close_task)
+                except _asyncio.CancelledError:
+                    # Either the caller was cancelled (propagate) or the close
+                    # task itself was cancelled (``_close_task`` is now None —
+                    # fall through to retry).  Distinguish by checking
+                    # ``_close_task``: if it's None, the task cleared itself.
+                    if self._close_task is None:
+                        # H4: the in-flight close task was self-cancelled;
+                        # fall through to create a fresh task and retry.
+                        pass
+                    else:
+                        # The caller was cancelled while the close task is
+                        # still running; propagate the cancellation.
+                        raise
+                else:
+                    # The in-flight task finished (success or component
+                    # failure).  If ``_closed`` is still False, the task
+                    # cleared ``_close_task`` so we can retry.
+                    if self._closed or self._close_task is not None:
+                        return
+                    # H4: ``_close_task`` was cleared by the failed path —
+                    # fall through to retry.
+            if self._closed:
+                return
+            # Create the shared cleanup task and shield it so a cancellation
+            # of the *caller* does not abort the cleanup itself.
+            self._close_task = _asyncio.ensure_future(self._run_close())
             try:
                 await _asyncio.shield(self._close_task)
             except _asyncio.CancelledError:
-                # Either the caller was cancelled (propagate) or the close
-                # task itself was cancelled (``_close_task`` is now None —
-                # fall through to retry).  Distinguish by checking
-                # ``_close_task``: if it's None, the task cleared itself.
-                if self._close_task is None:
-                    # H4: the in-flight close task was self-cancelled; fall
-                    # through to create a fresh task and retry cleanup.
-                    pass
-                else:
-                    # The caller was cancelled while the close task is
-                    # still running; propagate the cancellation.
-                    raise
-            else:
-                # The in-flight task finished (success or component
-                # failure).  If ``_closed`` is still False, the task
-                # cleared ``_close_task`` so we can retry.
-                if self._closed or self._close_task is not None:
-                    return
-                # H4: ``_close_task`` was cleared by the failed path —
-                # fall through to retry.
-        # Create the shared cleanup task and shield it so a cancellation
-        # of the *caller* does not abort the cleanup itself.
-        self._close_task = _asyncio.ensure_future(self._run_close())
-        try:
-            await _asyncio.shield(self._close_task)
-        except _asyncio.CancelledError:
-            # The caller was cancelled, but the cleanup task keeps running.
-            # Re-raise so the caller's cancellation propagates; a subsequent
-            # aclose() will await the still-running task (or, if the task
-            # self-cancelled and cleared ``_close_task``, create a fresh one).
-            raise
+                # The caller was cancelled, but the cleanup task keeps running.
+                # Re-raise so the caller's cancellation propagates; a subsequent
+                # aclose() will await the still-running task (or, if the task
+                # self-cancelled and cleared ``_close_task``, create a fresh one).
+                raise
+            # Check terminal state after the task completed.
+            if self._closed:
+                return
+            # H4: ``_close_failed`` is set — retry if attempts remain.
+            if attempt < max_attempts and self._close_failed:
+                logger.warning(
+                    "runtime aclose attempt %d/%d failed; retrying",
+                    attempt, max_attempts,
+                )
+                continue
+            # H4: all retries exhausted — raise so the caller observes the
+            # failure and can escalate (e.g. register with the server's
+            # orphan-cleanup registry).
+            if self._close_failed:
+                raise RuntimeCloseError(
+                    f"runtime cleanup failed after {max_attempts} attempts; "
+                    f"safety-critical components may not have reached a "
+                    f"terminal state — principal={self.principal_id} "
+                    f"session={self.session_id} runtime={self.runtime_id}"
+                )
+            break
 
     async def _run_close(self) -> None:
         """Run the actual cleanup; idempotent and failure-tolerant.
@@ -211,9 +247,15 @@ class RuntimeResult:
         ``finally`` so a subsequent ``aclose()`` creates a fresh task and
         retries — otherwise every future ``aclose()`` would re-await this
         cancelled/failed task forever, permanently preventing cleanup.
+
+        H4: ``_close_failed`` is reset at the start of each retry so the
+        last attempt's failure doesn't poison the next attempt's result.
         """
         if self._closed:
             return
+        # H4: reset _close_failed for this attempt — a previous attempt's
+        # failure should not make the retry appear to have failed.
+        self._close_failed = False
         failed = False
         try:
             # H3: fence Office mutations FIRST — wait for every in-flight
@@ -252,28 +294,34 @@ class RuntimeResult:
                     logger.debug(
                         "execution service close failed", exc_info=True
                     )
-            # H1: release this principal's per-session BrowserContext so its
+            # H1: release EVERY BrowserContext this runtime acquired so its
             # cookies / DOM / page state cannot leak into a subsequent run by
-            # a different principal.  Best-effort — the BrowserManager is a
-            # process-wide singleton, and a failure here must not block the
-            # rest of cleanup.  H5: pass session_id + runtime_id so the
-            # per-session context key is matched correctly (closing one
-            # runtime's context does NOT close a concurrent runtime's page).
-            if self.principal_id:
+            # a different runtime sharing the same process-wide
+            # BrowserManager.  Best-effort — a failure here must not block
+            # the rest of cleanup.
+            #
+            # H1 (lifecycle): we use ``close_runtime(runtime_id)`` (not
+            # ``close_context(principal_id, session_id, runtime_id)``)
+            # because a runtime may have acquired contexts under multiple
+            # keys (e.g. via different ``session_id``s during its
+            # lifetime).  ``close_context`` only releases ONE key and
+            # would leak the rest; ``close_runtime`` iterates every entry
+            # whose ``_runtime_owners`` set lists this ``runtime_id`` and
+            # decrements the refcount for each, so ALL contexts the
+            # runtime acquired are released regardless of the key.  A
+            # concurrent runtime sharing a context is NOT affected
+            # (refcount only closes when the last owner releases).
+            if self.runtime_id:
                 try:
                     from khaos.tools.browser_tools import _manager as _browser_manager
-                    await _browser_manager.close_context(
-                        self.principal_id,
-                        session_id=self.session_id,
-                        runtime_id=self.runtime_id,
-                    )
+                    await _browser_manager.close_runtime(self.runtime_id)
                 except Exception:
                     # Browser context close is best-effort — do NOT mark the
                     # runtime as failed-close just because the browser cleanup
                     # raised (Playwright may not even be installed).
                     logger.debug(
-                        "browser context close failed for principal %s",
-                        self.principal_id,
+                        "browser runtime close failed for runtime %s",
+                        self.runtime_id,
                         exc_info=True,
                     )
             # H3: only mark closed when every safety-critical component

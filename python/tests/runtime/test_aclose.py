@@ -10,6 +10,8 @@ wires the right component into the right field.
 
 from unittest.mock import AsyncMock, MagicMock
 
+import pytest
+
 from khaos.runtime.factory import RuntimeResult
 
 
@@ -144,7 +146,15 @@ async def test_aclose_tolerates_component_shutdown_failures():
     component's shutdown is expected to be idempotent — a retry will
     re-invoke them, and a component that already reached a terminal
     state on the first attempt should ideally not raise again.
+
+    H4: ``aclose`` now retries 3 times and then raises
+    ``RuntimeCloseError`` so the production caller is forced to observe
+    the failure.  Every component's shutdown IS still called on every
+    retry attempt (they're all invoked, just all fail), and the runtime
+    is left in a retryable state (``_closed=False``, ``_close_task=None``).
     """
+    from khaos.exceptions import RuntimeCloseError
+
     office = MagicMock()
     office.shutdown = AsyncMock(side_effect=RuntimeError("office boom"))
     memory = MagicMock()
@@ -163,11 +173,15 @@ async def test_aclose_tolerates_component_shutdown_failures():
         execution_service=execution,
         office_authority=office,
     )
-    # Must not raise — every failure is contained.
-    await result.aclose()
-    office.shutdown.assert_awaited_once()
-    memory.aclose.assert_awaited_once()
-    execution.shutdown.assert_awaited_once()
+    # H4: aclose raises after exhausting retries — every failure is still
+    # contained (no uncaught exception), but the caller is now forced to
+    # observe the failure.
+    with pytest.raises(RuntimeCloseError):
+        await result.aclose()
+    # Every component's shutdown was called on the first attempt.
+    office.shutdown.assert_awaited()
+    memory.aclose.assert_awaited()
+    execution.shutdown.assert_awaited()
     # H3: a component failure marks the runtime as failed-close, NOT closed.
     assert result._close_failed is True
     assert result._closed is False

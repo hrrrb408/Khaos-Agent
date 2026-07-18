@@ -24,3 +24,15 @@ class SubAgentLimitError(KhaosError):
 class CompressionCircuitOpenError(KhaosError):
     """Raised when repeated compression failures open the circuit."""
 
+
+class RuntimeCloseError(KhaosError):
+    """Raised when runtime cleanup fails after exhausting retries.
+
+    H4: ``RuntimeResult.aclose`` raises this when safety-critical
+    components (OfficeMutationAuthority, ExecutionService, MemoryManager)
+    fail to reach a terminal state after 3 attempts.  The caller
+    (AgentService / SubAgentRunner) must observe the failure and
+    escalate — e.g. register the runtime with the server's
+    orphan-cleanup registry so the resources are not silently leaked.
+    """
+
