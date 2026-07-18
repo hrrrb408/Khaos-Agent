@@ -525,11 +525,20 @@ class Database:
         status: str = "pending",
         principal_id: str = "",
     ) -> None:
-        """Insert or replace a subagent task row.
+        """Insert a subagent task row.
 
         B1: ``principal_id`` is persisted so collect / status queries
         can filter tasks by the authenticated caller.  Empty string is
         the legacy default (rows written before the column existed).
+
+        M3: uses plain ``INSERT`` (NOT ``INSERT ... ON CONFLICT(id) DO
+        UPDATE``).  Task IDs are now UUID4 (``task_{uuid.uuid4().hex}``)
+        so a collision is virtually impossible — but if one ever
+        happens, ``IntegrityError`` is raised instead of silently
+        overwriting an old row (which could be another principal's
+        history after a process restart reset the old incrementing
+        counter).  Callers that legitimately need to update an existing
+        row use ``update_subagent_task``.
         """
         conn = await self._require_conn()
         await self._ensure_subagent_tasks_principal_column()
@@ -537,12 +546,6 @@ class Database:
             """
             INSERT INTO subagent_tasks (id, parent_session_id, goal, context, tools, status, principal_id)
             VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                goal = excluded.goal,
-                context = excluded.context,
-                tools = excluded.tools,
-                status = excluded.status,
-                principal_id = excluded.principal_id
             """,
             (task_id, parent_session_id, goal, context, tools, status, principal_id),
         )

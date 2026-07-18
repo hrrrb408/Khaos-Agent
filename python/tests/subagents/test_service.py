@@ -10,7 +10,13 @@ async def test_handle_spawn_success():
     service = SubAgentService(spawner, runner=None)
 
     result = await service.handle_spawn(
-        {"goal": "inspect", "context": "ctx", "tools": ["read_file"], "timeout": 300}
+        {
+            "principal_id": "user1",
+            "goal": "inspect",
+            "context": "ctx",
+            "tools": ["read_file"],
+            "timeout": 300,
+        }
     )
 
     assert result == {"ok": True, "task_id": "task_1", "status": "running"}
@@ -18,7 +24,8 @@ async def test_handle_spawn_success():
     assert task.goal == "inspect"
     assert task.context == "ctx"
     assert task.tools == ["read_file"]
-    assert task.parent_session_id == "gateway"
+    # M2: parent_session_id is namespaced per principal.
+    assert task.parent_session_id == "subagent:user1"
 
 
 async def test_handle_spawn_error():
@@ -26,9 +33,21 @@ async def test_handle_spawn_error():
     spawner.spawn = AsyncMock(side_effect=RuntimeError("boom"))
     service = SubAgentService(spawner, runner=None)
 
-    result = await service.handle_spawn({"goal": "inspect"})
+    result = await service.handle_spawn({"principal_id": "user1", "goal": "inspect"})
 
     assert result == {"ok": False, "error": "boom"}
+
+
+async def test_handle_spawn_rejects_empty_principal():
+    """M2: empty ``principal_id`` is rejected before calling the spawner."""
+    spawner = MagicMock()
+    spawner.spawn = AsyncMock(return_value=SimpleNamespace(id="task_1"))
+    service = SubAgentService(spawner, runner=None)
+
+    result = await service.handle_spawn({"goal": "inspect"})
+
+    assert result == {"ok": False, "error": "principal_id is required"}
+    spawner.spawn.assert_not_awaited()
 
 
 async def test_handle_collect_success():
@@ -53,7 +72,7 @@ async def test_handle_collect_success():
     )
     service = SubAgentService(spawner, runner=None)
 
-    result = await service.handle_collect({})
+    result = await service.handle_collect({"principal_id": "user1"})
 
     assert result["ok"] is True
     assert result["total"] == 2
@@ -63,11 +82,35 @@ async def test_handle_collect_success():
     assert result["results"][1]["error"] == "boom"
 
 
+async def test_handle_collect_rejects_empty_principal():
+    """M2: empty ``principal_id`` is rejected before calling the spawner."""
+    spawner = MagicMock()
+    spawner.wait_all = AsyncMock(return_value=[])
+    service = SubAgentService(spawner, runner=None)
+
+    result = await service.handle_collect({})
+
+    assert result == {"ok": False, "error": "principal_id is required"}
+    spawner.wait_all.assert_not_awaited()
+
+
 async def test_handle_status():
+    spawner = MagicMock()
+    spawner.stats.return_value = {"active": 1, "total": 2}
+    service = SubAgentService(spawner, runner=None)
+
+    result = await service.handle_status({"principal_id": "user1"})
+
+    assert result == {"ok": True, "stats": {"active": 1, "total": 2}}
+
+
+async def test_handle_status_rejects_empty_principal():
+    """M2: empty ``principal_id`` is rejected before calling the spawner."""
     spawner = MagicMock()
     spawner.stats.return_value = {"active": 1, "total": 2}
     service = SubAgentService(spawner, runner=None)
 
     result = await service.handle_status({})
 
-    assert result == {"ok": True, "stats": {"active": 1, "total": 2}}
+    assert result == {"ok": False, "error": "principal_id is required"}
+    spawner.stats.assert_not_called()

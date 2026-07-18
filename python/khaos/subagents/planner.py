@@ -236,11 +236,26 @@ class TaskPlanner:
            d. 进入下一层
         4. 返回所有完成（或被跳过/失败）的任务
 
+        M2: the planner is an in-process caller (not the RPC service),
+        so it stamps every task with the sentinel principal_id
+        ``"orchestrator"`` and passes that to ``wait_all``.  This keeps
+        the planner working now that the spawner's empty-principal path
+        returns NOTHING (M2 defense in depth) instead of all tasks.
+
         Returns:
             所有见过的 SubAgentTask 列表（status 为 completed / failed / skipped）。
         """
         if not plan.tasks:
             return []
+
+        # M2: stamp every task with the sentinel "orchestrator" principal
+        # so ``wait_all(principal_id="orchestrator")`` actually waits for
+        # them.  Without this, the spawner's empty-principal path returns
+        # [] immediately (M2) and the planner would race the tasks.
+        _PLANNER_PRINCIPAL = "orchestrator"
+        for task in plan.tasks:
+            if not task.principal_id:
+                task.principal_id = _PLANNER_PRINCIPAL
 
         tasks_by_id: dict[str, SubAgentTask] = {task.id: task for task in plan.tasks}
         seen: list[SubAgentTask] = []
@@ -282,7 +297,9 @@ class TaskPlanner:
                     logger.warning("spawn failed for task %s: %s", task.id, exc)
 
             if spawned:
-                await spawner.wait_all()
+                # M2: pass the sentinel principal so wait_all actually
+                # waits for the spawned tasks.
+                await spawner.wait_all(principal_id=_PLANNER_PRINCIPAL)
 
             # 记录成功的 task_id
             for task in to_spawn:

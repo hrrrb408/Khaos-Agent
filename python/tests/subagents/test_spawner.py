@@ -14,6 +14,13 @@ from khaos.subagents.spawner import SubAgentConfig, SubAgentSpawner, SubAgentTas
 from khaos.tools.registry import create_builtin_registry
 
 
+# M2: the spawner now returns NOTHING for an empty principal_id (defense
+# in depth).  Tests that spawn tasks and then wait / collect / stat must
+# stamp the tasks with a non-empty principal_id and pass the same value
+# to wait_all / stats.
+_PRINCIPAL = "user1"
+
+
 async def _spawner(tmp_path, runner=None, max_concurrent=3, registry=None, config=None):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
@@ -30,12 +37,12 @@ async def test_spawn_batch_all_succeed(tmp_path):
     db, spawner = await _spawner(tmp_path, max_concurrent=3)
     try:
         tasks = [
-            SubAgentTask("t1", "one", "ctx", []),
-            SubAgentTask("t2", "two", "ctx", []),
-            SubAgentTask("t3", "three", "ctx", []),
+            SubAgentTask("t1", "one", "ctx", [], principal_id=_PRINCIPAL),
+            SubAgentTask("t2", "two", "ctx", [], principal_id=_PRINCIPAL),
+            SubAgentTask("t3", "three", "ctx", [], principal_id=_PRINCIPAL),
         ]
         spawned = await spawner.spawn_batch(tasks)
-        await spawner.wait_all()
+        await spawner.wait_all(principal_id=_PRINCIPAL)
 
         assert len(spawned) == 3
         assert all(t.status == "completed" for t in spawned)
@@ -48,13 +55,13 @@ async def test_spawn_batch_over_limit_skips_extras(tmp_path):
     db, spawner = await _spawner(tmp_path, max_concurrent=2)
     try:
         tasks = [
-            SubAgentTask("t1", "one", "ctx", []),
-            SubAgentTask("t2", "two", "ctx", []),
-            SubAgentTask("t3", "three", "ctx", []),
-            SubAgentTask("t4", "four", "ctx", []),
+            SubAgentTask("t1", "one", "ctx", [], principal_id=_PRINCIPAL),
+            SubAgentTask("t2", "two", "ctx", [], principal_id=_PRINCIPAL),
+            SubAgentTask("t3", "three", "ctx", [], principal_id=_PRINCIPAL),
+            SubAgentTask("t4", "four", "ctx", [], principal_id=_PRINCIPAL),
         ]
         spawned = await spawner.spawn_batch(tasks)
-        await spawner.wait_all()
+        await spawner.wait_all(principal_id=_PRINCIPAL)
 
         # 并发上限 2 → 只有 2 个被 spawn
         assert len(spawned) == 2
@@ -81,9 +88,11 @@ async def test_spawn_batch_when_concurrency_full(tmp_path):
 
     db, spawner = await _spawner(tmp_path, runner=slow, max_concurrent=1)
     try:
-        await spawner.spawn(SubAgentTask("t1", "running", "ctx", []))
-        spawned = await spawner.spawn_batch([SubAgentTask("t2", "queued", "ctx", [])])
-        await spawner.wait_all()
+        await spawner.spawn(SubAgentTask("t1", "running", "ctx", [], principal_id=_PRINCIPAL))
+        spawned = await spawner.spawn_batch(
+            [SubAgentTask("t2", "queued", "ctx", [], principal_id=_PRINCIPAL)]
+        )
+        await spawner.wait_all(principal_id=_PRINCIPAL)
 
         assert spawned == []
     finally:
@@ -105,11 +114,11 @@ async def test_stats_initial(tmp_path):
 async def test_stats_after_completion(tmp_path):
     db, spawner = await _spawner(tmp_path)
     try:
-        await spawner.spawn(SubAgentTask("t1", "one", "ctx", []))
-        await spawner.spawn(SubAgentTask("t2", "two", "ctx", []))
-        await spawner.wait_all()
+        await spawner.spawn(SubAgentTask("t1", "one", "ctx", [], principal_id=_PRINCIPAL))
+        await spawner.spawn(SubAgentTask("t2", "two", "ctx", [], principal_id=_PRINCIPAL))
+        await spawner.wait_all(principal_id=_PRINCIPAL)
 
-        stats = spawner.stats()
+        stats = spawner.stats(principal_id=_PRINCIPAL)
         assert stats["total"] == 2
         assert stats["completed"] == 2
         assert stats["active"] == 0
@@ -125,10 +134,10 @@ async def test_stats_counts_failed(tmp_path):
 
     db, spawner = await _spawner(tmp_path, runner=fail)
     try:
-        await spawner.spawn(SubAgentTask("t1", "one", "ctx", []))
-        await spawner.wait_all()
+        await spawner.spawn(SubAgentTask("t1", "one", "ctx", [], principal_id=_PRINCIPAL))
+        await spawner.wait_all(principal_id=_PRINCIPAL)
 
-        stats = spawner.stats()
+        stats = spawner.stats(principal_id=_PRINCIPAL)
         assert stats["total"] == 1
         assert stats["failed"] == 1
         assert stats["completed"] == 0
@@ -143,12 +152,12 @@ async def test_stats_active_while_running(tmp_path):
 
     db, spawner = await _spawner(tmp_path, runner=slow)
     try:
-        await spawner.spawn(SubAgentTask("t1", "one", "ctx", []))
+        await spawner.spawn(SubAgentTask("t1", "one", "ctx", [], principal_id=_PRINCIPAL))
         # 不等待：此刻应有一条 active 任务
-        stats = spawner.stats()
+        stats = spawner.stats(principal_id=_PRINCIPAL)
         assert stats["active"] == 1
         assert stats["total"] == 1
-        await spawner.wait_all()
+        await spawner.wait_all(principal_id=_PRINCIPAL)
     finally:
         await db.close()
 
@@ -171,8 +180,10 @@ async def test_nested_allowed_when_allow_nesting_true(tmp_path):
     config = SubAgentConfig(max_concurrent=3, max_spawn_depth=2, allow_nesting=True)
     db, spawner = await _spawner(tmp_path, config=config)
     try:
-        task = await spawner.spawn(SubAgentTask("t1", "nested", "ctx", [], depth=2))
-        await spawner.wait_all()
+        task = await spawner.spawn(
+            SubAgentTask("t1", "nested", "ctx", [], depth=2, principal_id=_PRINCIPAL)
+        )
+        await spawner.wait_all(principal_id=_PRINCIPAL)
         assert task.status == "completed"
     finally:
         await db.close()
@@ -207,8 +218,12 @@ async def test_spawn_accepts_registered_tools(tmp_path):
     registry = create_builtin_registry()
     db, spawner = await _spawner(tmp_path, registry=registry)
     try:
-        task = await spawner.spawn(SubAgentTask("t1", "g", "ctx", ["read_file", "search_files"]))
-        await spawner.wait_all()
+        task = await spawner.spawn(
+            SubAgentTask(
+                "t1", "g", "ctx", ["read_file", "search_files"], principal_id=_PRINCIPAL
+            )
+        )
+        await spawner.wait_all(principal_id=_PRINCIPAL)
         assert task.status == "completed"
     finally:
         await db.close()
@@ -219,8 +234,10 @@ async def test_spawn_without_registry_skips_validation(tmp_path):
     db, spawner = await _spawner(tmp_path, registry=None)
     try:
         # 即使工具名不存在，也不会报错
-        task = await spawner.spawn(SubAgentTask("t1", "g", "ctx", ["anything"]))
-        await spawner.wait_all()
+        task = await spawner.spawn(
+            SubAgentTask("t1", "g", "ctx", ["anything"], principal_id=_PRINCIPAL)
+        )
+        await spawner.wait_all(principal_id=_PRINCIPAL)
         assert task.status == "completed"
     finally:
         await db.close()
@@ -232,10 +249,13 @@ async def test_spawn_without_registry_skips_validation(tmp_path):
 async def test_spawn_generates_task_id_when_empty(tmp_path):
     db, spawner = await _spawner(tmp_path)
     try:
-        task = SubAgentTask("", "g", "ctx", [])
+        task = SubAgentTask("", "g", "ctx", [], principal_id=_PRINCIPAL)
         await spawner.spawn(task)
-        await spawner.wait_all()
+        await spawner.wait_all(principal_id=_PRINCIPAL)
+        # M3: task IDs are now UUID4 (``task_{uuid.uuid4().hex}``).
         assert task.id.startswith("task_")
         assert task.id != ""
+        # UUID4 hex is 32 chars; ``task_`` prefix is 5 chars.
+        assert len(task.id) == 5 + 32
     finally:
         await db.close()

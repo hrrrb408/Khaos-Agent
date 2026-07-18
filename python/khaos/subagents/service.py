@@ -18,6 +18,13 @@ class SubAgentService:
     payload and scopes results to that principal.  A different principal
     cannot observe another's goal / result / error / status — closing
     the cross-tenant data leakage.
+
+    M2: every handler rejects an empty ``principal_id`` BEFORE calling
+    the spawner.  Previously, a missing ``principal_id`` resolved to the
+    empty string and the spawner treated empty principal as "return ALL
+    tasks" (legacy behavior) — a fail-open security boundary.  Now the
+    service rejects empty principal up-front, and the spawner's empty-
+    principal path returns NOTHING (defense in depth).
     """
 
     def __init__(self, spawner: SubAgentSpawner, runner: SubAgentRunner | None):
@@ -29,10 +36,13 @@ class SubAgentService:
 
         B1: ``principal_id`` is read from the authenticated payload and
         stamped onto the task so ``collect`` / ``status`` can filter by
-        it.  When absent (legacy callers), the task is unscoped — but
-        the Go gateway always forwards the authenticated principal.
+        it.  M2: empty ``principal_id`` is rejected up-front — the Go
+        gateway always forwards the authenticated principal, so a missing
+        one is a bug or an attack.
         """
         principal_id = str(payload.get("principal_id") or "")
+        if not principal_id:
+            return {"ok": False, "error": "principal_id is required"}
         task = SubAgentTask(
             id="",
             goal=payload.get("goal", ""),
@@ -41,7 +51,7 @@ class SubAgentService:
             timeout=payload.get("timeout", 300),
             # B1: derive a per-principal parent session so tasks from
             # different principals don't share a session namespace.
-            parent_session_id=f"subagent:{principal_id}" if principal_id else "gateway",
+            parent_session_id=f"subagent:{principal_id}",
             depth=1,
             principal_id=principal_id,
         )
@@ -56,8 +66,11 @@ class SubAgentService:
         """Handle a Collect request.
 
         B1: only returns tasks owned by the authenticated principal.
+        M2: empty ``principal_id`` is rejected up-front.
         """
         principal_id = str(payload.get("principal_id") or "")
+        if not principal_id:
+            return {"ok": False, "error": "principal_id is required"}
         try:
             tasks = await self.spawner.wait_all(timeout=600, principal_id=principal_id)
             results = []
@@ -92,6 +105,9 @@ class SubAgentService:
         """Handle a Status request.
 
         B1: only counts tasks owned by the authenticated principal.
+        M2: empty ``principal_id`` is rejected up-front.
         """
         principal_id = str(payload.get("principal_id") or "")
+        if not principal_id:
+            return {"ok": False, "error": "principal_id is required"}
         return {"ok": True, "stats": self.spawner.stats(principal_id=principal_id)}

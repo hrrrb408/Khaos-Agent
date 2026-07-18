@@ -74,17 +74,20 @@ class SubAgentSpawner:
         self.registry = registry
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._tasks: dict[str, SubAgentTask] = {}
-        self._spawn_counter: int = 0
 
     @property
     def active_count(self) -> int:
         return len(self._active_tasks)
 
     def _ensure_task_id(self, task: SubAgentTask) -> None:
-        """生成稳定的 task_id（task_N 形式）当为空时。"""
+        """生成稳定的 task_id（UUID4 形式）当为空时。
+
+        M3: 旧的 ``task_N`` 计数器在进程重启后会重置为 0，``ON CONFLICT(id)
+        DO UPDATE`` 会覆盖旧任务记录（包括其他 principal 的历史）。  UUID4
+        保证全局唯一性，跨重启不会冲突。
+        """
         if not task.id:
-            self._spawn_counter += 1
-            task.id = f"task_{self._spawn_counter}"
+            task.id = f"task_{uuid.uuid4().hex}"
 
     def _validate_tools(self, task: SubAgentTask) -> None:
         """校验 task.tools 中的工具是否已注册（需要传入 registry）。"""
@@ -181,6 +184,12 @@ class SubAgentSpawner:
         B1: when ``principal_id`` is set, only tasks owned by that
         principal are counted — a different principal cannot observe
         another's task counts.
+
+        M2: when ``principal_id`` is empty, returns an EMPTY stats dict
+        (NOT all tasks).  The only caller that could pass empty principal
+        is the Python service, which now rejects it up-front.  If someone
+        bypasses the service and calls the spawner directly with empty
+        principal, they get NOTHING, not everything.
         """
         tasks = self._tasks_for_principal(principal_id)
         completed = sum(1 for t in tasks if t.status == "completed")
@@ -200,26 +209,28 @@ class SubAgentSpawner:
     def _tasks_for_principal(self, principal_id: str) -> list[SubAgentTask]:
         """B1: return tasks owned by ``principal_id``.
 
-        When ``principal_id`` is empty (legacy / test callers), return
-        ALL tasks — this preserves backward compatibility for callers
-        that haven't been updated.  Production callers always pass a
-        non-empty principal_id.
+        M2: when ``principal_id`` is empty, return an EMPTY list (NOT
+        all tasks).  The previous "legacy path — return all" behavior
+        was a fail-open security boundary: a caller bypassing the
+        Python service with an empty principal could observe every
+        principal's tasks.  The only caller that could pass empty
+        principal is the Python service, and we just made it reject
+        empty principal.  If someone bypasses the service and calls
+        the spawner directly with empty principal, they get NOTHING.
         """
         if not principal_id:
-            return list(self._tasks.values())
+            return []
         return [t for t in self._tasks.values() if t.principal_id == principal_id]
 
     async def wait_all(self, timeout: int = 600, principal_id: str = "") -> list[SubAgentTask]:
         """Wait for active tasks owned by ``principal_id`` (B1).
 
-        When ``principal_id`` is empty, waits for ALL tasks (legacy
-        behavior).  Production callers always pass a non-empty principal.
+        M2: when ``principal_id`` is empty, returns an EMPTY list
+        immediately (NOT all tasks).  See ``_tasks_for_principal`` for
+        the rationale.
         """
         if not principal_id:
-            # Legacy path — wait for all active tasks.
-            if self._active_tasks:
-                await asyncio.wait_for(asyncio.gather(*self._active_tasks.values()), timeout=timeout)
-            return list(self._tasks.values())
+            return []
         # B1: only wait for tasks owned by this principal.
         owned_active = {
             tid: task for tid, task in self._active_tasks.items()
