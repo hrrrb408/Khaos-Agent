@@ -1263,16 +1263,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         ),
         (
             "browser_screenshot",
-            "Take a screenshot of the current page.",
-            {
-                "type": "object",
-                "properties": {
-                    "save_path": {
-                        "type": "string",
-                        "description": "File path to save screenshot (optional, returns base64 if empty)",
-                    }
-                },
-            },
+            "Take a screenshot and return base64 without writing a file.",
+            {"type": "object", "properties": {}},
             (ToolCapability("filesystem.read", _BROWSER_MODES, frozenset({"app-data"})),),
         ),
         (
