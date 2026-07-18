@@ -345,22 +345,31 @@ class AgentService:
         for task in active_tasks:
             task.cancel()
         if active_tasks:
-            # M2: bounded drain so a handler that swallows CancelledError or
-            # otherwise wedges cannot block teardown forever.  This is
-            # fail-safe — a stuck chat still has its RuntimeResult in
-            # ``_active_runtimes``; the subsequent close-or-quarantine +
-            # ``drain_orphan_runtimes`` phases are the real terminal gate.
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*active_tasks, return_exceptions=True),
-                    timeout=CHAT_DRAIN_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
+            # M1: bounded drain with hard ownership semantics.  A task that
+            # swallows CancelledError used to make ``wait_for(gather)``
+            # raise TimeoutError, which the previous code only logged before
+            # continuing to dismantle Office/Browser/Audit/DB — while the
+            # swallowing task was still running and borrowing exactly those
+            # authorities.  ``asyncio.wait`` returns the pending set so we
+            # can fail closed: if any chat is still running at the deadline,
+            # refuse teardown by raising ``ServiceShutdownError``.  The
+            # residual runtime is still registered in ``_active_runtimes``
+            # and will be closed or quarantined by the next owner.
+            done, pending = await asyncio.wait(
+                active_tasks, timeout=CHAT_DRAIN_TIMEOUT,
+            )
+            if pending:
                 logger.error(
-                    "agent shutdown: %d chat task(s) did not settle within "
-                    "%.2fs; relying on runtime close/orphan drain",
-                    sum(1 for t in active_tasks if not t.done()),
-                    CHAT_DRAIN_TIMEOUT,
+                    "agent shutdown: %d chat task(s) did not terminate within "
+                    "%.2fs (swallowed cancellation or wedged); refusing to "
+                    "tear down shared authorities",
+                    len(pending), CHAT_DRAIN_TIMEOUT,
+                )
+                self.shutdown_failed = True
+                raise ServiceShutdownError(
+                    f"{len(pending)} chat task(s) did not terminate within "
+                    f"{CHAT_DRAIN_TIMEOUT}s; shared authorities cannot be "
+                    f"torn down safely"
                 )
 
         # Defensive ownership pass: a handler cancellation must normally run
@@ -1083,21 +1092,26 @@ async def serve_json_lines(
         for task in active_handlers:
             task.cancel()
         if active_handlers:
-            # M2: bounded drain.  A wedged connection handler used to be
-            # able to block teardown indefinitely.  The remaining runtime
-            # owners are still registered and will be closed or quarantined
-            # by ``AgentService.shutdown`` below.
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*active_handlers, return_exceptions=True),
-                    timeout=SERVER_HANDLER_DRAIN_TIMEOUT,
-                )
-            except asyncio.TimeoutError:
+            # M1: bounded drain with hard ownership semantics — same
+            # rationale as the chat drain in ``AgentService.shutdown``.  A
+            # handler that swallows CancelledError would have left
+            # ``wait_for(gather)`` to log+continue, dismantling shared
+            # state under a live handler.  Fail closed: pending handlers at
+            # the deadline refuse teardown.
+            done, pending = await asyncio.wait(
+                active_handlers, timeout=SERVER_HANDLER_DRAIN_TIMEOUT,
+            )
+            if pending:
                 logger.error(
-                    "server shutdown: %d handler task(s) did not settle within "
-                    "%.2fs; relying on runtime close/orphan drain",
-                    sum(1 for t in active_handlers if not t.done()),
-                    SERVER_HANDLER_DRAIN_TIMEOUT,
+                    "server shutdown: %d handler task(s) did not terminate "
+                    "within %.2fs (swallowed cancellation or wedged); "
+                    "refusing to tear down shared authorities",
+                    len(pending), SERVER_HANDLER_DRAIN_TIMEOUT,
+                )
+                raise ServiceShutdownError(
+                    f"{len(pending)} handler task(s) did not terminate within "
+                    f"{SERVER_HANDLER_DRAIN_TIMEOUT}s; shared authorities "
+                    f"cannot be torn down safely"
                 )
         if "server" in locals():
             await server.wait_closed()

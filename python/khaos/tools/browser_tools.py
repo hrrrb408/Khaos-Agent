@@ -167,9 +167,13 @@ class BrowserManager:
         self, headless: bool = True, browser_type: str = "chromium"
     ) -> dict[str, Any]:
         """Start the process browser under the singleton lifecycle lock."""
-        # H1: a permanently-closed manager never relaunches.
-        if self._closed:
-            return {"ok": False, "error": "browser manager is permanently closed"}
+        # H1: the closed-state check happens INSIDE the lock (in
+        # ``_launch_locked``) so a concurrent ``close()`` cannot slip a
+        # ``_closed=True`` between the check and lock acquisition.  Checking
+        # outside the lock was a TOCTOU race: ``ensure_page`` could pass the
+        # check, then ``close`` runs and tears the browser down, then
+        # ``ensure_page`` acquires the lock and relaunches via
+        # ``_launch_locked`` which previously had no closed-state guard.
         async with self._lifecycle_lock:
             return await self._launch_locked(headless, browser_type)
 
@@ -181,7 +185,19 @@ class BrowserManager:
         Returns:
             ``{"ok": True, "browser_type": ..., "headless": ...}`` 成功；
             ``{"ok": False, "error": "..."}`` 失败（Playwright 缺失或启动报错）。
+
+        H1: the closed-state check lives here (the deepest chokepoint) so
+        every launch path — ``launch()``, ``ensure_page()``'s lazy restart,
+        any future caller — is gated by it regardless of whether the outer
+        caller remembered to check.  Must be called under
+        ``_lifecycle_lock`` so the check cannot race a concurrent
+        ``close()``.
         """
+        if self._closed:
+            return {
+                "ok": False,
+                "error": "browser manager is permanently closed",
+            }
         if not _HAS_PLAYWRIGHT:
             return {
                 "ok": False,
@@ -364,11 +380,22 @@ class BrowserManager:
         return f"{p}:{s}:{r}"
 
     async def close(self) -> dict[str, Any]:
-        """关闭浏览器和 Playwright runtime（幂等）。"""
-        # H1: once closed, the manager stays closed — a detached task
-        # cannot relaunch a fresh Browser generation after teardown.
-        self._closed = True
+        """关闭浏览器和 Playwright runtime（幂等）。
+
+        H1: ``_closed`` is set INSIDE the lock so the state transition is
+        atomic with respect to ``launch`` / ``ensure_page``.  Setting it
+        outside the lock was a TOCTOU race: a concurrent caller that had
+        already passed its own (since-removed) outer check would acquire
+        the lock next and observe ``_browser=None`` + ``_closed=True``, but
+        the previous code path still fell through to ``_launch_locked``
+        which had no closed guard.  Now ``_closed`` flip and teardown share
+        one critical section, and ``_launch_locked`` itself rejects when
+        closed — defense in depth.
+        """
         async with self._lifecycle_lock:
+            if self._closed:
+                return {"ok": True}
+            self._closed = True
             try:
                 await self._close_all_contexts()
                 if self._browser:
@@ -427,10 +454,9 @@ class BrowserManager:
         """
         # The process-wide lifecycle lock coalesces concurrent first use and
         # avoids an unbounded per-key lock registry.
-        # H1: a permanently-closed manager never serves a new page.
-        if self._closed:
-            self._last_ensure_error = "browser manager is permanently closed"
-            return None
+        # H1: the closed-state check happens INSIDE the lock (in
+        # ``_ensure_page_locked``) so a concurrent ``close()`` cannot slip
+        # a ``_closed=True`` between the check and lock acquisition.
         self._last_ensure_error = ""
         key = self._context_key(principal_id, session_id, runtime_id)
         async with self._lifecycle_lock:
@@ -447,7 +473,18 @@ class BrowserManager:
         runtime_id: str,
         network_guard: Any,
     ) -> Optional[Page]:
-        """Create or reuse a page while ``_lifecycle_lock`` is held."""
+        """Create or reuse a page while ``_lifecycle_lock`` is held.
+
+        H1: the closed-state check lives here (inside the lock) so a
+        concurrent ``close()`` that flipped ``_closed`` after the caller
+        entered ``ensure_page`` but before it acquired the lock is observed
+        here.  Without this, the ``_browser is None`` branch below would
+        fall through to ``_launch_locked`` and relaunch a fresh browser
+        generation after teardown.
+        """
+        if self._closed:
+            self._last_ensure_error = "browser manager is permanently closed"
+            return None
         entry = self._contexts.get(key)
         if entry is not None and entry.get("page") is not None:
             # H1 (lifecycle): only bump refcount for a NEW runtime_id.

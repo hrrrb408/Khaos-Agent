@@ -594,40 +594,56 @@ async def test_json_line_server_shutdown_cancels_detached_subagent_before_db(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix server lifecycle requires UDS")
-async def test_agent_shutdown_does_not_block_on_wedged_chat(tmp_path, monkeypatch):
-    """M2: a slow chat task cannot wedge server teardown indefinitely.
+async def test_agent_shutdown_fails_closed_when_chat_swallows_cancel(
+    tmp_path, monkeypatch
+):
+    """M1: a chat task that swallows ``CancelledError`` must fail teardown
+    closed — ``AgentService.shutdown`` raises ``ServiceShutdownError`` and
+    does NOT proceed to dismantle Office / Browser / Audit / DB.
 
-    A chat task that blocks past the cancellation deadline used to make
-    ``AgentService.shutdown`` hang on ``asyncio.gather`` forever.  The
-    bounded drain deadline (``CHAT_DRAIN_TIMEOUT``) lets shutdown return
-    within a predictable ceiling; the residual runtime close / orphan
-    quarantine path is the real terminal gate.
+    The round-1 fix used ``wait_for(gather)`` which on timeout raised
+    ``TimeoutError`` that the code only logged, then continued teardown
+    while the swallowing task was still running and borrowing the shared
+    authorities.  The round-2 fix uses ``asyncio.wait`` to obtain the
+    pending set and raises ``ServiceShutdownError`` when any task is still
+    pending at the deadline.
 
-    Note: the chat generator below honours cancellation (the test must be
-    deterministic across Python versions).  What it pins is that
-    ``shutdown`` itself observes the deadline even when the chat task is
-    mid-iteration, not the chat task's cancellation behaviour.
+    The chat generator below genuinely swallows cancellation forever —
+    this is the adversarial case the audit specifically called out (the
+    round-1 test watered it down to a cancellable ``Event.wait``, which
+    proved nothing about the swallowing case).
     """
+    from khaos.exceptions import ServiceShutdownError
     from khaos.runtime.factory import RuntimeResult
-    from khaos.grpc_server import CHAT_DRAIN_TIMEOUT
 
     started = asyncio.Event()
-    release = asyncio.Event()
+    force_stop = asyncio.Event()
 
-    class SlowLoop:
+    class WedgedLoop:
         async def run(self, message, session_id):
             del message, session_id
             started.set()
-            # Block until the test releases us; cancellation propagates
-            # normally through ``Event.wait``.
-            await release.wait()
+            # Adversarial wedged chat task: swallow cancellation until
+            # ``force_stop`` is set, so the (monkeypatched 0.5s) drain
+            # deadline is exceeded by a wide margin and shutdown must
+            # raise ServiceShutdownError.  Pure infinite-swallow would
+            # hang pytest-asyncio's loop teardown on Python 3.13
+            # (``_cancel_all_tasks`` awaits every task), so the swallow
+            # loop is gated on a test-controlled event.
+            while not force_stop.is_set():
+                try:
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    if not force_stop.is_set():
+                        continue
+                    raise
             if False:
                 yield None
 
     async def fake_build(self, *args, **kwargs):
         del self, args, kwargs
         return RuntimeResult(
-            loop=SlowLoop(), mode_manager=MagicMock(), task_manager=None,
+            loop=WedgedLoop(), mode_manager=MagicMock(), task_manager=None,
             skill_generator=None, tool_scheduler=MagicMock(),
             memory_manager=MagicMock(aclose=AsyncMock()),
             skill_manager=MagicMock(), new_verify_fix_loop=None,
@@ -643,30 +659,33 @@ async def test_agent_shutdown_does_not_block_on_wedged_chat(tmp_path, monkeypatc
     await service.start()
 
     chat_task = asyncio.create_task(_drain_chat(service))
-    # Make sure the chat task is actually inside its runtime before we
-    # tear the service down — otherwise the test exercises nothing.
     await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    # Shrink the ceiling so the test doesn't wait the production 10s.
+    monkeypatch.setattr("khaos.grpc_server.CHAT_DRAIN_TIMEOUT", 0.5)
 
     loop = asyncio.get_running_loop()
     start = loop.time()
-    # Temporarily shrink the ceiling so the test doesn't wait the full
-    # production 10s.  ``shutdown`` reads CHAT_DRAIN_TIMEOUT at call time
-    # from the module attribute, so monkeypatching it inline is enough.
-    monkeypatch.setattr(
-        "khaos.grpc_server.CHAT_DRAIN_TIMEOUT", 0.5
-    )
-    try:
+    # shutdown must NOT hang (the wedged task would have made the old
+    # wait_for(gather) return silently after timeout), and must NOT
+    # proceed to teardown — it must raise ServiceShutdownError so the
+    # caller observes the failure and the shared authorities stay alive.
+    with pytest.raises(ServiceShutdownError, match="did not terminate"):
         await asyncio.wait_for(service.shutdown(), timeout=5.0)
-    except asyncio.TimeoutError:
-        pytest.fail("AgentService.shutdown hung past its drain deadline")
     elapsed = loop.time() - start
-    # shutdown returned within the (monkeypatched) ceiling + slack for
-    # the subsequent runtime close / orphan drain.  Must not hang.
-    assert elapsed < 4.0
-    release.set()
-    # The chat task was cancelled during shutdown; let it finish cleanly.
+    # Observed within the drain ceiling + modest slack — not hung.
+    assert elapsed < 4.0, f"shutdown took {elapsed:.2f}s, expected ~0.5s"
+    assert service.shutdown_failed is True
+
+    # Cleanup: signal the wedged chat task to stop swallowing, then
+    # cancel + await it so it terminates cleanly on both Python 3.11
+    # and 3.13 (otherwise pytest-asyncio's loop teardown would hang on
+    # the still-swallowing task).  db close lets the aiosqlite worker
+    # thread exit.
+    force_stop.set()
+    chat_task.cancel()
     try:
-        await asyncio.wait_for(chat_task, timeout=2.0)
+        await asyncio.wait_for(chat_task, timeout=5.0)
     except (asyncio.TimeoutError, asyncio.CancelledError):
         pass
     await db.close()

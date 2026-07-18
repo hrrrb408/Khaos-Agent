@@ -9,7 +9,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
-from khaos.exceptions import SubAgentLimitError, ToolNotFoundError
+from khaos.exceptions import ServiceShutdownError, SubAgentLimitError, ToolNotFoundError
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +78,15 @@ class SubAgentSpawner:
         # detached RPC caller cannot keep the spawner alive while the server
         # is tearing shared authorities (Office / Browser / Audit / DB) down.
         self._shutting_down: bool = False
+        # M2: serialize spawn vs shutdown so a spawn that has passed its
+        # _shutting_down check and is mid-DB-await cannot be missed by a
+        # concurrent shutdown's _active_tasks snapshot (which would leave
+        # the spawned task as an untracked orphan still borrowing shared
+        # authorities).  Both operations hold this lock across the whole
+        # critical section: spawn from its shutdown-check through inserting
+        # the new task into _active_tasks; shutdown from flipping
+        # _shutting_down through snapshotting _active_tasks.
+        self._spawn_lock: asyncio.Lock = asyncio.Lock()
 
     @property
     def active_count(self) -> int:
@@ -112,44 +121,53 @@ class SubAgentSpawner:
         - ``allow_nesting=False``（默认）：只允许 ``depth == 1``，任何 ``depth > 1``
           都被拒绝（沿用 ADR-002 的单层语义）。
         - ``allow_nesting=True``：允许嵌套，但仍受 ``max_spawn_depth`` 上限约束。
+
+        M2: the whole critical section (shutdown check → depth/concurrency
+        validation → DB insert → ``_active_tasks`` registration) is wrapped
+        in ``_spawn_lock`` so a concurrent ``shutdown()`` cannot snapshot
+        ``_active_tasks`` between this spawn's check and registration.  That
+        race used to leak an orphan task that borrowed shared authorities
+        (Office / Browser / Audit / DB) without any shutdown authority over
+        it.
         """
-        # H1: reject new work the moment shutdown begins.  A detached RPC
-        # caller (one whose ``Spawn`` handler already returned) cannot keep
-        # registering new background tasks while the server is dismantling
-        # shared authorities.
-        if self._shutting_down:
-            raise SubAgentLimitError("subagent spawner is shutting down")
-        if task.depth > 1 and not self.config.allow_nesting:
-            raise SubAgentLimitError(
-                f"subagents cannot spawn nested subagents "
-                f"(depth={task.depth}, nesting disabled)"
+        async with self._spawn_lock:
+            # H1: reject new work the moment shutdown begins.  A detached RPC
+            # caller (one whose ``Spawn`` handler already returned) cannot
+            # keep registering new background tasks while the server is
+            # dismantling shared authorities.
+            if self._shutting_down:
+                raise SubAgentLimitError("subagent spawner is shutting down")
+            if task.depth > 1 and not self.config.allow_nesting:
+                raise SubAgentLimitError(
+                    f"subagents cannot spawn nested subagents "
+                    f"(depth={task.depth}, nesting disabled)"
+                )
+            if task.depth > self.config.max_spawn_depth:
+                raise SubAgentLimitError(
+                    f"subagent nesting exceeds configured depth "
+                    f"(depth={task.depth} > max={self.config.max_spawn_depth})"
+                )
+            if self.active_count >= self.config.max_concurrent:
+                raise SubAgentLimitError(f"并发数已达上限 ({self.config.max_concurrent})")
+            self._ensure_task_id(task)
+            self._validate_tools(task)
+            task.status = "running"
+            self._tasks[task.id] = task
+            await self.db.create_session(task.parent_session_id)
+            await self.db.insert_subagent_task(
+                task.id,
+                task.parent_session_id,
+                task.goal,
+                task.context,
+                json.dumps(task.tools),
+                task.status,
+                # B1: persist the principal so list_subagent_tasks(principal_id)
+                # can filter rows on disk, not just in-memory.
+                task.principal_id,
             )
-        if task.depth > self.config.max_spawn_depth:
-            raise SubAgentLimitError(
-                f"subagent nesting exceeds configured depth "
-                f"(depth={task.depth} > max={self.config.max_spawn_depth})"
-            )
-        if self.active_count >= self.config.max_concurrent:
-            raise SubAgentLimitError(f"并发数已达上限 ({self.config.max_concurrent})")
-        self._ensure_task_id(task)
-        self._validate_tools(task)
-        task.status = "running"
-        self._tasks[task.id] = task
-        await self.db.create_session(task.parent_session_id)
-        await self.db.insert_subagent_task(
-            task.id,
-            task.parent_session_id,
-            task.goal,
-            task.context,
-            json.dumps(task.tools),
-            task.status,
-            # B1: persist the principal so list_subagent_tasks(principal_id)
-            # can filter rows on disk, not just in-memory.
-            task.principal_id,
-        )
-        async_task = asyncio.create_task(self._run_task(task))
-        self._active_tasks[task.id] = async_task
-        async_task.add_done_callback(lambda _: self._active_tasks.pop(task.id, None))
+            async_task = asyncio.create_task(self._run_task(task))
+            self._active_tasks[task.id] = async_task
+            async_task.add_done_callback(lambda _: self._active_tasks.pop(task.id, None))
         return task
 
     async def spawn_batch(self, tasks: list[SubAgentTask]) -> list[SubAgentTask]:
@@ -273,38 +291,41 @@ class SubAgentSpawner:
         DB while detached subagent runs were still in-flight — those runs
         borrow exactly those shared authorities.
 
-        Ordering:
+        M2: the ``_shutting_down`` flip and ``_active_tasks`` snapshot are
+        performed while holding ``_spawn_lock``, so a concurrent ``spawn()``
+        cannot register a new task after the snapshot is taken (leaking an
+        orphan) — spawn either sees ``_shutting_down=True`` and aborts, or
+        its registration precedes the snapshot and is included.
 
-        1.  Set ``_shutting_down`` so further ``spawn()`` is rejected.
-        2.  Snapshot ``_active_tasks`` and cancel each.
-        3.  Wait (bounded) for every cancelled task to finish.  Each
-            ``_run_task`` re-raises ``CancelledError`` AFTER persisting a
-            ``failed/cancelled`` terminal row, and each ``SubAgentRunner``
-            ``finally`` block calls ``close_runtime_or_register`` so the
-            borrowed runtime lands in the orphan registry for the server's
-            ``drain_orphan_runtimes`` to boundedly retry.
-        4.  On timeout: log and return (do NOT raise).  The orphan drain
-            phase still owns the runtime references and is the fail-safe
-            boundary — raising here would let the caller skip the Office /
-            Browser / Audit teardown that still needs to run.
+        M1: the bounded wait uses ``asyncio.wait`` to obtain the pending
+        set.  If any task is still pending when the deadline expires (e.g.
+        a task that swallows ``CancelledError``), this method raises
+        ``ServiceShutdownError`` rather than silently returning — the
+        caller must NOT proceed to dismantle shared authorities that the
+        residual task still borrows.  This is the fail-closed fix for the
+        ``wait_for(gather)`` variant, which on timeout left the swallowing
+        task running while teardown continued.
         """
-        self._shutting_down = True
-        snapshot = list(self._active_tasks.values())
+        async with self._spawn_lock:
+            self._shutting_down = True
+            snapshot = list(self._active_tasks.values())
         for task in snapshot:
             task.cancel()
         if not snapshot:
             return
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*snapshot, return_exceptions=True),
-                timeout=timeout,
-            )
-        except asyncio.TimeoutError:
+        done, pending = await asyncio.wait(snapshot, timeout=timeout)
+        if pending:
+            unfinished = len(pending)
             logger.error(
-                "subagent spawner shutdown: %d task(s) did not settle within "
-                "%.2fs; relying on orphan drain for the residual runtime(s)",
-                sum(1 for t in snapshot if not t.done()),
+                "subagent spawner shutdown: %d task(s) did not terminate "
+                "within %.2fs (swallowed cancellation or wedged); refusing "
+                "to release shared authority ownership",
+                unfinished,
                 timeout,
+            )
+            raise ServiceShutdownError(
+                f"{unfinished} subagent task(s) did not terminate within "
+                f"{timeout}s; shared authorities cannot be torn down safely"
             )
 
     async def collect_results(self, principal_id: str = "") -> list[str]:
