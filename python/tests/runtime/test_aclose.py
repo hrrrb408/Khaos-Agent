@@ -220,6 +220,8 @@ async def test_closed_field_is_not_bound_by_positional_construction():
     # The init signature must still accept the real components in order.
     # H5: ``session_id`` + ``runtime_id`` extend the per-session
     # BrowserContext key and must be in the init signature.
+    # H2: ``audit_logger`` is stored on RuntimeResult so ``aclose`` can
+    # close its file descriptor — added after ``runtime_id``.
     assert init_params == [
         "self",
         "loop",
@@ -236,7 +238,142 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "principal_id",
         "session_id",
         "runtime_id",
+        "audit_logger",
     ]
+
+
+# ───────────────────────── H2: audit logger close ──────────────────────────
+
+
+async def test_aclose_invokes_audit_logger_close():
+    """H2: ``aclose()`` must call ``audit_logger.close()`` so the file
+    descriptor is released — without this, configuring a file audit path
+    would leak the fd for the process's lifetime.
+
+    The close is best-effort and happens LAST (after every other
+    component has shut down) because audit logging may be needed during
+    component shutdown.
+    """
+    audit = MagicMock()
+    audit.close = MagicMock()
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        audit_logger=audit,
+    )
+    await result.aclose()
+    audit.close.assert_called_once()
+
+
+async def test_aclose_audit_logger_close_is_best_effort():
+    """H2: a failure in ``audit_logger.close()`` must NOT set
+    ``_close_failed=True`` — the audit fd is reclaimed by the OS on
+    process exit, so a close failure is not safety-critical.
+    """
+    audit = MagicMock()
+    audit.close = MagicMock(side_effect=RuntimeError("close boom"))
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        audit_logger=audit,
+    )
+    # Must not raise — audit close failure is best-effort.
+    await result.aclose()
+    assert result._closed is True
+    assert result._close_failed is False
+
+
+# ───────────────────────── H3: orphan-cleanup registry ────────────────────
+
+
+async def test_orphan_cleanup_registry_retries_failed_runtime():
+    """H3: a runtime that fails ``aclose()`` can be registered as an
+    orphan and ``cleanup_orphan_runtimes()`` will retry it.
+
+    The retry resets ``_close_failed`` so the orphan gets a fresh
+    3-attempt auto-retry cycle (``aclose`` returns immediately when
+    ``_close_failed`` is True to prevent concurrent callers from
+    re-running the retries — see H4).
+    """
+    from khaos.runtime.factory import (
+        cleanup_orphan_runtimes,
+        register_orphan_runtime,
+    )
+    from khaos.exceptions import RuntimeCloseError
+
+    office = MagicMock()
+    office.shutdown = AsyncMock(side_effect=RuntimeError("persistent failure"))
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        office_authority=office,
+    )
+    with pytest.raises(RuntimeCloseError):
+        await result.aclose()
+    # Register as orphan — the registry retains the runtime's component
+    # references so they are not silently leaked.
+    register_orphan_runtime(result)
+    # Cleanup retries — still fails, so the orphan remains.
+    remaining = await cleanup_orphan_runtimes()
+    assert remaining >= 1
+    # Now fix the office shutdown and retry — the orphan is removed.
+    office.shutdown = AsyncMock()
+    remaining = await cleanup_orphan_runtimes()
+    assert remaining == 0
+
+
+# ───────────────────────── H4: concurrent aclose lock ──────────────────────
+
+
+async def test_concurrent_aclose_callers_do_not_create_multiple_close_tasks():
+    """H4: when two concurrent ``aclose()`` callers race on a failing
+    close, only ONE close task is created at a time — the second caller
+    waits on the lock and sees the result of the first.
+
+    Without the lock, both callers would resume simultaneously when the
+    shared ``_close_task`` failed, each create a new ``_close_task``,
+    and run shutdown on the same components multiple times concurrently.
+    """
+    import asyncio
+    from khaos.exceptions import RuntimeCloseError
+
+    office = MagicMock()
+    office.shutdown = AsyncMock(side_effect=RuntimeError("boom"))
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        office_authority=office,
+    )
+    # Two concurrent aclose() calls.
+    with pytest.raises(RuntimeCloseError):
+        await asyncio.gather(result.aclose(), result.aclose())
+    # Each retry attempt called office.shutdown ONCE (3 attempts total),
+    # NOT 6 (which would happen if both callers created separate tasks).
+    assert office.shutdown.await_count == 3
 
 
 

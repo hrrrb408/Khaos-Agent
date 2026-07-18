@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import uuid
@@ -112,6 +113,12 @@ class RuntimeResult:
     principal_id: str = ""
     session_id: str = ""
     runtime_id: str = ""
+    # H2: the AuditLogger is stored here so ``aclose()`` can close its file
+    # descriptor — without this, configuring a file audit path would leak
+    # the fd for the process's lifetime.  Closed LAST in ``_run_close``
+    # (after every other component) because audit logging may be needed
+    # during component shutdown (e.g. to record the shutdown itself).
+    audit_logger: AuditLogger | None = None
     # B1: ``init=False`` so positional construction can never accidentally
     # bind a real component into ``_closed`` (which previously made
     # ``aclose()`` a no-op because the truthy component short-circuited it).
@@ -127,6 +134,13 @@ class RuntimeResult:
     _close_task: Any = field(default=None, init=False)
     _closed: bool = field(default=False, init=False)
     _close_failed: bool = field(default=False, init=False)
+    # H4: serializes the aclose() retry logic so concurrent callers don't
+    # each create a separate ``_close_task`` (which would run shutdown on
+    # the same components multiple times concurrently).  ``init=False`` so
+    # positional construction can never bind a component into it, and
+    # ``default_factory`` so each RuntimeResult gets its own Lock without
+    # being passed explicitly.
+    _close_lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
 
     async def aclose(self) -> None:
         """Release runtime-owned resources; database ownership stays with caller.
@@ -157,82 +171,116 @@ class RuntimeResult:
         built in so transient component failures don't propagate to the
         user.
 
+        H4: an ``asyncio.Lock`` serializes the retry loop so concurrent
+        ``aclose()`` callers don't each create a separate ``_close_task``
+        (which would run shutdown on the same components multiple times
+        concurrently).  Other callers wait on the lock, then see
+        ``_closed=True`` (if the first caller succeeded) or
+        ``_close_failed=True`` (if it exhausted retries) and return
+        without re-running the retries.  The orphan-cleanup registry
+        (``cleanup_orphan_runtimes``) resets ``_close_failed`` before
+        retrying so a persistently-failing runtime gets a fresh attempt
+        cycle.
+
         H1: releases the principal's per-session ``BrowserContext`` so
         cookies / DOM / page state cannot leak into a subsequent run by
         a different principal sharing the same process-wide BrowserManager.
         """
         import asyncio as _asyncio
 
-        # Already fully closed — nothing to do.
+        # Already fully closed — nothing to do (fast path, no lock).
         if self._closed:
             return
-        # H4: limited auto-retry so transient component failures are
-        # retried in-line; only persistent failures surface to the caller.
-        max_attempts = 3
-        for attempt in range(1, max_attempts + 1):
-            # A close task is already in flight — wait on the SAME task so
-            # concurrent callers don't return before cleanup finishes.
-            # H4: if the task was cancelled/raised, ``_run_close``'s finally
-            # clears ``_close_task`` (so a retry creates a fresh task).  In
-            # that case we fall through to the create-task path below.
-            if self._close_task is not None:
+        # H4: serialize the retry logic so concurrent callers don't each
+        # create a separate ``_close_task``.  The lock is held for the
+        # entire retry loop; other callers wait, then observe the terminal
+        # state set by the first caller.
+        async with self._close_lock:
+            # Re-check _closed inside the lock — another caller may have
+            # completed the close while we were waiting on the lock.
+            if self._closed:
+                return
+            # H4: a previous caller already exhausted the auto-retries.
+            # Don't re-run them — the caller is expected to register the
+            # runtime with the orphan-cleanup registry for further retries
+            # (``cleanup_orphan_runtimes`` resets ``_close_failed`` before
+            # retrying).  Returning here (rather than raising) means a
+            # concurrent caller that was waiting on the lock observes the
+            # first caller's ``RuntimeCloseError`` via ``asyncio.gather``
+            # and doesn't re-run the retries itself.
+            if self._close_failed:
+                return
+            # H4: limited auto-retry so transient component failures are
+            # retried in-line; only persistent failures surface to the caller.
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                # A close task is already in flight — wait on the SAME task so
+                # concurrent callers don't return before cleanup finishes.
+                # H4: if the task was cancelled/raised, ``_run_close``'s
+                # finally clears ``_close_task`` (so a retry creates a fresh
+                # task).  In that case we fall through to the create-task
+                # path below.
+                if self._close_task is not None:
+                    try:
+                        await _asyncio.shield(self._close_task)
+                    except _asyncio.CancelledError:
+                        # Either the caller was cancelled (propagate) or the
+                        # close task itself was cancelled (``_close_task`` is
+                        # now None — fall through to retry).  Distinguish by
+                        # checking ``_close_task``: if it's None, the task
+                        # cleared itself.
+                        if self._close_task is None:
+                            # H4: the in-flight close task was self-cancelled;
+                            # fall through to create a fresh task and retry.
+                            pass
+                        else:
+                            # The caller was cancelled while the close task is
+                            # still running; propagate the cancellation.
+                            raise
+                    else:
+                        # The in-flight task finished (success or component
+                        # failure).  If ``_closed`` is still False, the task
+                        # cleared ``_close_task`` so we can retry.
+                        if self._closed or self._close_task is not None:
+                            return
+                        # H4: ``_close_task`` was cleared by the failed path —
+                        # fall through to retry.
+                if self._closed:
+                    return
+                # Create the shared cleanup task and shield it so a
+                # cancellation of the *caller* does not abort the cleanup
+                # itself.
+                self._close_task = _asyncio.ensure_future(self._run_close())
                 try:
                     await _asyncio.shield(self._close_task)
                 except _asyncio.CancelledError:
-                    # Either the caller was cancelled (propagate) or the close
-                    # task itself was cancelled (``_close_task`` is now None —
-                    # fall through to retry).  Distinguish by checking
-                    # ``_close_task``: if it's None, the task cleared itself.
-                    if self._close_task is None:
-                        # H4: the in-flight close task was self-cancelled;
-                        # fall through to create a fresh task and retry.
-                        pass
-                    else:
-                        # The caller was cancelled while the close task is
-                        # still running; propagate the cancellation.
-                        raise
-                else:
-                    # The in-flight task finished (success or component
-                    # failure).  If ``_closed`` is still False, the task
-                    # cleared ``_close_task`` so we can retry.
-                    if self._closed or self._close_task is not None:
-                        return
-                    # H4: ``_close_task`` was cleared by the failed path —
-                    # fall through to retry.
-            if self._closed:
-                return
-            # Create the shared cleanup task and shield it so a cancellation
-            # of the *caller* does not abort the cleanup itself.
-            self._close_task = _asyncio.ensure_future(self._run_close())
-            try:
-                await _asyncio.shield(self._close_task)
-            except _asyncio.CancelledError:
-                # The caller was cancelled, but the cleanup task keeps running.
-                # Re-raise so the caller's cancellation propagates; a subsequent
-                # aclose() will await the still-running task (or, if the task
-                # self-cancelled and cleared ``_close_task``, create a fresh one).
-                raise
-            # Check terminal state after the task completed.
-            if self._closed:
-                return
-            # H4: ``_close_failed`` is set — retry if attempts remain.
-            if attempt < max_attempts and self._close_failed:
-                logger.warning(
-                    "runtime aclose attempt %d/%d failed; retrying",
-                    attempt, max_attempts,
-                )
-                continue
-            # H4: all retries exhausted — raise so the caller observes the
-            # failure and can escalate (e.g. register with the server's
-            # orphan-cleanup registry).
-            if self._close_failed:
-                raise RuntimeCloseError(
-                    f"runtime cleanup failed after {max_attempts} attempts; "
-                    f"safety-critical components may not have reached a "
-                    f"terminal state — principal={self.principal_id} "
-                    f"session={self.session_id} runtime={self.runtime_id}"
-                )
-            break
+                    # The caller was cancelled, but the cleanup task keeps
+                    # running.  Re-raise so the caller's cancellation
+                    # propagates; a subsequent aclose() will await the
+                    # still-running task (or, if the task self-cancelled and
+                    # cleared ``_close_task``, create a fresh one).
+                    raise
+                # Check terminal state after the task completed.
+                if self._closed:
+                    return
+                # H4: ``_close_failed`` is set — retry if attempts remain.
+                if attempt < max_attempts and self._close_failed:
+                    logger.warning(
+                        "runtime aclose attempt %d/%d failed; retrying",
+                        attempt, max_attempts,
+                    )
+                    continue
+                # H4: all retries exhausted — raise so the caller observes
+                # the failure and can escalate (register with the
+                # orphan-cleanup registry via ``register_orphan_runtime``).
+                if self._close_failed:
+                    raise RuntimeCloseError(
+                        f"runtime cleanup failed after {max_attempts} attempts; "
+                        f"safety-critical components may not have reached a "
+                        f"terminal state — principal={self.principal_id} "
+                        f"session={self.session_id} runtime={self.runtime_id}"
+                    )
+                break
 
     async def _run_close(self) -> None:
         """Run the actual cleanup; idempotent and failure-tolerant.
@@ -323,6 +371,21 @@ class RuntimeResult:
                         "browser runtime close failed for runtime %s",
                         self.runtime_id,
                         exc_info=True,
+                    )
+            # H2: close the AuditLogger LAST — audit logging may be needed
+            # during component shutdown (e.g. to record the shutdown event
+            # itself), so the file descriptor must remain open until every
+            # other component has settled.  Best-effort: a close failure
+            # does NOT set ``_close_failed`` (audit logger close is not
+            # safety-critical — the OS reclaims the fd on process exit).
+            if self.audit_logger is not None:
+                try:
+                    close_method = getattr(self.audit_logger, "close", None)
+                    if close_method is not None:
+                        close_method()
+                except Exception:
+                    logger.debug(
+                        "audit logger close failed", exc_info=True
                     )
             # H3: only mark closed when every safety-critical component
             # reached a terminal state.  A component failure sets
@@ -447,6 +510,13 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
             ),
             blocked_domains=list(effective_policy.network_blocked_domains),
         )
+    # H2: resolve the AuditLogger BEFORE the scheduler block so it is in
+    # scope for both the ``cfg.tool_scheduler is None`` branch (where it
+    # is wired into the SecurityMiddleware) AND the RuntimeResult at the
+    # end (where it is stored so ``aclose`` can close its fd).  Previously
+    # the variable was only assigned inside the ``if scheduler is None``
+    # block, so RuntimeResult couldn't reference it — the fd leaked.
+    audit_logger = cfg.audit_logger
     scheduler = cfg.tool_scheduler
     if scheduler is None:
         # B1: when a tool allowlist is configured (SubAgent path), prune the
@@ -468,7 +538,6 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # outside the server.  Now every entry point uses the same trust
         # boundary (H2: ``resolve_safe_audit_log_path`` constrains the path
         # to ``~/.khaos/audit/`` with O_NOFOLLOW + owner/mode checks).
-        audit_logger = cfg.audit_logger
         if audit_logger is None and effective_policy.audit_enabled:
             audit_logger = AuditLogger(
                 cfg.db,
@@ -539,4 +608,79 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # per-session BrowserContext keyed by (principal, session, runtime).
         session_id=cfg.session_id,
         runtime_id=cfg.runtime_id,
+        # H2: carry the AuditLogger so ``aclose`` can close its fd —
+        # without this, configuring a file audit path would leak the fd
+        # for the process's lifetime.
+        audit_logger=audit_logger,
     )
+
+
+# ──────────────────────── H3: orphan-cleanup registry ────────────────────────
+#
+# H3: when a runtime's ``aclose()`` exhausts its 3 auto-retries and raises
+# ``RuntimeCloseError``, the production caller (AgentService / SubAgentRunner)
+# is expected to catch the exception and call ``register_orphan_runtime``
+# so the runtime's component references are not silently leaked.  The
+# registry is a module-level list — ``cleanup_orphan_runtimes`` iterates it
+# and retries ``aclose()`` on each orphan, removing the ones that succeed.
+# This closes the gap where a persistently-failing runtime's resources
+# (file descriptors, Office mutation fences, BrowserContexts) were lost
+# because the caller discarded the runtime reference after the exception.
+
+_orphan_runtimes: list[RuntimeResult] = []
+
+
+def register_orphan_runtime(runtime: RuntimeResult) -> None:
+    """Register a runtime whose ``aclose()`` failed as an orphan.
+
+    H3: production callers should call this in the ``except`` clause
+    when ``RuntimeCloseError`` is raised from ``runtime.aclose()`` so the
+    runtime's component references are retained for a later retry via
+    ``cleanup_orphan_runtimes()``.  Without this, the runtime's file
+    descriptors / Office mutation fences / BrowserContexts would be
+    silently leaked because the caller discarded the reference.
+
+    Idempotent: registering the same runtime twice is a no-op (the
+    registry deduplicates by identity).
+    """
+    for existing in _orphan_runtimes:
+        if existing is runtime:
+            return
+    _orphan_runtimes.append(runtime)
+
+
+async def cleanup_orphan_runtimes() -> int:
+    """Retry ``aclose()`` on every registered orphan; remove the ones
+    that succeed.
+
+    H3: iterates ``_orphan_runtimes``, resets ``_close_failed`` /
+    ``_close_task`` on each orphan (so it gets a FRESH 3-attempt
+    auto-retry cycle — ``aclose()`` returns immediately when
+    ``_close_failed`` is True to prevent concurrent callers from
+    re-running the retries, see H4), then calls ``aclose()``.  Orphans
+    that succeed (``_closed`` becomes True) are removed; orphans that
+    raise ``RuntimeCloseError`` again are kept for a future retry.
+
+    Returns the count of remaining orphans.
+    """
+    remaining: list[RuntimeResult] = []
+    for runtime in _orphan_runtimes:
+        # H4: reset the exhaustion flag so the orphan gets a fresh
+        # 3-attempt auto-retry cycle.  ``aclose()`` returns immediately
+        # when ``_close_failed`` is True (to prevent concurrent callers
+        # from re-running the retries), so we MUST clear it here.
+        runtime._close_failed = False
+        runtime._close_task = None
+        try:
+            await runtime.aclose()
+        except RuntimeCloseError:
+            # Still failing — keep the orphan for a future retry.
+            remaining.append(runtime)
+            continue
+        if not runtime._closed:
+            # aclose returned without raising but didn't close (defensive
+            # — shouldn't happen after the reset above, but keep the
+            # orphan so a future retry can pick it up).
+            remaining.append(runtime)
+    _orphan_runtimes[:] = remaining
+    return len(_orphan_runtimes)
