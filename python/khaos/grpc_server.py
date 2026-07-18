@@ -68,6 +68,14 @@ logger = logging.getLogger(__name__)
 
 RPC_MAX_REQUEST_BYTES = 1024 * 1024
 RPC_AUTH_WINDOW_SECONDS = 30
+# M2: bounded shutdown deadlines so a stuck handler / chat / detached
+# subagent task cannot wedge server teardown.  These are fail-safe
+# ceilings — the underlying close/orphan-drain phases still enforce the
+# real terminal-state contracts (``ServiceShutdownError`` surfaces a
+# quarantined runtime; the caller never observes a silent partial close).
+SERVER_HANDLER_DRAIN_TIMEOUT = 5.0   # connection handler tasks
+CHAT_DRAIN_TIMEOUT = 10.0            # active AgentService chat tasks
+SUBAGENT_SHUTDOWN_TIMEOUT = 30.0     # detached SubAgent background tasks
 
 
 def _load_rpc_capability() -> str:
@@ -337,7 +345,23 @@ class AgentService:
         for task in active_tasks:
             task.cancel()
         if active_tasks:
-            await asyncio.gather(*active_tasks, return_exceptions=True)
+            # M2: bounded drain so a handler that swallows CancelledError or
+            # otherwise wedges cannot block teardown forever.  This is
+            # fail-safe — a stuck chat still has its RuntimeResult in
+            # ``_active_runtimes``; the subsequent close-or-quarantine +
+            # ``drain_orphan_runtimes`` phases are the real terminal gate.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*active_tasks, return_exceptions=True),
+                    timeout=CHAT_DRAIN_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "agent shutdown: %d chat task(s) did not settle within "
+                    "%.2fs; relying on runtime close/orphan drain",
+                    sum(1 for t in active_tasks if not t.done()),
+                    CHAT_DRAIN_TIMEOUT,
+                )
 
         # Defensive ownership pass: a handler cancellation must normally run
         # chat's finally block, but retain/close anything still registered.
@@ -1059,9 +1083,33 @@ async def serve_json_lines(
         for task in active_handlers:
             task.cancel()
         if active_handlers:
-            await asyncio.gather(*active_handlers, return_exceptions=True)
+            # M2: bounded drain.  A wedged connection handler used to be
+            # able to block teardown indefinitely.  The remaining runtime
+            # owners are still registered and will be closed or quarantined
+            # by ``AgentService.shutdown`` below.
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*active_handlers, return_exceptions=True),
+                    timeout=SERVER_HANDLER_DRAIN_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "server shutdown: %d handler task(s) did not settle within "
+                    "%.2fs; relying on runtime close/orphan drain",
+                    sum(1 for t in active_handlers if not t.done()),
+                    SERVER_HANDLER_DRAIN_TIMEOUT,
+                )
         if "server" in locals():
             await server.wait_closed()
+        # H1: detached SubAgent background tasks must be torn down BEFORE
+        # the shared Office / Browser / Audit / DB authorities.  SubAgent
+        # runs borrow all four; without this gate the server could close
+        # them under a live task.  ``SubAgentRunner.run`` finally-block
+        # already calls ``close_runtime_or_register``, so the cancelled
+        # runtimes land in the orphan registry for the bounded drain inside
+        # ``AgentService.shutdown``.
+        if subagent_service is not None:
+            await subagent_service.shutdown(timeout=SUBAGENT_SHUTDOWN_TIMEOUT)
         # Only after every handler/runtime is terminal may the service close
         # Office/Audit ownership.  A shutdown failure intentionally prevents
         # premature database close and remains observable to the caller.

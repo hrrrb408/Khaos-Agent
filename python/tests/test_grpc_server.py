@@ -485,7 +485,191 @@ async def test_json_line_server_shutdown_closes_active_chat_before_database(
     socket_parent.rmdir()
 
 
-async def test_memory_service_crud_search(tmp_path):
+@pytest.mark.skipif(os.name == "nt", reason="Unix server lifecycle requires UDS")
+async def test_json_line_server_shutdown_cancels_detached_subagent_before_db(
+    tmp_path, monkeypatch
+):
+    """H1: cancelling the real server tears down detached SubAgent tasks.
+
+    ``SubAgentService.Spawn`` returns ``running`` while the Spawner runs the
+    task on a detached background ``asyncio.Task``.  Previously the server's
+    shutdown sequence cancelled connection handlers and chat tasks but
+    never the detached subagent tasks — so Office / Browser / Audit / DB
+    could be dismantled under a live run.  This test pins the contract that
+    shutdown drains the spawner BEFORE the database closes.
+    """
+    import khaos.grpc_server as grpc_module
+    from khaos.subagents.service import SubAgentService
+    from khaos.subagents.spawner import SubAgentConfig, SubAgentSpawner, SubAgentTask
+
+    captured_spawners: list[SubAgentSpawner] = []
+    release = asyncio.Event()
+
+    async def blocking_runner(task: SubAgentTask) -> str:
+        await release.wait()
+        return "should-not-reach"
+
+    async def fake_build_subagent_service(db, project_root, config_path, **kwargs):
+        # Bypass the full runner wiring — we only need a real Spawner so we
+        # can assert shutdown authority over its detached task.
+        spawner = SubAgentSpawner(
+            SubAgentConfig(), db, runner=blocking_runner,
+        )
+        captured_spawners.append(spawner)
+        return SubAgentService(spawner, runner=None)
+
+    monkeypatch.setattr(
+        grpc_module, "_build_subagent_service", fake_build_subagent_service
+    )
+
+    socket_parent = Path("/tmp") / f"ksubagent-{uuid.uuid4().hex[:10]}"
+    socket_parent.mkdir(mode=0o700)
+    socket_path = socket_parent / "agent.sock"
+    server_task = asyncio.create_task(
+        serve_json_lines(
+            str(socket_path), str(tmp_path / "server.db"),
+            project_root=tmp_path, gateway_capability="c" * 48,
+            enable_subagents=True,
+        )
+    )
+    for _ in range(200):
+        if socket_path.exists() or server_task.done():
+            break
+        await asyncio.sleep(0.01)
+    if server_task.done():
+        try:
+            await server_task
+        except (PermissionError, OSError) as exc:
+            socket_parent.rmdir()
+            pytest.skip(f"sandbox does not allow lifecycle UDS: {exc}")
+    try:
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+    except (PermissionError, OSError) as exc:
+        server_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await server_task
+        socket_parent.rmdir()
+        pytest.skip(f"sandbox does not allow lifecycle UDS: {exc}")
+
+    try:
+        request = _signed_rpc_request(
+            "SubAgentService.Spawn",
+            {"goal": "block", "context": "", "tools": [], "principal_id": "gateway"},
+        )
+        writer.write((json.dumps(request) + "\n").encode("utf-8"))
+        await writer.drain()
+        # Wait for the spawn RPC reply AND the detached task to register.
+        line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+        reply = json.loads(line.decode("utf-8"))
+        assert reply["ok"] is True, reply
+        assert captured_spawners, "subagent service was never built"
+        spawner = captured_spawners[0]
+        for _ in range(200):
+            if spawner._active_tasks:
+                break
+            await asyncio.sleep(0.01)
+        assert spawner._active_tasks, "detached task never registered"
+
+        # Cancel the server.  Its finally-block must shut the spawner down
+        # (cancelling + awaiting the detached task) before the DB closes.
+        server_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(server_task, timeout=15.0)
+    finally:
+        writer.close()
+        try:
+            await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+        except (asyncio.TimeoutError, ConnectionError, OSError):
+            pass
+        release.set()
+        try:
+            socket_parent.rmdir()
+        except OSError:
+            pass
+
+    # The detached task must have been drained; the spawner is closed.
+    assert spawner._active_tasks == {}
+    assert spawner._shutting_down is True
+    assert not socket_path.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix server lifecycle requires UDS")
+async def test_agent_shutdown_does_not_block_on_wedged_chat(tmp_path, monkeypatch):
+    """M2: a wedged chat task cannot wedge server teardown indefinitely.
+
+    A chat task that swallows ``CancelledError`` used to make
+    ``AgentService.shutdown`` block on ``asyncio.gather`` forever.  The
+    bounded drain deadline lets shutdown surface the failure via the
+    existing runtime close / orphan quarantine path instead.
+    """
+    from khaos.runtime.factory import RuntimeResult
+    from khaos.grpc_server import CHAT_DRAIN_TIMEOUT
+
+    never = asyncio.Event()
+
+    class WedgedLoop:
+        async def run(self, message, session_id):
+            del message, session_id
+            # Swallow cancellation so gather() would hang without the
+            # bounded deadline.
+            while True:
+                try:
+                    await never.wait()
+                except asyncio.CancelledError:
+                    continue
+                if False:
+                    yield None
+
+    async def fake_build(self, *args, **kwargs):
+        del self, args, kwargs
+        return RuntimeResult(
+            loop=WedgedLoop(), mode_manager=MagicMock(), task_manager=None,
+            skill_generator=None, tool_scheduler=MagicMock(),
+            memory_manager=MagicMock(aclose=AsyncMock()),
+            skill_manager=MagicMock(), new_verify_fix_loop=None,
+            owns_office_authority=False,
+        )
+
+    monkeypatch.setattr(AgentService, "_build_runtime", fake_build)
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    await service.start()
+
+    chat_task = asyncio.create_task(
+        _drain_chat(service)
+    )
+    try:
+        loop = asyncio.get_running_loop()
+        start = loop.time()
+        # shutdown must return within the bounded ceiling; it does not raise
+        # on chat-drain timeout — the residual runtime close / orphan drain
+        # is the real terminal gate.
+        await asyncio.wait_for(service.shutdown(), timeout=CHAT_DRAIN_TIMEOUT + 8.0)
+        elapsed = loop.time() - start
+        # Sanity bound: must not have hung indefinitely, and should not be
+        # dramatically longer than the configured ceiling.
+        assert elapsed < CHAT_DRAIN_TIMEOUT + 7.0
+    finally:
+        chat_task.cancel()
+        # The wedged generator may surface either CancelledError (if it was
+        # mid-iteration) or ServiceShutdownError (if shutdown completed
+        # first and ``chat`` rejected the next iteration); both are the
+        # expected terminal outcomes here.
+        from khaos.exceptions import ServiceShutdownError as _SSE
+        with pytest.raises((asyncio.CancelledError, _SSE)):
+            await chat_task
+        never.set()
+        await db.close()
+
+
+async def _drain_chat(service: AgentService) -> None:
+    """Consume the chat event stream so the runtime actually starts."""
+    request = ChatRequest(session_id="wedged", message="x", mode="office")
+    async for _event in service.chat(request):
+        pass
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
