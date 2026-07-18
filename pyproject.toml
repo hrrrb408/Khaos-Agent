@@ -28,8 +28,11 @@ tui = [
 # BrowserContext lifecycle and concurrent-session isolation tests can run
 # against a real Chromium instance.  The matching browser binaries must
 # still be downloaded separately via ``playwright install chromium``.
+# B2: pinned to >=1.48 because ``context.route_web_socket()`` (the
+# WebSocket bypass closure) was only added in 1.48.  Older builds fail
+# closed at runtime via a ``hasattr`` probe in ``_install_route_guard``.
 browser = [
-    "playwright>=1.40",
+    "playwright>=1.48",
 ]
 tree-sitter = [
     "tree-sitter==0.26.0",
