@@ -74,6 +74,10 @@ class SubAgentSpawner:
         self.registry = registry
         self._active_tasks: dict[str, asyncio.Task] = {}
         self._tasks: dict[str, SubAgentTask] = {}
+        # H1: once shutdown begins, every subsequent spawn is rejected so a
+        # detached RPC caller cannot keep the spawner alive while the server
+        # is tearing shared authorities (Office / Browser / Audit / DB) down.
+        self._shutting_down: bool = False
 
     @property
     def active_count(self) -> int:
@@ -109,6 +113,12 @@ class SubAgentSpawner:
           都被拒绝（沿用 ADR-002 的单层语义）。
         - ``allow_nesting=True``：允许嵌套，但仍受 ``max_spawn_depth`` 上限约束。
         """
+        # H1: reject new work the moment shutdown begins.  A detached RPC
+        # caller (one whose ``Spawn`` handler already returned) cannot keep
+        # registering new background tasks while the server is dismantling
+        # shared authorities.
+        if self._shutting_down:
+            raise SubAgentLimitError("subagent spawner is shutting down")
         if task.depth > 1 and not self.config.allow_nesting:
             raise SubAgentLimitError(
                 f"subagents cannot spawn nested subagents "
@@ -254,6 +264,49 @@ class SubAgentSpawner:
         subtask.error = "cancelled"
         await self.db.update_subagent_task(task_id, "failed", subtask.result, subtask.error, finished=True)
 
+    async def shutdown(self, *, timeout: float = 30.0) -> None:
+        """Production shutdown authority for the spawner.
+
+        H1: ``SubAgentService.Spawn`` returns ``running`` while the Spawner
+        runs the task on a detached background ``asyncio.Task``.  Without
+        this method, server shutdown dismantled Office / Browser / Audit /
+        DB while detached subagent runs were still in-flight — those runs
+        borrow exactly those shared authorities.
+
+        Ordering:
+
+        1.  Set ``_shutting_down`` so further ``spawn()`` is rejected.
+        2.  Snapshot ``_active_tasks`` and cancel each.
+        3.  Wait (bounded) for every cancelled task to finish.  Each
+            ``_run_task`` re-raises ``CancelledError`` AFTER persisting a
+            ``failed/cancelled`` terminal row, and each ``SubAgentRunner``
+            ``finally`` block calls ``close_runtime_or_register`` so the
+            borrowed runtime lands in the orphan registry for the server's
+            ``drain_orphan_runtimes`` to boundedly retry.
+        4.  On timeout: log and return (do NOT raise).  The orphan drain
+            phase still owns the runtime references and is the fail-safe
+            boundary — raising here would let the caller skip the Office /
+            Browser / Audit teardown that still needs to run.
+        """
+        self._shutting_down = True
+        snapshot = list(self._active_tasks.values())
+        for task in snapshot:
+            task.cancel()
+        if not snapshot:
+            return
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*snapshot, return_exceptions=True),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "subagent spawner shutdown: %d task(s) did not settle within "
+                "%.2fs; relying on orphan drain for the residual runtime(s)",
+                sum(1 for t in snapshot if not t.done()),
+                timeout,
+            )
+
     async def collect_results(self, principal_id: str = "") -> list[str]:
         """Collect completed task results (B1: filtered by principal)."""
         tasks = self._tasks_for_principal(principal_id)
@@ -265,6 +318,32 @@ class SubAgentSpawner:
             task.status = "completed"
             await self.db.update_subagent_task(task.id, task.status, task.result, None, finished=True)
         except asyncio.CancelledError:
+            # H1: a cancelled subagent (server shutdown / explicit cancel)
+            # must leave an explicit terminal state.  Previously this branch
+            # only re-raised, so the DB row stayed ``running`` forever even
+            # though the runtime had been torn down.  Persist
+            # ``failed/cancelled`` BEFORE re-raising so observers see the
+            # terminal transition.
+            #
+            # The DB write itself may be cancelled (e.g. the server is
+            # tearing the DB down concurrently); swallow only that failure
+            # and surface the original cancellation, matching the
+            # ``close_runtime_or_register`` pattern.
+            task.status = "failed"
+            task.error = "cancelled"
+            current = asyncio.current_task()
+            if current is not None and hasattr(current, "uncancel"):
+                current.uncancel()
+            try:
+                await self.db.update_subagent_task(
+                    task.id, task.status, task.result, task.error, finished=True
+                )
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                logger.error(
+                    "subagent task %s cancelled but could not persist terminal state",
+                    task.id,
+                    exc_info=True,
+                )
             raise
         except Exception as exc:
             task.status = "failed"

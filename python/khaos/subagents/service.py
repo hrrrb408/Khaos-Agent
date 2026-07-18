@@ -31,6 +31,18 @@ class SubAgentService:
         self.spawner = spawner
         self.runner = runner
 
+    async def shutdown(self, *, timeout: float = 30.0) -> None:
+        """H1: production shutdown authority for the SubAgentService.
+
+        Delegates to ``SubAgentSpawner.shutdown`` so the JSON-line server
+        can tear down every detached background subagent task BEFORE the
+        shared Office / Browser / Audit / DB authorities are dismantled.
+        The ``SubAgentRunner`` already borrows those shared authorities, so
+        letting them be torn down while a detached task is still in-flight
+        is the gap this closes.
+        """
+        await self.spawner.shutdown(timeout=timeout)
+
     async def handle_spawn(self, payload: dict) -> dict[str, Any]:
         """Handle a Spawn request.
 
