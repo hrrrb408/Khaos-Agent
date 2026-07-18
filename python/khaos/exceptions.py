@@ -40,3 +40,6 @@ class RuntimeCloseError(KhaosError):
     the reference after the exception.
     """
 
+
+class ServiceShutdownError(KhaosError):
+    """Raised when a server-owned authority cannot reach a safe terminal state."""
