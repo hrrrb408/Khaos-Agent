@@ -69,7 +69,21 @@ class SubAgentService:
         )
         try:
             result = await self.spawner.spawn(task)
-            return {"ok": True, "task_id": result.id, "status": "running"}
+            # M3 (round-5): return the actual task status, not a hardcoded
+            # "running".  If shutdown began during spawn's DB work, the
+            # spawner aborts and returns a task with status="failed" /
+            # error="cancelled".  Previously the service reported
+            # ok=true, status=running regardless — so a caller could
+            # believe a task was running when it had already been
+            # cancelled and would never produce a result.
+            if result.status == "failed":
+                return {
+                    "ok": False,
+                    "task_id": result.id,
+                    "status": "failed",
+                    "error": result.error or "aborted",
+                }
+            return {"ok": True, "task_id": result.id, "status": result.status}
         except Exception as exc:
             logger.warning("subagent spawn failed: %s", exc)
             return {"ok": False, "error": str(exc)}

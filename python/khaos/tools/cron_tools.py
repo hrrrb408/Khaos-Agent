@@ -78,27 +78,130 @@ async def cron_list(**kwargs: Any) -> dict:
 
 
 async def cron_remove(task_id: str, **kwargs: Any) -> dict:
-    """Remove a scheduled task."""
+    """Remove a scheduled task.
+
+    Returns ``removed`` on success, ``not_found`` if the task does not
+    exist, ``invalid_state`` if the task is in a terminal execution
+    state (COMPLETED / FAILED — cannot be re-cancelled),
+    ``cancellation_pending`` if the in-flight executor did not
+    terminate within the cancel budget (retry ``remove`` to confirm),
+    or ``persistence_pending`` if the executor terminated but the DB
+    write failed (``stop()`` will retry — the state may not be durable
+    yet).
+    """
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    ok = await _cron_engine.remove(task_id)
-    return {"status": "removed" if ok else "not_found", "task_id": task_id}
+    result = await _cron_engine.remove(task_id)
+    if result == "ok":
+        return {"status": "removed", "task_id": task_id}
+    if result == "not_found":
+        return {"status": "not_found", "task_id": task_id}
+    if result == "invalid_state":
+        return {
+            "status": "invalid_state",
+            "task_id": task_id,
+            "error": "task is in a terminal execution state "
+                     "(COMPLETED / FAILED) — cannot be re-cancelled",
+        }
+    if result == "persistence_pending":
+        return {
+            "status": "persistence_pending",
+            "task_id": task_id,
+            "error": "executor terminated but the DB write failed; "
+                     "stop() will retry — the cancelled state may not "
+                     "survive a restart",
+        }
+    # cancellation_pending — executor did not terminate; task is still
+    # in _tasks with CANCELLED status (tombstone retained), caller
+    # can retry remove() to confirm.
+    return {
+        "status": "cancellation_pending",
+        "task_id": task_id,
+        "error": "executor did not terminate within cancel budget; "
+                 "task is marked cancelled but the old executor may "
+                 "still be running — retry remove() to confirm",
+    }
 
 
 async def cron_pause(task_id: str, **kwargs: Any) -> dict:
-    """Pause a scheduled task."""
+    """Pause a scheduled task.
+
+    Returns ``paused`` on success, ``not_found`` if the task does not
+    exist, ``invalid_state`` if the task is in a state that cannot be
+    paused (CANCELLED tombstone or terminal COMPLETED / FAILED),
+    ``cancellation_pending`` if the in-flight executor did not
+    terminate within the cancel budget (retry ``pause`` to confirm),
+    or ``persistence_pending`` if the executor terminated but the DB
+    write failed (``stop()`` will retry — the state may not be durable
+    yet).
+    """
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    ok = await _cron_engine.pause(task_id)
-    return {"status": "paused" if ok else "not_found", "task_id": task_id}
+    result = await _cron_engine.pause(task_id)
+    if result == "ok":
+        return {"status": "paused", "task_id": task_id}
+    if result == "not_found":
+        return {"status": "not_found", "task_id": task_id}
+    if result == "invalid_state":
+        return {
+            "status": "invalid_state",
+            "task_id": task_id,
+            "error": "task is in a state that cannot be paused "
+                     "(CANCELLED tombstone or terminal COMPLETED / "
+                     "FAILED) — state is unchanged",
+        }
+    if result == "persistence_pending":
+        return {
+            "status": "persistence_pending",
+            "task_id": task_id,
+            "error": "executor terminated but the DB write failed; "
+                     "stop() will retry — the paused state may not "
+                     "survive a restart",
+        }
+    # cancellation_pending — executor did not terminate; task is
+    # paused in memory but old executor may still be running.
+    return {
+        "status": "cancellation_pending",
+        "task_id": task_id,
+        "error": "executor did not terminate within cancel budget; "
+                 "task is marked paused but the old executor may "
+                 "still be running — retry pause() to confirm",
+    }
 
 
 async def cron_resume(task_id: str, **kwargs: Any) -> dict:
-    """Resume a paused scheduled task."""
+    """Resume a paused scheduled task.
+
+    Returns ``resumed`` on success, ``not_found`` if the task does
+    not exist, ``invalid_state`` if the task is not in the PAUSED
+    state (RUNNING / PENDING / CANCELLED / COMPLETED / FAILED —
+    cannot be resumed), or ``execution_pending`` if the task is
+    PAUSED but the old executor is still alive (retry after the
+    executor terminates or call ``remove`` to force-cancel).
+    """
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    ok = await _cron_engine.resume(task_id)
-    return {"status": "resumed" if ok else "not_found", "task_id": task_id}
+    result = await _cron_engine.resume(task_id)
+    if result == "ok":
+        return {"status": "resumed", "task_id": task_id}
+    if result == "not_found":
+        return {"status": "not_found", "task_id": task_id}
+    if result == "invalid_state":
+        return {
+            "status": "invalid_state",
+            "task_id": task_id,
+            "error": "task is not in the PAUSED state — only PAUSED "
+                     "tasks can be resumed (state is unchanged)",
+        }
+    # result == "execution_pending" — PAUSED but old executor alive
+    return {
+        "status": "execution_pending",
+        "task_id": task_id,
+        "error": "task is PAUSED but the old executor is still "
+                 "alive — resuming would cause double side effects; "
+                 "wait for the executor to terminate or call "
+                 "remove() to force-cancel",
+    }
 
 
 def _parse_schedule(schedule: str) -> "ScheduleConfig":

@@ -91,6 +91,15 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
         "test_browser_close_concurrency.py",
         "test_spawner_shutdown.py",
         "test_runner_shutdown.py",
+        # M4 (round-6): the Cron engine shutdown / cancelled-task
+        # persistence contracts and the SubAgent service real-status
+        # contract must stay in the matrix.  Without them in this
+        # required list, a future workflow edit could drop the files
+        # and the CI policy test would still pass, silently losing the
+        # round-6 cron bounded-drain / cancelled-state / service
+        # status coverage.
+        "test_cron_engine.py",
+        "test_service.py",
     ):
         assert required_contract in matrix
 

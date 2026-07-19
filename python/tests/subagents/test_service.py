@@ -6,7 +6,13 @@ from khaos.subagents.service import SubAgentService
 
 async def test_handle_spawn_success():
     spawner = MagicMock()
-    spawner.spawn = AsyncMock(return_value=SimpleNamespace(id="task_1"))
+    # M3 (round-5): service returns the real task status, so the mock
+    # must carry a ``status`` attribute.  A successful spawn returns
+    # ``running`` (the spawner flips ``initializing`` → ``running``
+    # once the runner is published).
+    spawner.spawn = AsyncMock(
+        return_value=SimpleNamespace(id="task_1", status="running")
+    )
     service = SubAgentService(spawner, runner=None)
 
     result = await service.handle_spawn(
@@ -26,6 +32,34 @@ async def test_handle_spawn_success():
     assert task.tools == ["read_file"]
     # M2: parent_session_id is namespaced per principal.
     assert task.parent_session_id == "subagent:user1"
+
+
+async def test_handle_spawn_returns_failed_when_aborted():
+    """M3 (round-5): when shutdown begins during spawn's DB work, the
+    spawner aborts and returns a task with ``status="failed"`` /
+    ``error="cancelled"``.  The service MUST surface this to the caller
+    as ``ok=false, status=failed`` instead of the previous hardcoded
+    ``ok=true, status=running`` — a caller believing a cancelled task is
+    running would wait forever for a result that will never come.
+    """
+    spawner = MagicMock()
+    spawner.spawn = AsyncMock(
+        return_value=SimpleNamespace(
+            id="task_1", status="failed", error="cancelled",
+        )
+    )
+    service = SubAgentService(spawner, runner=None)
+
+    result = await service.handle_spawn(
+        {"principal_id": "user1", "goal": "inspect"}
+    )
+
+    assert result == {
+        "ok": False,
+        "task_id": "task_1",
+        "status": "failed",
+        "error": "cancelled",
+    }
 
 
 async def test_handle_spawn_error():
