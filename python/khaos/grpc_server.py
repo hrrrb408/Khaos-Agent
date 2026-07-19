@@ -472,10 +472,29 @@ class AgentService:
             "shared Office mutation authority shutdown failed"
         ) from last_error
 
-    async def _execute_scheduled_prompt(self, task_id: str, prompt: str) -> str:
-        """Run a scheduled prompt through the normal office-mode agent path."""
+    async def _execute_scheduled_prompt(
+        self, task_id: str, prompt: str, principal_id: str = ""
+    ) -> str:
+        """Run a scheduled prompt through the normal office-mode agent path.
+
+        M4 batch 3.1.10 (CRITICAL): the executor signature now accepts
+        the task's ``principal_id`` so the scheduled prompt runs as the
+        creator (not the server UID).  Without this, ``chat()`` would
+        fall back to ``local-uid:{os.getuid()}`` and:
+
+          * Memory writes would be attributed to the wrong principal.
+          * BrowserContext / permission / audit decisions would bind
+            to the local server identity instead of the creator.
+          * A low-privilege remote principal could schedule a future
+            execution that runs as a higher-privilege local user.
+
+        ``CronEngine._execute_task`` calls this as a 3-arg executor;
+        the engine keeps a 2-arg fallback for older test executors.
+        """
         contents: list[str] = []
-        async for event in self.chat(ChatRequest(f"cron:{task_id}", prompt, "office")):
+        async for event in self.chat(
+            ChatRequest(f"cron:{task_id}", prompt, "office", principal_id=principal_id)
+        ):
             if event.get("event") == "message":
                 content = event.get("data", {}).get("content")
                 if content:

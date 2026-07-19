@@ -249,6 +249,20 @@ class ToolInvocationBroker:
         # principal, defense-in-depth against cross-principal leakage).
         if any(capability.name == "subagent.spawn" for capability in capabilities):
             handler_params["principal_id"] = context.get("principal_id", "")
+        # M4 batch 3.1.10 (CRITICAL): the five cron tools declare the
+        # ``cron.manage`` capability so the broker injects the caller's
+        # ``principal_id``.  The engine / DB layer filter every read and
+        # mutation by principal — without this injection the cron
+        # handlers receive ``principal_id=""`` and:
+        #   * ``cron_create`` raises ValueError (principal required);
+        #   * ``cron_list`` returns an empty list (no tasks visible);
+        #   * ``cron_pause`` / ``cron_resume`` / ``cron_remove`` return
+        #     ``not_found`` for every task (no ownership match).
+        # In a multi-principal deployment that would let one principal
+        # silently control another's scheduled tasks if the broker were
+        # ever bypassed — fail-closed on the broker injection path.
+        if any(capability.name == "cron.manage" for capability in capabilities):
+            handler_params["principal_id"] = context.get("principal_id", "")
         if mode == "coding" and name in _WORKSPACE_FILE_TOOLS and any(
             capability.name in {"filesystem.read", "filesystem.write"}
             for capability in capabilities
@@ -1658,6 +1672,22 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         )
     )
     # Hermes batch 5: cron + history tools (available in all modes).
+    # M4 batch 3.1.10 (CRITICAL): the five cron tools declare the
+    # ``cron.manage`` capability so ``ToolInvocationBroker.invoke``
+    # injects the caller's ``principal_id`` into the handler kwargs.
+    # Without a declared capability the broker treats them as
+    # no-capability tools and the handlers receive ``principal_id=""``
+    # even when the caller is authenticated — the engine then raises
+    # ``ValueError("principal_id is required for scheduled task creation")``
+    # on create, and list / pause / resume / remove cannot filter by
+    # owner, so any principal could observe or mutate another
+    # principal's tasks.  See ``cron_tools._require_principal`` and
+    # ``CronEngine._check_principal`` for the fail-closed enforcement.
+    _CRON_MANAGE_CAP = ToolCapability(
+        "cron.manage",
+        frozenset({"office", "coding"}),
+        frozenset({"app-data"}),
+    )
     for spec in CRON_TOOL_SPECS:
         registry.register(
             ToolDefinition(
@@ -1667,6 +1697,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 modes=["all"],
                 permission_level="write",
                 parallel=False,
+                capabilities=(_CRON_MANAGE_CAP,),
             )
         )
     for spec in HISTORY_TOOL_SPECS:

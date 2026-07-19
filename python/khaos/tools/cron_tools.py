@@ -5,6 +5,14 @@ via :func:`set_cron_engine` (called once at startup, mirroring how
 ``terminal_tools`` holds a module-level guard). Until an engine is injected the
 handlers report "not available" rather than pretending success — a tool that
 claims to create a task but creates nothing is worse than an honest failure.
+
+M4 batch 3.1.10 (CRITICAL): all handlers now accept a ``principal_id``
+keyword parameter (injected by the ``ToolInvocationBroker`` via the
+``cron.manage`` capability declared in ``registry.py``).  ``cron_create``
+stamps the principal on the task; ``cron_list`` / ``cron_pause`` /
+``cron_resume`` / ``cron_remove`` filter / verify ownership.  Empty
+principal is rejected — fail-closed (no fallback to a shared pseudo-
+principal).
 """
 
 from __future__ import annotations
@@ -26,7 +34,21 @@ def set_cron_engine(engine: Any) -> None:
     logger.info("cron engine injected into cron_tools")
 
 
-async def cron_create(name: str, prompt: str, schedule: str, **kwargs: Any) -> dict:
+def _require_principal(principal_id: str) -> dict[str, Any] | None:
+    """M4 batch 3.1.10 (CRITICAL): return an ``ok=false`` error dict if
+    ``principal_id`` is empty, else ``None``.
+
+    The cron tools must not fail open to a shared pseudo-principal when
+    the caller's principal is missing — that would let a misconfigured
+    tool context silently operate on any principal's tasks.  Empty
+    principal is rejected.
+    """
+    if not principal_id:
+        return {"status": "error", "error": "principal_id is required"}
+    return None
+
+
+async def cron_create(name: str, prompt: str, schedule: str, *, principal_id: str = "", **kwargs: Any) -> dict:
     """Create a new scheduled task.
 
     Args:
@@ -35,7 +57,14 @@ async def cron_create(name: str, prompt: str, schedule: str, **kwargs: Any) -> d
         schedule: Schedule expression (cron "0 9" / interval "30m" / ISO time)
         repeat: Optional max repeat count
         deliver_to: Where to send results (local / session:<id> / all)
+        principal_id: Caller's principal ID (injected by broker via
+            ``cron.manage`` capability).  Required — the task is bound
+            to this principal.
     """
+    principal_error = _require_principal(principal_id)
+    if principal_error is not None:
+        return principal_error
+
     config = _parse_schedule(schedule)
     if kwargs.get("repeat"):
         config.repeat = int(kwargs["repeat"])
@@ -47,7 +76,14 @@ async def cron_create(name: str, prompt: str, schedule: str, **kwargs: Any) -> d
             "error": "cron engine not configured",
             "name": name,
         }
-    task = await _cron_engine.create(name, prompt, config, deliver_to=deliver)
+    try:
+        task = await _cron_engine.create(
+            name, prompt, config, deliver_to=deliver,
+            principal_id=principal_id,
+        )
+    except ValueError as exc:
+        # principal_id validation failure
+        return {"status": "error", "error": str(exc), "name": name}
     return {
         "status": "created",
         "task_id": task.id,
@@ -58,11 +94,19 @@ async def cron_create(name: str, prompt: str, schedule: str, **kwargs: Any) -> d
     }
 
 
-async def cron_list(**kwargs: Any) -> dict:
-    """List all scheduled tasks."""
+async def cron_list(*, principal_id: str = "", **kwargs: Any) -> dict:
+    """List scheduled tasks for the caller's principal.
+
+    M4 batch 3.1.10 (CRITICAL): only tasks belonging to
+    ``principal_id`` are returned.
+    """
+    principal_error = _require_principal(principal_id)
+    if principal_error is not None:
+        return principal_error
+
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured", "tasks": []}
-    tasks = await _cron_engine.list_tasks()
+    tasks = await _cron_engine.list_tasks(principal_id=principal_id)
     return {
         "tasks": [
             {
@@ -77,21 +121,20 @@ async def cron_list(**kwargs: Any) -> dict:
     }
 
 
-async def cron_remove(task_id: str, **kwargs: Any) -> dict:
+async def cron_remove(task_id: str, *, principal_id: str = "", **kwargs: Any) -> dict:
     """Remove a scheduled task.
 
-    Returns ``removed`` on success, ``not_found`` if the task does not
-    exist, ``invalid_state`` if the task is in a terminal execution
-    state (COMPLETED / FAILED — cannot be re-cancelled),
-    ``cancellation_pending`` if the in-flight executor did not
-    terminate within the cancel budget (retry ``remove`` to confirm),
-    or ``persistence_pending`` if the executor terminated but the DB
-    write failed (``stop()`` will retry — the state may not be durable
-    yet).
+    M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
+    ``not_found`` if the task belongs to a different principal (fail-
+    closed — does not reveal existence).
     """
+    principal_error = _require_principal(principal_id)
+    if principal_error is not None:
+        return principal_error
+
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    result = await _cron_engine.remove(task_id)
+    result = await _cron_engine.remove(task_id, principal_id=principal_id)
     if result == "ok":
         return {"status": "removed", "task_id": task_id}
     if result == "not_found":
@@ -111,9 +154,7 @@ async def cron_remove(task_id: str, **kwargs: Any) -> dict:
                      "stop() will retry — the cancelled state may not "
                      "survive a restart",
         }
-    # cancellation_pending — executor did not terminate; task is still
-    # in _tasks with CANCELLED status (tombstone retained), caller
-    # can retry remove() to confirm.
+    # cancellation_pending — executor did not terminate
     return {
         "status": "cancellation_pending",
         "task_id": task_id,
@@ -123,21 +164,19 @@ async def cron_remove(task_id: str, **kwargs: Any) -> dict:
     }
 
 
-async def cron_pause(task_id: str, **kwargs: Any) -> dict:
+async def cron_pause(task_id: str, *, principal_id: str = "", **kwargs: Any) -> dict:
     """Pause a scheduled task.
 
-    Returns ``paused`` on success, ``not_found`` if the task does not
-    exist, ``invalid_state`` if the task is in a state that cannot be
-    paused (CANCELLED tombstone or terminal COMPLETED / FAILED),
-    ``cancellation_pending`` if the in-flight executor did not
-    terminate within the cancel budget (retry ``pause`` to confirm),
-    or ``persistence_pending`` if the executor terminated but the DB
-    write failed (``stop()`` will retry — the state may not be durable
-    yet).
+    M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
+    ``not_found`` if the task belongs to a different principal.
     """
+    principal_error = _require_principal(principal_id)
+    if principal_error is not None:
+        return principal_error
+
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    result = await _cron_engine.pause(task_id)
+    result = await _cron_engine.pause(task_id, principal_id=principal_id)
     if result == "ok":
         return {"status": "paused", "task_id": task_id}
     if result == "not_found":
@@ -158,8 +197,7 @@ async def cron_pause(task_id: str, **kwargs: Any) -> dict:
                      "stop() will retry — the paused state may not "
                      "survive a restart",
         }
-    # cancellation_pending — executor did not terminate; task is
-    # paused in memory but old executor may still be running.
+    # cancellation_pending
     return {
         "status": "cancellation_pending",
         "task_id": task_id,
@@ -169,19 +207,27 @@ async def cron_pause(task_id: str, **kwargs: Any) -> dict:
     }
 
 
-async def cron_resume(task_id: str, **kwargs: Any) -> dict:
+async def cron_resume(task_id: str, *, principal_id: str = "", **kwargs: Any) -> dict:
     """Resume a paused scheduled task.
 
-    Returns ``resumed`` on success, ``not_found`` if the task does
-    not exist, ``invalid_state`` if the task is not in the PAUSED
-    state (RUNNING / PENDING / CANCELLED / COMPLETED / FAILED —
-    cannot be resumed), or ``execution_pending`` if the task is
-    PAUSED but the old executor is still alive (retry after the
-    executor terminates or call ``remove`` to force-cancel).
+    M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
+    ``not_found`` if the task belongs to a different principal.
+
+    M4 batch 3.1.10 (MEDIUM): the engine's ``resume()`` may return
+    ``persistence_pending`` when the DB write fails.  Previously the
+    tool layer only handled ``ok`` / ``not_found`` / ``invalid_state``
+    and lumped everything else (including ``persistence_pending``)
+    into ``execution_pending`` — giving the user the misleading error
+    "old executor is still alive" when the real cause was a DB write
+    failure.  Now ``persistence_pending`` has its own branch.
     """
+    principal_error = _require_principal(principal_id)
+    if principal_error is not None:
+        return principal_error
+
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    result = await _cron_engine.resume(task_id)
+    result = await _cron_engine.resume(task_id, principal_id=principal_id)
     if result == "ok":
         return {"status": "resumed", "task_id": task_id}
     if result == "not_found":
@@ -192,6 +238,18 @@ async def cron_resume(task_id: str, **kwargs: Any) -> dict:
             "task_id": task_id,
             "error": "task is not in the PAUSED state — only PAUSED "
                      "tasks can be resumed (state is unchanged)",
+        }
+    if result == "persistence_pending":
+        # M4 batch 3.1.10 (MEDIUM): dedicated branch — the DB write
+        # failed, NOT the executor being alive.  The task stays PAUSED
+        # in memory and tick does not fire it.  The caller should
+        # retry resume() to confirm.
+        return {
+            "status": "persistence_pending",
+            "task_id": task_id,
+            "error": "DB write failed; task remains paused in memory "
+                     "and will NOT be fired by tick — retry resume() "
+                     "to confirm the state is durable",
         }
     # result == "execution_pending" — PAUSED but old executor alive
     return {

@@ -60,3 +60,13 @@ class ScheduledTask:
     # lifecycle_version prevents the executor from overwriting the DB
     # desired state (which matters across process restarts).
     lifecycle_version: int = 0
+    # M4 batch 3.1.10: principal-bound ownership.  Every task belongs
+    # to exactly one principal; list / pause / resume / remove filter
+    # on it.  The executor passes this to ChatRequest so the
+    # scheduled prompt runs as the creator (not the server UID).
+    principal_id: str = ""
+    # M4 batch 3.1.10: durable execution claim.  Set atomically via
+    # claim_scheduled_task() before the executor runs, so a crash
+    # during execution leaves a durable marker for restart recovery.
+    execution_id: Optional[str] = None
+    lease_until: Optional[datetime] = None

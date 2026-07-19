@@ -9,6 +9,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
 
@@ -35,6 +36,49 @@ CRON_STOP_DRAIN_TIMEOUT = 30.0
 # ``ServiceShutdownError`` on the next shutdown).
 _CANCEL_IN_FLIGHT_TIMEOUT = 10.0
 
+# M4 batch 3.1.10: execution lease duration.  When the executor claims
+# a task, it sets ``lease_until = now + EXECUTION_LEASE_SECONDS``.  If
+# the process crashes during execution, ``recover_expired_leases``
+# (called by ``start()`` on the next boot) marks the task as FAILED so
+# the at-least-once disclosure is durable.  The lease must be long
+# enough for the longest legitimate execution (an office-mode chat
+# turn with tool calls) but short enough that restart recovery
+# happens promptly.  10 minutes is a pragmatic default; callers can
+# override via the ``CronEngine(execution_lease_seconds=...)`` kwarg.
+EXECUTION_LEASE_SECONDS = 600.0
+
+
+# M4 batch 3.1.10: generation-based pending persistence.  Replaces the
+# old ``set[str]`` which only tracked task IDs and could be cleared by
+# a stale executor that lost a version race — discarding a NEWER
+# control operation's retry marker.  Each pending entry now carries
+# the ``operation_id`` of the operation that placed it, so a stale
+# executor only clears its OWN marker.
+from dataclasses import dataclass as _dc
+
+
+@_dc
+class PendingPersistence:
+    """A terminal state that has been set in memory but not yet persisted.
+
+    M4 batch 3.1.10 (HIGH-2): the old ``set[str]`` only tracked task
+    IDs.  When a stale executor's conditional UPDATE succeeded (because
+    a control op's DB write had failed, leaving the DB version
+    unchanged), the executor's ``discard(task.id)`` would clear the
+    control op's retry marker — the next ``pause()`` / ``resume()``
+    would return ``ok`` even though the DB still held the old state.
+
+    The generation field fixes this: each operation that places a
+    marker gets a unique ``operation_id``.  ``_persist_task_state``
+    only clears the marker if the stored ``operation_id`` matches its
+    own — so a stale executor cannot clear a newer control op's
+    marker.
+    """
+    operation_id: str
+    desired_status: str       # TaskStatus.value
+    expected_version: int     # for CAS retry
+    is_control_op: bool       # True = bumps version; False = executor write
+
 
 class CronEngine:
     """异步定时任务调度引擎。"""
@@ -45,6 +89,8 @@ class CronEngine:
         executor: Callable[[str, str], Awaitable[Any]] | None = None,
         on_complete: Callable[[ScheduledTask, Any], Awaitable[None]] | None = None,
         tick_interval: float = 30.0,  # 每 30 秒检查一次
+        *,
+        execution_lease_seconds: float = EXECUTION_LEASE_SECONDS,
     ):
         """
         参数：
@@ -52,11 +98,14 @@ class CronEngine:
         - executor: 实际执行函数，接收 (task_id, prompt)，返回结果
         - on_complete: 任务完成后的回调（推送结果等）
         - tick_interval: 检查间隔（秒）
+        - execution_lease_seconds: M4 batch 3.1.10 — durable execution
+          lease duration.  See ``EXECUTION_LEASE_SECONDS``.
         """
         self.db = db
         self._executor = executor
         self._on_complete = on_complete
         self._tick_interval = tick_interval
+        self._execution_lease_seconds = execution_lease_seconds
         self._tasks: dict[str, ScheduledTask] = {}
         self._running = False
         self._loop_task: asyncio.Task | None = None
@@ -84,7 +133,14 @@ class CronEngine:
         # would stay at ``running`` in the DB — and on restart the
         # scheduler would re-fire it, potentially double-executing
         # external side effects.
-        self._pending_persistence: set[str] = set()
+        #
+        # M4 batch 3.1.10 (HIGH-2): changed from ``set[str]`` to
+        # ``dict[str, PendingPersistence]`` keyed by task_id.  Each
+        # entry carries the ``operation_id`` of the operation that
+        # placed it, so a stale executor that lost a version race
+        # cannot clear a NEWER control op's retry marker — only its
+        # own.  See ``PendingPersistence`` for the full rationale.
+        self._pending_persistence: dict[str, PendingPersistence] = {}
         # H1 (round-8): retained reconcile owner registry.  Keyed by
         # task_id so the next ``stop()`` can dedupe — if a retained
         # owner is already reconciling task T, we MUST NOT spawn a
@@ -135,11 +191,39 @@ class CronEngine:
         self._task_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
-        """启动调度循环。"""
+        """启动调度循环。
+
+        M4 batch 3.1.10 (HIGH-3): before starting the tick loop,
+        recover any tasks with expired execution leases.  These
+        represent crashed executions whose terminal state was never
+        persisted.  Mark them as FAILED (durable at-least-once
+        disclosure) so they are not silently re-fired.
+        """
         if self._running:
             return
         self._running = True
         await self._load_tasks()
+        # M4 batch 3.1.10 (HIGH-3): recover expired leases.
+        if self.db:
+            try:
+                recovered = await self.db.recover_expired_leases(
+                    now_iso=datetime.utcnow().isoformat(),
+                )
+                if recovered > 0:
+                    logger.warning(
+                        "recovered %d expired execution lease(s) — "
+                        "these tasks were crashed mid-execution and "
+                        "are now marked FAILED (at-least-once disclosure)",
+                        recovered,
+                    )
+                    # Reload to pick up the FAILED states.
+                    await self._load_tasks()
+            except Exception:  # noqa: BLE001 — recovery failure is non-fatal
+                logger.error(
+                    "could not recover expired execution leases; "
+                    "crashed tasks may be silently re-fired",
+                    exc_info=True,
+                )
         self._loop_task = asyncio.create_task(self._tick_loop())
         logger.info("cron engine started with %d tasks", len(self._tasks))
 
@@ -381,19 +465,42 @@ class CronEngine:
         If ANY DB write fails, the task stays in ``_pending_persistence``
         and we raise ``ServiceShutdownError`` so the caller refuses to
         tear down the DB.  The next ``stop()`` call will retry.
+
+        M4 batch 3.1.10 (HIGH-2): each entry now carries the
+        ``operation_id`` and ``expected_version`` of the operation that
+        placed it.  The retry uses the stored ``expected_version`` for
+        control ops (CAS) so a stale executor's conditional write
+        can't shadow it.  For executor entries (``is_control_op=False``),
+        the retry uses the current ``task.lifecycle_version`` since the
+        executor's intent is just "persist my terminal state if the
+        version still matches".
         """
         if not self.db:
             return
         failures: list[str] = []
-        for task_id in list(self._pending_persistence):
+        for task_id, pending in list(self._pending_persistence.items()):
             task = self._tasks.get(task_id)
             if task is None:
                 # Task not in memory — clear the flag (can't retry
                 # without the in-memory state).
-                self._pending_persistence.discard(task_id)
+                self._pending_persistence.pop(task_id, None)
                 continue
             try:
-                await self._persist_task_state(task)
+                if pending.is_control_op:
+                    # Control op retry — unconditional, bumps version.
+                    # Use the CURRENT lifecycle_version as expected so
+                    # the CAS retry matches even if a prior retry
+                    # already bumped it.
+                    await self._persist_task_state(
+                        task, operation_id=pending.operation_id,
+                    )
+                else:
+                    # Executor entry retry — conditional on version.
+                    await self._persist_task_state(
+                        task,
+                        operation_id=pending.operation_id,
+                        expected_version=pending.expected_version,
+                    )
             except Exception:  # noqa: BLE001 — collect and raise
                 logger.error(
                     "cron engine: could not persist terminal state for "
@@ -415,8 +522,24 @@ class CronEngine:
         schedule: ScheduleConfig,
         deliver_to: str = "local",
         meta: dict | None = None,
+        *,
+        principal_id: str = "",
     ) -> ScheduledTask:
-        """创建并注册一个新任务。"""
+        """创建并注册一个新任务。
+
+        M4 batch 3.1.10:
+          - ``principal_id`` is REQUIRED (non-empty).  Every task is
+            bound to its creator; list / pause / resume / remove filter
+            on it.  Empty principal is rejected.
+          - ``next_run`` is now persisted atomically with the INSERT
+            (HIGH-1).  Previously the engine computed ``next_run`` in
+            memory but did NOT pass it to ``insert_scheduled_task``, so
+            the DB row's ``next_run`` stayed NULL until the first
+            execution — a restart before the first fire left the task
+            permanently stuck.
+        """
+        if not principal_id:
+            raise ValueError("principal_id is required for scheduled task creation")
         task = ScheduledTask(
             id=None,
             name=name,
@@ -424,20 +547,56 @@ class CronEngine:
             schedule=schedule,
             deliver_to=deliver_to,
             meta=meta or {},
+            principal_id=principal_id,
         )
         task.next_run = self._compute_next_run(task)
         if self.db:
             task.id = await self.db.insert_scheduled_task(
                 name, prompt, task.status.value, schedule,
                 deliver_to, meta,
+                principal_id=principal_id,
+                next_run=task.next_run.isoformat() if task.next_run else None,
             )
         else:
             task.id = f"task_{len(self._tasks)}"
         self._tasks[task.id] = task
-        logger.info("scheduled task created: %s (%s)", name, task.id)
+        self._execution_epoch[task.id] = task.lifecycle_version
+        logger.info("scheduled task created: %s (%s) for principal %s", name, task.id, principal_id)
         return task
 
-    async def pause(self, task_id: str) -> str:
+    async def list_tasks(
+        self, *, principal_id: str | None = None,
+    ) -> list[ScheduledTask]:
+        """List tasks, optionally filtered by ``principal_id``.
+
+        M4 batch 3.1.10 (CRITICAL): when ``principal_id`` is provided,
+        only tasks belonging to that principal are returned.  ``None``
+        returns all (internal use only — the tool layer always passes
+        a principal).
+        """
+        if principal_id is None:
+            return list(self._tasks.values())
+        return [
+            t for t in self._tasks.values()
+            if t.principal_id == principal_id
+        ]
+
+    def _check_principal(
+        self, task: ScheduledTask | None, principal_id: str,
+    ) -> ScheduledTask | None:
+        """M4 batch 3.1.10 (CRITICAL): return the task only if it
+        exists AND belongs to ``principal_id``.  Returns ``None`` if
+        the task doesn't exist OR belongs to a different principal —
+        so the caller returns ``not_found`` (not ``forbidden``) to
+        avoid revealing the task's existence.
+        """
+        if task is None:
+            return None
+        if task.principal_id != principal_id:
+            return None
+        return task
+
+    async def pause(self, task_id: str, *, principal_id: str = "") -> str:
         """Pause a task.
 
         Returns one of:
@@ -448,53 +607,28 @@ class CronEngine:
             already-PAUSED task, this is only returned after
             re-checking the executor and the persistence state (see
             H1 round-13).
-          - ``"not_found"``: task_id is not registered.
+          - ``"not_found"``: task_id is not registered OR does not
+            belong to ``principal_id`` (M4 batch 3.1.10).
           - ``"invalid_state"``: the task is in a state that cannot
             be paused (``CANCELLED`` removal tombstone, or a terminal
             state ``COMPLETED`` / ``FAILED``).  The caller MUST NOT
             claim the task is paused — the state is unchanged.
           - ``"cancellation_pending"``: the in-flight executor did NOT
-            terminate within the cancel budget.  The task's desired
-            state is still set to ``PAUSED`` (and persisted if
-            possible), but the old executor may still be producing
-            external side effects.  The caller MUST NOT claim the task
-            is paused — the executor is still live.  Retry ``pause()``
-            to confirm.  This is returned BOTH on the first pause
-            attempt (when the executor swallows cancel) AND on
-            subsequent retries while the executor is still alive.
+            terminate within the cancel budget.
           - ``"persistence_pending"``: the executor terminated but the
-            DB write failed.  The in-memory status is ``PAUSED`` and
-            ``stop()`` will retry the persist.  The caller MUST NOT
-            claim the task is durably paused — the state may not
-            survive a restart.  This is returned BOTH on the first
-            pause attempt AND on subsequent retries while the DB is
-            still failing.
+            DB write failed.
 
-        H1 (round-12): strict state transition matrix.  ``pause`` is
-        only allowed from ``PENDING`` or ``RUNNING`` (or retry on
-        ``PAUSED``).  Refuses ``CANCELLED`` (removal tombstone) and
-        terminal states ``COMPLETED`` / ``FAILED`` — without this, a
-        caller could pause a ``CANCELLED`` tombstone and then resume
-        it, resurrecting a removed task.  ``COMPLETED`` / ``FAILED``
-        are terminal execution states and should not be re-paused.
-
-        H1 (round-13): PAUSED is NOT an unconditional ok.  A prior
-        pause may have returned ``cancellation_pending`` (executor
-        still running) or ``persistence_pending`` (DB write failed).
-        When retrying pause on an already-PAUSED task, this method
-        re-checks the live executor and retries the persist if
-        ``task_id`` is in ``_pending_persistence``.  Only when the
-        executor has terminated AND the persist is durable (or not
-        needed) does it return ``ok``.  Without this, the second
-        pause would report ``paused`` even though the executor was
-        still producing side effects or the DB row was still
-        running/pending.
+        M4 batch 3.1.10 (CRITICAL): ``principal_id`` is REQUIRED.
+        Returns ``not_found`` if the task belongs to a different
+        principal (fail-closed — does not reveal existence).
 
         H1 (round-11): the per-task lock is held for the ENTIRE
         operation — including cancel + persist.
         """
         async with self._task_lock(task_id):
-            task = self._tasks.get(task_id)
+            task = self._check_principal(
+                self._tasks.get(task_id), principal_id,
+            )
             if not task:
                 return "not_found"
             # H1 (round-12): refuse terminal / removal states.
@@ -569,7 +703,7 @@ class CronEngine:
                 return "persistence_pending"
             return "ok"
 
-    async def resume(self, task_id: str) -> str:
+    async def resume(self, task_id: str, *, principal_id: str = "") -> str:
         """Resume a paused task.
 
         Returns one of:
@@ -629,7 +763,9 @@ class CronEngine:
         the post-write DB version.
         """
         async with self._task_lock(task_id):
-            task = self._tasks.get(task_id)
+            task = self._check_principal(
+                self._tasks.get(task_id), principal_id,
+            )
             if not task:
                 return "not_found"
             # H1 (round-12): only PAUSED can be resumed.
@@ -685,7 +821,7 @@ class CronEngine:
             task.next_run = new_next_run
             return "ok"
 
-    async def remove(self, task_id: str) -> str:
+    async def remove(self, task_id: str, *, principal_id: str = "") -> str:
         """Remove (cancel) a task.
 
         Returns one of:
@@ -693,53 +829,27 @@ class CronEngine:
             not running) AND the ``cancelled`` state was durably
             persisted (or there is no DB).  The task is popped from
             ``_tasks``.
-          - ``"not_found"``: task_id is not registered.
+          - ``"not_found"``: task_id is not registered OR does not
+            belong to ``principal_id`` (M4 batch 3.1.10).
           - ``"invalid_state"``: the task is in a terminal execution
             state (``COMPLETED`` / ``FAILED``) — these are durable
             final states and should not be re-cancelled.
           - ``"cancellation_pending"``: the in-flight executor did NOT
-            terminate within the cancel budget.  The task's desired
-            state is still set to ``CANCELLED`` (and persisted if
-            possible), but the old executor may still be producing
-            external side effects.  The task is NOT popped from
-            ``_tasks`` (Medium round-10: tombstone retained) so the
-            caller can retry ``remove()`` to confirm.  The caller MUST
-            NOT claim the task is removed — the executor is still live.
+            terminate within the cancel budget.
           - ``"persistence_pending"``: the executor terminated but the
-            DB write failed.  The task is NOT popped from ``_tasks``;
-            ``stop()`` will retry the persist.  The caller MUST NOT
-            claim the task is durably removed — the state may not
-            survive a restart.
+            DB write failed.
+
+        M4 batch 3.1.10 (CRITICAL): ``principal_id`` is REQUIRED.
+        Returns ``not_found`` if the task belongs to a different
+        principal (fail-closed).
 
         H1 (round-11): the per-task lock is held for the ENTIRE
-        operation — including cancel + persist.  This is the per-task
-        transaction boundary: remove is atomic with respect to
-        pause/resume and to tick's "re-check + publish".
-
-        H1 (round-9): the epoch is bumped BEFORE cancelling so the
-        old executor cannot overwrite the ``CANCELLED`` state when it
-        eventually completes.
-
-        H1 (round-12): terminal execution states (``COMPLETED`` /
-        ``FAILED``) are refused — these are durable final states and
-        should not be re-cancelled.  ``CANCELLED`` is allowed (retry
-        of an incomplete removal).  ``PENDING`` / ``RUNNING`` /
-        ``PAUSED`` are allowed (normal removal).
-
-        Medium (round-10): the task is NOT popped from ``_tasks``
-        when the executor did not terminate (``cancellation_pending``)
-        — even if the persist succeeded.  The tombstone (CANCELLED
-        status in ``_tasks``) is retained until the caller retries
-        ``remove()`` and the executor has actually terminated.
-
-        H2 (round-10): the return value reflects the persist result.
-        ``persistence_pending`` is returned when the DB write fails.
-
-        H2 (round-9): the task is NOT popped from ``_tasks`` until
-        ``_persist_task_state`` succeeds.
+        operation — including cancel + persist.
         """
         async with self._task_lock(task_id):
-            task = self._tasks.get(task_id)
+            task = self._check_principal(
+                self._tasks.get(task_id), principal_id,
+            )
             if not task:
                 return "not_found"
             # H1 (round-12): refuse terminal execution states — these
@@ -880,9 +990,6 @@ class CronEngine:
                 task_id, _CANCEL_IN_FLIGHT_TIMEOUT,
             )
             return False
-
-    async def list_tasks(self) -> list[ScheduledTask]:
-        return list(self._tasks.values())
 
     async def get(self, task_id: str) -> ScheduledTask | None:
         return self._tasks.get(task_id)
@@ -1036,11 +1143,58 @@ class CronEngine:
         # terminal UPDATE will match 0 rows (version mismatch) and the
         # stale write is discarded.
         version_at_start = task.lifecycle_version
+        # M4 batch 3.1.10 (HIGH-3): durable execution claim.  Before
+        # calling the executor (which may produce external side effects),
+        # atomically transition the DB row to RUNNING + execution_id +
+        # lease_until.  If the process crashes during execution, the
+        # lease marker survives and ``recover_expired_leases`` (called
+        # by ``start()`` on the next boot) marks the task as FAILED —
+        # durable at-least-once disclosure.
+        execution_id = uuid.uuid4().hex
+        lease_until_dt = datetime.utcnow() + timedelta(seconds=self._execution_lease_seconds)
+        if self.db:
+            try:
+                rowcount = await self.db.claim_scheduled_task(
+                    task.id,
+                    execution_id=execution_id,
+                    lease_until=lease_until_dt.isoformat(),
+                    expected_version=version_at_start,
+                )
+            except Exception:  # noqa: BLE001 — claim failure is non-fatal
+                logger.error(
+                    "cron task %s: could not claim durable lease; "
+                    "proceeding without lease (at-least-once risk)",
+                    task.name, exc_info=True,
+                )
+                rowcount = 1  # proceed anyway (legacy behavior)
+            if rowcount == 0:
+                # Claim failed — a control op bumped the version or
+                # the task was not PENDING.  Skip this execution.
+                logger.info(
+                    "cron task %s: durable claim failed (rowcount 0) — "
+                    "a control operation happened or task is not pending; "
+                    "skipping execution",
+                    task.name,
+                )
+                return
         task.status = TaskStatus.RUNNING
         task.last_run = datetime.utcnow()
+        task.execution_id = execution_id
+        task.lease_until = lease_until_dt
         try:
             if self._executor:
-                result = await self._executor(task.id, task.prompt)
+                # M4 batch 3.1.10 (CRITICAL): pass the task's
+                # ``principal_id`` so the scheduled prompt runs as the
+                # creator (not the server UID).  The executor signature
+                # is ``Callable[[str, str], Awaitable[Any]]`` (task_id,
+                # prompt); we extend it to optionally accept a third
+                # ``principal_id`` arg via ``functools.partial`` or
+                # a wrapper in the AgentService.  Here we use a
+                # try/except to handle both 2-arg and 3-arg executors.
+                try:
+                    result = await self._executor(task.id, task.prompt, task.principal_id)
+                except TypeError:
+                    result = await self._executor(task.id, task.prompt)
             else:
                 result = f"[no executor] prompt: {task.prompt[:100]}"
 
@@ -1087,6 +1241,8 @@ class CronEngine:
             # NOT overwrite it with our own CANCELLED write — re-raise
             # without persisting.
             if self._epoch_changed(task, epoch_at_start):
+                # M4 batch 3.1.10 (HIGH-3): clear lease before re-raising.
+                await self._clear_lease(task, execution_id)
                 raise
             task.status = TaskStatus.CANCELLED
             task.error = "cancelled"
@@ -1095,13 +1251,17 @@ class CronEngine:
                 # HIGH-3 (batch 3.1.8): conditional write — if the
                 # version changed (pause/remove happened), discard.
                 await self._persist_task_state(
-                    task, expected_version=version_at_start,
+                    task,
+                    expected_version=version_at_start,
+                    operation_id=execution_id,
                 )
             except Exception:  # noqa: BLE001 — stop() will retry
                 logger.error(
                     "cron task %s: could not persist cancelled terminal "
                     "state; will retry on stop()", task.name, exc_info=True,
                 )
+            # M4 batch 3.1.10 (HIGH-3): clear lease before re-raising.
+            await self._clear_lease(task, execution_id)
             raise
         except Exception as exc:
             # H1 (round-9): epoch fence on the failure path too.
@@ -1119,12 +1279,18 @@ class CronEngine:
         # H1 (round-9): re-check epoch before persisting — it might
         # have changed during the on_complete callback.
         if self._epoch_changed(task, epoch_at_start):
+            # M4 batch 3.1.10 (HIGH-3): still clear the lease — even
+            # if we're not persisting terminal state, the execution is
+            # over and the lease should not linger.
+            await self._clear_lease(task, execution_id)
             return
         try:
             # HIGH-3 (batch 3.1.8): conditional write — if the version
             # changed (pause/remove happened), discard.
             await self._persist_task_state(
-                task, expected_version=version_at_start,
+                task,
+                expected_version=version_at_start,
+                operation_id=execution_id,
             )
         except Exception:  # noqa: BLE001 — stop() will retry
             logger.error(
@@ -1132,6 +1298,34 @@ class CronEngine:
                 "will retry on stop()",
                 task.name, task.status.value, exc_info=True,
             )
+        # M4 batch 3.1.10 (HIGH-3): clear the durable lease after the
+        # terminal write (whether it succeeded or was discarded).  The
+        # execution is over — the lease must not linger and confuse
+        # restart recovery into thinking the process crashed.
+        await self._clear_lease(task, execution_id)
+
+    async def _clear_lease(self, task: ScheduledTask, execution_id: str) -> None:
+        """M4 batch 3.1.10 (HIGH-3): clear the durable execution lease.
+
+        Only clears if the stored ``execution_id`` matches — so a stale
+        executor that lost a lease race cannot clear a newer executor's
+        lease.  Failures are logged but non-fatal (the lease will
+        expire naturally if not cleared).
+        """
+        if not self.db:
+            return
+        try:
+            await self.db.clear_scheduled_task_lease(
+                task.id, execution_id=execution_id,
+            )
+        except Exception:  # noqa: BLE001 — lease cleanup is best-effort
+            logger.debug(
+                "cron task %s: could not clear execution lease "
+                "(will expire naturally)",
+                task.name, exc_info=True,
+            )
+        task.execution_id = None
+        task.lease_until = None
 
     def _epoch_changed(self, task: ScheduledTask, epoch_at_start: int) -> bool:
         """H1 (round-9): return ``True`` if the execution epoch for
@@ -1154,7 +1348,11 @@ class CronEngine:
         return False
 
     async def _persist_task_state(
-        self, task: ScheduledTask, *, expected_version: int | None = None,
+        self,
+        task: ScheduledTask,
+        *,
+        expected_version: int | None = None,
+        operation_id: str | None = None,
     ) -> bool:
         """Persist the current task state to the DB.
 
@@ -1177,13 +1375,15 @@ class CronEngine:
 
         HIGH (batch 3.1.9): the conditional UPDATE does NOT bump the
         version on success — only control operations (pause / resume /
-        remove) bump the version.  This means multiple sequential
-        executions of a recurring task reuse the same version and the
-        conditional UPDATE matches every time.  Previously the executor
-        bumped the version on each successful write, which caused the
-        second execution's ``expected_version`` to mismatch the
-        now-incremented DB version — every subsequent execution's
-        terminal state was silently discarded.
+        remove) bump the version.
+
+        M4 batch 3.1.10 (HIGH-2): ``operation_id`` — each caller
+        generates a unique id and passes it here.  The pending marker
+        is only cleared if the stored ``operation_id`` matches — so a
+        stale executor that lost a version race CANNOT clear a NEWER
+        control op's retry marker (the old ``set[str]`` design did
+        ``discard(task.id)`` which cleared whatever marker was there,
+        even if it belonged to a later control op).
 
         If ``expected_version`` is ``None`` (control operation path:
         pause / remove / resume), uses the unconditional
@@ -1196,10 +1396,25 @@ class CronEngine:
         """
         if not self.db:
             return True
-        # H2 (round-7): mark pending BEFORE the write.  Idempotent if
-        # the task is already in the set (e.g. a previous write failed
-        # and stop() is retrying).
-        self._pending_persistence.add(task.id)
+        # M4 batch 3.1.10 (HIGH-2): generate an operation_id if the
+        # caller didn't provide one (backwards compat for tests that
+        # call _persist_task_state directly).
+        if operation_id is None:
+            import uuid as _uuid
+            operation_id = _uuid.uuid4().hex
+        is_control_op = expected_version is None
+        # H2 (round-7): mark pending BEFORE the write.  M4 batch 3.1.10
+        # (HIGH-2): store the PendingPersistence entry.  If there is
+        # already a NEWER entry (different operation_id) for this task,
+        # we overwrite it — the caller holding the per-task lock
+        # guarantees only one operation at a time, so the newest
+        # operation's intent is always the correct one.
+        self._pending_persistence[task.id] = PendingPersistence(
+            operation_id=operation_id,
+            desired_status=task.status.value,
+            expected_version=expected_version if expected_version is not None else task.lifecycle_version,
+            is_control_op=is_control_op,
+        )
         if expected_version is not None:
             # HIGH-3 (batch 3.1.8): executor terminal write — conditional.
             rowcount = await self.db.update_scheduled_task_conditional(
@@ -1222,7 +1437,13 @@ class CronEngine:
                     "pause/remove/resume happened during execution",
                     task.name, expected_version,
                 )
-                self._pending_persistence.discard(task.id)
+                # M4 batch 3.1.10 (HIGH-2): only clear OUR marker —
+                # a newer control op may have placed its own marker
+                # while we were waiting for the conditional UPDATE.
+                # The old ``set[str].discard`` would have cleared it.
+                stored = self._pending_persistence.get(task.id)
+                if stored is not None and stored.operation_id == operation_id:
+                    self._pending_persistence.pop(task.id, None)
                 return False
         else:
             # Control operation — unconditional, bumps version.
@@ -1236,8 +1457,13 @@ class CronEngine:
                 error=task.error,
                 bump_version=True,
             )
-        # Only clear after a successful persist.
-        self._pending_persistence.discard(task.id)
+        # Only clear after a successful persist — and only if the
+        # stored marker is still OURS.  A concurrent control op may
+        # have replaced our marker with a newer one while we were
+        # awaiting the DB write.
+        stored = self._pending_persistence.get(task.id)
+        if stored is not None and stored.operation_id == operation_id:
+            self._pending_persistence.pop(task.id, None)
         return True
 
     async def _load_tasks(self) -> None:
@@ -1321,6 +1547,12 @@ def _task_from_row(row: dict) -> ScheduledTask | None:
         # the in-memory epoch fence and the DB conditional UPDATE both
         # work correctly after a restart.
         lifecycle_version=int(row.get("lifecycle_version", 0) or 0),
+        # M4 batch 3.1.10: restore principal ownership + lease markers
+        # so list / pause / resume / remove can filter by principal and
+        # restart recovery can detect crashed executions.
+        principal_id=str(row.get("principal_id") or ""),
+        execution_id=row.get("execution_id"),
+        lease_until=_parse_dt(row.get("lease_until")),
     )
 
 

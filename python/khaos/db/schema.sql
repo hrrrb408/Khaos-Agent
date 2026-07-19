@@ -168,7 +168,18 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     run_count       INTEGER NOT NULL DEFAULT 0,
     last_result     TEXT,
     error           TEXT,
-    lifecycle_version INTEGER NOT NULL DEFAULT 0
+    lifecycle_version INTEGER NOT NULL DEFAULT 0,
+    -- M4 batch 3.1.10: principal-bound ownership.  Every task belongs
+    -- to exactly one principal; list / pause / resume / remove filter
+    -- on it.  Legacy rows get 'legacy' and are NOT visible to any
+    -- authenticated principal (fail-closed).
+    principal_id    TEXT NOT NULL DEFAULT 'legacy',
+    -- M4 batch 3.1.10: durable execution claim.  Set atomically via
+    -- claim_scheduled_task() before the executor runs, so a crash
+    -- during execution leaves a durable RUNNING + lease marker that
+    -- restart recovery can detect and disclose (at-least-once).
+    execution_id    TEXT,
+    lease_until     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status ON scheduled_tasks(status, next_run);
