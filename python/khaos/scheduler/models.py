@@ -48,3 +48,15 @@ class ScheduledTask:
     deliver_to: str = "local"           # local | session:<id> | all
     enabled: bool = True
     meta: dict = field(default_factory=dict)  # 额外元数据
+    # HIGH-3 (batch 3.1.8): durable lifecycle version for optimistic
+    # concurrency on terminal-state writes.  Control operations
+    # (pause / remove / resume) unconditionally increment this; the
+    # executor's terminal write is conditional on the version it
+    # captured at start — if a control operation bumped the version,
+    # the executor's UPDATE matches 0 rows and the stale write is
+    # discarded.  This is the durable equivalent of the in-memory
+    # ``_execution_epoch`` fence: the in-memory fence prevents the
+    # executor from overwriting the in-memory desired state, and the
+    # lifecycle_version prevents the executor from overwriting the DB
+    # desired state (which matters across process restarts).
+    lifecycle_version: int = 0

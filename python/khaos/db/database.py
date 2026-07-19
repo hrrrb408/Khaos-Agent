@@ -96,6 +96,29 @@ class Database:
         conn = await self._require_conn()
         await conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         await conn.commit()
+        # HIGH-3 (batch 3.1.8): ensure lifecycle_version column exists on
+        # existing databases (CREATE TABLE IF NOT EXISTS won't add it to
+        # a pre-existing table).  See _ensure_scheduled_tasks_lifecycle_version.
+        await self._ensure_scheduled_tasks_lifecycle_version()
+
+    async def _ensure_scheduled_tasks_lifecycle_version(self) -> None:
+        """Add ``lifecycle_version`` column to legacy ``scheduled_tasks``.
+
+        HIGH-3 (batch 3.1.8): the column was added to ``schema.sql`` for
+        new databases, but existing databases created before this batch
+        won't have it (``CREATE TABLE IF NOT EXISTS`` is a no-op on an
+        existing table).  This helper uses ``ALTER TABLE`` to add the
+        column with a default of 0 — matching the schema.sql default.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(scheduled_tasks)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "lifecycle_version" not in columns:
+            await conn.execute(
+                "ALTER TABLE scheduled_tasks "
+                "ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 0"
+            )
+            await conn.commit()
 
     async def create_session(self, session_id: str, mode: str = "office") -> None:
         """Create a session if missing and keep its mode current."""
@@ -841,13 +864,30 @@ class Database:
         await conn.commit()
         return task_id
 
-    async def update_scheduled_task_status(self, task_id: str, status: str) -> None:
+    async def update_scheduled_task_status(
+        self, task_id: str, status: str, bump_version: bool = False,
+    ) -> int:
+        """Update only the status column.
+
+        HIGH-3 (batch 3.1.8): if ``bump_version`` is True, also increments
+        ``lifecycle_version``.  Returns the rowcount (1 = success, 0 = no
+        such task).  Used by control operations (pause / resume / remove)
+        which always win over stale executor writes.
+        """
         conn = await self._require_conn()
-        await conn.execute(
-            "UPDATE scheduled_tasks SET status = ? WHERE id = ?",
-            (status, task_id),
-        )
+        if bump_version:
+            cursor = await conn.execute(
+                "UPDATE scheduled_tasks SET status = ?, "
+                "lifecycle_version = lifecycle_version + 1 WHERE id = ?",
+                (status, task_id),
+            )
+        else:
+            cursor = await conn.execute(
+                "UPDATE scheduled_tasks SET status = ? WHERE id = ?",
+                (status, task_id),
+            )
         await conn.commit()
+        return cursor.rowcount
 
     async def update_scheduled_task(
         self,
@@ -858,7 +898,15 @@ class Database:
         run_count: int | None = None,
         last_result: str | None = None,
         error: str | None = None,
-    ) -> None:
+        bump_version: bool = False,
+    ) -> int:
+        """Update multiple columns.  Returns rowcount (1 = success, 0 = no
+        such task).
+
+        HIGH-3 (batch 3.1.8): if ``bump_version`` is True, also increments
+        ``lifecycle_version``.  Used by control operations which always
+        win over stale executor writes.
+        """
         conn = await self._require_conn()
         clauses: list[str] = []
         params: list[Any] = []
@@ -873,21 +921,81 @@ class Database:
             if val is not None:
                 clauses.append(f"{col} = ?")
                 params.append(val)
+        if bump_version:
+            clauses.append("lifecycle_version = lifecycle_version + 1")
         if not clauses:
-            return
+            return 1
         params.append(task_id)
-        await conn.execute(
+        cursor = await conn.execute(
             f"UPDATE scheduled_tasks SET {', '.join(clauses)} WHERE id = ?",
             tuple(params),
         )
         await conn.commit()
+        return cursor.rowcount
+
+    async def update_scheduled_task_conditional(
+        self,
+        task_id: str,
+        expected_version: int,
+        status: str | None = None,
+        last_run: str | None = None,
+        next_run: str | None = None,
+        run_count: int | None = None,
+        last_result: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        """Optimistic-concurrency UPDATE for executor terminal writes.
+
+        HIGH-3 (batch 3.1.8): the executor captures ``lifecycle_version``
+        at start and passes it as ``expected_version``.  The UPDATE only
+        succeeds if the version hasn't changed (no control operation
+        happened in between).  Returns rowcount:
+          - 1 = success (version matched, state written, version bumped)
+          - 0 = version mismatch (a pause / remove / resume happened;
+            the stale write is discarded)
+
+        The UPDATE always bumps ``lifecycle_version`` on success so the
+        next control operation's unconditional write doesn't accidentally
+        re-match a different executor's captured version.
+        """
+        conn = await self._require_conn()
+        clauses: list[str] = []
+        params: list[Any] = []
+        for col, val in [
+            ("status", status),
+            ("last_run", last_run),
+            ("next_run", next_run),
+            ("run_count", run_count),
+            ("last_result", last_result),
+            ("error", error),
+        ]:
+            if val is not None:
+                clauses.append(f"{col} = ?")
+                params.append(val)
+        clauses.append("lifecycle_version = lifecycle_version + 1")
+        # HIGH-3 (batch 3.1.8): WHERE clause is ``id = ? AND
+        # lifecycle_version = ?`` — params MUST be in that order
+        # (task_id first, then expected_version).  A previous version
+        # had these reversed, which made every conditional UPDATE
+        # match 0 rows (id column received an int, lifecycle_version
+        # received a string) — silently discarding every executor
+        # terminal write as a "version mismatch".
+        params.extend([task_id, expected_version])
+        cursor = await conn.execute(
+            f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
+            f"WHERE id = ? AND lifecycle_version = ?",
+            tuple(params),
+        )
+        await conn.commit()
+        return cursor.rowcount
 
     async def list_scheduled_tasks(self) -> list[dict[str, Any]]:
         conn = await self._require_conn()
         cursor = await conn.execute(
             """
             SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
-                   created_at, last_run, next_run, run_count, last_result, error
+                   created_at, last_run, next_run, run_count, last_result, error,
+                   lifecycle_version
             FROM scheduled_tasks
             ORDER BY created_at
             """

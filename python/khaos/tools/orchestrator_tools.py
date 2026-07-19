@@ -8,6 +8,19 @@ Dependencies (``SubAgentSpawner`` / ``SubAgentRunner``) are injected once at
 startup via :func:`init_orchestrator` and held in module-level globals. This
 mirrors how other tool modules (e.g. ``browser_tools``) receive their runtime
 state, keeping the handler signatures compatible with the scheduler.
+
+MEDIUM (batch 3.1.8): the four orchestrator tool handlers now accept a
+``principal_id`` keyword parameter (injected by the
+``ToolInvocationBroker`` via the ``subagent.spawn`` capability declared in
+``registry.py``).  ``spawn_subagent`` stamps the principal on the
+``SubAgentTask``; ``collect_results`` / ``subagent_status`` / ``execute_plan``
+pass it to ``wait_all`` / ``stats`` / each task in the plan so a principal
+only observes its own tasks.  ``spawn_subagent`` also returns the real
+post-spawn status (typically ``pending`` / ``initializing``) instead of the
+hardcoded ``"running"`` — so a spawn that failed during reservation reports
+the actual failure.  ``init_orchestrator`` is now wired in production by
+``_build_subagent_service`` (grpc_server.py) so the four handlers no longer
+return ``"Orchestrator not initialized"``.
 """
 
 from __future__ import annotations
@@ -31,6 +44,11 @@ def init_orchestrator(spawner: "SubAgentSpawner", runner: "SubAgentRunner") -> N
 
     在应用启动时调用一次，传入 SubAgentSpawner 和 SubAgentRunner 实例。
     重复调用会覆盖旧引用（便于测试重置）。
+
+    MEDIUM (batch 3.1.8): this is now called in production by
+    ``_build_subagent_service`` (grpc_server.py) so the four orchestrator
+    tool handlers are wired with the real spawner / runner instead of
+    returning ``"Orchestrator not initialized"``.
     """
     global _spawner, _runner
     _spawner = spawner
@@ -53,6 +71,8 @@ async def spawn_subagent(
     context: str = "",
     tools: list[str] | None = None,
     timeout: int = 300,
+    *,
+    principal_id: str = "",
 ) -> dict[str, Any]:
     """启动一个子代理执行指定任务。
 
@@ -61,45 +81,89 @@ async def spawn_subagent(
     - context: 额外上下文信息
     - tools: 子代理可用的工具列表（None / 空列表表示使用全部）
     - timeout: 超时秒数
+    - principal_id: 调用方主体 ID（由 ToolInvocationBroker 通过
+      ``subagent.spawn`` capability 注入）。空字符串表示未经认证的
+      本地调用，使用 ``local-uid`` 兜底。
 
     返回：
-        ``{"ok": True, "task_id": "...", "status": "running"}``
+        ``{"ok": True, "task_id": "...", "status": "<post-spawn status>"}``
         或 ``{"ok": False, "error": "..."}``
+
+    MEDIUM (batch 3.1.8): previously this handler hard-coded
+        ``{"ok": True, "status": "running"}`` regardless of the actual
+        spawn result, and did not stamp ``principal_id`` on the task —
+        so ``collect_results`` / ``subagent_status`` (which filter by
+        principal) returned empty for tasks spawned via this tool.
+        Now the principal is stamped on the task and the real
+        post-spawn status (typically ``pending`` / ``initializing``,
+        or ``failed`` if reservation was rejected) is returned.
     """
     if _spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
 
     from khaos.subagents.spawner import SubAgentTask
 
+    # MEDIUM (batch 3.1.8): stamp the principal so collect_results /
+    # subagent_status can filter by it.  Fall back to a local-uid so
+    # the task is at least observable by the same caller (the spawner
+    # returns empty for empty principal_id — defense in depth).
+    effective_principal = principal_id or "local-uid:orchestrator"
     task = SubAgentTask(
-        id="",  # 由 spawner 自动生成 task_N
+        id="",  # 由 spawner 自动生成 UUID
         goal=goal,
         context=context,
         tools=tools or [],
         timeout=timeout,
         parent_session_id="orchestrator",
         depth=1,
+        principal_id=effective_principal,
     )
     try:
         result = await _spawner.spawn(task)
-        return {"ok": True, "task_id": result.id, "status": "running"}
+        # MEDIUM (batch 3.1.8): return the REAL post-spawn status
+        # (typically "pending" or "initializing"; "failed" if the
+        # spawner rejected the reservation).  Previously this was
+        # hard-coded to "running".
+        return {
+            "ok": True,
+            "task_id": result.id,
+            "status": result.status,
+            "principal_id": effective_principal,
+        }
     except Exception as exc:  # noqa: BLE001 — 工具层兜底，转为结构化错误
         logger.error("Failed to spawn subagent: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
-async def collect_results() -> dict[str, Any]:
+async def collect_results(
+    *,
+    principal_id: str = "",
+) -> dict[str, Any]:
     """等待所有子任务完成并收集结果。
+
+    参数：
+    - principal_id: 调用方主体 ID（由 ToolInvocationBroker 注入）。
+      只收集属于该 principal 的任务。
 
     返回：
         ``{"ok": True, "results": [...], "total": int, "completed": int, "failed": int}``
         或 ``{"ok": False, "error": "..."}``
+
+    MEDIUM (batch 3.1.8): previously this handler called
+        ``_spawner.wait_all(timeout=600)`` with NO principal_id — the
+        spawner returns an empty list for empty principal (defense in
+        depth), so the tool always reported zero results for tasks
+        spawned via ``spawn_subagent``.  Now the principal is passed
+        through so the caller's own tasks are collected.
     """
     if _spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
 
+    effective_principal = principal_id or "local-uid:orchestrator"
     try:
-        tasks = await _spawner.wait_all(timeout=600)
+        tasks = await _spawner.wait_all(
+            timeout=600, principal_id=effective_principal,
+        )
         results = [_task_to_dict(task) for task in tasks]
         completed = sum(1 for r in results if r["status"] == "completed")
         failed = sum(1 for r in results if r["status"] == "failed")
@@ -115,16 +179,28 @@ async def collect_results() -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
-async def execute_plan(plan_json: str) -> dict[str, Any]:
+async def execute_plan(
+    plan_json: str,
+    *,
+    principal_id: str = "",
+) -> dict[str, Any]:
     """执行一个任务计划（JSON 格式）。
 
     参数：
     - plan_json: TaskPlanner.from_json() 可解析的 JSON 字符串
+    - principal_id: 调用方主体 ID（由 ToolInvocationBroker 注入）。
+      每个计划任务的 principal_id 都设为该值，确保 collect_results /
+      subagent_status 能正确过滤。
 
     返回：
         ``{"ok": True, "plan_id": "...", "results": [...], "total": int,
            "completed": int, "failed": int}``
         或 ``{"ok": False, "error": "..."}``
+
+    MEDIUM (batch 3.1.8): previously this handler did not stamp
+        ``principal_id`` on the plan's tasks, so collect_results /
+        subagent_status could not observe them.  Now every task in the
+        plan is stamped with the caller's principal before execution.
     """
     if _spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
@@ -134,6 +210,13 @@ async def execute_plan(plan_json: str) -> dict[str, Any]:
     plan = TaskPlanner.from_json(plan_json)
     if plan is None:
         return {"ok": False, "error": "Invalid plan JSON: failed to parse"}
+
+    # MEDIUM (batch 3.1.8): stamp every task in the plan with the
+    # caller's principal so collect_results / subagent_status can
+    # observe them.
+    effective_principal = principal_id or "local-uid:orchestrator"
+    for task in plan.tasks:
+        task.principal_id = effective_principal
 
     try:
         tasks = await TaskPlanner.execute_plan(plan, _spawner)
@@ -153,14 +236,28 @@ async def execute_plan(plan_json: str) -> dict[str, Any]:
         return {"ok": False, "error": str(exc)}
 
 
-async def subagent_status() -> dict[str, Any]:
+async def subagent_status(
+    *,
+    principal_id: str = "",
+) -> dict[str, Any]:
     """查看当前所有子任务状态（不等待）。
+
+    参数：
+    - principal_id: 调用方主体 ID（由 ToolInvocationBroker 注入）。
+      只统计属于该 principal 的任务。
 
     返回：
         ``{"ok": True, "stats": {"active": int, "total": int, "completed": int,
            "failed": int, "pending": int}}``
         或 ``{"ok": False, "error": "..."}``
+
+    MEDIUM (batch 3.1.8): previously this handler called
+        ``_spawner.stats()`` with NO principal_id — the spawner returns
+        an empty stats dict for empty principal (defense in depth), so
+        the tool always reported zero counts for tasks spawned via
+        ``spawn_subagent``.  Now the principal is passed through.
     """
     if _spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
-    return {"ok": True, "stats": _spawner.stats()}
+    effective_principal = principal_id or "local-uid:orchestrator"
+    return {"ok": True, "stats": _spawner.stats(principal_id=effective_principal)}

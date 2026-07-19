@@ -573,8 +573,10 @@ class CronEngine:
         """Resume a paused task.
 
         Returns one of:
-          - ``"ok"``: task was resumed — status set to PENDING and
-            next_run recomputed.
+          - ``"ok"``: task was resumed — ``PENDING + next_run`` was
+            durably persisted to the DB (or there is no DB) AND the
+            in-memory state was flipped to PENDING.  Tick will fire
+            the task on the next loop.
           - ``"not_found"``: task_id is not registered.
           - ``"invalid_state"``: the task is not in the ``PAUSED``
             state.  Only ``PAUSED`` tasks can be resumed.  This
@@ -589,6 +591,11 @@ class CronEngine:
             the old executor to race with the new execution when tick
             re-fires.  The caller should wait for the old executor to
             terminate (or call ``remove`` to force-cancel it).
+          - ``"persistence_pending"``: the DB write failed (or matched
+            0 rows because the task was removed concurrently).  The
+            in-memory task is UNCHANGED — still ``PAUSED`` — and tick
+            continues to ignore it.  The caller MUST NOT claim the
+            task is resumed; retry ``resume()`` to confirm.
 
         H1 (round-12): strict state transition matrix.  ``resume`` is
         only allowed from ``PAUSED``.  Previously ``resume`` accepted
@@ -604,6 +611,22 @@ class CronEngine:
 
         H1 (round-11): the per-task lock is held for the ENTIRE
         operation — including persist.
+
+        HIGH-2 (batch 3.1.8): persist-first.  The desired
+        ``PENDING + next_run`` state is written to the DB BEFORE the
+        in-memory task is flipped.  If the DB write fails, the task
+        stays ``PAUSED`` in memory and the caller receives
+        ``persistence_pending`` — tick continues to ignore it (PAUSED
+        is not in the "ready to fire" set), so no external side
+        effects are produced.  Without this, a DB write failure left
+        the task ``PENDING`` in memory but ``PAUSED`` in the DB —
+        tick fired, produced side effects, and the next ``resume``
+        call returned ``invalid_state`` (because the in-memory status
+        was already PENDING).  The DB write uses ``bump_version=True``
+        so the ``lifecycle_version`` is bumped (same as pause/remove);
+        the in-memory ``_bump_epoch`` is applied only AFTER the persist
+        succeeds so the in-memory ``task.lifecycle_version`` matches
+        the post-write DB version.
         """
         async with self._task_lock(task_id):
             task = self._tasks.get(task_id)
@@ -620,17 +643,46 @@ class CronEngine:
             exec_task = self._execute_tasks.get(task_id)
             if exec_task is not None and not exec_task.done():
                 return "execution_pending"
-            # H1 (round-9): bump epoch so any in-flight (cancellation-
-            # resistant) executor from before the pause cannot
-            # overwrite the resumed PENDING state.
+            # HIGH-2 (batch 3.1.8): persist-first.  Compute the new
+            # next_run WITHOUT applying it to the in-memory task.  If
+            # the DB write fails, the task stays PAUSED in memory and
+            # the caller gets ``persistence_pending`` to retry.
+            new_next_run = self._compute_next_run(task)
+            if self.db:
+                try:
+                    rowcount = await self.db.update_scheduled_task(
+                        task.id,
+                        status=TaskStatus.PENDING.value,
+                        next_run=new_next_run.isoformat()
+                        if new_next_run else None,
+                        bump_version=True,
+                    )
+                except Exception:  # noqa: BLE001 — caller retries
+                    logger.error(
+                        "cron task %s: could not persist resumed "
+                        "state; task remains paused in memory; "
+                        "caller should retry resume()",
+                        task.name, exc_info=True,
+                    )
+                    return "persistence_pending"
+                if rowcount == 0:
+                    # No matching row — DB row was removed (e.g. by a
+                    # concurrent remove() that won the race).  Treat
+                    # as persistence_pending so the caller re-checks.
+                    logger.error(
+                        "cron task %s: resume persist matched 0 rows; "
+                        "task may have been removed concurrently",
+                        task.name,
+                    )
+                    return "persistence_pending"
+            # Persist succeeded (or no DB).  Now bump the in-memory
+            # epoch (which also bumps task.lifecycle_version to match
+            # the post-write DB version) and flip the in-memory state
+            # to PENDING + new_next_run.  These updates are
+            # synchronous — no further I/O — so they cannot fail.
             self._bump_epoch(task_id)
             task.status = TaskStatus.PENDING
-            task.next_run = self._compute_next_run(task)
-            # Persist (I/O — but we hold the per-task lock).
-            if self.db:
-                await self.db.update_scheduled_task_status(
-                    task_id, TaskStatus.PENDING.value,
-                )
+            task.next_run = new_next_run
             return "ok"
 
     async def remove(self, task_id: str) -> str:
@@ -740,9 +792,19 @@ class CronEngine:
         the epoch at start and re-checks it before writing any terminal
         state; if the epoch changed, the old executor's write is
         discarded (the desired state set by pause/remove wins).
+
+        HIGH-3 (batch 3.1.8): also increments ``task.lifecycle_version``
+        so the durable DB fence works alongside the in-memory fence.
+        The in-memory ``_execution_epoch`` prevents the executor from
+        overwriting the in-memory desired state; ``lifecycle_version``
+        prevents the executor's DB write from overwriting the DB desired
+        state (via ``update_scheduled_task_conditional``).
         """
         new_epoch = self._execution_epoch.get(task_id, 0) + 1
         self._execution_epoch[task_id] = new_epoch
+        task = self._tasks.get(task_id)
+        if task is not None:
+            task.lifecycle_version = new_epoch
         return new_epoch
 
     async def _cancel_in_flight_execution(self, task_id: str) -> bool:
@@ -968,6 +1030,12 @@ class CronEngine:
         """
         # H1 (round-9): capture epoch at start.
         epoch_at_start = self._execution_epoch.get(task.id, 0)
+        # HIGH-3 (batch 3.1.8): capture lifecycle_version at start for
+        # the conditional DB write.  If a control operation bumps the
+        # version while the executor is running, the executor's
+        # terminal UPDATE will match 0 rows (version mismatch) and the
+        # stale write is discarded.
+        version_at_start = task.lifecycle_version
         task.status = TaskStatus.RUNNING
         task.last_run = datetime.utcnow()
         try:
@@ -1024,7 +1092,11 @@ class CronEngine:
             task.error = "cancelled"
             logger.info("task %s cancelled during execution", task.name)
             try:
-                await self._persist_task_state(task)
+                # HIGH-3 (batch 3.1.8): conditional write — if the
+                # version changed (pause/remove happened), discard.
+                await self._persist_task_state(
+                    task, expected_version=version_at_start,
+                )
             except Exception:  # noqa: BLE001 — stop() will retry
                 logger.error(
                     "cron task %s: could not persist cancelled terminal "
@@ -1049,7 +1121,11 @@ class CronEngine:
         if self._epoch_changed(task, epoch_at_start):
             return
         try:
-            await self._persist_task_state(task)
+            # HIGH-3 (batch 3.1.8): conditional write — if the version
+            # changed (pause/remove happened), discard.
+            await self._persist_task_state(
+                task, expected_version=version_at_start,
+            )
         except Exception:  # noqa: BLE001 — stop() will retry
             logger.error(
                 "cron task %s: could not persist terminal state %s; "
@@ -1077,7 +1153,9 @@ class CronEngine:
             return True
         return False
 
-    async def _persist_task_state(self, task: ScheduledTask) -> None:
+    async def _persist_task_state(
+        self, task: ScheduledTask, *, expected_version: int | None = None,
+    ) -> bool:
         """Persist the current task state to the DB.
 
         M3 (round-6): extracted so both the success / failure path and
@@ -1087,29 +1165,70 @@ class CronEngine:
         ``_pending_persistence`` BEFORE the DB write and only removed
         after a successful UPDATE.  If the write raises, the task stays
         in the set so ``stop()`` can retry it on the next call.
-        Previously failures were logged but swallowed — so a cancelled
-        task whose terminal UPDATE failed would stay at ``running`` in
-        the DB, and on restart the scheduler would re-fire it,
-        potentially double-executing external side effects.
+
+        HIGH-3 (batch 3.1.8): if ``expected_version`` is provided, uses
+        ``update_scheduled_task_conditional`` (optimistic concurrency).
+        Returns ``True`` if the write succeeded (rowcount 1), ``False``
+        if the version mismatched (rowcount 0 — a control operation
+        happened in between; the stale write is discarded).  The caller
+        (``_execute_task``) captures ``lifecycle_version`` at start and
+        passes it here so a pause/remove/resume that bumped the version
+        will cause the executor's terminal write to fail.
+
+        If ``expected_version`` is ``None`` (control operation path:
+        pause / remove / resume), uses the unconditional
+        ``update_scheduled_task`` with ``bump_version=True`` so the
+        control operation always wins.
+
+        Returns ``True`` on success (or when there is no DB).  Returns
+        ``False`` on version mismatch (only when ``expected_version``
+        is provided).
         """
         if not self.db:
-            return
+            return True
         # H2 (round-7): mark pending BEFORE the write.  Idempotent if
         # the task is already in the set (e.g. a previous write failed
         # and stop() is retrying).
         self._pending_persistence.add(task.id)
-        await self.db.update_scheduled_task(
-            task.id,
-            status=task.status.value,
-            last_run=task.last_run.isoformat() if task.last_run else None,
-            next_run=task.next_run.isoformat() if task.next_run else None,
-            run_count=task.run_count,
-            last_result=task.last_result,
-            error=task.error,
-        )
-        # Only clear after a successful persist.  If the await above
-        # raised, the flag stays set and ``stop()`` retries.
+        if expected_version is not None:
+            # HIGH-3 (batch 3.1.8): executor terminal write — conditional.
+            rowcount = await self.db.update_scheduled_task_conditional(
+                task.id,
+                expected_version=expected_version,
+                status=task.status.value,
+                last_run=task.last_run.isoformat() if task.last_run else None,
+                next_run=task.next_run.isoformat() if task.next_run else None,
+                run_count=task.run_count,
+                last_result=task.last_result,
+                error=task.error,
+            )
+            if rowcount == 0:
+                # Version mismatch — a control operation bumped the
+                # version.  Discard this stale write.  The control
+                # operation already wrote the desired state.
+                logger.info(
+                    "cron task %s: terminal write discarded (version "
+                    "mismatch: expected %d, current is higher); a "
+                    "pause/remove/resume happened during execution",
+                    task.name, expected_version,
+                )
+                self._pending_persistence.discard(task.id)
+                return False
+        else:
+            # Control operation — unconditional, bumps version.
+            await self.db.update_scheduled_task(
+                task.id,
+                status=task.status.value,
+                last_run=task.last_run.isoformat() if task.last_run else None,
+                next_run=task.next_run.isoformat() if task.next_run else None,
+                run_count=task.run_count,
+                last_result=task.last_result,
+                error=task.error,
+                bump_version=True,
+            )
+        # Only clear after a successful persist.
         self._pending_persistence.discard(task.id)
+        return True
 
     async def _load_tasks(self) -> None:
         """从 DB 加载已持久化的任务。"""

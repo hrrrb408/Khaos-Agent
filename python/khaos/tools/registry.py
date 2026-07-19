@@ -241,6 +241,14 @@ class ToolInvocationBroker:
             handler_params["approval_context"] = context.get("approval_context")
             handler_params["principal_id"] = context.get("principal_id")
             handler_params["requester"] = context.get("requester")
+        # MEDIUM (batch 3.1.8): the four orchestrator tools declare the
+        # ``subagent.spawn`` capability so the broker injects the caller's
+        # ``principal_id`` — the spawner / wait_all / stats filter on it,
+        # so without this injection a principal could never observe the
+        # tasks it spawned (spawner returns an empty list for empty
+        # principal, defense-in-depth against cross-principal leakage).
+        if any(capability.name == "subagent.spawn" for capability in capabilities):
+            handler_params["principal_id"] = context.get("principal_id", "")
         if mode == "coding" and name in _WORKSPACE_FILE_TOOLS and any(
             capability.name in {"filesystem.read", "filesystem.write"}
             for capability in capabilities
@@ -1460,6 +1468,19 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         )
     )
     # ── Phase 8.3 orchestrator tools (subagent spawn / collect / plan) ──
+    # MEDIUM (batch 3.1.8): the four orchestrator tools declare the
+    # ``subagent.spawn`` capability so ``ToolInvocationBroker.invoke``
+    # injects ``principal_id`` into the handler kwargs.  Without a
+    # declared capability the broker treats them as no-capability tools
+    # and the handlers receive ``principal_id=""`` even when the caller
+    # is authenticated — the spawner then returns an empty list for an
+    # empty principal, so ``collect_results`` / ``subagent_status`` can
+    # never observe tasks spawned via ``spawn_subagent``.
+    _SUBAGENT_SPAWN_CAP = ToolCapability(
+        "subagent.spawn",
+        frozenset({"office", "coding"}),
+        frozenset({"app-data"}),
+    )
     registry.register(
         ToolDefinition(
             name="spawn_subagent",
@@ -1495,6 +1516,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office", "coding"],
             permission_level="write",
             parallel=False,
+            capabilities=(_SUBAGENT_SPAWN_CAP,),
         )
     )
     registry.register(
@@ -1505,6 +1527,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office", "coding"],
             permission_level="read",
             parallel=False,
+            capabilities=(_SUBAGENT_SPAWN_CAP,),
         )
     )
     registry.register(
@@ -1528,6 +1551,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office", "coding"],
             permission_level="write",
             parallel=False,
+            capabilities=(_SUBAGENT_SPAWN_CAP,),
         )
     )
     registry.register(
@@ -1538,6 +1562,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office", "coding"],
             permission_level="read",
             parallel=True,
+            capabilities=(_SUBAGENT_SPAWN_CAP,),
         )
     )
     registry.register(
