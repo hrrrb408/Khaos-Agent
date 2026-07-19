@@ -3335,3 +3335,333 @@ async def test_lifecycle_version_bumped_by_control_operations(tmp_path) -> None:
         await engine.stop(timeout=2.0)
     finally:
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# HIGH (batch 3.1.9): lifecycle_version continuity across executions & restarts
+# ---------------------------------------------------------------------------
+
+
+async def test_recurring_task_consecutive_executions_both_persist(tmp_path) -> None:
+    """HIGH (batch 3.1.9) acceptance #1: a recurring task MUST persist
+    its terminal state on EVERY execution, not just the first.
+
+    Previously the executor's conditional UPDATE bumped
+    ``lifecycle_version`` on success, so the SECOND execution's
+    ``expected_version`` (captured at start, still the
+    pre-first-execution value) mismatched the now-incremented DB
+    version — every subsequent execution's terminal state was silently
+    discarded, the task appeared stuck at its pre-execution
+    ``next_run``, and a process restart could re-fire the task.
+    """
+    import asyncio
+
+    from khaos.db import Database
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        engine = CronEngine(
+            db=db,
+            executor=_recording_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        task = await engine.create(
+            "recurring", "p", ScheduleConfig(interval_seconds=60),
+        )
+        task_id = task.id
+
+        # Force the first execution.
+        engine._tasks[task_id].next_run = datetime.utcnow()
+        await asyncio.sleep(0.3)
+
+        # Verify the first execution persisted.
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["run_count"] == 1, (
+            f"first execution not persisted: run_count={row['run_count']}"
+        )
+
+        # Force the second execution.
+        engine._tasks[task_id].next_run = datetime.utcnow()
+        await asyncio.sleep(0.3)
+
+        # Verify the second execution persisted — this is the key
+        # assertion that previously failed (the conditional UPDATE
+        # matched 0 rows because the first execution bumped the
+        # version).
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["run_count"] == 2, (
+            f"second execution not persisted (run_count={row['run_count']}) "
+            f"— the conditional UPDATE matched 0 rows because the first "
+            "execution bumped the lifecycle_version"
+        )
+        # The version MUST stay at 0 — only control ops bump it.
+        assert row["lifecycle_version"] == 0, (
+            f"executor bumped version on success: {row['lifecycle_version']} "
+            "(should stay 0 — only control ops bump)"
+        )
+
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+
+async def test_executor_persists_after_engine_restart(tmp_path) -> None:
+    """HIGH (batch 3.1.9) acceptance #2: after a process restart, the
+    second execution's conditional UPDATE MUST still succeed.
+
+    Previously ``_task_from_row()`` did not load ``lifecycle_version``
+    from the DB and ``_load_tasks()`` did not initialize
+    ``_execution_epoch`` — so every loaded task defaulted to version 0
+    regardless of the DB version.  After a restart, the first control
+    operation's ``_bump_epoch`` set the in-memory version to 1 while
+    the DB version was already N, and every subsequent executor write
+    matched 0 rows and was discarded.
+    """
+    import asyncio
+
+    from khaos.db import Database
+
+    db_path = tmp_path / "khaos.db"
+    db = Database(db_path)
+    await db.connect()
+    await db.run_migrations()
+    try:
+        engine = CronEngine(
+            db=db,
+            executor=_recording_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        task = await engine.create(
+            "restart-recurring", "p", ScheduleConfig(interval_seconds=60),
+        )
+        task_id = task.id
+
+        # First execution.
+        engine._tasks[task_id].next_run = datetime.utcnow()
+        await asyncio.sleep(0.3)
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["run_count"] == 1
+
+        # Stop the engine (simulates process exit).
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+    # Reopen the DB and create a new engine (simulates restart).
+    db2 = Database(db_path)
+    await db2.connect()
+    await db2.run_migrations()
+    try:
+        engine2 = CronEngine(
+            db=db2,
+            executor=_recording_executor,
+            tick_interval=0.01,
+        )
+        await engine2.start()
+
+        # The task MUST be loaded from the DB.
+        assert task_id in engine2._tasks, "task not loaded from DB after restart"
+        loaded_task = engine2._tasks[task_id]
+        # HIGH (batch 3.1.9): lifecycle_version MUST be restored from
+        # the DB row (previously defaulted to 0).
+        assert loaded_task.lifecycle_version == 0, (
+            f"loaded lifecycle_version={loaded_task.lifecycle_version} "
+            "(expected 0 — no control ops have happened yet)"
+        )
+        # HIGH (batch 3.1.9): _execution_epoch MUST be initialized
+        # from the loaded lifecycle_version (previously defaulted to 0,
+        # which happened to be correct here but would diverge after a
+        # control op — see test_loads_lifecycle_version_gt_one).
+        assert engine2._execution_epoch.get(task_id, -1) == loaded_task.lifecycle_version, (
+            f"epoch={engine2._execution_epoch.get(task_id)} "
+            f"!= lifecycle_version={loaded_task.lifecycle_version}"
+        )
+
+        # Force a second execution — the conditional UPDATE MUST
+        # succeed (rowcount 1), not be discarded as a version mismatch.
+        engine2._tasks[task_id].next_run = datetime.utcnow()
+        await asyncio.sleep(0.3)
+
+        rows = await db2.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["run_count"] == 2, (
+            f"post-restart execution not persisted: run_count={row['run_count']} "
+            "(the conditional UPDATE matched 0 rows — version was not restored "
+            "from the DB after restart)"
+        )
+
+        await engine2.stop(timeout=2.0)
+    finally:
+        await db2.close()
+
+
+async def test_pause_resume_after_execution_keeps_versions_aligned(tmp_path) -> None:
+    """HIGH (batch 3.1.9) acceptance #3: after a successful execution,
+    ``pause → resume`` MUST keep the in-memory ``lifecycle_version``
+    and the DB ``lifecycle_version`` aligned, and the next execution
+    MUST succeed (not be discarded as a version mismatch).
+
+    Previously the executor bumped the DB version on success but did
+    NOT bump the in-memory version.  After ``pause → resume`` (which
+    bumped both), the next execution captured the in-memory version
+    (which was now BEHIND the DB version) and the conditional UPDATE
+    matched 0 rows.
+    """
+    import asyncio
+
+    from khaos.db import Database
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        engine = CronEngine(
+            db=db,
+            executor=_recording_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        task = await engine.create(
+            "pause-resume-version", "p", ScheduleConfig(interval_seconds=60),
+        )
+        task_id = task.id
+
+        # First execution.
+        engine._tasks[task_id].next_run = datetime.utcnow()
+        await asyncio.sleep(0.3)
+
+        # After execution, memory and DB versions MUST both be 0
+        # (executor does not bump the version).
+        assert engine._tasks[task_id].lifecycle_version == 0
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 0
+        assert row["run_count"] == 1
+
+        # Pause → Resume.  Both bump the version (memory + DB) to 1, 2.
+        assert await engine.pause(task_id) == "ok"
+        assert engine._tasks[task_id].lifecycle_version == 1
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 1
+
+        assert await engine.resume(task_id) == "ok"
+        assert engine._tasks[task_id].lifecycle_version == 2
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 2
+
+        # Force a second execution — the conditional UPDATE MUST
+        # succeed (expected_version=2 matches DB version=2).
+        engine._tasks[task_id].next_run = datetime.utcnow()
+        await asyncio.sleep(0.3)
+
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["run_count"] == 2, (
+            f"post-resume execution not persisted: run_count={row['run_count']} "
+            "(the conditional UPDATE matched 0 rows — version drift between "
+            "memory and DB)"
+        )
+        # Version stays at 2 (executor does not bump).
+        assert row["lifecycle_version"] == 2
+
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+
+async def test_loads_lifecycle_version_gt_one_from_db(tmp_path) -> None:
+    """HIGH (batch 3.1.9) acceptance #4: when the DB row has
+    ``lifecycle_version > 1`` (from prior control operations), the
+    engine MUST load that version into ``task.lifecycle_version`` AND
+    initialize ``_execution_epoch`` to match — so the first control
+    operation after restart continues from the correct version instead
+    of resetting to 1.
+
+    Previously ``_task_from_row()`` ignored the ``lifecycle_version``
+    column and ``_load_tasks()`` did not initialize ``_execution_epoch``,
+    so every loaded task started at version 0.  The first ``pause``
+    would set the in-memory version to 1 while the DB version became
+    N+1, and every subsequent executor write matched 0 rows.
+    """
+    import asyncio
+
+    from khaos.db import Database
+
+    db_path = tmp_path / "khaos.db"
+    db = Database(db_path)
+    await db.connect()
+    await db.run_migrations()
+    try:
+        engine = CronEngine(
+            db=db,
+            executor=_recording_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        task = await engine.create(
+            "loaded-version", "p", ScheduleConfig(interval_seconds=60),
+        )
+        task_id = task.id
+
+        # Bump the version to 2 via pause → resume.
+        await engine.pause(task_id)
+        await engine.resume(task_id)
+        assert engine._tasks[task_id].lifecycle_version == 2
+
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 2
+
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+    # Reopen the DB (simulates restart).
+    db2 = Database(db_path)
+    await db2.connect()
+    await db2.run_migrations()
+    try:
+        engine2 = CronEngine(
+            db=db2,
+            executor=_recording_executor,
+            tick_interval=0.01,
+        )
+        await engine2.start()
+
+        loaded_task = engine2._tasks[task_id]
+        # HIGH (batch 3.1.9): lifecycle_version MUST be restored to 2.
+        assert loaded_task.lifecycle_version == 2, (
+            f"loaded lifecycle_version={loaded_task.lifecycle_version} "
+            "(expected 2 — _task_from_row must load the DB column)"
+        )
+        # HIGH (batch 3.1.9): _execution_epoch MUST be initialized to
+        # match the loaded lifecycle_version.
+        assert engine2._execution_epoch.get(task_id, -1) == 2, (
+            f"epoch={engine2._execution_epoch.get(task_id)} "
+            "(expected 2 — _load_tasks must initialize epoch from "
+            "lifecycle_version)"
+        )
+
+        # Now pause — the in-memory version MUST continue from 2 → 3,
+        # not reset to 0 → 1.
+        await engine2.pause(task_id)
+        assert loaded_task.lifecycle_version == 3, (
+            f"post-restart pause set version={loaded_task.lifecycle_version} "
+            "(expected 3 — continue from loaded version 2)"
+        )
+        rows = await db2.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 3
+
+        await engine2.stop(timeout=2.0)
+    finally:
+        await db2.close()

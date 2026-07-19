@@ -950,13 +950,21 @@ class Database:
         at start and passes it as ``expected_version``.  The UPDATE only
         succeeds if the version hasn't changed (no control operation
         happened in between).  Returns rowcount:
-          - 1 = success (version matched, state written, version bumped)
+          - 1 = success (version matched, state written)
           - 0 = version mismatch (a pause / remove / resume happened;
             the stale write is discarded)
 
-        The UPDATE always bumps ``lifecycle_version`` on success so the
-        next control operation's unconditional write doesn't accidentally
-        re-match a different executor's captured version.
+        HIGH (batch 3.1.9): the UPDATE does NOT bump ``lifecycle_version``
+        on success.  Only control operations (pause / resume / remove)
+        bump the version — so multiple sequential executions of a
+        recurring task reuse the same version and the conditional UPDATE
+        matches every time.  Previously the executor bumped the version
+        on each successful write, which caused the SECOND execution's
+        ``expected_version`` (still the captured-at-start value) to
+        mismatch the now-incremented DB version — every subsequent
+        execution's terminal state was silently discarded, the task
+        appeared stuck at its pre-execution ``next_run``, and a process
+        restart could re-fire the task immediately.
         """
         conn = await self._require_conn()
         clauses: list[str] = []
@@ -972,7 +980,9 @@ class Database:
             if val is not None:
                 clauses.append(f"{col} = ?")
                 params.append(val)
-        clauses.append("lifecycle_version = lifecycle_version + 1")
+        # HIGH (batch 3.1.9): NO version bump here — only the WHERE
+        # clause checks the version.  Control ops bump the version;
+        # executor writes only check it.
         # HIGH-3 (batch 3.1.8): WHERE clause is ``id = ? AND
         # lifecycle_version = ?`` — params MUST be in that order
         # (task_id first, then expected_version).  A previous version

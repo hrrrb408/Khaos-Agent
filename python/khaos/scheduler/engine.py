@@ -1175,6 +1175,16 @@ class CronEngine:
         passes it here so a pause/remove/resume that bumped the version
         will cause the executor's terminal write to fail.
 
+        HIGH (batch 3.1.9): the conditional UPDATE does NOT bump the
+        version on success — only control operations (pause / resume /
+        remove) bump the version.  This means multiple sequential
+        executions of a recurring task reuse the same version and the
+        conditional UPDATE matches every time.  Previously the executor
+        bumped the version on each successful write, which caused the
+        second execution's ``expected_version`` to mismatch the
+        now-incremented DB version — every subsequent execution's
+        terminal state was silently discarded.
+
         If ``expected_version`` is ``None`` (control operation path:
         pause / remove / resume), uses the unconditional
         ``update_scheduled_task`` with ``bump_version=True`` so the
@@ -1231,7 +1241,18 @@ class CronEngine:
         return True
 
     async def _load_tasks(self) -> None:
-        """从 DB 加载已持久化的任务。"""
+        """从 DB 加载已持久化的任务。
+
+        HIGH (batch 3.1.9): after loading each task, initialize the
+        in-memory ``_execution_epoch`` from the task's
+        ``lifecycle_version``.  Without this, the epoch defaulted to 0
+        after restart, so the first ``_bump_epoch`` (from a control op)
+        set the in-memory version to 1 while the DB version was already
+        N — every subsequent executor write matched 0 rows and was
+        discarded.  Synchronizing the epoch with the durable version
+        at load time keeps the in-memory fence and the DB fence aligned
+        across restarts.
+        """
         if not self.db:
             return
         try:
@@ -1243,10 +1264,23 @@ class CronEngine:
             task = _task_from_row(row)
             if task is not None:
                 self._tasks[task.id] = task
+                # HIGH (batch 3.1.9): initialize the in-memory execution
+                # epoch from the durable lifecycle version so control
+                # operations and executor writes stay aligned after a
+                # restart.
+                self._execution_epoch[task.id] = task.lifecycle_version
 
 
 def _task_from_row(row: dict) -> ScheduledTask | None:
-    """Reconstruct a ScheduledTask from a DB row dict."""
+    """Reconstruct a ScheduledTask from a DB row dict.
+
+    HIGH (batch 3.1.9): loads ``lifecycle_version`` from the DB row so
+    the in-memory ``task.lifecycle_version`` matches the durable version
+    after a process restart.  Without this, every loaded task defaulted
+    to version 0, so the first control operation's ``_bump_epoch`` set
+    the in-memory version to 1 while the DB version was already N —
+    every subsequent executor write matched 0 rows and was discarded.
+    """
     task_id = row.get("id")
     if task_id is None:
         return None
@@ -1283,6 +1317,10 @@ def _task_from_row(row: dict) -> ScheduledTask | None:
         error=row.get("error"),
         last_run=_parse_dt(row.get("last_run")),
         next_run=_parse_dt(row.get("next_run")),
+        # HIGH (batch 3.1.9): restore the durable lifecycle version so
+        # the in-memory epoch fence and the DB conditional UPDATE both
+        # work correctly after a restart.
+        lifecycle_version=int(row.get("lifecycle_version", 0) or 0),
     )
 
 
