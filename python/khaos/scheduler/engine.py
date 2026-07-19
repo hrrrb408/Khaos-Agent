@@ -8,12 +8,24 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Optional
 
+from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler.models import ScheduleConfig, ScheduledTask, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+
+# H1 (round-6): total deadline for ``stop()`` to drain in-flight
+# ``_execute_task`` coroutines.  An executor that swallows
+# ``CancelledError`` (e.g. an AgentService.chat that catches it for
+# permission-ledger cleanup) used to make ``asyncio.gather`` hang
+# forever — blocking ``AgentService.stop_producers`` and preventing the
+# bounded ``CHAT_DRAIN_TIMEOUT`` from ever starting.  This ceiling
+# converts that hang into a fail-closed ``ServiceShutdownError``.
+CRON_STOP_DRAIN_TIMEOUT = 30.0
 
 
 class CronEngine:
@@ -58,7 +70,7 @@ class CronEngine:
         self._loop_task = asyncio.create_task(self._tick_loop())
         logger.info("cron engine started with %d tasks", len(self._tasks))
 
-    async def stop(self) -> None:
+    async def stop(self, *, timeout: float = CRON_STOP_DRAIN_TIMEOUT) -> None:
         """停止调度循环。
 
         M4 (round-5): cancel and await every in-flight ``_execute_task``
@@ -68,6 +80,18 @@ class CronEngine:
         If the engine stops while such a task is running, it must be
         cancelled + drained BEFORE the engine's callers tear down the DB
         and shared authorities — otherwise the task accesses a closed DB.
+
+        H1 (round-6): the drain is now bounded by a total deadline.
+        The round-5 implementation used
+        ``asyncio.gather(..., return_exceptions=True)`` with no timeout,
+        so an executor that swallows ``CancelledError`` (e.g. a chat
+        turn that catches it for permission-ledger cleanup) made
+        ``stop()`` hang forever — ``AgentService.stop_producers`` would
+        never return and the bounded ``CHAT_DRAIN_TIMEOUT`` would never
+        start.  We now use ``asyncio.wait(timeout=...)`` and raise
+        ``ServiceShutdownError`` if any task is still pending at the
+        deadline, WITHOUT clearing ``_execute_tasks`` so the caller
+        retains ownership of the still-live tasks.
         """
         self._running = False
         if self._loop_task:
@@ -77,18 +101,40 @@ class CronEngine:
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
-        # M4 (round-5): cancel + drain in-flight executions.  Use
-        # ``return_exceptions=True`` so one task's failure doesn't mask
-        # the others; each task's ``_execute_task`` body already catches
-        # ``Exception`` and records the error.
+        # H1 (round-6): bounded drain.  Snapshot the in-flight tasks,
+        # cancel them, then ``asyncio.wait`` with the total deadline.
+        # If any task is still pending at the deadline, raise
+        # ``ServiceShutdownError`` and DO NOT clear ``_execute_tasks``
+        # — the caller must retain ownership of the still-live tasks
+        # so they are not silently orphaned (the next owner / process
+        # exit will reap them).
         if self._execute_tasks:
-            for t in self._execute_tasks:
-                if not t.done():
-                    t.cancel()
-            try:
-                await asyncio.gather(*self._execute_tasks, return_exceptions=True)
-            except Exception:  # noqa: BLE001 — defensive
-                pass
+            snapshot = [t for t in self._execute_tasks if not t.done()]
+            for t in snapshot:
+                t.cancel()
+            if snapshot:
+                done, pending = await asyncio.wait(
+                    snapshot, timeout=timeout,
+                )
+                if pending:
+                    # Leave ``_execute_tasks`` intact — the pending
+                    # tasks are still borrowing shared authorities and
+                    # must not be silently released.  The caller
+                    # (AgentService.stop_producers → shutdown) raises
+                    # ``ServiceShutdownError`` and refuses to tear down
+                    # the DB / shared authorities.
+                    logger.error(
+                        "cron engine stop: %d execute_task(s) did not "
+                        "terminate within %.2fs (swallowed cancellation "
+                        "or wedged); refusing to release task ownership",
+                        len(pending), timeout,
+                    )
+                    raise ServiceShutdownError(
+                        f"{len(pending)} cron execute_task(s) did not "
+                        f"terminate within {timeout}s; shared authorities "
+                        "cannot be torn down safely"
+                    )
+            # All tasks drained — safe to clear the registry.
             self._execute_tasks.clear()
         logger.info("cron engine stopped")
 
@@ -218,7 +264,19 @@ class CronEngine:
             await asyncio.sleep(self._tick_interval)
 
     async def _execute_task(self, task: ScheduledTask) -> None:
-        """执行单个任务。"""
+        """执行单个任务。
+
+        M3 (round-6): ``CancelledError`` is now caught explicitly so a
+        shutdown-time cancellation persists a ``cancelled`` terminal
+        state to the DB instead of leaving the row at ``running``.
+        Previously the ``except Exception`` branch did NOT catch
+        ``CancelledError`` (it inherits from ``BaseException`` in
+        Python 3.8+), so the cancellation bypassed both the error
+        branch and the DB update — leaving the in-memory task at
+        ``RUNNING`` and the DB row stale.  On restart the scheduler
+        would re-fire the task, potentially double-executing any
+        external side effects.
+        """
         task.status = TaskStatus.RUNNING
         task.last_run = datetime.utcnow()
         try:
@@ -242,12 +300,37 @@ class CronEngine:
                 await self._on_complete(task, result)
 
             logger.info("task %s executed successfully (run #%d)", task.name, task.run_count)
+        except asyncio.CancelledError:
+            # M3 (round-6): persist a cancelled terminal state before
+            # re-raising so the DB row does not stay ``running`` and
+            # the task is not re-scheduled on restart.  Swallow
+            # secondary errors from the DB write (the engine may be
+            # tearing down concurrently) — the in-memory state has
+            # already flipped, which is the authoritative signal to
+            # ``stop()``'s drain.
+            task.status = TaskStatus.CANCELLED
+            task.error = "cancelled"
+            logger.info("task %s cancelled during execution", task.name)
+            await self._persist_task_state(task)
+            raise
         except Exception as exc:
             task.status = TaskStatus.FAILED
             task.error = str(exc)
             logger.error("task %s failed: %s", task.name, exc)
 
-        if self.db:
+        await self._persist_task_state(task)
+
+    async def _persist_task_state(self, task: ScheduledTask) -> None:
+        """Persist the current task state to the DB.
+
+        M3 (round-6): extracted so both the success / failure path and
+        the ``CancelledError`` path share the same durable write.
+        Failures are logged but not re-raised — the caller (``stop()``'s
+        drain) treats the in-memory status as the authoritative signal.
+        """
+        if not self.db:
+            return
+        try:
             await self.db.update_scheduled_task(
                 task.id,
                 status=task.status.value,
@@ -256,6 +339,11 @@ class CronEngine:
                 run_count=task.run_count,
                 last_result=task.last_result,
                 error=task.error,
+            )
+        except Exception:  # noqa: BLE001 — teardown race
+            logger.error(
+                "cron task %s: could not persist terminal state %s",
+                task.name, task.status.value, exc_info=True,
             )
 
     async def _load_tasks(self) -> None:

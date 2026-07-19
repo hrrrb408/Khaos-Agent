@@ -295,3 +295,158 @@ async def test_stop_cancels_tick_loop_without_execute_tasks() -> None:
     # Idempotent: a second stop() is a no-op.
     await engine.stop()
     assert engine._loop_task is None
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-6): stop() bounded against cancellation-resistant executors
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_bounded_against_swallowing_executor() -> None:
+    """H1 (round-6): ``stop()`` MUST be bounded by a total deadline even
+    when the executor swallows ``CancelledError``.
+
+    The round-5 implementation used
+    ``asyncio.gather(..., return_exceptions=True)`` with no timeout, so
+    an executor that swallows ``CancelledError`` (e.g. a chat turn that
+    catches it for permission-ledger cleanup) made ``stop()`` hang
+    forever — ``AgentService.stop_producers`` would never return and
+    the bounded ``CHAT_DRAIN_TIMEOUT`` would never start.
+
+    The round-6 fix uses ``asyncio.wait(timeout=...)`` and raises
+    ``ServiceShutdownError`` if any task is still pending at the
+    deadline, WITHOUT clearing ``_execute_tasks`` so the caller
+    retains ownership.
+    """
+    import asyncio
+    import time
+
+    from khaos.exceptions import ServiceShutdownError
+
+    release = asyncio.Event()
+
+    async def swallowing_executor(task_id: str, prompt: str) -> str:
+        while not release.is_set():
+            try:
+                await release.wait()
+            except asyncio.CancelledError:
+                if release.is_set():
+                    raise
+                # swallow: stay pending past the deadline
+
+    engine = CronEngine(
+        executor=swallowing_executor,
+        tick_interval=0.01,
+    )
+    iso = datetime.utcnow().isoformat()
+    await engine.create("swallow", "p", ScheduleConfig(iso_time=iso))
+    await engine.start()
+    # Wait for the executor to actually start (proving the task is
+    # in-flight, not just queued).
+    await asyncio.sleep(0.05)
+    assert engine._execute_tasks, (
+        "tick loop did not register the _execute_task coroutine"
+    )
+
+    # stop() must raise within ~0.5s, NOT hang forever.
+    start = time.monotonic()
+    with pytest.raises(ServiceShutdownError, match="did not terminate"):
+        await engine.stop(timeout=0.5)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0, (
+        f"stop() took {elapsed:.2f}s with timeout=0.5s — drain is not "
+        "bounded against cancellation-resistant executors"
+    )
+    # _execute_tasks is NOT cleared — the pending task is still
+    # borrowing shared authorities and the caller retains ownership.
+    assert engine._execute_tasks, (
+        "stop() cleared _execute_tasks despite pending tasks — "
+        "ownership of still-live tasks was silently released"
+    )
+    # Cleanup: release the swallowing executor so the test process can
+    # exit cleanly.
+    release.set()
+    for t in engine._execute_tasks:
+        t.cancel()
+    await asyncio.gather(*engine._execute_tasks, return_exceptions=True)
+
+
+# ---------------------------------------------------------------------------
+# M3 (round-6): _execute_task persists cancelled terminal state
+# ---------------------------------------------------------------------------
+
+
+async def test_execute_task_persists_cancelled_state_on_cancellation(tmp_path) -> None:
+    """M3 (round-6): when ``_execute_task`` is cancelled mid-execution,
+    it MUST persist a ``cancelled`` terminal state to the DB before
+    re-raising.
+
+    Previously the ``except Exception`` branch did NOT catch
+    ``CancelledError`` (it inherits from ``BaseException`` in Python
+    3.8+), so the cancellation bypassed both the error branch and the
+    DB update — leaving the in-memory task at ``RUNNING`` and the DB
+    row stale.  On restart the scheduler would re-fire the task,
+    potentially double-executing any external side effects.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduledTask, ScheduleConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        # Start the engine BEFORE creating the task so ``_load_tasks``
+        # doesn't overwrite the in-memory task's ``next_run`` (the DB
+        # row doesn't store ``next_run``, so a reload leaves it None
+        # and the tick loop never picks the task up).
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("cancel-test", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id  # DB assigns a UUID hex id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Cancel the in-flight _execute_task directly (simulating
+        # shutdown-time cancellation).
+        exec_tasks = list(engine._execute_tasks)
+        assert len(exec_tasks) == 1
+        exec_tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exec_tasks[0]
+
+        # The in-memory task MUST reflect the cancelled terminal state.
+        cancelled_task = engine._tasks[task_id]
+        assert cancelled_task.status == TaskStatus.CANCELLED, (
+            f"expected CANCELLED, got {cancelled_task.status} — CancelledError was "
+            "not caught and the task is still RUNNING"
+        )
+        assert cancelled_task.error == "cancelled"
+
+        # The DB row MUST also reflect the cancelled terminal state.
+        # (Previously the DB row stayed at ``running`` because the
+        # cancellation bypassed the DB update.)
+        rows = await db.list_scheduled_tasks()
+        cancel_row = next(r for r in rows if r["id"] == task_id)
+        assert cancel_row["status"] == "cancelled", (
+            f"expected DB status=cancelled, got {cancel_row['status']} — "
+            "the cancelled terminal state was not persisted"
+        )
+
+        release.set()
+        await engine.stop()
+    finally:
+        await db.close()
