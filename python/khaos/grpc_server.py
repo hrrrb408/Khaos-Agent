@@ -321,6 +321,19 @@ class AgentService:
         self._active_runtimes: dict[int, object] = {}
         self._office_shutdown_task: asyncio.Task | None = None
         self.shutdown_failed = False
+        # M2 (round-3): admission lock serialises ``chat``'s admission
+        # decision + owner reservation against ``shutdown``'s
+        # ``_accepting_work = False`` flip + owner snapshot.  Without it,
+        # a chat that passed the accepting_work check could be mid-await
+        # in ``_build_runtime`` while shutdown snapshotted an empty
+        # ``_active_chat_tasks`` and proceeded to dismantle shared
+        # authorities — the chat would then resume and register a runtime
+        # after shutdown believed all owners were drained.  The JSON-line
+        # server's connection-handler registry is an outer guard for the
+        # production RPC path, but ``AgentService`` is also a direct
+        # caller (cron / webhook) and its lifecycle contract must hold
+        # independently.
+        self._admission_lock = asyncio.Lock()
 
     async def start(self) -> None:
         """Start process-scoped background services."""
@@ -337,11 +350,23 @@ class AgentService:
         # Stop producers, then cancel/wait every active turn while shared
         # authorities and the database are still available.
         await self.stop_producers()
-        current = asyncio.current_task()
-        active_tasks = [
-            task for task in self._active_chat_tasks
-            if task is not current and not task.done()
-        ]
+        # M2 (round-3): take the admission lock for the accepting_work flip
+        # and owner snapshot so a concurrent ``chat`` cannot pass its
+        # admission check, await ``_build_runtime``, and register a runtime
+        # AFTER this snapshot — which would leak an owner shutdown believes
+        # it has drained.  ``chat`` releases the lock before entering the
+        # long-running ``loop.run`` stream, so this does not serialise
+        # active chats against each other, only against admission.
+        async with self._admission_lock:
+            # stop_producers already set _accepting_work=False outside the
+            # lock; re-assert it under the lock so chat's admission check
+            # (under the same lock) cannot observe a stale True here.
+            self._accepting_work = False
+            current = asyncio.current_task()
+            active_tasks = [
+                task for task in self._active_chat_tasks
+                if task is not current and not task.done()
+            ]
         for task in active_tasks:
             task.cancel()
         if active_tasks:
@@ -465,19 +490,34 @@ class AgentService:
         ``loop.run`` raises or the client disconnects.  The shared
         OfficeMutationAuthority is borrowed (not owned), so ``aclose`` does
         NOT shut it down — ``AgentService.shutdown`` does.
+
+        M2 (round-3): the admission check and owner reservation are
+        performed while holding ``_admission_lock``, and ``shutdown``
+        acquires the same lock when flipping ``_accepting_work`` and
+        snapshotting ``_active_chat_tasks``.  This closes the await gap
+        where a chat that had passed the admission check could be mid-
+        ``_build_runtime`` while shutdown snapshotted an empty owner set
+        and proceeded to dismantle shared authorities.  The lock is held
+        only across admission + registration (a few cheap dict mutations
+        and the runtime build); the long-running ``loop.run`` stream is
+        outside the lock so concurrent chats are not serialised.
         """
-        if not self._accepting_work:
-            raise ServiceShutdownError("AgentService is shutting down")
-        session_id = request.session_id or str(uuid.uuid4())
-        runtime = await self._build_runtime(
-            session_id,
-            request.mode,
-            request.principal_id or f"local-uid:{os.getuid()}",
-        )
-        owner_task = asyncio.current_task()
-        if owner_task is not None:
-            self._active_chat_tasks.add(owner_task)
-        self._active_runtimes[id(runtime)] = runtime
+        runtime = None
+        async with self._admission_lock:
+            if not self._accepting_work:
+                raise ServiceShutdownError("AgentService is shutting down")
+            session_id = request.session_id or str(uuid.uuid4())
+            # Reserve the owner task BEFORE the runtime build so shutdown's
+            # snapshot (under the same lock) cannot miss this chat.
+            owner_task = asyncio.current_task()
+            if owner_task is not None:
+                self._active_chat_tasks.add(owner_task)
+            runtime = await self._build_runtime(
+                session_id,
+                request.mode,
+                request.principal_id or f"local-uid:{os.getuid()}",
+            )
+            self._active_runtimes[id(runtime)] = runtime
         try:
             async for message in runtime.loop.run(request.message, session_id):
                 yield _message_to_event(message)

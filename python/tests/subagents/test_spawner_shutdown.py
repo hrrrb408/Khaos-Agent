@@ -227,7 +227,63 @@ async def test_spawner_shutdown_raises_when_task_does_not_terminate(tmp_path):
         await db.close()
 
 
+# ──────── M1 (round-3): cancel-before-first-run DB reconciliation ──────────
+
+
+async def test_shutdown_persists_cancelled_state_for_never_started_task(tmp_path):
+    """M1 (round-3): a task cancelled BEFORE its first scheduling slot
+    must still reach a terminal DB state.
+
+    Spawn's sequence is: DB write ``running`` → ``asyncio.create_task`` →
+    register in ``_active_tasks``.  Shutdown then calls ``task.cancel()``.
+    If the Task is cancelled before its coroutine gets its first event-
+    loop slot, Python never enters ``_run_task``'s body, so its
+    ``except CancelledError`` DB-write branch never runs.  The DB row
+    would stay ``running`` forever even though the asyncio Task is done.
+
+    ``shutdown`` now runs a reconcile pass over the snapshot, persisting
+    ``failed/cancelled`` for any task whose status is still non-terminal.
+    """
+    never_entered = asyncio.Event()
+
+    async def never_starts_runner(task: SubAgentTask) -> str:
+        never_entered.set()
+        return "should-not-reach"
+
+    db, spawner = await _spawner(tmp_path, runner=never_starts_runner)
+    try:
+        # Spawn a task whose runner yields immediately (so the spawner Task
+        # is created but has not yet been scheduled by the loop).
+        task = await spawner.spawn(
+            SubAgentTask("t1", "race", "ctx", [], principal_id=_PRINCIPAL)
+        )
+        # Crucially do NOT await anything that would let the spawned
+        # coroutine run before we shut it down — we want the cancel to
+        # land before _run_task's body executes.  shutdown() will cancel
+        # the asyncio Task and then reconcile.
+        await spawner.shutdown(timeout=2.0)
+
+        # The runner body must NOT have executed.
+        assert not never_entered.is_set(), (
+            "test setup failed: the runner coroutine actually ran"
+        )
+        # The asyncio Task is done (cancelled before first step).
+        assert task.id not in spawner._active_tasks
+        # The DB row must reflect a terminal state, not the stale
+        # ``running`` value written by spawn().
+        rows = await db.list_subagent_tasks()
+        assert len(rows) == 1
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["error"] == "cancelled"
+        # In-memory state mirrors the DB row.
+        assert spawner._tasks[task.id].status == "failed"
+        assert spawner._tasks[task.id].error == "cancelled"
+    finally:
+        await db.close()
+
+
 # ─────────────── M2: spawn/shutdown critical section atomicity ──────────────
+
 
 
 async def test_spawn_during_shutdown_is_rejected_or_tracked(tmp_path):
