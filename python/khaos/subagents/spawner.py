@@ -102,6 +102,14 @@ class SubAgentSpawner:
         # failed, the next shutdown saw a terminal memory status and skipped
         # the task — the DB row stayed ``running`` forever.
         self._pending_persistence: set[str] = set()
+        # M2 (round-6): track in-flight reconcile owner tasks so a
+        # subsequent shutdown can see they're still running (and the
+        # caller retains ownership of the shared authorities they
+        # borrow).  ``asyncio.wait`` with a timeout returns without
+        # cancelling the inner task on timeout, so we must NOT lose
+        # the reference — otherwise a wedged DB reconcile would leak
+        # the task and the DB connection it holds.
+        self._reconcile_owners: set[asyncio.Task] = set()
 
     @property
     def active_count(self) -> int:
@@ -303,6 +311,16 @@ class SubAgentSpawner:
         terminal state was set in memory but never reached the DB (e.g.
         the DB was wedged or the write was cancelled).
 
+        M1 (round-6): validate the UPDATE rowcount.  If the row does
+        not exist (spawn was cancelled BEFORE
+        ``insert_subagent_task`` ran), the zero-row UPDATE is NOT
+        success — fall back to an INSERT so the task's terminal state
+        is durably present for later ``collect`` / ``status`` / audit
+        queries.  Previously the spawner cleared
+        ``_pending_persistence`` on a zero-row UPDATE, so the task
+        vanished from every later query even though its in-memory
+        state was terminal.
+
         The caller is responsible for setting ``task.status`` /
         ``task.error`` / ``task.result`` to their terminal values BEFORE
         calling this helper.  This helper does NOT change business
@@ -310,10 +328,44 @@ class SubAgentSpawner:
         the persist succeeded.
         """
         self._pending_persistence.add(task.id)
-        await self.db.update_subagent_task(
+        rowcount = await self.db.update_subagent_task(
             task.id, task.status, task.result, task.error, finished=True,
         )
-        # Only clear after a successful persist.  If the await above
+        if rowcount == 0:
+            # M1 (round-6): the row was never INSERTed (spawn was
+            # cancelled before ``insert_subagent_task`` ran, or the DB
+            # was reset between INSERT and UPDATE).  INSERT the
+            # terminal row directly so the task is durably present for
+            # later queries instead of vanishing.  ``tools`` is
+            # serialized as JSON for parity with the normal spawn
+            # path; if the in-memory task lost its tools list (edge
+            # case), persist an empty list.
+            #
+            # The parent session may not exist either (spawn was
+            # cancelled before ``create_session`` ran), so create it
+            # idempotently first — ``create_session`` uses
+            # ``ON CONFLICT DO UPDATE``, so this is safe even if the
+            # session already exists.
+            await self.db.create_session(task.parent_session_id)
+            tools_json = json.dumps(task.tools or [])
+            await self.db.insert_subagent_task(
+                task.id,
+                task.parent_session_id,
+                task.goal,
+                task.context,
+                tools_json,
+                task.status,
+                task.principal_id,
+            )
+            # The INSERT path leaves ``result`` / ``error`` /
+            # ``finished_at`` unset; re-issue the UPDATE so the
+            # terminal state is complete.  This second UPDATE is
+            # guaranteed to affect exactly one row (we just INSERTed
+            # it), so no further rowcount check is needed.
+            await self.db.update_subagent_task(
+                task.id, task.status, task.result, task.error, finished=True,
+            )
+        # Only clear after a successful persist.  If either await above
         # raised, the flag stays set and reconcile retries.
         self._pending_persistence.discard(task.id)
 
@@ -571,6 +623,19 @@ class SubAgentSpawner:
                 done_ids.add(tid)
         # M2 (round-5): bound reconcile by the remaining deadline.  A
         # wedged DB must not make shutdown hang forever.
+        # M2 (round-6): run reconcile in its own owner task and use
+        # ``asyncio.wait`` (NOT ``wait_for``) so a cancellation-resistant
+        # DB coroutine cannot make shutdown exceed the total deadline.
+        # ``wait_for`` cancels the inner coroutine on timeout and then
+        # WAITS for it to actually terminate — if the inner coroutine
+        # swallows ``CancelledError`` (e.g. a wedged aiosqlite connection
+        # that catches it for connection-pool cleanup), ``wait_for`` hangs
+        # forever.  ``asyncio.wait`` with a timeout returns immediately
+        # on timeout WITHOUT cancelling the inner task, leaving it
+        # pending.  We raise ``ServiceShutdownError`` and leave the
+        # reconcile task alive — the caller retains ownership (the task
+        # is registered in ``_reconcile_owners`` so a subsequent
+        # shutdown can re-drain it).
         remaining = deadline - time.monotonic()
         if done_ids:
             if remaining <= 0:
@@ -579,17 +644,45 @@ class SubAgentSpawner:
                     f"{len(done_ids)} task(s) need persistence, "
                     f"{len(self._pending_persistence)} pending"
                 )
-            try:
-                await asyncio.wait_for(
-                    self._reconcile_terminal_states(done_ids),
-                    timeout=remaining,
+            reconcile_task = asyncio.create_task(
+                self._reconcile_terminal_states(done_ids)
+            )
+            # Track the reconcile owner so a subsequent shutdown can
+            # see it's still in flight (and cancel + drain it if the
+            # DB eventually un-wedges).  Without this tracking the
+            # task would be orphaned if shutdown raises below.
+            self._reconcile_owners.add(reconcile_task)
+            reconcile_task.add_done_callback(
+                self._reconcile_owners.discard
+            )
+            done_reconcile, pending_reconcile = await asyncio.wait(
+                {reconcile_task}, timeout=remaining,
+            )
+            if pending_reconcile:
+                # The reconcile task is still running — do NOT cancel
+                # it (cancellation may not propagate through a wedged
+                # DB await).  Leave it registered in
+                # ``_reconcile_owners`` so the caller / next shutdown
+                # retains ownership.  Raise so the caller refuses to
+                # tear down shared authorities.
+                logger.error(
+                    "subagent spawner shutdown: terminal state "
+                    "reconciliation did not complete within %.2fs budget; "
+                    "%d task(s) still pending persistence, reconcile "
+                    "owner retained",
+                    remaining, len(self._pending_persistence),
                 )
-            except asyncio.TimeoutError:
                 raise ServiceShutdownError(
                     f"terminal state reconciliation did not complete within "
                     f"remaining {remaining:.2f}s budget; "
                     f"{len(self._pending_persistence)} task(s) still pending"
                 )
+            # Reconcile completed — surface any exception it raised
+            # (e.g. a DB write failure that left tasks in
+            # ``_pending_persistence`` for the next shutdown).
+            exc = reconcile_task.exception()
+            if exc is not None:
+                raise exc
         if pending:
             unfinished = len(pending)
             logger.error(

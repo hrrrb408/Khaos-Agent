@@ -479,6 +479,14 @@ async def test_spawn_aborts_when_shutdown_begins_during_db_work(tmp_path):
 
         spawn_task = asyncio.create_task(spawn_one())
         await asyncio.wait_for(spawn_in_db.wait(), timeout=2.0)
+        # Restore the real ``create_session`` BEFORE shutdown so the
+        # reconcile pass (which may fall back to ``create_session`` +
+        # ``insert_subagent_task`` for the pre-INSERT cancel case) is
+        # not blocked by the stalling wrapper.  This test is about M1
+        # (owner cancellation), not reconcile-stall behavior (covered
+        # by ``test_reconcile_bounded_by_total_shutdown_deadline``).
+        db.create_session = original_create
+        spawner.db = db
         # Shutdown while spawn's DB work is parked.  M1: shutdown cancels
         # the spawn coroutine (the initializing owner) and awaits it.
         await spawner.shutdown(timeout=2.0)
@@ -858,5 +866,147 @@ async def test_reconcile_bounded_by_total_shutdown_deadline(tmp_path):
             f"shutdown took {elapsed:.2f}s with timeout=0.5s — reconcile "
             "is not bounded by the total deadline"
         )
+    finally:
+        await db.close()
+
+
+# ── M2 (round-6): reconcile bounded even when DB swallows cancellation ─────
+
+
+async def test_reconcile_bounded_against_cancellation_resistant_db(tmp_path):
+    """M2 (round-6): the reconcile deadline must hold even when the DB
+    coroutine SWALLOWS ``CancelledError``.
+
+    The round-5 test above used ``asyncio.Event().wait()``, which
+    responds to cancellation — so it proved the ``wait_for`` path but
+    NOT the cancellation-resistant case.  ``wait_for`` cancels the
+    inner coroutine on timeout and then WAITS for it to terminate; if
+    the inner coroutine swallows ``CancelledError`` (e.g. a wedged
+    aiosqlite connection that catches it for pool cleanup),
+    ``wait_for`` hangs forever.
+
+    The round-6 fix runs reconcile in its own owner task and uses
+    ``asyncio.wait`` (NOT ``wait_for``) so the inner task is left
+    pending on timeout — shutdown raises immediately, and the
+    reconcile task is retained in ``_reconcile_owners`` for ownership.
+    """
+    db, spawner = await _spawner(tmp_path)
+    try:
+        async def never_starts(task: SubAgentTask) -> str:
+            return "should-not-reach"
+
+        spawner.runner = never_starts
+        await spawner.spawn(
+            SubAgentTask("t1", "g", "ctx", [], principal_id=_PRINCIPAL)
+        )
+
+        # A cancellation-resistant DB update: swallows CancelledError
+        # and never returns.  This is the worst case — neither
+        # cancellation nor timeout can make it terminate.
+        release = asyncio.Event()
+
+        async def swallowing_update(*args, **kwargs):
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    if release.is_set():
+                        raise
+                    # swallow: stay pending past the deadline
+
+        db.update_subagent_task = swallowing_update
+        spawner.db = db
+
+        import time
+        start = time.monotonic()
+        with pytest.raises(ServiceShutdownError):
+            await spawner.shutdown(timeout=0.5)
+        elapsed = time.monotonic() - start
+        # Must return within ~0.5s, NOT hang forever waiting for the
+        # swallowing coroutine to terminate.
+        assert elapsed < 5.0, (
+            f"shutdown took {elapsed:.2f}s with timeout=0.5s — reconcile "
+            "is not bounded against cancellation-resistant DB awaits"
+        )
+        # The reconcile owner is retained — it's still borrowing the DB
+        # connection.  The caller (server) retains ownership.
+        assert spawner._reconcile_owners, (
+            "reconcile owner was not retained — a wedged DB task was "
+            "silently orphaned"
+        )
+    finally:
+        # Cleanup: release the swallowing coroutine so the test process
+        # can exit cleanly.
+        release.set()
+        await db.close()
+
+
+# ───── M1 (round-6): pre-INSERT cancel persists terminal row via upsert ────
+
+
+async def test_pre_insert_cancel_persists_terminal_row(tmp_path):
+    """M1 (round-6): if spawn is cancelled BEFORE
+    ``insert_subagent_task`` runs, the row was never INSERTed.  The
+    zero-row UPDATE must NOT be silently treated as success —
+    ``_persist_terminal`` falls back to an INSERT (upsert) so the
+    task's terminal state is durably present for later queries.
+
+    Previously the spawner cleared ``_pending_persistence`` on a
+    zero-row UPDATE, so the task vanished from every later query even
+    though its in-memory state was terminal.
+
+    Sequence:
+      1. Spawn stalls inside ``create_session`` (before INSERT).
+      2. Shutdown cancels the spawn coroutine.
+      3. Reconcile tries UPDATE → rowcount=0 (row never INSERTed).
+      4. ``_persist_terminal`` falls back to ``create_session`` +
+         ``insert_subagent_task`` + ``update_subagent_task``.
+      5. DB row now exists with ``status=failed, error=cancelled``.
+    """
+    db, spawner = await _spawner(tmp_path)
+    try:
+        spawn_in_db = asyncio.Event()
+        original_create = db.create_session
+
+        async def stalling_create(session_id):
+            spawn_in_db.set()
+            await asyncio.Event().wait()  # never resolves — spawn will be cancelled
+            return await original_create(session_id)
+
+        db.create_session = stalling_create
+        spawner.db = db
+
+        async def spawn_one():
+            return await spawner.spawn(
+                SubAgentTask("t1", "g", "ctx", [], principal_id=_PRINCIPAL)
+            )
+
+        spawn_task = asyncio.create_task(spawn_one())
+        await asyncio.wait_for(spawn_in_db.wait(), timeout=2.0)
+
+        # Restore the real ``create_session`` so the reconcile fallback
+        # can actually create the parent session.
+        db.create_session = original_create
+        spawner.db = db
+
+        # Shutdown cancels the spawn coroutine and reconciles.  The
+        # reconcile's UPDATE returns rowcount=0 (no row yet), so
+        # ``_persist_terminal`` falls back to INSERT.
+        await spawner.shutdown(timeout=2.0)
+
+        with pytest.raises(asyncio.CancelledError):
+            await spawn_task
+
+        # The DB row MUST exist with the terminal state — it was not
+        # silently dropped.
+        rows = await db.list_subagent_tasks()
+        assert len(rows) == 1, (
+            f"pre-INSERT cancel: expected 1 terminal row, got {len(rows)} — "
+            "the zero-row UPDATE was treated as success and the task vanished"
+        )
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["error"] == "cancelled"
+        # _pending_persistence was cleared (the upsert succeeded).
+        assert "t1" not in spawner._pending_persistence
     finally:
         await db.close()

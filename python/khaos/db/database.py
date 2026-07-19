@@ -558,11 +558,23 @@ class Database:
         result: str | None = None,
         error: str | None = None,
         finished: bool = False,
-    ) -> None:
-        """Update subagent task status/result/error."""
+    ) -> int:
+        """Update subagent task status/result/error.
+
+        M1 (round-6): returns the number of rows actually updated.
+        Callers that need durability (e.g. ``SubAgentSpawner._persist_terminal``)
+        MUST treat a zero return as "the row does not exist" — the
+        terminal state was NOT persisted.  Previously the method
+        returned ``None`` and discarded the cursor, so a zero-row
+        ``UPDATE`` (e.g. when spawn was cancelled BEFORE
+        ``insert_subagent_task`` ran) was silently treated as success.
+        The spawner then cleared ``_pending_persistence`` and shutdown
+        returned OK — but the DB had no row at all, so the task
+        vanished from every later query.
+        """
         conn = await self._require_conn()
         finished_expr = "datetime('now')" if finished else "finished_at"
-        await conn.execute(
+        cursor = await conn.execute(
             f"""
             UPDATE subagent_tasks
             SET status = ?, result = ?, error = ?, finished_at = {finished_expr}
@@ -571,6 +583,7 @@ class Database:
             (status, result, error, task_id),
         )
         await conn.commit()
+        return cursor.rowcount or 0
 
     async def list_subagent_tasks(self, principal_id: str | None = None) -> list[dict[str, Any]]:
         """List subagent tasks.
