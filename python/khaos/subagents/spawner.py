@@ -109,7 +109,14 @@ class SubAgentSpawner:
         # cancelling the inner task on timeout, so we must NOT lose
         # the reference — otherwise a wedged DB reconcile would leak
         # the task and the DB connection it holds.
-        self._reconcile_owners: set[asyncio.Task] = set()
+        # H1 (round-7): keyed by task_id so the next shutdown can
+        # dedupe — if a retained owner is already reconciling task T,
+        # we must NOT spawn a second reconcile for T (that would race
+        # with the retained one and could double-write).  Multiple
+        # task_ids may share one owner (one reconcile pass covers a
+        # batch); each task_id maps to the single owner task that is
+        # currently reconciling it.
+        self._reconcile_owners: dict[str, asyncio.Task] = {}
 
     @property
     def active_count(self) -> int:
@@ -616,11 +623,9 @@ class SubAgentSpawner:
         # (it's in ``_pending_persistence``).  Such tasks are NOT in the
         # snapshot above (they're already terminal in memory), so without
         # this they would never be retried — the DB row would stay
-        # ``running`` forever.  Include them in the reconcile pass so
-        # every shutdown retries until persistence succeeds.
-        for tid in list(self._pending_persistence):
-            if tid in self._tasks:
-                done_ids.add(tid)
+        # ``running`` forever.  They are added to ``done_ids`` AFTER the
+        # retained-owner re-drain below (so we don't double-reconcile
+        # with a retained owner that's still working on them).
         # M2 (round-5): bound reconcile by the remaining deadline.  A
         # wedged DB must not make shutdown hang forever.
         # M2 (round-6): run reconcile in its own owner task and use
@@ -636,6 +641,96 @@ class SubAgentSpawner:
         # reconcile task alive — the caller retains ownership (the task
         # is registered in ``_reconcile_owners`` so a subsequent
         # shutdown can re-drain it).
+        # H1 (round-7): BEFORE spawning a new reconcile, re-drain any
+        # retained owners from a previous shutdown.  The previous
+        # design only snapshotted ``_active_tasks`` /
+        # ``_initializing_owners`` / ``_pending_persistence`` and then
+        # created a fresh reconcile task — so a retained owner from
+        # shutdown #1 was never awaited by shutdown #2, which could
+        # spawn a SECOND reconcile for the same task_ids (racing with
+        # the retained one) and then return success while the retained
+        # owner was still holding the DB.  Now:
+        #   1. Snapshot ALL existing ``_reconcile_owners`` (BOTH done
+        #      AND pending).  Done owners are included so their
+        #      exceptions get explicitly read — the discard callback
+        #      only reads the exception (to suppress the asyncio
+        #      "never retrieved" warning) but does NOT remove the
+        #      owner; removal is the next shutdown's job.
+        #   2. Any still-pending owner → raise ``ServiceShutdownError``
+        #      and keep the registry intact (do NOT clear it).  This
+        #      is the fail-closed path: we MUST NOT spawn a new
+        #      reconcile for the same task_id while a retained owner
+        #      is still working on it (that would race).
+        #   3. Any done owner → read its exception (log it for
+        #      observability), remove the entry, and let the fresh
+        #      reconcile below retry the persist.  We do NOT raise on
+        #      the old exception — the user's H2 contract requires
+        #      ``stop()`` to RETRY on the next call.  If the DB is
+        #      still broken, the fresh retry will raise; if the DB has
+        #      recovered, the fresh retry succeeds and the terminal
+        #      state becomes durable.
+        retained_owners_snapshot = dict(self._reconcile_owners)
+        if retained_owners_snapshot:
+            remaining = max(deadline - time.monotonic(), 0.0)
+            if remaining <= 0:
+                raise ServiceShutdownError(
+                    f"no budget remaining to re-drain {len(retained_owners_snapshot)} "
+                    f"retained reconcile owner(s); "
+                    f"{len(self._pending_persistence)} task(s) still pending"
+                )
+            retained_done, retained_pending = await asyncio.wait(
+                set(retained_owners_snapshot.values()), timeout=remaining,
+            )
+            # Read exceptions from done owners so unobserved exceptions
+            # don't get silently swallowed by the discard callback.
+            # Log for observability but do NOT raise — the fresh
+            # reconcile below will retry the persist and decide.
+            for tid, owner in retained_owners_snapshot.items():
+                if owner in retained_done:
+                    # Pop the entry — the discard callback only READ
+                    # the exception (so asyncio wouldn't warn); it did
+                    # NOT remove the owner.  Removal is our job.
+                    self._reconcile_owners.pop(tid, None)
+                    exc = owner.exception()
+                    if exc is not None:
+                        logger.error(
+                            "subagent spawner shutdown: retained reconcile "
+                            "owner for task %s terminated with exception: %r; "
+                            "will retry persist via fresh reconcile",
+                            tid, exc, exc_info=exc,
+                        )
+                # else: still pending — leave it registered.
+            if retained_pending:
+                logger.error(
+                    "subagent spawner shutdown: %d retained reconcile "
+                    "owner(s) still pending after %.2fs budget; refusing "
+                    "to spawn a new reconcile (would race with retained)",
+                    len(retained_pending), remaining,
+                )
+                raise ServiceShutdownError(
+                    f"{len(retained_pending)} retained reconcile owner(s) "
+                    f"still pending after {remaining:.2f}s; cannot spawn a "
+                    "new reconcile without racing — shared authorities "
+                    "cannot be torn down safely"
+                )
+            # All retained owners terminated (some may have had
+            # exceptions, which we logged).  Tasks they were
+            # reconciling may still be in ``_pending_persistence`` if
+            # the DB write failed — the fresh reconcile below will
+            # retry them.  (The ``for tid in list(self._pending_persistence)``
+            # loop after this block adds them to ``done_ids``.)
+        # Dedupe: any task_id already covered by a retained owner that
+        # is STILL pending (not in retained_done above — but we raised
+        # in that case, so we only reach here if all retained owners
+        # terminated) does not need a new reconcile.  But since we
+        # raised on pending retained owners, here all retained owners
+        # are done — so any task still in ``_pending_persistence`` needs
+        # a fresh reconcile.
+        # Re-add task_ids whose persistence is still pending (the
+        # retained owner may have failed before persisting them).
+        for tid in list(self._pending_persistence):
+            if tid in self._tasks:
+                done_ids.add(tid)
         remaining = deadline - time.monotonic()
         if done_ids:
             if remaining <= 0:
@@ -647,14 +742,29 @@ class SubAgentSpawner:
             reconcile_task = asyncio.create_task(
                 self._reconcile_terminal_states(done_ids)
             )
-            # Track the reconcile owner so a subsequent shutdown can
-            # see it's still in flight (and cancel + drain it if the
-            # DB eventually un-wedges).  Without this tracking the
-            # task would be orphaned if shutdown raises below.
-            self._reconcile_owners.add(reconcile_task)
-            reconcile_task.add_done_callback(
-                self._reconcile_owners.discard
-            )
+            # H1 (round-7): register the reconcile owner keyed by
+            # task_id so a subsequent shutdown can dedupe.  All
+            # task_ids in this batch share the same owner.
+            for tid in done_ids:
+                self._reconcile_owners[tid] = reconcile_task
+            # H1 (round-7): the done callback only READS the exception
+            # (so asyncio doesn't warn about "Task exception was never
+            # retrieved" if shutdown is never called again).  It does
+            # NOT remove the owner from ``_reconcile_owners`` — that
+            # is the next shutdown's job, AFTER it has surfaced the
+            # exception as ``ServiceShutdownError``.  Removing the
+            # owner here would let the next shutdown miss the exception
+            # entirely (the discard callback runs synchronously at
+            # task completion, before the next shutdown can snapshot).
+            def _read_owner_exception(_t, tids=frozenset(done_ids)) -> None:
+                exc = _t.exception()
+                if exc is not None:
+                    logger.error(
+                        "subagent spawner: retained reconcile owner for "
+                        "task(s) %s terminated with exception: %r",
+                        sorted(tids), exc, exc_info=exc,
+                    )
+            reconcile_task.add_done_callback(_read_owner_exception)
             done_reconcile, pending_reconcile = await asyncio.wait(
                 {reconcile_task}, timeout=remaining,
             )

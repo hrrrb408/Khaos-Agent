@@ -1010,3 +1010,198 @@ async def test_pre_insert_cancel_persists_terminal_row(tmp_path):
         assert "t1" not in spawner._pending_persistence
     finally:
         await db.close()
+
+
+# ── H1 (round-7): second shutdown re-drains retained reconcile owner ───────
+
+
+async def test_second_shutdown_redrains_retained_reconcile_owner(tmp_path):
+    """H1 (round-7): if the first shutdown's reconcile owner is retained
+    (timeout with a cancellation-resistant DB), the second shutdown MUST
+    re-drain it BEFORE spawning a new reconcile — otherwise the new
+    reconcile would race with the retained one and the caller could
+    return success while the retained owner is still holding the DB.
+
+    Sequence:
+      1. Spawn a task whose runner never starts (cancel-before-first-run).
+      2. Wedge ``update_subagent_task`` so the first shutdown's reconcile
+         hangs.  The reconcile owner is retained in
+         ``_reconcile_owners``.
+      3. Second shutdown: MUST snapshot the retained owner, await it
+         within the total deadline, and refuse to spawn a new reconcile
+         while it's still pending.
+      4. Release the wedge so the retained owner terminates; a third
+         shutdown now succeeds and persists the terminal state.
+    """
+    db, spawner = await _spawner(tmp_path)
+    try:
+        async def never_starts(task: SubAgentTask) -> str:
+            return "should-not-reach"
+
+        spawner.runner = never_starts
+        await spawner.spawn(
+            SubAgentTask("t1", "g", "ctx", [], principal_id=_PRINCIPAL)
+        )
+
+        # A cancellation-resistant DB update: swallows CancelledError
+        # and never returns until ``release`` is set.  After release,
+        # it calls the real update so the retained owner can actually
+        # persist the terminal state (returning ``None`` would make
+        # ``_persist_terminal`` treat rowcount=None as success without
+        # touching the DB).
+        release = asyncio.Event()
+        original_update = db.update_subagent_task
+
+        async def swallowing_update(*args, **kwargs):
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    if release.is_set():
+                        raise
+                    # swallow: stay pending past the deadline
+            return await original_update(*args, **kwargs)
+
+        db.update_subagent_task = swallowing_update
+        spawner.db = db
+
+        # First shutdown: reconcile hangs, owner is retained.
+        with pytest.raises(ServiceShutdownError):
+            await spawner.shutdown(timeout=0.5)
+        # The retained owner is registered — the caller retains
+        # ownership of the still-live DB task.
+        assert spawner._reconcile_owners, (
+            "first shutdown did not retain the reconcile owner — "
+            "a wedged DB task was silently orphaned"
+        )
+        first_owner_count = len(spawner._reconcile_owners)
+
+        # Second shutdown: MUST re-drain the retained owner BEFORE
+        # spawning a new reconcile.  Since the retained owner is still
+        # pending (release is not set), the second shutdown MUST raise
+        # ServiceShutdownError and MUST NOT spawn a second reconcile
+        # for the same task_id (no racing).
+        with pytest.raises(ServiceShutdownError, match="retained reconcile"):
+            await spawner.shutdown(timeout=0.5)
+        # No new reconcile was spawned — the owner set is unchanged.
+        assert len(spawner._reconcile_owners) == first_owner_count, (
+            "second shutdown spawned a new reconcile while a retained "
+            "owner was still pending — would race with the retained one"
+        )
+
+        # Release the wedge so the retained owner can terminate.  It
+        # resumes, exits the swallow loop, and calls the real update
+        # (captured in ``original_update``) to persist the terminal
+        # state.
+        release.set()
+        # Give the event loop a chance to let the retained owner finish.
+        await asyncio.sleep(0.1)
+        # The retained owner has now terminated and persisted the
+        # terminal state.  A third shutdown should succeed (no
+        # retained owner, no pending persistence).
+        await spawner.shutdown(timeout=2.0)
+        assert not spawner._reconcile_owners, (
+            "third shutdown did not clear the retained owner registry"
+        )
+        rows = await db.list_subagent_tasks()
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["error"] == "cancelled"
+    finally:
+        release.set()
+        await db.close()
+
+
+# ── H1 (round-7): retained owner exception is surfaced ─────────────────────
+
+
+async def test_retained_reconcile_owner_exception_is_surfaced(tmp_path):
+    """H1 (round-7): if a retained reconcile owner terminates with an
+    exception (e.g. a DB write failure that's NOT a cancellation), the
+    next shutdown MUST explicitly read that exception (not silently
+    swallow it via the discard callback) and then RETRY the persist via
+    a fresh reconcile.  If the retry also fails, the second shutdown
+    raises ``ServiceShutdownError`` — the caller is informed that the
+    terminal state is still not durable.
+
+    This matches the user's H2 contract: ``stop()`` MUST retry on the
+    next call.  The old exception is logged for observability but does
+    NOT block the retry — if the DB has recovered, the retry succeeds
+    and the terminal state becomes durable.
+
+    Sequence:
+      1. Spawn a task, wedge ``update_subagent_task`` so the first
+         shutdown's reconcile hangs (retained owner).
+      2. Release the wedge so the retained owner resumes — the
+         swallowing update raises ``RuntimeError`` after release, so
+         the retained owner terminates with an exception.
+      3. Second shutdown: reads the retained owner's exception (logged),
+         removes the owner, and retries the persist via a fresh
+         reconcile.  The retry also fails (DB still broken) and raises
+         ``ServiceShutdownError`` matching "could not persist".
+
+    Implementation note: we do NOT swap ``db.update_subagent_task`` to
+    a different function after the first shutdown — the retained owner
+    is already inside the original ``swallowing_update`` call, so
+    swapping the attribute would not affect it.  Instead the same
+    ``swallowing_update`` raises after ``release`` is set.
+    """
+    db, spawner = await _spawner(tmp_path)
+    try:
+        async def never_starts(task: SubAgentTask) -> str:
+            return "should-not-reach"
+
+        spawner.runner = never_starts
+        await spawner.spawn(
+            SubAgentTask("t1", "g", "ctx", [], principal_id=_PRINCIPAL)
+        )
+
+        release = asyncio.Event()
+
+        async def swallowing_then_failing_update(*args, **kwargs):
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    if release.is_set():
+                        raise
+                    # swallow: stay pending past the deadline
+            # release is set — raise so the retained owner terminates
+            # with an exception.  This simulates a wedged DB that
+            # surfaces a hard error once it resumes (e.g. the
+            # connection was closed under it).  The fresh retry in the
+            # second shutdown will also hit this raise.
+            raise RuntimeError("DB is being torn down")
+
+        db.update_subagent_task = swallowing_then_failing_update
+        spawner.db = db
+
+        # First shutdown: reconcile hangs, owner retained.
+        with pytest.raises(ServiceShutdownError):
+            await spawner.shutdown(timeout=0.5)
+        assert spawner._reconcile_owners
+
+        # Release the wedge so the retained owner resumes and hits the
+        # RuntimeError.  The reconcile_task terminates with a
+        # ``ServiceShutdownError`` (raised by
+        # ``_reconcile_terminal_states`` after the persist failed).
+        release.set()
+        await asyncio.sleep(0.1)
+
+        # Second shutdown: the retained owner has terminated with an
+        # exception.  Shutdown reads it (logged), removes the owner,
+        # and retries the persist via a fresh reconcile.  The retry
+        # also fails (DB still broken) and raises
+        # ``ServiceShutdownError`` matching "could not persist".
+        with pytest.raises(ServiceShutdownError, match="could not persist"):
+            await spawner.shutdown(timeout=2.0)
+        # The fresh retry's owner has been registered and terminated.
+        # It's still in ``_reconcile_owners`` (the discard callback
+        # only reads the exception, doesn't remove it).  A third
+        # shutdown would read it, log it, and retry again.
+        assert "t1" in spawner._pending_persistence, (
+            "after the fresh retry failed, the task MUST still be in "
+            "_pending_persistence so the next shutdown retries again"
+        )
+    finally:
+        release.set()
+        await db.close()
