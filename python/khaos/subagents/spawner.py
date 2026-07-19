@@ -297,23 +297,40 @@ class SubAgentSpawner:
         orphan) — spawn either sees ``_shutting_down=True`` and aborts, or
         its registration precedes the snapshot and is included.
 
-        M1: the bounded wait uses ``asyncio.wait`` to obtain the pending
-        set.  If any task is still pending when the deadline expires (e.g.
-        a task that swallows ``CancelledError``), this method raises
-        ``ServiceShutdownError`` rather than silently returning — the
-        caller must NOT proceed to dismantle shared authorities that the
-        residual task still borrows.  This is the fail-closed fix for the
-        ``wait_for(gather)`` variant, which on timeout left the swallowing
-        task running while teardown continued.
+        M1 (round-3): after the bounded wait, every snapshot task's DB row
+        is reconciled to a terminal state.  A task that was cancelled
+        BEFORE its coroutine got its first scheduling slot never enters
+        ``_run_task``'s body, so its ``except CancelledError`` DB-write
+        branch never runs — the row would stay ``running`` forever even
+        though the asyncio Task is ``done``.  This pass walks the snapshot
+        and explicitly persists ``failed/cancelled`` for any task whose
+        ``SubAgentTask.status`` is still non-terminal, independent of the
+        coroutine's own exception handling.
+
+        M1 (round-2): the bounded wait uses ``asyncio.wait`` to obtain the
+        pending set.  If any task is still pending when the deadline
+        expires (e.g. a task that swallows ``CancelledError``), this
+        method raises ``ServiceShutdownError`` rather than silently
+        returning — the caller must NOT proceed to dismantle shared
+        authorities that the residual task still borrows.  This is the
+        fail-closed fix for the ``wait_for(gather)`` variant, which on
+        timeout left the swallowing task running while teardown continued.
         """
         async with self._spawn_lock:
             self._shutting_down = True
+            snapshot_ids = list(self._active_tasks.keys())
             snapshot = list(self._active_tasks.values())
         for task in snapshot:
             task.cancel()
         if not snapshot:
             return
         done, pending = await asyncio.wait(snapshot, timeout=timeout)
+        # M1 (round-3): reconcile DB state for every snapshotted task.
+        # ``_run_task``'s CancelledError branch only runs if the coroutine
+        # got at least one scheduling slot; a task cancelled before its
+        # first step never enters the body, so we must persist the
+        # terminal transition here as the authoritative owner.
+        await self._reconcile_terminal_states(snapshot_ids)
         if pending:
             unfinished = len(pending)
             logger.error(
@@ -327,6 +344,46 @@ class SubAgentSpawner:
                 f"{unfinished} subagent task(s) did not terminate within "
                 f"{timeout}s; shared authorities cannot be torn down safely"
             )
+
+    async def _reconcile_terminal_states(self, task_ids: list[str]) -> None:
+        """M1 (round-3): persist terminal DB state for every shutdown task.
+
+        Walks the given task IDs and, for any whose ``SubAgentTask.status``
+        is still non-terminal (``running`` / ``pending``), writes
+        ``failed/cancelled`` to the DB and updates the in-memory object.
+
+        This is the authoritative safety net for the cancel-before-first-
+        run case where ``_run_task``'s own ``except CancelledError``
+        branch never executes (Python does not enter a coroutine body
+        that is cancelled before its first scheduling slot).  Without
+        this pass, such a task's DB row would stay ``running`` forever
+        even though the asyncio Task is ``done``.
+
+        Failures are logged and swallowed — the shutdown path must not
+        abort because of a single row's update failure, and the in-memory
+        ``SubAgentTask.status`` is updated regardless so observers see
+        the terminal transition.
+        """
+        TERMINAL = {"completed", "failed"}
+        for task_id in task_ids:
+            subtask = self._tasks.get(task_id)
+            if subtask is None or subtask.status in TERMINAL:
+                continue
+            subtask.status = "failed"
+            subtask.error = "cancelled"
+            try:
+                await self.db.update_subagent_task(
+                    task_id, subtask.status, subtask.result, subtask.error,
+                    finished=True,
+                )
+            except Exception:  # noqa: BLE001 — best-effort DB persist
+                logger.error(
+                    "subagent shutdown: could not persist terminal state "
+                    "for task %s (in-memory status still updated)",
+                    task_id,
+                    exc_info=True,
+                )
+
 
     async def collect_results(self, principal_id: str = "") -> list[str]:
         """Collect completed task results (B1: filtered by principal)."""
