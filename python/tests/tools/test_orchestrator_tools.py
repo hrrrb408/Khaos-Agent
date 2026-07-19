@@ -108,7 +108,10 @@ async def test_spawn_subagent_success(reset_globals):
     spawner = _make_spawner(spawn_side_effect=lambda _task: spawned)
     init_orchestrator(spawner, MagicMock())
 
-    result = await spawn_subagent(goal="write tests", context="ctx", tools=["read_file"])
+    result = await spawn_subagent(
+        goal="write tests", context="ctx", tools=["read_file"],
+        principal_id="user1",
+    )
 
     assert result["ok"] is True
     assert result["task_id"] == "t42"
@@ -126,7 +129,7 @@ async def test_spawn_subagent_defaults(reset_globals):
     spawner = _make_spawner(spawn_side_effect=lambda _task: spawned)
     init_orchestrator(spawner, MagicMock())
 
-    result = await spawn_subagent(goal="only goal")
+    result = await spawn_subagent(goal="only goal", principal_id="user1")
 
     assert result["ok"] is True
     task_arg = spawner.spawn.call_args.args[0]
@@ -145,7 +148,7 @@ async def test_spawn_subagent_handles_exception(reset_globals):
     spawner = _make_spawner(spawn_side_effect=RuntimeError("concurrency full"))
     init_orchestrator(spawner, MagicMock())
 
-    result = await spawn_subagent(goal="x")
+    result = await spawn_subagent(goal="x", principal_id="user1")
     assert result["ok"] is False
     assert "concurrency full" in result["error"]
 
@@ -156,7 +159,7 @@ async def test_spawn_subagent_handles_subagent_limit_error(reset_globals):
     spawner = _make_spawner(spawn_side_effect=SubAgentLimitError("depth exceeded"))
     init_orchestrator(spawner, MagicMock())
 
-    result = await spawn_subagent(goal="x")
+    result = await spawn_subagent(goal="x", principal_id="user1")
     assert result["ok"] is False
     assert "depth exceeded" in result["error"]
 
@@ -172,7 +175,7 @@ async def test_collect_results_success(reset_globals):
     spawner = _make_spawner(wait_all_return=tasks)
     init_orchestrator(spawner, MagicMock())
 
-    result = await collect_results()
+    result = await collect_results(principal_id="user1")
 
     assert result["ok"] is True
     assert result["total"] == 2
@@ -190,7 +193,7 @@ async def test_collect_results_empty(reset_globals):
     spawner = _make_spawner(wait_all_return=[])
     init_orchestrator(spawner, MagicMock())
 
-    result = await collect_results()
+    result = await collect_results(principal_id="user1")
     assert result["ok"] is True
     assert result["total"] == 0
     assert result["completed"] == 0
@@ -208,7 +211,7 @@ async def test_collect_results_handles_timeout(reset_globals):
     spawner = _make_spawner(wait_all_side_effect=asyncio.TimeoutError())
     init_orchestrator(spawner, MagicMock())
 
-    result = await collect_results()
+    result = await collect_results(principal_id="user1")
     assert result["ok"] is False
     assert "error" in result
 
@@ -234,7 +237,7 @@ async def test_execute_plan_success(reset_globals):
         "description": "parallel",
         "tasks": [{"goal": "a"}, {"goal": "b"}],
     })
-    result = await execute_plan(plan_json)
+    result = await execute_plan(plan_json, principal_id="user1")
 
     assert result["ok"] is True
     assert "plan_id" in result
@@ -248,7 +251,7 @@ async def test_execute_plan_success(reset_globals):
 async def test_execute_plan_invalid_json(reset_globals):
     init_orchestrator(_make_spawner(), MagicMock())
 
-    result = await execute_plan("not valid json")
+    result = await execute_plan("not valid json", principal_id="user1")
     assert result["ok"] is False
     assert "error" in result
 
@@ -257,7 +260,7 @@ async def test_execute_plan_empty_object_json(reset_globals):
     """A valid JSON object with no tasks parses but yields zero results."""
     init_orchestrator(_make_spawner(), MagicMock())
 
-    result = await execute_plan('{"tasks": []}')
+    result = await execute_plan('{"tasks": []}', principal_id="user1")
     assert result["ok"] is True
     assert result["total"] == 0
 
@@ -285,7 +288,7 @@ async def test_execute_plan_reports_failures(reset_globals):
         "tasks": [{"goal": "a"}, {"goal": "b"}],
         "dependencies": {"task_2": ["task_1"]},
     })
-    result = await execute_plan(plan_json)
+    result = await execute_plan(plan_json, principal_id="user1")
 
     assert result["ok"] is True
     assert result["failed"] == 1  # only the first task counts as failed
@@ -302,7 +305,7 @@ async def test_subagent_status_returns_stats(reset_globals):
     spawner = _make_spawner(stats_value=stats)
     init_orchestrator(spawner, MagicMock())
 
-    result = await subagent_status()
+    result = await subagent_status(principal_id="user1")
     assert result == {"ok": True, "stats": stats}
 
 
@@ -636,3 +639,110 @@ async def test_build_subagent_service_orchestrator_tools_not_initialized_after(
         orch_module._spawner = None
         orch_module._runner = None
         await db.close()
+
+
+# ───────── MEDIUM (batch 3.1.9): shutdown-race ok=false + principal required ─────────
+
+
+async def test_spawn_subagent_shutdown_race_returns_ok_false(reset_globals) -> None:
+    """MEDIUM-1 (batch 3.1.9) acceptance #5: when the spawner returns
+    a task with a terminal failure status (``failed`` / ``cancelled``)
+    — e.g. the spawn lost a shutdown race and the task was aborted —
+    ``spawn_subagent`` MUST return ``ok=false`` with the task's error,
+    NOT ``ok=true, status="failed"``.
+
+    Previously the handler hard-coded ``ok=true`` for every non-exception
+    return, so a shutdown-race abort produced:
+        ``{"ok": true, "status": "failed", ...}``
+    which contradicts the ``ok`` flag's meaning and breaks callers that
+    branch on ``ok``.  The RPC ``SubAgentService`` already returns
+    ``ok=false`` for terminal failures; the tool path now matches.
+    """
+    # Simulate the spawner's shutdown-race path: it returns the task
+    # normally (no exception) but with status="failed" and
+    # error="cancelled" — exactly what happens when shutdown begins
+    # during the DB work and the reservation is aborted.
+    aborted_task = _StubTask(
+        task_id="t-aborted",
+        status="failed",
+        error="cancelled",
+    )
+    spawner = _make_spawner(spawn_side_effect=lambda _task: aborted_task)
+    init_orchestrator(spawner, MagicMock())
+
+    result = await spawn_subagent(goal="x", principal_id="user1")
+
+    assert result["ok"] is False, (
+        f"expected ok=false (status=failed), got ok={result['ok']}, "
+        f"full result: {result}"
+    )
+    assert result["status"] == "failed", (
+        f"expected status=failed, got: {result.get('status')}"
+    )
+    assert result["error"] == "cancelled", (
+        f"expected error='cancelled', got: {result.get('error')}"
+    )
+    assert result["task_id"] == "t-aborted"
+
+
+async def test_spawn_subagent_cancelled_status_also_returns_ok_false(
+    reset_globals,
+) -> None:
+    """MEDIUM-1 (batch 3.1.9): ``cancelled`` is also a terminal failure
+    status — verify the handler returns ``ok=false`` for it too (not
+    just ``failed``).
+    """
+    cancelled_task = _StubTask(
+        task_id="t-cancelled",
+        status="cancelled",
+        error="shutdown",
+    )
+    spawner = _make_spawner(spawn_side_effect=lambda _task: cancelled_task)
+    init_orchestrator(spawner, MagicMock())
+
+    result = await spawn_subagent(goal="x", principal_id="user1")
+
+    assert result["ok"] is False
+    assert result["status"] == "cancelled"
+    assert result["error"] == "shutdown"
+
+
+@pytest.mark.parametrize(
+    "handler_name,handler,kwargs",
+    [
+        ("spawn_subagent", spawn_subagent, {"goal": "x"}),
+        ("collect_results", collect_results, {}),
+        ("execute_plan", execute_plan, {"plan_json": '{"tasks": []}'}),
+        ("subagent_status", subagent_status, {}),
+    ],
+)
+async def test_orchestrator_tools_refuse_empty_principal(
+    handler_name, handler, kwargs, reset_globals,
+) -> None:
+    """MEDIUM-2 (batch 3.1.9) acceptance #6: all four orchestrator
+    handlers MUST refuse empty ``principal_id`` instead of falling
+    back to a shared pseudo-principal (``local-uid:orchestrator``).
+
+    The fallback was fail-open: any handler invoked without an
+    authenticated principal (e.g. a misconfigured tool context) would
+    silently land all tasks under a shared pseudo-principal, bypassing
+    the spawner's "empty principal → empty result" defense.  The RPC
+    path already requires a principal; the tool path now matches.
+    """
+    init_orchestrator(_make_spawner(), MagicMock())
+
+    # Empty principal_id (the default) — must be refused.
+    result = await handler(**kwargs)
+    assert result["ok"] is False, (
+        f"{handler_name}: expected ok=false for empty principal_id, "
+        f"got: {result}"
+    )
+    assert result["error"] == "principal_id is required", (
+        f"{handler_name}: expected 'principal_id is required' error, "
+        f"got: {result.get('error')}"
+    )
+
+    # Also explicitly empty string.
+    result = await handler(principal_id="", **kwargs)
+    assert result["ok"] is False
+    assert result["error"] == "principal_id is required"
