@@ -83,6 +83,14 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
         # H4 / H5 / H6 closures) must stay in the matrix so a future
         # refactor cannot silently regress the closed boundaries.
         "test_m4_security_regression.py",
+        # M3 (round-3): the round-2 lifecycle regression tests must stay
+        # in the matrix — without them in this required list, a future
+        # workflow edit could drop the files and the CI policy test would
+        # still pass, silently losing the BrowserManager / spawner /
+        # runner shutdown coverage.
+        "test_browser_close_concurrency.py",
+        "test_spawner_shutdown.py",
+        "test_runner_shutdown.py",
     ):
         assert required_contract in matrix
 
