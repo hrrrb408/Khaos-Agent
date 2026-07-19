@@ -60,6 +60,17 @@ class CronEngine:
         # shutdown and could run after the DB / shared authorities were
         # torn down.
         self._execute_tasks: set[asyncio.Task] = set()
+        # H2 (round-7): terminal-state persistence state machine.
+        # Tracks task_ids whose terminal state was set in memory but
+        # NOT yet persisted to the DB.  ``stop()`` retries these on
+        # every call until the UPDATE succeeds; if the DB is wedged,
+        # ``stop()`` raises ``ServiceShutdownError`` so the caller
+        # refuses to tear down the DB while a row is still stale.
+        # Without this, a cancelled task whose terminal UPDATE failed
+        # would stay at ``running`` in the DB — and on restart the
+        # scheduler would re-fire it, potentially double-executing
+        # external side effects.
+        self._pending_persistence: set[str] = set()
 
     async def start(self) -> None:
         """启动调度循环。"""
@@ -92,7 +103,20 @@ class CronEngine:
         ``ServiceShutdownError`` if any task is still pending at the
         deadline, WITHOUT clearing ``_execute_tasks`` so the caller
         retains ownership of the still-live tasks.
+
+        H2 (round-7): after the drain, retry any task whose terminal
+        state was set in memory but NOT yet persisted to the DB
+        (tracked in ``_pending_persistence``).  If the DB write fails,
+        raise ``ServiceShutdownError`` so the caller refuses to tear
+        down the DB while a row is still stale — without this, a
+        cancelled task whose terminal UPDATE failed would stay at
+        ``running`` in the DB, and on restart the scheduler would
+        re-fire it, potentially double-executing external side effects.
+        The retry uses the SAME total deadline (the drain and the
+        reconcile share one budget).
         """
+        import time
+        deadline = time.monotonic() + timeout
         self._running = False
         if self._loop_task:
             self._loop_task.cancel()
@@ -113,8 +137,9 @@ class CronEngine:
             for t in snapshot:
                 t.cancel()
             if snapshot:
+                remaining = max(deadline - time.monotonic(), 0.0)
                 done, pending = await asyncio.wait(
-                    snapshot, timeout=timeout,
+                    snapshot, timeout=remaining,
                 )
                 if pending:
                     # Leave ``_execute_tasks`` intact — the pending
@@ -127,16 +152,91 @@ class CronEngine:
                         "cron engine stop: %d execute_task(s) did not "
                         "terminate within %.2fs (swallowed cancellation "
                         "or wedged); refusing to release task ownership",
-                        len(pending), timeout,
+                        len(pending), remaining,
                     )
                     raise ServiceShutdownError(
                         f"{len(pending)} cron execute_task(s) did not "
-                        f"terminate within {timeout}s; shared authorities "
-                        "cannot be torn down safely"
+                        f"terminate within {remaining:.2f}s; shared "
+                        "authorities cannot be torn down safely"
                     )
             # All tasks drained — safe to clear the registry.
             self._execute_tasks.clear()
+        # H2 (round-7): retry any task whose terminal state was set in
+        # memory but NOT yet persisted.  ``_execute_task``'s
+        # ``_persist_task_state`` may have failed (e.g. the DB was
+        # momentarily wedged) and left the task_id in
+        # ``_pending_persistence``.  Without this retry, the DB row
+        # would stay stale and the task would be re-fired on restart.
+        # Bounded by the remaining total deadline.
+        if self._pending_persistence and self.db:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ServiceShutdownError(
+                    f"no budget remaining for terminal state reconciliation; "
+                    f"{len(self._pending_persistence)} cron task(s) "
+                    "still pending persistence"
+                )
+            # Run the reconcile in its own owner task so we can bound
+            # it with ``asyncio.wait`` (NOT ``wait_for`` — see the
+            # spawner's M2 round-6 fix for the cancellation-resistant
+            # rationale).
+            reconcile_task = asyncio.create_task(
+                self._reconcile_pending_persistence()
+            )
+            done_rec, pending_rec = await asyncio.wait(
+                {reconcile_task}, timeout=remaining,
+            )
+            if pending_rec:
+                logger.error(
+                    "cron engine stop: terminal state reconciliation "
+                    "did not complete within %.2fs budget; %d task(s) "
+                    "still pending persistence",
+                    remaining, len(self._pending_persistence),
+                )
+                raise ServiceShutdownError(
+                    f"cron terminal state reconciliation did not complete "
+                    f"within {remaining:.2f}s; "
+                    f"{len(self._pending_persistence)} task(s) still pending"
+                )
+            exc = reconcile_task.exception()
+            if exc is not None:
+                raise exc
         logger.info("cron engine stopped")
+
+    async def _reconcile_pending_persistence(self) -> None:
+        """Retry terminal-state persistence for every task in
+        ``_pending_persistence``.
+
+        H2 (round-7): called by ``stop()`` after the execute_task drain.
+        If ANY DB write fails, the task stays in ``_pending_persistence``
+        and we raise ``ServiceShutdownError`` so the caller refuses to
+        tear down the DB.  The next ``stop()`` call will retry.
+        """
+        if not self.db:
+            return
+        failures: list[str] = []
+        for task_id in list(self._pending_persistence):
+            task = self._tasks.get(task_id)
+            if task is None:
+                # Task not in memory — clear the flag (can't retry
+                # without the in-memory state).
+                self._pending_persistence.discard(task_id)
+                continue
+            try:
+                await self._persist_task_state(task)
+            except Exception:  # noqa: BLE001 — collect and raise
+                logger.error(
+                    "cron engine: could not persist terminal state for "
+                    "task %s — durability gap, refusing to continue "
+                    "teardown",
+                    task_id, exc_info=True,
+                )
+                failures.append(task_id)
+        if failures:
+            raise ServiceShutdownError(
+                f"could not persist terminal state for {len(failures)} "
+                f"cron task(s): {failures}; DB may be closed under live rows"
+            )
 
     async def create(
         self,
@@ -303,48 +403,76 @@ class CronEngine:
         except asyncio.CancelledError:
             # M3 (round-6): persist a cancelled terminal state before
             # re-raising so the DB row does not stay ``running`` and
-            # the task is not re-scheduled on restart.  Swallow
-            # secondary errors from the DB write (the engine may be
-            # tearing down concurrently) — the in-memory state has
-            # already flipped, which is the authoritative signal to
-            # ``stop()``'s drain.
+            # the task is not re-scheduled on restart.
+            # H2 (round-7): if the DB write fails, swallow the
+            # secondary exception so the ``raise`` still fires — the
+            # task stays in ``_pending_persistence`` for ``stop()`` to
+            # retry.  Without this, a DB failure here would propagate
+            # out of ``_persist_task_state`` and mask the
+            # ``CancelledError``, leaving the caller (``stop()``'s
+            # drain) without the cancellation signal.
             task.status = TaskStatus.CANCELLED
             task.error = "cancelled"
             logger.info("task %s cancelled during execution", task.name)
-            await self._persist_task_state(task)
+            try:
+                await self._persist_task_state(task)
+            except Exception:  # noqa: BLE001 — stop() will retry
+                logger.error(
+                    "cron task %s: could not persist cancelled terminal "
+                    "state; will retry on stop()", task.name, exc_info=True,
+                )
             raise
         except Exception as exc:
             task.status = TaskStatus.FAILED
             task.error = str(exc)
             logger.error("task %s failed: %s", task.name, exc)
 
-        await self._persist_task_state(task)
+        # H2 (round-7): the success / failure path's persist may also
+        # fail; swallow it so the _execute_task coroutine terminates
+        # cleanly.  ``stop()`` will retry the persist via its reconcile
+        # pass (``_pending_persistence`` retains the task_id).
+        try:
+            await self._persist_task_state(task)
+        except Exception:  # noqa: BLE001 — stop() will retry
+            logger.error(
+                "cron task %s: could not persist terminal state %s; "
+                "will retry on stop()",
+                task.name, task.status.value, exc_info=True,
+            )
 
     async def _persist_task_state(self, task: ScheduledTask) -> None:
         """Persist the current task state to the DB.
 
         M3 (round-6): extracted so both the success / failure path and
         the ``CancelledError`` path share the same durable write.
-        Failures are logged but not re-raised — the caller (``stop()``'s
-        drain) treats the in-memory status as the authoritative signal.
+
+        H2 (round-7): state-machine tracking.  The task is added to
+        ``_pending_persistence`` BEFORE the DB write and only removed
+        after a successful UPDATE.  If the write raises, the task stays
+        in the set so ``stop()`` can retry it on the next call.
+        Previously failures were logged but swallowed — so a cancelled
+        task whose terminal UPDATE failed would stay at ``running`` in
+        the DB, and on restart the scheduler would re-fire it,
+        potentially double-executing external side effects.
         """
         if not self.db:
             return
-        try:
-            await self.db.update_scheduled_task(
-                task.id,
-                status=task.status.value,
-                last_run=task.last_run.isoformat() if task.last_run else None,
-                next_run=task.next_run.isoformat() if task.next_run else None,
-                run_count=task.run_count,
-                last_result=task.last_result,
-                error=task.error,
-            )
-        except Exception:  # noqa: BLE001 — teardown race
-            logger.error(
-                "cron task %s: could not persist terminal state %s",
-                task.name, task.status.value, exc_info=True,
-            )
+        # H2 (round-7): mark pending BEFORE the write.  Idempotent if
+        # the task is already in the set (e.g. a previous write failed
+        # and stop() is retrying).
+        self._pending_persistence.add(task.id)
+        await self.db.update_scheduled_task(
+            task.id,
+            status=task.status.value,
+            last_run=task.last_run.isoformat() if task.last_run else None,
+            next_run=task.next_run.isoformat() if task.next_run else None,
+            run_count=task.run_count,
+            last_result=task.last_result,
+            error=task.error,
+        )
+        # Only clear after a successful persist.  If the await above
+        # raised, the flag stays set and ``stop()`` retries.
+        self._pending_persistence.discard(task.id)
 
     async def _load_tasks(self) -> None:
         """从 DB 加载已持久化的任务。"""

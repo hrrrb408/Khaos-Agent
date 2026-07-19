@@ -450,3 +450,213 @@ async def test_execute_task_persists_cancelled_state_on_cancellation(tmp_path) -
         await engine.stop()
     finally:
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H2 (round-7): terminal persistence retry across stop() calls
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
+    """H2 (round-7): if the terminal-state DB write fails during
+    ``_execute_task`` (e.g. the DB is momentarily wedged), ``stop()``
+    MUST retry it via ``_pending_persistence``.  If the retry also
+    fails, ``stop()`` raises ``ServiceShutdownError`` so the caller
+    refuses to tear down the DB while a row is still stale.  The next
+    ``stop()`` call retries again.
+
+    Without this state machine, a cancelled task whose terminal UPDATE
+    failed would stay at ``running`` in the DB — and on restart the
+    scheduler would re-fire it, potentially double-executing external
+    side effects.
+
+    Sequence:
+      1. Spawn a Cron task whose executor stalls.
+      2. Patch ``update_scheduled_task`` to fail on the first call.
+      3. Cancel the execute_task — its ``_persist_task_state`` fails,
+         leaving the task_id in ``_pending_persistence``.
+      4. First ``stop()``: reconcile retries the persist — fails again
+         (still patched).  Raises ``ServiceShutdownError``.
+      5. Restore ``update_scheduled_task`` to the real implementation.
+      6. Second ``stop()``: reconcile retries — succeeds this time.
+         DB row now carries the ``cancelled`` terminal state.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.exceptions import ServiceShutdownError
+    from khaos.scheduler.models import ScheduledTask, ScheduleConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("retry-test", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Patch update to fail on the first call (the cancel path's
+        # _persist_task_state will hit this).
+        original_update = db.update_scheduled_task
+        call_count = {"n": 0}
+
+        async def failing_update(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise RuntimeError("DB is being torn down")
+            return await original_update(*args, **kwargs)
+
+        db.update_scheduled_task = failing_update
+
+        # Cancel the execute_task — its _persist_task_state fails,
+        # leaving the task_id in _pending_persistence.
+        exec_tasks = list(engine._execute_tasks)
+        assert len(exec_tasks) == 1
+        exec_tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exec_tasks[0]
+        # The task is in _pending_persistence (the persist failed).
+        assert task_id in engine._pending_persistence, (
+            "cancelled task whose persist failed is NOT in "
+            "_pending_persistence — stop() cannot retry it"
+        )
+
+        # Patch update to fail again so the first stop()'s reconcile
+        # also fails.
+        async def failing_update_2(*args, **kwargs):
+            raise RuntimeError("DB still wedged")
+
+        db.update_scheduled_task = failing_update_2
+
+        # First stop(): reconcile retries the persist, fails, raises
+        # ServiceShutdownError.
+        with pytest.raises(ServiceShutdownError, match="could not persist"):
+            await engine.stop(timeout=2.0)
+        # The task is STILL in _pending_persistence — the failed retry
+        # did NOT clear the flag.
+        assert task_id in engine._pending_persistence, (
+            "failed persist retry cleared _pending_persistence — "
+            "the next stop() cannot retry"
+        )
+
+        # Restore the real update so the next retry succeeds.
+        db.update_scheduled_task = original_update
+
+        # Second stop(): reconcile retries the persist, succeeds.
+        await engine.stop(timeout=2.0)
+
+        # The terminal state is now durable.
+        assert task_id not in engine._pending_persistence
+        rows = await db.list_scheduled_tasks()
+        cancel_row = next(r for r in rows if r["id"] == task_id)
+        assert cancel_row["status"] == "cancelled", (
+            f"expected DB status=cancelled, got {cancel_row['status']} — "
+            "the second stop() did not persist the terminal state"
+        )
+
+        release.set()
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H2 (round-7): restart does not re-fire a cancelled task
+# ---------------------------------------------------------------------------
+
+
+async def test_cancelled_task_not_refired_on_restart(tmp_path) -> None:
+    """H2 (round-7): a cancelled task whose terminal state was
+    persisted by ``stop()`` MUST NOT be re-fired when a new engine
+    instance loads tasks from the DB.
+
+    This is the user-visible contract the persistence state machine
+    exists to protect: without it, a cancelled task whose terminal
+    UPDATE failed would stay at ``running`` in the DB, and on restart
+    the scheduler would re-fire it, potentially double-executing
+    external side effects.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        started = asyncio.Event()
+        release = asyncio.Event()
+        exec_count = {"n": 0}
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            exec_count["n"] += 1
+            started.set()
+            await release.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        # Use a one-shot ISO task in the past so it's immediately due.
+        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        task = await engine.create("restart-test", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Cancel the execute_task — its _persist_task_state persists
+        # the cancelled terminal state.
+        exec_tasks = list(engine._execute_tasks)
+        assert len(exec_tasks) == 1
+        exec_tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exec_tasks[0]
+
+        # stop() persists the cancelled terminal state via reconcile.
+        await engine.stop(timeout=2.0)
+        assert task_id not in engine._pending_persistence
+
+        # The DB row is cancelled.
+        rows = await db.list_scheduled_tasks()
+        cancel_row = next(r for r in rows if r["id"] == task_id)
+        assert cancel_row["status"] == "cancelled"
+
+        # Simulate a restart: a new engine instance loads tasks from
+        # the DB.  The cancelled task MUST NOT be re-fired.
+        release.set()  # so any accidental re-fire doesn't hang the test
+        started.clear()
+        exec_count["n"] = 0
+
+        engine2 = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine2.start()
+        # Give the tick loop a chance to fire any due tasks.
+        await asyncio.sleep(0.1)
+        # The cancelled task was NOT re-fired.
+        assert exec_count["n"] == 0, (
+            f"cancelled task was re-fired {exec_count['n']} time(s) on "
+            "restart — the terminal state was not durable"
+        )
+        await engine2.stop()
+    finally:
+        await db.close()
