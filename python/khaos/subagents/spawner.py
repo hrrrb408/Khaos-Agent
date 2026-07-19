@@ -122,14 +122,32 @@ class SubAgentSpawner:
           都被拒绝（沿用 ADR-002 的单层语义）。
         - ``allow_nesting=True``：允许嵌套，但仍受 ``max_spawn_depth`` 上限约束。
 
-        M2: the whole critical section (shutdown check → depth/concurrency
-        validation → DB insert → ``_active_tasks`` registration) is wrapped
-        in ``_spawn_lock`` so a concurrent ``shutdown()`` cannot snapshot
-        ``_active_tasks`` between this spawn's check and registration.  That
-        race used to leak an orphan task that borrowed shared authorities
-        (Office / Browser / Audit / DB) without any shutdown authority over
-        it.
+        Reservation lifecycle (round-4 audit closure):
+
+        The round-3 fix held ``_spawn_lock`` across the DB awaits
+        (``create_session`` / ``insert_subagent_task``).  That closed the
+        spawn/shutdown snapshot race but introduced a worse problem: a
+        slow or wedged DB call held the lock indefinitely, so
+        ``shutdown()`` blocked on lock acquisition and its 30s
+        ``asyncio.wait`` deadline never started.
+
+        The reservation pattern splits validation from the DB work:
+
+          1. Under ``_spawn_lock`` (cheap): shutdown check, depth /
+             concurrency validation, task-id assignment.  Register the
+             task in ``_tasks`` with status ``initializing`` so
+             ``shutdown``'s snapshot sees it as an in-flight owner.
+          2. OUTSIDE the lock: DB ``create_session`` + ``insert_subagent_task``.
+             A slow / wedged DB no longer blocks shutdown.
+          3. Under ``_spawn_lock`` again: if shutdown flipped
+             ``_shutting_down`` during the DB work, persist a
+             ``failed/cancelled`` terminal row (the task was admitted but
+             never started) and return without launching the runner.
+             Otherwise flip status to ``running``, create the
+             ``_run_task`` asyncio task, and register it in
+             ``_active_tasks``.
         """
+        # Step 1: validate + reserve under the lock.  No DB I/O here.
         async with self._spawn_lock:
             # H1: reject new work the moment shutdown begins.  A detached RPC
             # caller (one whose ``Spawn`` handler already returned) cannot
@@ -151,23 +169,64 @@ class SubAgentSpawner:
                 raise SubAgentLimitError(f"并发数已达上限 ({self.config.max_concurrent})")
             self._ensure_task_id(task)
             self._validate_tools(task)
-            task.status = "running"
+            # Reserve the task as ``initializing`` so shutdown's snapshot
+            # cannot miss it while the DB work below is in flight.
+            task.status = "initializing"
             self._tasks[task.id] = task
-            await self.db.create_session(task.parent_session_id)
-            await self.db.insert_subagent_task(
-                task.id,
-                task.parent_session_id,
-                task.goal,
-                task.context,
-                json.dumps(task.tools),
-                task.status,
-                # B1: persist the principal so list_subagent_tasks(principal_id)
-                # can filter rows on disk, not just in-memory.
-                task.principal_id,
-            )
-            async_task = asyncio.create_task(self._run_task(task))
-            self._active_tasks[task.id] = async_task
-            async_task.add_done_callback(lambda _: self._active_tasks.pop(task.id, None))
+
+        # Step 2: DB work OUTSIDE the lock.  A slow / wedged DB call no
+        # longer blocks shutdown from acquiring the lock and running its
+        # bounded drain.  Cancellation from shutdown propagates here.
+        await self.db.create_session(task.parent_session_id)
+        await self.db.insert_subagent_task(
+            task.id,
+            task.parent_session_id,
+            task.goal,
+            task.context,
+            json.dumps(task.tools),
+            task.status,
+            # B1: persist the principal so list_subagent_tasks(principal_id)
+            # can filter rows on disk, not just in-memory.
+            task.principal_id,
+        )
+
+        # Step 3: re-acquire the lock to publish or abort.
+        async with self._spawn_lock:
+            if self._shutting_down:
+                # Shutdown began while we were doing the DB work.  The
+                # task was admitted (its reservation is in the snapshot)
+                # but never started running.  Persist a cancelled
+                # terminal state so the DB row does not stay
+                # ``initializing`` forever, and DO NOT launch the runner
+                # (shared authorities may already be torn down).
+                task.status = "failed"
+                task.error = "cancelled"
+                # Release the lock before the DB call so we don't hold
+                # it across another await — the shutdown path already
+                # snapshotted this task's reservation.
+                pass
+            else:
+                task.status = "running"
+                async_task = asyncio.create_task(self._run_task(task))
+                self._active_tasks[task.id] = async_task
+                # Capture task.id at registration time; the callback receives
+                # the asyncio Task as its argument (which we don't need).
+                _tid = task.id
+                async_task.add_done_callback(
+                    lambda _t, tid=_tid: self._active_tasks.pop(tid, None)
+                )
+        # Persist terminal state for the aborted case outside the lock.
+        if task.status == "failed":
+            try:
+                await self.db.update_subagent_task(
+                    task.id, task.status, task.result, task.error, finished=True
+                )
+            except Exception:  # noqa: BLE001 — best-effort
+                logger.error(
+                    "spawn: could not persist cancelled terminal state for "
+                    "task %s (DB work raced with shutdown)",
+                    task.id, exc_info=True,
+                )
         return task
 
     async def spawn_batch(self, tasks: list[SubAgentTask]) -> list[SubAgentTask]:
@@ -291,46 +350,71 @@ class SubAgentSpawner:
         DB while detached subagent runs were still in-flight — those runs
         borrow exactly those shared authorities.
 
-        M2: the ``_shutting_down`` flip and ``_active_tasks`` snapshot are
-        performed while holding ``_spawn_lock``, so a concurrent ``spawn()``
-        cannot register a new task after the snapshot is taken (leaking an
-        orphan) — spawn either sees ``_shutting_down=True`` and aborts, or
-        its registration precedes the snapshot and is included.
+        H1b (round-4): the ``_shutting_down`` flip and snapshot acquire
+        ``_spawn_lock``, but ``spawn`` only holds the lock for cheap
+        validation + reservation — DB I/O runs outside — so a slow DB
+        call cannot block this shutdown from reaching its bounded drain.
 
-        M1 (round-3): after the bounded wait, every snapshot task's DB row
-        is reconciled to a terminal state.  A task that was cancelled
-        BEFORE its coroutine got its first scheduling slot never enters
-        ``_run_task``'s body, so its ``except CancelledError`` DB-write
-        branch never runs — the row would stay ``running`` forever even
-        though the asyncio Task is ``done``.  This pass walks the snapshot
-        and explicitly persists ``failed/cancelled`` for any task whose
-        ``SubAgentTask.status`` is still non-terminal, independent of the
-        coroutine's own exception handling.
+        The snapshot covers BOTH ``_active_tasks`` (running runners) AND
+        ``_tasks`` entries still in ``initializing`` (reserved but the
+        spawn's DB work had not finished when shutdown began).  Both are
+        in-flight owners; both must be reconciled.
 
-        M1 (round-2): the bounded wait uses ``asyncio.wait`` to obtain the
-        pending set.  If any task is still pending when the deadline
-        expires (e.g. a task that swallows ``CancelledError``), this
-        method raises ``ServiceShutdownError`` rather than silently
-        returning — the caller must NOT proceed to dismantle shared
-        authorities that the residual task still borrows.  This is the
-        fail-closed fix for the ``wait_for(gather)`` variant, which on
-        timeout left the swallowing task running while teardown continued.
+        M1 (round-4): only ``done`` tasks are reconciled to a terminal
+        DB state.  ``pending`` tasks (still running, swallowed cancel)
+        are LEFT at their current status — falsely marking a still-
+        running task ``failed/cancelled`` would hide that it still
+        borrows shared authorities.  Pending at the deadline raises
+        ``ServiceShutdownError``.
+
+        M2 (round-4): DB reconciliation failures propagate as
+        ``ServiceShutdownError`` instead of being swallowed.  Silently
+        logging them would let shutdown close the DB while a row is
+        still ``running`` — exactly the durability gap this reconcile
+        pass exists to close.
         """
         async with self._spawn_lock:
             self._shutting_down = True
-            snapshot_ids = list(self._active_tasks.keys())
-            snapshot = list(self._active_tasks.values())
-        for task in snapshot:
+            # Snapshot every reserved task — both running and initializing.
+            # ``_tasks`` is the superset (spawn adds to it before the DB
+            # work and before promoting to _active_tasks).
+            snapshot_ids = [
+                tid for tid, t in self._tasks.items()
+                if t.status in ("running", "initializing", "pending")
+            ]
+            # Capture the id → asyncio.Task mapping at snapshot time so we
+            # can match ``done`` entries by identity AFTER the wait, even
+            # though each task's done-callback pops it from
+            # ``_active_tasks`` during the wait.
+            snapshot_active_map = {
+                tid: self._active_tasks[tid]
+                for tid in snapshot_ids
+                if tid in self._active_tasks
+            }
+            active_snapshot = list(snapshot_active_map.values())
+        for task in active_snapshot:
             task.cancel()
-        if not snapshot:
-            return
-        done, pending = await asyncio.wait(snapshot, timeout=timeout)
-        # M1 (round-3): reconcile DB state for every snapshotted task.
-        # ``_run_task``'s CancelledError branch only runs if the coroutine
-        # got at least one scheduling slot; a task cancelled before its
-        # first step never enters the body, so we must persist the
-        # terminal transition here as the authoritative owner.
-        await self._reconcile_terminal_states(snapshot_ids)
+        done: set = set()
+        pending: set = set()
+        if active_snapshot:
+            done, pending = await asyncio.wait(active_snapshot, timeout=timeout)
+        # M1 (round-4): reconcile ONLY the done tasks.  ``done`` here is
+        # the set of asyncio Tasks that terminated; their SubAgentTask
+        # may still be non-terminal if _run_task's body never ran.  We do
+        # NOT touch pending tasks' DB rows — they are still alive.
+        done_ids: set[str] = set()
+        for tid, atask in snapshot_active_map.items():
+            if atask in done:
+                done_ids.add(tid)
+        # Also include initializing reservations whose asyncio Task was
+        # never created (spawn's DB work was mid-flight when shutdown
+        # began): they are done by definition (never started) and must
+        # be reconciled.
+        for tid in snapshot_ids:
+            subtask = self._tasks.get(tid)
+            if subtask is not None and subtask.status == "initializing":
+                done_ids.add(tid)
+        await self._reconcile_terminal_states(done_ids)
         if pending:
             unfinished = len(pending)
             logger.error(
@@ -345,12 +429,13 @@ class SubAgentSpawner:
                 f"{timeout}s; shared authorities cannot be torn down safely"
             )
 
-    async def _reconcile_terminal_states(self, task_ids: list[str]) -> None:
-        """M1 (round-3): persist terminal DB state for every shutdown task.
+    async def _reconcile_terminal_states(self, task_ids: set[str]) -> None:
+        """M1 (round-4): persist terminal DB state for done shutdown tasks.
 
         Walks the given task IDs and, for any whose ``SubAgentTask.status``
-        is still non-terminal (``running`` / ``pending``), writes
-        ``failed/cancelled`` to the DB and updates the in-memory object.
+        is still non-terminal (``running`` / ``initializing`` / ``pending``),
+        writes ``failed/cancelled`` to the DB and updates the in-memory
+        object.
 
         This is the authoritative safety net for the cancel-before-first-
         run case where ``_run_task``'s own ``except CancelledError``
@@ -365,6 +450,7 @@ class SubAgentSpawner:
         the terminal transition.
         """
         TERMINAL = {"completed", "failed"}
+        failures: list[str] = []
         for task_id in task_ids:
             subtask = self._tasks.get(task_id)
             if subtask is None or subtask.status in TERMINAL:
@@ -376,14 +462,25 @@ class SubAgentSpawner:
                     task_id, subtask.status, subtask.result, subtask.error,
                     finished=True,
                 )
-            except Exception:  # noqa: BLE001 — best-effort DB persist
+            except Exception:  # noqa: BLE001 — surface as shutdown failure
+                # M2 (round-4): do NOT swallow.  Silently logging would let
+                # shutdown close the DB while a row is still ``running``,
+                # which is exactly the durability gap this reconcile pass
+                # exists to close.  Record the failure and raise after the
+                # loop so the caller observes it.
                 logger.error(
                     "subagent shutdown: could not persist terminal state "
-                    "for task %s (in-memory status still updated)",
+                    "for task %s — durability gap, refusing to continue "
+                    "teardown",
                     task_id,
                     exc_info=True,
                 )
-
+                failures.append(task_id)
+        if failures:
+            raise ServiceShutdownError(
+                f"could not persist terminal state for {len(failures)} "
+                f"subagent task(s): {failures}; DB may be closed under live rows"
+            )
 
     async def collect_results(self, principal_id: str = "") -> list[str]:
         """Collect completed task results (B1: filtered by principal)."""

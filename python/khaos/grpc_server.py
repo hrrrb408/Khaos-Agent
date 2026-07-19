@@ -350,13 +350,13 @@ class AgentService:
         # Stop producers, then cancel/wait every active turn while shared
         # authorities and the database are still available.
         await self.stop_producers()
-        # M2 (round-3): take the admission lock for the accepting_work flip
-        # and owner snapshot so a concurrent ``chat`` cannot pass its
-        # admission check, await ``_build_runtime``, and register a runtime
-        # AFTER this snapshot — which would leak an owner shutdown believes
-        # it has drained.  ``chat`` releases the lock before entering the
-        # long-running ``loop.run`` stream, so this does not serialise
-        # active chats against each other, only against admission.
+        # Take the admission lock for the accepting_work flip and owner
+        # snapshot so a concurrent ``chat`` cannot publish a runtime AFTER
+        # this snapshot.  This lock acquisition is bounded: chat only holds
+        # the lock for cheap dict mutations (reserve / publish), NOT across
+        # ``_build_runtime`` (which is slow DB I/O) — so a wedged build
+        # cannot block this shutdown from reaching the bounded drain below.
+        # See ``chat()``'s reservation pattern.
         async with self._admission_lock:
             # stop_producers already set _accepting_work=False outside the
             # lock; re-assert it under the lock so chat's admission check
@@ -491,44 +491,84 @@ class AgentService:
         OfficeMutationAuthority is borrowed (not owned), so ``aclose`` does
         NOT shut it down — ``AgentService.shutdown`` does.
 
-        M2 (round-3): the admission check and owner reservation are
-        performed while holding ``_admission_lock``, and ``shutdown``
-        acquires the same lock when flipping ``_accepting_work`` and
-        snapshotting ``_active_chat_tasks``.  This closes the await gap
-        where a chat that had passed the admission check could be mid-
-        ``_build_runtime`` while shutdown snapshotted an empty owner set
-        and proceeded to dismantle shared authorities.  The lock is held
-        only across admission + registration (a few cheap dict mutations
-        and the runtime build); the long-running ``loop.run`` stream is
-        outside the lock so concurrent chats are not serialised.
+        Reservation lifecycle (round-4 audit closure):
+
+        The previous round-3 fix held ``_admission_lock`` across the whole
+        ``_build_runtime`` await.  That closed the owner-snapshot race but
+        introduced a worse problem: ``_build_runtime`` does real DB I/O
+        (mode_manager.load / switch, permission_engine.load_rules,
+        task_manager.load), so a slow or wedged build held the lock
+        indefinitely and shutdown's ``CHAT_DRAIN_TIMEOUT`` deadline never
+        started — shutdown blocked on lock acquisition before it could
+        even begin the bounded wait.
+
+        The reservation pattern splits admission from the build:
+
+          1. Under ``_admission_lock`` (cheap): check ``_accepting_work``,
+             register ``owner_task`` in ``_active_chat_tasks``.  This is
+             the reservation — shutdown's snapshot WILL see it.
+          2. OUTSIDE the lock: ``await _build_runtime(...)``.  A slow or
+             wedged build no longer blocks shutdown; the owner task is
+             already registered, so shutdown's cancel + bounded drain
+             applies to it directly.
+          3. Under ``_admission_lock`` again: if shutdown flipped
+             ``_accepting_work`` during the build, abort (the owner task
+             is about to be or has already been cancelled by shutdown).
+             Otherwise publish the runtime in ``_active_runtimes``.
+
+        The ``finally`` wraps the whole body — including the build — so a
+        build failure or cancellation still discards the owner task from
+        ``_active_chat_tasks`` (closing the round-3 M3 leak where the
+        reservation was only cleaned up after a successful build).
         """
+        owner_task = asyncio.current_task()
         runtime = None
+        # Register the reservation BEFORE any await so shutdown's snapshot
+        # cannot miss this chat.  Cheap dict mutation under the lock; the
+        # expensive build is outside.
         async with self._admission_lock:
             if not self._accepting_work:
                 raise ServiceShutdownError("AgentService is shutting down")
-            session_id = request.session_id or str(uuid.uuid4())
-            # Reserve the owner task BEFORE the runtime build so shutdown's
-            # snapshot (under the same lock) cannot miss this chat.
-            owner_task = asyncio.current_task()
             if owner_task is not None:
                 self._active_chat_tasks.add(owner_task)
+        try:
+            session_id = request.session_id or str(uuid.uuid4())
+            # Build OUTSIDE the lock — a slow / wedged build no longer
+            # blocks shutdown from acquiring the lock and running its
+            # bounded drain.  Cancellation from shutdown propagates here.
             runtime = await self._build_runtime(
                 session_id,
                 request.mode,
                 request.principal_id or f"local-uid:{os.getuid()}",
             )
-            self._active_runtimes[id(runtime)] = runtime
-        try:
+            # Publish under the lock so shutdown's snapshot of
+            # _active_runtimes is consistent.  If shutdown closed
+            # admission while we were building, abort — the owner task
+            # has already been cancelled (or is about to be) and any
+            # runtime we built must be torn down.
+            async with self._admission_lock:
+                if not self._accepting_work:
+                    # shutdown began during the build; do not serve.  The
+                    # finally block below closes/quarantines the runtime
+                    # and discards the owner reservation.
+                    raise ServiceShutdownError(
+                        "AgentService began shutting down during runtime build"
+                    )
+                self._active_runtimes[id(runtime)] = runtime
             async for message in runtime.loop.run(request.message, session_id):
                 yield _message_to_event(message)
         finally:
+            # Covers build failure, build cancellation, and normal exit.
+            # Without this wrap, a _build_runtime raise would leak the
+            # owner_task reference in _active_chat_tasks forever.
             from khaos.runtime import close_runtime_or_register
-            try:
-                await close_runtime_or_register(runtime)
-            finally:
-                self._active_runtimes.pop(id(runtime), None)
-                if owner_task is not None:
-                    self._active_chat_tasks.discard(owner_task)
+            if runtime is not None:
+                try:
+                    await close_runtime_or_register(runtime)
+                finally:
+                    self._active_runtimes.pop(id(runtime), None)
+            if owner_task is not None:
+                self._active_chat_tasks.discard(owner_task)
 
     async def switch_mode(self, session_id: str, target_mode: str) -> dict:
         mode_manager = ModeManager(self.db, project_root=self.project_root)

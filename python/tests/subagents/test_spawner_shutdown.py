@@ -216,6 +216,17 @@ async def test_spawner_shutdown_raises_when_task_does_not_terminate(tmp_path):
         # The wedged task must still be pending — shutdown did not pretend
         # to drain it.  Its ownership is preserved for the caller.
         assert not async_task.done()
+        # M1 (round-4): pending tasks must NOT be falsely written as a
+        # terminal DB state.  The task is still alive and borrowing shared
+        # authorities; marking it ``failed/cancelled`` would hide that.
+        # The in-memory status stays at its pre-shutdown value, and the DB
+        # row is NOT updated by the reconcile pass (which only touches
+        # ``done`` tasks).
+        wedged_subtask = spawner._tasks[task_id]
+        assert wedged_subtask.status != "failed", (
+            "pending task was falsely marked failed — its still-live "
+            "ownership of shared authorities is now hidden"
+        )
     finally:
         # Cleanup: set release so the next cancel terminates the coroutine.
         release.set()
@@ -359,3 +370,150 @@ async def test_spawn_during_shutdown_is_rejected_or_tracked(tmp_path):
         assert "shutting down" in err
         assert spawner._active_tasks == {}
     await db.close()
+
+
+# ──────────── H1b (round-4): spawn DB work outside _spawn_lock ──────────────
+
+
+async def test_spawn_db_work_does_not_block_shutdown_lock(tmp_path):
+    """H1b (round-4): ``spawn``'s DB awaits run OUTSIDE ``_spawn_lock`` so a
+    slow DB call cannot block ``shutdown`` from acquiring the lock and
+    starting its bounded drain.
+
+    The round-3 fix held the lock across ``create_session`` /
+    ``insert_subagent_task``; a wedged DB held the lock indefinitely and
+    shutdown's deadline never started.  The round-4 fix uses a
+    reservation pattern — validate under the lock, DB work outside,
+    re-lock to publish.
+    """
+    from unittest.mock import AsyncMock
+
+    db, spawner = await _spawner(tmp_path)
+    try:
+        spawn_in_db = asyncio.Event()
+        release_db = asyncio.Event()
+        lock_free_during_db: list[bool] = []
+
+        original_create = db.create_session
+
+        async def stalling_create(session_id):
+            spawn_in_db.set()
+            # Probe: can shutdown's lock be acquired while we're parked
+            # here?  It MUST be (DB work is outside the lock now).
+            try:
+                await asyncio.wait_for(
+                    spawner._spawn_lock.acquire(), timeout=0.3,
+                )
+                lock_free_during_db.append(True)
+                spawner._spawn_lock.release()
+            except asyncio.TimeoutError:
+                lock_free_during_db.append(False)
+            await release_db.wait()
+            return await original_create(session_id)
+
+        db.create_session = stalling_create
+        spawner.db = db
+
+        spawn_task = asyncio.create_task(spawner.spawn(
+            SubAgentTask("t1", "g", "ctx", [], principal_id=_PRINCIPAL)
+        ))
+        await asyncio.wait_for(spawn_in_db.wait(), timeout=2.0)
+        # The DB work is parked.  shutdown MUST be able to acquire
+        # _spawn_lock (the round-3 design would have blocked here).
+        # We verify by reading the probe result recorded by stalling_create.
+        release_db.set()
+        await spawn_task  # spawn completes
+        assert lock_free_during_db == [True], (
+            "_spawn_lock was held during spawn's DB work — a slow DB "
+            "would block shutdown from reaching its bounded drain"
+        )
+    finally:
+        await db.close()
+
+
+async def test_spawn_aborts_when_shutdown_begins_during_db_work(tmp_path):
+    """H1b (round-4): if shutdown begins while spawn's DB work is in
+    flight, spawn persists a cancelled terminal state and does NOT launch
+    the runner.
+
+    This is the reservation abort path: spawn reserved the task
+    (``initializing``), shutdown flipped ``_shutting_down`` during the
+    DB await, spawn re-acquires the lock, sees shutdown, writes
+    ``failed/cancelled``, and returns without creating a runner task.
+    """
+    db, spawner = await _spawner(tmp_path)
+    try:
+        spawn_in_db = asyncio.Event()
+        release_db = asyncio.Event()
+        original_create = db.create_session
+
+        async def stalling_create(session_id):
+            spawn_in_db.set()
+            await release_db.wait()
+            return await original_create(session_id)
+
+        db.create_session = stalling_create
+        spawner.db = db
+
+        async def spawn_one():
+            return await spawner.spawn(
+                SubAgentTask("t1", "g", "ctx", [], principal_id=_PRINCIPAL)
+            )
+
+        spawn_task = asyncio.create_task(spawn_one())
+        await asyncio.wait_for(spawn_in_db.wait(), timeout=2.0)
+        # Shutdown while spawn's DB work is parked.
+        await spawner.shutdown(timeout=2.0)
+        release_db.set()
+        task = await spawn_task
+
+        # Spawn did NOT launch a runner — the task is terminal, not running.
+        assert task.status == "failed"
+        assert task.error == "cancelled"
+        assert task.id not in spawner._active_tasks
+        # DB row reflects the abort, not stale ``initializing``.
+        rows = await db.list_subagent_tasks()
+        assert rows[0]["status"] == "failed"
+        assert rows[0]["error"] == "cancelled"
+    finally:
+        await db.close()
+
+
+# ──────────── M2 (round-4): DB reconcile failure propagates ─────────────────
+
+
+async def test_shutdown_raises_when_db_reconcile_fails(tmp_path):
+    """M2 (round-4): if the DB update during reconcile fails, shutdown
+    MUST raise ``ServiceShutdownError`` instead of silently logging and
+    continuing.
+
+    Silently swallowing would let shutdown close the DB while a row is
+    still marked ``running`` — exactly the durability gap the reconcile
+    pass exists to close.
+    """
+    from unittest.mock import AsyncMock
+
+    db, spawner = await _spawner(tmp_path)
+    try:
+        # Spawn a task that never starts its runner (we'll cancel before
+        # first step), so reconcile MUST persist its terminal state.
+        never_entered = asyncio.Event()
+
+        async def never_starts(task: SubAgentTask) -> str:
+            never_entered.set()
+            return "should-not-reach"
+
+        spawner.runner = never_starts
+        task = await spawner.spawn(
+            SubAgentTask("t1", "g", "ctx", [], principal_id=_PRINCIPAL)
+        )
+        # Break the DB update so reconcile cannot persist terminal state.
+        db.update_subagent_task = AsyncMock(
+            side_effect=RuntimeError("DB is being torn down")
+        )
+        spawner.db = db
+
+        with pytest.raises(ServiceShutdownError, match="could not persist"):
+            await spawner.shutdown(timeout=2.0)
+    finally:
+        await db.close()
