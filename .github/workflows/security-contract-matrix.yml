@@ -49,7 +49,7 @@ jobs:
         run: python -m pytest python/tests/coding/test_m4_batch3_1_6_2_authority.py -q
       - name: Run POSIX RPC peer-identity contracts
         if: runner.os != 'Windows'
-        run: python -m pytest python/tests/test_grpc_server.py python/tests/runtime/test_factory_effective_policy.py python/tests/security/test_m4_security_regression.py python/tests/subagents/test_spawner_shutdown.py python/tests/subagents/test_runner_shutdown.py -q
+        run: python -m pytest python/tests/test_grpc_server.py python/tests/runtime/test_factory_effective_policy.py python/tests/security/test_m4_security_regression.py python/tests/subagents/test_spawner_shutdown.py python/tests/subagents/test_runner_shutdown.py python/tests/subagents/test_service.py python/tests/scheduler/test_cron_engine.py -q
       - name: Run POSIX workspace boundary contracts
         if: runner.os != 'Windows'
         run: python -m pytest python/tests/coding/test_safe_workspace_fs.py python/tests/coding/test_workspace_boundary.py python/tests/coding/test_workspace_manager.py python/tests/coding/test_execution_binding.py python/tests/coding/test_m4_batch3_0_workspace_mutation.py python/tests/tools/test_office_workspace_fs_security.py python/tests/tools/test_office_mutation_fence.py python/tests/tools/test_office_aggregate_storage.py python/tests/tools/test_file_search_redos.py -q
