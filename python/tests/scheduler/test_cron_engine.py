@@ -268,7 +268,7 @@ async def test_stop_drains_in_flight_execute_tasks() -> None:
     await asyncio.wait_for(engine.stop(), timeout=2.0)
 
     # All execute_tasks are done (cancelled + drained).
-    assert engine._execute_tasks == set(), (
+    assert engine._execute_tasks == {}, (
         "stop() did not drain in-flight _execute_tasks"
     )
     # Cleanup: release the executor's stall so any pending coroutine
@@ -291,7 +291,7 @@ async def test_stop_cancels_tick_loop_without_execute_tasks() -> None:
     # Tick loop is gone.
     assert engine._loop_task is None
     # No in-flight executions tracked.
-    assert engine._execute_tasks == set()
+    assert engine._execute_tasks == {}
     # Idempotent: a second stop() is a no-op.
     await engine.stop()
     assert engine._loop_task is None
@@ -366,9 +366,9 @@ async def test_stop_bounded_against_swallowing_executor() -> None:
     # Cleanup: release the swallowing executor so the test process can
     # exit cleanly.
     release.set()
-    for t in engine._execute_tasks:
+    for t in engine._execute_tasks.values():
         t.cancel()
-    await asyncio.gather(*engine._execute_tasks, return_exceptions=True)
+    await asyncio.gather(*engine._execute_tasks.values(), return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +422,7 @@ async def test_execute_task_persists_cancelled_state_on_cancellation(tmp_path) -
 
         # Cancel the in-flight _execute_task directly (simulating
         # shutdown-time cancellation).
-        exec_tasks = list(engine._execute_tasks)
+        exec_tasks = list(engine._execute_tasks.values())
         assert len(exec_tasks) == 1
         exec_tasks[0].cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -525,7 +525,7 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
 
         # Cancel the execute_task — its _persist_task_state fails,
         # leaving the task_id in _pending_persistence.
-        exec_tasks = list(engine._execute_tasks)
+        exec_tasks = list(engine._execute_tasks.values())
         assert len(exec_tasks) == 1
         exec_tasks[0].cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -623,7 +623,7 @@ async def test_cancelled_task_not_refired_on_restart(tmp_path) -> None:
 
         # Cancel the execute_task — its _persist_task_state persists
         # the cancelled terminal state.
-        exec_tasks = list(engine._execute_tasks)
+        exec_tasks = list(engine._execute_tasks.values())
         assert len(exec_tasks) == 1
         exec_tasks[0].cancel()
         with pytest.raises(asyncio.CancelledError):
@@ -659,4 +659,517 @@ async def test_cancelled_task_not_refired_on_restart(tmp_path) -> None:
         )
         await engine2.stop()
     finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-8): stop() re-drains retained persistence owner
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
+    """H1 (round-8): if the first ``stop()``'s reconcile owner is
+    retained (timeout with a cancellation-resistant DB), the second
+    ``stop()`` MUST re-drain it BEFORE spawning a new reconcile —
+    otherwise the new reconcile would race with the retained one and
+    the caller could return success while the retained owner is still
+    holding the DB.
+
+    Sequence:
+      1. Spawn a Cron task whose executor stalls.
+      2. Patch ``update_scheduled_task`` to FAIL on the first call so
+         the cancel path's ``_persist_task_state`` raises (swallowed
+         by the CancelledError branch).  The task_id is now in
+         ``_pending_persistence``.
+      3. Cancel the execute_task.  The cancel's persist fails →
+         task_id stays in ``_pending_persistence``.
+      4. Patch ``update_scheduled_task`` to HANG (swallow cancel)
+         until ``release_db`` is set, then call the real update.
+      5. First ``stop()``: reconcile owner is created and wedged;
+         times out → raises ``ServiceShutdownError``.  Owner is
+         retained in ``_persistence_owners``.
+      6. Second ``stop()``: MUST snapshot the retained owner, await it
+         within the total deadline, and refuse to spawn a new
+         reconcile while it's still pending.
+      7. Release the wedge so the retained owner terminates (calls the
+         real update).  A third ``stop()`` now succeeds and the DB
+         row carries the cancelled terminal state.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.exceptions import ServiceShutdownError
+    from khaos.scheduler.models import ScheduleConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    # Initialise cleanup Events BEFORE the try block so the finally
+    # clause can always release them even if an early assertion fails.
+    release_db = asyncio.Event()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release_exec.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("retained-owner", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Patch update to FAIL on the first call so the cancel path's
+        # _persist_task_state raises and leaves task_id in
+        # _pending_persistence.  Subsequent calls will be replaced by
+        # the swallowing_update below.
+        original_update = db.update_scheduled_task
+        call_count = {"n": 0}
+
+        async def failing_first_update(*args, **kwargs):
+            call_count["n"] += 1
+            raise RuntimeError("DB is being torn down")
+
+        db.update_scheduled_task = failing_first_update
+
+        # Cancel the execute_task — its _persist_task_state fails,
+        # leaving the task_id in _pending_persistence.
+        exec_tasks = list(engine._execute_tasks.values())
+        assert len(exec_tasks) == 1
+        exec_tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exec_tasks[0]
+        assert task_id in engine._pending_persistence, (
+            "cancelled task whose persist failed is NOT in "
+            "_pending_persistence — stop() cannot retry it"
+        )
+
+        # Now wedge update_scheduled_task so the reconcile hangs until
+        # release_db is set.  After release, it calls the real update
+        # so the retained owner can actually persist.
+        async def swallowing_update(*args, **kwargs):
+            while not release_db.is_set():
+                try:
+                    await release_db.wait()
+                except asyncio.CancelledError:
+                    if release_db.is_set():
+                        raise
+                    # swallow: stay pending past the deadline
+            return await original_update(*args, **kwargs)
+
+        db.update_scheduled_task = swallowing_update
+
+        # First stop(): reconcile hangs, owner is retained.
+        with pytest.raises(ServiceShutdownError):
+            await engine.stop(timeout=0.5)
+        assert engine._persistence_owners, (
+            "first stop() did not retain the persistence owner — "
+            "a wedged DB task was silently orphaned"
+        )
+        first_owner_count = len(engine._persistence_owners)
+
+        # Second stop(): MUST re-drain the retained owner BEFORE
+        # spawning a new reconcile.  Since the retained owner is still
+        # pending (release_db is not set), the second stop MUST raise
+        # ServiceShutdownError and MUST NOT spawn a second reconcile
+        # for the same task_id (no racing).
+        with pytest.raises(ServiceShutdownError, match="retained persistence"):
+            await engine.stop(timeout=0.5)
+        assert len(engine._persistence_owners) == first_owner_count, (
+            "second stop() spawned a new reconcile while a retained "
+            "owner was still pending — would race with the retained one"
+        )
+
+        # Release the wedge so the retained owner can terminate and
+        # call the real update to persist the terminal state.
+        release_db.set()
+        await asyncio.sleep(0.1)
+        # Third stop(): the retained owner has terminated and persisted
+        # the terminal state.  stop() should succeed.
+        await engine.stop(timeout=2.0)
+        assert not engine._persistence_owners, (
+            "third stop() did not clear the retained owner registry"
+        )
+        rows = await db.list_scheduled_tasks()
+        cancel_row = next(r for r in rows if r["id"] == task_id)
+        assert cancel_row["status"] == "cancelled", (
+            f"expected DB status=cancelled, got {cancel_row['status']} — "
+            "the retained owner did not persist the terminal state"
+        )
+
+        release_exec.set()
+    finally:
+        release_db.set()
+        release_exec.set()
+        await db.close()
+
+
+async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> None:
+    """H1 (round-8): if a retained persistence owner terminates with an
+    exception (e.g. a DB write failure that's NOT a cancellation), the
+    next ``stop()`` MUST explicitly read that exception (not silently
+    swallow it via the discard callback) and then RETRY the persist
+    via a fresh reconcile.  If the retry also fails, ``stop()`` raises
+    ``ServiceShutdownError`` — the caller is informed that the
+    terminal state is still not durable.
+
+    This matches the H2 contract: ``stop()`` MUST retry on the next
+    call.  The old exception is logged for observability but does NOT
+    block the retry — if the DB has recovered, the retry succeeds and
+    the terminal state becomes durable.
+
+    Sequence:
+      1. Spawn a Cron task whose executor stalls.
+      2. Cancel the execute_task so its ``_persist_task_state`` is
+         invoked; wedge ``update_scheduled_task`` so the first
+         ``stop()``'s reconcile hangs (retained owner).
+      3. Release the wedge so the retained owner resumes — the
+         swallowing update raises ``RuntimeError`` after release, so
+         the retained owner terminates with an exception.
+      4. Second ``stop()``: reads the retained owner's exception
+         (logged), removes the owner, and retries the persist via a
+         fresh reconcile.  The retry also fails (DB still broken) and
+         raises ``ServiceShutdownError`` matching "could not persist".
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.exceptions import ServiceShutdownError
+    from khaos.scheduler.models import ScheduleConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    # Initialise cleanup Events BEFORE the try block so the finally
+    # clause can always release them even if an early assertion fails.
+    release_db = asyncio.Event()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release_exec.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("retained-exc", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Patch update to FAIL on the first call so the cancel path's
+        # _persist_task_state raises and leaves task_id in
+        # _pending_persistence.
+        async def failing_first_update(*args, **kwargs):
+            raise RuntimeError("DB is being torn down")
+
+        db.update_scheduled_task = failing_first_update
+
+        # Cancel the execute_task — its _persist_task_state fails,
+        # leaving the task_id in _pending_persistence.
+        exec_tasks = list(engine._execute_tasks.values())
+        assert len(exec_tasks) == 1
+        exec_tasks[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await exec_tasks[0]
+        assert task_id in engine._pending_persistence, (
+            "cancelled task whose persist failed is NOT in "
+            "_pending_persistence — stop() cannot retry it"
+        )
+
+        # Wedge update_scheduled_task: swallows cancellation until
+        # release_db is set, then raises RuntimeError (simulating a
+        # wedged DB that surfaces a hard error once it resumes).
+        async def swallowing_then_failing_update(*args, **kwargs):
+            while not release_db.is_set():
+                try:
+                    await release_db.wait()
+                except asyncio.CancelledError:
+                    if release_db.is_set():
+                        raise
+                    # swallow: stay pending past the deadline
+            raise RuntimeError("DB is being torn down")
+
+        db.update_scheduled_task = swallowing_then_failing_update
+
+        # First stop(): reconcile hangs, owner retained.
+        with pytest.raises(ServiceShutdownError):
+            await engine.stop(timeout=0.5)
+        assert engine._persistence_owners
+
+        # Release the wedge so the retained owner resumes and hits the
+        # RuntimeError.  The reconcile_task terminates with a
+        # ``ServiceShutdownError`` (raised by
+        # ``_reconcile_pending_persistence`` after the persist failed).
+        release_db.set()
+        await asyncio.sleep(0.1)
+
+        # Second stop(): the retained owner has terminated with an
+        # exception.  stop() reads it (logged), removes the owner, and
+        # retries the persist via a fresh reconcile.  The retry also
+        # fails (DB still broken) and raises ``ServiceShutdownError``
+        # matching "could not persist".
+        with pytest.raises(ServiceShutdownError, match="could not persist"):
+            await engine.stop(timeout=2.0)
+        # The fresh retry's owner has been registered and terminated.
+        # The task is still in ``_pending_persistence`` for the next
+        # stop() to retry.
+        assert task_id in engine._pending_persistence, (
+            "after the fresh retry failed, the task MUST still be in "
+            "_pending_persistence so the next stop() retries again"
+        )
+
+        release_exec.set()
+    finally:
+        release_db.set()
+        release_exec.set()
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# M1 (round-8): pause / remove cancel in-flight execution
+# ---------------------------------------------------------------------------
+
+
+async def test_pause_cancels_in_flight_execution(tmp_path) -> None:
+    """M1 (round-8): ``pause()`` MUST cancel + await the in-flight
+    ``_execute_task`` BEFORE flipping the status to ``paused``.
+    Otherwise the in-flight execution would complete after ``pause()``
+    returned and overwrite the ``paused`` DB row with ``completed`` /
+    ``pending`` — the user-visible contract ("I paused this task")
+    would be silently violated and the executor's external side
+    effects would keep running.
+
+    Sequence:
+      1. Spawn a Cron task whose executor stalls.
+      2. Call ``pause()`` while the executor is in-flight.
+      3. ``pause()`` cancels + awaits the executor, then writes
+         ``paused`` to the DB.
+      4. The DB row is ``paused`` (NOT ``running`` / ``completed`` /
+         ``pending``).  The in-memory status is also ``paused``.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        started = asyncio.Event()
+        release_exec = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release_exec.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("pause-test", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # The executor is in-flight.
+        assert task_id in engine._execute_tasks
+
+        # pause() cancels + awaits the in-flight executor, then writes
+        # paused to the DB.
+        ok = await engine.pause(task_id)
+        assert ok is True
+
+        # The in-flight execution was cancelled and removed from the
+        # registry (it terminated within the cancel budget).
+        assert task_id not in engine._execute_tasks, (
+            "pause() did not cancel + drain the in-flight executor — "
+            "the registry still has the task"
+        )
+        # The in-memory status is ``paused`` (NOT ``running``).
+        assert engine._tasks[task_id].status == TaskStatus.PAUSED, (
+            f"expected PAUSED, got {engine._tasks[task_id].status} — "
+            "the in-flight executor overwrote the paused state"
+        )
+        # The DB row is also ``paused``.
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "paused", (
+            f"expected DB status=paused, got {row['status']} — "
+            "the in-flight executor's terminal write overwrote the "
+            "paused DB row"
+        )
+
+        release_exec.set()
+        await engine.stop(timeout=2.0)
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+async def test_remove_cancels_in_flight_execution(tmp_path) -> None:
+    """M1 (round-8): ``remove()`` MUST cancel + await the in-flight
+    ``_execute_task`` BEFORE popping the task from ``_tasks``.
+    Otherwise the in-flight execution would complete after ``remove()``
+    returned and overwrite the ``cancelled`` DB row with
+    ``completed`` / ``pending`` — on restart the scheduler would
+    re-fire the task, potentially double-executing external side
+    effects.
+
+    Sequence:
+      1. Spawn a Cron task whose executor stalls.
+      2. Call ``remove()`` while the executor is in-flight.
+      3. ``remove()`` cancels + awaits the executor, then writes
+         ``cancelled`` to the DB.
+      4. The DB row is ``cancelled`` (NOT ``running`` / ``completed`` /
+         ``pending``).  The task is popped from ``_tasks``.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        started = asyncio.Event()
+        release_exec = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release_exec.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("remove-test", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # The executor is in-flight.
+        assert task_id in engine._execute_tasks
+
+        # remove() cancels + awaits the in-flight executor, then
+        # writes cancelled to the DB and pops the task from _tasks.
+        ok = await engine.remove(task_id)
+        assert ok is True
+
+        # The in-flight execution was cancelled and removed.
+        assert task_id not in engine._execute_tasks, (
+            "remove() did not cancel + drain the in-flight executor — "
+            "the registry still has the task"
+        )
+        # The task is popped from _tasks.
+        assert task_id not in engine._tasks, (
+            "remove() did not pop the task from _tasks"
+        )
+        # The DB row is ``cancelled`` (NOT ``running`` / ``completed``
+        # / ``pending``).
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "cancelled", (
+            f"expected DB status=cancelled, got {row['status']} — "
+            "the in-flight executor's terminal write overwrote the "
+            "cancelled DB row"
+        )
+
+        release_exec.set()
+        await engine.stop(timeout=2.0)
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+async def test_remove_prevents_task_refire_on_restart(tmp_path) -> None:
+    """M1 (round-8): a task removed while executing MUST NOT be
+    re-fired on restart.  This is the user-visible contract the
+    pause/remove cancel exists to protect — without it, the in-flight
+    executor would overwrite the ``cancelled`` DB row with
+    ``pending``/``completed``, and on restart the scheduler would
+    re-fire the task, potentially double-executing external side
+    effects.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        started = asyncio.Event()
+        release_exec = asyncio.Event()
+        exec_count = {"n": 0}
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            exec_count["n"] += 1
+            started.set()
+            await release_exec.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        # ISO time in the past so the task is immediately due.
+        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        task = await engine.create("remove-restart", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # remove() while the executor is in-flight.
+        ok = await engine.remove(task_id)
+        assert ok is True
+
+        # stop() the engine.
+        release_exec.set()
+        await engine.stop(timeout=2.0)
+
+        # Simulate a restart: a new engine instance loads tasks from
+        # the DB.  The cancelled task MUST NOT be re-fired.
+        started.clear()
+        exec_count["n"] = 0
+
+        engine2 = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine2.start()
+        await asyncio.sleep(0.1)
+        assert exec_count["n"] == 0, (
+            f"removed task was re-fired {exec_count['n']} time(s) on "
+            "restart — the in-flight executor overwrote the cancelled "
+            "DB row"
+        )
+        await engine2.stop()
+    finally:
+        release_exec.set()
         await db.close()
