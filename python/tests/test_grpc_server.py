@@ -692,26 +692,24 @@ async def test_agent_shutdown_fails_closed_when_chat_swallows_cancel(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Unix server lifecycle requires UDS")
-async def test_agent_shutdown_cannot_miss_chat_mid_admission(tmp_path, monkeypatch):
-    """M2 (round-3): shutdown's owner snapshot cannot miss a chat that is
-    mid-``_build_runtime`` after passing admission.
+async def test_chat_owner_reservation_visible_to_shutdown_during_build(
+    tmp_path, monkeypatch
+):
+    """H1a (round-4): shutdown's owner snapshot MUST see a chat that is
+    mid-``_build_runtime``, even though the build now runs OUTSIDE the
+    admission lock.
 
-    The previous code checked ``_accepting_work`` and THEN awaited
-    ``_build_runtime`` before registering the owner task in
-    ``_active_chat_tasks``.  A concurrent shutdown could flip
-    ``_accepting_work=False``, snapshot an empty owner set, and proceed
-    to dismantle shared authorities — the chat would later resume and
-    register a runtime after shutdown believed all owners were drained.
+    The round-3 fix held the admission lock across the build, which
+    closed the snapshot race but introduced a worse problem: a slow
+    build blocked shutdown from acquiring the lock, so the bounded drain
+    never started.  The round-4 fix uses a reservation pattern — register
+    the owner task under the lock (cheap), then build outside.
 
-    The fix serialises admission+registration against shutdown's flip+
-    snapshot under ``_admission_lock``.  Because admission holds the
-    lock across the build, shutdown's snapshot is blocked until the
-    chat has registered its owner — so the owner is always visible.
-
-    We assert the contract by stalling ``_build_runtime`` on a
-    test-controlled event, then running shutdown and confirming it
-    BLOCKS on the admission lock (chat holds it) rather than returning
-    with an empty owner set.
+    This test pins BOTH halves of the contract:
+      * The owner task IS in ``_active_chat_tasks`` while the build is
+        in flight (so shutdown's snapshot cannot miss it).
+      * The admission lock is NOT held during the build (so shutdown can
+        acquire it and reach its bounded drain).
     """
     from unittest.mock import AsyncMock, MagicMock
     from khaos.exceptions import ServiceShutdownError as _SSE
@@ -719,23 +717,28 @@ async def test_agent_shutdown_cannot_miss_chat_mid_admission(tmp_path, monkeypat
 
     chat_in_build = asyncio.Event()
     release_build = asyncio.Event()
-
-    class _StopLoop:
-        """A loop whose ``run`` raises immediately so chat exits cleanly
-        once the runtime is built — we are not testing loop behaviour,
-        only admission atomicity."""
-        async def run(self, message, session_id):
-            del message, session_id
-            raise _SSE("test: chat stopped after admission")
-            if False:
-                yield None
+    owner_visible_during_build: list[bool] = []
+    lock_free_during_build: list[bool] = []
 
     async def fake_build(self, *args, **kwargs):
         del self, args, kwargs
         chat_in_build.set()
+        # While parked here (outside the admission lock), the test
+        # driver probes the admission lock and the owner-task registry.
+        owner_visible_during_build.append(
+            any(not t.done() for t in service._active_chat_tasks)
+        )
+        try:
+            await asyncio.wait_for(
+                service._admission_lock.acquire(), timeout=0.3,
+            )
+            lock_free_during_build.append(True)
+            service._admission_lock.release()
+        except asyncio.TimeoutError:
+            lock_free_during_build.append(False)
         await release_build.wait()
         return RuntimeResult(
-            loop=_StopLoop(), mode_manager=MagicMock(), task_manager=None,
+            loop=MagicMock(), mode_manager=MagicMock(), task_manager=None,
             skill_generator=None, tool_scheduler=MagicMock(),
             memory_manager=MagicMock(aclose=AsyncMock()),
             skill_manager=MagicMock(), new_verify_fix_loop=None,
@@ -750,8 +753,6 @@ async def test_agent_shutdown_cannot_miss_chat_mid_admission(tmp_path, monkeypat
     service = AgentService(db, project_root=tmp_path)
     await service.start()
 
-    # Start the chat coroutine.  It will enter admission, register its
-    # owner task, then stall inside _build_runtime waiting on release_build.
     async def drive_chat():
         request = ChatRequest(session_id="race", message="x", mode="office")
         try:
@@ -762,42 +763,156 @@ async def test_agent_shutdown_cannot_miss_chat_mid_admission(tmp_path, monkeypat
 
     chat_task = asyncio.create_task(drive_chat())
     await asyncio.wait_for(chat_in_build.wait(), timeout=2.0)
-
-    # Now try to acquire the admission lock.  It MUST be held by chat
-    # (inside _build_runtime), proving shutdown's snapshot — which
-    # acquires the same lock — is blocked until chat finishes registering
-    # its owner.  Use wait_for with a short timeout; success here would
-    # mean the await gap is back.
-    lock_acquired = False
-    try:
-        await asyncio.wait_for(
-            service._admission_lock.acquire(), timeout=0.3,
-        )
-        lock_acquired = True
-        service._admission_lock.release()
-    except asyncio.TimeoutError:
-        pass  # expected: chat holds the lock
-    assert not lock_acquired, (
-        "_admission_lock was acquirable while chat is mid-build; the "
-        "admission+build critical section is not atomic"
-    )
-
-    # Release the build so chat can finish its admission critical section
-    # and proceed.  The _StopLoop raises ServiceShutdownError so chat
-    # exits cleanly via the except branch above.
+    # Let fake_build finish its probes.
     release_build.set()
     try:
         await asyncio.wait_for(chat_task, timeout=2.0)
     except (asyncio.TimeoutError, asyncio.CancelledError):
         chat_task.cancel()
 
-    # Drain residual runtimes so the test does not leak resources.
+    # The owner task MUST have been visible during the build (reservation
+    # registered before the build started).
+    assert owner_visible_during_build == [True], (
+        "chat owner task was NOT registered before _build_runtime — "
+        "shutdown's snapshot could miss a mid-build chat"
+    )
+    # The admission lock MUST have been acquirable during the build
+    # (build runs outside the lock — shutdown is not blocked).
+    assert lock_free_during_build == [True], (
+        "_admission_lock was held during _build_runtime — a slow build "
+        "would block shutdown from reaching its bounded drain"
+    )
+
     from khaos.runtime import close_runtime_or_register
     for runtime in list(service._active_runtimes.values()):
         try:
             await close_runtime_or_register(runtime)
         except Exception:  # noqa: BLE001
             pass
+    await db.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix server lifecycle requires UDS")
+async def test_shutdown_reaches_drain_promptly_when_build_is_slow(
+    tmp_path, monkeypatch
+):
+    """H1a (round-4): a slow ``_build_runtime`` MUST NOT block shutdown
+    from reaching its bounded drain.
+
+    The round-3 design held the admission lock across the build, so a
+    slow/wedged build blocked shutdown's lock acquisition —
+    ``CHAT_DRAIN_TIMEOUT`` never started and shutdown hung indefinitely
+    (the audit's "deadline can be defeated before it begins" scenario).
+
+    The round-4 fix moves the build outside the lock.  shutdown acquires
+    the lock promptly, cancels the mid-build chat's owner task (whose
+    reservation was registered under the lock), and the cancellation
+    propagates through ``_build_runtime``'s await — so the chat
+    terminates and shutdown completes well within the deadline.
+
+    This test pins the timing contract: shutdown returns within a few
+    seconds even when the build was parked, instead of hanging on lock
+    acquisition.  (A chat that swallows CancelledError past the deadline
+    is covered by ``test_agent_shutdown_fails_closed_when_chat_swallows_cancel``.)
+    """
+    from khaos.exceptions import ServiceShutdownError as _SSE
+
+    chat_in_build = asyncio.Event()
+    release_build = asyncio.Event()
+
+    async def slow_build(self, *args, **kwargs):
+        del self, args, kwargs
+        chat_in_build.set()
+        # Park until the test releases us OR shutdown cancels us.
+        # CancelledError from shutdown propagates through this await.
+        await release_build.wait()
+        return None
+
+    monkeypatch.setattr(AgentService, "_build_runtime", slow_build)
+    monkeypatch.setattr("khaos.grpc_server.CHAT_DRAIN_TIMEOUT", 2.0)
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    await service.start()
+
+    async def drive_chat():
+        request = ChatRequest(session_id="slow", message="x", mode="office")
+        try:
+            async for _event in service.chat(request):
+                pass
+        except (_SSE, asyncio.CancelledError, RuntimeError):
+            pass
+
+    chat_task = asyncio.create_task(drive_chat())
+    await asyncio.wait_for(chat_in_build.wait(), timeout=2.0)
+
+    # shutdown should NOT hang on admission-lock acquisition.  It will
+    # cancel the chat_task; the chat's _build_runtime await raises
+    # CancelledError, the finally cleans up, the task completes, and
+    # shutdown's drain sees an empty pending set.
+    import time as _time
+    start = _time.monotonic()
+    try:
+        await asyncio.wait_for(service.shutdown(), timeout=10.0)
+    except asyncio.TimeoutError:
+        pytest.fail(
+            "shutdown hung — admission lock was likely held by the slow build"
+        )
+    except _SSE:
+        # Acceptable: a residual task did not terminate in time.
+        pass
+    elapsed = _time.monotonic() - start
+    # Must return within the drain deadline + modest slack, not hang.
+    assert elapsed < 5.0, f"shutdown took {elapsed:.2f}s, expected < 5s"
+
+    # Cleanup.
+    release_build.set()
+    chat_task.cancel()
+    try:
+        await asyncio.wait_for(chat_task, timeout=1.0)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        pass
+    await db.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix server lifecycle requires UDS")
+async def test_chat_owner_cleaned_up_when_build_raises(tmp_path, monkeypatch):
+    """M3 (round-4): if ``_build_runtime`` raises or is cancelled, the
+    owner task MUST be removed from ``_active_chat_tasks``.
+
+    The round-3 code only cleaned up the owner task in a ``finally`` that
+    ran AFTER a successful build — a build failure left the reservation
+    in ``_active_chat_tasks`` forever, accumulating dead task references
+    over the AgentService's lifetime.  The round-4 fix wraps the whole
+    body (including the build) in ``try/finally`` so the reservation is
+    always discarded.
+    """
+    async def failing_build(self, *args, **kwargs):
+        del self, args, kwargs
+        raise RuntimeError("simulated config / DB failure")
+
+    monkeypatch.setattr(AgentService, "_build_runtime", failing_build)
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    await service.start()
+
+    request = ChatRequest(session_id="fail", message="x", mode="office")
+    # The chat generator surfaces the build failure.
+    with pytest.raises(RuntimeError, match="simulated config"):
+        async for _event in service.chat(request):
+            pass
+
+    # The owner reservation MUST have been cleaned up — no leftover
+    # task reference that would accumulate across repeated failures.
+    assert service._active_chat_tasks == set(), (
+        "owner task leaked into _active_chat_tasks after build failure"
+    )
+    assert service._active_runtimes == {}
     await db.close()
 
 
