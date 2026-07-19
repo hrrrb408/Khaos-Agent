@@ -31,8 +31,9 @@ def test_cron_create_and_list(tmp_path: Path) -> None:
             "standup",
             "summarize today",
             ScheduleConfig(interval_seconds=3600),
+            principal_id="hermes-test",
         )
-        listed = await engine.list_tasks()
+        listed = await engine.list_tasks(principal_id="hermes-test")
         assert task in listed
         assert listed[0].name == "standup"
 
@@ -76,8 +77,14 @@ def test_cron_db_persistence(tmp_path: Path) -> None:
     async def run():
         db = await _db(tmp_path)
         engine = CronEngine(db=db)
-        await engine.create("daily", "p", ScheduleConfig(cron="0 9"), deliver_to="local")
-        rows = await db.list_scheduled_tasks()
+        await engine.create(
+            "daily",
+            "p",
+            ScheduleConfig(cron="0 9"),
+            deliver_to="local",
+            principal_id="hermes-test",
+        )
+        rows = await db.list_scheduled_tasks(principal_id="hermes-test")
         assert len(rows) == 1
         assert rows[0]["name"] == "daily"
         await db.close()

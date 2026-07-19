@@ -100,6 +100,9 @@ class Database:
         # existing databases (CREATE TABLE IF NOT EXISTS won't add it to
         # a pre-existing table).  See _ensure_scheduled_tasks_lifecycle_version.
         await self._ensure_scheduled_tasks_lifecycle_version()
+        # M4 batch 3.1.10: ensure principal_id, execution_id, lease_until
+        # columns exist on existing databases.
+        await self._ensure_scheduled_tasks_principal_and_lease()
 
     async def _ensure_scheduled_tasks_lifecycle_version(self) -> None:
         """Add ``lifecycle_version`` column to legacy ``scheduled_tasks``.
@@ -118,6 +121,43 @@ class Database:
                 "ALTER TABLE scheduled_tasks "
                 "ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 0"
             )
+            await conn.commit()
+
+    async def _ensure_scheduled_tasks_principal_and_lease(self) -> None:
+        """Add ``principal_id``, ``execution_id``, ``lease_until`` columns.
+
+        M4 batch 3.1.10: the columns were added to ``schema.sql`` for
+        new databases, but existing databases created before this batch
+        won't have them (``CREATE TABLE IF NOT EXISTS`` is a no-op on
+        an existing table).  This helper uses ``ALTER TABLE`` to add
+        them with defaults matching schema.sql.
+
+        ``principal_id`` defaults to ``'legacy'`` — existing rows are
+        NOT visible to any authenticated principal (fail-closed).  The
+        server bootstrap may optionally re-claim them for a specific
+        principal, but the default is to hide them.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(scheduled_tasks)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        added = False
+        if "principal_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE scheduled_tasks "
+                "ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            added = True
+        if "execution_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN execution_id TEXT"
+            )
+            added = True
+        if "lease_until" not in columns:
+            await conn.execute(
+                "ALTER TABLE scheduled_tasks ADD COLUMN lease_until TEXT"
+            )
+            added = True
+        if added:
             await conn.commit()
 
     async def create_session(self, session_id: str, mode: str = "office") -> None:
@@ -845,10 +885,27 @@ class Database:
         schedule,
         deliver_to: str = "local",
         meta: dict | None = None,
+        *,
+        principal_id: str = "",
+        next_run: str | None = None,
     ) -> str:
-        """Persist a new scheduled task and return its id."""
+        """Persist a new scheduled task and return its id.
+
+        M4 batch 3.1.10:
+          - ``principal_id`` is REQUIRED (non-empty).  Every task is
+            bound to its creator; list / pause / resume / remove filter
+            on it.  Empty principal is rejected — fail-closed.
+          - ``next_run`` is now persisted atomically with the INSERT.
+            Previously the engine computed ``next_run`` in memory but
+            did NOT pass it here, so the DB row's ``next_run`` stayed
+            NULL until the first execution — a restart before the first
+            fire left the task permanently stuck (tick skips tasks with
+            ``next_run IS NULL``).
+        """
         import uuid
 
+        if not principal_id:
+            raise ValueError("principal_id is required for scheduled task creation")
         conn = await self._require_conn()
         task_id = uuid.uuid4().hex[:12]
         schedule_json = json.dumps(_schedule_to_dict(schedule), ensure_ascii=False)
@@ -856,10 +913,12 @@ class Database:
         await conn.execute(
             """
             INSERT INTO scheduled_tasks
-                (id, name, prompt, status, schedule_config, deliver_to, meta)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (id, name, prompt, status, schedule_config, deliver_to, meta,
+                 principal_id, next_run)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, name, prompt, status, schedule_json, deliver_to, meta_json),
+            (task_id, name, prompt, status, schedule_json, deliver_to, meta_json,
+             principal_id, next_run),
         )
         await conn.commit()
         return task_id
@@ -999,26 +1058,153 @@ class Database:
         await conn.commit()
         return cursor.rowcount
 
-    async def list_scheduled_tasks(self) -> list[dict[str, Any]]:
+    async def list_scheduled_tasks(
+        self, *, principal_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List scheduled tasks, optionally filtered by ``principal_id``.
+
+        M4 batch 3.1.10: when ``principal_id`` is provided, only tasks
+        belonging to that principal are returned.  ``None`` returns all
+        (used by the engine's internal ``_load_tasks`` / reconcile).
+        """
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
-                   created_at, last_run, next_run, run_count, last_result, error,
-                   lifecycle_version
-            FROM scheduled_tasks
-            ORDER BY created_at
-            """
-        )
+        if principal_id is not None:
+            cursor = await conn.execute(
+                """
+                SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
+                       created_at, last_run, next_run, run_count, last_result, error,
+                       lifecycle_version, principal_id, execution_id, lease_until
+                FROM scheduled_tasks
+                WHERE principal_id = ?
+                ORDER BY created_at
+                """,
+                (principal_id,),
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
+                       created_at, last_run, next_run, run_count, last_result, error,
+                       lifecycle_version, principal_id, execution_id, lease_until
+                FROM scheduled_tasks
+                ORDER BY created_at
+                """
+            )
         return [dict(row) for row in await cursor.fetchall()]
 
-    async def get_scheduled_task(self, task_id: str) -> dict[str, Any] | None:
+    async def get_scheduled_task(
+        self, task_id: str, *, principal_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Get a scheduled task by id, optionally verifying ``principal_id``.
+
+        M4 batch 3.1.10: when ``principal_id`` is provided, returns
+        ``None`` if the task belongs to a different principal — so the
+        engine can return ``not_found`` (rather than revealing the
+        task's existence to an unauthorized caller).
+        """
         conn = await self._require_conn()
         cursor = await conn.execute(
             "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
         )
         row = await cursor.fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        result = dict(row)
+        if principal_id is not None and result.get("principal_id") != principal_id:
+            return None
+        return result
+
+    async def claim_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        execution_id: str,
+        lease_until: str,
+        expected_version: int,
+    ) -> int:
+        """Atomically claim a task for execution (durable lease).
+
+        M4 batch 3.1.10: CAS UPDATE that transitions a task from
+        PENDING to RUNNING, stamping an ``execution_id`` and
+        ``lease_until`` so a crash during execution leaves a durable
+        marker that restart recovery can detect and disclose.
+
+        Returns rowcount:
+          - 1 = claim succeeded (status was PENDING, version matched)
+          - 0 = claim failed (task was not PENDING, or a control op
+                bumped the version since the executor captured it)
+
+        The UPDATE does NOT bump ``lifecycle_version`` — execution
+        claims are not control operations.  This keeps the version
+        stable across multiple sequential executions of a recurring
+        task.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = 'running', execution_id = ?, lease_until = ?,
+                last_run = ?
+            WHERE id = ? AND status = 'pending' AND lifecycle_version = ?
+            """,
+            (execution_id, lease_until, lease_until, task_id, expected_version),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+    async def clear_scheduled_task_lease(
+        self, task_id: str, *, execution_id: str,
+    ) -> int:
+        """Clear the execution lease on a task after successful terminal write.
+
+        M4 batch 3.1.10: called by the executor after it has written
+        the terminal state (COMPLETED / FAILED / PENDING-for-next-run).
+        Clears ``execution_id`` and ``lease_until`` only if the stored
+        ``execution_id`` matches — so a stale executor that lost a
+        lease race cannot clear a newer executor's lease.
+
+        Returns rowcount (1 = cleared, 0 = execution_id mismatch).
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET execution_id = NULL, lease_until = NULL
+            WHERE id = ? AND execution_id = ?
+            """,
+            (task_id, execution_id),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+    async def recover_expired_leases(self, *, now_iso: str) -> int:
+        """Mark tasks with expired leases as FAILED (durable at-least-once disclosure).
+
+        M4 batch 3.1.10: called by ``CronEngine.start()`` after loading
+        tasks.  Any task with ``status='running'`` and
+        ``lease_until < now`` represents a crashed execution — its
+        terminal state was never persisted.  Mark it FAILED with an
+        error explaining the crash, and bump the lifecycle_version so
+        any stale executor that somehow resumes will fail its
+        conditional write.
+
+        Returns the number of tasks recovered.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = 'failed', error = 'execution lease expired '
+                || '(process crash during execution; at-least-once disclosure)',
+                execution_id = NULL, lease_until = NULL,
+                lifecycle_version = lifecycle_version + 1
+            WHERE status = 'running' AND lease_until IS NOT NULL
+                  AND lease_until < ?
+            """,
+            (now_iso,),
+        )
+        await conn.commit()
+        return cursor.rowcount
 
     # ------------------------------------------------------------------
     # Hermes batch 2: session history FTS5 search

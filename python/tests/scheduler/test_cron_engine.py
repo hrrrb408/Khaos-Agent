@@ -29,19 +29,20 @@ async def test_create_task() -> None:
         "daily-standup",
         "summarize today",
         ScheduleConfig(interval_seconds=3600),
+        principal_id="test",
     )
 
     assert task.id is not None
     assert task.name == "daily-standup"
     assert task.status == TaskStatus.PENDING
     assert task.next_run is not None
-    listed = await engine.list_tasks()
+    listed = await engine.list_tasks(principal_id="test")
     assert task in listed
 
 
 async def test_get_returns_task() -> None:
     engine = _engine()
-    created = await engine.create("t", "p", ScheduleConfig(interval_seconds=60))
+    created = await engine.create("t", "p", ScheduleConfig(interval_seconds=60), principal_id="test")
     fetched = await engine.get(created.id)
     assert fetched is created
 
@@ -53,9 +54,9 @@ async def test_get_unknown_returns_none() -> None:
 
 async def test_list_tasks() -> None:
     engine = _engine()
-    await engine.create("a", "p", ScheduleConfig(interval_seconds=60))
-    await engine.create("b", "p", ScheduleConfig(interval_seconds=60))
-    assert len(await engine.list_tasks()) == 2
+    await engine.create("a", "p", ScheduleConfig(interval_seconds=60), principal_id="test")
+    await engine.create("b", "p", ScheduleConfig(interval_seconds=60), principal_id="test")
+    assert len(await engine.list_tasks(principal_id="test")) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -65,31 +66,31 @@ async def test_list_tasks() -> None:
 
 async def test_pause_resume() -> None:
     engine = _engine()
-    task = await engine.create("t", "p", ScheduleConfig(interval_seconds=60))
+    task = await engine.create("t", "p", ScheduleConfig(interval_seconds=60), principal_id="test")
 
-    assert await engine.pause(task.id) == "ok"
+    assert await engine.pause(task.id, principal_id="test") == "ok"
     assert task.status == TaskStatus.PAUSED
 
-    assert await engine.resume(task.id) == "ok"
+    assert await engine.resume(task.id, principal_id="test") == "ok"
     assert task.status == TaskStatus.PENDING
     assert task.next_run is not None  # resume recomputes next_run
 
 
 async def test_pause_unknown_returns_false() -> None:
-    assert await _engine().pause("ghost") == "not_found"
+    assert await _engine().pause("ghost", principal_id="test") == "not_found"
 
 
 async def test_remove() -> None:
     engine = _engine()
-    task = await engine.create("t", "p", ScheduleConfig(interval_seconds=60))
+    task = await engine.create("t", "p", ScheduleConfig(interval_seconds=60), principal_id="test")
 
-    assert await engine.remove(task.id) == "ok"
+    assert await engine.remove(task.id, principal_id="test") == "ok"
     assert await engine.get(task.id) is None
     assert task.status == TaskStatus.CANCELLED
 
 
 async def test_remove_unknown_returns_false() -> None:
-    assert await _engine().remove("ghost") == "not_found"
+    assert await _engine().remove("ghost", principal_id="test") == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +145,7 @@ async def test_task_lifecycle_pending_running_completed() -> None:
     """A one-shot (iso_time) task transitions PENDING → RUNNING → COMPLETED."""
     engine = _engine()
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("once", "do once", ScheduleConfig(iso_time=iso))
+    task = await engine.create("once", "do once", ScheduleConfig(iso_time=iso), principal_id="test")
 
     await engine._execute_task(task)
 
@@ -158,7 +159,8 @@ async def test_repeat_limit() -> None:
     """A repeating task hits COMPLETED after `repeat` runs."""
     engine = _engine()
     task = await engine.create(
-        "bounded", "p", ScheduleConfig(interval_seconds=60, repeat=2)
+        "bounded", "p", ScheduleConfig(interval_seconds=60, repeat=2),
+        principal_id="test",
     )
     await engine._execute_task(task)
     assert task.status == TaskStatus.PENDING  # still pending, 1/2
@@ -171,7 +173,7 @@ async def test_repeat_limit() -> None:
 async def test_onetime_task_completed() -> None:
     engine = _engine()
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("once2", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("once2", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine._execute_task(task)
     assert task.status == TaskStatus.COMPLETED
 
@@ -180,7 +182,7 @@ async def test_task_failure() -> None:
     """An executor that raises marks the task FAILED."""
     engine = CronEngine(executor=_raising_executor)
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("boom", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("boom", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine._execute_task(task)
     assert task.status == TaskStatus.FAILED
     assert task.error is not None
@@ -203,7 +205,7 @@ async def test_on_complete_invoked() -> None:
 
     engine = CronEngine(executor=_recording_executor, on_complete=on_complete)
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("cb", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("cb", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine._execute_task(task)
 
     assert calls == [("cb", "executed:p")]
@@ -252,7 +254,7 @@ async def test_stop_drains_in_flight_execute_tasks() -> None:
     )
     # Due immediately.
     iso = datetime.utcnow().isoformat()
-    await engine.create("in-flight", "p", ScheduleConfig(iso_time=iso))
+    await engine.create("in-flight", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine.start()
 
     # Wait for the executor to actually start (proving the task is
@@ -339,7 +341,7 @@ async def test_stop_bounded_against_swallowing_executor() -> None:
         tick_interval=0.01,
     )
     iso = datetime.utcnow().isoformat()
-    await engine.create("swallow", "p", ScheduleConfig(iso_time=iso))
+    await engine.create("swallow", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine.start()
     # Wait for the executor to actually start (proving the task is
     # in-flight, not just queued).
@@ -416,7 +418,7 @@ async def test_execute_task_persists_cancelled_state_on_cancellation(tmp_path) -
         # and the tick loop never picks the task up).
         await engine.start()
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("cancel-test", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("cancel-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id  # DB assigns a UUID hex id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
@@ -510,7 +512,7 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
         )
         await engine.start()
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("retry-test", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("retry-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
@@ -520,7 +522,6 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
         # _persist_task_state raises and leaves task_id in
         # _pending_persistence.
         original_conditional = db.update_scheduled_task_conditional
-        original_update = db.update_scheduled_task
 
         async def failing_conditional(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
@@ -540,16 +541,19 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # Restore the conditional update (the reconcile path uses the
-        # unconditional ``update_scheduled_task`` so we don't need the
-        # conditional patch anymore).  Patch the unconditional update
-        # to fail so the first stop()'s reconcile also fails.
-        db.update_scheduled_task_conditional = original_conditional
-
-        async def failing_update_2(*args, **kwargs):
+        # M4 batch 3.1.10 (HIGH-2): the reconcile path now uses
+        # ``update_scheduled_task_conditional`` for executor entries
+        # (``is_control_op=False``) — it respects the captured
+        # ``expected_version`` so a stale executor's retry cannot
+        # overwrite a newer control op's state.  Keep the conditional
+        # patch failing so the first stop()'s reconcile ALSO fails.
+        # (Previously the reconcile used the unconditional
+        # ``update_scheduled_task`` and the test patched that; the
+        # generation-based pending persistence changed the dispatch.)
+        async def failing_conditional_2(*args, **kwargs):
             raise RuntimeError("DB still wedged")
 
-        db.update_scheduled_task = failing_update_2
+        db.update_scheduled_task_conditional = failing_conditional_2
 
         # First stop(): reconcile retries the persist, fails, raises
         # ServiceShutdownError.
@@ -562,8 +566,8 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
             "the next stop() cannot retry"
         )
 
-        # Restore the real update so the next retry succeeds.
-        db.update_scheduled_task = original_update
+        # Restore the real conditional update so the next retry succeeds.
+        db.update_scheduled_task_conditional = original_conditional
 
         # Second stop(): reconcile retries the persist, succeeds.
         await engine.stop(timeout=2.0)
@@ -625,7 +629,7 @@ async def test_cancelled_task_not_refired_on_restart(tmp_path) -> None:
         await engine.start()
         # Use a one-shot ISO task in the past so it's immediately due.
         iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
-        task = await engine.create("restart-test", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("restart-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
@@ -735,7 +739,7 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
         )
         await engine.start()
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("retained-owner", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("retained-owner", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
@@ -744,7 +748,6 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
         # task_id in _pending_persistence.  (The executor's terminal
         # write now uses update_scheduled_task_conditional.)
         original_conditional = db.update_scheduled_task_conditional
-        original_update = db.update_scheduled_task
 
         async def failing_conditional(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
@@ -763,13 +766,15 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # Restore the conditional update; wedge the UNCONDITIONAL
-        # update (used by the reconcile path) so the reconcile hangs
-        # until release_db is set.  After release, it calls the real
-        # update so the retained owner can actually persist.
-        db.update_scheduled_task_conditional = original_conditional
-
-        async def swallowing_update(*args, **kwargs):
+        # M4 batch 3.1.10 (HIGH-2): the reconcile path now uses
+        # ``update_scheduled_task_conditional`` for executor entries
+        # (``is_control_op=False``).  Wedge the CONDITIONAL update so
+        # the reconcile hangs until release_db is set.  After release,
+        # it calls the real update so the retained owner can actually
+        # persist.  (Previously the reconcile used the unconditional
+        # ``update_scheduled_task`` and the test wedged that; the
+        # generation-based pending persistence changed the dispatch.)
+        async def swallowing_conditional(*args, **kwargs):
             while not release_db.is_set():
                 try:
                     await release_db.wait()
@@ -777,9 +782,9 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
                     if release_db.is_set():
                         raise
                     # swallow: stay pending past the deadline
-            return await original_update(*args, **kwargs)
+            return await original_conditional(*args, **kwargs)
 
-        db.update_scheduled_task = swallowing_update
+        db.update_scheduled_task_conditional = swallowing_conditional
 
         # First stop(): reconcile hangs, owner is retained.
         with pytest.raises(ServiceShutdownError):
@@ -881,7 +886,7 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
         )
         await engine.start()
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("retained-exc", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("retained-exc", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
@@ -908,13 +913,16 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # Restore the conditional update; wedge the UNCONDITIONAL
-        # update (used by the reconcile path): swallows cancellation
-        # until release_db is set, then raises RuntimeError (simulating
-        # a wedged DB that surfaces a hard error once it resumes).
-        db.update_scheduled_task_conditional = original_conditional
-
-        async def swallowing_then_failing_update(*args, **kwargs):
+        # M4 batch 3.1.10 (HIGH-2): the reconcile path now uses
+        # ``update_scheduled_task_conditional`` for executor entries
+        # (``is_control_op=False``).  Wedge the CONDITIONAL update:
+        # swallows cancellation until release_db is set, then raises
+        # RuntimeError (simulating a wedged DB that surfaces a hard
+        # error once it resumes).  (Previously the reconcile used the
+        # unconditional ``update_scheduled_task`` and the test wedged
+        # that; the generation-based pending persistence changed the
+        # dispatch.)
+        async def swallowing_then_failing_conditional(*args, **kwargs):
             while not release_db.is_set():
                 try:
                     await release_db.wait()
@@ -924,7 +932,7 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
                     # swallow: stay pending past the deadline
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = swallowing_then_failing_update
+        db.update_scheduled_task_conditional = swallowing_then_failing_conditional
 
         # First stop(): reconcile hangs, owner retained.
         with pytest.raises(ServiceShutdownError):
@@ -1006,7 +1014,7 @@ async def test_pause_cancels_in_flight_execution(tmp_path) -> None:
         )
         await engine.start()
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("pause-test", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("pause-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
@@ -1015,7 +1023,7 @@ async def test_pause_cancels_in_flight_execution(tmp_path) -> None:
 
         # pause() cancels + awaits the in-flight executor, then writes
         # paused to the DB.
-        result = await engine.pause(task_id)
+        result = await engine.pause(task_id, principal_id="test")
         assert result == "ok"
 
         # The in-flight execution was cancelled and removed from the
@@ -1086,7 +1094,7 @@ async def test_remove_cancels_in_flight_execution(tmp_path) -> None:
         )
         await engine.start()
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("remove-test", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("remove-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
@@ -1095,7 +1103,7 @@ async def test_remove_cancels_in_flight_execution(tmp_path) -> None:
 
         # remove() cancels + awaits the in-flight executor, then
         # writes cancelled to the DB and pops the task from _tasks.
-        result = await engine.remove(task_id)
+        result = await engine.remove(task_id, principal_id="test")
         assert result == "ok"
 
         # The in-flight execution was cancelled and removed.
@@ -1160,12 +1168,12 @@ async def test_remove_prevents_task_refire_on_restart(tmp_path) -> None:
         await engine.start()
         # ISO time in the past so the task is immediately due.
         iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
-        task = await engine.create("remove-restart", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("remove-restart", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
         # remove() while the executor is in-flight.
-        result = await engine.remove(task_id)
+        result = await engine.remove(task_id, principal_id="test")
         assert result == "ok"
 
         # stop() the engine.
@@ -1272,7 +1280,8 @@ async def test_pause_returns_cancellation_pending_and_epoch_fence_holds(
             await engine.start()
             iso = datetime.utcnow().isoformat()
             task = await engine.create(
-                "pause-cp", "p", ScheduleConfig(iso_time=iso)
+                "pause-cp", "p", ScheduleConfig(iso_time=iso),
+                principal_id="test",
             )
             task_id = task.id
             await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -1280,7 +1289,7 @@ async def test_pause_returns_cancellation_pending_and_epoch_fence_holds(
             # pause() cancels the executor.  The executor swallows
             # CancelledError, so after the 0.3s budget pause() returns
             # cancellation_pending — NOT ok.
-            result = await engine.pause(task_id)
+            result = await engine.pause(task_id, principal_id="test")
             assert result == "cancellation_pending", (
                 f"expected cancellation_pending, got {result!r} — "
                 "pause() claimed success despite the executor not "
@@ -1427,7 +1436,8 @@ async def test_remove_returns_cancellation_pending_and_epoch_fence_holds(
             await engine.start()
             iso = datetime.utcnow().isoformat()
             task = await engine.create(
-                "remove-cp", "p", ScheduleConfig(iso_time=iso)
+                "remove-cp", "p", ScheduleConfig(iso_time=iso),
+                principal_id="test",
             )
             task_id = task.id
             await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -1435,7 +1445,7 @@ async def test_remove_returns_cancellation_pending_and_epoch_fence_holds(
             # remove() cancels the executor.  The executor swallows
             # CancelledError, so after the 0.3s budget remove() returns
             # cancellation_pending — NOT ok.
-            result = await engine.remove(task_id)
+            result = await engine.remove(task_id, principal_id="test")
             assert result == "cancellation_pending", (
                 f"expected cancellation_pending, got {result!r} — "
                 "remove() claimed success despite the executor not "
@@ -1573,7 +1583,8 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
         await engine.start()
         iso = datetime.utcnow().isoformat()
         task = await engine.create(
-            "remove-retain", "p", ScheduleConfig(iso_time=iso)
+            "remove-retain", "p", ScheduleConfig(iso_time=iso),
+            principal_id="test",
         )
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -1593,7 +1604,7 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
         # H2 (round-10): remove() now returns persistence_pending
         # (NOT ok) when the DB write fails — the caller is informed
         # that the cancelled state may not be durable.
-        result = await engine.remove(task_id)
+        result = await engine.remove(task_id, principal_id="test")
         assert result == "persistence_pending", (
             f"expected persistence_pending, got {result!r} — "
             "remove() claimed success (ok) despite the terminal "
@@ -1696,12 +1707,12 @@ async def test_tick_does_not_publish_for_paused_task(tmp_path) -> None:
         )
         # Create a task that's due NOW but DON'T start the engine yet.
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("pause-tick", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("pause-tick", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
 
         # Pause BEFORE starting the engine — the task is due but
         # paused.  Tick's re-check MUST skip it.
-        result = await engine.pause(task_id)
+        result = await engine.pause(task_id, principal_id="test")
         assert result == "ok", (
             f"expected ok, got {result!r} — pause() of a not-running "
             "task should succeed"
@@ -1790,11 +1801,11 @@ async def test_tick_does_not_publish_for_removed_task(tmp_path) -> None:
         )
         # Create a task that's due NOW but DON'T start the engine yet.
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("remove-tick", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("remove-tick", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
 
         # Remove BEFORE starting the engine.
-        result = await engine.remove(task_id)
+        result = await engine.remove(task_id, principal_id="test")
         assert result == "ok", (
             f"expected ok, got {result!r} — remove() of a not-running "
             "task should succeed"
@@ -1872,7 +1883,8 @@ async def test_pause_returns_persistence_pending_on_db_failure(
         await engine.start()
         iso = datetime.utcnow().isoformat()
         task = await engine.create(
-            "pause-pp", "p", ScheduleConfig(iso_time=iso)
+            "pause-pp", "p", ScheduleConfig(iso_time=iso),
+            principal_id="test",
         )
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -1888,7 +1900,7 @@ async def test_pause_returns_persistence_pending_on_db_failure(
 
         # pause() cancels the executor (clean terminate), then tries
         # to persist PAUSED — FAILS.  Returns persistence_pending.
-        result = await engine.pause(task_id)
+        result = await engine.pause(task_id, principal_id="test")
         assert result == "persistence_pending", (
             f"expected persistence_pending, got {result!r} — "
             "pause() claimed success (ok) despite the terminal "
@@ -1993,14 +2005,15 @@ async def test_remove_cancellation_pending_tombstone_allows_retry(
             await engine.start()
             iso = datetime.utcnow().isoformat()
             task = await engine.create(
-                "remove-tomb", "p", ScheduleConfig(iso_time=iso)
+                "remove-tomb", "p", ScheduleConfig(iso_time=iso),
+                principal_id="test",
             )
             task_id = task.id
             await asyncio.wait_for(started.wait(), timeout=2.0)
 
             # First remove(): executor swallows cancel → returns
             # cancellation_pending.  Task is NOT popped (tombstone).
-            result1 = await engine.remove(task_id)
+            result1 = await engine.remove(task_id, principal_id="test")
             assert result1 == "cancellation_pending", (
                 f"expected cancellation_pending, got {result1!r}"
             )
@@ -2012,7 +2025,7 @@ async def test_remove_cancellation_pending_tombstone_allows_retry(
 
             # Retry remove() while the executor is still running —
             # MUST return cancellation_pending again (NOT not_found).
-            result2 = await engine.remove(task_id)
+            result2 = await engine.remove(task_id, principal_id="test")
             assert result2 == "cancellation_pending", (
                 f"expected cancellation_pending on retry, got "
                 f"{result2!r} — the tombstone was not retained "
@@ -2029,7 +2042,7 @@ async def test_remove_cancellation_pending_tombstone_allows_retry(
             # Retry remove() — now the executor is done, so cancel_ok
             # is True.  The persist already succeeded (from the first
             # remove), so persist_ok is True.  Returns ok and pops.
-            result3 = await engine.remove(task_id)
+            result3 = await engine.remove(task_id, principal_id="test")
             assert result3 == "ok", (
                 f"expected ok on retry after executor terminated, "
                 f"got {result3!r} — the tombstone retry did not "
@@ -2158,14 +2171,14 @@ async def test_concurrent_pause_and_resume_are_serialized() -> None:
     engine._tick_interval = 0.01
     await engine.start()
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("pause-resume", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("pause-resume", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
     await asyncio.wait_for(started.wait(), timeout=2.0)
 
     # Start pause() and resume() concurrently.  The per-task lock
     # serializes them — one runs fully before the other starts.
-    pause_task = asyncio.ensure_future(engine.pause(task_id))
-    resume_task = asyncio.ensure_future(engine.resume(task_id))
+    pause_task = asyncio.ensure_future(engine.pause(task_id, principal_id="test"))
+    resume_task = asyncio.ensure_future(engine.resume(task_id, principal_id="test"))
 
     # Both should complete without error.  The per-task lock ensures
     # they don't interleave — one's cancel+persist completes before
@@ -2249,14 +2262,15 @@ async def test_resume_refuses_cancelled_tombstone(tmp_path) -> None:
             await engine.start()
             iso = datetime.utcnow().isoformat()
             task = await engine.create(
-                "resume-tomb", "p", ScheduleConfig(iso_time=iso)
+                "resume-tomb", "p", ScheduleConfig(iso_time=iso),
+                principal_id="test",
             )
             task_id = task.id
             await asyncio.wait_for(started.wait(), timeout=2.0)
 
             # remove() returns cancellation_pending (executor swallows
             # cancel).  Task stays in _tasks as a CANCELLED tombstone.
-            result = await engine.remove(task_id)
+            result = await engine.remove(task_id, principal_id="test")
             assert result == "cancellation_pending"
             assert task_id in engine._tasks
             assert engine._tasks[task_id].status == TaskStatus.CANCELLED
@@ -2266,7 +2280,7 @@ async def test_resume_refuses_cancelled_tombstone(tmp_path) -> None:
             # state transition matrix (only PAUSED can be resumed),
             # so the return is "invalid_state" (was "cancelled" in
             # round-11).
-            resume_result = await engine.resume(task_id)
+            resume_result = await engine.resume(task_id, principal_id="test")
             assert resume_result == "invalid_state", (
                 f"expected 'invalid_state', got {resume_result!r} — "
                 "resume() did not refuse the CANCELLED removal "
@@ -2332,7 +2346,7 @@ async def test_resume_refuses_running_task() -> None:
     engine._tick_interval = 0.01
     await engine.start()
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("resume-running", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("resume-running", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
     await asyncio.wait_for(started.wait(), timeout=2.0)
 
@@ -2344,7 +2358,7 @@ async def test_resume_refuses_running_task() -> None:
     )
 
     # resume() MUST refuse — return invalid_state.
-    result = await engine.resume(task_id)
+    result = await engine.resume(task_id, principal_id="test")
     assert result == "invalid_state", (
         f"expected invalid_state, got {result!r} — resume() did not "
         "refuse a RUNNING task; tick would re-fire and produce "
@@ -2379,12 +2393,12 @@ async def test_resume_refuses_terminal_states() -> None:
 
     engine = _engine()
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("resume-terminal", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("resume-terminal", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
 
     # Test COMPLETED.
     engine._tasks[task_id].status = TaskStatus.COMPLETED
-    result = await engine.resume(task_id)
+    result = await engine.resume(task_id, principal_id="test")
     assert result == "invalid_state", (
         f"expected invalid_state for COMPLETED, got {result!r}"
     )
@@ -2395,7 +2409,7 @@ async def test_resume_refuses_terminal_states() -> None:
 
     # Test FAILED.
     engine._tasks[task_id].status = TaskStatus.FAILED
-    result = await engine.resume(task_id)
+    result = await engine.resume(task_id, principal_id="test")
     assert result == "invalid_state", (
         f"expected invalid_state for FAILED, got {result!r}"
     )
@@ -2421,14 +2435,14 @@ async def test_pause_refuses_cancelled_tombstone() -> None:
 
     engine = _engine()
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("pause-cancelled", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("pause-cancelled", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
 
     # Simulate a removal tombstone.
     engine._tasks[task_id].status = TaskStatus.CANCELLED
 
     # pause() MUST refuse — return invalid_state.
-    result = await engine.pause(task_id)
+    result = await engine.pause(task_id, principal_id="test")
     assert result == "invalid_state", (
         f"expected invalid_state, got {result!r} — pause() did not "
         "refuse a CANCELLED tombstone; the task could be resurrected "
@@ -2460,12 +2474,12 @@ async def test_pause_refuses_terminal_states() -> None:
 
     engine = _engine()
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("pause-terminal", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("pause-terminal", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
 
     # Test COMPLETED.
     engine._tasks[task_id].status = TaskStatus.COMPLETED
-    result = await engine.pause(task_id)
+    result = await engine.pause(task_id, principal_id="test")
     assert result == "invalid_state", (
         f"expected invalid_state for COMPLETED, got {result!r}"
     )
@@ -2476,7 +2490,7 @@ async def test_pause_refuses_terminal_states() -> None:
 
     # Test FAILED.
     engine._tasks[task_id].status = TaskStatus.FAILED
-    result = await engine.pause(task_id)
+    result = await engine.pause(task_id, principal_id="test")
     assert result == "invalid_state", (
         f"expected invalid_state for FAILED, got {result!r}"
     )
@@ -2547,19 +2561,20 @@ async def test_cancelled_tombstone_cannot_be_resurrected_via_pause_resume(
             await engine.start()
             iso = datetime.utcnow().isoformat()
             task = await engine.create(
-                "resurrect", "p", ScheduleConfig(iso_time=iso)
+                "resurrect", "p", ScheduleConfig(iso_time=iso),
+                principal_id="test",
             )
             task_id = task.id
             await asyncio.wait_for(started.wait(), timeout=2.0)
 
             # remove() returns cancellation_pending (executor swallows
             # cancel).  Task stays in _tasks as a CANCELLED tombstone.
-            result = await engine.remove(task_id)
+            result = await engine.remove(task_id, principal_id="test")
             assert result == "cancellation_pending"
             assert engine._tasks[task_id].status == TaskStatus.CANCELLED
 
             # pause() MUST refuse — return invalid_state (NOT ok).
-            pause_result = await engine.pause(task_id)
+            pause_result = await engine.pause(task_id, principal_id="test")
             assert pause_result == "invalid_state", (
                 f"expected invalid_state, got {pause_result!r} — "
                 "pause() did not refuse the CANCELLED tombstone; "
@@ -2574,7 +2589,7 @@ async def test_cancelled_tombstone_cannot_be_resurrected_via_pause_resume(
 
             # resume() MUST also refuse — return invalid_state (NOT ok)
             # because the task is CANCELLED, not PAUSED.
-            resume_result = await engine.resume(task_id)
+            resume_result = await engine.resume(task_id, principal_id="test")
             assert resume_result == "invalid_state", (
                 f"expected invalid_state, got {resume_result!r} — "
                 "resume() did not refuse the CANCELLED tombstone"
@@ -2657,7 +2672,8 @@ async def test_resume_paused_with_live_executor_returns_execution_pending(
             await engine.start()
             iso = datetime.utcnow().isoformat()
             task = await engine.create(
-                "resume-exec-pending", "p", ScheduleConfig(iso_time=iso)
+                "resume-exec-pending", "p", ScheduleConfig(iso_time=iso),
+                principal_id="test",
             )
             task_id = task.id
             await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -2665,7 +2681,7 @@ async def test_resume_paused_with_live_executor_returns_execution_pending(
             # pause() returns cancellation_pending (executor swallows
             # cancel).  Task is PAUSED in memory + DB, but the old
             # executor is still in _execute_tasks.
-            pause_result = await engine.pause(task_id)
+            pause_result = await engine.pause(task_id, principal_id="test")
             assert pause_result == "cancellation_pending"
             assert engine._tasks[task_id].status == TaskStatus.PAUSED
             assert task_id in engine._execute_tasks
@@ -2673,7 +2689,7 @@ async def test_resume_paused_with_live_executor_returns_execution_pending(
 
             # resume() MUST return execution_pending (NOT ok) because
             # the old executor is still alive.
-            resume_result = await engine.resume(task_id)
+            resume_result = await engine.resume(task_id, principal_id="test")
             assert resume_result == "execution_pending", (
                 f"expected execution_pending, got {resume_result!r} — "
                 "resume() did not detect the live executor; the old "
@@ -2707,7 +2723,7 @@ async def test_resume_paused_with_live_executor_returns_execution_pending(
             )
 
             # Now resume() returns ok — the old executor is gone.
-            resume_result2 = await engine.resume(task_id)
+            resume_result2 = await engine.resume(task_id, principal_id="test")
             assert resume_result2 == "ok", (
                 f"expected ok after executor terminated, got "
                 f"{resume_result2!r}"
@@ -2746,12 +2762,12 @@ async def test_remove_refuses_terminal_states() -> None:
 
     engine = _engine()
     iso = datetime.utcnow().isoformat()
-    task = await engine.create("remove-terminal", "p", ScheduleConfig(iso_time=iso))
+    task = await engine.create("remove-terminal", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
 
     # Test COMPLETED.
     engine._tasks[task_id].status = TaskStatus.COMPLETED
-    result = await engine.remove(task_id)
+    result = await engine.remove(task_id, principal_id="test")
     assert result == "invalid_state", (
         f"expected invalid_state for COMPLETED, got {result!r}"
     )
@@ -2762,7 +2778,7 @@ async def test_remove_refuses_terminal_states() -> None:
 
     # Test FAILED.
     engine._tasks[task_id].status = TaskStatus.FAILED
-    result = await engine.remove(task_id)
+    result = await engine.remove(task_id, principal_id="test")
     assert result == "invalid_state", (
         f"expected invalid_state for FAILED, got {result!r}"
     )
@@ -2838,7 +2854,8 @@ async def test_pause_retry_with_live_executor_returns_cancellation_pending(
             await engine.start()
             iso = datetime.utcnow().isoformat()
             task = await engine.create(
-                "pause-retry-live", "p", ScheduleConfig(iso_time=iso)
+                "pause-retry-live", "p", ScheduleConfig(iso_time=iso),
+                principal_id="test",
             )
             task_id = task.id
             await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -2846,7 +2863,7 @@ async def test_pause_retry_with_live_executor_returns_cancellation_pending(
             # First pause() — executor swallows cancel → returns
             # cancellation_pending.  Task is PAUSED in memory + DB,
             # but the executor is still in _execute_tasks.
-            result1 = await engine.pause(task_id)
+            result1 = await engine.pause(task_id, principal_id="test")
             assert result1 == "cancellation_pending", (
                 f"first pause: expected cancellation_pending, got "
                 f"{result1!r}"
@@ -2857,7 +2874,7 @@ async def test_pause_retry_with_live_executor_returns_cancellation_pending(
 
             # Second pause() while the executor is still alive —
             # MUST return cancellation_pending (NOT ok).
-            result2 = await engine.pause(task_id)
+            result2 = await engine.pause(task_id, principal_id="test")
             assert result2 == "cancellation_pending", (
                 f"second pause: expected cancellation_pending, got "
                 f"{result2!r} — pause(PAUSED) returned ok despite the "
@@ -2883,7 +2900,7 @@ async def test_pause_retry_with_live_executor_returns_cancellation_pending(
 
             # Third pause() — executor is gone, persist already done
             # (from the first pause).  Returns ok.
-            result3 = await engine.pause(task_id)
+            result3 = await engine.pause(task_id, principal_id="test")
             assert result3 == "ok", (
                 f"third pause: expected ok (executor gone, persist "
                 f"done), got {result3!r}"
@@ -2958,7 +2975,8 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
         await engine.start()
         iso = datetime.utcnow().isoformat()
         task = await engine.create(
-            "pause-retry-persist", "p", ScheduleConfig(iso_time=iso)
+            "pause-retry-persist", "p", ScheduleConfig(iso_time=iso),
+            principal_id="test",
         )
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -2974,7 +2992,7 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
 
         # First pause() — executor cancels cleanly, but DB write
         # fails → persistence_pending.
-        result1 = await engine.pause(task_id)
+        result1 = await engine.pause(task_id, principal_id="test")
         assert result1 == "persistence_pending", (
             f"first pause: expected persistence_pending, got "
             f"{result1!r}"
@@ -2987,7 +3005,7 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
 
         # Second pause() while the DB is still failing — MUST return
         # persistence_pending (NOT ok).
-        result2 = await engine.pause(task_id)
+        result2 = await engine.pause(task_id, principal_id="test")
         assert result2 == "persistence_pending", (
             f"second pause: expected persistence_pending, got "
             f"{result2!r} — pause(PAUSED) returned ok despite the DB "
@@ -3004,7 +3022,7 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
         db.update_scheduled_task = original_update
 
         # Third pause() — DB recovered, persist succeeds → ok.
-        result3 = await engine.pause(task_id)
+        result3 = await engine.pause(task_id, principal_id="test")
         assert result3 == "ok", (
             f"third pause: expected ok (DB recovered, persist "
             f"succeeded), got {result3!r}"
@@ -3061,11 +3079,11 @@ async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
         )
         await engine.start()
         iso = datetime.utcnow().isoformat()
-        task = await engine.create("resume-fail", "p", ScheduleConfig(iso_time=iso))
+        task = await engine.create("resume-fail", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
 
         # Move the task into PAUSED via pause().
-        result = await engine.pause(task_id)
+        result = await engine.pause(task_id, principal_id="test")
         assert result == "ok"
         assert engine._tasks[task_id].status == TaskStatus.PAUSED
 
@@ -3080,7 +3098,7 @@ async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
         db.update_scheduled_task = failing_update
 
         # resume() — DB write fails.  In-memory task MUST stay PAUSED.
-        result = await engine.resume(task_id)
+        result = await engine.resume(task_id, principal_id="test")
         assert result == "persistence_pending", (
             f"expected persistence_pending, got {result!r}"
         )
@@ -3091,7 +3109,7 @@ async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
 
         # Restore the DB.  Now resume() should succeed.
         db.update_scheduled_task = original_update
-        result = await engine.resume(task_id)
+        result = await engine.resume(task_id, principal_id="test")
         assert result == "ok", (
             f"expected ok (DB recovered), got {result!r}"
         )
@@ -3132,11 +3150,12 @@ async def test_resume_persist_first_does_not_fire_tick(tmp_path) -> None:
         # Use an interval schedule so the task is recurring.
         task = await engine.create(
             "no-tick", "p", ScheduleConfig(interval_seconds=60),
+            principal_id="test",
         )
         task_id = task.id
 
         # Pause the task.
-        result = await engine.pause(task_id)
+        result = await engine.pause(task_id, principal_id="test")
         assert result == "ok"
 
         # Patch DB so resume's persist fails.
@@ -3148,7 +3167,7 @@ async def test_resume_persist_first_does_not_fire_tick(tmp_path) -> None:
         db.update_scheduled_task = failing_update
 
         # resume() — fails.  Task stays PAUSED.
-        result = await engine.resume(task_id)
+        result = await engine.resume(task_id, principal_id="test")
         assert result == "persistence_pending"
 
         # Let the tick loop run a few times.
@@ -3163,7 +3182,7 @@ async def test_resume_persist_first_does_not_fire_tick(tmp_path) -> None:
 
         # Restore DB and resume successfully.
         db.update_scheduled_task = original_update
-        result = await engine.resume(task_id)
+        result = await engine.resume(task_id, principal_id="test")
         assert result == "ok"
 
         await engine.stop(timeout=2.0)
@@ -3219,6 +3238,7 @@ async def test_stale_executor_conditional_update_does_not_overwrite_paused(
         await engine.start()
         task = await engine.create(
             "stale-write", "p", ScheduleConfig(interval_seconds=60),
+            principal_id="test",
         )
         task_id = task.id
         # Force the task to be immediately eligible for tick (the
@@ -3235,7 +3255,7 @@ async def test_stale_executor_conditional_update_does_not_overwrite_paused(
         # Call pause() while the executor is stalling.  This bumps
         # lifecycle_version (in-memory and DB) and sets the DB row to
         # PAUSED.
-        result = await engine.pause(task_id)
+        result = await engine.pause(task_id, principal_id="test")
         # The executor is stalling and will be cancelled by pause();
         # the cancel should succeed (stalling executor responds to
         # CancelledError via release.wait()).
@@ -3300,6 +3320,7 @@ async def test_lifecycle_version_bumped_by_control_operations(tmp_path) -> None:
         await engine.start()
         task = await engine.create(
             "version-bump", "p", ScheduleConfig(interval_seconds=60),
+            principal_id="test",
         )
         task_id = task.id
 
@@ -3309,7 +3330,7 @@ async def test_lifecycle_version_bumped_by_control_operations(tmp_path) -> None:
         assert row["lifecycle_version"] == 0
 
         # pause() bumps the version.
-        await engine.pause(task_id)
+        await engine.pause(task_id, principal_id="test")
         rows = await db.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)
         assert row["lifecycle_version"] == 1, (
@@ -3317,7 +3338,7 @@ async def test_lifecycle_version_bumped_by_control_operations(tmp_path) -> None:
         )
 
         # resume() bumps the version again.
-        await engine.resume(task_id)
+        await engine.resume(task_id, principal_id="test")
         rows = await db.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)
         assert row["lifecycle_version"] == 2, (
@@ -3325,7 +3346,7 @@ async def test_lifecycle_version_bumped_by_control_operations(tmp_path) -> None:
         )
 
         # remove() bumps the version again.
-        await engine.remove(task_id)
+        await engine.remove(task_id, principal_id="test")
         rows = await db.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)
         assert row["lifecycle_version"] == 3, (
@@ -3370,6 +3391,7 @@ async def test_recurring_task_consecutive_executions_both_persist(tmp_path) -> N
         await engine.start()
         task = await engine.create(
             "recurring", "p", ScheduleConfig(interval_seconds=60),
+            principal_id="test",
         )
         task_id = task.id
 
@@ -3439,6 +3461,7 @@ async def test_executor_persists_after_engine_restart(tmp_path) -> None:
         await engine.start()
         task = await engine.create(
             "restart-recurring", "p", ScheduleConfig(interval_seconds=60),
+            principal_id="test",
         )
         task_id = task.id
 
@@ -3530,6 +3553,7 @@ async def test_pause_resume_after_execution_keeps_versions_aligned(tmp_path) -> 
         await engine.start()
         task = await engine.create(
             "pause-resume-version", "p", ScheduleConfig(interval_seconds=60),
+            principal_id="test",
         )
         task_id = task.id
 
@@ -3546,13 +3570,13 @@ async def test_pause_resume_after_execution_keeps_versions_aligned(tmp_path) -> 
         assert row["run_count"] == 1
 
         # Pause → Resume.  Both bump the version (memory + DB) to 1, 2.
-        assert await engine.pause(task_id) == "ok"
+        assert await engine.pause(task_id, principal_id="test") == "ok"
         assert engine._tasks[task_id].lifecycle_version == 1
         rows = await db.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)
         assert row["lifecycle_version"] == 1
 
-        assert await engine.resume(task_id) == "ok"
+        assert await engine.resume(task_id, principal_id="test") == "ok"
         assert engine._tasks[task_id].lifecycle_version == 2
         rows = await db.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)
@@ -3609,12 +3633,13 @@ async def test_loads_lifecycle_version_gt_one_from_db(tmp_path) -> None:
         await engine.start()
         task = await engine.create(
             "loaded-version", "p", ScheduleConfig(interval_seconds=60),
+            principal_id="test",
         )
         task_id = task.id
 
         # Bump the version to 2 via pause → resume.
-        await engine.pause(task_id)
-        await engine.resume(task_id)
+        await engine.pause(task_id, principal_id="test")
+        await engine.resume(task_id, principal_id="test")
         assert engine._tasks[task_id].lifecycle_version == 2
 
         rows = await db.list_scheduled_tasks()
@@ -3653,7 +3678,7 @@ async def test_loads_lifecycle_version_gt_one_from_db(tmp_path) -> None:
 
         # Now pause — the in-memory version MUST continue from 2 → 3,
         # not reset to 0 → 1.
-        await engine2.pause(task_id)
+        await engine2.pause(task_id, principal_id="test")
         assert loaded_task.lifecycle_version == 3, (
             f"post-restart pause set version={loaded_task.lifecycle_version} "
             "(expected 3 — continue from loaded version 2)"
