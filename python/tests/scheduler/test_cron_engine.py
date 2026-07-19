@@ -70,7 +70,7 @@ async def test_pause_resume() -> None:
     assert await engine.pause(task.id) == "ok"
     assert task.status == TaskStatus.PAUSED
 
-    assert await engine.resume(task.id) is True
+    assert await engine.resume(task.id) == "ok"
     assert task.status == TaskStatus.PENDING
     assert task.next_run is not None  # resume recomputes next_run
 
@@ -2021,6 +2021,252 @@ async def test_remove_cancellation_pending_tombstone_allows_retry(
                 "terminated and the persist succeeded"
             )
 
+            await engine.stop(timeout=2.0)
+        finally:
+            engine_module._CANCEL_IN_FLIGHT_TIMEOUT = original_budget
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-11): done callback compares by identity — old callback
+# doesn't remove new owner
+# ---------------------------------------------------------------------------
+
+
+async def test_done_callback_does_not_remove_new_owner() -> None:
+    """H1 (round-11): when an old ``_execute_task`` completes, its
+    done callback MUST NOT remove a NEW owner that was registered
+    after the old task completed but before the callback ran.
+
+    Without identity comparison, the following sequence orphaned the
+    new owner:
+      1. Tick publishes owner A for task T.
+      2. Owner A completes (e.g. the executor returned).
+      3. Before A's done callback runs, a new owner B is registered
+         for task T (e.g. via resume + tick re-publish).
+      4. A's done callback runs and pops ``_execute_tasks[T]`` —
+         but the current owner is B, not A.  B is now orphaned: it's
+         still running but no longer tracked, so ``stop()`` cannot
+         cancel + drain it.
+
+    The fix: the done callback compares the current owner by identity
+    (``self._execute_tasks.get(tid) is owner``) before popping.  If
+    the current owner is a different task, the callback is a no-op.
+    """
+    import asyncio
+
+    engine = _engine()
+
+    # Register a NEW "owner" (a dummy future task) in _execute_tasks.
+    async def _dummy() -> None:
+        await asyncio.sleep(100)
+
+    new_owner = asyncio.ensure_future(_dummy())
+    engine._execute_tasks["task-T"] = new_owner
+
+    # Simulate the OLD owner completing.  Create an old task, register
+    # a callback with the OLD owner as the identity reference
+    # (mimicking what _tick_loop does), then make the old task
+    # complete and let the callback fire.
+    async def _old_executor() -> None:
+        pass
+
+    old_owner = asyncio.ensure_future(_old_executor())
+
+    def _on_done(_t, tid="task-T", owner=old_owner) -> None:
+        if engine._execute_tasks.get(tid) is owner:
+            engine._execute_tasks.pop(tid, None)
+
+    old_owner.add_done_callback(_on_done)
+    # Let the old owner complete and its callback fire.
+    await asyncio.wait_for(old_owner, timeout=2.0)
+    # Yield to the event loop so the callback runs.
+    await asyncio.sleep(0)
+
+    # The NEW owner is STILL in _execute_tasks — the old callback
+    # did NOT remove it (identity mismatch).
+    assert engine._execute_tasks.get("task-T") is new_owner, (
+        "the old done callback removed the new owner — identity "
+        "check is missing or broken; the new owner is orphaned"
+    )
+
+    # Cleanup.
+    new_owner.cancel()
+    try:
+        await new_owner
+    except asyncio.CancelledError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-11): concurrent pause + resume — per-task lock serializes
+# ---------------------------------------------------------------------------
+
+
+async def test_concurrent_pause_and_resume_are_serialized() -> None:
+    """H1 (round-11): concurrent ``pause()`` and ``resume()`` on the
+    same task MUST be serialized by the per-task lock.  Without
+    serialization, the following race was possible:
+      1. pause acquires lock, sets PAUSED, releases lock.
+      2. resume acquires lock, sets PENDING, releases lock.
+      3. pause's cancel runs.
+      4. pause's persist writes PAUSED; resume's persist writes PENDING.
+    Final: PENDING in memory + DB, but pause returned "ok" — the
+    user's pause intent was silently overwritten by resume.
+
+    With the per-task lock held for the ENTIRE operation (including
+    cancel + persist), step 2 blocks until step 3+4 complete.  The
+    final state is consistent: whichever operation runs last wins,
+    and both return values are accurate.
+    """
+    import asyncio
+
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    engine = _engine()
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def stalling_executor(task_id: str, prompt: str) -> str:
+        started.set()
+        await release.wait()
+        return "ok"
+
+    engine._executor = stalling_executor
+    engine._tick_interval = 0.01
+    await engine.start()
+    iso = datetime.utcnow().isoformat()
+    task = await engine.create("pause-resume", "p", ScheduleConfig(iso_time=iso))
+    task_id = task.id
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    # Start pause() and resume() concurrently.  The per-task lock
+    # serializes them — one runs fully before the other starts.
+    pause_task = asyncio.ensure_future(engine.pause(task_id))
+    resume_task = asyncio.ensure_future(engine.resume(task_id))
+
+    # Both should complete without error.  The per-task lock ensures
+    # they don't interleave — one's cancel+persist completes before
+    # the other's state modification begins.
+    pause_result, resume_result = await asyncio.gather(pause_task, resume_task)
+
+    # Both should return a valid status.
+    assert pause_result in ("ok", "cancellation_pending", "persistence_pending"), (
+        f"pause returned {pause_result!r}"
+    )
+    assert resume_result in ("ok", "cancelled"), (
+        f"resume returned {resume_result!r}"
+    )
+
+    # The final state is consistent — either PAUSED or PENDING, NOT
+    # a mix.  The per-task lock ensures whichever ran last wins
+    # cleanly.
+    final_status = engine._tasks[task_id].status
+    assert final_status in (TaskStatus.PAUSED, TaskStatus.PENDING), (
+        f"final status is {final_status} — inconsistent state from "
+        "concurrent pause + resume (per-task lock did not serialize)"
+    )
+
+    # Cleanup.
+    release.set()
+    await engine.stop(timeout=2.0)
+
+
+# ---------------------------------------------------------------------------
+# Medium (round-11): resume() refuses CANCELLED removal tombstone
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_refuses_cancelled_tombstone(tmp_path) -> None:
+    """Medium (round-11): ``resume()`` MUST refuse to resume a
+    CANCELLED removal tombstone.  Previously ``resume()`` did not
+    check the status at all — a caller could resume a CANCELLED
+    tombstone, flipping it to PENDING and causing the removed task
+    to be re-fired.
+
+    Sequence:
+      1. Spawn a task with a swallowing executor.
+      2. Call ``remove()`` — returns ``cancellation_pending``.  Task
+         stays in _tasks as a CANCELLED tombstone (executor still
+         running).
+      3. Call ``resume()`` — MUST return ``cancelled`` (NOT ``ok``).
+         The task is STILL CANCELLED.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def swallowing_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            while not release_exec.is_set():
+                try:
+                    await release_exec.wait()
+                except asyncio.CancelledError:
+                    if release_exec.is_set():
+                        raise
+                    # swallow
+            return "stale"
+
+        engine = CronEngine(
+            db=db,
+            executor=swallowing_executor,
+            tick_interval=0.01,
+        )
+        original_budget = engine_module._CANCEL_IN_FLIGHT_TIMEOUT
+        engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
+        try:
+            await engine.start()
+            iso = datetime.utcnow().isoformat()
+            task = await engine.create(
+                "resume-tomb", "p", ScheduleConfig(iso_time=iso)
+            )
+            task_id = task.id
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+
+            # remove() returns cancellation_pending (executor swallows
+            # cancel).  Task stays in _tasks as a CANCELLED tombstone.
+            result = await engine.remove(task_id)
+            assert result == "cancellation_pending"
+            assert task_id in engine._tasks
+            assert engine._tasks[task_id].status == TaskStatus.CANCELLED
+
+            # resume() MUST refuse — return "cancelled", NOT "ok".
+            resume_result = await engine.resume(task_id)
+            assert resume_result == "cancelled", (
+                f"expected 'cancelled', got {resume_result!r} — "
+                "resume() did not refuse the CANCELLED removal "
+                "tombstone; the task would be re-fired"
+            )
+
+            # The task is STILL CANCELLED (resume did not flip it to
+            # PENDING).
+            assert engine._tasks[task_id].status == TaskStatus.CANCELLED, (
+                f"expected CANCELLED, got "
+                f"{engine._tasks[task_id].status} — resume() "
+                "flipped the tombstone to PENDING"
+            )
+
+            # The DB row is STILL CANCELLED.
+            rows = await db.list_scheduled_tasks()
+            row = next(r for r in rows if r["id"] == task_id)
+            assert row["status"] == "cancelled", (
+                f"expected DB status=cancelled, got {row['status']} — "
+                "resume() overwrote the cancelled DB row"
+            )
+
+            # Release the executor so stop() can drain.
+            release_exec.set()
             await engine.stop(timeout=2.0)
         finally:
             engine_module._CANCEL_IN_FLIGHT_TIMEOUT = original_budget

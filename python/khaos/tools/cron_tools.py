@@ -151,11 +151,26 @@ async def cron_pause(task_id: str, **kwargs: Any) -> dict:
 
 
 async def cron_resume(task_id: str, **kwargs: Any) -> dict:
-    """Resume a paused scheduled task."""
+    """Resume a paused scheduled task.
+
+    Returns ``resumed`` on success, ``not_found`` if the task does
+    not exist, or ``cancelled`` if the task is a CANCELLED removal
+    tombstone (cannot resume a task pending removal).
+    """
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    ok = await _cron_engine.resume(task_id)
-    return {"status": "resumed" if ok else "not_found", "task_id": task_id}
+    result = await _cron_engine.resume(task_id)
+    if result == "ok":
+        return {"status": "resumed", "task_id": task_id}
+    if result == "not_found":
+        return {"status": "not_found", "task_id": task_id}
+    # result == "cancelled" — task is a removal tombstone
+    return {
+        "status": "cancelled",
+        "task_id": task_id,
+        "error": "task is a CANCELLED removal tombstone — cannot "
+                 "resume; retry remove() to complete the removal",
+    }
 
 
 def _parse_schedule(schedule: str) -> "ScheduleConfig":
