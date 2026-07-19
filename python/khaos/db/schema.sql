@@ -167,7 +167,8 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     next_run        TEXT,
     run_count       INTEGER NOT NULL DEFAULT 0,
     last_result     TEXT,
-    error           TEXT
+    error           TEXT,
+    lifecycle_version INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status ON scheduled_tasks(status, next_run);

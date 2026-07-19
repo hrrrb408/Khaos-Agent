@@ -472,11 +472,15 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
 
     Sequence:
       1. Spawn a Cron task whose executor stalls.
-      2. Patch ``update_scheduled_task`` to fail on the first call.
+      2. Patch ``update_scheduled_task_conditional`` to fail on the
+         first call (HIGH-3 batch 3.1.8: the executor's terminal
+         write now uses the conditional UPDATE, not the
+         unconditional ``update_scheduled_task``).
       3. Cancel the execute_task — its ``_persist_task_state`` fails,
          leaving the task_id in ``_pending_persistence``.
-      4. First ``stop()``: reconcile retries the persist — fails again
-         (still patched).  Raises ``ServiceShutdownError``.
+      4. Patch ``update_scheduled_task`` to fail so the first
+         ``stop()``'s reconcile retry (which uses the unconditional
+         path) also fails.  Raises ``ServiceShutdownError``.
       5. Restore ``update_scheduled_task`` to the real implementation.
       6. Second ``stop()``: reconcile retries — succeeds this time.
          DB row now carries the ``cancelled`` terminal state.
@@ -510,18 +514,18 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # Patch update to fail on the first call (the cancel path's
-        # _persist_task_state will hit this).
+        # HIGH-3 (batch 3.1.8): the executor's terminal write now uses
+        # ``update_scheduled_task_conditional`` (optimistic concurrency).
+        # Patch THAT method to fail so the cancel path's
+        # _persist_task_state raises and leaves task_id in
+        # _pending_persistence.
+        original_conditional = db.update_scheduled_task_conditional
         original_update = db.update_scheduled_task
-        call_count = {"n": 0}
 
-        async def failing_update(*args, **kwargs):
-            call_count["n"] += 1
-            if call_count["n"] == 1:
-                raise RuntimeError("DB is being torn down")
-            return await original_update(*args, **kwargs)
+        async def failing_conditional(*args, **kwargs):
+            raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = failing_update
+        db.update_scheduled_task_conditional = failing_conditional
 
         # Cancel the execute_task — its _persist_task_state fails,
         # leaving the task_id in _pending_persistence.
@@ -536,8 +540,12 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # Patch update to fail again so the first stop()'s reconcile
-        # also fails.
+        # Restore the conditional update (the reconcile path uses the
+        # unconditional ``update_scheduled_task`` so we don't need the
+        # conditional patch anymore).  Patch the unconditional update
+        # to fail so the first stop()'s reconcile also fails.
+        db.update_scheduled_task_conditional = original_conditional
+
         async def failing_update_2(*args, **kwargs):
             raise RuntimeError("DB still wedged")
 
@@ -677,14 +685,18 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
 
     Sequence:
       1. Spawn a Cron task whose executor stalls.
-      2. Patch ``update_scheduled_task`` to FAIL on the first call so
-         the cancel path's ``_persist_task_state`` raises (swallowed
-         by the CancelledError branch).  The task_id is now in
-         ``_pending_persistence``.
+      2. Patch ``update_scheduled_task_conditional`` to FAIL so the
+         cancel path's ``_persist_task_state`` raises (swallowed by
+         the CancelledError branch).  HIGH-3 (batch 3.1.8): the
+         executor's terminal write uses the conditional UPDATE, not
+         the unconditional ``update_scheduled_task``.  The task_id is
+         now in ``_pending_persistence``.
       3. Cancel the execute_task.  The cancel's persist fails →
          task_id stays in ``_pending_persistence``.
-      4. Patch ``update_scheduled_task`` to HANG (swallow cancel)
-         until ``release_db`` is set, then call the real update.
+      4. Restore the conditional update; patch
+         ``update_scheduled_task`` to HANG (swallow cancel) until
+         ``release_db`` is set, then call the real update.  The
+         reconcile path uses the unconditional update.
       5. First ``stop()``: reconcile owner is created and wedged;
          times out → raises ``ServiceShutdownError``.  Owner is
          retained in ``_persistence_owners``.
@@ -727,18 +739,17 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # Patch update to FAIL on the first call so the cancel path's
-        # _persist_task_state raises and leaves task_id in
-        # _pending_persistence.  Subsequent calls will be replaced by
-        # the swallowing_update below.
+        # HIGH-3 (batch 3.1.8): patch the CONDITIONAL update to FAIL
+        # so the cancel path's _persist_task_state raises and leaves
+        # task_id in _pending_persistence.  (The executor's terminal
+        # write now uses update_scheduled_task_conditional.)
+        original_conditional = db.update_scheduled_task_conditional
         original_update = db.update_scheduled_task
-        call_count = {"n": 0}
 
-        async def failing_first_update(*args, **kwargs):
-            call_count["n"] += 1
+        async def failing_conditional(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = failing_first_update
+        db.update_scheduled_task_conditional = failing_conditional
 
         # Cancel the execute_task — its _persist_task_state fails,
         # leaving the task_id in _pending_persistence.
@@ -752,9 +763,12 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # Now wedge update_scheduled_task so the reconcile hangs until
-        # release_db is set.  After release, it calls the real update
-        # so the retained owner can actually persist.
+        # Restore the conditional update; wedge the UNCONDITIONAL
+        # update (used by the reconcile path) so the reconcile hangs
+        # until release_db is set.  After release, it calls the real
+        # update so the retained owner can actually persist.
+        db.update_scheduled_task_conditional = original_conditional
+
         async def swallowing_update(*args, **kwargs):
             while not release_db.is_set():
                 try:
@@ -871,13 +885,16 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # Patch update to FAIL on the first call so the cancel path's
-        # _persist_task_state raises and leaves task_id in
-        # _pending_persistence.
-        async def failing_first_update(*args, **kwargs):
+        # HIGH-3 (batch 3.1.8): patch the CONDITIONAL update to FAIL
+        # so the cancel path's _persist_task_state raises and leaves
+        # task_id in _pending_persistence.  (The executor's terminal
+        # write now uses update_scheduled_task_conditional.)
+        original_conditional = db.update_scheduled_task_conditional
+
+        async def failing_conditional(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = failing_first_update
+        db.update_scheduled_task_conditional = failing_conditional
 
         # Cancel the execute_task — its _persist_task_state fails,
         # leaving the task_id in _pending_persistence.
@@ -891,9 +908,12 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # Wedge update_scheduled_task: swallows cancellation until
-        # release_db is set, then raises RuntimeError (simulating a
-        # wedged DB that surfaces a hard error once it resumes).
+        # Restore the conditional update; wedge the UNCONDITIONAL
+        # update (used by the reconcile path): swallows cancellation
+        # until release_db is set, then raises RuntimeError (simulating
+        # a wedged DB that surfaces a hard error once it resumes).
+        db.update_scheduled_task_conditional = original_conditional
+
         async def swallowing_then_failing_update(*args, **kwargs):
             while not release_db.is_set():
                 try:
@@ -3006,4 +3026,312 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
         await engine.stop(timeout=2.0)
     finally:
         release_exec.set()
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# HIGH-2 (batch 3.1.8): resume() persist-first
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
+    """HIGH-2 (batch 3.1.8): if the DB write fails during ``resume()``,
+    the in-memory task MUST stay ``PAUSED`` so tick continues to ignore
+    it (no external side effects).  The caller receives
+    ``persistence_pending`` and can retry.
+
+    Previously ``resume()`` set ``task.status = PENDING`` BEFORE the DB
+    write — so a DB failure left the task PENDING in memory but PAUSED
+    in the DB.  Tick fired, produced side effects, and the next
+    ``resume()`` returned ``invalid_state`` (because the in-memory
+    status was already PENDING).
+    """
+    import asyncio
+
+    from khaos.db import Database
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        engine = CronEngine(
+            db=db,
+            executor=_recording_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("resume-fail", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+
+        # Move the task into PAUSED via pause().
+        result = await engine.pause(task_id)
+        assert result == "ok"
+        assert engine._tasks[task_id].status == TaskStatus.PAUSED
+
+        # Patch update_scheduled_task to fail so resume's persist-first
+        # DB write raises.  (resume uses the unconditional
+        # update_scheduled_task with bump_version=True.)
+        original_update = db.update_scheduled_task
+
+        async def failing_update(*args, **kwargs):
+            raise RuntimeError("DB is being torn down")
+
+        db.update_scheduled_task = failing_update
+
+        # resume() — DB write fails.  In-memory task MUST stay PAUSED.
+        result = await engine.resume(task_id)
+        assert result == "persistence_pending", (
+            f"expected persistence_pending, got {result!r}"
+        )
+        assert engine._tasks[task_id].status == TaskStatus.PAUSED, (
+            f"expected PAUSED (DB failed, in-memory must not flip), "
+            f"got {engine._tasks[task_id].status}"
+        )
+
+        # Restore the DB.  Now resume() should succeed.
+        db.update_scheduled_task = original_update
+        result = await engine.resume(task_id)
+        assert result == "ok", (
+            f"expected ok (DB recovered), got {result!r}"
+        )
+        assert engine._tasks[task_id].status == TaskStatus.PENDING
+
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+
+async def test_resume_persist_first_does_not_fire_tick(tmp_path) -> None:
+    """HIGH-2 (batch 3.1.8): when ``resume()``'s DB write fails, tick
+    MUST NOT fire the task.  The task stays PAUSED in memory (which is
+    not in the "ready to fire" set), so even if the tick loop runs, it
+    skips the task.  This test verifies that no executor invocation
+    happens while the task is in the failed-resume state.
+    """
+    import asyncio
+
+    from khaos.db import Database
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        executor_calls = []
+
+        async def recording_executor(task_id: str, prompt: str) -> str:
+            executor_calls.append(task_id)
+            return f"executed:{prompt}"
+
+        engine = CronEngine(
+            db=db,
+            executor=recording_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        # Use an interval schedule so the task is recurring.
+        task = await engine.create(
+            "no-tick", "p", ScheduleConfig(interval_seconds=60),
+        )
+        task_id = task.id
+
+        # Pause the task.
+        result = await engine.pause(task_id)
+        assert result == "ok"
+
+        # Patch DB so resume's persist fails.
+        original_update = db.update_scheduled_task
+
+        async def failing_update(*args, **kwargs):
+            raise RuntimeError("DB is being torn down")
+
+        db.update_scheduled_task = failing_update
+
+        # resume() — fails.  Task stays PAUSED.
+        result = await engine.resume(task_id)
+        assert result == "persistence_pending"
+
+        # Let the tick loop run a few times.
+        await asyncio.sleep(0.1)
+
+        # The executor MUST NOT have been called for this task while
+        # it's in the failed-resume (PAUSED) state.
+        assert task_id not in executor_calls, (
+            f"tick fired the task during a failed resume — "
+            f"executor_calls={executor_calls}"
+        )
+
+        # Restore DB and resume successfully.
+        db.update_scheduled_task = original_update
+        result = await engine.resume(task_id)
+        assert result == "ok"
+
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# HIGH-3 (batch 3.1.8): lifecycle_version blocks stale executor writes
+# ---------------------------------------------------------------------------
+
+
+async def test_stale_executor_conditional_update_does_not_overwrite_paused(
+    tmp_path,
+) -> None:
+    """HIGH-3 (batch 3.1.8): an old executor's delayed DB write MUST NOT
+    overwrite a ``PAUSED`` state set by ``pause()``.  The executor's
+    terminal write uses ``update_scheduled_task_conditional`` with the
+    ``lifecycle_version`` captured at start; ``pause()`` bumps the
+    version, so the executor's conditional UPDATE matches 0 rows and
+    the stale write is discarded.
+
+    Sequence:
+      1. Start a task whose executor stalls (so we can race pause
+         against the in-flight execution).
+      2. ``pause()`` is called while the executor is running.  Pause
+         bumps the lifecycle_version and writes PAUSED.
+      3. The executor resumes and tries to write its terminal state
+         (PENDING / COMPLETED).  The conditional UPDATE must match 0
+         rows (version mismatch) and the DB row MUST stay PAUSED.
+    """
+    import asyncio
+
+    from khaos.db import Database
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release.wait()
+            return "stale-result"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        task = await engine.create(
+            "stale-write", "p", ScheduleConfig(interval_seconds=60),
+        )
+        task_id = task.id
+        # Force the task to be immediately eligible for tick (the
+        # interval schedule sets next_run = now + 60s, which would
+        # make the test wait 60s for the first fire).
+        engine._tasks[task_id].next_run = datetime.utcnow()
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Capture the lifecycle_version at executor start (for
+        # assertion later).
+        version_at_start = engine._tasks[task_id].lifecycle_version
+        assert version_at_start == 0
+
+        # Call pause() while the executor is stalling.  This bumps
+        # lifecycle_version (in-memory and DB) and sets the DB row to
+        # PAUSED.
+        result = await engine.pause(task_id)
+        # The executor is stalling and will be cancelled by pause();
+        # the cancel should succeed (stalling executor responds to
+        # CancelledError via release.wait()).
+        assert result in ("ok", "cancellation_pending"), (
+            f"unexpected pause result: {result!r}"
+        )
+
+        # The DB row MUST now be PAUSED with a bumped version.
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "paused", (
+            f"expected DB status=paused after pause(), got {row['status']}"
+        )
+        db_version_after_pause = row["lifecycle_version"]
+        assert db_version_after_pause > version_at_start, (
+            f"lifecycle_version not bumped: {db_version_after_pause} "
+            f"<= {version_at_start}"
+        )
+
+        # Now release the executor.  It will resume, return a result,
+        # and try to write its terminal state (PENDING) via the
+        # conditional UPDATE.  The conditional UPDATE MUST fail
+        # (version mismatch) — the DB row MUST stay PAUSED.
+        release.set()
+        # Give the executor time to finish and attempt its write.
+        await asyncio.sleep(0.2)
+
+        # The DB row MUST still be PAUSED (the executor's stale write
+        # was discarded by the conditional UPDATE).
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "paused", (
+            f"stale executor overwrote PAUSED: DB status={row['status']} "
+            f"(version={row['lifecycle_version']}) — the conditional "
+            "UPDATE did not block the stale write"
+        )
+
+        await engine.stop(timeout=2.0)
+    finally:
+        release.set()
+        await db.close()
+
+
+async def test_lifecycle_version_bumped_by_control_operations(tmp_path) -> None:
+    """HIGH-3 (batch 3.1.8): pause / remove / resume MUST bump the
+    ``lifecycle_version`` in the DB so that any in-flight executor's
+    conditional terminal write is discarded (matches 0 rows).
+    """
+    import asyncio
+
+    from khaos.db import Database
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        engine = CronEngine(
+            db=db,
+            executor=_recording_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        task = await engine.create(
+            "version-bump", "p", ScheduleConfig(interval_seconds=60),
+        )
+        task_id = task.id
+
+        # Initial version is 0.
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 0
+
+        # pause() bumps the version.
+        await engine.pause(task_id)
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 1, (
+            f"pause did not bump version: {row['lifecycle_version']}"
+        )
+
+        # resume() bumps the version again.
+        await engine.resume(task_id)
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 2, (
+            f"resume did not bump version: {row['lifecycle_version']}"
+        )
+
+        # remove() bumps the version again.
+        await engine.remove(task_id)
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["lifecycle_version"] == 3, (
+            f"remove did not bump version: {row['lifecycle_version']}"
+        )
+
+        await engine.stop(timeout=2.0)
+    finally:
         await db.close()

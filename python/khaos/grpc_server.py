@@ -1297,6 +1297,16 @@ async def _build_subagent_service(
         runner=runner.run,
         registry=create_runtime_registry(),
     )
+    # MEDIUM (batch 3.1.8): wire the orchestrator tool handlers
+    # (``spawn_subagent`` / ``collect_results`` / ``execute_plan`` /
+    # ``subagent_status``) with the real spawner + runner so they no
+    # longer return ``"Orchestrator not initialized"`` in production.
+    # The four handlers are registered in ``register_builtin_tools``
+    # with a placeholder handler; ``create_runtime_registry`` rebinds
+    # them to ``orchestrator_tools.{spawn_subagent,collect_results,...}``
+    # but those module-level globals stay ``None`` until this call.
+    from khaos.tools.orchestrator_tools import init_orchestrator
+    init_orchestrator(spawner, runner)
     return SubAgentService(spawner, runner)
 
 

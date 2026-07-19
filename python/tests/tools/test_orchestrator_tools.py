@@ -269,9 +269,9 @@ async def test_execute_plan_not_initialized(reset_globals):
 
 
 async def test_execute_plan_reports_failures(reset_globals):
-    """task_1 fails → task_2 (depends on task_1) is marked skipped by planner."""
+    """First task fails → second task (depends on first) is marked skipped by planner."""
     async def failing_then_skip(task):
-        if task.id == "task_1":
+        if task.goal == "a":
             task.status = "failed"
             task.error = "boom"
         # task_2 should be skipped by the planner BEFORE spawn is called,
@@ -288,7 +288,7 @@ async def test_execute_plan_reports_failures(reset_globals):
     result = await execute_plan(plan_json)
 
     assert result["ok"] is True
-    assert result["failed"] == 1  # only task_1 counts as failed
+    assert result["failed"] == 1  # only the first task counts as failed
     statuses = {r["status"] for r in result["results"]}
     assert "skipped" in statuses  # task_2 was skipped
     assert "failed" in statuses
@@ -339,3 +339,300 @@ def test_orchestrator_permission_levels():
     assert registry.get("collect_results").permission_level == "read"
     assert registry.get("execute_plan").permission_level == "write"
     assert registry.get("subagent_status").permission_level == "read"
+
+
+# ─────────── MEDIUM (batch 3.1.8): capability + principal wiring ──────────
+
+
+def test_orchestrator_tools_declare_subagent_spawn_capability():
+    """MEDIUM (batch 3.1.8): the four orchestrator tools MUST declare
+    the ``subagent.spawn`` capability so ``ToolInvocationBroker.invoke``
+    injects ``principal_id`` into the handler kwargs.  Without a
+    declared capability the broker treats them as no-capability tools
+    and the handlers receive ``principal_id=""`` even when the caller
+    is authenticated — the spawner returns an empty list for an empty
+    principal, so ``collect_results`` / ``subagent_status`` can never
+    observe tasks spawned via ``spawn_subagent``.
+    """
+    registry = create_runtime_registry()
+    for name in (
+        "spawn_subagent",
+        "collect_results",
+        "execute_plan",
+        "subagent_status",
+    ):
+        tool = registry.get(name)
+        cap_names = {c.name for c in tool.capabilities}
+        assert "subagent.spawn" in cap_names, (
+            f"{name} must declare subagent.spawn capability; got {cap_names}"
+        )
+
+
+async def test_broker_injects_principal_id_for_subagent_spawn(reset_globals):
+    """MEDIUM (batch 3.1.8): ``ToolInvocationBroker.invoke`` MUST
+    inject ``principal_id`` from the context dict when the tool
+    declares the ``subagent.spawn`` capability.  This is the glue
+    between the authenticated caller and the spawner's per-principal
+    filtering — without it, the handler always receives an empty
+    principal and can never observe its own tasks.
+    """
+    from khaos.tools.registry import ToolInvocationBroker
+
+    captured: dict = {}
+
+    async def fake_handler(*, principal_id: str = "", **_kwargs):
+        captured["principal_id"] = principal_id
+        return {"ok": True, "principal_id": principal_id}
+
+    registry = create_runtime_registry()
+    # Replace the spawn_subagent handler with a spy that records the
+    # injected principal_id.  The tool definition (with its
+    # ``subagent.spawn`` capability) is unchanged.
+    registry.get("spawn_subagent").handler = fake_handler
+
+    broker = ToolInvocationBroker(registry)
+    result = await broker.invoke(
+        "spawn_subagent",
+        mode="office",
+        context={"principal_id": "user1"},
+        goal="x",
+    )
+
+    assert captured["principal_id"] == "user1", (
+        f"broker did not inject principal_id; got {captured}"
+    )
+    assert result["principal_id"] == "user1"
+
+
+async def test_orchestrator_tools_principal_isolation_integration(tmp_path):
+    """MEDIUM (batch 3.1.8) acceptance #5: end-to-end integration test
+    using a REAL SubAgentSpawner + SQLite.  ``spawn_subagent`` stamps
+    the caller's principal on the task; ``collect_results`` /
+    ``subagent_status`` filter on it.  A different principal sees
+    nothing (defense-in-depth against cross-principal leakage).
+    """
+    from khaos.db import Database
+    from khaos.subagents.spawner import SubAgentConfig, SubAgentSpawner
+    from khaos.tools.registry import ToolInvocationBroker
+
+    async def quick_runner(task):
+        return f"done:{task.goal}"
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    spawner = SubAgentSpawner(
+        SubAgentConfig(max_concurrent=3), db, runner=quick_runner,
+    )
+    init_orchestrator(spawner, MagicMock())
+    try:
+        registry = create_runtime_registry()
+        broker = ToolInvocationBroker(registry)
+
+        # Spawn as user1 via the broker — exercises the full
+        # capability-gated principal_id injection path.
+        ctx_user1 = {"principal_id": "user1"}
+        result = await broker.invoke(
+            "spawn_subagent",
+            mode="office",
+            context=ctx_user1,
+            goal="hello",
+        )
+        assert result["ok"] is True
+        assert result["principal_id"] == "user1"
+        task_id = result["task_id"]
+
+        # Wait for the spawned task to finish so collect/status see
+        # the terminal state.
+        await spawner.wait_all(principal_id="user1")
+
+        # Collect as user1 — should see the one completed task.
+        collect = await broker.invoke(
+            "collect_results",
+            mode="office",
+            context=ctx_user1,
+        )
+        assert collect["ok"] is True
+        assert collect["total"] == 1
+        assert collect["completed"] == 1
+        assert collect["results"][0]["task_id"] == task_id
+
+        # Status as user1 — should see the one completed task.
+        status = await broker.invoke(
+            "subagent_status",
+            mode="office",
+            context=ctx_user1,
+        )
+        assert status["ok"] is True
+        assert status["stats"]["total"] == 1
+        assert status["stats"]["completed"] == 1
+        assert status["stats"]["active"] == 0
+
+        # Status as user2 — should see ZERO tasks (per-principal
+        # isolation; the spawner returns empty for a different
+        # principal).
+        ctx_user2 = {"principal_id": "user2"}
+        status2 = await broker.invoke(
+            "subagent_status",
+            mode="office",
+            context=ctx_user2,
+        )
+        assert status2["ok"] is True
+        assert status2["stats"]["total"] == 0
+        assert status2["stats"]["completed"] == 0
+    finally:
+        orchestrator_tools._spawner = None
+        orchestrator_tools._runner = None
+        await db.close()
+
+
+async def test_spawn_subagent_returns_real_failure_when_spawner_rejects(
+    tmp_path, reset_globals,
+):
+    """MEDIUM (batch 3.1.8) acceptance #4: when the spawner rejects
+    spawn (here: shutdown already begun), the orchestrator tool MUST
+    return the real failure — NOT the legacy hard-coded
+    ``{"ok": True, "status": "running"}``.
+
+    Previously the handler ignored the spawner's result and always
+    returned ``status="running"``, hiding every rejection
+    (concurrency full / depth exceeded / shutting down) behind a
+    false success.
+    """
+    from khaos.db import Database
+    from khaos.subagents.spawner import SubAgentConfig, SubAgentSpawner
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    spawner = SubAgentSpawner(SubAgentConfig(max_concurrent=3), db)
+    init_orchestrator(spawner, MagicMock())
+    try:
+        # Trigger shutdown — every subsequent spawn is rejected with
+        # SubAgentLimitError("subagent spawner is shutting down").
+        await spawner.shutdown(timeout=1.0)
+
+        result = await spawn_subagent(goal="x", principal_id="user1")
+
+        # Real failure surfaced — NOT the hard-coded "running".
+        assert result["ok"] is False, (
+            f"expected ok=False (spawner is shutting down), got: {result}"
+        )
+        assert "shutting down" in result["error"], (
+            f"expected 'shutting down' in error, got: {result}"
+        )
+        # Defense-in-depth: status must never be the legacy "running".
+        assert result.get("status") != "running"
+    finally:
+        orchestrator_tools._spawner = None
+        orchestrator_tools._runner = None
+        await db.close()
+
+
+async def test_build_subagent_service_wires_init_orchestrator(tmp_path):
+    """MEDIUM (batch 3.1.8) acceptance #6: production startup MUST
+    call ``init_orchestrator`` so the four orchestrator tool handlers
+    no longer return ``"Orchestrator not initialized"``.
+
+    ``_build_subagent_service`` constructs the real ``SubAgentSpawner``
+    + ``SubAgentRunner`` but previously did NOT call
+    ``init_orchestrator`` — so the orchestrator tool module-level
+    globals (``_spawner`` / ``_runner``) stayed ``None`` and every
+    handler returned ``{"ok": False, "error": "Orchestrator not
+    initialized"}`` in production.  This test pins the wiring by
+    monkeypatching ``init_orchestrator`` and asserting the call.
+    """
+    import khaos.grpc_server as grpc_module
+    from khaos.db import Database
+    from khaos.tools import orchestrator_tools as orch_module
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "providers: {}\nmodels: {}\n", encoding="utf-8",
+    )
+
+    captured: list[tuple] = []
+
+    real_init = orch_module.init_orchestrator
+
+    def spy_init(spawner, runner):
+        captured.append((spawner, runner))
+        # Delegate to the real init so the rest of _build_subagent_service
+        # sees a consistent module state.
+        real_init(spawner, runner)
+
+    original_init = grpc_module.__dict__.get("init_orchestrator")
+    # _build_subagent_service imports init_orchestrator lazily from
+    # khaos.tools.orchestrator_tools, so patch it on the source module.
+    orch_module.init_orchestrator = spy_init
+    try:
+        await grpc_module._build_subagent_service(
+            db,
+            project_root=tmp_path,
+            config_path=tmp_path / "config.yaml",
+        )
+        assert captured, (
+            "_build_subagent_service did not call init_orchestrator; "
+            "the 4 orchestrator tools would return 'Orchestrator not "
+            "initialized' in production"
+        )
+        # The spawner passed to init_orchestrator is the real one
+        # constructed inside _build_subagent_service.
+        spawner_arg, runner_arg = captured[0]
+        from khaos.subagents.spawner import SubAgentSpawner
+        from khaos.subagents.runner import SubAgentRunner
+        assert isinstance(spawner_arg, SubAgentSpawner)
+        assert isinstance(runner_arg, SubAgentRunner)
+        # And the module globals are now wired.
+        assert orch_module._spawner is spawner_arg
+        assert orch_module._runner is runner_arg
+    finally:
+        orch_module.init_orchestrator = real_init
+        orch_module._spawner = None
+        orch_module._runner = None
+        await db.close()
+
+
+async def test_build_subagent_service_orchestrator_tools_not_initialized_after(
+    tmp_path,
+):
+    """MEDIUM (batch 3.1.8) acceptance #6 (behavioural mirror): after
+    ``_build_subagent_service`` runs, calling ``spawn_subagent``
+    directly MUST NOT return ``"Orchestrator not initialized"`` —
+    i.e. the production init wired the globals.
+    """
+    import khaos.grpc_server as grpc_module
+    from khaos.db import Database
+    from khaos.tools import orchestrator_tools as orch_module
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding", encoding="utf-8")
+    (tmp_path / "config.yaml").write_text(
+        "providers: {}\nmodels: {}\n", encoding="utf-8",
+    )
+    try:
+        await grpc_module._build_subagent_service(
+            db,
+            project_root=tmp_path,
+            config_path=tmp_path / "config.yaml",
+        )
+        # The handler should no longer short-circuit with "Orchestrator
+        # not initialized" — it should reach the spawner and either
+        # succeed or fail with a real spawner error.
+        result = await spawn_subagent(goal="x", principal_id="user1")
+        assert result.get("error") != "Orchestrator not initialized", (
+            f"orchestrator tools still not initialized in production: {result}"
+        )
+    finally:
+        orch_module._spawner = None
+        orch_module._runner = None
+        await db.close()

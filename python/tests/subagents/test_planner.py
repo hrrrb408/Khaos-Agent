@@ -31,6 +31,14 @@ def _plan_with(goals: list[str], deps: dict[str, list[str]] | None = None) -> st
     return json.dumps(payload)
 
 
+def _assert_valid_uuid_id(tid: str) -> None:
+    """Assert a task id is a fresh UUID (not a sequential task_N)."""
+    assert tid.startswith("task_"), f"id must start with 'task_': {tid!r}"
+    uuid_hex = tid[len("task_"):]
+    assert len(uuid_hex) == 32, f"id must be task_ + 32-char hex, got {tid!r}"
+    int(uuid_hex, 16)  # must be valid hex
+
+
 # ───────────────────────────── from_json ────────────────────────────────
 
 
@@ -49,7 +57,10 @@ def test_from_json_parses_tasks():
     assert plan is not None
     assert plan.description == "add tests"
     assert len(plan.tasks) == 2
-    assert [t.id for t in plan.tasks] == ["task_1", "task_2"]
+    # HIGH-1 (batch 3.1.8): ids are now fresh UUIDs, not task_N.
+    for t in plan.tasks:
+        _assert_valid_uuid_id(t.id)
+    assert len({t.id for t in plan.tasks}) == 2  # all unique
     assert plan.tasks[0].goal == "test a"
     assert plan.tasks[0].tools == ["read_file"]
     assert plan.tasks[0].context == "ctx a"
@@ -61,7 +72,10 @@ def test_from_json_auto_assigns_task_ids():
     plan_json = json.dumps({"tasks": [{"goal": "g1"}, {"goal": "g2"}]})
     plan = TaskPlanner.from_json(plan_json)
 
-    assert [t.id for t in plan.tasks] == ["task_1", "task_2"]
+    # HIGH-1 (batch 3.1.8): ids are now fresh UUIDs, not task_N.
+    for t in plan.tasks:
+        _assert_valid_uuid_id(t.id)
+    assert len({t.id for t in plan.tasks}) == 2
 
 
 def test_from_json_with_dependencies():
@@ -69,7 +83,9 @@ def test_from_json_with_dependencies():
     plan = TaskPlanner.from_json(plan_json)
 
     assert plan.has_dependencies is True
-    assert plan.dependencies == {"task_2": ["task_1"]}
+    # Dependencies are resolved to real UUIDs.
+    t1, t2 = plan.tasks[0].id, plan.tasks[1].id
+    assert plan.dependencies == {t2: [t1]}
 
 
 def test_from_json_dependencies_using_declared_ids():
@@ -85,9 +101,9 @@ def test_from_json_dependencies_using_declared_ids():
     )
     plan = TaskPlanner.from_json(plan_json)
 
-    # declared ids map to auto ids internally
-    assert "task_2" in plan.dependencies
-    assert plan.dependencies["task_2"] == ["task_1"]
+    # declared ids map to real UUIDs internally
+    t1, t2 = plan.tasks[0].id, plan.tasks[1].id
+    assert plan.dependencies == {t2: [t1]}
 
 
 def test_from_json_empty_tasks():
@@ -124,7 +140,8 @@ def test_from_json_ignores_dependency_on_unknown_id():
     )
     plan = TaskPlanner.from_json(plan_json)
     # external_done 不在 task_ids 中，应在依赖里被过滤掉
-    assert plan.dependencies == {"task_1": ["external_done"]}  # 原始映射保留（运行时处理）
+    t1 = plan.tasks[0].id
+    assert plan.dependencies == {t1: ["external_done"]}  # 原始映射保留（运行时处理）
     # 但 has_dependencies 仍为 True，因为 dependencies 非空
     assert plan.has_dependencies is True
 
@@ -139,7 +156,9 @@ def test_to_json_roundtrip():
 
     assert data["description"] == plan.description
     assert len(data["tasks"]) == 2
-    assert [t["id"] for t in data["tasks"]] == ["task_1", "task_2"]
+    # HIGH-1 (batch 3.1.8): ids are fresh UUIDs.
+    for t in data["tasks"]:
+        _assert_valid_uuid_id(t["id"])
     assert data["tasks"][0]["goal"] == "a"
     assert data["tasks"][0]["tools"] == ["read_file"]
 
@@ -149,9 +168,19 @@ def test_to_json_preserves_dependencies():
     plan = TaskPlanner.from_json(plan_json)
     roundtrip = TaskPlanner.from_json(TaskPlanner.to_json(plan))
 
-    assert roundtrip.dependencies == plan.dependencies
+    # HIGH-1 (batch 3.1.8): each from_json call generates fresh UUIDs,
+    # so the exact dependency keys/values differ across the roundtrip.
+    # What MUST be preserved is the STRUCTURE: same number of tasks,
+    # same goals, same dependency graph shape (one task depends on the
+    # other).
     assert roundtrip.has_dependencies is plan.has_dependencies
     assert [t.goal for t in roundtrip.tasks] == [t.goal for t in plan.tasks]
+    assert len(roundtrip.dependencies) == 1
+    # The single dependency entry maps the second task → the first task.
+    rt_key = next(iter(roundtrip.dependencies.keys()))
+    rt_val = next(iter(roundtrip.dependencies.values()))
+    assert rt_key == roundtrip.tasks[1].id
+    assert rt_val == [roundtrip.tasks[0].id]
 
 
 # ───────────────────────── create_simple_tasks ─────────────────────────
@@ -164,7 +193,10 @@ def test_create_simple_tasks_basic():
     assert plan.has_dependencies is False
     assert plan.dependencies == {}
     assert all(t.tools == ["read_file"] for t in plan.tasks)
-    assert [t.id for t in plan.tasks] == ["task_1", "task_2"]
+    # HIGH-1 (batch 3.1.8): ids are fresh UUIDs.
+    for t in plan.tasks:
+        _assert_valid_uuid_id(t.id)
+    assert len({t.id for t in plan.tasks}) == 2
     assert [t.goal for t in plan.tasks] == ["do a", "do b"]
 
 
@@ -217,9 +249,12 @@ async def test_execute_plan_with_deps_layered(tmp_path):
 
         assert len(results) == 3
         assert all(t.status == "completed" for t in results)
-        # task_1 必须先于 task_2 / task_3 完成
-        assert execution_order.index("task_1") < execution_order.index("task_2")
-        assert execution_order.index("task_1") < execution_order.index("task_3")
+        # task_1 (now a UUID) must complete before task_2 / task_3.
+        t1_id = plan.tasks[0].id
+        t2_id = plan.tasks[1].id
+        t3_id = plan.tasks[2].id
+        assert execution_order.index(t1_id) < execution_order.index(t2_id)
+        assert execution_order.index(t1_id) < execution_order.index(t3_id)
     finally:
         await db.close()
 
@@ -229,7 +264,7 @@ async def test_execute_plan_failure_skips_dependents(tmp_path):
     db = await _db(tmp_path)
     try:
         async def failing_first(task: SubAgentTask) -> str:
-            if task.id == "task_1":
+            if task.id == plan.tasks[0].id:
                 raise RuntimeError("upstream broken")
             return f"done:{task.id}"
 
@@ -239,10 +274,12 @@ async def test_execute_plan_failure_skips_dependents(tmp_path):
 
         results = {t.id: t for t in await TaskPlanner.execute_plan(plan, spawner)}
 
-        assert results["task_1"].status == "failed"
-        assert results["task_2"].status == "skipped"
-        assert results["task_2"].error is not None
-        assert "task_1" in results["task_2"].error
+        t1_id = plan.tasks[0].id
+        t2_id = plan.tasks[1].id
+        assert results[t1_id].status == "failed"
+        assert results[t2_id].status == "skipped"
+        assert results[t2_id].error is not None
+        assert t1_id in results[t2_id].error
     finally:
         await db.close()
 
@@ -279,7 +316,10 @@ async def test_execute_plan_chain_three_layers(tmp_path):
         results = await TaskPlanner.execute_plan(plan, spawner)
 
         assert [t.status for t in results] == ["completed"] * 3
-        assert order == ["task_1", "task_2", "task_3"]
+        t1_id = plan.tasks[0].id
+        t2_id = plan.tasks[1].id
+        t3_id = plan.tasks[2].id
+        assert order == [t1_id, t2_id, t3_id]
     finally:
         await db.close()
 
@@ -289,7 +329,7 @@ async def test_execute_plan_partial_failure_isolates_siblings(tmp_path):
     db = await _db(tmp_path)
     try:
         async def runner(task: SubAgentTask) -> str:
-            if task.id == "task_1":
+            if task.id == plan.tasks[0].id:
                 raise RuntimeError("nope")
             return f"done:{task.id}"
 
@@ -297,7 +337,9 @@ async def test_execute_plan_partial_failure_isolates_siblings(tmp_path):
         plan = TaskPlanner.create_simple_tasks(["a", "b"])  # 无依赖
 
         results = {t.id: t for t in await TaskPlanner.execute_plan(plan, spawner)}
-        assert results["task_1"].status == "failed"
-        assert results["task_2"].status == "completed"
+        t1_id = plan.tasks[0].id
+        t2_id = plan.tasks[1].id
+        assert results[t1_id].status == "failed"
+        assert results[t2_id].status == "completed"
     finally:
         await db.close()

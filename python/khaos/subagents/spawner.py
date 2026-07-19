@@ -144,9 +144,31 @@ class SubAgentSpawner:
         M3: 旧的 ``task_N`` 计数器在进程重启后会重置为 0，``ON CONFLICT(id)
         DO UPDATE`` 会覆盖旧任务记录（包括其他 principal 的历史）。  UUID4
         保证全局唯一性，跨重启不会冲突。
+
+        HIGH-1 (batch 3.1.8): the planner now generates fresh UUIDs for
+        every task (no more ``task_N``).  The spawner only generates a
+        UUID when the caller did not supply one, and REFUSES duplicate
+        IDs (see ``_reject_duplicate_id``) so that two concurrent plans
+        cannot collide on the same id.
         """
         if not task.id:
             task.id = f"task_{uuid.uuid4().hex}"
+
+    def _reject_duplicate_id(self, task_id: str) -> None:
+        """Refuse a task whose id already exists in ``_tasks``.
+
+        HIGH-1 (batch 3.1.8): defense-in-depth gate.  Even though the
+        planner now generates UUIDs, a caller that supplies its own
+        non-unique id would overwrite the existing ``_tasks`` /
+        ``_initializing_owners`` entries, re-opening the
+        ``max_concurrent`` bypass and the initializing-owner loss.
+        Raise ``SubAgentLimitError`` instead of silently overwriting.
+        """
+        if task_id in self._tasks:
+            raise SubAgentLimitError(
+                f"task id {task_id!r} already exists in the spawner; "
+                "duplicate ids are not allowed — use a fresh UUID"
+            )
 
     def _validate_tools(self, task: SubAgentTask) -> None:
         """校验 task.tools 中的工具是否已注册（需要传入 registry）。"""
@@ -216,6 +238,7 @@ class SubAgentSpawner:
             if self.active_count >= self.config.max_concurrent:
                 raise SubAgentLimitError(f"并发数已达上限 ({self.config.max_concurrent})")
             self._ensure_task_id(task)
+            self._reject_duplicate_id(task.id)
             self._validate_tools(task)
             # Reserve the task as ``initializing`` so shutdown's snapshot
             # cannot miss it while the DB work below is in flight.

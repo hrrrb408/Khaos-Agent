@@ -67,24 +67,34 @@ class TaskPlanner:
         plan_id = data.get("id") or f"plan-{uuid.uuid4().hex[:8]}"
         description = data.get("description", "")
 
-        # ── 构建 tasks，自动生成 task_N 形式的 id ──
+        # ── 构建 tasks ──
+        # HIGH-1 (batch 3.1.8): every task gets a fresh global UUID.
+        # Previously the planner generated ``task_1``, ``task_2`` etc.
+        # which collided across concurrent plans (two plans both
+        # containing ``task_1`` would overwrite each other in the
+        # spawner's ``_tasks`` registry and the DB).  The logical
+        # ``task_N`` / declared id is only used as a key in the
+        # ``declared_to_uuid`` mapping so ``dependencies`` entries
+        # (which may reference either form) can be resolved to the
+        # real UUID.
         task_specs = data.get("tasks", [])
         if not isinstance(task_specs, list):
             task_specs = []
         tasks: list[SubAgentTask] = []
-        # 记录 JSON 中声明的 id（如果有）→ 自动生成 id 的映射，
-        # 以便 dependencies 可以引用任一形式。
-        declared_to_auto: dict[str, str] = {}
+        # Maps both declared id and ``task_N`` to the real UUID, so
+        # dependencies can reference either form.
+        declared_to_uuid: dict[str, str] = {}
         auto_index = 0
         for spec in task_specs:
             if not isinstance(spec, dict):
                 continue
             auto_index += 1
-            auto_id = f"task_{auto_index}"
+            logical_id = f"task_{auto_index}"
+            real_id = f"task_{uuid.uuid4().hex}"
             declared_id = spec.get("id")
             if declared_id:
-                declared_to_auto[str(declared_id)] = auto_id
-            declared_to_auto[auto_id] = auto_id
+                declared_to_uuid[str(declared_id)] = real_id
+            declared_to_uuid[logical_id] = real_id
             goal = str(spec.get("goal", ""))
             tools = spec.get("tools", [])
             if not isinstance(tools, list):
@@ -92,7 +102,7 @@ class TaskPlanner:
             tools = [str(t) for t in tools]
             tasks.append(
                 SubAgentTask(
-                    id=auto_id,
+                    id=real_id,
                     goal=goal,
                     context=str(spec.get("context", "") or ""),
                     tools=tools,
@@ -107,11 +117,11 @@ class TaskPlanner:
         dependencies: dict[str, list[str]] = {}
         if isinstance(raw_deps, dict) and raw_deps:
             for key, deps in raw_deps.items():
-                resolved_key = declared_to_auto.get(str(key), str(key))
+                resolved_key = declared_to_uuid.get(str(key), str(key))
                 if not isinstance(deps, list):
                     deps = [deps] if deps is not None else []
                 resolved_deps = [
-                    declared_to_auto.get(str(d), str(d)) for d in deps if d is not None
+                    declared_to_uuid.get(str(d), str(d)) for d in deps if d is not None
                 ]
                 if resolved_deps:
                     dependencies[resolved_key] = resolved_deps
@@ -157,14 +167,14 @@ class TaskPlanner:
         tool_set = tools if tools is not None else []
         tasks = [
             SubAgentTask(
-                id=f"task_{index}",
+                id=f"task_{uuid.uuid4().hex}",
                 goal=goal,
                 context=context,
                 tools=list(tool_set),
                 timeout=timeout,
                 parent_session_id=parent_session_id,
             )
-            for index, goal in enumerate(goals, start=1)
+            for goal in goals
         ]
         return SubTaskPlan(
             id=f"plan-{uuid.uuid4().hex[:8]}",

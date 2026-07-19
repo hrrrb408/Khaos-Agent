@@ -5,6 +5,7 @@ Existing spawn/cancel/wait_all behaviour is covered by test_subagent_spawner.py.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import pytest
 
@@ -257,5 +258,112 @@ async def test_spawn_generates_task_id_when_empty(tmp_path):
         assert task.id != ""
         # UUID4 hex is 32 chars; ``task_`` prefix is 5 chars.
         assert len(task.id) == 5 + 32
+    finally:
+        await db.close()
+
+
+# ─────────────────── HIGH-1 (batch 3.1.8): duplicate id rejection ──────
+
+
+async def test_spawn_rejects_duplicate_id(tmp_path):
+    """HIGH-1 (batch 3.1.8): the spawner MUST refuse a task whose id
+    already exists in ``_tasks``.  Without this, a caller that supplies
+    its own non-unique id would overwrite the existing
+    ``_tasks`` / ``_initializing_owners`` entries, re-opening the
+    ``max_concurrent`` bypass and the initializing-owner loss.
+    """
+    db, spawner = await _spawner(tmp_path, max_concurrent=3)
+    try:
+        # First task with a fixed id — accepted.
+        task1 = SubAgentTask(
+            "task_fixed_duplicate", "g1", "ctx", [],
+            principal_id=_PRINCIPAL,
+        )
+        await spawner.spawn(task1)
+        await spawner.wait_all(principal_id=_PRINCIPAL)
+        assert task1.id == "task_fixed_duplicate"
+
+        # Second task with the SAME id — must raise SubAgentLimitError.
+        task2 = SubAgentTask(
+            "task_fixed_duplicate", "g2", "ctx", [],
+            principal_id=_PRINCIPAL,
+        )
+        with pytest.raises(SubAgentLimitError, match="already exists"):
+            await spawner.spawn(task2)
+
+        # The original task is still there (not overwritten).
+        assert "task_fixed_duplicate" in spawner._tasks
+        assert spawner._tasks["task_fixed_duplicate"] is task1
+    finally:
+        await db.close()
+
+
+async def test_two_concurrent_plans_with_same_logical_ids_get_distinct_uuids(
+    tmp_path,
+):
+    """HIGH-1 (batch 3.1.8): two concurrent plans that both declare
+    ``task_1`` / ``task_2`` must produce DISTINCT global UUIDs in the
+    spawner — otherwise the second reservation overwrites the first
+    ``_tasks`` / ``_initializing_owners`` entry, re-opening the
+    ``max_concurrent`` bypass and the initializing-owner loss.
+
+    The planner maps each logical id (``task_N`` or any declared id)
+    to a fresh ``task_{uuid.uuid4().hex}``; the spawner refuses
+    duplicates as defense in depth.  This test verifies the end-to-end
+    contract: two plans with identical logical ids can be spawned
+    concurrently without collision.
+    """
+    from khaos.subagents.planner import TaskPlanner
+
+    db, spawner = await _spawner(tmp_path, max_concurrent=10)
+    try:
+        # Two plans with identical logical ids.
+        plan_a = TaskPlanner.from_json(
+            json.dumps({
+                "description": "plan a",
+                "tasks": [
+                    {"goal": "a1", "tools": []},
+                    {"goal": "a2", "tools": []},
+                ],
+            })
+        )
+        plan_b = TaskPlanner.from_json(
+            json.dumps({
+                "description": "plan b",
+                "tasks": [
+                    {"goal": "b1", "tools": []},
+                    {"goal": "b2", "tools": []},
+                ],
+            })
+        )
+        # Both plans have logical ids task_1, task_2 — but the
+        # real_ids must be distinct UUIDs.
+        ids_a = {t.id for t in plan_a.tasks}
+        ids_b = {t.id for t in plan_b.tasks}
+        # Within each plan, ids are unique.
+        assert len(ids_a) == 2
+        assert len(ids_b) == 2
+        # Across plans, ids are disjoint (no collision).
+        assert ids_a.isdisjoint(ids_b), (
+            f"plans share task ids: {ids_a & ids_b}"
+        )
+        # All ids are fresh UUIDs (not bare task_1 / task_2).
+        for tid in ids_a | ids_b:
+            assert tid.startswith("task_")
+            uuid_hex = tid[len("task_"):]
+            assert len(uuid_hex) == 32
+            int(uuid_hex, 16)
+
+        # Spawn all tasks from both plans concurrently.  No
+        # SubAgentLimitError should be raised (all ids are distinct).
+        for task in list(plan_a.tasks) + list(plan_b.tasks):
+            task.principal_id = _PRINCIPAL
+            await spawner.spawn(task)
+        await spawner.wait_all(principal_id=_PRINCIPAL)
+
+        # All four tasks are tracked in the spawner with distinct ids.
+        assert len(spawner._tasks) == 4
+        all_ids = {t.id for t in spawner._tasks.values()}
+        assert all_ids == ids_a | ids_b
     finally:
         await db.close()
