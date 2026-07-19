@@ -443,7 +443,11 @@ class CronEngine:
         Returns one of:
           - ``"ok"``: task was paused — executor terminated (or was
             not running) AND the ``paused`` state was durably
-            persisted (or there is no DB).
+            persisted (or there is no DB, or the persist was already
+            complete from a prior successful pause).  For an
+            already-PAUSED task, this is only returned after
+            re-checking the executor and the persistence state (see
+            H1 round-13).
           - ``"not_found"``: task_id is not registered.
           - ``"invalid_state"``: the task is in a state that cannot
             be paused (``CANCELLED`` removal tombstone, or a terminal
@@ -455,20 +459,36 @@ class CronEngine:
             possible), but the old executor may still be producing
             external side effects.  The caller MUST NOT claim the task
             is paused — the executor is still live.  Retry ``pause()``
-            to confirm.
+            to confirm.  This is returned BOTH on the first pause
+            attempt (when the executor swallows cancel) AND on
+            subsequent retries while the executor is still alive.
           - ``"persistence_pending"``: the executor terminated but the
             DB write failed.  The in-memory status is ``PAUSED`` and
             ``stop()`` will retry the persist.  The caller MUST NOT
             claim the task is durably paused — the state may not
-            survive a restart.
+            survive a restart.  This is returned BOTH on the first
+            pause attempt AND on subsequent retries while the DB is
+            still failing.
 
         H1 (round-12): strict state transition matrix.  ``pause`` is
-        only allowed from ``PENDING`` or ``RUNNING`` (or idempotent on
+        only allowed from ``PENDING`` or ``RUNNING`` (or retry on
         ``PAUSED``).  Refuses ``CANCELLED`` (removal tombstone) and
         terminal states ``COMPLETED`` / ``FAILED`` — without this, a
         caller could pause a ``CANCELLED`` tombstone and then resume
         it, resurrecting a removed task.  ``COMPLETED`` / ``FAILED``
         are terminal execution states and should not be re-paused.
+
+        H1 (round-13): PAUSED is NOT an unconditional ok.  A prior
+        pause may have returned ``cancellation_pending`` (executor
+        still running) or ``persistence_pending`` (DB write failed).
+        When retrying pause on an already-PAUSED task, this method
+        re-checks the live executor and retries the persist if
+        ``task_id`` is in ``_pending_persistence``.  Only when the
+        executor has terminated AND the persist is durable (or not
+        needed) does it return ``ok``.  Without this, the second
+        pause would report ``paused`` even though the executor was
+        still producing side effects or the DB row was still
+        running/pending.
 
         H1 (round-11): the per-task lock is held for the ENTIRE
         operation — including cancel + persist.
@@ -477,18 +497,51 @@ class CronEngine:
             task = self._tasks.get(task_id)
             if not task:
                 return "not_found"
-            # H1 (round-12): strict state transition matrix.
-            # Idempotent on PAUSED — return ok without re-persisting
-            # (the state is already PAUSED).
-            if task.status == TaskStatus.PAUSED:
-                return "ok"
-            # Refuse terminal / removal states.
+            # H1 (round-12): refuse terminal / removal states.
             if task.status in (
                 TaskStatus.CANCELLED,
                 TaskStatus.COMPLETED,
                 TaskStatus.FAILED,
             ):
                 return "invalid_state"
+            # H1 (round-13): PAUSED is NOT an unconditional ok.  A
+            # prior pause may have returned ``cancellation_pending``
+            # (executor swallowed cancel and is still running) or
+            # ``persistence_pending`` (DB write failed).  The caller
+            # is expected to retry pause() to confirm the executor
+            # has terminated and the state is durable.  Without this
+            # re-check, the second pause would return ok and the
+            # public API would report ``paused`` even though:
+            #   - the executor is still producing side effects, OR
+            #   - the DB row is still running/pending (crash → re-fire).
+            if task.status == TaskStatus.PAUSED:
+                # Re-check the live executor.  If still alive, try
+                # to cancel it again (bounded by the cancel budget)
+                # — the caller is explicitly retrying.
+                cancel_ok = await self._cancel_in_flight_execution(task_id)
+                # Re-check / retry persistence.  If task_id is in
+                # _pending_persistence, the prior persist failed and
+                # we MUST retry.  If not in _pending_persistence,
+                # the prior persist succeeded — no-op.
+                persist_ok = True
+                if self.db and task_id in self._pending_persistence:
+                    try:
+                        await self._persist_task_state(task)
+                    except Exception:  # noqa: BLE001 — stop() will retry
+                        persist_ok = False
+                        logger.error(
+                            "cron task %s: could not persist paused "
+                            "state on retry; will retry on stop()",
+                            task.name, exc_info=True,
+                        )
+                # Prefer cancellation_pending (the live executor is
+                # the more dangerous failure — it's still producing
+                # side effects right now).
+                if not cancel_ok:
+                    return "cancellation_pending"
+                if not persist_ok:
+                    return "persistence_pending"
+                return "ok"
             # Allowed: PENDING or RUNNING.
             # H1 (round-9): bump epoch BEFORE cancelling so the old
             # executor cannot overwrite the PAUSED state we're about

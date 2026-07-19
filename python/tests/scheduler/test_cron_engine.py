@@ -2750,3 +2750,260 @@ async def test_remove_refuses_terminal_states() -> None:
         f"expected FAILED, got {engine._tasks[task_id].status} — "
         "remove() flipped a terminal state despite returning invalid_state"
     )
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-13): pause(PAUSED) re-checks live executor + retries persist
+# ---------------------------------------------------------------------------
+
+
+async def test_pause_retry_with_live_executor_returns_cancellation_pending(
+    tmp_path,
+) -> None:
+    """H1 (round-13): when ``pause()`` is called on an already-PAUSED
+    task whose old executor is still alive (because a prior pause
+    returned ``cancellation_pending``), the retry MUST also return
+    ``cancellation_pending`` (NOT ``ok``) — the executor is still
+    producing side effects.  Only after the executor terminates does
+    the retry return ``ok``.
+
+    Without this re-check, the second pause would unconditionally
+    return ``ok`` and the public API would report ``paused`` even
+    though the executor was still running — silently violating the
+    user-visible contract.
+
+    Sequence:
+      1. Spawn a task with a swallowing executor.
+      2. First ``pause()`` → ``cancellation_pending`` (executor
+         swallowed cancel).  Task is PAUSED in memory + DB, but the
+         executor is still in ``_execute_tasks``.
+      3. Second ``pause()`` while the executor is still alive → MUST
+         return ``cancellation_pending`` (NOT ``ok``).
+      4. Release the executor so it terminates.
+      5. Third ``pause()`` → ``ok`` (executor is gone, persist
+         already done).
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def swallowing_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            while not release_exec.is_set():
+                try:
+                    await release_exec.wait()
+                except asyncio.CancelledError:
+                    if release_exec.is_set():
+                        raise
+                    # swallow
+            return "stale"
+
+        engine = CronEngine(
+            db=db,
+            executor=swallowing_executor,
+            tick_interval=0.01,
+        )
+        original_budget = engine_module._CANCEL_IN_FLIGHT_TIMEOUT
+        engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
+        try:
+            await engine.start()
+            iso = datetime.utcnow().isoformat()
+            task = await engine.create(
+                "pause-retry-live", "p", ScheduleConfig(iso_time=iso)
+            )
+            task_id = task.id
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+
+            # First pause() — executor swallows cancel → returns
+            # cancellation_pending.  Task is PAUSED in memory + DB,
+            # but the executor is still in _execute_tasks.
+            result1 = await engine.pause(task_id)
+            assert result1 == "cancellation_pending", (
+                f"first pause: expected cancellation_pending, got "
+                f"{result1!r}"
+            )
+            assert engine._tasks[task_id].status == TaskStatus.PAUSED
+            assert task_id in engine._execute_tasks
+            assert not engine._execute_tasks[task_id].done()
+
+            # Second pause() while the executor is still alive —
+            # MUST return cancellation_pending (NOT ok).
+            result2 = await engine.pause(task_id)
+            assert result2 == "cancellation_pending", (
+                f"second pause: expected cancellation_pending, got "
+                f"{result2!r} — pause(PAUSED) returned ok despite the "
+                "executor still being alive; the public API would "
+                "report 'paused' even though the executor is still "
+                "producing side effects"
+            )
+            # The executor is still alive.
+            assert task_id in engine._execute_tasks
+            assert not engine._execute_tasks[task_id].done()
+
+            # Release the executor so it terminates.
+            release_exec.set()
+            await asyncio.wait_for(
+                engine._execute_tasks[task_id], timeout=2.0
+            )
+            # The done callback should have removed it from
+            # _execute_tasks.
+            assert task_id not in engine._execute_tasks, (
+                "the done callback did not remove the terminated "
+                "executor from _execute_tasks"
+            )
+
+            # Third pause() — executor is gone, persist already done
+            # (from the first pause).  Returns ok.
+            result3 = await engine.pause(task_id)
+            assert result3 == "ok", (
+                f"third pause: expected ok (executor gone, persist "
+                f"done), got {result3!r}"
+            )
+
+            # The task is still PAUSED.
+            assert engine._tasks[task_id].status == TaskStatus.PAUSED
+            # No pending persistence.
+            assert task_id not in engine._pending_persistence, (
+                "task_id is still in _pending_persistence despite "
+                "the persist having succeeded on the first pause"
+            )
+
+            await engine.stop(timeout=2.0)
+        finally:
+            engine_module._CANCEL_IN_FLIGHT_TIMEOUT = original_budget
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+async def test_pause_retry_with_db_failure_returns_persistence_pending(
+    tmp_path,
+) -> None:
+    """H1 (round-13): when ``pause()`` is called on an already-PAUSED
+    task whose prior persist failed (prior pause returned
+    ``persistence_pending``), the retry MUST also return
+    ``persistence_pending`` (NOT ``ok``) while the DB is still
+    failing.  Only after the DB recovers and the persist succeeds does
+    the retry return ``ok`` and clear ``_pending_persistence``.
+
+    Without this re-check, the second pause would unconditionally
+    return ``ok`` and the public API would report ``paused`` even
+    though the DB row was still ``running`` / ``pending`` — if the
+    process crashed before ``stop()`` retried, the task would be
+    re-fired on restart.
+
+    Sequence:
+      1. Spawn a task with a stalling executor (clean cancel).
+      2. Patch ``update_scheduled_task`` to FAIL.
+      3. First ``pause()`` → ``persistence_pending`` (executor
+         terminated, DB write failed).  ``task_id`` is in
+         ``_pending_persistence``.
+      4. Second ``pause()`` while the DB is still failing → MUST
+         return ``persistence_pending`` (NOT ``ok``).
+      5. Restore ``update_scheduled_task``.
+      6. Third ``pause()`` → ``ok`` (persist succeeds,
+         ``_pending_persistence`` cleared).
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release_exec.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create(
+            "pause-retry-persist", "p", ScheduleConfig(iso_time=iso)
+        )
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Patch update_scheduled_task to FAIL so pause()'s persist
+        # raises.
+        original_update = db.update_scheduled_task
+
+        async def failing_update(*args, **kwargs):
+            raise RuntimeError("DB is being torn down")
+
+        db.update_scheduled_task = failing_update
+
+        # First pause() — executor cancels cleanly, but DB write
+        # fails → persistence_pending.
+        result1 = await engine.pause(task_id)
+        assert result1 == "persistence_pending", (
+            f"first pause: expected persistence_pending, got "
+            f"{result1!r}"
+        )
+        assert engine._tasks[task_id].status == TaskStatus.PAUSED
+        assert task_id in engine._pending_persistence, (
+            "task_id is NOT in _pending_persistence after the first "
+            "pause failed to persist"
+        )
+
+        # Second pause() while the DB is still failing — MUST return
+        # persistence_pending (NOT ok).
+        result2 = await engine.pause(task_id)
+        assert result2 == "persistence_pending", (
+            f"second pause: expected persistence_pending, got "
+            f"{result2!r} — pause(PAUSED) returned ok despite the DB "
+            "still failing; the public API would report 'paused' "
+            "even though the DB row is still running/pending"
+        )
+        # task_id is still in _pending_persistence.
+        assert task_id in engine._pending_persistence, (
+            "task_id was removed from _pending_persistence despite "
+            "the persist still failing"
+        )
+
+        # Restore update_scheduled_task so the retry can succeed.
+        db.update_scheduled_task = original_update
+
+        # Third pause() — DB recovered, persist succeeds → ok.
+        result3 = await engine.pause(task_id)
+        assert result3 == "ok", (
+            f"third pause: expected ok (DB recovered, persist "
+            f"succeeded), got {result3!r}"
+        )
+        # _pending_persistence is cleared.
+        assert task_id not in engine._pending_persistence, (
+            "task_id is still in _pending_persistence despite the "
+            "retry persist having succeeded"
+        )
+        # The DB row is now PAUSED.
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "paused", (
+            f"expected DB status=paused, got {row['status']} — "
+            "the retry persist did not write PAUSED to the DB"
+        )
+
+        release_exec.set()
+        await engine.stop(timeout=2.0)
+    finally:
+        release_exec.set()
+        await db.close()
