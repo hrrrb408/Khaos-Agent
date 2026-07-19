@@ -81,10 +81,11 @@ async def cron_remove(task_id: str, **kwargs: Any) -> dict:
     """Remove a scheduled task.
 
     Returns ``removed`` on success, ``not_found`` if the task does not
-    exist, or ``cancellation_pending`` if the in-flight executor did
-    not terminate within the cancel budget — in the last case the
-    task's desired state is ``cancelled`` but the old executor may
-    still be producing side effects; the caller should retry.
+    exist, ``cancellation_pending`` if the in-flight executor did not
+    terminate within the cancel budget (retry ``remove`` to confirm),
+    or ``persistence_pending`` if the executor terminated but the DB
+    write failed (``stop()`` will retry — the state may not be durable
+    yet).
     """
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
@@ -93,8 +94,17 @@ async def cron_remove(task_id: str, **kwargs: Any) -> dict:
         return {"status": "removed", "task_id": task_id}
     if result == "not_found":
         return {"status": "not_found", "task_id": task_id}
+    if result == "persistence_pending":
+        return {
+            "status": "persistence_pending",
+            "task_id": task_id,
+            "error": "executor terminated but the DB write failed; "
+                     "stop() will retry — the cancelled state may not "
+                     "survive a restart",
+        }
     # cancellation_pending — executor did not terminate; task is still
-    # in _tasks with CANCELLED status, caller can retry.
+    # in _tasks with CANCELLED status (tombstone retained), caller
+    # can retry remove() to confirm.
     return {
         "status": "cancellation_pending",
         "task_id": task_id,
@@ -108,10 +118,11 @@ async def cron_pause(task_id: str, **kwargs: Any) -> dict:
     """Pause a scheduled task.
 
     Returns ``paused`` on success, ``not_found`` if the task does not
-    exist, or ``cancellation_pending`` if the in-flight executor did
-    not terminate within the cancel budget — in the last case the
-    task's desired state is ``paused`` but the old executor may still
-    be producing side effects; the caller should retry.
+    exist, ``cancellation_pending`` if the in-flight executor did not
+    terminate within the cancel budget (retry ``pause`` to confirm),
+    or ``persistence_pending`` if the executor terminated but the DB
+    write failed (``stop()`` will retry — the state may not be durable
+    yet).
     """
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
@@ -120,8 +131,16 @@ async def cron_pause(task_id: str, **kwargs: Any) -> dict:
         return {"status": "paused", "task_id": task_id}
     if result == "not_found":
         return {"status": "not_found", "task_id": task_id}
+    if result == "persistence_pending":
+        return {
+            "status": "persistence_pending",
+            "task_id": task_id,
+            "error": "executor terminated but the DB write failed; "
+                     "stop() will retry — the paused state may not "
+                     "survive a restart",
+        }
     # cancellation_pending — executor did not terminate; task is
-    # paused in memory + DB but old executor may still be running.
+    # paused in memory but old executor may still be running.
     return {
         "status": "cancellation_pending",
         "task_id": task_id,

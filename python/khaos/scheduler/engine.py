@@ -107,6 +107,19 @@ class CronEngine:
         # silently violating the user-visible contract ("I paused /
         # removed this task").
         self._execution_epoch: dict[str, int] = {}
+        # H1 (round-10): lifecycle lock.  Serializes the "re-check +
+        # publish" sequence in ``_tick_loop`` against the "modify
+        # state + bump epoch + snapshot owner" sequence in
+        # ``pause`` / ``remove`` / ``resume``.  Without this lock,
+        # tick could snapshot a task as PENDING, then pause/remove
+        # could flip it to PAUSED/CANCELLED, then tick would publish a
+        # new ``_execute_task`` for the now-paused/removed task.  The
+        # new executor captures the POST-pause epoch (so the epoch
+        # fence does NOT trigger) and overwrites the PAUSED/CANCELLED
+        # state with PENDING/COMPLETED.
+        # The lock is held only for in-memory state changes — NO I/O
+        # (executor await, DB write) is performed while holding it.
+        self._lifecycle_lock: asyncio.Lock = asyncio.Lock()
 
     async def start(self) -> None:
         """启动调度循环。"""
@@ -415,15 +428,29 @@ class CronEngine:
         """Pause a task.
 
         Returns one of:
-          - ``"ok"``: task was paused (executor was not running, or
-            cancel terminated it within the budget).
+          - ``"ok"``: task was paused — executor terminated (or was
+            not running) AND the ``paused`` state was durably
+            persisted (or there is no DB).
           - ``"not_found"``: task_id is not registered.
           - ``"cancellation_pending"``: the in-flight executor did NOT
             terminate within the cancel budget.  The task's desired
-            state is still set to ``PAUSED`` (and persisted), but the
-            old executor may still be producing external side effects.
-            The caller MUST NOT claim the task is paused — the
-            executor is still live.
+            state is still set to ``PAUSED`` (and persisted if
+            possible), but the old executor may still be producing
+            external side effects.  The caller MUST NOT claim the task
+            is paused — the executor is still live.  Retry ``pause()``
+            to confirm.
+          - ``"persistence_pending"``: the executor terminated but the
+            DB write failed.  The in-memory status is ``PAUSED`` and
+            ``stop()`` will retry the persist.  The caller MUST NOT
+            claim the task is durably paused — the state may not
+            survive a restart.
+
+        H1 (round-10): the lifecycle lock serializes "modify state +
+        bump epoch + snapshot owner" against tick's "re-check +
+        publish".  Without this, tick could publish a new executor
+        for the task AFTER pause set PAUSED — the new executor
+        captures the post-pause epoch (fence doesn't trigger) and
+        overwrites PAUSED with PENDING/COMPLETED.
 
         H1 (round-9): the epoch is bumped BEFORE cancelling.  This
         prevents the old executor (if it ignores cancel) from
@@ -431,45 +458,67 @@ class CronEngine:
         — the epoch fence in ``_execute_task`` discards the stale
         write.
 
-        M1 (round-8): cancel + await the in-flight executor before
-        flipping the status, so the executor cannot overwrite the
-        ``paused`` DB row with ``completed`` / ``pending``.
+        H2 (round-10): the return value now reflects the persist
+        result.  Previously ``pause()`` returned ``ok`` even when the
+        DB write failed — the caller was misled into believing the
+        paused state was durable.  Now ``persistence_pending`` is
+        returned so the caller can retry or warn the user.
 
         H2 (round-9): the persist uses ``_persist_task_state`` (the
         state-machine path) so a DB failure is tracked in
-        ``_pending_persistence`` and retried by ``stop()``.  This
-        replaces the bare ``update_scheduled_task_status`` which had
-        no retry.
+        ``_pending_persistence`` and retried by ``stop()``.
         """
-        task = self._tasks.get(task_id)
-        if not task:
-            return "not_found"
-        # H1 (round-9): bump epoch BEFORE cancelling so the old
-        # executor cannot overwrite the PAUSED state we're about to
-        # set (epoch fence in _execute_task).
-        self._bump_epoch(task_id)
-        cancel_ok = await self._cancel_in_flight_execution(task_id)
-        task.status = TaskStatus.PAUSED
+        # H1 (round-10): hold the lifecycle lock only for the
+        # in-memory state change — NO I/O while holding it.
+        async with self._lifecycle_lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return "not_found"
+            # H1 (round-9): bump epoch BEFORE cancelling so the old
+            # executor cannot overwrite the PAUSED state we're about
+            # to set (epoch fence in _execute_task).
+            self._bump_epoch(task_id)
+            task.status = TaskStatus.PAUSED
+            # Snapshot the in-flight owner so we can cancel it outside
+            # the lock (cancel awaits the executor — I/O).
+            cancel_target = self._execute_tasks.get(task_id)
+        # Cancel outside the lock (I/O).
+        cancel_ok = await self._cancel_in_flight_execution(
+            task_id, cancel_target
+        )
+        # Persist outside the lock (I/O).
+        persist_ok = True
         if self.db:
             try:
                 await self._persist_task_state(task)
             except Exception:  # noqa: BLE001 — stop() will retry
+                persist_ok = False
                 logger.error(
                     "cron task %s: could not persist paused state; "
                     "will retry on stop()", task.name, exc_info=True,
                 )
-        return "ok" if cancel_ok else "cancellation_pending"
+        # H2 (round-10): return value reflects BOTH cancel and persist.
+        if not cancel_ok:
+            return "cancellation_pending"
+        if not persist_ok:
+            return "persistence_pending"
+        return "ok"
 
     async def resume(self, task_id: str) -> bool:
-        task = self._tasks.get(task_id)
-        if not task:
-            return False
-        # H1 (round-9): bump epoch so any in-flight (cancellation-
-        # resistant) executor from before the pause cannot overwrite
-        # the resumed PENDING state.
-        self._bump_epoch(task_id)
-        task.status = TaskStatus.PENDING
-        task.next_run = self._compute_next_run(task)
+        # H1 (round-10): hold the lifecycle lock for the in-memory
+        # state change so tick cannot publish a new executor for the
+        # task between the status flip and the next_run recompute.
+        async with self._lifecycle_lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return False
+            # H1 (round-9): bump epoch so any in-flight (cancellation-
+            # resistant) executor from before the pause cannot
+            # overwrite the resumed PENDING state.
+            self._bump_epoch(task_id)
+            task.status = TaskStatus.PENDING
+            task.next_run = self._compute_next_run(task)
+        # Persist outside the lock (I/O).
         if self.db:
             await self.db.update_scheduled_task_status(task_id, TaskStatus.PENDING.value)
         return True
@@ -478,22 +527,52 @@ class CronEngine:
         """Remove (cancel) a task.
 
         Returns one of:
-          - ``"ok"``: task was removed (executor was not running, or
-            cancel terminated it within the budget) AND the terminal
-            ``cancelled`` state was durably persisted (or there is no
-            DB).  The task is popped from ``_tasks``.
+          - ``"ok"``: task was removed — executor terminated (or was
+            not running) AND the ``cancelled`` state was durably
+            persisted (or there is no DB).  The task is popped from
+            ``_tasks``.
           - ``"not_found"``: task_id is not registered.
           - ``"cancellation_pending"``: the in-flight executor did NOT
             terminate within the cancel budget.  The task's desired
             state is still set to ``CANCELLED`` (and persisted if
             possible), but the old executor may still be producing
             external side effects.  The task is NOT popped from
-            ``_tasks`` so the caller can retry.  The caller MUST NOT
-            claim the task is removed — the executor is still live.
+            ``_tasks`` (Medium round-10: tombstone retained) so the
+            caller can retry ``remove()`` to confirm.  The caller MUST
+            NOT claim the task is removed — the executor is still live.
+          - ``"persistence_pending"``: the executor terminated but the
+            DB write failed.  The task is NOT popped from ``_tasks``;
+            ``stop()`` will retry the persist.  The caller MUST NOT
+            claim the task is durably removed — the state may not
+            survive a restart.
+
+        H1 (round-10): the lifecycle lock serializes "modify state +
+        bump epoch + snapshot owner" against tick's "re-check +
+        publish".  Without this, tick could publish a new executor
+        for the task AFTER remove set CANCELLED — the new executor
+        captures the post-remove epoch (fence doesn't trigger) and
+        overwrites CANCELLED with PENDING/COMPLETED, potentially
+        re-firing the removed task on restart.
 
         H1 (round-9): the epoch is bumped BEFORE cancelling so the
         old executor cannot overwrite the ``CANCELLED`` state when it
         eventually completes.
+
+        Medium (round-10): the task is NOT popped from ``_tasks``
+        when the executor did not terminate (``cancellation_pending``)
+        — even if the persist succeeded.  Previously ``remove()``
+        popped on successful persist regardless of ``cancel_ok``, so
+        the public API told the user "retry remove" but the retry
+        returned ``not_found`` (task already popped) even though the
+        old executor was still running.  Now the tombstone (CANCELLED
+        status in ``_tasks``) is retained until the caller retries
+        ``remove()`` and the executor has actually terminated.
+
+        H2 (round-10): the return value now reflects the persist
+        result.  Previously ``remove()`` returned ``ok`` even when the
+        DB write failed — the caller was misled into believing the
+        removed state was durable.  Now ``persistence_pending`` is
+        returned so the caller can retry or warn the user.
 
         H2 (round-9): the task is NOT popped from ``_tasks`` until
         ``_persist_task_state`` succeeds.  If the persist fails, the
@@ -508,30 +587,50 @@ class CronEngine:
         M1 (round-8): cancel + await the in-flight executor before
         flipping the status.
         """
-        task = self._tasks.get(task_id)
-        if not task:
-            return "not_found"
-        # H1 (round-9): bump epoch BEFORE cancelling.
-        self._bump_epoch(task_id)
-        cancel_ok = await self._cancel_in_flight_execution(task_id)
-        task.status = TaskStatus.CANCELLED
+        # H1 (round-10): hold the lifecycle lock only for the
+        # in-memory state change — NO I/O while holding it.
+        async with self._lifecycle_lock:
+            task = self._tasks.get(task_id)
+            if not task:
+                return "not_found"
+            # H1 (round-9): bump epoch BEFORE cancelling.
+            self._bump_epoch(task_id)
+            task.status = TaskStatus.CANCELLED
+            # Snapshot the in-flight owner so we can cancel it outside
+            # the lock (cancel awaits the executor — I/O).
+            cancel_target = self._execute_tasks.get(task_id)
+        # Cancel outside the lock (I/O).
+        cancel_ok = await self._cancel_in_flight_execution(
+            task_id, cancel_target
+        )
+        # Persist outside the lock (I/O).
+        persist_ok = True
         if self.db:
             try:
                 # H2 (round-9): use the state-machine persist path so
                 # a failure is tracked in _pending_persistence and
-                # retried by stop().  Only pop from _tasks on success.
+                # retried by stop().
                 await self._persist_task_state(task)
-                self._tasks.pop(task_id, None)
             except Exception:  # noqa: BLE001 — stop() will retry
+                persist_ok = False
                 logger.error(
                     "cron task %s: could not persist cancelled state; "
                     "will retry on stop() — task retained in _tasks "
                     "for reconcile", task.name, exc_info=True,
                 )
-        else:
-            # No DB — nothing to persist, safe to pop.
-            self._tasks.pop(task_id, None)
-        return "ok" if cancel_ok else "cancellation_pending"
+        # Medium (round-10): do NOT pop if cancel failed — the
+        # executor is still running.  Keep the tombstone (CANCELLED
+        # status in _tasks) so the caller can retry remove() and get
+        # a meaningful result (not not_found).
+        if not cancel_ok:
+            return "cancellation_pending"
+        # H2 (round-9/10): do NOT pop if persist failed — the task
+        # stays in _tasks with CANCELLED status for stop() to retry.
+        if not persist_ok:
+            return "persistence_pending"
+        # Both succeeded — safe to pop.
+        self._tasks.pop(task_id, None)
+        return "ok"
 
     def _bump_epoch(self, task_id: str) -> int:
         """H1 (round-9): increment the execution epoch for ``task_id``.
@@ -546,7 +645,11 @@ class CronEngine:
         self._execution_epoch[task_id] = new_epoch
         return new_epoch
 
-    async def _cancel_in_flight_execution(self, task_id: str) -> bool:
+    async def _cancel_in_flight_execution(
+        self,
+        task_id: str,
+        exec_task: asyncio.Task | None = None,
+    ) -> bool:
         """M1 (round-8): cancel + await the in-flight ``_execute_task``
         for ``task_id``, if any.
 
@@ -554,6 +657,14 @@ class CronEngine:
         terminated (within the cancel budget).  Returns ``False`` if
         the executor did NOT terminate within the budget — the caller
         MUST NOT claim success in this case.
+
+        H1 (round-10): accepts an optional ``exec_task`` parameter —
+        the snapshot of the in-flight owner taken under the lifecycle
+        lock by ``pause`` / ``remove``.  This avoids a TOCTOU race
+        where the owner could change between lock release and the
+        ``_execute_tasks.get(task_id)`` lookup.  If ``exec_task`` is
+        ``None``, falls back to the lookup (for callers that don't
+        hold the lock).
 
         H1 (round-9): the return value is now authoritative.  Previously
         this method returned ``None`` and the caller (``pause`` /
@@ -572,7 +683,8 @@ class CronEngine:
         shared authorities) for ``stop()`` to handle — ``stop()`` will
         raise ``ServiceShutdownError`` on the next shutdown.
         """
-        exec_task = self._execute_tasks.get(task_id)
+        if exec_task is None:
+            exec_task = self._execute_tasks.get(task_id)
         if exec_task is None or exec_task.done():
             return True
         exec_task.cancel()
@@ -670,35 +782,53 @@ class CronEngine:
         """后台循环，检查到期的任务。"""
         while self._running:
             now = datetime.utcnow()
-            due_tasks = [
+            # Snapshot candidates without the lock — worst case we
+            # consider a candidate that was just paused/removed, and
+            # the re-check under the lock below skips it.
+            due_candidates = [
                 task for task in self._tasks.values()
                 if task.enabled
                 and task.status == TaskStatus.PENDING
                 and task.next_run
                 and task.next_run <= now
             ]
-            for task in due_tasks:
-                # M4 (round-5): track the execution task so ``stop()``
-                # can cancel + await it.  Discard on completion so the
-                # registry doesn't grow without bound.
-                # M1 (round-8): keyed by task_id so ``pause()`` /
-                # ``remove()`` can find and cancel the in-flight
-                # execution for a specific task.
-                # If there's already an in-flight execution for this
-                # task_id (e.g. the previous tick fired it and it's
-                # still running), do NOT start a second one — the
-                # executor would race with the first and the second
-                # ``_persist_task_state`` could overwrite the first's
-                # terminal state.  Skip this tick; the next tick will
-                # pick it up if the first one has finished.
-                if task.id in self._execute_tasks and not self._execute_tasks[task.id].done():
-                    continue
-                exec_task = asyncio.create_task(self._execute_task(task))
-                self._execute_tasks[task.id] = exec_task
-                _tid = task.id
-                exec_task.add_done_callback(
-                    lambda _t, tid=_tid: self._execute_tasks.pop(tid, None)
-                )
+            for task in due_candidates:
+                # H1 (round-10): re-check under the lifecycle lock
+                # right before publishing.  Without this, pause/remove
+                # could run between the snapshot and the publish — the
+                # task would be paused/removed in memory and DB, but
+                # tick would still start a new ``_execute_task`` for
+                # it.  The new executor captures the POST-pause epoch
+                # (so the epoch fence does NOT trigger) and overwrites
+                # the PAUSED/CANCELLED state with PENDING/COMPLETED,
+                # silently violating the user-visible contract and
+                # potentially re-firing a removed task on restart.
+                # The lock is held only for the in-memory re-check +
+                # publish — NO I/O is performed while holding it.
+                async with self._lifecycle_lock:
+                    if task.status != TaskStatus.PENDING:
+                        continue
+                    if not task.enabled:
+                        continue
+                    # M1 (round-8): if there's already an in-flight
+                    # execution for this task_id, do NOT start a
+                    # second one — the executor would race with the
+                    # first and the second ``_persist_task_state``
+                    # could overwrite the first's terminal state.
+                    if task.id in self._execute_tasks and not self._execute_tasks[task.id].done():
+                        continue
+                    # M4 (round-5): track the execution task so
+                    # ``stop()`` can cancel + await it.  Discard on
+                    # completion so the registry doesn't grow without
+                    # bound.  M1 (round-8): keyed by task_id so
+                    # ``pause()`` / ``remove()`` can find and cancel
+                    # the in-flight execution for a specific task.
+                    exec_task = asyncio.create_task(self._execute_task(task))
+                    self._execute_tasks[task.id] = exec_task
+                    _tid = task.id
+                    exec_task.add_done_callback(
+                        lambda _t, tid=_tid: self._execute_tasks.pop(tid, None)
+                    )
             await asyncio.sleep(self._tick_interval)
 
     async def _execute_task(self, task: ScheduledTask) -> None:

@@ -1422,11 +1422,15 @@ async def test_remove_returns_cancellation_pending_and_epoch_fence_holds(
                 "terminating within the cancel budget"
             )
 
-            # The persist of CANCELLED succeeded (DB is healthy), so
-            # the task IS popped from _tasks.
-            assert task_id not in engine._tasks, (
-                "remove() did not pop the task from _tasks despite "
-                "the persist succeeding"
+            # Medium (round-10): the task is NOT popped from _tasks
+            # when cancellation_pending — the tombstone (CANCELLED
+            # status) is retained so the caller can retry remove()
+            # and get a meaningful result (not not_found).
+            assert task_id in engine._tasks, (
+                "remove() popped the task from _tasks despite "
+                "cancellation_pending — the caller cannot retry "
+                "(would get not_found) even though the executor "
+                "is still running"
             )
             # The desired state is durable: DB row is CANCELLED.
             rows = await db.list_scheduled_tasks()
@@ -1566,10 +1570,14 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
         # remove() cancels the executor (clean terminate), then tries
         # to persist CANCELLED — FAILS.  The task is NOT popped from
         # _tasks; task_id is in _pending_persistence.
+        # H2 (round-10): remove() now returns persistence_pending
+        # (NOT ok) when the DB write fails — the caller is informed
+        # that the cancelled state may not be durable.
         result = await engine.remove(task_id)
-        assert result == "ok", (
-            f"expected ok (cancel_ok=True; persist failure does not "
-            f"change the return value), got {result!r}"
+        assert result == "persistence_pending", (
+            f"expected persistence_pending, got {result!r} — "
+            "remove() claimed success (ok) despite the terminal "
+            "persist failing"
         )
 
         # The task is STILL in _tasks (NOT popped).
@@ -1612,6 +1620,410 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
         )
 
         release_exec.set()
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-10): lifecycle lock — tick does not publish for paused/removed tasks
+# ---------------------------------------------------------------------------
+
+
+async def test_tick_does_not_publish_for_paused_task(tmp_path) -> None:
+    """H1 (round-10): after ``pause()`` returns, the tick loop MUST NOT
+    publish a new ``_execute_task`` for the paused task — even if the
+    task was snapshotted as due before pause ran.
+
+    Without the lifecycle lock, the following race was possible:
+      1. Tick snapshots task T as due (status PENDING).
+      2. Pause runs: bumps epoch, sets PAUSED, persists, returns ok.
+      3. Tick processes the stale snapshot and publishes
+         ``_execute_task(T)``.  The new executor captures the
+         POST-pause epoch (so the epoch fence does NOT trigger) and
+         overwrites PAUSED with PENDING/COMPLETED — silently
+         violating the user-visible contract and re-firing the task.
+
+    The fix re-checks the task status under the lifecycle lock right
+    before publishing.  If pause/remove set PAUSED/CANCELLED, tick
+    skips the publish.
+
+    This test deterministically exercises the post-pause state: pause
+    is called BEFORE the tick loop runs, so the tick's re-check MUST
+    skip the paused task.  The race window itself (pause between
+    snapshot and publish) is covered by the lock semantics — the
+    re-check is atomic with the publish.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        exec_count = {"n": 0}
+
+        async def counting_executor(task_id: str, prompt: str) -> str:
+            exec_count["n"] += 1
+            return "should-not-run"
+
+        engine = CronEngine(
+            db=db,
+            executor=counting_executor,
+            tick_interval=0.01,
+        )
+        # Create a task that's due NOW but DON'T start the engine yet.
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("pause-tick", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+
+        # Pause BEFORE starting the engine — the task is due but
+        # paused.  Tick's re-check MUST skip it.
+        result = await engine.pause(task_id)
+        assert result == "ok", (
+            f"expected ok, got {result!r} — pause() of a not-running "
+            "task should succeed"
+        )
+        assert engine._tasks[task_id].status == TaskStatus.PAUSED
+
+        # Start the engine — the tick loop will snapshot the task as
+        # due (next_run <= now) but the re-check under the lock MUST
+        # skip it because status is PAUSED.
+        await engine.start()
+        # Give the tick loop multiple iterations to pick it up.
+        await asyncio.sleep(0.1)
+
+        # The executor was NEVER called — tick's re-check skipped the
+        # paused task.
+        assert exec_count["n"] == 0, (
+            f"tick published _execute_task for a paused task — "
+            f"executor was called {exec_count['n']} time(s); the "
+            "lifecycle lock re-check did not skip the paused task"
+        )
+        # No _execute_task was created for the paused task.
+        assert task_id not in engine._execute_tasks, (
+            "tick registered an _execute_task for a paused task — "
+            "the lifecycle lock re-check did not skip it"
+        )
+        # The task is still PAUSED (not overwritten to RUNNING /
+        # PENDING / COMPLETED).
+        assert engine._tasks[task_id].status == TaskStatus.PAUSED, (
+            f"expected PAUSED, got {engine._tasks[task_id].status} — "
+            "tick's publish overwrote the paused state"
+        )
+        # The DB row is still PAUSED.
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "paused", (
+            f"expected DB status=paused, got {row['status']} — "
+            "tick's publish overwrote the paused DB row"
+        )
+
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+
+async def test_tick_does_not_publish_for_removed_task(tmp_path) -> None:
+    """H1 (round-10): after ``remove()`` returns ok, the tick loop
+    MUST NOT publish a new ``_execute_task`` for the removed task —
+    even if the task was snapshotted as due before remove ran.
+
+    Without the lifecycle lock, the following race was possible:
+      1. Tick snapshots task T as due (status PENDING).
+      2. Remove runs: bumps epoch, sets CANCELLED, persists, pops
+         from _tasks, returns ok.
+      3. Tick processes the stale snapshot (still holds a reference
+         to the task object) and publishes ``_execute_task(T)``.  The
+         new executor captures the POST-remove epoch (so the epoch
+         fence does NOT trigger) and overwrites CANCELLED with
+         PENDING/COMPLETED — on restart the scheduler would re-fire
+         the removed task, potentially double-executing external side
+         effects.
+
+    The fix re-checks the task status under the lifecycle lock right
+    before publishing.  Since remove popped the task from _tasks AND
+    set status to CANCELLED, tick's re-check (``task.status !=
+    PENDING``) skips the publish.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        exec_count = {"n": 0}
+
+        async def counting_executor(task_id: str, prompt: str) -> str:
+            exec_count["n"] += 1
+            return "should-not-run"
+
+        engine = CronEngine(
+            db=db,
+            executor=counting_executor,
+            tick_interval=0.01,
+        )
+        # Create a task that's due NOW but DON'T start the engine yet.
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create("remove-tick", "p", ScheduleConfig(iso_time=iso))
+        task_id = task.id
+
+        # Remove BEFORE starting the engine.
+        result = await engine.remove(task_id)
+        assert result == "ok", (
+            f"expected ok, got {result!r} — remove() of a not-running "
+            "task should succeed"
+        )
+        # The task is popped from _tasks.
+        assert task_id not in engine._tasks
+
+        # Start the engine — the tick loop will snapshot candidates
+        # from _tasks (which no longer contains the removed task).  No
+        # _execute_task should be created.
+        await engine.start()
+        await asyncio.sleep(0.1)
+
+        # The executor was NEVER called.
+        assert exec_count["n"] == 0, (
+            f"tick published _execute_task for a removed task — "
+            f"executor was called {exec_count['n']} time(s)"
+        )
+        # The DB row is still CANCELLED (not overwritten to RUNNING /
+        # PENDING / COMPLETED).
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "cancelled", (
+            f"expected DB status=cancelled, got {row['status']} — "
+            "tick's publish overwrote the cancelled DB row"
+        )
+
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H2 (round-10): pause/remove return persistence_pending on DB write failure
+# ---------------------------------------------------------------------------
+
+
+async def test_pause_returns_persistence_pending_on_db_failure(
+    tmp_path,
+) -> None:
+    """H2 (round-10): when ``pause()`` succeeds in cancelling the
+    executor but the DB write fails, it MUST return
+    ``persistence_pending`` (NOT ``ok``) — the caller is informed
+    that the paused state may not be durable.
+
+    Previously ``pause()`` returned ``ok`` whenever ``cancel_ok`` was
+    True, regardless of the persist result.  The caller was misled
+    into believing the paused state was durable — if the process
+    crashed before ``stop()`` retried the persist, the DB row would
+    stay at ``running`` / ``pending`` and the task would be re-fired
+    on restart.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    try:
+        started = asyncio.Event()
+        release_exec = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release_exec.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create(
+            "pause-pp", "p", ScheduleConfig(iso_time=iso)
+        )
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Patch update_scheduled_task to FAIL so pause()'s persist
+        # raises.
+        original_update = db.update_scheduled_task
+
+        async def failing_update(*args, **kwargs):
+            raise RuntimeError("DB is being torn down")
+
+        db.update_scheduled_task = failing_update
+
+        # pause() cancels the executor (clean terminate), then tries
+        # to persist PAUSED — FAILS.  Returns persistence_pending.
+        result = await engine.pause(task_id)
+        assert result == "persistence_pending", (
+            f"expected persistence_pending, got {result!r} — "
+            "pause() claimed success (ok) despite the terminal "
+            "persist failing"
+        )
+
+        # The in-memory status is PAUSED.
+        assert engine._tasks[task_id].status == TaskStatus.PAUSED, (
+            f"expected PAUSED, got {engine._tasks[task_id].status}"
+        )
+        # task_id is in _pending_persistence for stop() to retry.
+        assert task_id in engine._pending_persistence, (
+            "task_id is NOT in _pending_persistence — stop() cannot "
+            "retry the terminal persist"
+        )
+
+        # Restore update_scheduled_task so stop()'s reconcile can
+        # succeed.
+        db.update_scheduled_task = original_update
+
+        # stop() retries the persist via reconcile — succeeds.
+        await engine.stop(timeout=2.0)
+
+        # The terminal state is now durable.
+        assert task_id not in engine._pending_persistence
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "paused", (
+            f"expected DB status=paused, got {row['status']} — "
+            "stop()'s reconcile did not persist the terminal state"
+        )
+
+        release_exec.set()
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# Medium (round-10): remove(cancellation_pending) tombstone — retry works
+# ---------------------------------------------------------------------------
+
+
+async def test_remove_cancellation_pending_tombstone_allows_retry(
+    tmp_path,
+) -> None:
+    """Medium (round-10): when ``remove()`` returns
+    ``cancellation_pending`` (executor did not terminate), the task
+    MUST stay in ``_tasks`` as a tombstone (CANCELLED status) so the
+    caller can retry ``remove()`` and get a meaningful result — NOT
+    ``not_found``.
+
+    Previously ``remove()`` popped the task from ``_tasks`` whenever
+    the persist succeeded, regardless of ``cancel_ok``.  The public
+    API told the user "retry remove", but the retry returned
+    ``not_found`` (task already popped) even though the old executor
+    was still running — the caller had no way to confirm the
+    executor had actually terminated.
+
+    Sequence:
+      1. Spawn a task whose executor swallows CancelledError.
+      2. Call ``remove()`` — returns ``cancellation_pending``.  The
+         task is NOT popped (tombstone retained).
+      3. Retry ``remove()`` while the executor is still running —
+         returns ``cancellation_pending`` again (NOT not_found).
+      4. Release the executor so it terminates.
+      5. Retry ``remove()`` — now returns ``ok`` (executor done,
+         persist already done).  The task is popped.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def swallowing_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            while not release_exec.is_set():
+                try:
+                    await release_exec.wait()
+                except asyncio.CancelledError:
+                    if release_exec.is_set():
+                        raise
+                    # swallow: stay pending past the cancel budget
+            return "stale-result"
+
+        engine = CronEngine(
+            db=db,
+            executor=swallowing_executor,
+            tick_interval=0.01,
+        )
+        original_budget = engine_module._CANCEL_IN_FLIGHT_TIMEOUT
+        engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
+        try:
+            await engine.start()
+            iso = datetime.utcnow().isoformat()
+            task = await engine.create(
+                "remove-tomb", "p", ScheduleConfig(iso_time=iso)
+            )
+            task_id = task.id
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+
+            # First remove(): executor swallows cancel → returns
+            # cancellation_pending.  Task is NOT popped (tombstone).
+            result1 = await engine.remove(task_id)
+            assert result1 == "cancellation_pending", (
+                f"expected cancellation_pending, got {result1!r}"
+            )
+            assert task_id in engine._tasks, (
+                "remove() popped the task from _tasks despite "
+                "cancellation_pending — the caller cannot retry"
+            )
+            assert engine._tasks[task_id].status == TaskStatus.CANCELLED
+
+            # Retry remove() while the executor is still running —
+            # MUST return cancellation_pending again (NOT not_found).
+            result2 = await engine.remove(task_id)
+            assert result2 == "cancellation_pending", (
+                f"expected cancellation_pending on retry, got "
+                f"{result2!r} — the tombstone was not retained "
+                "(retry returned not_found despite the executor "
+                "still running)"
+            )
+
+            # Release the executor so it terminates.
+            release_exec.set()
+            await asyncio.wait_for(
+                engine._execute_tasks[task_id], timeout=2.0
+            )
+
+            # Retry remove() — now the executor is done, so cancel_ok
+            # is True.  The persist already succeeded (from the first
+            # remove), so persist_ok is True.  Returns ok and pops.
+            result3 = await engine.remove(task_id)
+            assert result3 == "ok", (
+                f"expected ok on retry after executor terminated, "
+                f"got {result3!r} — the tombstone retry did not "
+                "complete the removal"
+            )
+            # The task is now popped.
+            assert task_id not in engine._tasks, (
+                "remove() did not pop the task after the executor "
+                "terminated and the persist succeeded"
+            )
+
+            await engine.stop(timeout=2.0)
+        finally:
+            engine_module._CANCEL_IN_FLIGHT_TIMEOUT = original_budget
     finally:
         release_exec.set()
         await db.close()
