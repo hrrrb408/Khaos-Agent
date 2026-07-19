@@ -207,3 +207,91 @@ async def test_on_complete_invoked() -> None:
     await engine._execute_task(task)
 
     assert calls == [("cb", "executed:p")]
+
+
+# ---------------------------------------------------------------------------
+# M4 (round-5): stop() drains in-flight _execute_task coroutines
+# ---------------------------------------------------------------------------
+
+
+async def test_stop_drains_in_flight_execute_tasks() -> None:
+    """M4 (round-5): ``stop()`` MUST cancel and await every in-flight
+    ``_execute_task`` coroutine.
+
+    Previously ``_tick_loop`` fired ``asyncio.create_task(...)`` without
+    keeping a reference, so a task that just started (but hadn't entered
+    ``AgentService.chat()`` yet) escaped the engine's shutdown and could
+    run after the DB / shared authorities were torn down — accessing a
+    closed DB.
+
+    The round-5 fix tracks ``_execute_tasks: set[asyncio.Task]`` with a
+    discard-on-completion callback, and ``stop()`` cancels + gathers
+    them with ``return_exceptions=True`` before returning.
+
+    Sequence:
+      1. Engine with a stall-able executor and a 0.01s tick interval.
+      2. Create an ISO task that's already due → tick loop fires
+         ``_execute_task`` immediately.
+      3. The executor stalls on an Event so the task is in-flight.
+      4. ``stop()`` cancels the tick loop AND the in-flight
+         ``_execute_task``; both must be done when ``stop()`` returns.
+    """
+    import asyncio
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def stalling_executor(task_id: str, prompt: str) -> str:
+        started.set()
+        await release.wait()
+        return "should-not-reach"
+
+    engine = CronEngine(
+        executor=stalling_executor,
+        tick_interval=0.01,  # fire quickly so the due task is picked up
+    )
+    # Due immediately.
+    iso = datetime.utcnow().isoformat()
+    await engine.create("in-flight", "p", ScheduleConfig(iso_time=iso))
+    await engine.start()
+
+    # Wait for the executor to actually start (proving the task is
+    # in-flight, not just queued).
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+    assert engine._execute_tasks, (
+        "tick loop did not register the _execute_task coroutine"
+    )
+
+    # stop() must cancel + drain the in-flight task.  release is never
+    # set, so without the M4 fix the task would hang forever (or escape
+    # and access a closed DB after stop() returns).
+    await asyncio.wait_for(engine.stop(), timeout=2.0)
+
+    # All execute_tasks are done (cancelled + drained).
+    assert engine._execute_tasks == set(), (
+        "stop() did not drain in-flight _execute_tasks"
+    )
+    # Cleanup: release the executor's stall so any pending coroutine
+    # wakes cleanly (defensive — they should already be cancelled).
+    release.set()
+
+
+async def test_stop_cancels_tick_loop_without_execute_tasks() -> None:
+    """M4 (round-5): ``stop()`` with no in-flight executions still
+    cancels the tick loop cleanly and is idempotent.
+    """
+    import asyncio
+
+    engine = _engine()
+    await engine.start()
+    assert engine._loop_task is not None
+
+    await engine.stop()
+
+    # Tick loop is gone.
+    assert engine._loop_task is None
+    # No in-flight executions tracked.
+    assert engine._execute_tasks == set()
+    # Idempotent: a second stop() is a no-op.
+    await engine.stop()
+    assert engine._loop_task is None

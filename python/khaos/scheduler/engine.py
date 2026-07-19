@@ -40,6 +40,14 @@ class CronEngine:
         self._tasks: dict[str, ScheduledTask] = {}
         self._running = False
         self._loop_task: asyncio.Task | None = None
+        # M4 (round-5): track in-flight ``_execute_task`` coroutines so
+        # ``stop()`` can cancel + await them.  Previously ``_tick_loop``
+        # fired ``asyncio.create_task(self._execute_task(task))`` without
+        # keeping a reference, so a task that just started (but hadn't
+        # entered ``AgentService.chat()`` yet) escaped the engine's
+        # shutdown and could run after the DB / shared authorities were
+        # torn down.
+        self._execute_tasks: set[asyncio.Task] = set()
 
     async def start(self) -> None:
         """启动调度循环。"""
@@ -51,7 +59,16 @@ class CronEngine:
         logger.info("cron engine started with %d tasks", len(self._tasks))
 
     async def stop(self) -> None:
-        """停止调度循环。"""
+        """停止调度循环。
+
+        M4 (round-5): cancel and await every in-flight ``_execute_task``
+        coroutine so they don't outlive the engine.  An ``_execute_task``
+        calls ``self._executor(...)`` which (in production) is
+        ``AgentService._execute_scheduled_prompt`` → ``AgentService.chat``.
+        If the engine stops while such a task is running, it must be
+        cancelled + drained BEFORE the engine's callers tear down the DB
+        and shared authorities — otherwise the task accesses a closed DB.
+        """
         self._running = False
         if self._loop_task:
             self._loop_task.cancel()
@@ -60,6 +77,19 @@ class CronEngine:
             except asyncio.CancelledError:
                 pass
             self._loop_task = None
+        # M4 (round-5): cancel + drain in-flight executions.  Use
+        # ``return_exceptions=True`` so one task's failure doesn't mask
+        # the others; each task's ``_execute_task`` body already catches
+        # ``Exception`` and records the error.
+        if self._execute_tasks:
+            for t in self._execute_tasks:
+                if not t.done():
+                    t.cancel()
+            try:
+                await asyncio.gather(*self._execute_tasks, return_exceptions=True)
+            except Exception:  # noqa: BLE001 — defensive
+                pass
+            self._execute_tasks.clear()
         logger.info("cron engine stopped")
 
     async def create(
@@ -179,7 +209,12 @@ class CronEngine:
                 and task.next_run <= now
             ]
             for task in due_tasks:
-                asyncio.create_task(self._execute_task(task))
+                # M4 (round-5): track the execution task so ``stop()``
+                # can cancel + await it.  Discard on completion so the
+                # set doesn't grow without bound.
+                exec_task = asyncio.create_task(self._execute_task(task))
+                self._execute_tasks.add(exec_task)
+                exec_task.add_done_callback(self._execute_tasks.discard)
             await asyncio.sleep(self._tick_interval)
 
     async def _execute_task(self, task: ScheduledTask) -> None:
