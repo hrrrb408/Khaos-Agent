@@ -445,6 +445,10 @@ class CronEngine:
             not running) AND the ``paused`` state was durably
             persisted (or there is no DB).
           - ``"not_found"``: task_id is not registered.
+          - ``"invalid_state"``: the task is in a state that cannot
+            be paused (``CANCELLED`` removal tombstone, or a terminal
+            state ``COMPLETED`` / ``FAILED``).  The caller MUST NOT
+            claim the task is paused — the state is unchanged.
           - ``"cancellation_pending"``: the in-flight executor did NOT
             terminate within the cancel budget.  The task's desired
             state is still set to ``PAUSED`` (and persisted if
@@ -458,18 +462,34 @@ class CronEngine:
             claim the task is durably paused — the state may not
             survive a restart.
 
+        H1 (round-12): strict state transition matrix.  ``pause`` is
+        only allowed from ``PENDING`` or ``RUNNING`` (or idempotent on
+        ``PAUSED``).  Refuses ``CANCELLED`` (removal tombstone) and
+        terminal states ``COMPLETED`` / ``FAILED`` — without this, a
+        caller could pause a ``CANCELLED`` tombstone and then resume
+        it, resurrecting a removed task.  ``COMPLETED`` / ``FAILED``
+        are terminal execution states and should not be re-paused.
+
         H1 (round-11): the per-task lock is held for the ENTIRE
-        operation — including cancel + persist.  This is the per-task
-        transaction boundary: pause is atomic with respect to
-        resume/remove and to tick's "re-check + publish".  Without
-        holding the lock during cancel + persist, a concurrent
-        resume could run between the in-memory state change and the
-        persist, overwriting PAUSED with PENDING in memory and DB.
+        operation — including cancel + persist.
         """
         async with self._task_lock(task_id):
             task = self._tasks.get(task_id)
             if not task:
                 return "not_found"
+            # H1 (round-12): strict state transition matrix.
+            # Idempotent on PAUSED — return ok without re-persisting
+            # (the state is already PAUSED).
+            if task.status == TaskStatus.PAUSED:
+                return "ok"
+            # Refuse terminal / removal states.
+            if task.status in (
+                TaskStatus.CANCELLED,
+                TaskStatus.COMPLETED,
+                TaskStatus.FAILED,
+            ):
+                return "invalid_state"
+            # Allowed: PENDING or RUNNING.
             # H1 (round-9): bump epoch BEFORE cancelling so the old
             # executor cannot overwrite the PAUSED state we're about
             # to set (epoch fence in _execute_task).
@@ -503,29 +523,50 @@ class CronEngine:
           - ``"ok"``: task was resumed — status set to PENDING and
             next_run recomputed.
           - ``"not_found"``: task_id is not registered.
-          - ``"cancelled"``: the task is a CANCELLED removal
-            tombstone — cannot resume a task that's pending removal.
-            The caller should retry ``remove()`` to complete the
-            removal (or just wait for the executor to terminate).
+          - ``"invalid_state"``: the task is not in the ``PAUSED``
+            state.  Only ``PAUSED`` tasks can be resumed.  This
+            covers ``RUNNING`` (the executor is still producing side
+            effects — wait for it to complete or pause it first),
+            ``PENDING`` (already active — no-op), ``CANCELLED``
+            (removal tombstone — retry ``remove``), ``COMPLETED`` /
+            ``FAILED`` (terminal execution state — cannot be resumed).
+          - ``"execution_pending"``: the task is ``PAUSED`` but the
+            old executor is still alive (didn't respond to cancel
+            during the prior ``pause``).  Resuming now would cause
+            the old executor to race with the new execution when tick
+            re-fires.  The caller should wait for the old executor to
+            terminate (or call ``remove`` to force-cancel it).
 
-        Medium (round-11): validates the CANCELLED removal tombstone
-        state.  Previously ``resume()`` did not check the status at
-        all — a caller could resume a CANCELLED tombstone, flipping
-        it to PENDING and causing the removed task to be re-fired.
+        H1 (round-12): strict state transition matrix.  ``resume`` is
+        only allowed from ``PAUSED``.  Previously ``resume`` accepted
+        any non-CANCELLED state, including ``RUNNING`` (the executor
+        was still producing side effects — resuming caused tick to
+        re-fire, producing two concurrent executions and double side
+        effects) and terminal states ``COMPLETED`` / ``FAILED``
+        (resurrecting a finished task).  Also refuses if a live
+        executor still exists for the task (``execution_pending``) —
+        without this, the old executor's epoch-fenced write would be
+        discarded, but the old executor would still produce external
+        side effects while the new execution ran concurrently.
 
         H1 (round-11): the per-task lock is held for the ENTIRE
-        operation — including persist.  This is the per-task
-        transaction boundary: resume is atomic with respect to
-        pause/remove and to tick's "re-check + publish".
+        operation — including persist.
         """
         async with self._task_lock(task_id):
             task = self._tasks.get(task_id)
             if not task:
                 return "not_found"
-            # Medium (round-11): refuse to resume a CANCELLED removal
-            # tombstone — the task is pending removal.
-            if task.status == TaskStatus.CANCELLED:
-                return "cancelled"
+            # H1 (round-12): only PAUSED can be resumed.
+            if task.status != TaskStatus.PAUSED:
+                return "invalid_state"
+            # H1 (round-12): refuse if a live executor still exists.
+            # This happens when a prior ``pause`` returned
+            # ``cancellation_pending`` (the executor swallowed cancel).
+            # Resuming now would leave the old executor running while
+            # tick re-publishes a new one — double side effects.
+            exec_task = self._execute_tasks.get(task_id)
+            if exec_task is not None and not exec_task.done():
+                return "execution_pending"
             # H1 (round-9): bump epoch so any in-flight (cancellation-
             # resistant) executor from before the pause cannot
             # overwrite the resumed PENDING state.
@@ -548,6 +589,9 @@ class CronEngine:
             persisted (or there is no DB).  The task is popped from
             ``_tasks``.
           - ``"not_found"``: task_id is not registered.
+          - ``"invalid_state"``: the task is in a terminal execution
+            state (``COMPLETED`` / ``FAILED``) — these are durable
+            final states and should not be re-cancelled.
           - ``"cancellation_pending"``: the in-flight executor did NOT
             terminate within the cancel budget.  The task's desired
             state is still set to ``CANCELLED`` (and persisted if
@@ -571,6 +615,12 @@ class CronEngine:
         old executor cannot overwrite the ``CANCELLED`` state when it
         eventually completes.
 
+        H1 (round-12): terminal execution states (``COMPLETED`` /
+        ``FAILED``) are refused — these are durable final states and
+        should not be re-cancelled.  ``CANCELLED`` is allowed (retry
+        of an incomplete removal).  ``PENDING`` / ``RUNNING`` /
+        ``PAUSED`` are allowed (normal removal).
+
         Medium (round-10): the task is NOT popped from ``_tasks``
         when the executor did not terminate (``cancellation_pending``)
         — even if the persist succeeded.  The tombstone (CANCELLED
@@ -587,6 +637,10 @@ class CronEngine:
             task = self._tasks.get(task_id)
             if not task:
                 return "not_found"
+            # H1 (round-12): refuse terminal execution states — these
+            # are durable final states and should not be re-cancelled.
+            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+                return "invalid_state"
             # H1 (round-9): bump epoch BEFORE cancelling.
             self._bump_epoch(task_id)
             task.status = TaskStatus.CANCELLED

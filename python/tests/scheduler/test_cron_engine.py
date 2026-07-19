@@ -2241,10 +2241,14 @@ async def test_resume_refuses_cancelled_tombstone(tmp_path) -> None:
             assert task_id in engine._tasks
             assert engine._tasks[task_id].status == TaskStatus.CANCELLED
 
-            # resume() MUST refuse — return "cancelled", NOT "ok".
+            # resume() MUST refuse — return "invalid_state", NOT "ok".
+            # H1 (round-12): CANCELLED is now handled by the strict
+            # state transition matrix (only PAUSED can be resumed),
+            # so the return is "invalid_state" (was "cancelled" in
+            # round-11).
             resume_result = await engine.resume(task_id)
-            assert resume_result == "cancelled", (
-                f"expected 'cancelled', got {resume_result!r} — "
+            assert resume_result == "invalid_state", (
+                f"expected 'invalid_state', got {resume_result!r} — "
                 "resume() did not refuse the CANCELLED removal "
                 "tombstone; the task would be re-fired"
             )
@@ -2273,3 +2277,476 @@ async def test_resume_refuses_cancelled_tombstone(tmp_path) -> None:
     finally:
         release_exec.set()
         await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-12): strict state transition matrix
+# ---------------------------------------------------------------------------
+
+
+async def test_resume_refuses_running_task() -> None:
+    """H1 (round-12): ``resume()`` MUST refuse a RUNNING task.  The
+    executor is still producing side effects — resuming would cause
+    tick to re-fire, producing two concurrent executions and double
+    side effects.
+
+    Sequence:
+      1. Spawn a task with a stalling executor (status becomes RUNNING).
+      2. Call ``resume()`` — MUST return ``invalid_state`` (NOT ``ok``).
+      3. The task is STILL RUNNING (resume did not flip it to PENDING).
+    """
+    import asyncio
+
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    engine = _engine()
+    release = asyncio.Event()
+    started = asyncio.Event()
+
+    async def stalling_executor(task_id: str, prompt: str) -> str:
+        started.set()
+        await release.wait()
+        return "ok"
+
+    engine._executor = stalling_executor
+    engine._tick_interval = 0.01
+    await engine.start()
+    iso = datetime.utcnow().isoformat()
+    task = await engine.create("resume-running", "p", ScheduleConfig(iso_time=iso))
+    task_id = task.id
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    # Manually set status to RUNNING (it should already be RUNNING
+    # since _execute_task sets it at start, but be defensive).
+    assert engine._tasks[task_id].status == TaskStatus.RUNNING, (
+        f"expected RUNNING, got {engine._tasks[task_id].status} — "
+        "test setup wrong"
+    )
+
+    # resume() MUST refuse — return invalid_state.
+    result = await engine.resume(task_id)
+    assert result == "invalid_state", (
+        f"expected invalid_state, got {result!r} — resume() did not "
+        "refuse a RUNNING task; tick would re-fire and produce "
+        "double side effects"
+    )
+
+    # The task is STILL RUNNING (resume did not flip it).
+    assert engine._tasks[task_id].status == TaskStatus.RUNNING, (
+        f"expected RUNNING, got {engine._tasks[task_id].status} — "
+        "resume() flipped the status despite returning invalid_state"
+    )
+
+    # Cleanup.
+    release.set()
+    await engine.stop(timeout=2.0)
+
+
+async def test_resume_refuses_terminal_states() -> None:
+    """H1 (round-12): ``resume()`` MUST refuse terminal execution
+    states (``COMPLETED`` / ``FAILED``).  These are durable final
+    states — resuming would resurrect a finished task.
+
+    Sequence:
+      1. Create a task (no executor running).
+      2. Manually set status to COMPLETED.  Call ``resume()`` — MUST
+         return ``invalid_state``.
+      3. Manually set status to FAILED.  Call ``resume()`` — MUST
+         return ``invalid_state``.
+      4. In both cases, the status is unchanged.
+    """
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    engine = _engine()
+    iso = datetime.utcnow().isoformat()
+    task = await engine.create("resume-terminal", "p", ScheduleConfig(iso_time=iso))
+    task_id = task.id
+
+    # Test COMPLETED.
+    engine._tasks[task_id].status = TaskStatus.COMPLETED
+    result = await engine.resume(task_id)
+    assert result == "invalid_state", (
+        f"expected invalid_state for COMPLETED, got {result!r}"
+    )
+    assert engine._tasks[task_id].status == TaskStatus.COMPLETED, (
+        f"expected COMPLETED, got {engine._tasks[task_id].status} — "
+        "resume() flipped a terminal state despite returning invalid_state"
+    )
+
+    # Test FAILED.
+    engine._tasks[task_id].status = TaskStatus.FAILED
+    result = await engine.resume(task_id)
+    assert result == "invalid_state", (
+        f"expected invalid_state for FAILED, got {result!r}"
+    )
+    assert engine._tasks[task_id].status == TaskStatus.FAILED, (
+        f"expected FAILED, got {engine._tasks[task_id].status} — "
+        "resume() flipped a terminal state despite returning invalid_state"
+    )
+
+
+async def test_pause_refuses_cancelled_tombstone() -> None:
+    """H1 (round-12): ``pause()`` MUST refuse a CANCELLED removal
+    tombstone.  Without this, a caller could pause a CANCELLED
+    tombstone (turning it into PAUSED) and then resume it,
+    resurrecting a removed task.
+
+    Sequence:
+      1. Create a task.  Manually set status to CANCELLED (simulating
+         a removal tombstone).
+      2. Call ``pause()`` — MUST return ``invalid_state`` (NOT ``ok``).
+      3. The task is STILL CANCELLED (pause did not flip it).
+    """
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    engine = _engine()
+    iso = datetime.utcnow().isoformat()
+    task = await engine.create("pause-cancelled", "p", ScheduleConfig(iso_time=iso))
+    task_id = task.id
+
+    # Simulate a removal tombstone.
+    engine._tasks[task_id].status = TaskStatus.CANCELLED
+
+    # pause() MUST refuse — return invalid_state.
+    result = await engine.pause(task_id)
+    assert result == "invalid_state", (
+        f"expected invalid_state, got {result!r} — pause() did not "
+        "refuse a CANCELLED tombstone; the task could be resurrected "
+        "via pause → resume"
+    )
+
+    # The task is STILL CANCELLED.
+    assert engine._tasks[task_id].status == TaskStatus.CANCELLED, (
+        f"expected CANCELLED, got {engine._tasks[task_id].status} — "
+        "pause() flipped the tombstone to PAUSED despite returning "
+        "invalid_state"
+    )
+
+
+async def test_pause_refuses_terminal_states() -> None:
+    """H1 (round-12): ``pause()`` MUST refuse terminal execution
+    states (``COMPLETED`` / ``FAILED``).  These are durable final
+    states — pausing them is meaningless and could confuse the
+    caller.
+
+    Sequence:
+      1. Create a task.  Manually set status to COMPLETED.  Call
+         ``pause()`` — MUST return ``invalid_state``.
+      2. Manually set status to FAILED.  Call ``pause()`` — MUST
+         return ``invalid_state``.
+      3. In both cases, the status is unchanged.
+    """
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    engine = _engine()
+    iso = datetime.utcnow().isoformat()
+    task = await engine.create("pause-terminal", "p", ScheduleConfig(iso_time=iso))
+    task_id = task.id
+
+    # Test COMPLETED.
+    engine._tasks[task_id].status = TaskStatus.COMPLETED
+    result = await engine.pause(task_id)
+    assert result == "invalid_state", (
+        f"expected invalid_state for COMPLETED, got {result!r}"
+    )
+    assert engine._tasks[task_id].status == TaskStatus.COMPLETED, (
+        f"expected COMPLETED, got {engine._tasks[task_id].status} — "
+        "pause() flipped a terminal state despite returning invalid_state"
+    )
+
+    # Test FAILED.
+    engine._tasks[task_id].status = TaskStatus.FAILED
+    result = await engine.pause(task_id)
+    assert result == "invalid_state", (
+        f"expected invalid_state for FAILED, got {result!r}"
+    )
+    assert engine._tasks[task_id].status == TaskStatus.FAILED, (
+        f"expected FAILED, got {engine._tasks[task_id].status} — "
+        "pause() flipped a terminal state despite returning invalid_state"
+    )
+
+
+async def test_cancelled_tombstone_cannot_be_resurrected_via_pause_resume(
+    tmp_path,
+) -> None:
+    """H1 (round-12): a CANCELLED removal tombstone MUST NOT be
+    resurrectable via ``pause`` → ``resume``.  Previously
+    ``pause(CANCELLED)`` was allowed (it didn't check the status),
+    turning the tombstone into PAUSED; then ``resume(PAUSED)`` was
+    allowed, turning it into PENDING — the removed task was re-fired.
+
+    With the strict state transition matrix:
+      - ``pause(CANCELLED)`` returns ``invalid_state``.
+      - Even if the status were somehow flipped to PAUSED,
+        ``resume(PAUSED)`` checks for a live executor — but the
+        tombstone has no live executor (the executor was cancelled),
+        so resume would succeed.  The pause refusal is the key gate.
+
+    Sequence:
+      1. Spawn a task with a swallowing executor.
+      2. Call ``remove()`` — returns ``cancellation_pending``.  Task
+         stays in _tasks as a CANCELLED tombstone.
+      3. Call ``pause()`` — MUST return ``invalid_state`` (NOT ``ok``).
+         The task is STILL CANCELLED.
+      4. Call ``resume()`` — MUST return ``invalid_state`` (NOT ``ok``)
+         because the task is CANCELLED, not PAUSED.
+      5. The task is STILL CANCELLED — not resurrected.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def swallowing_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            while not release_exec.is_set():
+                try:
+                    await release_exec.wait()
+                except asyncio.CancelledError:
+                    if release_exec.is_set():
+                        raise
+                    # swallow
+            return "stale"
+
+        engine = CronEngine(
+            db=db,
+            executor=swallowing_executor,
+            tick_interval=0.01,
+        )
+        original_budget = engine_module._CANCEL_IN_FLIGHT_TIMEOUT
+        engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
+        try:
+            await engine.start()
+            iso = datetime.utcnow().isoformat()
+            task = await engine.create(
+                "resurrect", "p", ScheduleConfig(iso_time=iso)
+            )
+            task_id = task.id
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+
+            # remove() returns cancellation_pending (executor swallows
+            # cancel).  Task stays in _tasks as a CANCELLED tombstone.
+            result = await engine.remove(task_id)
+            assert result == "cancellation_pending"
+            assert engine._tasks[task_id].status == TaskStatus.CANCELLED
+
+            # pause() MUST refuse — return invalid_state (NOT ok).
+            pause_result = await engine.pause(task_id)
+            assert pause_result == "invalid_state", (
+                f"expected invalid_state, got {pause_result!r} — "
+                "pause() did not refuse the CANCELLED tombstone; "
+                "the task could be resurrected via pause → resume"
+            )
+            # The task is STILL CANCELLED.
+            assert engine._tasks[task_id].status == TaskStatus.CANCELLED, (
+                f"expected CANCELLED, got "
+                f"{engine._tasks[task_id].status} — pause() flipped "
+                "the tombstone to PAUSED"
+            )
+
+            # resume() MUST also refuse — return invalid_state (NOT ok)
+            # because the task is CANCELLED, not PAUSED.
+            resume_result = await engine.resume(task_id)
+            assert resume_result == "invalid_state", (
+                f"expected invalid_state, got {resume_result!r} — "
+                "resume() did not refuse the CANCELLED tombstone"
+            )
+            # The task is STILL CANCELLED.
+            assert engine._tasks[task_id].status == TaskStatus.CANCELLED
+
+            # The DB row is STILL CANCELLED.
+            rows = await db.list_scheduled_tasks()
+            row = next(r for r in rows if r["id"] == task_id)
+            assert row["status"] == "cancelled", (
+                f"expected DB status=cancelled, got {row['status']} — "
+                "the tombstone was resurrected in the DB"
+            )
+
+            # Release the executor so stop() can drain.
+            release_exec.set()
+            await engine.stop(timeout=2.0)
+        finally:
+            engine_module._CANCEL_IN_FLIGHT_TIMEOUT = original_budget
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+async def test_resume_paused_with_live_executor_returns_execution_pending(
+    tmp_path,
+) -> None:
+    """H1 (round-12): ``resume()`` on a PAUSED task whose old executor
+    is still alive MUST return ``execution_pending`` (NOT ``ok``).
+
+    This happens when a prior ``pause`` returned
+    ``cancellation_pending`` (the executor swallowed cancel).  The
+    task's status is PAUSED in memory and DB, but the old executor is
+    still running.  Resuming now would leave the old executor running
+    while tick re-publishes a new one — double side effects.
+
+    Sequence:
+      1. Spawn a task with a swallowing executor.
+      2. Call ``pause()`` — returns ``cancellation_pending``.  The
+         task is PAUSED in memory + DB, but the old executor is still
+         in _execute_tasks.
+      3. Call ``resume()`` — MUST return ``execution_pending`` (NOT
+         ``ok``) because the old executor is still alive.
+      4. The task is STILL PAUSED (resume did not flip it to PENDING).
+      5. Release the executor.  Now ``resume()`` returns ``ok``.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def swallowing_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            while not release_exec.is_set():
+                try:
+                    await release_exec.wait()
+                except asyncio.CancelledError:
+                    if release_exec.is_set():
+                        raise
+                    # swallow
+            return "stale"
+
+        engine = CronEngine(
+            db=db,
+            executor=swallowing_executor,
+            tick_interval=0.01,
+        )
+        original_budget = engine_module._CANCEL_IN_FLIGHT_TIMEOUT
+        engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
+        try:
+            await engine.start()
+            iso = datetime.utcnow().isoformat()
+            task = await engine.create(
+                "resume-exec-pending", "p", ScheduleConfig(iso_time=iso)
+            )
+            task_id = task.id
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+
+            # pause() returns cancellation_pending (executor swallows
+            # cancel).  Task is PAUSED in memory + DB, but the old
+            # executor is still in _execute_tasks.
+            pause_result = await engine.pause(task_id)
+            assert pause_result == "cancellation_pending"
+            assert engine._tasks[task_id].status == TaskStatus.PAUSED
+            assert task_id in engine._execute_tasks
+            assert not engine._execute_tasks[task_id].done()
+
+            # resume() MUST return execution_pending (NOT ok) because
+            # the old executor is still alive.
+            resume_result = await engine.resume(task_id)
+            assert resume_result == "execution_pending", (
+                f"expected execution_pending, got {resume_result!r} — "
+                "resume() did not detect the live executor; the old "
+                "executor would race with the new execution, causing "
+                "double side effects"
+            )
+            # The task is STILL PAUSED (resume did not flip it).
+            assert engine._tasks[task_id].status == TaskStatus.PAUSED, (
+                f"expected PAUSED, got {engine._tasks[task_id].status} "
+                "— resume() flipped the status despite returning "
+                "execution_pending"
+            )
+            # The DB row is STILL PAUSED.
+            rows = await db.list_scheduled_tasks()
+            row = next(r for r in rows if r["id"] == task_id)
+            assert row["status"] == "paused", (
+                f"expected DB status=paused, got {row['status']} — "
+                "resume() overwrote the paused DB row"
+            )
+
+            # Release the executor so it terminates.
+            release_exec.set()
+            await asyncio.wait_for(
+                engine._execute_tasks[task_id], timeout=2.0
+            )
+            # The done callback should have removed it from
+            # _execute_tasks.
+            assert task_id not in engine._execute_tasks, (
+                "the done callback did not remove the terminated "
+                "executor from _execute_tasks"
+            )
+
+            # Now resume() returns ok — the old executor is gone.
+            resume_result2 = await engine.resume(task_id)
+            assert resume_result2 == "ok", (
+                f"expected ok after executor terminated, got "
+                f"{resume_result2!r}"
+            )
+            # The task is now PENDING.
+            assert engine._tasks[task_id].status == TaskStatus.PENDING
+            # The DB row is now PENDING.
+            rows = await db.list_scheduled_tasks()
+            row = next(r for r in rows if r["id"] == task_id)
+            assert row["status"] == "pending", (
+                f"expected DB status=pending, got {row['status']}"
+            )
+
+            await engine.stop(timeout=2.0)
+        finally:
+            engine_module._CANCEL_IN_FLIGHT_TIMEOUT = original_budget
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+async def test_remove_refuses_terminal_states() -> None:
+    """H1 (round-12): ``remove()`` MUST refuse terminal execution
+    states (``COMPLETED`` / ``FAILED``).  These are durable final
+    states — re-cancelling them is meaningless and could confuse the
+    caller.
+
+    Sequence:
+      1. Create a task.  Manually set status to COMPLETED.  Call
+         ``remove()`` — MUST return ``invalid_state``.
+      2. Manually set status to FAILED.  Call ``remove()`` — MUST
+         return ``invalid_state``.
+      3. In both cases, the status is unchanged.
+    """
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    engine = _engine()
+    iso = datetime.utcnow().isoformat()
+    task = await engine.create("remove-terminal", "p", ScheduleConfig(iso_time=iso))
+    task_id = task.id
+
+    # Test COMPLETED.
+    engine._tasks[task_id].status = TaskStatus.COMPLETED
+    result = await engine.remove(task_id)
+    assert result == "invalid_state", (
+        f"expected invalid_state for COMPLETED, got {result!r}"
+    )
+    assert engine._tasks[task_id].status == TaskStatus.COMPLETED, (
+        f"expected COMPLETED, got {engine._tasks[task_id].status} — "
+        "remove() flipped a terminal state despite returning invalid_state"
+    )
+
+    # Test FAILED.
+    engine._tasks[task_id].status = TaskStatus.FAILED
+    result = await engine.remove(task_id)
+    assert result == "invalid_state", (
+        f"expected invalid_state for FAILED, got {result!r}"
+    )
+    assert engine._tasks[task_id].status == TaskStatus.FAILED, (
+        f"expected FAILED, got {engine._tasks[task_id].status} — "
+        "remove() flipped a terminal state despite returning invalid_state"
+    )

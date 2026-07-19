@@ -81,7 +81,9 @@ async def cron_remove(task_id: str, **kwargs: Any) -> dict:
     """Remove a scheduled task.
 
     Returns ``removed`` on success, ``not_found`` if the task does not
-    exist, ``cancellation_pending`` if the in-flight executor did not
+    exist, ``invalid_state`` if the task is in a terminal execution
+    state (COMPLETED / FAILED — cannot be re-cancelled),
+    ``cancellation_pending`` if the in-flight executor did not
     terminate within the cancel budget (retry ``remove`` to confirm),
     or ``persistence_pending`` if the executor terminated but the DB
     write failed (``stop()`` will retry — the state may not be durable
@@ -94,6 +96,13 @@ async def cron_remove(task_id: str, **kwargs: Any) -> dict:
         return {"status": "removed", "task_id": task_id}
     if result == "not_found":
         return {"status": "not_found", "task_id": task_id}
+    if result == "invalid_state":
+        return {
+            "status": "invalid_state",
+            "task_id": task_id,
+            "error": "task is in a terminal execution state "
+                     "(COMPLETED / FAILED) — cannot be re-cancelled",
+        }
     if result == "persistence_pending":
         return {
             "status": "persistence_pending",
@@ -118,7 +127,9 @@ async def cron_pause(task_id: str, **kwargs: Any) -> dict:
     """Pause a scheduled task.
 
     Returns ``paused`` on success, ``not_found`` if the task does not
-    exist, ``cancellation_pending`` if the in-flight executor did not
+    exist, ``invalid_state`` if the task is in a state that cannot be
+    paused (CANCELLED tombstone or terminal COMPLETED / FAILED),
+    ``cancellation_pending`` if the in-flight executor did not
     terminate within the cancel budget (retry ``pause`` to confirm),
     or ``persistence_pending`` if the executor terminated but the DB
     write failed (``stop()`` will retry — the state may not be durable
@@ -131,6 +142,14 @@ async def cron_pause(task_id: str, **kwargs: Any) -> dict:
         return {"status": "paused", "task_id": task_id}
     if result == "not_found":
         return {"status": "not_found", "task_id": task_id}
+    if result == "invalid_state":
+        return {
+            "status": "invalid_state",
+            "task_id": task_id,
+            "error": "task is in a state that cannot be paused "
+                     "(CANCELLED tombstone or terminal COMPLETED / "
+                     "FAILED) — state is unchanged",
+        }
     if result == "persistence_pending":
         return {
             "status": "persistence_pending",
@@ -154,8 +173,11 @@ async def cron_resume(task_id: str, **kwargs: Any) -> dict:
     """Resume a paused scheduled task.
 
     Returns ``resumed`` on success, ``not_found`` if the task does
-    not exist, or ``cancelled`` if the task is a CANCELLED removal
-    tombstone (cannot resume a task pending removal).
+    not exist, ``invalid_state`` if the task is not in the PAUSED
+    state (RUNNING / PENDING / CANCELLED / COMPLETED / FAILED —
+    cannot be resumed), or ``execution_pending`` if the task is
+    PAUSED but the old executor is still alive (retry after the
+    executor terminates or call ``remove`` to force-cancel).
     """
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
@@ -164,12 +186,21 @@ async def cron_resume(task_id: str, **kwargs: Any) -> dict:
         return {"status": "resumed", "task_id": task_id}
     if result == "not_found":
         return {"status": "not_found", "task_id": task_id}
-    # result == "cancelled" — task is a removal tombstone
+    if result == "invalid_state":
+        return {
+            "status": "invalid_state",
+            "task_id": task_id,
+            "error": "task is not in the PAUSED state — only PAUSED "
+                     "tasks can be resumed (state is unchanged)",
+        }
+    # result == "execution_pending" — PAUSED but old executor alive
     return {
-        "status": "cancelled",
+        "status": "execution_pending",
         "task_id": task_id,
-        "error": "task is a CANCELLED removal tombstone — cannot "
-                 "resume; retry remove() to complete the removal",
+        "error": "task is PAUSED but the old executor is still "
+                 "alive — resuming would cause double side effects; "
+                 "wait for the executor to terminate or call "
+                 "remove() to force-cancel",
     }
 
 
