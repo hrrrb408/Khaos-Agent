@@ -51,7 +51,7 @@ async def test_concurrent_ensure_page_cannot_relaunch_after_close(monkeypatch):
     original_launch_locked = manager._launch_locked
 
     async def tracking_launch_locked(*args, **kwargs):
-        if manager._closed:
+        if manager._closing_requested:
             launch_calls_after_close.append(1)
         return await original_launch_locked(*args, **kwargs)
 
@@ -77,6 +77,8 @@ async def test_concurrent_ensure_page_cannot_relaunch_after_close(monkeypatch):
     # the inner guard by calling ensure_page after close with _browser=None.
     await manager.close()
     assert manager._closed is True
+    assert manager._closing_requested is True
+    assert manager._close_failed is False
     assert manager._browser is None
 
     page = await manager.ensure_page(
@@ -138,6 +140,7 @@ async def test_close_sets_closed_inside_lock_not_outside():
         assert not isinstance(r, Exception), r
     # Manager is closed and stays closed.
     assert manager._closed is True
+    assert manager._closing_requested is True
     assert manager._browser is None
     # launch result reflects the closed state (closed check fires before
     # the playwright check inside _launch_locked).
@@ -178,4 +181,80 @@ async def test_interleaved_close_during_launch_acquisition_cannot_relaunch(monke
     assert launch_result["ok"] is False
     assert "permanently closed" in launch_result["error"]
     assert manager._closed is True
+    assert manager._closing_requested is True
     assert manager._browser is None
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-3): failed first close must be retryable, not falsely "ok"
+# ---------------------------------------------------------------------------
+
+
+async def test_failed_first_close_does_not_short_circuit_second_call(monkeypatch):
+    """H1 (round-3): a failed first ``close()`` must NOT set ``_closed``.
+
+    The previous single-flag design flipped ``_closed=True`` at the START
+    of close(), so a teardown failure (context.close / browser.close /
+    playwright.stop raising) left ``_closed`` permanently True.  The next
+    close() saw ``_closed`` and short-circuited to ``{ok: True}`` without
+    retrying — defeating AgentService.shutdown's fail-closed gate on the
+    browser result.
+
+    The 3-state fix:
+      * ``_closing_requested`` flips at the start (permanently blocks
+        launch/ensure_page — a half-torn-down manager must not serve new
+        work).
+      * ``_closed`` flips ONLY after every resource terminated cleanly.
+      * ``_close_failed`` records the failure so close() keeps retrying.
+    """
+    monkeypatch.setattr(browser_tools, "_HAS_PLAYWRIGHT", True)
+    manager = BrowserManager()
+
+    # Inject a fake browser + playwright whose close()/stop() raise on the
+    # first invocation and succeed on the second.  This simulates a
+    # transient teardown failure (e.g. browser process already gone).
+    call_counts = {"browser_close": 0, "playwright_stop": 0}
+
+    class FlakeyBrowser:
+        async def close(self):
+            call_counts["browser_close"] += 1
+            if call_counts["browser_close"] == 1:
+                raise RuntimeError("transient browser close failure")
+
+    class FlakeyPlaywright:
+        async def stop(self):
+            call_counts["playwright_stop"] += 1
+
+    manager._browser = FlakeyBrowser()
+    manager._playwright = FlakeyPlaywright()
+
+    # First close: fails.  Must report failure AND mark _close_failed, but
+    # NOT set _closed (so the next call actually retries).
+    first = await manager.close()
+    assert first["ok"] is False
+    assert "transient browser close failure" in first["error"]
+    assert manager._closed is False
+    assert manager._close_failed is True
+    # _closing_requested is permanent — launch/ensure_page must reject even
+    # though the manager is not fully closed.
+    assert manager._closing_requested is True
+    launch_result = await manager.launch()
+    assert launch_result["ok"] is False
+    assert "permanently closed" in launch_result["error"]
+
+    # Second close: browser.close() succeeds on the 2nd call.  Must
+    # actually retry (call_counts incremented again), report success,
+    # and now set _closed.
+    second = await manager.close()
+    assert second["ok"] is True
+    assert call_counts["browser_close"] == 2  # retried, not short-circuited
+    assert manager._closed is True
+    assert manager._close_failed is False
+    assert manager._browser is None
+
+    # Third close is now a true idempotent no-op (does NOT re-invoke
+    # browser.close, which is None anyway).
+    third = await manager.close()
+    assert third["ok"] is True
+    assert call_counts["browser_close"] == 2  # no extra invocation
+

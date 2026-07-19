@@ -138,12 +138,32 @@ class BrowserManager:
         # keys and grew for the lifetime of the server.
         self._lifecycle_lock = asyncio.Lock()
         self._context_close_failures: dict[str, int] = {}
-        # H1: once ``close()`` has run, the manager is permanently closed.
-        # A detached subagent task whose cancellation races with server
-        # teardown cannot relaunch a fresh Browser generation via
-        # ``launch()`` / ``ensure_page()`` after the shared authority has
-        # already been dismantled.
+        # H1 (round-3): the close lifecycle is now a 3-state machine so
+        # that a FAILED first close can be retried instead of falsely
+        # reporting success on the second call:
+        #
+        #   _closing_requested — set the moment ``close()`` begins.
+        #     Permanently blocks ``launch``/``ensure_page`` (no new
+        #     browser generation can start once teardown is requested).
+        #     Never cleared.
+        #   _closed — set ONLY after every owned resource (contexts,
+        #     browser, playwright) has terminated cleanly.  Idempotent
+        #     close() short-circuits to ``{ok: True}`` only when this is
+        #     set.  Without a successful teardown, the next close() MUST
+        #     keep retrying.
+        #   _close_failed — set when the previous close attempt raised.
+        #     Lets ``launch``/``ensure_page`` keep rejecting (because
+        #     _closing_requested stays True) while ``close`` keeps
+        #     retrying until resources actually terminate.
+        #
+        # The previous single-flag ``_closed`` was set BEFORE the
+        # teardown attempts, so a failure left it permanently True —
+        # the next close() saw ``_closed`` and returned ``{ok: True}``
+        # without retrying, defeating AgentService.shutdown's fail-closed
+        # gate on the browser result.
+        self._closing_requested: bool = False
         self._closed: bool = False
+        self._close_failed: bool = False
 
     @property
     def is_ready(self) -> bool:
@@ -186,14 +206,17 @@ class BrowserManager:
             ``{"ok": True, "browser_type": ..., "headless": ...}`` 成功；
             ``{"ok": False, "error": "..."}`` 失败（Playwright 缺失或启动报错）。
 
-        H1: the closed-state check lives here (the deepest chokepoint) so
-        every launch path — ``launch()``, ``ensure_page()``'s lazy restart,
-        any future caller — is gated by it regardless of whether the outer
-        caller remembered to check.  Must be called under
-        ``_lifecycle_lock`` so the check cannot race a concurrent
-        ``close()``.
+        H1 (round-3): the closed-state check uses ``_closing_requested`` so
+        it rejects new launches the moment teardown begins — even when the
+        previous close() attempt FAILED (``_closed`` stays False on
+        failure, but ``_closing_requested`` is permanent).  This is the
+        deepest chokepoint: every launch path — ``launch()``,
+        ``ensure_page()``'s lazy restart, any future caller — is gated
+        regardless of whether the outer caller remembered to check.  Must
+        be called under ``_lifecycle_lock`` so the check cannot race a
+        concurrent ``close()``.
         """
-        if self._closed:
+        if self._closing_requested:
             return {
                 "ok": False,
                 "error": "browser manager is permanently closed",
@@ -380,22 +403,38 @@ class BrowserManager:
         return f"{p}:{s}:{r}"
 
     async def close(self) -> dict[str, Any]:
-        """关闭浏览器和 Playwright runtime（幂等）。
+        """关闭浏览器和 Playwright runtime（幂等且可重试）。
 
-        H1: ``_closed`` is set INSIDE the lock so the state transition is
-        atomic with respect to ``launch`` / ``ensure_page``.  Setting it
-        outside the lock was a TOCTOU race: a concurrent caller that had
-        already passed its own (since-removed) outer check would acquire
-        the lock next and observe ``_browser=None`` + ``_closed=True``, but
-        the previous code path still fell through to ``_launch_locked``
-        which had no closed guard.  Now ``_closed`` flip and teardown share
-        one critical section, and ``_launch_locked`` itself rejects when
-        closed — defense in depth.
+        H1 (round-3): the close state is now a 3-state machine so a failed
+        first close can be retried instead of falsely reporting success
+        on the next call:
+
+        * ``_closing_requested`` is set the moment close() begins and never
+          cleared — ``launch``/``ensure_page`` permanently reject new
+          work after this.
+        * ``_closed`` is set ONLY after every owned resource has terminated
+          cleanly.  The idempotent ``{ok: True}`` short-circuit fires only
+          when this is set.  A failed close does NOT set ``_closed``, so
+          the next close() actually retries.
+        * ``_close_failed`` records the previous failure so the manager
+          stays closed-for-launch while still permitting close() retries.
+
+        All state reads/writes are inside ``_lifecycle_lock`` so the
+        state transitions are atomic with respect to launch/ensure_page.
         """
         async with self._lifecycle_lock:
+            # Idempotent: once every resource has terminated cleanly, a
+            # subsequent close() is a no-op success.  This short-circuit
+            # fires ONLY on full success — a failed previous attempt
+            # (``_close_failed``) keeps ``_closed`` False so the caller
+            # can observe and retry.
             if self._closed:
                 return {"ok": True}
-            self._closed = True
+            # Mark teardown-in-progress so launch/ensure_page reject new
+            # work from this point on.  Never cleared, even on failure —
+            # a half-torn-down manager must not serve new pages.
+            self._closing_requested = True
+            self._close_failed = False
             try:
                 await self._close_all_contexts()
                 if self._browser:
@@ -405,8 +444,17 @@ class BrowserManager:
                 self._browser = None
                 self._playwright = None
                 self._context_close_failures.clear()
+                # All resources terminated cleanly — only now is the
+                # manager truly closed.  The idempotent short-circuit
+                # above will fire on subsequent calls.
+                self._closed = True
                 return {"ok": True}
             except Exception as exc:  # noqa: BLE001 — surfaced as error dict
+                # Teardown failed: do NOT set ``_closed``.  The next
+                # close() call must retry the residual resources instead
+                # of short-circuiting to success.  ``_closing_requested``
+                # stays True so no new browser generation starts.
+                self._close_failed = True
                 logger.error("Failed to close browser: %s", exc)
                 return {"ok": False, "error": str(exc)}
 
@@ -475,14 +523,13 @@ class BrowserManager:
     ) -> Optional[Page]:
         """Create or reuse a page while ``_lifecycle_lock`` is held.
 
-        H1: the closed-state check lives here (inside the lock) so a
-        concurrent ``close()`` that flipped ``_closed`` after the caller
-        entered ``ensure_page`` but before it acquired the lock is observed
-        here.  Without this, the ``_browser is None`` branch below would
-        fall through to ``_launch_locked`` and relaunch a fresh browser
-        generation after teardown.
+        H1 (round-3): the closed-state check uses ``_closing_requested``
+        so a half-torn-down manager (first close failed) still rejects
+        new pages while a retry is pending — without relying on the
+        failure-only ``_closed`` flag.  Inside the lock so the check
+        cannot race a concurrent ``close()``.
         """
-        if self._closed:
+        if self._closing_requested:
             self._last_ensure_error = "browser manager is permanently closed"
             return None
         entry = self._contexts.get(key)
