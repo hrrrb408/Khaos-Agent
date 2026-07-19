@@ -96,6 +96,17 @@ class CronEngine:
         # the asyncio "never retrieved" warning); removal is the next
         # ``stop()``'s job, AFTER it has explicitly read the exception.
         self._persistence_owners: dict[str, asyncio.Task] = {}
+        # H1 (round-9): execution epoch fence.  Bumped by ``pause()``
+        # and ``remove()`` BEFORE they cancel the in-flight executor.
+        # ``_execute_task`` captures the epoch at start and re-checks
+        # it before writing any terminal state (PENDING / COMPLETED /
+        # CANCELLED / FAILED).  If the epoch changed during execution,
+        # the old executor MUST NOT overwrite the desired state set by
+        # pause/remove — otherwise a slow executor that ignored cancel
+        # could come back later and write ``pending`` / ``completed``,
+        # silently violating the user-visible contract ("I paused /
+        # removed this task").
+        self._execution_epoch: dict[str, int] = {}
 
     async def start(self) -> None:
         """启动调度循环。"""
@@ -229,7 +240,18 @@ class CronEngine:
             for tid, owner in retained_snapshot.items():
                 if owner in retained_done:
                     self._persistence_owners.pop(tid, None)
-                    exc = owner.exception()
+                    # H1 (round-9): ``Task.exception()`` RAISES
+                    # ``CancelledError`` on a cancelled task (rather
+                    # than returning it).  In Python 3.8+
+                    # ``CancelledError`` inherits from ``BaseException``,
+                    # so ``except Exception`` would NOT catch it.  Use
+                    # a bare ``except`` for defensive safety even
+                    # though we don't expect this owner to be cancelled
+                    # — unify with the SubAgent owner state machine.
+                    try:
+                        exc = owner.exception()
+                    except asyncio.CancelledError:
+                        exc = None
                     if exc is not None:
                         logger.error(
                             "cron engine stop: retained persistence "
@@ -292,7 +314,12 @@ class CronEngine:
             def _read_owner_exception(
                 _t, tids=frozenset(pending_ids),
             ) -> None:
-                exc = _t.exception()
+                # H1 (round-9): catch CancelledError — see the re-drain
+                # loop above for the rationale.
+                try:
+                    exc = _t.exception()
+                except asyncio.CancelledError:
+                    exc = None
                 if exc is not None:
                     logger.error(
                         "cron engine: retained persistence owner for "
@@ -384,100 +411,170 @@ class CronEngine:
         logger.info("scheduled task created: %s (%s)", name, task.id)
         return task
 
-    async def pause(self, task_id: str) -> bool:
+    async def pause(self, task_id: str) -> str:
         """Pause a task.
 
-        M1 (round-8): if the task is currently executing (there is an
-        in-flight ``_execute_task`` for it), cancel + await it BEFORE
-        flipping the status.  Otherwise the in-flight execution would
-        complete after ``pause()`` returned and overwrite the ``paused``
-        DB row with ``completed`` / ``pending`` — the user-visible
-        contract ("I paused this task") would be silently violated and
-        the executor's external side effects would keep running.
+        Returns one of:
+          - ``"ok"``: task was paused (executor was not running, or
+            cancel terminated it within the budget).
+          - ``"not_found"``: task_id is not registered.
+          - ``"cancellation_pending"``: the in-flight executor did NOT
+            terminate within the cancel budget.  The task's desired
+            state is still set to ``PAUSED`` (and persisted), but the
+            old executor may still be producing external side effects.
+            The caller MUST NOT claim the task is paused — the
+            executor is still live.
 
-        The cancelled ``_execute_task`` writes ``cancelled`` to the DB
-        via its ``CancelledError`` branch; this method then overrides
-        with ``paused``.  The net DB state is ``paused``.
+        H1 (round-9): the epoch is bumped BEFORE cancelling.  This
+        prevents the old executor (if it ignores cancel) from
+        overwriting the ``PAUSED`` state when it eventually completes
+        — the epoch fence in ``_execute_task`` discards the stale
+        write.
+
+        M1 (round-8): cancel + await the in-flight executor before
+        flipping the status, so the executor cannot overwrite the
+        ``paused`` DB row with ``completed`` / ``pending``.
+
+        H2 (round-9): the persist uses ``_persist_task_state`` (the
+        state-machine path) so a DB failure is tracked in
+        ``_pending_persistence`` and retried by ``stop()``.  This
+        replaces the bare ``update_scheduled_task_status`` which had
+        no retry.
         """
         task = self._tasks.get(task_id)
         if not task:
-            return False
-        await self._cancel_in_flight_execution(task_id)
+            return "not_found"
+        # H1 (round-9): bump epoch BEFORE cancelling so the old
+        # executor cannot overwrite the PAUSED state we're about to
+        # set (epoch fence in _execute_task).
+        self._bump_epoch(task_id)
+        cancel_ok = await self._cancel_in_flight_execution(task_id)
         task.status = TaskStatus.PAUSED
         if self.db:
-            await self.db.update_scheduled_task_status(task_id, TaskStatus.PAUSED.value)
-        return True
+            try:
+                await self._persist_task_state(task)
+            except Exception:  # noqa: BLE001 — stop() will retry
+                logger.error(
+                    "cron task %s: could not persist paused state; "
+                    "will retry on stop()", task.name, exc_info=True,
+                )
+        return "ok" if cancel_ok else "cancellation_pending"
 
     async def resume(self, task_id: str) -> bool:
         task = self._tasks.get(task_id)
         if not task:
             return False
+        # H1 (round-9): bump epoch so any in-flight (cancellation-
+        # resistant) executor from before the pause cannot overwrite
+        # the resumed PENDING state.
+        self._bump_epoch(task_id)
         task.status = TaskStatus.PENDING
         task.next_run = self._compute_next_run(task)
         if self.db:
             await self.db.update_scheduled_task_status(task_id, TaskStatus.PENDING.value)
         return True
 
-    async def remove(self, task_id: str) -> bool:
+    async def remove(self, task_id: str) -> str:
         """Remove (cancel) a task.
 
-        M1 (round-8): if the task is currently executing, cancel + await
-        the in-flight ``_execute_task`` BEFORE popping the task from
-        ``_tasks``.  Otherwise the in-flight execution would complete
-        after ``remove()`` returned and overwrite the ``cancelled`` DB
-        row with ``completed`` / ``pending`` — the user-visible contract
-        ("I removed this task, it should not run again") would be
-        silently violated and the executor's external side effects would
-        keep running.  On restart the scheduler would also re-fire the
-        task (DB row was overwritten back to ``pending``).
+        Returns one of:
+          - ``"ok"``: task was removed (executor was not running, or
+            cancel terminated it within the budget) AND the terminal
+            ``cancelled`` state was durably persisted (or there is no
+            DB).  The task is popped from ``_tasks``.
+          - ``"not_found"``: task_id is not registered.
+          - ``"cancellation_pending"``: the in-flight executor did NOT
+            terminate within the cancel budget.  The task's desired
+            state is still set to ``CANCELLED`` (and persisted if
+            possible), but the old executor may still be producing
+            external side effects.  The task is NOT popped from
+            ``_tasks`` so the caller can retry.  The caller MUST NOT
+            claim the task is removed — the executor is still live.
 
-        The cancelled ``_execute_task`` writes ``cancelled`` to the DB
-        via its ``CancelledError`` branch; this method then pops the
-        task from ``_tasks`` and writes ``cancelled`` again (idempotent).
+        H1 (round-9): the epoch is bumped BEFORE cancelling so the
+        old executor cannot overwrite the ``CANCELLED`` state when it
+        eventually completes.
+
+        H2 (round-9): the task is NOT popped from ``_tasks`` until
+        ``_persist_task_state`` succeeds.  If the persist fails, the
+        task stays in ``_tasks`` with status ``CANCELLED`` and is
+        tracked in ``_pending_persistence`` for ``stop()`` to retry.
+        Previously ``remove()`` popped from ``_tasks`` BEFORE the
+        DB write — if the write failed, ``reconcile`` could not find
+        the task in memory and silently discarded the pending flag,
+        leaving the DB row at ``running`` / ``pending`` and causing
+        the task to be re-fired on restart.
+
+        M1 (round-8): cancel + await the in-flight executor before
+        flipping the status.
         """
         task = self._tasks.get(task_id)
         if not task:
-            return False
-        await self._cancel_in_flight_execution(task_id)
-        self._tasks.pop(task_id, None)
+            return "not_found"
+        # H1 (round-9): bump epoch BEFORE cancelling.
+        self._bump_epoch(task_id)
+        cancel_ok = await self._cancel_in_flight_execution(task_id)
         task.status = TaskStatus.CANCELLED
         if self.db:
-            await self.db.update_scheduled_task_status(task_id, TaskStatus.CANCELLED.value)
-        return True
+            try:
+                # H2 (round-9): use the state-machine persist path so
+                # a failure is tracked in _pending_persistence and
+                # retried by stop().  Only pop from _tasks on success.
+                await self._persist_task_state(task)
+                self._tasks.pop(task_id, None)
+            except Exception:  # noqa: BLE001 — stop() will retry
+                logger.error(
+                    "cron task %s: could not persist cancelled state; "
+                    "will retry on stop() — task retained in _tasks "
+                    "for reconcile", task.name, exc_info=True,
+                )
+        else:
+            # No DB — nothing to persist, safe to pop.
+            self._tasks.pop(task_id, None)
+        return "ok" if cancel_ok else "cancellation_pending"
 
-    async def _cancel_in_flight_execution(self, task_id: str) -> None:
+    def _bump_epoch(self, task_id: str) -> int:
+        """H1 (round-9): increment the execution epoch for ``task_id``.
+
+        Called by ``pause()`` / ``remove()`` / ``resume()`` BEFORE
+        cancelling the in-flight executor.  ``_execute_task`` captures
+        the epoch at start and re-checks it before writing any terminal
+        state; if the epoch changed, the old executor's write is
+        discarded (the desired state set by pause/remove wins).
+        """
+        new_epoch = self._execution_epoch.get(task_id, 0) + 1
+        self._execution_epoch[task_id] = new_epoch
+        return new_epoch
+
+    async def _cancel_in_flight_execution(self, task_id: str) -> bool:
         """M1 (round-8): cancel + await the in-flight ``_execute_task``
         for ``task_id``, if any.
 
-        If the task is not currently executing (no entry in
-        ``_execute_tasks``, or the entry is already done), this is a
-        no-op.  Otherwise the in-flight coroutine is cancelled; its
-        ``CancelledError`` branch writes ``cancelled`` to the DB and
-        re-raises.  The caller (``pause`` / ``remove``) then overrides
-        the DB row with the desired final state.
+        Returns ``True`` if the executor was not running, or if it
+        terminated (within the cancel budget).  Returns ``False`` if
+        the executor did NOT terminate within the budget — the caller
+        MUST NOT claim success in this case.
+
+        H1 (round-9): the return value is now authoritative.  Previously
+        this method returned ``None`` and the caller (``pause`` /
+        ``remove``) always claimed success, even when the executor was
+        still running — the user-visible contract was silently violated.
 
         The wait is bounded by ``_CANCEL_IN_FLIGHT_TIMEOUT`` (10s) so
         a cancellation-resistant executor cannot wedge ``pause`` /
         ``remove`` forever — they are user-facing RPCs and must return
         in bounded time.  We use ``asyncio.wait`` (NOT ``wait_for``)
         so a cancellation-resistant executor that swallows
-        ``CancelledError`` does NOT make the wait hang forever —
-        ``wait_for`` cancels the inner coroutine on timeout and then
-        WAITS for it to terminate, which would hang; ``wait`` returns
-        immediately on timeout, leaving the inner task pending.
+        ``CancelledError`` does NOT make the wait hang forever.
 
         If the executor does not terminate within the budget, the
         in-flight task remains in ``_execute_tasks`` (still borrowing
         shared authorities) for ``stop()`` to handle — ``stop()`` will
-        raise ``ServiceShutdownError`` on the next shutdown.  The
-        pause/remove proceeds anyway, writing the desired final state
-        to the DB; the wedged executor's later DB write (if it ever
-        terminates) will be a no-op stale-write that the next
-        ``_tick_loop`` / ``stop()`` cycle reconciles.
+        raise ``ServiceShutdownError`` on the next shutdown.
         """
         exec_task = self._execute_tasks.get(task_id)
         if exec_task is None or exec_task.done():
-            return
+            return True
         exec_task.cancel()
         done, pending = await asyncio.wait(
             {exec_task}, timeout=_CANCEL_IN_FLIGHT_TIMEOUT,
@@ -505,18 +602,21 @@ class CronEngine:
                     task_id, exc, exc_info=exc,
                 )
             self._execute_tasks.pop(task_id, None)
+            return True
         else:
             # The executor did not terminate within the budget.  Leave
             # it in ``_execute_tasks`` (still borrowing shared
-            # authorities) for ``stop()`` to handle.  Proceed with
-            # pause/remove anyway — the user-facing RPC must return.
+            # authorities) for ``stop()`` to handle.  The caller
+            # (pause/remove) returns "cancellation_pending" so the
+            # user is informed that the executor is still live.
             logger.error(
                 "cron engine: in-flight execution for task %s did not "
-                "terminate within %.1fs cancel budget; proceeding with "
-                "pause/remove — wedged task remains in _execute_tasks "
-                "for stop() to handle",
+                "terminate within %.1fs cancel budget; returning "
+                "cancellation_pending — wedged task remains in "
+                "_execute_tasks for stop() to handle",
                 task_id, _CANCEL_IN_FLIGHT_TIMEOUT,
             )
+            return False
 
     async def list_tasks(self) -> list[ScheduledTask]:
         return list(self._tasks.values())
@@ -614,7 +714,20 @@ class CronEngine:
         ``RUNNING`` and the DB row stale.  On restart the scheduler
         would re-fire the task, potentially double-executing any
         external side effects.
+
+        H1 (round-9): execution epoch fence.  The epoch is captured at
+        start and re-checked before writing ANY terminal state
+        (PENDING / COMPLETED / CANCELLED / FAILED).  If the epoch
+        changed during execution (because ``pause()`` / ``remove()``
+        was called), the old executor MUST NOT overwrite the desired
+        state — it returns / re-raises without persisting.  This
+        prevents a cancellation-resistant executor that ignores cancel
+        from coming back later and writing ``pending`` / ``completed``,
+        silently violating the user-visible contract ("I paused /
+        removed this task").
         """
+        # H1 (round-9): capture epoch at start.
+        epoch_at_start = self._execution_epoch.get(task.id, 0)
         task.status = TaskStatus.RUNNING
         task.last_run = datetime.utcnow()
         try:
@@ -622,6 +735,16 @@ class CronEngine:
                 result = await self._executor(task.id, task.prompt)
             else:
                 result = f"[no executor] prompt: {task.prompt[:100]}"
+
+            # H1 (round-9): epoch fence on the success path.  If
+            # pause/remove was called while the executor was running,
+            # they bumped the epoch and set the desired terminal state
+            # (PAUSED / CANCELLED).  We MUST NOT overwrite it with
+            # PENDING / COMPLETED — the stale write would silently
+            # violate the user-visible contract.
+            if self._epoch_changed(task, epoch_at_start):
+                return
+
             task.last_result = str(result)[:2000] if result else ""
             task.run_count += 1
 
@@ -649,6 +772,14 @@ class CronEngine:
             # out of ``_persist_task_state`` and mask the
             # ``CancelledError``, leaving the caller (``stop()``'s
             # drain) without the cancellation signal.
+            #
+            # H1 (round-9): epoch fence on the cancel path too.  If
+            # pause/remove bumped the epoch, they've already set the
+            # desired terminal state (PAUSED / CANCELLED).  We must
+            # NOT overwrite it with our own CANCELLED write — re-raise
+            # without persisting.
+            if self._epoch_changed(task, epoch_at_start):
+                raise
             task.status = TaskStatus.CANCELLED
             task.error = "cancelled"
             logger.info("task %s cancelled during execution", task.name)
@@ -661,6 +792,9 @@ class CronEngine:
                 )
             raise
         except Exception as exc:
+            # H1 (round-9): epoch fence on the failure path too.
+            if self._epoch_changed(task, epoch_at_start):
+                return
             task.status = TaskStatus.FAILED
             task.error = str(exc)
             logger.error("task %s failed: %s", task.name, exc)
@@ -669,6 +803,11 @@ class CronEngine:
         # fail; swallow it so the _execute_task coroutine terminates
         # cleanly.  ``stop()`` will retry the persist via its reconcile
         # pass (``_pending_persistence`` retains the task_id).
+        #
+        # H1 (round-9): re-check epoch before persisting — it might
+        # have changed during the on_complete callback.
+        if self._epoch_changed(task, epoch_at_start):
+            return
         try:
             await self._persist_task_state(task)
         except Exception:  # noqa: BLE001 — stop() will retry
@@ -677,6 +816,26 @@ class CronEngine:
                 "will retry on stop()",
                 task.name, task.status.value, exc_info=True,
             )
+
+    def _epoch_changed(self, task: ScheduledTask, epoch_at_start: int) -> bool:
+        """H1 (round-9): return ``True`` if the execution epoch for
+        ``task`` has changed since ``epoch_at_start``.
+
+        Called by ``_execute_task`` before writing any terminal state.
+        If the epoch changed, ``pause()`` / ``remove()`` / ``resume()``
+        was called during execution — the desired state they set must
+        NOT be overwritten by the stale executor.
+        """
+        current = self._execution_epoch.get(task.id, 0)
+        if current != epoch_at_start:
+            logger.info(
+                "task %s: execution epoch changed (%d → %d); "
+                "pause/remove/resume requested during execution — "
+                "not overwriting the desired state",
+                task.name, epoch_at_start, current,
+            )
+            return True
+        return False
 
     async def _persist_task_state(self, task: ScheduledTask) -> None:
         """Persist the current task state to the DB.

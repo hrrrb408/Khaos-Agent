@@ -67,7 +67,7 @@ async def test_pause_resume() -> None:
     engine = _engine()
     task = await engine.create("t", "p", ScheduleConfig(interval_seconds=60))
 
-    assert await engine.pause(task.id) is True
+    assert await engine.pause(task.id) == "ok"
     assert task.status == TaskStatus.PAUSED
 
     assert await engine.resume(task.id) is True
@@ -76,20 +76,20 @@ async def test_pause_resume() -> None:
 
 
 async def test_pause_unknown_returns_false() -> None:
-    assert await _engine().pause("ghost") is False
+    assert await _engine().pause("ghost") == "not_found"
 
 
 async def test_remove() -> None:
     engine = _engine()
     task = await engine.create("t", "p", ScheduleConfig(interval_seconds=60))
 
-    assert await engine.remove(task.id) is True
+    assert await engine.remove(task.id) == "ok"
     assert await engine.get(task.id) is None
     assert task.status == TaskStatus.CANCELLED
 
 
 async def test_remove_unknown_returns_false() -> None:
-    assert await _engine().remove("ghost") is False
+    assert await _engine().remove("ghost") == "not_found"
 
 
 # ---------------------------------------------------------------------------
@@ -995,8 +995,8 @@ async def test_pause_cancels_in_flight_execution(tmp_path) -> None:
 
         # pause() cancels + awaits the in-flight executor, then writes
         # paused to the DB.
-        ok = await engine.pause(task_id)
-        assert ok is True
+        result = await engine.pause(task_id)
+        assert result == "ok"
 
         # The in-flight execution was cancelled and removed from the
         # registry (it terminated within the cancel budget).
@@ -1075,8 +1075,8 @@ async def test_remove_cancels_in_flight_execution(tmp_path) -> None:
 
         # remove() cancels + awaits the in-flight executor, then
         # writes cancelled to the DB and pops the task from _tasks.
-        ok = await engine.remove(task_id)
-        assert ok is True
+        result = await engine.remove(task_id)
+        assert result == "ok"
 
         # The in-flight execution was cancelled and removed.
         assert task_id not in engine._execute_tasks, (
@@ -1145,8 +1145,8 @@ async def test_remove_prevents_task_refire_on_restart(tmp_path) -> None:
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
         # remove() while the executor is in-flight.
-        ok = await engine.remove(task_id)
-        assert ok is True
+        result = await engine.remove(task_id)
+        assert result == "ok"
 
         # stop() the engine.
         release_exec.set()
@@ -1170,6 +1170,448 @@ async def test_remove_prevents_task_refire_on_restart(tmp_path) -> None:
             "DB row"
         )
         await engine2.stop()
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H1 (round-9): pause/remove return cancellation_pending + epoch fence
+# ---------------------------------------------------------------------------
+
+
+async def test_pause_returns_cancellation_pending_and_epoch_fence_holds(
+    tmp_path,
+) -> None:
+    """H1 (round-9): when ``pause()`` is called on a task whose executor
+    swallows ``CancelledError`` and does NOT terminate within the cancel
+    budget, ``pause()`` MUST return ``cancellation_pending`` (NOT
+    ``ok``) — the caller MUST NOT claim the task is paused.
+
+    Simultaneously, the execution epoch fence MUST prevent the stale
+    executor from overwriting the ``PAUSED`` state when it eventually
+    completes.  Without the fence, the stale executor's success path
+    would set the status to ``PENDING`` / ``COMPLETED``, increment
+    ``run_count``, and overwrite the ``paused`` DB row — silently
+    violating the user-visible contract ("I paused this task") and
+    causing the task to be re-fired.
+
+    Sequence:
+      1. Spawn a Cron task whose executor swallows ``CancelledError``
+         until ``release_exec`` is set.
+      2. Patch ``_CANCEL_IN_FLIGHT_TIMEOUT`` to 0.3s so the test
+         doesn't wait 10s.
+      3. Call ``pause()`` — bumps epoch, cancels the executor.  The
+         executor swallows, so after the 0.3s budget ``pause()``
+         returns ``cancellation_pending``.  In-memory status is
+         ``PAUSED``; DB row is ``PAUSED``; the old executor is still
+         in ``_execute_tasks``.
+      4. Release the executor.  It returns from the swallowed cancel
+         and proceeds to the success path of ``_execute_task``.  The
+         epoch fence detects the bumped epoch and returns WITHOUT
+         overwriting the ``PAUSED`` state.
+      5. In-memory status is still ``PAUSED``; DB row is still
+         ``PAUSED``; ``run_count`` did NOT increment.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def swallowing_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            # Swallow CancelledError until release_exec is set, then
+            # return — simulating a slow executor that ignored cancel
+            # and eventually completed.
+            while not release_exec.is_set():
+                try:
+                    await release_exec.wait()
+                except asyncio.CancelledError:
+                    if release_exec.is_set():
+                        raise
+                    # swallow: stay pending past the cancel budget
+            return "stale-result"
+
+        engine = CronEngine(
+            db=db,
+            executor=swallowing_executor,
+            tick_interval=0.01,
+        )
+        # Patch the cancel budget to 0.3s so pause() doesn't wait 10s.
+        original_budget = engine_module._CANCEL_IN_FLIGHT_TIMEOUT
+        engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
+        try:
+            await engine.start()
+            iso = datetime.utcnow().isoformat()
+            task = await engine.create(
+                "pause-cp", "p", ScheduleConfig(iso_time=iso)
+            )
+            task_id = task.id
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+
+            # pause() cancels the executor.  The executor swallows
+            # CancelledError, so after the 0.3s budget pause() returns
+            # cancellation_pending — NOT ok.
+            result = await engine.pause(task_id)
+            assert result == "cancellation_pending", (
+                f"expected cancellation_pending, got {result!r} — "
+                "pause() claimed success despite the executor not "
+                "terminating within the cancel budget"
+            )
+
+            # The desired state is set: in-memory PAUSED, DB PAUSED.
+            assert engine._tasks[task_id].status == TaskStatus.PAUSED, (
+                f"expected PAUSED, got {engine._tasks[task_id].status} — "
+                "pause() did not set the desired state"
+            )
+            rows = await db.list_scheduled_tasks()
+            row = next(r for r in rows if r["id"] == task_id)
+            assert row["status"] == "paused", (
+                f"expected DB status=paused, got {row['status']} — "
+                "pause() did not persist the desired state"
+            )
+
+            # The old executor is STILL in _execute_tasks (swallowed
+            # cancel, did not terminate).  Ownership of the still-live
+            # task is retained for stop() to handle.
+            assert task_id in engine._execute_tasks, (
+                "pause() cleared _execute_tasks despite the executor "
+                "not terminating — ownership of the still-live task "
+                "was silently released"
+            )
+            assert not engine._execute_tasks[task_id].done(), (
+                "the wedged executor was marked done despite swallowing "
+                "cancel — test setup is wrong"
+            )
+            # run_count has NOT incremented (the executor has not
+            # completed yet).
+            assert engine._tasks[task_id].run_count == 0, (
+                f"run_count={engine._tasks[task_id].run_count} — the "
+                "executor incremented run_count before completing"
+            )
+
+            # Now release the executor.  It returns from the swallowed
+            # cancel and proceeds to the success path of _execute_task.
+            # The epoch fence detects the bumped epoch and returns
+            # WITHOUT overwriting the PAUSED state.
+            release_exec.set()
+            await asyncio.wait_for(
+                engine._execute_tasks[task_id], timeout=2.0
+            )
+
+            # run_count did NOT increment (the stale success path was
+            # fenced).
+            assert engine._tasks[task_id].run_count == 0, (
+                f"run_count={engine._tasks[task_id].run_count} — the "
+                "stale executor's success path was NOT fenced and "
+                "incremented run_count"
+            )
+            # The in-memory status is still PAUSED (NOT PENDING /
+            # COMPLETED).
+            assert engine._tasks[task_id].status == TaskStatus.PAUSED, (
+                f"expected PAUSED after stale executor completed, got "
+                f"{engine._tasks[task_id].status} — the epoch fence "
+                "did NOT prevent the stale in-memory write"
+            )
+            # The DB row is still PAUSED.
+            rows = await db.list_scheduled_tasks()
+            row = next(r for r in rows if r["id"] == task_id)
+            assert row["status"] == "paused", (
+                f"expected DB status=paused after stale executor "
+                f"completed, got {row['status']} — the epoch fence "
+                "did NOT prevent the stale DB write"
+            )
+
+            await engine.stop(timeout=2.0)
+        finally:
+            engine_module._CANCEL_IN_FLIGHT_TIMEOUT = original_budget
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+async def test_remove_returns_cancellation_pending_and_epoch_fence_holds(
+    tmp_path,
+) -> None:
+    """H1 (round-9): when ``remove()`` is called on a task whose
+    executor swallows ``CancelledError`` and does NOT terminate within
+    the cancel budget, ``remove()`` MUST return ``cancellation_pending``
+    (NOT ``ok``) — the caller MUST NOT claim the task is removed.
+
+    The execution epoch fence MUST prevent the stale executor from
+    overwriting the ``CANCELLED`` DB row when it eventually completes.
+    Without the fence, the stale executor's success path would set the
+    status to ``PENDING`` / ``COMPLETED`` and overwrite the
+    ``cancelled`` DB row — on restart the scheduler would re-fire the
+    task, potentially double-executing external side effects.
+
+    Sequence:
+      1. Spawn a Cron task whose executor swallows ``CancelledError``
+         until ``release_exec`` is set.  Keep a reference to the task
+         object (``remove()`` pops it from ``_tasks`` on successful
+         persist, but the executor still holds a reference).
+      2. Patch ``_CANCEL_IN_FLIGHT_TIMEOUT`` to 0.3s.
+      3. Call ``remove()`` — bumps epoch, cancels the executor.  The
+         executor swallows, so after the 0.3s budget ``remove()``
+         returns ``cancellation_pending``.  The task IS popped from
+         ``_tasks`` (because the persist of ``CANCELLED`` succeeded),
+         the DB row is ``CANCELLED``, and the old executor is still
+         in ``_execute_tasks``.
+      4. Release the executor.  It returns from the swallowed cancel
+         and proceeds to the success path of ``_execute_task``.  The
+         epoch fence detects the bumped epoch and returns WITHOUT
+         overwriting the ``CANCELLED`` DB row.
+      5. DB row is still ``CANCELLED``; ``run_count`` did NOT
+         increment; the task object's status is still ``CANCELLED``.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler import engine as engine_module
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def swallowing_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            while not release_exec.is_set():
+                try:
+                    await release_exec.wait()
+                except asyncio.CancelledError:
+                    if release_exec.is_set():
+                        raise
+                    # swallow: stay pending past the cancel budget
+            return "stale-result"
+
+        engine = CronEngine(
+            db=db,
+            executor=swallowing_executor,
+            tick_interval=0.01,
+        )
+        original_budget = engine_module._CANCEL_IN_FLIGHT_TIMEOUT
+        engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
+        try:
+            await engine.start()
+            iso = datetime.utcnow().isoformat()
+            task = await engine.create(
+                "remove-cp", "p", ScheduleConfig(iso_time=iso)
+            )
+            task_id = task.id
+            await asyncio.wait_for(started.wait(), timeout=2.0)
+
+            # remove() cancels the executor.  The executor swallows
+            # CancelledError, so after the 0.3s budget remove() returns
+            # cancellation_pending — NOT ok.
+            result = await engine.remove(task_id)
+            assert result == "cancellation_pending", (
+                f"expected cancellation_pending, got {result!r} — "
+                "remove() claimed success despite the executor not "
+                "terminating within the cancel budget"
+            )
+
+            # The persist of CANCELLED succeeded (DB is healthy), so
+            # the task IS popped from _tasks.
+            assert task_id not in engine._tasks, (
+                "remove() did not pop the task from _tasks despite "
+                "the persist succeeding"
+            )
+            # The desired state is durable: DB row is CANCELLED.
+            rows = await db.list_scheduled_tasks()
+            row = next(r for r in rows if r["id"] == task_id)
+            assert row["status"] == "cancelled", (
+                f"expected DB status=cancelled, got {row['status']} — "
+                "remove() did not persist the desired state"
+            )
+            # The task object (still referenced by the executor) has
+            # status CANCELLED.
+            assert task.status == TaskStatus.CANCELLED
+            assert task.run_count == 0, (
+                f"run_count={task.run_count} — the executor "
+                "incremented run_count before completing"
+            )
+
+            # The old executor is STILL in _execute_tasks.
+            assert task_id in engine._execute_tasks, (
+                "remove() cleared _execute_tasks despite the executor "
+                "not terminating — ownership of the still-live task "
+                "was silently released"
+            )
+            assert not engine._execute_tasks[task_id].done(), (
+                "the wedged executor was marked done despite swallowing "
+                "cancel — test setup is wrong"
+            )
+
+            # Release the executor.  It returns from the swallowed
+            # cancel and proceeds to the success path of _execute_task.
+            # The epoch fence detects the bumped epoch and returns
+            # WITHOUT overwriting the CANCELLED DB row.
+            release_exec.set()
+            await asyncio.wait_for(
+                engine._execute_tasks[task_id], timeout=2.0
+            )
+
+            # run_count did NOT increment (the stale success path was
+            # fenced).
+            assert task.run_count == 0, (
+                f"run_count={task.run_count} — the stale executor's "
+                "success path was NOT fenced and incremented run_count"
+            )
+            # The task object's status is still CANCELLED.
+            assert task.status == TaskStatus.CANCELLED, (
+                f"expected CANCELLED after stale executor completed, "
+                f"got {task.status} — the epoch fence did NOT prevent "
+                "the stale in-memory write"
+            )
+            # The DB row is still CANCELLED.
+            rows = await db.list_scheduled_tasks()
+            row = next(r for r in rows if r["id"] == task_id)
+            assert row["status"] == "cancelled", (
+                f"expected DB status=cancelled after stale executor "
+                f"completed, got {row['status']} — the epoch fence "
+                "did NOT prevent the stale DB write"
+            )
+
+            await engine.stop(timeout=2.0)
+        finally:
+            engine_module._CANCEL_IN_FLIGHT_TIMEOUT = original_budget
+    finally:
+        release_exec.set()
+        await db.close()
+
+
+# ---------------------------------------------------------------------------
+# H2 (round-9): remove() retains the task when terminal persist fails
+# ---------------------------------------------------------------------------
+
+
+async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
+    """H2 (round-9): if the terminal-state DB write fails during
+    ``remove()``, the task MUST stay in ``_tasks`` with status
+    ``CANCELLED`` and in ``_pending_persistence`` so ``stop()`` can
+    retry the persist.  Previously ``remove()`` popped from ``_tasks``
+    BEFORE the DB write — if the write failed, ``reconcile`` could not
+    find the task in memory and silently discarded the pending flag,
+    leaving the DB row at ``running`` / ``pending`` and causing the
+    task to be re-fired on restart.
+
+    Sequence:
+      1. Spawn a Cron task whose executor stalls.
+      2. Patch ``update_scheduled_task`` to FAIL.
+      3. Call ``remove()`` — bumps epoch, cancels the executor (clean
+         terminate, so ``cancel_ok=True``).  The epoch fence makes the
+         executor's ``CancelledError`` branch re-raise WITHOUT
+         persisting (so only ``remove()``'s persist is attempted).
+         ``remove()`` sets status to ``CANCELLED``, calls
+         ``_persist_task_state`` → FAILS.  ``task_id`` is now in
+         ``_pending_persistence``.  ``remove()`` does NOT pop from
+         ``_tasks``.  Returns ``"ok"`` (cancel_ok=True).
+      4. Verify the task is STILL in ``_tasks`` with status
+         ``CANCELLED`` and ``task_id`` is in ``_pending_persistence``.
+      5. Restore ``update_scheduled_task``.
+      6. ``stop()`` retries the persist via reconcile — succeeds.
+      7. The DB row is now ``CANCELLED``.
+    """
+    import asyncio
+
+    from khaos.db import Database
+    from khaos.scheduler.models import ScheduleConfig, TaskStatus
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    release_exec = asyncio.Event()
+    try:
+        started = asyncio.Event()
+
+        async def stalling_executor(task_id: str, prompt: str) -> str:
+            started.set()
+            await release_exec.wait()
+            return "should-not-reach"
+
+        engine = CronEngine(
+            db=db,
+            executor=stalling_executor,
+            tick_interval=0.01,
+        )
+        await engine.start()
+        iso = datetime.utcnow().isoformat()
+        task = await engine.create(
+            "remove-retain", "p", ScheduleConfig(iso_time=iso)
+        )
+        task_id = task.id
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Patch update_scheduled_task to FAIL so remove()'s persist
+        # raises and the task is retained in _tasks.
+        original_update = db.update_scheduled_task
+
+        async def failing_update(*args, **kwargs):
+            raise RuntimeError("DB is being torn down")
+
+        db.update_scheduled_task = failing_update
+
+        # remove() cancels the executor (clean terminate), then tries
+        # to persist CANCELLED — FAILS.  The task is NOT popped from
+        # _tasks; task_id is in _pending_persistence.
+        result = await engine.remove(task_id)
+        assert result == "ok", (
+            f"expected ok (cancel_ok=True; persist failure does not "
+            f"change the return value), got {result!r}"
+        )
+
+        # The task is STILL in _tasks (NOT popped).
+        assert task_id in engine._tasks, (
+            "remove() popped the task from _tasks despite the "
+            "terminal persist failing — reconcile cannot retry "            "without the in-memory state"
+        )
+        # The in-memory status is CANCELLED.
+        assert engine._tasks[task_id].status == TaskStatus.CANCELLED, (
+            f"expected CANCELLED, got {engine._tasks[task_id].status}"
+        )
+        # task_id is in _pending_persistence for stop() to retry.
+        assert task_id in engine._pending_persistence, (
+            "task_id is NOT in _pending_persistence — stop() cannot "
+            "retry the terminal persist"
+        )
+        # The executor was cancelled cleanly (not in _execute_tasks).
+        assert task_id not in engine._execute_tasks, (
+            "the executor was not drained — remove() returned before "
+            "cancel completed"
+        )
+
+        # Restore update_scheduled_task so stop()'s reconcile can
+        # succeed.
+        db.update_scheduled_task = original_update
+
+        # stop() retries the persist via reconcile — succeeds.
+        await engine.stop(timeout=2.0)
+
+        # The terminal state is now durable.
+        assert task_id not in engine._pending_persistence, (
+            "stop() did not clear _pending_persistence after a "
+            "successful retry"
+        )
+        rows = await db.list_scheduled_tasks()
+        row = next(r for r in rows if r["id"] == task_id)
+        assert row["status"] == "cancelled", (
+            f"expected DB status=cancelled, got {row['status']} — "
+            "stop()'s reconcile did not persist the terminal state"
+        )
+
+        release_exec.set()
     finally:
         release_exec.set()
         await db.close()
