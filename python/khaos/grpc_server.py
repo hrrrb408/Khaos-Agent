@@ -738,26 +738,6 @@ class AgentService:
         # ``state_root.project_id`` (sha256(realpath(root))[:32]).
         from khaos.db.state_root import project_id as _compute_project_id
         _bound_project_id = _compute_project_id(self.project_root)
-        self.cron_engine = CronEngine(
-            db=db,
-            executor=self._execute_scheduled_prompt,
-            project_id=_bound_project_id,
-            policy_digest=self._effective_policy.digest,
-        )
-        set_cron_engine(self.cron_engine)
-        self.channel_registry = ChannelRegistry()
-        self._webhook_replay_guard = WebhookReplayGuard(
-            consumer=self.db.consume_webhook_event
-        )
-        self._verified_webhook_limiter = WebhookRateLimiter()
-        set_channel_registry(self.channel_registry)
-        # B1: the OfficeMutationAuthority is a server-lifecycle object shared
-        # across every chat / webhook / cron turn.  Reusing one instance keeps
-        # the aggregate storage baseline stable across turns (closing the
-        # cross-turn quota bypass).  Per-turn runtimes borrow it (via
-        # RuntimeConfig.office_authority); RuntimeResult.aclose does NOT close
-        # it — AgentService.shutdown does.
-        self._office_authority = OfficeMutationAuthority()
         # H1: a single server-lifecycle AuditLogger shared by the main runtime
         # AND every SubAgent run, so security events from both paths land in
         # the same audit trail.  ``log_path`` comes from the effective policy
@@ -765,6 +745,8 @@ class AgentService:
         # audit).  H2: ``resolve_safe_audit_log_path`` constrains the path
         # to a trusted directory so an untrusted project cannot point audit
         # at an arbitrary host file (symlink / FIFO / device attacks).
+        # M4 batch 3.1.16B-3: constructed BEFORE CronEngine so it can be
+        # injected into the engine for drift-quarantine audit logging.
         self._audit_logger = (
             AuditLogger(
                 self.db,
@@ -783,6 +765,29 @@ class AgentService:
             if self._effective_policy.audit_enabled
             else None
         )
+        self.cron_engine = CronEngine(
+            db=db,
+            executor=self._execute_scheduled_prompt,
+            project_id=_bound_project_id,
+            policy_digest=self._effective_policy.digest,
+            # M4 batch 3.1.16B-3: inject the server-lifecycle AuditLogger
+            # so drift quarantine events land in the audit trail.
+            audit_logger=self._audit_logger,
+        )
+        set_cron_engine(self.cron_engine)
+        self.channel_registry = ChannelRegistry()
+        self._webhook_replay_guard = WebhookReplayGuard(
+            consumer=self.db.consume_webhook_event
+        )
+        self._verified_webhook_limiter = WebhookRateLimiter()
+        set_channel_registry(self.channel_registry)
+        # B1: the OfficeMutationAuthority is a server-lifecycle object shared
+        # across every chat / webhook / cron turn.  Reusing one instance keeps
+        # the aggregate storage baseline stable across turns (closing the
+        # cross-turn quota bypass).  Per-turn runtimes borrow it (via
+        # RuntimeConfig.office_authority); RuntimeResult.aclose does NOT close
+        # it — AgentService.shutdown does.
+        self._office_authority = OfficeMutationAuthority()
         self._accepting_work = True
         self._active_chat_tasks: set[asyncio.Task] = set()
         self._active_runtimes: dict[int, object] = {}

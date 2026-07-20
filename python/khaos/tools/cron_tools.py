@@ -99,6 +99,14 @@ async def cron_list(*, principal_id: str = "", **kwargs: Any) -> dict:
 
     M4 batch 3.1.10 (CRITICAL): only tasks belonging to
     ``principal_id`` are returned.
+
+    M4 batch 3.1.16B-3 (CRITICAL): exposes ``error`` (so quarantined
+    tasks surface their drift reason) and a truncated
+    ``policy_digest_prefix`` (8 chars — enough for debugging which
+    policy snapshot the task was created under, without exposing the
+    full digest fingerprint).  ``project_id_prefix`` is similarly
+    truncated.  This lets users see at a glance whether a ``failed``
+    task is a natural failure or a security-context drift quarantine.
     """
     principal_error = _require_principal(principal_id)
     if principal_error is not None:
@@ -115,6 +123,19 @@ async def cron_list(*, principal_id: str = "", **kwargs: Any) -> dict:
                 "status": t.status.value,
                 "next_run": t.next_run.isoformat() if t.next_run else None,
                 "run_count": t.run_count,
+                # M4 batch 3.1.16B-3: surface the error message so
+                # quarantined tasks (status=failed + error starts with
+                # "quarantined:") are distinguishable from natural
+                # failures.  None for tasks without an error.
+                "error": t.error,
+                # M4 batch 3.1.16B-3: truncated policy/project
+                # fingerprints for debugging.  Empty string for
+                # legacy/test tasks (no snapshot).  Only the first 8
+                # chars are exposed — enough to compare two snapshots
+                # for equality, not enough to reconstruct the full
+                # digest (which is a security fingerprint).
+                "policy_digest_prefix": t.policy_digest[:8] if t.policy_digest else "",
+                "project_id_prefix": t.project_id[:8] if t.project_id else "",
             }
             for t in tasks
         ]
@@ -144,7 +165,10 @@ async def cron_remove(task_id: str, *, principal_id: str = "", **kwargs: Any) ->
             "status": "invalid_state",
             "task_id": task_id,
             "error": "task is in a terminal execution state "
-                     "(COMPLETED / FAILED) — cannot be re-cancelled",
+                     "(COMPLETED / FAILED) — cannot be re-cancelled. "
+                     "Note: drift-quarantined tasks (FAILED with "
+                     "error starting 'quarantined:') CAN be removed; "
+                     "use cron_list to check the error field.",
         }
     if result == "persistence_pending":
         return {
