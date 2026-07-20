@@ -301,6 +301,12 @@ class CronEngine:
         # previous process).
         if self.db:
             try:
+                # M4 batch 3.1.13 (CRITICAL-2): query the task IDs
+                # that will be recovered BEFORE the bulk UPDATE, so we
+                # can per-task reload them afterwards (instead of the
+                # full ``_load_tasks()`` that overwrites other tasks'
+                # in-memory state).
+                running_ids = await self.db.query_running_task_ids()
                 recovered_running = await self.db.recover_all_running_tasks()
                 if recovered_running > 0:
                     logger.warning(
@@ -312,6 +318,9 @@ class CronEngine:
                 # M4 batch 3.1.10 (HIGH-3): also sweep expired leases
                 # (catches in-process hangs from a prior session that
                 # were never cleaned up — idempotent with the above).
+                expired_ids = await self.db.query_expired_lease_task_ids(
+                    now_iso=datetime.utcnow().isoformat(),
+                )
                 recovered_expired = await self.db.recover_expired_leases(
                     now_iso=datetime.utcnow().isoformat(),
                 )
@@ -323,8 +332,15 @@ class CronEngine:
                         recovered_expired,
                     )
                 if recovered_running > 0 or recovered_expired > 0:
-                    # Reload to pick up the FAILED states.
-                    await self._load_tasks()
+                    # M4 batch 3.1.13 (CRITICAL-2): per-task reload
+                    # instead of full ``_load_tasks()``.  At startup
+                    # there are no pending markers or live executors,
+                    # so this is equivalent to a full reload — but it
+                    # establishes the per-task reload path used by the
+                    # periodic sweep (which MUST NOT full-reload).
+                    recovered_ids = set(running_ids) | set(expired_ids)
+                    for tid in recovered_ids:
+                        await self._reload_one_task_from_db(tid)
             except Exception:  # noqa: BLE001 — recovery failure is fatal
                 logger.error(
                     "could not recover running/expired tasks; "
@@ -650,10 +666,40 @@ class CronEngine:
                 continue
             try:
                 if pending.is_control_op:
-                    # Control op retry — idempotent CAS.
-                    await self._persist_task_state(
-                        task, operation_id=pending.operation_id,
-                    )
+                    # M4 batch 3.1.13 (CRITICAL-2 criterion 6): use
+                    # the marker's IMMUTABLE ``desired_status`` instead
+                    # of the mutable ``task.status``.  Previously
+                    # reconcile passed the live ``task`` to
+                    # ``_persist_task_state``, which read
+                    # ``task.status.value`` as the desired state.  If a
+                    # periodic sweep (or any future code path) reloaded
+                    # the task from the DB and changed ``task.status``
+                    # back to ``pending``, reconcile would persist
+                    # ``pending`` instead of the marker's ``paused`` /
+                    # ``cancelled`` — silently dropping the user's
+                    # control intent.
+                    #
+                    # The marker's ``desired_status`` is the immutable
+                    # source of truth for the LATEST control op's
+                    # intent (any newer control op OVERWRITES the
+                    # marker in ``_persist_task_state``).  Setting
+                    # ``task.status`` to the marker's desired value is
+                    # therefore safe and correct.
+                    original_status = task.status
+                    task.status = TaskStatus(pending.desired_status)
+                    try:
+                        await self._persist_task_state(
+                            task, operation_id=pending.operation_id,
+                        )
+                    finally:
+                        # If the persist succeeded, ``task.status``
+                        # already matches the marker's desired state
+                        # (and ``task.lifecycle_version`` was updated).
+                        # If it failed, restore the original status so
+                        # the in-memory state is not corrupted for the
+                        # next reconcile attempt.
+                        if task.status != TaskStatus(pending.desired_status):
+                            task.status = original_status
                 else:
                     # Executor entry retry — atomic finalize.
                     await self._finalize_task_state(
@@ -829,7 +875,14 @@ class CronEngine:
                 if self.db and task_id in self._pending_persistence:
                     existing_marker = self._pending_persistence[task_id]
                     try:
-                        await self._persist_task_state(
+                        # M4 batch 3.1.13 (HIGH): capture the return
+                        # value — ``_persist_task_state`` returns
+                        # ``False`` when a newer control op won with a
+                        # DIFFERENT state.  Previously this path just
+                        # ``await``-ed the call, so ``persist_ok``
+                        # stayed ``True`` and ``pause`` returned ``ok``
+                        # despite the DB NOT being at ``paused``.
+                        persist_ok = await self._persist_task_state(
                             task, operation_id=existing_marker.operation_id,
                         )
                     except Exception:  # noqa: BLE001 — stop() will retry
@@ -860,7 +913,16 @@ class CronEngine:
             persist_ok = True
             if self.db:
                 try:
-                    await self._persist_task_state(task)
+                    # M4 batch 3.1.13 (HIGH): capture the return value.
+                    # ``_persist_task_state`` returns ``False`` when a
+                    # newer control op (e.g. a concurrent sweep or a
+                    # second instance's recovery) won with a DIFFERENT
+                    # state.  Previously this path just ``await``-ed
+                    # the call, so ``persist_ok`` stayed ``True`` and
+                    # ``pause`` returned ``ok`` despite the DB NOT
+                    # being at ``paused`` — forming a user-visible vs
+                    # durable-state inconsistency.
+                    persist_ok = await self._persist_task_state(task)
                 except Exception:  # noqa: BLE001 — stop() will retry
                     persist_ok = False
                     logger.error(
@@ -1369,6 +1431,25 @@ class CronEngine:
             # handles the cross-process case; this handles the
             # in-process case.  On failure, enter degraded mode —
             # we can't trust the DB state.
+            #
+            # M4 batch 3.1.13 (CRITICAL-1): the sweep must FIRST cancel
+            # + bounded-await the live executor BEFORE writing FAILED.
+            # Previously the sweep unconditionally wrote FAILED via
+            # ``recover_expired_leases`` and then reloaded — the live
+            # executor kept producing side effects after the DB said
+            # FAILED, and ``pause``/``remove`` would refuse the FAILED
+            # terminal state so the user couldn't stop it.  Now the
+            # sweep queries expired-lease task IDs, revokes each
+            # executor, and only then writes FAILED per-task.
+            #
+            # M4 batch 3.1.13 (CRITICAL-2): the sweep no longer calls
+            # ``_load_tasks()`` (full reload).  Instead it reloads only
+            # the recovered task IDs via ``_reload_one_task_from_db``,
+            # which skips tasks with pending persistence markers or
+            # live executors.  Previously the full reload overwrote
+            # the in-memory state of a task whose ``pause`` persist
+            # had failed (in-memory PAUSED, DB PENDING) — the reload
+            # changed it to PENDING and the tick re-fired it.
             if (
                 self.db
                 and (time.monotonic() - self._last_lease_sweep)
@@ -1376,17 +1457,37 @@ class CronEngine:
             ):
                 self._last_lease_sweep = time.monotonic()
                 try:
-                    recovered = await self.db.recover_expired_leases(
+                    expired_ids = await self.db.query_expired_lease_task_ids(
                         now_iso=now.isoformat(),
                     )
-                    if recovered > 0:
+                    if expired_ids:
                         logger.warning(
-                            "periodic lease sweep recovered %d "
-                            "expired lease(s) — executor hang detected",
-                            recovered,
+                            "periodic lease sweep: %d expired lease(s) "
+                            "detected — revoking live executors before "
+                            "writing FAILED",
+                            len(expired_ids),
                         )
-                        # Reload to pick up the FAILED states.
-                        await self._load_tasks()
+                        for tid in expired_ids:
+                            ok = await self._revoke_and_recover_lease(
+                                tid, now_iso=now.isoformat(),
+                            )
+                            if not ok:
+                                # Executor did NOT terminate — enter
+                                # degraded mode.  The wedged executor
+                                # stays in ``_execute_tasks`` for
+                                # ``stop()`` to handle.  The DB is NOT
+                                # written as FAILED (the lease is still
+                                # in the DB, and the next sweep will
+                                # retry).
+                                self._degraded = True
+                                logger.error(
+                                    "periodic lease sweep: executor for "
+                                    "task %s did not terminate within "
+                                    "%.1fs; entering DEGRADED mode — "
+                                    "wedged executor remains in "
+                                    "_execute_tasks for stop()",
+                                    tid, _CANCEL_IN_FLIGHT_TIMEOUT,
+                                )
                 except Exception:  # noqa: BLE001 — sweep failure is fatal
                     logger.error(
                         "periodic lease sweep failed; entering "
@@ -1395,6 +1496,11 @@ class CronEngine:
                     )
                     self._degraded = True
                     continue
+            # M4 batch 3.1.13 (CRITICAL-2): tick MUST skip tasks with
+            # pending persistence markers.  A task whose ``pause`` /
+            # ``remove`` persist failed has its desired state in the
+            # marker, NOT in the DB.  Re-firing it from the DB's stale
+            # ``pending`` state would produce unwanted side effects.
             # Snapshot candidates without the lock — worst case we
             # consider a candidate that was just paused/removed, and
             # the re-check under the lock below skips it.
@@ -1404,6 +1510,7 @@ class CronEngine:
                 and task.status == TaskStatus.PENDING
                 and task.next_run
                 and task.next_run <= now
+                and task.id not in self._pending_persistence
             ]
             for task in due_candidates:
                 # H1 (round-11): acquire the per-task lock for the
@@ -2119,6 +2226,144 @@ class CronEngine:
                 # operations and executor writes stay aligned after a
                 # restart.
                 self._execution_epoch[task.id] = task.lifecycle_version
+
+    async def _reload_one_task_from_db(self, task_id: str) -> None:
+        """M4 batch 3.1.13 (CRITICAL-2): per-task reload from the DB.
+
+        Used by the periodic lease sweep to pick up the FAILED state
+        for a recovered task WITHOUT overwriting other tasks' in-memory
+        state.  Previously the sweep called ``_load_tasks()`` (full
+        reload) which blew away the in-memory PAUSED state of a task
+        whose ``pause`` persist had failed (in-memory PAUSED, DB
+        PENDING) — the reload changed it to PENDING and the tick
+        re-fired it.
+
+        Skips the reload if:
+          - The task has a pending persistence marker (the marker's
+            desired state wins over the DB's recovered state).
+          - The task has a live executor (the executor's terminal
+            write will finalize the state).
+        """
+        if not self.db:
+            return
+        async with self._task_lock(task_id):
+            # Don't overwrite a task that has a pending control
+            # marker — the marker's desired state wins.
+            if task_id in self._pending_persistence:
+                return
+            # Don't overwrite a task with a live executor.
+            exec_task = self._execute_tasks.get(task_id)
+            if exec_task is not None and not exec_task.done():
+                return
+            try:
+                row = await self.db.get_scheduled_task(task_id)
+            except Exception:  # noqa: BLE001 — DB unreadable
+                self._degraded = True
+                logger.error(
+                    "cron engine: could not reload task %s from DB "
+                    "during sweep; entering DEGRADED mode",
+                    task_id, exc_info=True,
+                )
+                return
+            if row is None:
+                self._tasks.pop(task_id, None)
+                return
+            task = _task_from_row(row)
+            if task is not None:
+                self._tasks[task_id] = task
+                self._execution_epoch[task_id] = task.lifecycle_version
+
+    async def _revoke_and_recover_lease(
+        self, task_id: str, *, now_iso: str,
+    ) -> bool:
+        """M4 batch 3.1.13 (CRITICAL-1): revoke a live executor whose
+        lease has expired, then write FAILED to the DB and reload the
+        in-memory task.
+
+        Holds the per-task lock for the entire operation so the tick
+        loop cannot publish a new executor for this task while we're
+        revoking the old one.
+
+        Returns ``True`` if:
+          - The executor was not running, OR
+          - The executor terminated within the cancel budget, OR
+          - The task has a pending persistence marker (the marker's
+            desired state wins — the lease is NOT written as FAILED;
+            the marker will be retried by ``stop()`` / reconcile).
+
+        Returns ``False`` if the executor did NOT terminate within the
+        cancel budget — the caller must enter degraded mode.  The
+        wedged executor stays in ``_execute_tasks`` for ``stop()`` to
+        handle.  The DB is NOT written as FAILED in this case — the
+        lease survives and the next sweep will retry.
+        """
+        async with self._task_lock(task_id):
+            has_marker = task_id in self._pending_persistence
+            exec_task = self._execute_tasks.get(task_id)
+            if exec_task is not None and not exec_task.done():
+                # Bump epoch so the executor's terminal write is
+                # discarded (the lease sweep's FAILED state wins).
+                self._bump_epoch(task_id)
+                exec_task.cancel()
+                done, pending = await asyncio.wait(
+                    {exec_task}, timeout=_CANCEL_IN_FLIGHT_TIMEOUT,
+                )
+                if exec_task not in done:
+                    # Executor did NOT terminate — return False so
+                    # the caller enters degraded mode.  The wedged
+                    # executor stays in ``_execute_tasks``.
+                    return False
+                # Executor terminated — pop it (identity check in
+                # case a new owner was registered).
+                if self._execute_tasks.get(task_id) is exec_task:
+                    self._execute_tasks.pop(task_id, None)
+            if has_marker:
+                # The marker's desired state wins — don't write FAILED.
+                # The marker will be retried by ``stop()`` or the
+                # next reconcile.  The executor (if alive) was still
+                # cancelled above — it should not keep producing side
+                # effects.
+                logger.info(
+                    "cron task %s: lease sweep skipped FAILED write — "
+                    "pending persistence marker present (desired %r); "
+                    "marker will be retried",
+                    task_id,
+                    self._pending_persistence[task_id].desired_status,
+                )
+                return True
+            # No marker — safe to write FAILED to the DB.
+            try:
+                recovered = await self.db.recover_one_expired_lease(
+                    task_id, now_iso=now_iso,
+                )
+            except Exception:  # noqa: BLE001 — DB error
+                self._degraded = True
+                logger.error(
+                    "cron task %s: lease sweep could not write FAILED; "
+                    "entering DEGRADED mode",
+                    task_id, exc_info=True,
+                )
+                return True
+            if recovered:
+                logger.warning(
+                    "cron task %s: lease sweep wrote FAILED (executor "
+                    "revoked + lease cleared)",
+                    task_id,
+                )
+                # Reload the in-memory task to pick up the FAILED state.
+                try:
+                    row = await self.db.get_scheduled_task(task_id)
+                except Exception:  # noqa: BLE001 — DB unreadable
+                    self._degraded = True
+                    return True
+                if row is None:
+                    self._tasks.pop(task_id, None)
+                    return True
+                task = _task_from_row(row)
+                if task is not None:
+                    self._tasks[task_id] = task
+                    self._execution_epoch[task_id] = task.lifecycle_version
+            return True
 
 
 def _task_from_row(row: dict) -> ScheduledTask | None:

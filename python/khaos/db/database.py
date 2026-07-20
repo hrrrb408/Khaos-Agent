@@ -1298,6 +1298,76 @@ class Database:
         await conn.commit()
         return cursor.rowcount
 
+    async def query_running_task_ids(self) -> list[str]:
+        """M4 batch 3.1.13 (CRITICAL-2): query task IDs with
+        ``status='running'`` WITHOUT writing FAILED.
+
+        Called by ``CronEngine.start()`` BEFORE
+        ``recover_all_running_tasks`` so the engine can per-task
+        reload the recovered tasks (instead of the full
+        ``_load_tasks()`` that overwrites other tasks' in-memory
+        state — see CRITICAL-2 in the security review).
+
+        Single-instance model: at startup, any task with
+        ``status='running'`` belongs to a DEAD previous process.
+        We query the IDs first so we know which tasks will be
+        recovered, then call ``recover_all_running_tasks`` to
+        bulk-UPDATE them, then per-task reload each one.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id FROM scheduled_tasks WHERE status = 'running'"
+        )
+        rows = await cursor.fetchall()
+        return [str(row[0]) for row in rows]
+
+    async def query_expired_lease_task_ids(self, *, now_iso: str) -> list[str]:
+        """M4 batch 3.1.13 (CRITICAL-1): query task IDs with expired
+        leases WITHOUT writing FAILED.
+
+        The tick loop uses this to identify which executors need to be
+        revoked BEFORE the sweep writes FAILED.  Previously the sweep
+        unconditionally wrote FAILED via ``recover_expired_leases`` and
+        then called ``_load_tasks()`` — the live executor was never
+        cancelled, producing side effects after the DB said FAILED.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT id FROM scheduled_tasks "
+            "WHERE status = 'running' AND lease_until IS NOT NULL "
+            "AND lease_until < ?",
+            (now_iso,),
+        )
+        rows = await cursor.fetchall()
+        return [str(row[0]) for row in rows]
+
+    async def recover_one_expired_lease(
+        self, task_id: str, *, now_iso: str,
+    ) -> bool:
+        """M4 batch 3.1.13 (CRITICAL-1): per-task lease recovery.
+
+        Conditional on ``status='running'`` AND ``lease_until < now``
+        AND ``lease_until IS NOT NULL``.  Called by the tick loop's
+        periodic sweep AFTER the live executor has been cancelled and
+        bounded-awaited.  Returns ``True`` if the row was updated.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = 'failed', error = 'execution lease expired '
+                || '(periodic sweep; live executor revoked; '
+                || 'at-least-once disclosure)',
+                execution_id = NULL, lease_until = NULL,
+                lifecycle_version = lifecycle_version + 1
+            WHERE id = ? AND status = 'running'
+                  AND lease_until IS NOT NULL AND lease_until < ?
+            """,
+            (task_id, now_iso),
+        )
+        await conn.commit()
+        return cursor.rowcount == 1
+
     async def finalize_scheduled_task(
         self,
         task_id: str,
