@@ -521,8 +521,12 @@ async def test_acceptance_7_crashed_execution_recovered_as_failed(tmp_path) -> N
         assert row["status"] == "failed", (
             f"expected status=failed after crash recovery, got {row['status']}"
         )
-        assert "lease expired" in (row["error"] or ""), (
-            f"expected error mentioning lease expiry, got {row['error']!r}"
+        assert (
+            "lease expired" in (row["error"] or "")
+            or "process restart detected" in (row["error"] or "")
+            or "single-instance" in (row["error"] or "")
+        ), (
+            f"expected error mentioning lease expiry or process restart, got {row['error']!r}"
         )
         await engine2.stop()
     finally:
@@ -580,16 +584,16 @@ async def test_acceptance_8_stale_executor_cannot_clear_newer_control_marker(tmp
         # this for its conditional UPDATE).
         version_at_start = task.lifecycle_version
 
-        # M4 batch 3.1.11 (HIGH-2): patch ``control_update_scheduled_task``
+        # M4 batch 3.1.11 (HIGH-2): patch ``control_finalize_scheduled_task``
         # (the idempotent CAS used by pause) to fail, so the PAUSED
         # marker is left in _pending_persistence.  pause() no longer
         # uses the unconditional ``update_scheduled_task``.
-        original_update = db.control_update_scheduled_task
+        original_update = db.control_finalize_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB wedged for control op")
 
-        db.control_update_scheduled_task = failing_update
+        db.control_finalize_scheduled_task = failing_update
 
         # Call pause — it bumps the epoch, sets PAUSED in memory, and
         # tries to persist.  The persist fails, leaving a NEW marker
@@ -604,7 +608,7 @@ async def test_acceptance_8_stale_executor_cannot_clear_newer_control_marker(tmp
         pause_operation_id = pause_marker.operation_id
 
         # Restore the control CAS.
-        db.control_update_scheduled_task = original_update
+        db.control_finalize_scheduled_task = original_update
 
         # Release the executor — it will try to write its terminal
         # state (PENDING for next run, since it's a one-shot ISO task
@@ -768,15 +772,14 @@ async def test_acceptance_10_cron_resume_propagates_persistence_pending(tmp_path
         await engine.pause(task.id, principal_id="alice")
 
         # M4 batch 3.1.11 (HIGH-2): patch
-        # ``control_update_scheduled_task`` (the idempotent CAS used by
-        # resume) to fail.  resume() no longer uses the unconditional
-        # ``update_scheduled_task`` with bump_version=True.
-        original_update = db.control_update_scheduled_task
+        # ``control_finalize_scheduled_task`` (the idempotent CAS used
+        # by resume — M4 batch 3.1.12 CRITICAL-2) to fail.
+        original_update = db.control_finalize_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB wedged on resume")
 
-        db.control_update_scheduled_task = failing_update
+        db.control_finalize_scheduled_task = failing_update
 
         # Engine layer: resume returns persistence_pending.
         result = await engine.resume(task.id, principal_id="alice")
@@ -807,7 +810,7 @@ async def test_acceptance_10_cron_resume_propagates_persistence_pending(tmp_path
         finally:
             set_cron_engine(None)
 
-        db.control_update_scheduled_task = original_update
+        db.control_finalize_scheduled_task = original_update
     finally:
         await db.close()
 

@@ -358,8 +358,12 @@ async def test_acceptance_4_terminal_write_failure_restart_recovers_as_failed(
             f"expected failed (crash recovery), got {row['status']} — "
             "the retained lease was not recovered"
         )
-        assert "lease expired" in (row["error"] or ""), (
-            f"error message should mention lease expiry, got: {row['error']}"
+        assert (
+            "lease expired" in (row["error"] or "")
+            or "process restart detected" in (row["error"] or "")
+            or "single-instance" in (row["error"] or "")
+        ), (
+            f"error message should mention lease expiry or process restart, got: {row['error']}"
         )
         assert row["execution_id"] is None, (
             "execution_id should be cleared after recovery"
@@ -534,7 +538,7 @@ async def test_acceptance_7_stale_executor_does_not_overwrite_control_marker(
     Sequence:
       1. Create a task with a stalling executor that swallows cancel.
       2. Let tick fire and the executor stall.
-      3. Patch ``control_update_scheduled_task`` to fail so pause's
+      3. Patch ``control_finalize_scheduled_task`` to fail so pause's
          marker is left in ``_pending_persistence``.
       4. Call ``pause()`` — it bumps the epoch, sets PAUSED, persist
          fails, marker is placed (is_control_op=True).  Because the
@@ -542,7 +546,7 @@ async def test_acceptance_7_stale_executor_does_not_overwrite_control_marker(
          ``cancellation_pending`` (the executor didn't terminate within
          the cancel budget) — but the marker IS placed because
          ``_persist_task_state`` runs before the cancel-ok check.
-      5. Restore ``control_update_scheduled_task``.
+      5. Restore ``control_finalize_scheduled_task``.
       6. Release the executor — it completes and tries to write its
          terminal state.  The epoch fence (pause bumped the epoch)
          redirects to ``_clear_lease``, which does NOT touch
@@ -586,14 +590,14 @@ async def test_acceptance_7_stale_executor_does_not_overwrite_control_marker(
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # Patch control_update_scheduled_task to fail so pause's marker
+        # Patch control_finalize_scheduled_task to fail so pause's marker
         # is left in _pending_persistence.
-        original_control = db.control_update_scheduled_task
+        original_control = db.control_finalize_scheduled_task
 
         async def failing_control(*args, **kwargs):
             raise RuntimeError("DB wedged for control op")
 
-        db.control_update_scheduled_task = failing_control
+        db.control_finalize_scheduled_task = failing_control
 
         # Call pause — bumps epoch, sets PAUSED, persist fails.
         # The executor is cancellation-resistant, so pause returns
@@ -611,8 +615,8 @@ async def test_acceptance_7_stale_executor_does_not_overwrite_control_marker(
         assert pause_marker.is_control_op is True
         pause_operation_id = pause_marker.operation_id
 
-        # Restore control_update_scheduled_task.
-        db.control_update_scheduled_task = original_control
+        # Restore control_finalize_scheduled_task.
+        db.control_finalize_scheduled_task = original_control
 
         # Release the executor — it completes and tries to write its
         # terminal state.  The epoch fence (pause bumped the epoch)
@@ -659,12 +663,12 @@ async def test_acceptance_8_control_op_commit_then_raise_no_version_drift(
 
     Sequence:
       1. Create a task and capture its lifecycle_version.
-      2. Patch ``control_update_scheduled_task`` to commit-then-raise
+      2. Patch ``control_finalize_scheduled_task`` to commit-then-raise
          on the first call.
       3. Call ``pause()`` — it bumps the epoch (in-memory version = 1),
          commits the CAS (DB version = 1), then raises.
       4. The retry (via reconcile or second pause) calls
-         ``control_update_scheduled_task`` again with the SAME
+         ``control_finalize_scheduled_task`` again with the SAME
          expected/target version.  The CAS matches 0 rows (DB is
          already at target) — read-back confirms and treats as success.
       5. The DB version MUST be 1 (NOT 2 or higher).
@@ -681,9 +685,9 @@ async def test_acceptance_8_control_op_commit_then_raise_no_version_drift(
             (await db.get_scheduled_task(task.id))["lifecycle_version"]
         )
 
-        # Patch control_update_scheduled_task to commit-then-raise
+        # Patch control_finalize_scheduled_task to commit-then-raise
         # on the first call.
-        original_control = db.control_update_scheduled_task
+        original_control = db.control_finalize_scheduled_task
         call_count = {"n": 0}
 
         async def commit_then_raise(*args, **kwargs):
@@ -695,11 +699,11 @@ async def test_acceptance_8_control_op_commit_then_raise_no_version_drift(
             # Subsequent calls: return the real result.
             return await original_control(*args, **kwargs)
 
-        db.control_update_scheduled_task = commit_then_raise
+        db.control_finalize_scheduled_task = commit_then_raise
 
         # Call pause — it bumps the epoch (in-memory version = 1),
         # then calls _persist_task_state which calls
-        # control_update_scheduled_task.  The CAS commits (DB version
+        # control_finalize_scheduled_task.  The CAS commits (DB version
         # = 1) but raises.  The read-back confirms (DB at target=1,
         # status=paused) and treats it as success.
         result = await engine.pause(task.id, principal_id="alice")
@@ -723,7 +727,7 @@ async def test_acceptance_8_control_op_commit_then_raise_no_version_drift(
             f"({db_version_after}) — version drift between memory and DB"
         )
 
-        db.control_update_scheduled_task = original_control
+        db.control_finalize_scheduled_task = original_control
     finally:
         await db.close()
 

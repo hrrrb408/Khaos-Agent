@@ -136,6 +136,17 @@ class Database:
         NOT visible to any authenticated principal (fail-closed).  The
         server bootstrap may optionally re-claim them for a specific
         principal, but the default is to hide them.
+
+        M4 batch 3.1.12 (HIGH-2): legacy tasks (those with
+        ``principal_id = 'legacy'``) are now QUARANTINED at migration
+        time — ``status`` is set to ``'failed'`` and ``error`` records
+        the quarantine reason.  Previously the migration comment
+        claimed legacy tasks were "hidden", but ``CronEngine`` loads
+        ALL tasks and the executor only rejected EMPTY principal —
+        so ``'legacy'`` (non-empty) tasks would execute as a synthetic
+        principal with no real owner.  Quarantine is fail-closed: an
+        admin must explicitly re-claim the task with a real principal
+        (via a future ``cron_claim`` tool) before it can run again.
         """
         conn = await self._require_conn()
         cursor = await conn.execute("PRAGMA table_info(scheduled_tasks)")
@@ -159,6 +170,29 @@ class Database:
             added = True
         if added:
             await conn.commit()
+        # M4 batch 3.1.12 (HIGH-2): quarantine legacy tasks.  Run
+        # unconditionally (not just when columns were added) so a DB
+        # that had the columns added by an earlier 3.1.10 run but
+        # wasn't quarantined is also caught up.  The UPDATE is a no-op
+        # if no legacy tasks exist or they're already quarantined.
+        # NOTE: ``enabled`` is an in-memory field only (not a DB
+        # column) — the quarantine is enforced by ``status='failed'``
+        # (tick loop only fires ``pending`` tasks) and by
+        # ``_execute_task`` rejecting ``principal_id='legacy'``.
+        await conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = 'failed',
+                error = 'quarantined: legacy migration - task has no '
+                        || 'authenticated owner; an admin must re-claim '
+                        || 'it with a real principal before it can run',
+                execution_id = NULL,
+                lease_until = NULL
+            WHERE principal_id = 'legacy'
+              AND status != 'failed'
+            """
+        )
+        await conn.commit()
 
     async def create_session(self, session_id: str, mode: str = "office") -> None:
         """Create a session if missing and keep its mode current."""
@@ -1196,6 +1230,13 @@ class Database:
         any stale executor that somehow resumes will fail its
         conditional write.
 
+        M4 batch 3.1.12 (HIGH-1): ``recover_all_running_tasks`` is now
+        the preferred startup recovery path (single-instance model —
+        all RUNNING rows belong to the dead previous process).  This
+        method is still used for periodic sweep inside a running
+        engine (catches executor hangs where the lease expires but
+        the process is still alive).
+
         Returns the number of tasks recovered.
         """
         conn = await self._require_conn()
@@ -1210,6 +1251,49 @@ class Database:
                   AND lease_until < ?
             """,
             (now_iso,),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+    async def recover_all_running_tasks(self) -> int:
+        """M4 batch 3.1.12 (HIGH-1): mark ALL running tasks as FAILED.
+
+        Single-instance model: when the engine starts, any task with
+        ``status='running'`` belongs to a DEAD previous process (the
+        process crash is why we're starting).  Without this, a task
+        whose lease hasn't expired yet would stay RUNNING forever —
+        ``recover_expired_leases`` only matches ``lease_until < now``,
+        and the tick loop only fires PENDING tasks, so an unexpired
+        RUNNING row is never re-evaluated.
+
+        This method is called by ``CronEngine.start()`` BEFORE
+        ``recover_expired_leases``.  It catches:
+          - Tasks with unexpired leases (the gap left by 3.1.10).
+          - Tasks with expired leases (idempotent with
+            ``recover_expired_leases`` — the second call matches 0
+            rows because status is no longer 'running').
+          - Tasks with NULL leases (the CRITICAL-2 hole from 3.1.11
+            where a stale executor cleared the lease but left status
+            RUNNING — though 3.1.12's atomic control_finalize closes
+            that hole at the source, this is the defense-in-depth).
+
+        Bumps ``lifecycle_version`` so any stale executor that
+        somehow resumes will fail its conditional write.
+
+        Returns the number of tasks recovered.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            UPDATE scheduled_tasks
+            SET status = 'failed',
+                error = 'process restart detected - task was running '
+                        || 'at startup; single-instance model treats '
+                        || 'this as a crash (at-least-once disclosure)',
+                execution_id = NULL, lease_until = NULL,
+                lifecycle_version = lifecycle_version + 1
+            WHERE status = 'running'
+            """
         )
         await conn.commit()
         return cursor.rowcount
@@ -1314,12 +1398,79 @@ class Database:
             happened): UPDATE matches 0 rows — the caller must NOT
             overwrite; the newer op wins.
 
+        M4 batch 3.1.12 (CRITICAL-2): this method does NOT clear the
+        execution lease (``execution_id`` / ``lease_until``).  Use
+        ``control_finalize_scheduled_task`` for control ops that need
+        to release the lease atomically with the state transition —
+        otherwise a stale executor's ``_clear_lease`` could clear the
+        lease while the control op's persist has failed, leaving the
+        DB at ``status='running' + execution_id=NULL + lease_until=NULL``
+        (permanently stuck, unrecoverable).
+
         Returns rowcount (1 = applied, 0 = version mismatch).
         """
         conn = await self._require_conn()
         clauses: list[str] = [
             "status = ?",
             "lifecycle_version = ?",
+        ]
+        params: list[Any] = [status, target_version]
+        for col, val in [
+            ("next_run", next_run),
+            ("error", error),
+        ]:
+            if val is not None:
+                clauses.append(f"{col} = ?")
+                params.append(val)
+        params.append(task_id)
+        cursor = await conn.execute(
+            f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
+            f"WHERE id = ? AND lifecycle_version = ?",
+            tuple(params + [expected_version]),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+    async def control_finalize_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        target_version: int,
+        status: str,
+        next_run: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        """M4 batch 3.1.12 (CRITICAL-2): atomic control state + lease clear.
+
+        Combines the control op's state transition (status +
+        lifecycle_version) AND the execution lease release
+        (``execution_id = NULL`` / ``lease_until = NULL``) into a
+        single CAS UPDATE.  This closes the CRITICAL-2 hole where a
+        control op persisted the desired state but left the lease in
+        the DB — then a stale executor's ``_clear_lease`` cleared
+        the lease independently while the control op's persist had
+        actually FAILED, leaving ``status='running' + NULL lease``
+        (permanently stuck, unrecoverable by ``recover_expired_leases``
+        which matches ``lease_until IS NOT NULL``).
+
+        The UPDATE is conditional on ``lifecycle_version =
+        expected_version``.  Idempotent on retry:
+          - DB at ``expected_version``: UPDATE succeeds, sets
+            ``target_version`` + clears lease.
+          - DB at ``target_version`` (prior retry committed): UPDATE
+            matches 0 rows — caller reads back to confirm.
+          - DB at higher version (newer control op): UPDATE matches
+            0 rows — caller must NOT overwrite.
+
+        Returns rowcount (1 = applied, 0 = version mismatch).
+        """
+        conn = await self._require_conn()
+        clauses: list[str] = [
+            "status = ?",
+            "lifecycle_version = ?",
+            "execution_id = NULL",
+            "lease_until = NULL",
         ]
         params: list[Any] = [status, target_version]
         for col, val in [
