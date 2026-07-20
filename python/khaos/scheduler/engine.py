@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import time
@@ -95,20 +96,40 @@ class CronEngine:
         """
         参数：
         - db: Database 实例（持久化任务）
-        - executor: 实际执行函数，接收 (task_id, prompt)，返回结果
+        - executor: 实际执行函数，接收 (task_id, prompt, principal_id)
         - on_complete: 任务完成后的回调（推送结果等）
         - tick_interval: 检查间隔（秒）
         - execution_lease_seconds: M4 batch 3.1.10 — durable execution
           lease duration.  See ``EXECUTION_LEASE_SECONDS``.
+
+        M4 batch 3.1.11 (CRITICAL-3): the executor interface is now
+        strictly 3-arg ``(task_id, prompt, principal_id)``.  Legacy
+        2-arg executors ``(task_id, prompt)`` are detected via
+        ``inspect.signature`` at construction time and wrapped — the
+        wrapper accepts ``principal_id`` but does NOT forward it (so a
+        legacy test executor never sees it).  The previous runtime
+        ``except TypeError`` fallback is removed: it caught internal
+        ``TypeError`` from the executor body (not just "wrong arity")
+        and re-executed WITHOUT ``principal_id`` — causing double
+        execution and a silent identity downgrade to the server UID.
         """
         self.db = db
-        self._executor = executor
+        self._executor = self._wrap_executor(executor)
         self._on_complete = on_complete
         self._tick_interval = tick_interval
         self._execution_lease_seconds = execution_lease_seconds
         self._tasks: dict[str, ScheduledTask] = {}
         self._running = False
         self._loop_task: asyncio.Task | None = None
+        # M4 batch 3.1.11 (MEDIUM-2): if ``start()`` cannot recover
+        # expired leases, the engine enters ``_degraded`` mode and
+        # refuses to fire new executions.  ``_running`` may be True
+        # (tick loop active for state observation) but ``_degraded``
+        # gates ``_execute_task``.  Without this, a lease-recovery
+        # failure left crashed tasks un-recovered AND the engine
+        # continued accepting new executions — compounding the
+        # inconsistency.
+        self._degraded: bool = False
         # M4 (round-5): track in-flight ``_execute_task`` coroutines so
         # ``stop()`` can cancel + await them.  Previously ``_tick_loop``
         # fired ``asyncio.create_task(self._execute_task(task))`` without
@@ -198,10 +219,20 @@ class CronEngine:
         represent crashed executions whose terminal state was never
         persisted.  Mark them as FAILED (durable at-least-once
         disclosure) so they are not silently re-fired.
+
+        M4 batch 3.1.11 (MEDIUM-2): if lease recovery fails, the
+        engine enters ``_degraded`` mode — the tick loop runs (so
+        pause / resume / remove still work) but ``_execute_task``
+        refuses to fire new executions.  Without this, a lease-recovery
+        failure left crashed tasks un-recovered (potentially re-fired
+        on the next tick) AND continued accepting new executions,
+        compounding the inconsistency.  Fail-closed: an operator must
+        explicitly resolve the recovery failure and restart.
         """
         if self._running:
             return
         self._running = True
+        self._degraded = False
         await self._load_tasks()
         # M4 batch 3.1.10 (HIGH-3): recover expired leases.
         if self.db:
@@ -218,14 +249,25 @@ class CronEngine:
                     )
                     # Reload to pick up the FAILED states.
                     await self._load_tasks()
-            except Exception:  # noqa: BLE001 — recovery failure is non-fatal
+            except Exception:  # noqa: BLE001 — recovery failure is fatal
                 logger.error(
                     "could not recover expired execution leases; "
-                    "crashed tasks may be silently re-fired",
+                    "entering DEGRADED mode — new executions are "
+                    "refused until the DB is recovered and the engine "
+                    "is restarted.  Crashed tasks may be in an "
+                    "unknown state.",
                     exc_info=True,
                 )
+                self._degraded = True
         self._loop_task = asyncio.create_task(self._tick_loop())
-        logger.info("cron engine started with %d tasks", len(self._tasks))
+        if self._degraded:
+            logger.warning(
+                "cron engine started in DEGRADED mode with %d tasks "
+                "(lease recovery failed; new executions refused)",
+                len(self._tasks),
+            )
+        else:
+            logger.info("cron engine started with %d tasks", len(self._tasks))
 
     async def stop(self, *, timeout: float = CRON_STOP_DRAIN_TIMEOUT) -> None:
         """停止调度循环。
@@ -466,14 +508,17 @@ class CronEngine:
         and we raise ``ServiceShutdownError`` so the caller refuses to
         tear down the DB.  The next ``stop()`` call will retry.
 
-        M4 batch 3.1.10 (HIGH-2): each entry now carries the
-        ``operation_id`` and ``expected_version`` of the operation that
-        placed it.  The retry uses the stored ``expected_version`` for
-        control ops (CAS) so a stale executor's conditional write
-        can't shadow it.  For executor entries (``is_control_op=False``),
-        the retry uses the current ``task.lifecycle_version`` since the
-        executor's intent is just "persist my terminal state if the
-        version still matches".
+        M4 batch 3.1.11:
+          - Control op entries (``is_control_op=True``) retry via
+            ``_persist_task_state`` which now uses the idempotent CAS
+            (``control_update_scheduled_task``).  A retry after
+            commit-then-raise matches 0 rows, reads back to confirm,
+            and treats it as success — no version drift.
+          - Executor entries (``is_control_op=False``) retry via
+            ``_finalize_task_state`` (atomic terminal write + lease
+            clear).  If the lease was already cleared by a prior
+            finalize, the CAS matches 0 rows (execution_id mismatch)
+            and we read back to confirm.
         """
         if not self.db:
             return
@@ -487,19 +532,16 @@ class CronEngine:
                 continue
             try:
                 if pending.is_control_op:
-                    # Control op retry — unconditional, bumps version.
-                    # Use the CURRENT lifecycle_version as expected so
-                    # the CAS retry matches even if a prior retry
-                    # already bumped it.
+                    # Control op retry — idempotent CAS.
                     await self._persist_task_state(
                         task, operation_id=pending.operation_id,
                     )
                 else:
-                    # Executor entry retry — conditional on version.
-                    await self._persist_task_state(
+                    # Executor entry retry — atomic finalize.
+                    await self._finalize_task_state(
                         task,
-                        operation_id=pending.operation_id,
                         expected_version=pending.expected_version,
+                        operation_id=pending.operation_id,
                     )
             except Exception:  # noqa: BLE001 — collect and raise
                 logger.error(
@@ -657,10 +699,21 @@ class CronEngine:
                 # _pending_persistence, the prior persist failed and
                 # we MUST retry.  If not in _pending_persistence,
                 # the prior persist succeeded — no-op.
+                #
+                # M4 batch 3.1.11 (HIGH-1): pass the EXISTING marker's
+                # operation_id so the retry is recognized as the SAME
+                # operation (not a new one).  Without this, the
+                # ``_persist_task_state`` "skip if newer control-op
+                # marker" check would see a different operation_id and
+                # skip the retry — returning ``ok`` despite the DB
+                # write still failing.
                 persist_ok = True
                 if self.db and task_id in self._pending_persistence:
+                    existing_marker = self._pending_persistence[task_id]
                     try:
-                        await self._persist_task_state(task)
+                        await self._persist_task_state(
+                            task, operation_id=existing_marker.operation_id,
+                        )
                     except Exception:  # noqa: BLE001 — stop() will retry
                         persist_ok = False
                         logger.error(
@@ -785,32 +838,97 @@ class CronEngine:
             # the caller gets ``persistence_pending`` to retry.
             new_next_run = self._compute_next_run(task)
             if self.db:
+                # M4 batch 3.1.11 (HIGH-2): idempotent CAS.  Use
+                # ``control_update_scheduled_task`` with the CURRENT
+                # lifecycle_version as ``expected_version`` (the bump
+                # has NOT happened yet — resume is persist-first).
+                # ``target_version = expected + 1``.  On retry after
+                # commit-then-raise, the DB is already at ``target``
+                # — the CAS matches 0 rows and we read back to
+                # confirm (idempotent).
+                expected = task.lifecycle_version
+                target = expected + 1
                 try:
-                    rowcount = await self.db.update_scheduled_task(
+                    rowcount = await self.db.control_update_scheduled_task(
                         task.id,
+                        expected_version=expected,
+                        target_version=target,
                         status=TaskStatus.PENDING.value,
                         next_run=new_next_run.isoformat()
                         if new_next_run else None,
-                        bump_version=True,
                     )
                 except Exception:  # noqa: BLE001 — caller retries
-                    logger.error(
-                        "cron task %s: could not persist resumed "
-                        "state; task remains paused in memory; "
-                        "caller should retry resume()",
-                        task.name, exc_info=True,
-                    )
-                    return "persistence_pending"
+                    # Could be commit-then-raise — read back to verify.
+                    try:
+                        row = await self.db.get_scheduled_task(task.id)
+                    except Exception:  # noqa: BLE001 — DB unreadable
+                        logger.error(
+                            "cron task %s: could not persist resumed "
+                            "state AND could not read back; task "
+                            "remains paused in memory; caller should "
+                            "retry resume()",
+                            task.name, exc_info=True,
+                        )
+                        return "persistence_pending"
+                    if (
+                        row is not None
+                        and int(row.get("lifecycle_version", 0)) == target
+                        and row.get("status") == TaskStatus.PENDING.value
+                    ):
+                        # Commit-then-raise — the write DID commit.
+                        logger.info(
+                            "cron task %s: resume CAS raised but "
+                            "read-back confirms target version + "
+                            "status (commit-then-raise recovered)",
+                            task.name,
+                        )
+                        rowcount = 1
+                    else:
+                        logger.error(
+                            "cron task %s: could not persist resumed "
+                            "state; task remains paused in memory; "
+                            "caller should retry resume()",
+                            task.name, exc_info=True,
+                        )
+                        return "persistence_pending"
                 if rowcount == 0:
-                    # No matching row — DB row was removed (e.g. by a
-                    # concurrent remove() that won the race).  Treat
-                    # as persistence_pending so the caller re-checks.
-                    logger.error(
-                        "cron task %s: resume persist matched 0 rows; "
-                        "task may have been removed concurrently",
-                        task.name,
-                    )
-                    return "persistence_pending"
+                    # Version mismatch — either a prior retry already
+                    # committed (DB at ``target``) or a newer control
+                    # op happened (DB at > ``target``).  Read back.
+                    try:
+                        row = await self.db.get_scheduled_task(task.id)
+                    except Exception:  # noqa: BLE001 — treat as failure
+                        row = None
+                    if (
+                        row is not None
+                        and int(row.get("lifecycle_version", 0)) == target
+                        and row.get("status") == TaskStatus.PENDING.value
+                    ):
+                        # Prior retry committed — idempotent success.
+                        logger.info(
+                            "cron task %s: resume CAS returned 0 but "
+                            "read-back confirms target version + "
+                            "status (prior retry committed)",
+                            task.name,
+                        )
+                    elif row is None:
+                        # No matching row — DB row was removed.
+                        logger.error(
+                            "cron task %s: resume persist matched 0 "
+                            "rows and read-back returned None; task "
+                            "may have been removed concurrently",
+                            task.name,
+                        )
+                        return "persistence_pending"
+                    else:
+                        # A newer control op won.
+                        logger.error(
+                            "cron task %s: resume CAS returned 0 — "
+                            "a newer control operation happened; not "
+                            "overwriting",
+                            task.name,
+                        )
+                        return "persistence_pending"
             # Persist succeeded (or no DB).  Now bump the in-memory
             # epoch (which also bumps task.lifecycle_version to match
             # the post-write DB version) and flip the in-memory state
@@ -916,6 +1034,55 @@ class CronEngine:
         if task is not None:
             task.lifecycle_version = new_epoch
         return new_epoch
+
+    @staticmethod
+    def _wrap_executor(
+        executor: Callable[..., Awaitable[Any]] | None,
+    ) -> Callable[[str, str, str], Awaitable[Any]] | None:
+        """M4 batch 3.1.11 (CRITICAL-3): wrap legacy 2-arg executors.
+
+        Detects the executor's arity via ``inspect.signature`` ONCE at
+        construction time (not at every call).  If the executor accepts
+        3+ positional params, it's used as-is.  If it accepts only 2,
+        it's wrapped so the caller can always invoke
+        ``(task_id, prompt, principal_id)`` — the wrapper drops
+        ``principal_id`` (legacy executors don't need it; production
+        executors must declare 3-arg).
+
+        This replaces the runtime ``except TypeError`` fallback that
+        caught internal ``TypeError`` from the executor body and
+        re-executed without ``principal_id`` — causing double execution
+        and a silent identity downgrade.
+        """
+        if executor is None:
+            return None
+        try:
+            sig = inspect.signature(executor)
+            positional = [
+                p for p in sig.parameters.values()
+                if p.kind in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                )
+            ]
+            # ``has_var_positional`` means the executor accepts *args —
+            # treat as 3-arg compatible.
+            has_var_positional = any(
+                p.kind == inspect.Parameter.VAR_POSITIONAL
+                for p in sig.parameters.values()
+            )
+        except (TypeError, ValueError):
+            # Builtins / C-implemented callables — assume 3-arg.
+            return executor
+        if len(positional) >= 3 or has_var_positional:
+            return executor
+
+        # Legacy 2-arg executor — wrap it.  The wrapper accepts
+        # ``principal_id`` but does NOT forward it.
+        async def _wrapped(task_id: str, prompt: str, principal_id: str) -> Any:
+            return await executor(task_id, prompt)
+
+        return _wrapped
 
     async def _cancel_in_flight_execution(self, task_id: str) -> bool:
         """M1 (round-8): cancel + await the in-flight ``_execute_task``
@@ -1055,6 +1222,14 @@ class CronEngine:
         """后台循环，检查到期的任务。"""
         while self._running:
             now = datetime.utcnow()
+            # M4 batch 3.1.11 (MEDIUM-2): in DEGRADED mode, refuse to
+            # fire new executions.  The tick loop still runs so
+            # pause / resume / remove work (they don't go through
+            # ``_execute_task``).  An operator must resolve the lease
+            # recovery failure and restart the engine.
+            if self._degraded:
+                await asyncio.sleep(self._tick_interval)
+                continue
             # Snapshot candidates without the lock — worst case we
             # consider a candidate that was just paused/removed, and
             # the re-check under the lock below skips it.
@@ -1116,95 +1291,177 @@ class CronEngine:
         M3 (round-6): ``CancelledError`` is now caught explicitly so a
         shutdown-time cancellation persists a ``cancelled`` terminal
         state to the DB instead of leaving the row at ``running``.
-        Previously the ``except Exception`` branch did NOT catch
-        ``CancelledError`` (it inherits from ``BaseException`` in
-        Python 3.8+), so the cancellation bypassed both the error
-        branch and the DB update — leaving the in-memory task at
-        ``RUNNING`` and the DB row stale.  On restart the scheduler
-        would re-fire the task, potentially double-executing any
-        external side effects.
 
         H1 (round-9): execution epoch fence.  The epoch is captured at
-        start and re-checked before writing ANY terminal state
-        (PENDING / COMPLETED / CANCELLED / FAILED).  If the epoch
-        changed during execution (because ``pause()`` / ``remove()``
-        was called), the old executor MUST NOT overwrite the desired
-        state — it returns / re-raises without persisting.  This
-        prevents a cancellation-resistant executor that ignores cancel
-        from coming back later and writing ``pending`` / ``completed``,
-        silently violating the user-visible contract ("I paused /
-        removed this task").
+        start and re-checked before writing ANY terminal state.
+
+        M4 batch 3.1.11 (CRITICAL-1): durable claim is now strictly
+        fail-closed.  If ``claim_scheduled_task`` raises (DB error,
+        commit-then-raise), the executor MUST NOT be called — we read
+        back the row to verify whether the claim actually committed
+        (same execution_id + RUNNING + expected version).  Only if
+        verification succeeds does execution proceed.  Previously a
+        claim exception was swallowed and ``rowcount = 1`` proceeded
+        without a lease — violating the "durable execution ownership"
+        invariant.
+
+        M4 batch 3.1.11 (CRITICAL-2): terminal state + lease clear
+        are now combined into a single ``finalize_scheduled_task`` CAS
+        UPDATE.  Previously the terminal write and the lease clear
+        were separate operations; if the terminal write raised, the
+        ``except`` branch still cleared the lease — leaving the DB row
+        at ``status='running' + execution_id=NULL + lease_until=NULL``
+        (permanently stuck, unrecoverable).
+
+        M4 batch 3.1.11 (CRITICAL-3): the ``except TypeError`` fallback
+        is removed.  The executor interface is strictly 3-arg
+        (``__init__`` wraps legacy 2-arg executors).  Internal
+        ``TypeError`` from the executor body now propagates as FAILED
+        — no double execution, no identity downgrade.
+
+        M4 batch 3.1.11 (MEDIUM-1): ``claim_scheduled_task`` now takes
+        ``started_at`` (the actual execution start time) for
+        ``last_run``, NOT ``lease_until``.
         """
+        # M4 batch 3.1.11 (CRITICAL-3): reject empty principal before
+        # calling the executor.  An empty principal would cause
+        # ``chat()`` to fall back to ``local-uid:{os.getuid()}``,
+        # silently executing as the server UID.  This check is the
+        # last line of defense — ``cron_create`` already rejects empty
+        # principal, and the broker injects ``principal_id`` for every
+        # cron tool call.  But a corrupted DB row (legacy migration
+        # gone wrong) could still produce an empty principal here.
+        if not task.principal_id:
+            logger.error(
+                "cron task %s: refusing to execute — task has no "
+                "principal_id (data integrity error); marking FAILED",
+                task.name,
+            )
+            # M4 batch 3.1.11 (CRITICAL-3 fix): bump the epoch BEFORE
+            # persisting so the control-op CAS in
+            # ``_persist_task_state`` uses the correct expected/target
+            # versions.  Without this, ``task.lifecycle_version`` stays
+            # at the DB value, ``expected = lifecycle_version - 1``
+            # doesn't match the DB, and the FAILED state is never
+            # durably written — the task stays at ``pending`` and tick
+            # re-fires it on every loop, spamming the log.
+            self._bump_epoch(task.id)
+            task.status = TaskStatus.FAILED
+            task.error = "task has no principal_id (data integrity error)"
+            if self.db:
+                try:
+                    await self._persist_task_state(task)
+                except Exception:  # noqa: BLE001 — stop() will retry
+                    logger.error(
+                        "cron task %s: could not persist FAILED state "
+                        "for empty-principal task",
+                        task.name, exc_info=True,
+                    )
+            return
+
         # H1 (round-9): capture epoch at start.
         epoch_at_start = self._execution_epoch.get(task.id, 0)
         # HIGH-3 (batch 3.1.8): capture lifecycle_version at start for
-        # the conditional DB write.  If a control operation bumps the
-        # version while the executor is running, the executor's
-        # terminal UPDATE will match 0 rows (version mismatch) and the
-        # stale write is discarded.
+        # the conditional DB write.
         version_at_start = task.lifecycle_version
-        # M4 batch 3.1.10 (HIGH-3): durable execution claim.  Before
-        # calling the executor (which may produce external side effects),
-        # atomically transition the DB row to RUNNING + execution_id +
-        # lease_until.  If the process crashes during execution, the
-        # lease marker survives and ``recover_expired_leases`` (called
-        # by ``start()`` on the next boot) marks the task as FAILED —
-        # durable at-least-once disclosure.
+        # M4 batch 3.1.11 (MEDIUM-1): capture started_at for last_run.
+        started_at_dt = datetime.utcnow()
+        # M4 batch 3.1.10 (HIGH-3): durable execution claim.
         execution_id = uuid.uuid4().hex
-        lease_until_dt = datetime.utcnow() + timedelta(seconds=self._execution_lease_seconds)
+        lease_until_dt = started_at_dt + timedelta(seconds=self._execution_lease_seconds)
         if self.db:
+            # M4 batch 3.1.11 (CRITICAL-1): fail-closed on claim.
+            claim_committed = False
             try:
                 rowcount = await self.db.claim_scheduled_task(
                     task.id,
                     execution_id=execution_id,
+                    started_at=started_at_dt.isoformat(),
                     lease_until=lease_until_dt.isoformat(),
                     expected_version=version_at_start,
                 )
-            except Exception:  # noqa: BLE001 — claim failure is non-fatal
+                if rowcount == 1:
+                    claim_committed = True
+                else:
+                    # rowcount 0 — task was not PENDING or version
+                    # changed.  This is a clean "skip" — NOT an error.
+                    logger.info(
+                        "cron task %s: durable claim returned 0 rows — "
+                        "a control operation happened or task is not "
+                        "pending; skipping execution",
+                        task.name,
+                    )
+                    return
+            except Exception:  # noqa: BLE001 — CRITICAL-1: fail-closed
+                # Claim raised — could be DB error OR commit-then-raise.
+                # Read back to verify whether the claim actually
+                # committed.  Only proceed if the DB shows EXACTLY our
+                # execution_id + RUNNING + expected version.
                 logger.error(
-                    "cron task %s: could not claim durable lease; "
-                    "proceeding without lease (at-least-once risk)",
+                    "cron task %s: durable claim raised; verifying "
+                    "whether the claim committed (commit-then-raise)",
                     task.name, exc_info=True,
                 )
-                rowcount = 1  # proceed anyway (legacy behavior)
-            if rowcount == 0:
-                # Claim failed — a control op bumped the version or
-                # the task was not PENDING.  Skip this execution.
-                logger.info(
-                    "cron task %s: durable claim failed (rowcount 0) — "
-                    "a control operation happened or task is not pending; "
-                    "skipping execution",
-                    task.name,
-                )
+                try:
+                    row = await self.db.get_scheduled_task(task.id)
+                except Exception:  # noqa: BLE001 — DB unreadable
+                    logger.error(
+                        "cron task %s: could not read back row after "
+                        "claim exception; FAIL-CLOSED — refusing to "
+                        "execute without confirmed lease",
+                        task.name, exc_info=True,
+                    )
+                    return
+                if (
+                    row is not None
+                    and row.get("execution_id") == execution_id
+                    and row.get("status") == "running"
+                    and int(row.get("lifecycle_version", 0)) == version_at_start
+                ):
+                    # Commit-then-raise: the claim DID commit.  Safe
+                    # to proceed — we own the lease.
+                    logger.info(
+                        "cron task %s: claim verified via read-back "
+                        "(commit-then-raise recovered)",
+                        task.name,
+                    )
+                    claim_committed = True
+                else:
+                    logger.error(
+                        "cron task %s: claim exception + read-back "
+                        "mismatch — FAIL-CLOSED; row state: %r",
+                        task.name,
+                        {
+                            "execution_id": row.get("execution_id") if row else None,
+                            "status": row.get("status") if row else None,
+                            "lifecycle_version": row.get("lifecycle_version") if row else None,
+                        },
+                    )
+                    return
+            if not claim_committed:
                 return
         task.status = TaskStatus.RUNNING
-        task.last_run = datetime.utcnow()
+        task.last_run = started_at_dt  # MEDIUM-1: actual start time
         task.execution_id = execution_id
         task.lease_until = lease_until_dt
         try:
             if self._executor:
-                # M4 batch 3.1.10 (CRITICAL): pass the task's
-                # ``principal_id`` so the scheduled prompt runs as the
-                # creator (not the server UID).  The executor signature
-                # is ``Callable[[str, str], Awaitable[Any]]`` (task_id,
-                # prompt); we extend it to optionally accept a third
-                # ``principal_id`` arg via ``functools.partial`` or
-                # a wrapper in the AgentService.  Here we use a
-                # try/except to handle both 2-arg and 3-arg executors.
-                try:
-                    result = await self._executor(task.id, task.prompt, task.principal_id)
-                except TypeError:
-                    result = await self._executor(task.id, task.prompt)
+                # M4 batch 3.1.11 (CRITICAL-3): no more
+                # ``except TypeError`` fallback.  The executor is
+                # always 3-arg (``__init__`` wraps legacy 2-arg).
+                # Internal ``TypeError`` propagates to the
+                # ``except Exception`` branch → FAILED.
+                result = await self._executor(task.id, task.prompt, task.principal_id)
             else:
                 result = f"[no executor] prompt: {task.prompt[:100]}"
 
-            # H1 (round-9): epoch fence on the success path.  If
-            # pause/remove was called while the executor was running,
-            # they bumped the epoch and set the desired terminal state
-            # (PAUSED / CANCELLED).  We MUST NOT overwrite it with
-            # PENDING / COMPLETED — the stale write would silently
-            # violate the user-visible contract.
+            # H1 (round-9): epoch fence on the success path.
             if self._epoch_changed(task, epoch_at_start):
+                # M4 batch 3.1.11 (CRITICAL-2): control op won —
+                # clear the lease (control op has taken over; the
+                # lease is irrelevant).  Use ``_clear_lease`` because
+                # we have no terminal state to finalize.
+                await self._clear_lease(task, execution_id)
                 return
 
             task.last_result = str(result)[:2000] if result else ""
@@ -1224,85 +1481,69 @@ class CronEngine:
 
             logger.info("task %s executed successfully (run #%d)", task.name, task.run_count)
         except asyncio.CancelledError:
-            # M3 (round-6): persist a cancelled terminal state before
-            # re-raising so the DB row does not stay ``running`` and
-            # the task is not re-scheduled on restart.
-            # H2 (round-7): if the DB write fails, swallow the
-            # secondary exception so the ``raise`` still fires — the
-            # task stays in ``_pending_persistence`` for ``stop()`` to
-            # retry.  Without this, a DB failure here would propagate
-            # out of ``_persist_task_state`` and mask the
-            # ``CancelledError``, leaving the caller (``stop()``'s
-            # drain) without the cancellation signal.
-            #
-            # H1 (round-9): epoch fence on the cancel path too.  If
-            # pause/remove bumped the epoch, they've already set the
-            # desired terminal state (PAUSED / CANCELLED).  We must
-            # NOT overwrite it with our own CANCELLED write — re-raise
-            # without persisting.
+            # H1 (round-9): epoch fence on the cancel path too.
             if self._epoch_changed(task, epoch_at_start):
-                # M4 batch 3.1.10 (HIGH-3): clear lease before re-raising.
+                # M4 batch 3.1.11 (CRITICAL-2): control op won —
+                # clear lease, don't finalize (control op owns state).
                 await self._clear_lease(task, execution_id)
                 raise
             task.status = TaskStatus.CANCELLED
             task.error = "cancelled"
             logger.info("task %s cancelled during execution", task.name)
+            # M4 batch 3.1.11 (CRITICAL-2): atomic finalize — terminal
+            # write + lease clear in one CAS.  If the write fails, the
+            # lease is RETAINED (not cleared) so restart recovery can
+            # disclose the crash.
             try:
-                # HIGH-3 (batch 3.1.8): conditional write — if the
-                # version changed (pause/remove happened), discard.
-                await self._persist_task_state(
+                await self._finalize_task_state(
                     task,
                     expected_version=version_at_start,
                     operation_id=execution_id,
                 )
             except Exception:  # noqa: BLE001 — stop() will retry
                 logger.error(
-                    "cron task %s: could not persist cancelled terminal "
-                    "state; will retry on stop()", task.name, exc_info=True,
+                    "cron task %s: could not finalize cancelled "
+                    "terminal state; lease RETAINED for restart "
+                    "recovery; will retry on stop()",
+                    task.name, exc_info=True,
                 )
-            # M4 batch 3.1.10 (HIGH-3): clear lease before re-raising.
-            await self._clear_lease(task, execution_id)
             raise
         except Exception as exc:
             # H1 (round-9): epoch fence on the failure path too.
             if self._epoch_changed(task, epoch_at_start):
+                # M4 batch 3.1.11 (CRITICAL-2): control op won.
+                await self._clear_lease(task, execution_id)
                 return
             task.status = TaskStatus.FAILED
             task.error = str(exc)
             logger.error("task %s failed: %s", task.name, exc)
 
-        # H2 (round-7): the success / failure path's persist may also
-        # fail; swallow it so the _execute_task coroutine terminates
-        # cleanly.  ``stop()`` will retry the persist via its reconcile
-        # pass (``_pending_persistence`` retains the task_id).
-        #
-        # H1 (round-9): re-check epoch before persisting — it might
-        # have changed during the on_complete callback.
+        # H2 (round-7): persist the terminal state.
+        # H1 (round-9): re-check epoch before persisting.
         if self._epoch_changed(task, epoch_at_start):
-            # M4 batch 3.1.10 (HIGH-3): still clear the lease — even
-            # if we're not persisting terminal state, the execution is
-            # over and the lease should not linger.
+            # M4 batch 3.1.11 (CRITICAL-2): control op won — clear
+            # lease, don't finalize.
             await self._clear_lease(task, execution_id)
             return
         try:
-            # HIGH-3 (batch 3.1.8): conditional write — if the version
-            # changed (pause/remove happened), discard.
-            await self._persist_task_state(
+            # M4 batch 3.1.11 (CRITICAL-2): atomic finalize.
+            await self._finalize_task_state(
                 task,
                 expected_version=version_at_start,
                 operation_id=execution_id,
             )
         except Exception:  # noqa: BLE001 — stop() will retry
             logger.error(
-                "cron task %s: could not persist terminal state %s; "
-                "will retry on stop()",
+                "cron task %s: could not finalize terminal state %s; "
+                "lease RETAINED for restart recovery; will retry on stop()",
                 task.name, task.status.value, exc_info=True,
             )
-        # M4 batch 3.1.10 (HIGH-3): clear the durable lease after the
-        # terminal write (whether it succeeded or was discarded).  The
-        # execution is over — the lease must not linger and confuse
-        # restart recovery into thinking the process crashed.
-        await self._clear_lease(task, execution_id)
+            # M4 batch 3.1.11 (CRITICAL-2): DO NOT clear the lease
+            # here — the terminal write failed, so the lease must
+            # survive for ``recover_expired_leases`` to disclose the
+            # crash on restart.  Previously this called
+            # ``_clear_lease`` unconditionally, leaving the row
+            # permanently stuck at RUNNING + NULL lease.
 
     async def _clear_lease(self, task: ScheduledTask, execution_id: str) -> None:
         """M4 batch 3.1.10 (HIGH-3): clear the durable execution lease.
@@ -1311,6 +1552,12 @@ class CronEngine:
         executor that lost a lease race cannot clear a newer executor's
         lease.  Failures are logged but non-fatal (the lease will
         expire naturally if not cleared).
+
+        M4 batch 3.1.11 (CRITICAL-2): this method is now ONLY called
+        when a control operation won the epoch race (the executor's
+        terminal state was discarded).  The normal success / failure /
+        cancel path uses ``_finalize_task_state`` which combines the
+        terminal write + lease clear into a single atomic CAS.
         """
         if not self.db:
             return
@@ -1326,6 +1573,90 @@ class CronEngine:
             )
         task.execution_id = None
         task.lease_until = None
+
+    async def _finalize_task_state(
+        self,
+        task: ScheduledTask,
+        *,
+        expected_version: int,
+        operation_id: str,
+    ) -> bool:
+        """M4 batch 3.1.11 (CRITICAL-2): atomic terminal write + lease clear.
+
+        Wraps ``db.finalize_scheduled_task`` (single CAS UPDATE that
+        sets the terminal status AND clears ``execution_id`` /
+        ``lease_until``).  If the UPDATE raises, BOTH the terminal
+        write and the lease clear are aborted — the lease survives so
+        ``recover_expired_leases`` can disclose the crash on restart.
+
+        Also places / clears the pending persistence marker (HIGH-1:
+        does NOT overwrite an existing control-op marker).
+
+        Returns ``True`` on success, ``False`` on version mismatch
+        (rowcount 0 — a control op happened; the stale write is
+        discarded, and the lease is NOT cleared because the control
+        op owns the state now — ``_clear_lease`` is the caller's
+        responsibility in that case).
+        """
+        if not self.db:
+            return True
+        # HIGH-1: don't overwrite an existing control-op marker.
+        existing = self._pending_persistence.get(task.id)
+        if (
+            existing is not None
+            and existing.is_control_op
+            and existing.operation_id != operation_id
+        ):
+            logger.info(
+                "cron task %s: executor finalize skipped — a newer "
+                "control-op marker exists (operation_id=%s); the "
+                "control op owns the state",
+                task.name, existing.operation_id,
+            )
+            return False
+        self._pending_persistence[task.id] = PendingPersistence(
+            operation_id=operation_id,
+            desired_status=task.status.value,
+            expected_version=expected_version,
+            is_control_op=False,
+        )
+        rowcount = await self.db.finalize_scheduled_task(
+            task.id,
+            execution_id=task.execution_id or "",
+            expected_version=expected_version,
+            status=task.status.value,
+            last_run=task.last_run.isoformat() if task.last_run else None,
+            next_run=task.next_run.isoformat() if task.next_run else None,
+            run_count=task.run_count,
+            last_result=task.last_result,
+            error=task.error,
+        )
+        if rowcount == 0:
+            # Version mismatch OR execution_id mismatch — a control
+            # op or a newer executor won.  Discard the stale write.
+            logger.info(
+                "cron task %s: finalize returned 0 rows (version or "
+                "execution_id mismatch); a control op or newer "
+                "executor won — stale write discarded",
+                task.name,
+            )
+            stored = self._pending_persistence.get(task.id)
+            if stored is not None and stored.operation_id == operation_id:
+                self._pending_persistence.pop(task.id, None)
+            # Clear in-memory lease fields — the DB lease will be
+            # cleared by the control op's persist or by restart
+            # recovery.  We don't call ``_clear_lease`` here because
+            # the execution_id in the DB might not be ours anymore.
+            task.execution_id = None
+            task.lease_until = None
+            return False
+        # Success — clear the marker if it's still ours.
+        stored = self._pending_persistence.get(task.id)
+        if stored is not None and stored.operation_id == operation_id:
+            self._pending_persistence.pop(task.id, None)
+        task.execution_id = None
+        task.lease_until = None
+        return True
 
     def _epoch_changed(self, task: ScheduledTask, epoch_at_start: int) -> bool:
         """H1 (round-9): return ``True`` if the execution epoch for
@@ -1354,113 +1685,153 @@ class CronEngine:
         expected_version: int | None = None,
         operation_id: str | None = None,
     ) -> bool:
-        """Persist the current task state to the DB.
+        """Persist the current task state to the DB (control op path).
 
-        M3 (round-6): extracted so both the success / failure path and
-        the ``CancelledError`` path share the same durable write.
+        M4 batch 3.1.11 (HIGH-2): control operations now use
+        ``control_update_scheduled_task`` — an idempotent CAS that
+        takes an explicit ``expected_version`` and ``target_version``
+        (exactly ``expected_version + 1``).  A retry after
+        commit-then-raise matches 0 rows (the DB is already at
+        ``target_version``) — the caller reads back to confirm and
+        treats it as success.  This replaces the unconditional
+        ``update_scheduled_task(bump_version=True)`` which bumped the
+        version on every retry, causing version drift.
 
-        H2 (round-7): state-machine tracking.  The task is added to
-        ``_pending_persistence`` BEFORE the DB write and only removed
-        after a successful UPDATE.  If the write raises, the task stays
-        in the set so ``stop()`` can retry it on the next call.
+        M4 batch 3.1.11 (HIGH-1): executor markers (``is_control_op
+        = False``) are NOT placed if a newer control-op marker
+        already exists.  Previously the unconditional
+        ``self._pending_persistence[task.id] = ...`` let a stale
+        executor overwrite a newer control op's retry marker — the
+        control op's persist would then be lost.
 
-        HIGH-3 (batch 3.1.8): if ``expected_version`` is provided, uses
-        ``update_scheduled_task_conditional`` (optimistic concurrency).
-        Returns ``True`` if the write succeeded (rowcount 1), ``False``
-        if the version mismatched (rowcount 0 — a control operation
-        happened in between; the stale write is discarded).  The caller
-        (``_execute_task``) captures ``lifecycle_version`` at start and
-        passes it here so a pause/remove/resume that bumped the version
-        will cause the executor's terminal write to fail.
+        Executor terminal writes (``expected_version is not None``)
+        go through ``_finalize_task_state`` (atomic + lease clear),
+        NOT this method.  This method is now ONLY for control
+        operations (``expected_version is None``).
 
-        HIGH (batch 3.1.9): the conditional UPDATE does NOT bump the
-        version on success — only control operations (pause / resume /
-        remove) bump the version.
-
-        M4 batch 3.1.10 (HIGH-2): ``operation_id`` — each caller
-        generates a unique id and passes it here.  The pending marker
-        is only cleared if the stored ``operation_id`` matches — so a
-        stale executor that lost a version race CANNOT clear a NEWER
-        control op's retry marker (the old ``set[str]`` design did
-        ``discard(task.id)`` which cleared whatever marker was there,
-        even if it belonged to a later control op).
-
-        If ``expected_version`` is ``None`` (control operation path:
-        pause / remove / resume), uses the unconditional
-        ``update_scheduled_task`` with ``bump_version=True`` so the
-        control operation always wins.
-
-        Returns ``True`` on success (or when there is no DB).  Returns
-        ``False`` on version mismatch (only when ``expected_version``
-        is provided).
+        Returns ``True`` on success (or when there is no DB).
         """
         if not self.db:
             return True
-        # M4 batch 3.1.10 (HIGH-2): generate an operation_id if the
-        # caller didn't provide one (backwards compat for tests that
-        # call _persist_task_state directly).
         if operation_id is None:
             import uuid as _uuid
             operation_id = _uuid.uuid4().hex
         is_control_op = expected_version is None
-        # H2 (round-7): mark pending BEFORE the write.  M4 batch 3.1.10
-        # (HIGH-2): store the PendingPersistence entry.  If there is
-        # already a NEWER entry (different operation_id) for this task,
-        # we overwrite it — the caller holding the per-task lock
-        # guarantees only one operation at a time, so the newest
-        # operation's intent is always the correct one.
+        if not is_control_op:
+            # Executor path — should use ``_finalize_task_state``.
+            # Keep this branch for backwards compat with tests that
+            # call ``_persist_task_state`` directly with
+            # ``expected_version``.
+            return await self._finalize_task_state(
+                task,
+                expected_version=expected_version,
+                operation_id=operation_id,
+            )
+        # Control operation path — idempotent CAS.
+        # HIGH-1: don't overwrite a newer control-op marker.
+        existing = self._pending_persistence.get(task.id)
+        if (
+            existing is not None
+            and existing.is_control_op
+            and existing.operation_id != operation_id
+        ):
+            logger.info(
+                "cron task %s: control persist skipped — a newer "
+                "control-op marker exists (operation_id=%s)",
+                task.name, existing.operation_id,
+            )
+            return True
+        # Capture the expected / target version for the idempotent
+        # CAS.  ``pause()`` / ``remove()`` call ``_bump_epoch``
+        # BEFORE ``_persist_task_state``, which already incremented
+        # ``task.lifecycle_version``.  So the pre-bump version (what
+        # the DB currently has) is ``task.lifecycle_version - 1``.
+        # The target is ``task.lifecycle_version`` (the bumped value).
+        # On retry after commit-then-raise, the DB is already at
+        # ``target`` — the CAS matches 0 rows and we read back to
+        # confirm (idempotent).
+        expected = task.lifecycle_version - 1  # pre-bump DB version
+        target = task.lifecycle_version        # post-bump in-memory
         self._pending_persistence[task.id] = PendingPersistence(
             operation_id=operation_id,
             desired_status=task.status.value,
-            expected_version=expected_version if expected_version is not None else task.lifecycle_version,
-            is_control_op=is_control_op,
+            expected_version=expected,
+            is_control_op=True,
         )
-        if expected_version is not None:
-            # HIGH-3 (batch 3.1.8): executor terminal write — conditional.
-            rowcount = await self.db.update_scheduled_task_conditional(
+        try:
+            rowcount = await self.db.control_update_scheduled_task(
                 task.id,
-                expected_version=expected_version,
+                expected_version=expected,
+                target_version=target,
                 status=task.status.value,
-                last_run=task.last_run.isoformat() if task.last_run else None,
                 next_run=task.next_run.isoformat() if task.next_run else None,
-                run_count=task.run_count,
-                last_result=task.last_result,
                 error=task.error,
             )
-            if rowcount == 0:
-                # Version mismatch — a control operation bumped the
-                # version.  Discard this stale write.  The control
-                # operation already wrote the desired state.
+        except Exception:
+            # The CAS raised — could be commit-then-raise.  Read back
+            # to verify.  If the DB is already at ``target_version``
+            # with the desired status, treat as success.
+            try:
+                row = await self.db.get_scheduled_task(task.id)
+            except Exception:  # noqa: BLE001 — DB unreadable
+                raise
+            if (
+                row is not None
+                and int(row.get("lifecycle_version", 0)) == target
+                and row.get("status") == task.status.value
+            ):
                 logger.info(
-                    "cron task %s: terminal write discarded (version "
-                    "mismatch: expected %d, current is higher); a "
-                    "pause/remove/resume happened during execution",
-                    task.name, expected_version,
+                    "cron task %s: control CAS raised but read-back "
+                    "confirms target version + status (commit-then-raise)",
+                    task.name,
                 )
-                # M4 batch 3.1.10 (HIGH-2): only clear OUR marker —
-                # a newer control op may have placed its own marker
-                # while we were waiting for the conditional UPDATE.
-                # The old ``set[str].discard`` would have cleared it.
                 stored = self._pending_persistence.get(task.id)
                 if stored is not None and stored.operation_id == operation_id:
                     self._pending_persistence.pop(task.id, None)
-                return False
-        else:
-            # Control operation — unconditional, bumps version.
-            await self.db.update_scheduled_task(
-                task.id,
-                status=task.status.value,
-                last_run=task.last_run.isoformat() if task.last_run else None,
-                next_run=task.next_run.isoformat() if task.next_run else None,
-                run_count=task.run_count,
-                last_result=task.last_result,
-                error=task.error,
-                bump_version=True,
+                task.lifecycle_version = target
+                self._execution_epoch[task.id] = target
+                return True
+            raise
+        if rowcount == 0:
+            # Version mismatch — either a prior retry already
+            # committed (DB at ``target``) or a newer control op
+            # happened (DB at > ``target``).  Read back to
+            # distinguish.
+            try:
+                row = await self.db.get_scheduled_task(task.id)
+            except Exception:  # noqa: BLE001 — treat as failure
+                row = None
+            if (
+                row is not None
+                and int(row.get("lifecycle_version", 0)) == target
+                and row.get("status") == task.status.value
+            ):
+                # Prior retry committed — idempotent success.
+                logger.info(
+                    "cron task %s: control CAS returned 0 but "
+                    "read-back confirms target version + status "
+                    "(prior retry committed)",
+                    task.name,
+                )
+                stored = self._pending_persistence.get(task.id)
+                if stored is not None and stored.operation_id == operation_id:
+                    self._pending_persistence.pop(task.id, None)
+                task.lifecycle_version = target
+                self._execution_epoch[task.id] = target
+                return True
+            # A newer control op won — don't overwrite.
+            logger.info(
+                "cron task %s: control CAS returned 0 — a newer "
+                "control operation happened; not overwriting",
+                task.name,
             )
-        # Only clear after a successful persist — and only if the
-        # stored marker is still OURS.  A concurrent control op may
-        # have replaced our marker with a newer one while we were
-        # awaiting the DB write.
+            stored = self._pending_persistence.get(task.id)
+            if stored is not None and stored.operation_id == operation_id:
+                self._pending_persistence.pop(task.id, None)
+            return False
+        # Success — update in-memory version + clear marker.
+        task.lifecycle_version = target
+        self._execution_epoch[task.id] = target
         stored = self._pending_persistence.get(task.id)
         if stored is not None and stored.operation_id == operation_id:
             self._pending_persistence.pop(task.id, None)

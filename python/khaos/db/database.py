@@ -1119,6 +1119,7 @@ class Database:
         task_id: str,
         *,
         execution_id: str,
+        started_at: str,
         lease_until: str,
         expected_version: int,
     ) -> int:
@@ -1128,6 +1129,13 @@ class Database:
         PENDING to RUNNING, stamping an ``execution_id`` and
         ``lease_until`` so a crash during execution leaves a durable
         marker that restart recovery can detect and disclose.
+
+        M4 batch 3.1.11 (MEDIUM-1): ``last_run`` is now set to
+        ``started_at`` (the actual execution start time), NOT
+        ``lease_until`` (the deadline).  Previously ``last_run`` was
+        set to ``lease_until``, making the DB appear ~10 minutes
+        behind the real start time during execution — corrupting
+        audit timelines and crash-recovery forensics.
 
         Returns rowcount:
           - 1 = claim succeeded (status was PENDING, version matched)
@@ -1147,7 +1155,7 @@ class Database:
                 last_run = ?
             WHERE id = ? AND status = 'pending' AND lifecycle_version = ?
             """,
-            (execution_id, lease_until, lease_until, task_id, expected_version),
+            (execution_id, lease_until, started_at, task_id, expected_version),
         )
         await conn.commit()
         return cursor.rowcount
@@ -1202,6 +1210,130 @@ class Database:
                   AND lease_until < ?
             """,
             (now_iso,),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+    async def finalize_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        execution_id: str,
+        expected_version: int,
+        status: str,
+        last_run: str | None = None,
+        next_run: str | None = None,
+        run_count: int | None = None,
+        last_result: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        """Atomic terminal write + lease clear (CAS).
+
+        M4 batch 3.1.11 (CRITICAL-2): combines the terminal state
+        write AND the lease clear into a single conditional UPDATE so
+        they cannot diverge.  Previously the executor wrote the
+        terminal state, then SEPARATELY cleared the lease — if the
+        terminal write raised (DB error, commit-then-raise), the
+        ``except`` branch still cleared the lease, leaving the DB row
+        at ``status='running' + execution_id=NULL + lease_until=NULL``
+        — permanently stuck (``recover_expired_leases`` only matches
+        rows with ``lease_until IS NOT NULL``).
+
+        The UPDATE is conditional on BOTH ``execution_id`` (so a stale
+        executor can't finalize a newer executor's task) AND
+        ``lifecycle_version`` (so a stale executor can't overwrite a
+        control op's desired state).  Returns rowcount:
+          - 1 = success (terminal state written + lease cleared)
+          - 0 = version mismatch OR execution_id mismatch (a control
+                op or a newer executor won; the stale write is
+                discarded).  The lease is NOT cleared in this case —
+                the caller must leave it intact for restart recovery.
+        """
+        conn = await self._require_conn()
+        clauses: list[str] = [
+            "status = ?",
+            "execution_id = NULL",
+            "lease_until = NULL",
+        ]
+        params: list[Any] = [status]
+        for col, val in [
+            ("last_run", last_run),
+            ("next_run", next_run),
+            ("run_count", run_count),
+            ("last_result", last_result),
+            ("error", error),
+        ]:
+            if val is not None:
+                clauses.append(f"{col} = ?")
+                params.append(val)
+        # NO version bump — executor terminal writes never bump the
+        # version (only control operations do).
+        params.extend([task_id, execution_id, expected_version])
+        cursor = await conn.execute(
+            f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
+            f"WHERE id = ? AND execution_id = ? AND lifecycle_version = ?",
+            tuple(params),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+    async def control_update_scheduled_task(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        target_version: int,
+        status: str,
+        next_run: str | None = None,
+        error: str | None = None,
+    ) -> int:
+        """Idempotent CAS for control operations (pause / resume / remove).
+
+        M4 batch 3.1.11 (HIGH-2): replaces the unconditional
+        ``update_scheduled_task(bump_version=True)`` for control ops.
+        Previously a control op used
+        ``lifecycle_version = lifecycle_version + 1`` unconditionally,
+        so a retry after commit-then-raise bumped the version AGAIN
+        — causing version drift between the in-memory epoch (still
+        the first bump) and the DB (bumped twice).  Subsequent
+        executor writes with the captured ``expected_version`` would
+        permanently mismatch.
+
+        This method takes an explicit ``expected_version`` (the
+        version the control op observed at start) and a
+        ``target_version`` (exactly ``expected_version + 1``).  The
+        UPDATE is conditional on ``lifecycle_version = expected_version``
+        and sets it to ``target_version`` — so a retry after
+        commit-then-raise is idempotent:
+          - If the DB is still at ``expected_version``: UPDATE
+            succeeds, sets to ``target_version``.
+          - If the DB is already at ``target_version`` (prior retry
+            committed): UPDATE matches 0 rows (version mismatch) —
+            the caller treats this as success by reading back.
+          - If the DB is at a HIGHER version (a newer control op
+            happened): UPDATE matches 0 rows — the caller must NOT
+            overwrite; the newer op wins.
+
+        Returns rowcount (1 = applied, 0 = version mismatch).
+        """
+        conn = await self._require_conn()
+        clauses: list[str] = [
+            "status = ?",
+            "lifecycle_version = ?",
+        ]
+        params: list[Any] = [status, target_version]
+        for col, val in [
+            ("next_run", next_run),
+            ("error", error),
+        ]:
+            if val is not None:
+                clauses.append(f"{col} = ?")
+                params.append(val)
+        params.append(task_id)
+        cursor = await conn.execute(
+            f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
+            f"WHERE id = ? AND lifecycle_version = ?",
+            tuple(params + [expected_version]),
         )
         await conn.commit()
         return cursor.rowcount

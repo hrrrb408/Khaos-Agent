@@ -434,6 +434,7 @@ async def test_acceptance_6_claim_fails_if_version_changed(tmp_path) -> None:
         rowcount = await db.claim_scheduled_task(
             task.id,
             execution_id="test-exec-id",
+            started_at="2026-01-01T00:00:00",
             lease_until="2099-01-01T00:00:00",
             expected_version=0,  # stale — pause bumped it to 1
         )
@@ -579,14 +580,16 @@ async def test_acceptance_8_stale_executor_cannot_clear_newer_control_marker(tmp
         # this for its conditional UPDATE).
         version_at_start = task.lifecycle_version
 
-        # Patch the unconditional update (used by pause) to fail, so
-        # the PAUSED marker is left in _pending_persistence.
-        original_update = db.update_scheduled_task
+        # M4 batch 3.1.11 (HIGH-2): patch ``control_update_scheduled_task``
+        # (the idempotent CAS used by pause) to fail, so the PAUSED
+        # marker is left in _pending_persistence.  pause() no longer
+        # uses the unconditional ``update_scheduled_task``.
+        original_update = db.control_update_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB wedged for control op")
 
-        db.update_scheduled_task = failing_update
+        db.control_update_scheduled_task = failing_update
 
         # Call pause — it bumps the epoch, sets PAUSED in memory, and
         # tries to persist.  The persist fails, leaving a NEW marker
@@ -600,8 +603,8 @@ async def test_acceptance_8_stale_executor_cannot_clear_newer_control_marker(tmp
         assert pause_marker.is_control_op is True
         pause_operation_id = pause_marker.operation_id
 
-        # Restore the unconditional update.
-        db.update_scheduled_task = original_update
+        # Restore the control CAS.
+        db.control_update_scheduled_task = original_update
 
         # Release the executor — it will try to write its terminal
         # state (PENDING for next run, since it's a one-shot ISO task
@@ -635,24 +638,26 @@ async def test_acceptance_8_stale_executor_cannot_clear_newer_control_marker(tmp
 
 
 async def test_acceptance_9_commit_then_raise_no_version_drift(tmp_path) -> None:
-    """Criterion 9: if the DB commits the conditional UPDATE but the
-    caller receives an exception (ambiguous commit — e.g. a network
-    error between commit and response), the retry MUST NOT bump the
-    version again.
+    """Criterion 9 (batch 3.1.10): if the DB commits the conditional
+    UPDATE but the caller receives an exception (ambiguous commit —
+    e.g. a network error between commit and response), the retry MUST
+    NOT bump the version again.
+
+    M4 batch 3.1.11 (CRITICAL-2): the executor terminal write now uses
+    ``finalize_scheduled_task`` (atomic terminal write + lease clear).
+    The test patches THAT method (not ``update_scheduled_task_conditional``)
+    and sets up a valid ``execution_id`` (via ``claim_scheduled_task``)
+    so the CAS WHERE clause matches.
 
     Sequence:
       1. Create a task and capture its lifecycle_version.
-      2. Patch ``update_scheduled_task_conditional`` to commit the
-         UPDATE (returning rowcount=1) but then raise (simulating an
-         ambiguous commit).
-      3. Call ``_persist_task_state`` — it commits, raises, the marker
+      2. Claim the task (sets ``execution_id`` in the DB).
+      3. Patch ``finalize_scheduled_task`` to commit the UPDATE
+         (returning rowcount=1) but then raise (ambiguous commit).
+      4. Call ``_persist_task_state`` — it commits, raises, the marker
          stays in _pending_persistence.
-      4. Reconcile retries — this time the conditional UPDATE matches
-         0 rows (the version in the DB was NOT bumped by the executor
-         write, so the row's version is still the captured one — but
-         the row's status is already the desired state, so the retry
-         is a no-op).
-      5. The DB version MUST NOT have drifted (the executor write does
+      5. Reconcile retries — the second call succeeds (no raise).
+      6. The DB version MUST NOT have drifted (the executor write does
          not bump the version; only control ops do).
     """
     db = await _make_db(tmp_path)
@@ -667,8 +672,25 @@ async def test_acceptance_9_commit_then_raise_no_version_drift(tmp_path) -> None
         row_before = await db.get_scheduled_task(task.id)
         db_version_before = int(row_before["lifecycle_version"])
 
-        # Patch the conditional update to commit (return 1) then raise.
-        original_conditional = db.update_scheduled_task_conditional
+        # M4 batch 3.1.11: claim the task so the DB has a valid
+        # execution_id — ``finalize_scheduled_task`` checks it in the
+        # WHERE clause.  Mirror the execution_id on the in-memory task.
+        execution_id = "test-exec-id-9"
+        started_at = datetime.utcnow().isoformat()
+        lease_until = (datetime.utcnow() + timedelta(seconds=600)).isoformat()
+        rowcount = await db.claim_scheduled_task(
+            task.id,
+            execution_id=execution_id,
+            started_at=started_at,
+            lease_until=lease_until,
+            expected_version=version_before,
+        )
+        assert rowcount == 1, "claim should succeed — task is PENDING"
+        task.execution_id = execution_id
+        task.lease_until = datetime.fromisoformat(lease_until)
+
+        # Patch finalize_scheduled_task to commit (return 1) then raise.
+        original_finalize = db.finalize_scheduled_task
         call_count = {"n": 0}
 
         async def commit_then_raise(*args, **kwargs):
@@ -676,12 +698,12 @@ async def test_acceptance_9_commit_then_raise_no_version_drift(tmp_path) -> None
             if call_count["n"] == 1:
                 # First call: commit the UPDATE (call the real one),
                 # then raise to simulate an ambiguous commit.
-                result = await original_conditional(*args, **kwargs)
+                result = await original_finalize(*args, **kwargs)
                 raise RuntimeError("ambiguous commit — network error")
             # Subsequent calls: just return the real result (no raise).
-            return await original_conditional(*args, **kwargs)
+            return await original_finalize(*args, **kwargs)
 
-        db.update_scheduled_task_conditional = commit_then_raise
+        db.finalize_scheduled_task = commit_then_raise
 
         # Set a terminal state and try to persist.
         task.status = TaskStatus.COMPLETED
@@ -694,13 +716,17 @@ async def test_acceptance_9_commit_then_raise_no_version_drift(tmp_path) -> None
             pass  # the ambiguous commit
 
         # The marker is in _pending_persistence (the persist raised).
-        assert task.id in engine._pending_persistence
+        assert task.id in engine._pending_persistence, (
+            "task.id is NOT in _pending_persistence after commit-then-raise"
+        )
 
         # Reconcile retries — the second call succeeds (no raise).
         await engine._reconcile_pending_persistence()
 
         # The marker is cleared.
-        assert task.id not in engine._pending_persistence
+        assert task.id not in engine._pending_persistence, (
+            "marker was not cleared after successful reconcile retry"
+        )
 
         # The DB version MUST NOT have drifted — the executor write
         # does not bump the version (only control ops do).
@@ -713,7 +739,7 @@ async def test_acceptance_9_commit_then_raise_no_version_drift(tmp_path) -> None
             "write to mismatch and be silently discarded"
         )
 
-        db.update_scheduled_task_conditional = original_conditional
+        db.finalize_scheduled_task = original_finalize
     finally:
         await db.close()
 
@@ -741,13 +767,16 @@ async def test_acceptance_10_cron_resume_propagates_persistence_pending(tmp_path
         # Pause the task so it can be resumed.
         await engine.pause(task.id, principal_id="alice")
 
-        # Patch the unconditional update (used by resume) to fail.
-        original_update = db.update_scheduled_task
+        # M4 batch 3.1.11 (HIGH-2): patch
+        # ``control_update_scheduled_task`` (the idempotent CAS used by
+        # resume) to fail.  resume() no longer uses the unconditional
+        # ``update_scheduled_task`` with bump_version=True.
+        original_update = db.control_update_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB wedged on resume")
 
-        db.update_scheduled_task = failing_update
+        db.control_update_scheduled_task = failing_update
 
         # Engine layer: resume returns persistence_pending.
         result = await engine.resume(task.id, principal_id="alice")
@@ -778,7 +807,7 @@ async def test_acceptance_10_cron_resume_propagates_persistence_pending(tmp_path
         finally:
             set_cron_engine(None)
 
-        db.update_scheduled_task = original_update
+        db.control_update_scheduled_task = original_update
     finally:
         await db.close()
 

@@ -516,19 +516,19 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # HIGH-3 (batch 3.1.8): the executor's terminal write now uses
-        # ``update_scheduled_task_conditional`` (optimistic concurrency).
-        # Patch THAT method to fail so the cancel path's
-        # _persist_task_state raises and leaves task_id in
-        # _pending_persistence.
-        original_conditional = db.update_scheduled_task_conditional
+        # M4 batch 3.1.11 (CRITICAL-2): the executor's terminal write
+        # now uses ``finalize_scheduled_task`` (atomic terminal write +
+        # lease clear in one CAS).  Patch THAT method to fail so the
+        # cancel path's _finalize_task_state raises and leaves task_id
+        # in _pending_persistence.
+        original_finalize = db.finalize_scheduled_task
 
-        async def failing_conditional(*args, **kwargs):
+        async def failing_finalize(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task_conditional = failing_conditional
+        db.finalize_scheduled_task = failing_finalize
 
-        # Cancel the execute_task — its _persist_task_state fails,
+        # Cancel the execute_task — its _finalize_task_state fails,
         # leaving the task_id in _pending_persistence.
         exec_tasks = list(engine._execute_tasks.values())
         assert len(exec_tasks) == 1
@@ -541,19 +541,15 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # M4 batch 3.1.10 (HIGH-2): the reconcile path now uses
-        # ``update_scheduled_task_conditional`` for executor entries
-        # (``is_control_op=False``) — it respects the captured
-        # ``expected_version`` so a stale executor's retry cannot
-        # overwrite a newer control op's state.  Keep the conditional
+        # M4 batch 3.1.11 (CRITICAL-2): the reconcile path now uses
+        # ``finalize_scheduled_task`` for executor entries
+        # (``is_control_op=False``) — it's the atomic CAS that
+        # combines terminal write + lease clear.  Keep the finalize
         # patch failing so the first stop()'s reconcile ALSO fails.
-        # (Previously the reconcile used the unconditional
-        # ``update_scheduled_task`` and the test patched that; the
-        # generation-based pending persistence changed the dispatch.)
-        async def failing_conditional_2(*args, **kwargs):
+        async def failing_finalize_2(*args, **kwargs):
             raise RuntimeError("DB still wedged")
 
-        db.update_scheduled_task_conditional = failing_conditional_2
+        db.finalize_scheduled_task = failing_finalize_2
 
         # First stop(): reconcile retries the persist, fails, raises
         # ServiceShutdownError.
@@ -566,8 +562,8 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
             "the next stop() cannot retry"
         )
 
-        # Restore the real conditional update so the next retry succeeds.
-        db.update_scheduled_task_conditional = original_conditional
+        # Restore the real finalize so the next retry succeeds.
+        db.finalize_scheduled_task = original_finalize
 
         # Second stop(): reconcile retries the persist, succeeds.
         await engine.stop(timeout=2.0)
@@ -743,18 +739,20 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # HIGH-3 (batch 3.1.8): patch the CONDITIONAL update to FAIL
-        # so the cancel path's _persist_task_state raises and leaves
-        # task_id in _pending_persistence.  (The executor's terminal
-        # write now uses update_scheduled_task_conditional.)
-        original_conditional = db.update_scheduled_task_conditional
+        # M4 batch 3.1.11 (CRITICAL-2): patch ``finalize_scheduled_task``
+        # (the atomic terminal-write + lease-clear CAS) to FAIL so the
+        # cancel path's ``_finalize_task_state`` raises and leaves
+        # task_id in _pending_persistence.  The cancel path no longer
+        # uses ``update_scheduled_task_conditional`` — it goes through
+        # ``_finalize_task_state`` → ``db.finalize_scheduled_task``.
+        original_finalize = db.finalize_scheduled_task
 
-        async def failing_conditional(*args, **kwargs):
+        async def failing_finalize(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task_conditional = failing_conditional
+        db.finalize_scheduled_task = failing_finalize
 
-        # Cancel the execute_task — its _persist_task_state fails,
+        # Cancel the execute_task — its _finalize_task_state fails,
         # leaving the task_id in _pending_persistence.
         exec_tasks = list(engine._execute_tasks.values())
         assert len(exec_tasks) == 1
@@ -766,15 +764,15 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # M4 batch 3.1.10 (HIGH-2): the reconcile path now uses
-        # ``update_scheduled_task_conditional`` for executor entries
-        # (``is_control_op=False``).  Wedge the CONDITIONAL update so
-        # the reconcile hangs until release_db is set.  After release,
-        # it calls the real update so the retained owner can actually
-        # persist.  (Previously the reconcile used the unconditional
-        # ``update_scheduled_task`` and the test wedged that; the
-        # generation-based pending persistence changed the dispatch.)
-        async def swallowing_conditional(*args, **kwargs):
+        # M4 batch 3.1.11 (CRITICAL-2): the reconcile path now uses
+        # ``finalize_scheduled_task`` for executor entries
+        # (``is_control_op=False``).  Wedge the FINALIZE CAS so the
+        # reconcile hangs until release_db is set.  After release, it
+        # calls the real finalize so the retained owner can actually
+        # persist.  (Previously the reconcile used the conditional
+        # ``update_scheduled_task_conditional``; the atomic finalize
+        # combined terminal-write + lease-clear into one CAS.)
+        async def swallowing_finalize(*args, **kwargs):
             while not release_db.is_set():
                 try:
                     await release_db.wait()
@@ -782,9 +780,9 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
                     if release_db.is_set():
                         raise
                     # swallow: stay pending past the deadline
-            return await original_conditional(*args, **kwargs)
+            return await original_finalize(*args, **kwargs)
 
-        db.update_scheduled_task_conditional = swallowing_conditional
+        db.finalize_scheduled_task = swallowing_finalize
 
         # First stop(): reconcile hangs, owner is retained.
         with pytest.raises(ServiceShutdownError):
@@ -890,18 +888,20 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # HIGH-3 (batch 3.1.8): patch the CONDITIONAL update to FAIL
-        # so the cancel path's _persist_task_state raises and leaves
-        # task_id in _pending_persistence.  (The executor's terminal
-        # write now uses update_scheduled_task_conditional.)
-        original_conditional = db.update_scheduled_task_conditional
+        # M4 batch 3.1.11 (CRITICAL-2): patch ``finalize_scheduled_task``
+        # (the atomic terminal-write + lease-clear CAS) to FAIL so the
+        # cancel path's ``_finalize_task_state`` raises and leaves
+        # task_id in _pending_persistence.  The cancel path no longer
+        # uses ``update_scheduled_task_conditional`` — it goes through
+        # ``_finalize_task_state`` → ``db.finalize_scheduled_task``.
+        original_finalize = db.finalize_scheduled_task
 
-        async def failing_conditional(*args, **kwargs):
+        async def failing_finalize(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task_conditional = failing_conditional
+        db.finalize_scheduled_task = failing_finalize
 
-        # Cancel the execute_task — its _persist_task_state fails,
+        # Cancel the execute_task — its _finalize_task_state fails,
         # leaving the task_id in _pending_persistence.
         exec_tasks = list(engine._execute_tasks.values())
         assert len(exec_tasks) == 1
@@ -913,16 +913,15 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
             "_pending_persistence — stop() cannot retry it"
         )
 
-        # M4 batch 3.1.10 (HIGH-2): the reconcile path now uses
-        # ``update_scheduled_task_conditional`` for executor entries
-        # (``is_control_op=False``).  Wedge the CONDITIONAL update:
+        # M4 batch 3.1.11 (CRITICAL-2): the reconcile path now uses
+        # ``finalize_scheduled_task`` for executor entries
+        # (``is_control_op=False``).  Wedge the FINALIZE CAS:
         # swallows cancellation until release_db is set, then raises
         # RuntimeError (simulating a wedged DB that surfaces a hard
         # error once it resumes).  (Previously the reconcile used the
-        # unconditional ``update_scheduled_task`` and the test wedged
-        # that; the generation-based pending persistence changed the
-        # dispatch.)
-        async def swallowing_then_failing_conditional(*args, **kwargs):
+        # conditional ``update_scheduled_task_conditional``; the atomic
+        # finalize combined terminal-write + lease-clear into one CAS.)
+        async def swallowing_then_failing_finalize(*args, **kwargs):
             while not release_db.is_set():
                 try:
                     await release_db.wait()
@@ -932,7 +931,7 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
                     # swallow: stay pending past the deadline
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task_conditional = swallowing_then_failing_conditional
+        db.finalize_scheduled_task = swallowing_then_failing_finalize
 
         # First stop(): reconcile hangs, owner retained.
         with pytest.raises(ServiceShutdownError):
@@ -1589,14 +1588,18 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # Patch update_scheduled_task to FAIL so remove()'s persist
-        # raises and the task is retained in _tasks.
-        original_update = db.update_scheduled_task
+        # M4 batch 3.1.11 (HIGH-2): patch ``control_update_scheduled_task``
+        # (the idempotent CAS used by control ops) to FAIL so remove()'s
+        # persist raises and the task is retained in _tasks.  remove()
+        # no longer uses the unconditional ``update_scheduled_task`` —
+        # it goes through ``_persist_task_state`` (control op path) →
+        # ``control_update_scheduled_task``.
+        original_update = db.control_update_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = failing_update
+        db.control_update_scheduled_task = failing_update
 
         # remove() cancels the executor (clean terminate), then tries
         # to persist CANCELLED — FAILS.  The task is NOT popped from
@@ -1631,9 +1634,9 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
             "cancel completed"
         )
 
-        # Restore update_scheduled_task so stop()'s reconcile can
-        # succeed.
-        db.update_scheduled_task = original_update
+        # Restore control_update_scheduled_task so stop()'s reconcile
+        # can succeed.
+        db.control_update_scheduled_task = original_update
 
         # stop() retries the persist via reconcile — succeeds.
         await engine.stop(timeout=2.0)
@@ -1889,14 +1892,18 @@ async def test_pause_returns_persistence_pending_on_db_failure(
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # Patch update_scheduled_task to FAIL so pause()'s persist
-        # raises.
-        original_update = db.update_scheduled_task
+        # M4 batch 3.1.11 (HIGH-2): patch
+        # ``control_update_scheduled_task`` (the idempotent CAS used by
+        # control ops) to FAIL so pause()'s persist raises.  pause() no
+        # longer uses the unconditional ``update_scheduled_task`` — it
+        # goes through ``_persist_task_state`` (control op path) →
+        # ``control_update_scheduled_task``.
+        original_update = db.control_update_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = failing_update
+        db.control_update_scheduled_task = failing_update
 
         # pause() cancels the executor (clean terminate), then tries
         # to persist PAUSED — FAILS.  Returns persistence_pending.
@@ -1917,9 +1924,9 @@ async def test_pause_returns_persistence_pending_on_db_failure(
             "retry the terminal persist"
         )
 
-        # Restore update_scheduled_task so stop()'s reconcile can
-        # succeed.
-        db.update_scheduled_task = original_update
+        # Restore control_update_scheduled_task so stop()'s reconcile
+        # can succeed.
+        db.control_update_scheduled_task = original_update
 
         # stop() retries the persist via reconcile — succeeds.
         await engine.stop(timeout=2.0)
@@ -2162,7 +2169,7 @@ async def test_concurrent_pause_and_resume_are_serialized() -> None:
     release = asyncio.Event()
     started = asyncio.Event()
 
-    async def stalling_executor(task_id: str, prompt: str) -> str:
+    async def stalling_executor(task_id: str, prompt: str, principal_id: str) -> str:
         started.set()
         await release.wait()
         return "ok"
@@ -2337,7 +2344,7 @@ async def test_resume_refuses_running_task() -> None:
     release = asyncio.Event()
     started = asyncio.Event()
 
-    async def stalling_executor(task_id: str, prompt: str) -> str:
+    async def stalling_executor(task_id: str, prompt: str, principal_id: str) -> str:
         started.set()
         await release.wait()
         return "ok"
@@ -2981,14 +2988,18 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # Patch update_scheduled_task to FAIL so pause()'s persist
-        # raises.
-        original_update = db.update_scheduled_task
+        # M4 batch 3.1.11 (HIGH-2): patch
+        # ``control_update_scheduled_task`` (the idempotent CAS used by
+        # control ops) to FAIL so pause()'s persist raises.  pause() no
+        # longer uses the unconditional ``update_scheduled_task`` — it
+        # goes through ``_persist_task_state`` (control op path) →
+        # ``control_update_scheduled_task``.
+        original_update = db.control_update_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = failing_update
+        db.control_update_scheduled_task = failing_update
 
         # First pause() — executor cancels cleanly, but DB write
         # fails → persistence_pending.
@@ -3018,8 +3029,9 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
             "the persist still failing"
         )
 
-        # Restore update_scheduled_task so the retry can succeed.
-        db.update_scheduled_task = original_update
+        # Restore control_update_scheduled_task so the retry can
+        # succeed.
+        db.control_update_scheduled_task = original_update
 
         # Third pause() — DB recovered, persist succeeds → ok.
         result3 = await engine.pause(task_id, principal_id="test")
@@ -3087,15 +3099,18 @@ async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
         assert result == "ok"
         assert engine._tasks[task_id].status == TaskStatus.PAUSED
 
-        # Patch update_scheduled_task to fail so resume's persist-first
-        # DB write raises.  (resume uses the unconditional
-        # update_scheduled_task with bump_version=True.)
-        original_update = db.update_scheduled_task
+        # M4 batch 3.1.11 (HIGH-2): patch
+        # ``control_update_scheduled_task`` to fail so resume's
+        # persist-first DB write raises.  resume() no longer uses the
+        # unconditional ``update_scheduled_task`` with bump_version=True
+        # — it uses the idempotent CAS ``control_update_scheduled_task``
+        # with explicit expected_version + target_version.
+        original_update = db.control_update_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = failing_update
+        db.control_update_scheduled_task = failing_update
 
         # resume() — DB write fails.  In-memory task MUST stay PAUSED.
         result = await engine.resume(task_id, principal_id="test")
@@ -3108,7 +3123,7 @@ async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
         )
 
         # Restore the DB.  Now resume() should succeed.
-        db.update_scheduled_task = original_update
+        db.control_update_scheduled_task = original_update
         result = await engine.resume(task_id, principal_id="test")
         assert result == "ok", (
             f"expected ok (DB recovered), got {result!r}"
@@ -3158,13 +3173,16 @@ async def test_resume_persist_first_does_not_fire_tick(tmp_path) -> None:
         result = await engine.pause(task_id, principal_id="test")
         assert result == "ok"
 
-        # Patch DB so resume's persist fails.
-        original_update = db.update_scheduled_task
+        # M4 batch 3.1.11 (HIGH-2): patch
+        # ``control_update_scheduled_task`` so resume's persist fails.
+        # resume() uses the idempotent CAS (not the unconditional
+        # ``update_scheduled_task``).
+        original_update = db.control_update_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.update_scheduled_task = failing_update
+        db.control_update_scheduled_task = failing_update
 
         # resume() — fails.  Task stays PAUSED.
         result = await engine.resume(task_id, principal_id="test")
@@ -3181,7 +3199,7 @@ async def test_resume_persist_first_does_not_fire_tick(tmp_path) -> None:
         )
 
         # Restore DB and resume successfully.
-        db.update_scheduled_task = original_update
+        db.control_update_scheduled_task = original_update
         result = await engine.resume(task_id, principal_id="test")
         assert result == "ok"
 
