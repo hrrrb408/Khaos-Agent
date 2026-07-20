@@ -429,14 +429,26 @@ def _probe_uds_liveness(uds_path: Path) -> bool:
         # Non-blocking connect returns EINPROGRESS on Unix; the socket
         # is writable when the connect completes.  A successful connect
         # means a server accepted it — the instance is alive.
-        import select
-        _, writable, _ = select.select([], [probe], [], 0.5)
-        if probe in writable:
-            # Check SO_ERROR — 0 means connected successfully.
-            err = probe.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-            return err == 0
-        # Timeout — assume alive (conservative).
-        return True
+        #
+        # M4 batch 3.1.16B-4: use ``selectors.DefaultSelector``
+        # instead of ``select.select``.  ``select.select`` has a hard
+        # fd-number ceiling of 1024 on macOS (FD_SETSIZE), which
+        # causes ``ValueError: filedescriptor out of range in select()``
+        # when the test suite has accumulated many open fds.  The
+        # ``selectors`` module auto-selects ``poll`` / ``kqueue`` /
+        # ``epoll`` on platforms that support them, none of which have
+        # the 1024 fd limit.  This is the standard library's
+        # recommended replacement for ``select.select``.
+        import selectors
+        with selectors.DefaultSelector() as sel:
+            sel.register(probe, selectors.EVENT_WRITE)
+            ready = sel.select(timeout=0.5)
+            if ready:
+                # Check SO_ERROR — 0 means connected successfully.
+                err = probe.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                return err == 0
+            # Timeout — assume alive (conservative).
+            return True
     except ConnectionRefusedError:
         # Stale socket — no process is listening.
         return False
@@ -589,32 +601,49 @@ class GatewayRPCAuthenticator:
             raise PermissionError("RPC peer socket identity is unavailable")
         peer = getattr(peer, "_sock", peer)
         peer_pid: int | None = None
-        if hasattr(peer, "getpeereid"):
-            peer_uid, _peer_gid = peer.getpeereid()
-            if sys.platform == "darwin":
-                peer_pid = struct.unpack(
-                    "=i",
-                    peer.getsockopt(getattr(socket, "SOL_LOCAL", 0), 2, 4),
-                )[0]
-        elif hasattr(socket, "LOCAL_PEERCRED"):
-            credentials = peer.getsockopt(
-                getattr(socket, "SOL_LOCAL", 0), socket.LOCAL_PEERCRED, 128
-            )
-            if len(credentials) < 8:
-                raise PermissionError("RPC peer credentials are truncated")
-            _version, peer_uid = struct.unpack_from("=II", credentials)
-            if sys.platform == "darwin":
-                peer_pid = struct.unpack(
-                    "=i",
-                    peer.getsockopt(getattr(socket, "SOL_LOCAL", 0), 2, 4),
-                )[0]
-        elif hasattr(socket, "SO_PEERCRED"):
-            credentials = peer.getsockopt(
-                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
-            )
-            peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
-        else:
-            raise PermissionError("RPC peer credentials are unsupported")
+        try:
+            if hasattr(peer, "getpeereid"):
+                peer_uid, _peer_gid = peer.getpeereid()
+                if sys.platform == "darwin":
+                    peer_pid = struct.unpack(
+                        "=i",
+                        peer.getsockopt(getattr(socket, "SOL_LOCAL", 0), 2, 4),
+                    )[0]
+            elif hasattr(socket, "LOCAL_PEERCRED"):
+                credentials = peer.getsockopt(
+                    getattr(socket, "SOL_LOCAL", 0), socket.LOCAL_PEERCRED, 128
+                )
+                if len(credentials) < 8:
+                    raise PermissionError("RPC peer credentials are truncated")
+                _version, peer_uid = struct.unpack_from("=II", credentials)
+                if sys.platform == "darwin":
+                    peer_pid = struct.unpack(
+                        "=i",
+                        peer.getsockopt(getattr(socket, "SOL_LOCAL", 0), 2, 4),
+                    )[0]
+            elif hasattr(socket, "SO_PEERCRED"):
+                credentials = peer.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+                )
+                peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
+            else:
+                raise PermissionError("RPC peer credentials are unsupported")
+        except PermissionError:
+            raise
+        except OSError as exc:
+            # M4 batch 3.1.16B-4: macOS ``getsockopt(SOL_LOCAL,
+            # LOCAL_PEERPID)`` raises ``OSError(57, ENOTCONN)`` when
+            # the peer has already half-closed the connection (common
+            # in test suites that open + close rapidly).  Previously
+            # this propagated as an unhandled OSError, crashed the
+            # ``handle`` coroutine, and left the client with an empty
+            # event stream (causing ``KeyError: 'event'`` in
+            # ``test_triad_smoke``).  Treat it as "peer identity
+            # unavailable" — fail-closed (reject the connection).
+            raise PermissionError(
+                f"RPC peer socket is not connected: {exc} "
+                f"(fail-closed — peer identity unavailable)"
+            ) from exc
         if peer_uid != self._expected_uid:
             raise PermissionError("RPC peer UID is not the configured Gateway UID")
         if peer_pid is None or peer_pid <= 0:
