@@ -72,7 +72,19 @@ class TransitionResult(Enum):
 
 @dataclass
 class CodingTask:
-    """State record for one coding task."""
+    """State record for one coding task.
+
+    M4 batch 3.1.16A-3: every task is owned by exactly one principal.
+    The ``principal_id`` is stamped at ``TaskManager.create`` time from
+    the manager's bound principal and persisted in ``state_json`` so it
+    round-trips through ``TaskManager.load``.  It is intentionally NOT
+    exposed in the public ``to_dict()`` (TUI / RPC) output — only in
+    ``to_dict(include_internal=True)`` — because the principal is an
+    ownership invariant, not a display field.  An authenticated
+    principal can only ever see tasks they own (filtered at the DB
+    layer), so exposing it would be redundant and could mislead callers
+    into thinking they can set it.
+    """
 
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
     goal: str = ""
@@ -89,13 +101,22 @@ class CodingTask:
     # Each entry: {tool_name, arguments, success}.
     trace: list[dict] = field(default_factory=list)
     event_sequence: int = 0
+    # M4 batch 3.1.16A-3: principal-scoped ownership.  Default 'legacy'
+    # is fail-closed — a task constructed without a principal is never
+    # visible to an authenticated principal's TaskManager.
+    principal_id: str = "legacy"
 
     def touch(self) -> None:
         """Stamp ``updated_at`` to now."""
         self.updated_at = datetime.now()
 
     def to_dict(self, include_internal: bool = False) -> dict[str, Any]:
-        """Serialize to a JSON-safe dict for the TUI / RPC layer."""
+        """Serialize to a JSON-safe dict for the TUI / RPC layer.
+
+        ``principal_id`` is included only when ``include_internal=True``
+        (persistence path) so it round-trips through ``state_json``.
+        The public TUI/RPC view never exposes it.
+        """
         data = {
             "id": self.id,
             "goal": self.goal,
@@ -112,6 +133,7 @@ class CodingTask:
             data["metadata"] = self.metadata
             data["trace"] = self.trace
             data["event_sequence"] = self.event_sequence
+            data["principal_id"] = self.principal_id
         return data
 
 
@@ -120,9 +142,30 @@ class TaskManager:
 
     Thread-safe via an ``asyncio.Lock`` so ``AgentLoop`` (recording activity)
     and the TUI / JSON-line server (reading state) can share one instance.
+
+    M4 batch 3.1.16A-3 (CRITICAL): every manager is bound to exactly one
+    ``principal_id`` at construction.  All DB reads and writes are scoped
+    to that principal — a different principal's tasks are invisible.
+    Legacy rows (``principal_id='legacy'``) in the database are filtered
+    out by ``list_coding_tasks(principal_id=...)`` and are therefore
+    never loaded into the in-memory ``_tasks`` cache.
+
+    The in-memory ``_tasks`` cache is preserved because each manager is
+    constructed per-runtime (per ``AgentLoop``), each runtime belongs to
+    exactly one principal, and ``load`` is called once at startup — the
+    cache is implicitly principal-scoped.  Concurrent runtimes under
+    different principals hold separate managers with separate caches;
+    concurrent runtimes under the same principal share the database but
+    each reload their own cache via ``load``.
     """
 
-    def __init__(self, max_active: int = 5, db: Any = None) -> None:
+    def __init__(
+        self,
+        max_active: int = 5,
+        db: Any = None,
+        *,
+        principal_id: str = "legacy",
+    ) -> None:
         self._tasks: dict[str, CodingTask] = {}
         self._max_active = max_active
         self._lock = asyncio.Lock()
@@ -138,6 +181,13 @@ class TaskManager:
         # is serialized with active lease acquisition / Batch 3 execution.
         self._mutation_fence: Any = None
         self._execution_scope_resolver: Any = None
+        # A3-1: principal binding.  Every task created, loaded, or
+        # persisted through this manager is scoped to this principal.
+        # ``principal_id='legacy'`` is the fail-closed default — a
+        # manager constructed without an authenticated principal can
+        # only see its own 'legacy' tasks (which should only exist as
+        # migration leftovers, quarantined to ``status='failed'``).
+        self._principal_id = principal_id
 
     def set_lease_invalidation_hook(self, hook: Any) -> None:
         """Register a callable invoked during cancel to release execution leases."""
@@ -152,10 +202,15 @@ class TaskManager:
         self._execution_scope_resolver = resolver
 
     async def load(self) -> None:
-        """Restore tasks and mark interrupted in-flight work as blocked."""
+        """Restore tasks and mark interrupted in-flight work as blocked.
+
+        M4 batch 3.1.16A-3: only tasks owned by this manager's bound
+        principal are loaded.  Legacy rows and other principals' tasks
+        are filtered out at the DB layer (``list_coding_tasks``).
+        """
         if self._db is None:
             return
-        for data in await self._db.list_coding_tasks():
+        for data in await self._db.list_coding_tasks(principal_id=self._principal_id):
             task = CodingTask(
                 id=data["id"], goal=data.get("goal", ""),
                 status=TaskStatus.parse(data.get("status", "pending")),
@@ -168,6 +223,13 @@ class TaskManager:
                 error=data.get("error"), metadata=dict(data.get("metadata", {})),
                 trace=list(data.get("trace", [])),
                 event_sequence=int(data.get("event_sequence", 0)),
+                # A3-3: preserve the persisted principal.  Pre-A3 rows
+                # lack this field and default to 'legacy' (matching the
+                # migration helper's quarantine), so they'd be filtered
+                # out by ``list_coding_tasks`` anyway — but if a row
+                # somehow reached here without a principal, defaulting
+                # to 'legacy' keeps the invariant.
+                principal_id=data.get("principal_id", self._principal_id),
             )
             if task.status in ACTIVE_STATUSES:
                 task.status = TaskStatus.BLOCKED
@@ -177,14 +239,20 @@ class TaskManager:
             await self._persist(task)
 
     async def create(self, goal: str) -> CodingTask:
-        """Create a new task. Raises if the active-task limit is reached."""
+        """Create a new task. Raises if the active-task limit is reached.
+
+        M4 batch 3.1.16A-3: the new task is stamped with this manager's
+        bound ``principal_id`` so it is owned by that principal for its
+        entire lifecycle.  An authenticated principal can therefore
+        never create a task that another principal could see or cancel.
+        """
         async with self._lock:
             if self._active_count() >= self._max_active:
                 raise RuntimeError(
                     f"max active tasks reached ({self._max_active}); "
                     "complete or cancel an existing task first"
                 )
-            task = CodingTask(goal=goal)
+            task = CodingTask(goal=goal, principal_id=self._principal_id)
             self._tasks[task.id] = task
             await self._persist(task)
             logger.info("created coding task %s: %s", task.id, goal[:80])
@@ -380,7 +448,17 @@ class TaskManager:
     async def _persist(self, task: CodingTask) -> None:
         task.event_sequence += 1
         if self._db is not None:
-            await self._db.upsert_coding_task(task.to_dict(include_internal=True))
+            # A3-2: stamp the bound principal on every persisted row so
+            # ``list_coding_tasks(principal_id=...)`` can filter by it.
+            # The task's own ``principal_id`` is the source of truth
+            # (set at create time from ``self._principal_id``); we pass
+            # it explicitly here so a row can never silently inherit
+            # the DB default ('legacy') if a future code path constructs
+            # a task with a different principal.
+            await self._db.upsert_coding_task(
+                task.to_dict(include_internal=True),
+                principal_id=task.principal_id,
+            )
         event = {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": task.event_sequence, "type": f"task.{task.status.value}", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
         for queue in self._subscribers.get(task.id, []):
             queue.put_nowait(event)

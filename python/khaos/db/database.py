@@ -6,6 +6,7 @@ import json
 import asyncio
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -108,6 +109,8 @@ class Database:
         await self._ensure_permissions_principal_columns()
         await self._ensure_memories_principal_columns()
         await self._ensure_audit_log_principal_columns()
+        # M4 batch 3.1.16A-3: principal-scoped ownership for coding_tasks.
+        await self._ensure_coding_tasks_principal_columns()
 
     async def _ensure_scheduled_tasks_lifecycle_version(self) -> None:
         """Add ``lifecycle_version`` column to legacy ``scheduled_tasks``.
@@ -404,6 +407,84 @@ class Database:
             "ON audit_log(principal_id, created_at)"
         )
         await conn.commit()
+
+    async def _ensure_coding_tasks_principal_columns(self) -> None:
+        """M4 batch 3.1.16A-3 (CRITICAL): add ``principal_id`` column to
+        ``coding_tasks`` for principal-scoped ownership.
+
+        Legacy rows (pre-A-3) get ``principal_id='legacy'`` and are
+        QUARANTINED at migration time — ``status`` is set to ``'failed'``
+        and ``error`` records the quarantine reason.  This mirrors the
+        ``scheduled_tasks`` legacy quarantine from batch 3.1.12 (HIGH-2):
+        an unauthenticated task with no real owner must never execute or
+        surface to an authenticated principal's TaskManager.
+
+        Quarantine is enforced by:
+        - ``list_coding_tasks`` filtering by ``WHERE principal_id = ?``
+          so legacy rows are invisible to authenticated principals.
+        - ``TaskManager.load`` only loading rows for the bound principal.
+        - ``TaskManager.create`` stamping the bound principal on every
+          new task, so post-A3 tasks can never inherit 'legacy'.
+
+        The UPDATE runs unconditionally (not just when the column is
+        added) so a DB that had the column added by an earlier partial
+        run but wasn't quarantined is also caught up.  The UPDATE is a
+        no-op if no legacy tasks exist or they're already quarantined.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(coding_tasks)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        added = False
+        if "principal_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE coding_tasks "
+                "ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            added = True
+        if added:
+            await conn.commit()
+        # Principal-scoped lookup index (idempotent).
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_coding_tasks_principal "
+            "ON coding_tasks(principal_id, status)"
+        )
+        await conn.commit()
+        # M4 batch 3.1.16A-3: quarantine legacy tasks.  Run unconditionally
+        # so a DB that had the column added by an earlier partial run but
+        # wasn't quarantined is also caught up.  The UPDATE is a no-op if
+        # no legacy tasks exist or they're already quarantined.
+        #
+        # ``status='failed'`` is the fail-closed signal: ``TaskManager.load``
+        # only loads rows scoped to the bound principal (so legacy rows are
+        # invisible anyway), but if a future bug ever causes a legacy row
+        # to be loaded, ``status='failed'`` ensures it cannot enter the
+        # active lifecycle (``ACTIVE_STATUSES`` excludes ``FAILED``).
+        #
+        # ``state_json`` is patched in-place so the in-memory ``error``
+        # field round-trips through ``TaskManager.load`` correctly.
+        legacy_rows = await conn.execute(
+            "SELECT id, state_json FROM coding_tasks "
+            "WHERE principal_id = 'legacy' AND status != 'failed'"
+        )
+        legacy_rows = await legacy_rows.fetchall()
+        if legacy_rows:
+            for row in legacy_rows:
+                try:
+                    state = json.loads(str(row["state_json"]))
+                except (json.JSONDecodeError, TypeError):
+                    state = {}
+                state["status"] = "failed"
+                state["error"] = (
+                    "quarantined: legacy migration - task has no "
+                    "authenticated owner; an admin must re-claim it "
+                    "with a real principal before it can run"
+                )
+                await conn.execute(
+                    "UPDATE coding_tasks SET status = 'failed', "
+                    "state_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(state), datetime.now().isoformat(), row["id"]),
+                )
+            await conn.commit()
 
     async def create_session(self, session_id: str, mode: str = "office") -> None:
         """Create a session if missing and keep its mode current."""
@@ -2044,25 +2125,56 @@ class Database:
             )
         await conn.commit()
 
-    async def upsert_coding_task(self, task: dict[str, Any]) -> None:
-        """Persist the complete JSON-safe state of one coding task."""
+    async def upsert_coding_task(
+        self, task: dict[str, Any], *, principal_id: str = "legacy"
+    ) -> None:
+        """Persist the complete JSON-safe state of one coding task.
+
+        M4 batch 3.1.16A-3: ``principal_id`` is stamped on the row so
+        ``list_coding_tasks`` can filter by it.  Callers should pass the
+        bound principal; the default ``'legacy'`` is fail-closed and
+        only used by pre-A3 callers that haven't been migrated yet.
+        """
         conn = await self._require_conn()
         await conn.execute(
             """
-            INSERT INTO coding_tasks (id, goal, status, state_json, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO coding_tasks (id, goal, status, state_json, created_at, updated_at, principal_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET goal=excluded.goal,
                 status=excluded.status, state_json=excluded.state_json,
-                updated_at=excluded.updated_at
+                updated_at=excluded.updated_at,
+                principal_id=excluded.principal_id
             """,
-            (task["id"], task["goal"], task["status"], json.dumps(task), task["created_at"], task["updated_at"]),
+            (
+                task["id"], task["goal"], task["status"],
+                json.dumps(task), task["created_at"], task["updated_at"],
+                principal_id,
+            ),
         )
         await conn.commit()
 
-    async def list_coding_tasks(self) -> list[dict[str, Any]]:
-        """Load persisted coding-task state in creation order."""
+    async def list_coding_tasks(
+        self, *, principal_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Load persisted coding-task state in creation order.
+
+        M4 batch 3.1.16A-3: when ``principal_id`` is given, only rows
+        owned by that principal are returned.  ``principal_id=None``
+        (default) is the explicit admin opt-in that returns every row
+        regardless of owner — used by migration / admin tooling, never
+        by an authenticated principal's TaskManager.
+        """
         conn = await self._require_conn()
-        cursor = await conn.execute("SELECT state_json FROM coding_tasks ORDER BY created_at")
+        if principal_id is None:
+            cursor = await conn.execute(
+                "SELECT state_json FROM coding_tasks ORDER BY created_at"
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT state_json FROM coding_tasks "
+                "WHERE principal_id = ? ORDER BY created_at",
+                (principal_id,),
+            )
         return [json.loads(str(row["state_json"])) for row in await cursor.fetchall()]
 
     async def search_sessions(
