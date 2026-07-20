@@ -23,6 +23,21 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import AsyncIterator
 
+# M4 batch 3.1.13 (CRITICAL-3): fcntl-based process-level exclusive
+# lock to enforce the single-instance model.  Without this, a second
+# process could ``unlink`` the live first process's UDS socket, open
+# the same DB, and mark all RUNNING tasks as FAILED via
+# ``recover_all_running_tasks`` — while the first process's executors
+# kept running and producing side effects.  The lock is acquired
+# BEFORE socket unlink / migration / recovery and held for the
+# process lifetime.  fcntl is Unix-only; on Windows the UDS server
+# itself is unavailable (``asyncio.start_unix_server`` doesn't exist),
+# so the lock is a no-op there.
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover — Windows
+    _fcntl = None
+
 from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.approval import ApprovalBroker
 from khaos.agent.compressor import ContextCompressor
@@ -76,6 +91,95 @@ RPC_AUTH_WINDOW_SECONDS = 30
 SERVER_HANDLER_DRAIN_TIMEOUT = 5.0   # connection handler tasks
 CHAT_DRAIN_TIMEOUT = 10.0            # active AgentService chat tasks
 SUBAGENT_SHUTDOWN_TIMEOUT = 30.0     # detached SubAgent background tasks
+
+
+def _acquire_instance_lock(db_path: str) -> int | None:
+    """M4 batch 3.1.13 (CRITICAL-3): acquire a process-level exclusive
+    lock on a lockfile bound to the DB path.
+
+    The lock prevents a second Khaos process from opening the same DB
+    and running ``recover_all_running_tasks`` (which marks ALL running
+    tasks as FAILED) while the first process's executors are still
+    alive.  Without this, the "single-instance model" was just a
+    comment assumption — not an enforced safety constraint.
+
+    The lock is ``fcntl.LOCK_EX | fcntl.LOCK_NB`` (non-blocking): if
+    another process holds it, we fail immediately with
+    ``PermissionError``.  The lock is released automatically when the
+    process exits (the fd is closed by the OS).
+
+    Returns the lock fd (which MUST be kept open for the process
+    lifetime), or ``None`` on platforms without fcntl (Windows — the
+    UDS server itself is unavailable there).
+    """
+    if _fcntl is None:
+        return None
+    lockfile_path = str(Path(db_path).resolve()) + ".instance.lock"
+    # Create the lockfile with 0600 (owner-only).  O_CREAT | O_RDWR
+    # so we don't truncate an existing lockfile (another process might
+    # be holding it).
+    fd = os.open(lockfile_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(fd)
+        raise PermissionError(
+            f"another Khaos instance holds the exclusive lock on "
+            f"{lockfile_path}; refusing to start (single-instance "
+            f"model enforced — CRITICAL-3)"
+        ) from exc
+    # Write the current PID for diagnostics (not used for locking —
+    # the flock is the authoritative lock).
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+        os.fsync(fd)
+    except OSError:
+        pass  # non-fatal — the lock itself is what matters
+    return fd
+
+
+def _probe_uds_liveness(uds_path: Path) -> bool:
+    """M4 batch 3.1.13 (CRITICAL-3): probe whether a live process is
+    listening on the given UDS path.
+
+    Attempts a non-blocking ``connect`` to the socket.  If the connect
+    succeeds (or raises ``EINPROGRESS`` then completes), a live server
+    is listening → return ``True``.  If the connect fails with
+    ``ECONNREFUSED``, the socket is stale (the server process died
+    without unlinking) → return ``False``.  Other errors are
+    treated conservatively as "alive" (fail-closed — don't unlink a
+    socket we're not sure about).
+
+    This is called BEFORE ``uds_path.unlink()`` so a live first
+    process's socket is NOT replaced by a second process.
+    """
+    probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    probe.setblocking(False)
+    try:
+        probe.connect(str(uds_path))
+        # Non-blocking connect returns EINPROGRESS on Unix; the socket
+        # is writable when the connect completes.  A successful connect
+        # means a server accepted it — the instance is alive.
+        import select
+        _, writable, _ = select.select([], [probe], [], 0.5)
+        if probe in writable:
+            # Check SO_ERROR — 0 means connected successfully.
+            err = probe.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+            return err == 0
+        # Timeout — assume alive (conservative).
+        return True
+    except ConnectionRefusedError:
+        # Stale socket — no process is listening.
+        return False
+    except FileNotFoundError:
+        # Socket doesn't exist (race — already unlinked).
+        return False
+    except OSError:
+        # Other errors (EACCES, ENOTSOCK, etc.) — be conservative.
+        return True
+    finally:
+        probe.close()
 
 
 def _load_rpc_capability() -> str:
@@ -977,7 +1081,26 @@ async def serve_json_lines(
     gateway_uid: int | None = None,
     gateway_pid: int | None = None,
 ) -> None:
-    """Serve the privileged JSON-line control plane over a mode-0600 UDS."""
+    """Serve the privileged JSON-line control plane over a mode-0600 UDS.
+
+    M4 batch 3.1.13 (CRITICAL-3): the server now enforces the
+    single-instance model with a process-level exclusive lock
+    (``fcntl.flock``) on a lockfile bound to the DB path.  The lock is
+    acquired BEFORE socket unlink / migration / recovery.  A second
+    process that tries to start against the same DB fails immediately
+    with ``PermissionError`` — it cannot ``unlink`` the live first
+    process's UDS socket, open the DB, and mark all RUNNING tasks as
+    FAILED while the first process's executors are still running.
+
+    Additionally, when an existing UDS socket is found, a liveness
+    probe (non-blocking ``connect``) is performed BEFORE ``unlink``.
+    If the probe succeeds, a live server is listening → refuse to
+    start.  If the probe gets ``ECONNREFUSED``, the socket is stale
+    (the previous process died without unlinking) → safe to replace.
+    Previously the code unconditionally ``unlink``-ed any existing
+    socket, which let a second process replace the first process's
+    live socket.
+    """
     uds_path = Path(socket_path).expanduser().resolve()
     capability = gateway_capability or _load_rpc_capability()
     authenticator = GatewayRPCAuthenticator(
@@ -987,10 +1110,27 @@ async def serve_json_lines(
     parent_stat = uds_path.parent.stat()
     if parent_stat.st_uid != os.getuid() or stat.S_IMODE(parent_stat.st_mode) != 0o700:
         raise PermissionError("RPC socket parent must be owned by Runtime and mode 0700")
+    # M4 batch 3.1.13 (CRITICAL-3): acquire the process-level
+    # exclusive lock BEFORE touching the UDS socket or the DB.  This
+    # must happen BEFORE the liveness probe below — even if the probe
+    # gets lucky and the socket looks stale, we MUST NOT start a
+    # second instance against the same DB.  The lock fd is kept in a
+    # local variable and released when the process exits (the OS
+    # closes the fd).
+    instance_lock_fd = _acquire_instance_lock(db_path)
     if uds_path.exists() or uds_path.is_symlink():
         mode = uds_path.lstat().st_mode
         if not stat.S_ISSOCK(mode):
             raise PermissionError(f"refusing to replace non-socket RPC path: {uds_path}")
+        # M4 batch 3.1.13 (CRITICAL-3): probe liveness BEFORE unlink.
+        # If a live server is listening, refuse to start.  Only
+        # ``ECONNREFUSED`` (stale socket) is safe to replace.
+        if _probe_uds_liveness(uds_path):
+            raise PermissionError(
+                f"refusing to replace live UDS socket: {uds_path} — "
+                f"another Khaos instance is listening (CRITICAL-3: "
+                f"single-instance model enforced)"
+            )
         uds_path.unlink()
 
     db = Database(db_path)
@@ -1228,6 +1368,16 @@ async def serve_json_lines(
         # premature database close and remains observable to the caller.
         await agent.shutdown()
         await db.close()
+        # M4 batch 3.1.13 (CRITICAL-3): release the process-level
+        # exclusive lock so the next instance can start immediately.
+        # The OS would release it on process exit anyway, but explicit
+        # release lets a restart-after-clean-shutdown proceed without
+        # waiting for the OS to reclaim the fd.
+        if instance_lock_fd is not None:
+            try:
+                os.close(instance_lock_fd)
+            except OSError:
+                pass
 
 
 def _parse_json_line(line: bytes) -> dict:
