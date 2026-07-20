@@ -380,6 +380,33 @@ class CronEngine:
                 "failed; new executions refused)",
             )
             return
+        # M4 batch 3.1.16B-2 (CRITICAL): drift detection at start().
+        # Compare each loaded task's stored snapshot against the
+        # engine's bound values.  Drifted tasks are quarantined to
+        # ``status='failed'`` so the tick loop (which only fires
+        # ``pending`` tasks) skips them.  This is the primary
+        # enforcement point — it catches:
+        # - Legacy rows (empty ``policy_digest``) loaded by a
+        #   production engine
+        # - Tasks created under a previous policy version
+        # - Tasks created under a different project root (DB moved)
+        # Test engines (empty ``_policy_digest``) skip enforcement —
+        # see ``_check_snapshot_drift`` for the rationale.
+        if self._policy_digest:
+            drifted_count = 0
+            for task in list(self._tasks.values()):
+                drift_reason = self._check_snapshot_drift(task)
+                if drift_reason is not None:
+                    await self._quarantine_drifted_task(task, drift_reason)
+                    drifted_count += 1
+            if drifted_count > 0:
+                logger.warning(
+                    "cron engine start: quarantined %d drifted task(s) "
+                    "— these tasks were created under a different "
+                    "security context and will not execute until "
+                    "re-created under the current policy/project",
+                    drifted_count,
+                )
         # M4 batch 3.1.12 (HIGH-1): single-instance recovery — mark
         # ALL running tasks as FAILED (they belong to the dead
         # previous process).
@@ -1676,6 +1703,94 @@ class CronEngine:
             task.lifecycle_version = new_epoch
         return new_epoch
 
+    def _check_snapshot_drift(self, task: "ScheduledTask") -> str | None:
+        """M4 batch 3.1.16B-2 (CRITICAL): detect security-context drift.
+
+        Compares the task's stored snapshot (``policy_digest`` +
+        ``project_id``, captured at creation time) against the engine's
+        bound values (captured at construction time).  Any mismatch
+        means the task was created under a DIFFERENT security context
+        — executing it under the current context would violate the
+        "a task created under policy A must NOT silently execute under
+        policy B" invariant.
+
+        Drift cases:
+        - ``task.policy_digest != self._policy_digest``: the effective
+          policy changed between task creation and engine start.  This
+          happens when ``khaos_policy.yaml`` is edited, when the
+          project root moves, or when a DB created by one project is
+          opened by another.
+        - ``task.project_id != self._project_id``: the project root
+          changed.  ``project_id = sha256(realpath(project_root))[:32]``
+          so this catches both directory moves and symlink redirects.
+        - ``task.policy_digest == ""`` on a production engine (non-
+          empty ``self._policy_digest``): legacy or test-created task
+          loaded by a production engine.  The task has no authenticated
+          snapshot — fail-closed.
+
+        Test mode: when the engine's ``_policy_digest`` is empty (test
+        engines that don't pass a digest), drift detection is DISABLED
+        — otherwise every test-created task (which also has empty
+        ``policy_digest``) would be quarantined.  Production engines
+        ALWAYS have a non-empty digest (enforced by ``AgentService``
+        construction in ``grpc_server.py``).
+
+        Returns an error message string if drifted, or ``None`` if the
+        snapshot matches.  The caller is responsible for quarantine
+        (mark ``status=failed`` + persist).
+        """
+        # Test mode: engine has no bound digest → skip enforcement.
+        # This is the same fail-closed default as B-1: an engine
+        # constructed without an authenticated policy snapshot stamps
+        # empty strings on new tasks; B-2 extends this to LOADED tasks
+        # — but only when the engine actually has a digest to compare.
+        if not self._policy_digest:
+            return None
+        # Production engine — enforce drift detection.
+        if task.policy_digest != self._policy_digest:
+            return (
+                f"security-context drift: task policy_digest "
+                f"{task.policy_digest!r} != engine policy_digest "
+                f"{self._policy_digest!r} (task was created under a "
+                f"different effective policy; refusing to execute "
+                f"under the current policy — fail-closed)"
+            )
+        if task.project_id != self._project_id:
+            return (
+                f"security-context drift: task project_id "
+                f"{task.project_id!r} != engine project_id "
+                f"{self._project_id!r} (task was created under a "
+                f"different project root; refusing to execute under "
+                f"the current project — fail-closed)"
+            )
+        return None
+
+    async def _quarantine_drifted_task(self, task: "ScheduledTask", reason: str) -> None:
+        """M4 batch 3.1.16B-2 (CRITICAL): quarantine a drifted task.
+
+        Marks the task as ``failed`` in memory and persists the state
+        to the DB so the tick loop (which only fires ``pending``
+        tasks) skips it.  The quarantine is durable — the task stays
+        ``failed`` until an admin explicitly re-creates it under the
+        current security context.
+        """
+        logger.error(
+            "cron task %s (%s): QUARANTINED — %s",
+            task.name, task.id, reason,
+        )
+        self._bump_epoch(task.id)
+        task.status = TaskStatus.FAILED
+        task.error = f"quarantined: {reason}"
+        if self.db:
+            try:
+                await self._persist_task_state(task)
+            except Exception:  # noqa: BLE001 — stop() will retry
+                logger.error(
+                    "cron task %s: could not persist FAILED state for "
+                    "drifted task; will be retried by stop()",
+                    task.name, exc_info=True,
+                )
+
     @staticmethod
     def _wrap_executor(
         executor: Callable[..., Awaitable[Any]] | None,
@@ -2124,6 +2239,24 @@ class CronEngine:
                         "for unauthenticated-principal task",
                         task.name, exc_info=True,
                     )
+            return
+
+        # M4 batch 3.1.16B-2 (CRITICAL): defense-in-depth drift check
+        # at claim time.  ``start()`` already quarantines drifted tasks
+        # after ``_load_tasks()``, but this re-check guards against:
+        # - A task whose DB row was mutated between ``start()`` and
+        #   the tick firing (e.g. by a future ``cron_migrate`` tool)
+        # - A task whose in-memory snapshot is stale because the row
+        #   was reloaded by ``_reload_one_task_from_db`` after a
+        #   control op that didn't preserve the snapshot (shouldn't
+        #   happen, but defense-in-depth)
+        # - A task created by ``create()`` on an engine whose bound
+        #   digest changed between construction and the first tick
+        #   (shouldn't happen — digest is immutable after construction
+        #   — but the check is cheap and the invariant is critical)
+        drift_reason = self._check_snapshot_drift(task)
+        if drift_reason is not None:
+            await self._quarantine_drifted_task(task, drift_reason)
             return
 
         # H1 (round-9): capture epoch at start.
