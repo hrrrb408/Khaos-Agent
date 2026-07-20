@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import inspect
 import json
 import logging
@@ -18,6 +19,40 @@ from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler.models import ScheduleConfig, ScheduledTask, TaskStatus
 
 logger = logging.getLogger(__name__)
+
+
+class CronEngineState(enum.Enum):
+    """M4 batch 3.1.15 (CRITICAL-2): explicit lifecycle state machine.
+
+    The previous design used a single ``_running: bool`` flag, which
+    conflated "the tick loop is active" with "the engine is in a clean
+    state for restart".  A failed ``stop()`` (cancellation-resistant
+    executor) set ``_running = False`` but retained live owners in
+    ``_execute_tasks`` — a subsequent ``start()`` saw ``_running ==
+    False`` and proceeded to call ``recover_all_running_tasks()``,
+    marking the STILL-RUNNING executors as FAILED in the DB.  This is
+    not "previous-process crash recovery"; it is the SAME process
+    mis-killing its own live owners.
+
+    The state machine gates ``start()`` explicitly:
+
+      NEW        → start() allowed; stop() is a no-op.
+      RUNNING    → start() is a no-op; stop() proceeds.
+      STOPPING   → start() rejected; stop() is a no-op (already in progress).
+      STOPPED    → start() allowed (clean restart); stop() is a no-op.
+      QUARANTINED → start() REJECTED (live owners retained); stop()
+                    retries (may succeed if owners terminated).
+
+    Only NEW and STOPPED allow ``start()``.  QUARANTINED requires the
+    process to be restarted (or ``stop()`` to be retried until it
+    reaches STOPPED).
+    """
+
+    NEW = "new"
+    RUNNING = "running"
+    STOPPING = "stopping"
+    STOPPED = "stopped"
+    QUARANTINED = "quarantined"
 
 
 # H1 (round-6): total deadline for ``stop()`` to drain in-flight
@@ -140,6 +175,12 @@ class CronEngine:
         self._tasks: dict[str, ScheduledTask] = {}
         self._running = False
         self._loop_task: asyncio.Task | None = None
+        # M4 batch 3.1.15 (CRITICAL-2): explicit lifecycle state.  See
+        # ``CronEngineState`` for the full rationale.  ``_running``
+        # remains the tick-loop gate (checked at the top of each tick
+        # iteration); ``_lifecycle_state`` gates ``start()`` and
+        # tracks whether the engine is in a clean state for restart.
+        self._lifecycle_state: CronEngineState = CronEngineState.NEW
         # M4 batch 3.1.11 (MEDIUM-2): if ``start()`` cannot recover
         # expired leases, the engine enters ``_degraded`` mode and
         # refuses to fire new executions.  ``_running`` may be True
@@ -273,9 +314,29 @@ class CronEngine:
         and fired them, while pre-existing DB tasks were invisible
         (and could be re-created with the same name, racing the
         hidden rows).
+
+        M4 batch 3.1.15 (CRITICAL-2): explicit lifecycle state machine.
+        ``start()`` is rejected unless the state is ``NEW`` or
+        ``STOPPED``.  A failed ``stop()`` transitions to
+        ``QUARANTINED`` (live owners retained); ``start()`` from
+        ``QUARANTINED`` raises ``RuntimeError`` so the caller cannot
+        accidentally ``recover_all_running_tasks()`` its own live
+        executors.  The caller must either retry ``stop()`` until it
+        reaches ``STOPPED``, or restart the process.
         """
-        if self._running:
-            return
+        if self._lifecycle_state in (CronEngineState.RUNNING, CronEngineState.STOPPING):
+            return  # Already running or stopping — no-op.
+        if self._lifecycle_state == CronEngineState.QUARANTINED:
+            raise RuntimeError(
+                "cron engine is QUARANTINED (previous stop() failed "
+                "with live owners retained in _execute_tasks / "
+                "_persistence_owners); refusing to start — calling "
+                "recover_all_running_tasks() would mark the live "
+                "executors as FAILED.  Retry stop() until it succeeds, "
+                "or restart the process. (CRITICAL-2)"
+            )
+        # State is NEW or STOPPED — proceed.
+        self._lifecycle_state = CronEngineState.RUNNING
         self._running = True
         self._degraded = False
         # M4 batch 3.1.12 (HIGH-2 + acceptance 9): _load_tasks failure
@@ -418,180 +479,208 @@ class CronEngine:
              reconcile below retry the persist.  We do NOT raise on
              the old exception — the H2 contract requires ``stop()``
              to RETRY on the next call.
+
+        M4 batch 3.1.15 (CRITICAL-2): explicit lifecycle state machine.
+        On entry, ``stop()`` transitions to ``STOPPING``.  On clean
+        exit, it transitions to ``STOPPED``.  On ANY exception
+        (``ServiceShutdownError`` or other), it transitions to
+        ``QUARANTINED`` — ``start()`` will reject until the caller
+        retries ``stop()`` to reach ``STOPPED``.  This prevents a
+        failed stop (live owners retained) from being followed by a
+        ``start()`` that calls ``recover_all_running_tasks()`` on the
+        SAME process's live executors.
         """
         import time
+        # M4 batch 3.1.15 (CRITICAL-2): state machine transitions.
+        if self._lifecycle_state == CronEngineState.STOPPED:
+            return  # Clean stop — no-op.
+        # RUNNING, STOPPING, or QUARANTINED — proceed (retry path for
+        # QUARANTINED is allowed: the live owners may have terminated
+        # since the failed stop).
+        self._lifecycle_state = CronEngineState.STOPPING
         deadline = time.monotonic() + timeout
         self._running = False
-        if self._loop_task:
-            self._loop_task.cancel()
-            try:
-                await self._loop_task
-            except asyncio.CancelledError:
-                pass
-            self._loop_task = None
-        # H1 (round-6): bounded drain.  Snapshot the in-flight tasks,
-        # cancel them, then ``asyncio.wait`` with the total deadline.
-        # If any task is still pending at the deadline, raise
-        # ``ServiceShutdownError`` and DO NOT clear ``_execute_tasks``
-        # — the caller must retain ownership of the still-live tasks
-        # so they are not silently orphaned (the next owner / process
-        # exit will reap them).
-        if self._execute_tasks:
-            snapshot = [
-                t for t in self._execute_tasks.values() if not t.done()
-            ]
-            for t in snapshot:
-                t.cancel()
-            if snapshot:
+        try:
+            if self._loop_task:
+                self._loop_task.cancel()
+                try:
+                    await self._loop_task
+                except asyncio.CancelledError:
+                    pass
+                self._loop_task = None
+            # H1 (round-6): bounded drain.  Snapshot the in-flight tasks,
+            # cancel them, then ``asyncio.wait`` with the total deadline.
+            # If any task is still pending at the deadline, raise
+            # ``ServiceShutdownError`` and DO NOT clear ``_execute_tasks``
+            # — the caller must retain ownership of the still-live tasks
+            # so they are not silently orphaned (the next owner / process
+            # exit will reap them).
+            if self._execute_tasks:
+                snapshot = [
+                    t for t in self._execute_tasks.values() if not t.done()
+                ]
+                for t in snapshot:
+                    t.cancel()
+                if snapshot:
+                    remaining = max(deadline - time.monotonic(), 0.0)
+                    done, pending = await asyncio.wait(
+                        snapshot, timeout=remaining,
+                    )
+                    if pending:
+                        # Leave ``_execute_tasks`` intact — the pending
+                        # tasks are still borrowing shared authorities and
+                        # must not be silently released.  The caller
+                        # (AgentService.stop_producers → shutdown) raises
+                        # ``ServiceShutdownError`` and refuses to tear down
+                        # the DB / shared authorities.
+                        logger.error(
+                            "cron engine stop: %d execute_task(s) did not "
+                            "terminate within %.2fs (swallowed cancellation "
+                            "or wedged); refusing to release task ownership",
+                            len(pending), remaining,
+                        )
+                        raise ServiceShutdownError(
+                            f"{len(pending)} cron execute_task(s) did not "
+                            f"terminate within {remaining:.2f}s; shared "
+                            "authorities cannot be torn down safely"
+                        )
+                # All tasks drained — safe to clear the registry.
+                self._execute_tasks.clear()
+            # H1 (round-8): re-drain retained reconcile owners BEFORE
+            # spawning a new reconcile.  See the method docstring for the
+            # full rationale.
+            if self._persistence_owners:
+                retained_snapshot = dict(self._persistence_owners)
                 remaining = max(deadline - time.monotonic(), 0.0)
-                done, pending = await asyncio.wait(
-                    snapshot, timeout=remaining,
+                if remaining <= 0:
+                    raise ServiceShutdownError(
+                        f"no budget remaining to re-drain "
+                        f"{len(retained_snapshot)} retained persistence "
+                        f"owner(s); {len(self._pending_persistence)} "
+                        "task(s) still pending"
+                    )
+                retained_done, retained_pending = await asyncio.wait(
+                    set(retained_snapshot.values()), timeout=remaining,
                 )
-                if pending:
-                    # Leave ``_execute_tasks`` intact — the pending
-                    # tasks are still borrowing shared authorities and
-                    # must not be silently released.  The caller
-                    # (AgentService.stop_producers → shutdown) raises
-                    # ``ServiceShutdownError`` and refuses to tear down
-                    # the DB / shared authorities.
+                for tid, owner in retained_snapshot.items():
+                    if owner in retained_done:
+                        self._persistence_owners.pop(tid, None)
+                        # H1 (round-9): ``Task.exception()`` RAISES
+                        # ``CancelledError`` on a cancelled task (rather
+                        # than returning it).  In Python 3.8+
+                        # ``CancelledError`` inherits from ``BaseException``,
+                        # so ``except Exception`` would NOT catch it.  Use
+                        # a bare ``except`` for defensive safety even
+                        # though we don't expect this owner to be cancelled
+                        # — unify with the SubAgent owner state machine.
+                        try:
+                            exc = owner.exception()
+                        except asyncio.CancelledError:
+                            exc = None
+                        if exc is not None:
+                            logger.error(
+                                "cron engine stop: retained persistence "
+                                "owner for task %s terminated with exception: "
+                                "%r; will retry persist via fresh reconcile",
+                                tid, exc, exc_info=exc,
+                            )
+                    # else: still pending — leave it registered.
+                if retained_pending:
                     logger.error(
-                        "cron engine stop: %d execute_task(s) did not "
-                        "terminate within %.2fs (swallowed cancellation "
-                        "or wedged); refusing to release task ownership",
-                        len(pending), remaining,
+                        "cron engine stop: %d retained persistence owner(s) "
+                        "still pending after %.2fs budget; refusing to spawn "
+                        "a new reconcile (would race with retained)",
+                        len(retained_pending), remaining,
                     )
                     raise ServiceShutdownError(
-                        f"{len(pending)} cron execute_task(s) did not "
-                        f"terminate within {remaining:.2f}s; shared "
-                        "authorities cannot be torn down safely"
+                        f"{len(retained_pending)} retained persistence "
+                        f"owner(s) still pending after {remaining:.2f}s; "
+                        "cannot spawn a new reconcile without racing — "
+                        "shared authorities cannot be torn down safely"
                     )
-            # All tasks drained — safe to clear the registry.
-            self._execute_tasks.clear()
-        # H1 (round-8): re-drain retained reconcile owners BEFORE
-        # spawning a new reconcile.  See the method docstring for the
-        # full rationale.
-        if self._persistence_owners:
-            retained_snapshot = dict(self._persistence_owners)
-            remaining = max(deadline - time.monotonic(), 0.0)
-            if remaining <= 0:
-                raise ServiceShutdownError(
-                    f"no budget remaining to re-drain "
-                    f"{len(retained_snapshot)} retained persistence "
-                    f"owner(s); {len(self._pending_persistence)} "
-                    "task(s) still pending"
+                # All retained owners terminated (some may have had
+                # exceptions, which we logged).  Tasks they were
+                # reconciling may still be in ``_pending_persistence`` if
+                # the DB write failed — the fresh reconcile below will
+                # retry them.
+            # H2 (round-7): retry any task whose terminal state was set in
+            # memory but NOT yet persisted.  ``_execute_task``'s
+            # ``_persist_task_state`` may have failed (e.g. the DB was
+            # momentarily wedged) and left the task_id in
+            # ``_pending_persistence``.  Without this retry, the DB row
+            # would stay stale and the task would be re-fired on restart.
+            # Bounded by the remaining total deadline.
+            if self._pending_persistence and self.db:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ServiceShutdownError(
+                        f"no budget remaining for terminal state reconciliation; "
+                        f"{len(self._pending_persistence)} cron task(s) "
+                        "still pending persistence"
+                    )
+                # Run the reconcile in its own owner task so we can bound
+                # it with ``asyncio.wait`` (NOT ``wait_for`` — see the
+                # spawner's M2 round-6 fix for the cancellation-resistant
+                # rationale).
+                pending_ids = set(self._pending_persistence)
+                reconcile_task = asyncio.create_task(
+                    self._reconcile_pending_persistence()
                 )
-            retained_done, retained_pending = await asyncio.wait(
-                set(retained_snapshot.values()), timeout=remaining,
-            )
-            for tid, owner in retained_snapshot.items():
-                if owner in retained_done:
-                    self._persistence_owners.pop(tid, None)
-                    # H1 (round-9): ``Task.exception()`` RAISES
-                    # ``CancelledError`` on a cancelled task (rather
-                    # than returning it).  In Python 3.8+
-                    # ``CancelledError`` inherits from ``BaseException``,
-                    # so ``except Exception`` would NOT catch it.  Use
-                    # a bare ``except`` for defensive safety even
-                    # though we don't expect this owner to be cancelled
-                    # — unify with the SubAgent owner state machine.
+                # H1 (round-8): register the reconcile owner keyed by
+                # task_id so a subsequent ``stop()`` can dedupe.  All
+                # task_ids in this batch share the same owner.
+                for tid in pending_ids:
+                    self._persistence_owners[tid] = reconcile_task
+                # The done callback only READS the exception (so asyncio
+                # doesn't warn about "Task exception was never retrieved"
+                # if ``stop()`` is never called again).  It does NOT
+                # remove the owner — that is the next ``stop()``'s job,
+                # AFTER it has surfaced the exception.
+                def _read_owner_exception(
+                    _t, tids=frozenset(pending_ids),
+                ) -> None:
+                    # H1 (round-9): catch CancelledError — see the re-drain
+                    # loop above for the rationale.
                     try:
-                        exc = owner.exception()
+                        exc = _t.exception()
                     except asyncio.CancelledError:
                         exc = None
                     if exc is not None:
                         logger.error(
-                            "cron engine stop: retained persistence "
-                            "owner for task %s terminated with exception: "
-                            "%r; will retry persist via fresh reconcile",
-                            tid, exc, exc_info=exc,
+                            "cron engine: retained persistence owner for "
+                            "task(s) %s terminated with exception: %r",
+                            sorted(tids), exc, exc_info=exc,
                         )
-                # else: still pending — leave it registered.
-            if retained_pending:
-                logger.error(
-                    "cron engine stop: %d retained persistence owner(s) "
-                    "still pending after %.2fs budget; refusing to spawn "
-                    "a new reconcile (would race with retained)",
-                    len(retained_pending), remaining,
+                reconcile_task.add_done_callback(_read_owner_exception)
+                done_rec, pending_rec = await asyncio.wait(
+                    {reconcile_task}, timeout=remaining,
                 )
-                raise ServiceShutdownError(
-                    f"{len(retained_pending)} retained persistence "
-                    f"owner(s) still pending after {remaining:.2f}s; "
-                    "cannot spawn a new reconcile without racing — "
-                    "shared authorities cannot be torn down safely"
-                )
-            # All retained owners terminated (some may have had
-            # exceptions, which we logged).  Tasks they were
-            # reconciling may still be in ``_pending_persistence`` if
-            # the DB write failed — the fresh reconcile below will
-            # retry them.
-        # H2 (round-7): retry any task whose terminal state was set in
-        # memory but NOT yet persisted.  ``_execute_task``'s
-        # ``_persist_task_state`` may have failed (e.g. the DB was
-        # momentarily wedged) and left the task_id in
-        # ``_pending_persistence``.  Without this retry, the DB row
-        # would stay stale and the task would be re-fired on restart.
-        # Bounded by the remaining total deadline.
-        if self._pending_persistence and self.db:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ServiceShutdownError(
-                    f"no budget remaining for terminal state reconciliation; "
-                    f"{len(self._pending_persistence)} cron task(s) "
-                    "still pending persistence"
-                )
-            # Run the reconcile in its own owner task so we can bound
-            # it with ``asyncio.wait`` (NOT ``wait_for`` — see the
-            # spawner's M2 round-6 fix for the cancellation-resistant
-            # rationale).
-            pending_ids = set(self._pending_persistence)
-            reconcile_task = asyncio.create_task(
-                self._reconcile_pending_persistence()
-            )
-            # H1 (round-8): register the reconcile owner keyed by
-            # task_id so a subsequent ``stop()`` can dedupe.  All
-            # task_ids in this batch share the same owner.
-            for tid in pending_ids:
-                self._persistence_owners[tid] = reconcile_task
-            # The done callback only READS the exception (so asyncio
-            # doesn't warn about "Task exception was never retrieved"
-            # if ``stop()`` is never called again).  It does NOT
-            # remove the owner — that is the next ``stop()``'s job,
-            # AFTER it has surfaced the exception.
-            def _read_owner_exception(
-                _t, tids=frozenset(pending_ids),
-            ) -> None:
-                # H1 (round-9): catch CancelledError — see the re-drain
-                # loop above for the rationale.
-                try:
-                    exc = _t.exception()
-                except asyncio.CancelledError:
-                    exc = None
-                if exc is not None:
+                if pending_rec:
                     logger.error(
-                        "cron engine: retained persistence owner for "
-                        "task(s) %s terminated with exception: %r",
-                        sorted(tids), exc, exc_info=exc,
+                        "cron engine stop: terminal state reconciliation "
+                        "did not complete within %.2fs budget; %d task(s) "
+                        "still pending persistence",
+                        remaining, len(self._pending_persistence),
                     )
-            reconcile_task.add_done_callback(_read_owner_exception)
-            done_rec, pending_rec = await asyncio.wait(
-                {reconcile_task}, timeout=remaining,
-            )
-            if pending_rec:
-                logger.error(
-                    "cron engine stop: terminal state reconciliation "
-                    "did not complete within %.2fs budget; %d task(s) "
-                    "still pending persistence",
-                    remaining, len(self._pending_persistence),
-                )
-                raise ServiceShutdownError(
-                    f"cron terminal state reconciliation did not complete "
-                    f"within {remaining:.2f}s; "
-                    f"{len(self._pending_persistence)} task(s) still pending"
-                )
-            exc = reconcile_task.exception()
-            if exc is not None:
-                raise exc
-        logger.info("cron engine stopped")
+                    raise ServiceShutdownError(
+                        f"cron terminal state reconciliation did not complete "
+                        f"within {remaining:.2f}s; "
+                        f"{len(self._pending_persistence)} task(s) still pending"
+                    )
+                exc = reconcile_task.exception()
+                if exc is not None:
+                    raise exc
+            logger.info("cron engine stopped")
+        except BaseException:
+            # M4 batch 3.1.15 (CRITICAL-2): ANY failure (ServiceShutdown
+            # Error from drain/reconcile, or any other exception) trans-
+            # tions the engine to QUARANTINED.  ``start()`` will reject
+            # from this state, preventing ``recover_all_running_tasks()``
+            # from mis-killing the retained live owners.
+            self._lifecycle_state = CronEngineState.QUARANTINED
+            raise
+        else:
+            self._lifecycle_state = CronEngineState.STOPPED
 
     async def _reconcile_pending_persistence(self) -> None:
         """Retry terminal-state persistence for every task in
@@ -889,8 +978,8 @@ class CronEngine:
     async def _retry_executor_marker(
         self, task_id: str, marker: PendingPersistence,
     ) -> bool:
-        """M4 batch 3.1.14 (HIGH): retry an executor marker's
-        persistence.
+        """M4 batch 3.1.14 (HIGH) + 3.1.15 (HIGH-3): retry an executor
+        marker's persistence.
 
         Executor markers are placed by ``_finalize_task_state`` when
         the executor's terminal write fails.  The retry uses the
@@ -904,35 +993,39 @@ class CronEngine:
         back the DB — if it's already at the marker's desired status,
         idempotent success; otherwise, durability gap.
 
-        Returns ``True`` on success or idempotent success.
+        M4 batch 3.1.15 (HIGH-3): when ``_finalize_task_state`` returns
+        ``False`` (CAS 0 rows — version or execution_id mismatch), we
+        NO LONGER assume "newer op won" and pop the marker.  Instead,
+        read back the DB and classify:
+
+          a. DB at marker's ``desired_status`` → idempotent success
+             (commit-then-raise on the previous attempt).  Pop marker.
+          b. DB at a DIFFERENT terminal status (CANCELLED / PAUSED /
+             FAILED by a newer control op) → stale marker, newer op
+             won.  Pop marker.
+          c. DB still ``running`` (or any non-terminal state) →
+             durability gap.  The CAS failed for an unknown reason
+             (e.g. execution_id mismatch because someone rewrote the
+             row, or version mismatch from a failed concurrent
+             control-op persist).  KEEP the marker (re-place it if
+             ``_finalize_task_state`` already popped it) and return
+             ``False`` — the caller (reconcile) raises
+             ``ServiceShutdownError``.
+
+        Previously the code unconditionally popped the marker and
+        returned ``True`` on CAS 0, which let ``stop()`` succeed while
+        the DB was still ``running`` — the task would be re-fired on
+        restart, potentially double-executing side effects.
+
+        Returns ``True`` on success, idempotent success, or stale
+        marker (newer op won).
         Returns ``False`` on durability gap (caller raises
         ``ServiceShutdownError``).
         """
         task = self._tasks.get(task_id)
         if task is None:
-            # Task was popped — read back the DB.
-            try:
-                row = await self.db.get_scheduled_task(task_id)
-            except Exception:  # noqa: BLE001 — DB unreadable
-                logger.error(
-                    "cron task %s: executor reconcile could not read "
-                    "DB — durability gap",
-                    task_id, exc_info=True,
-                )
-                return False
-            if (
-                row is not None
-                and row.get("status") == marker.desired_status
-            ):
-                self._pending_persistence.pop(task_id, None)
-                return True
-            logger.error(
-                "cron task %s: executor marker desired %r but DB "
-                "status=%r — durability gap",
-                task_id, marker.desired_status,
-                row.get("status") if row else "<missing>",
-            )
-            return False
+            # Task was popped — read back the DB and classify.
+            return await self._classify_executor_marker(task_id, marker)
         # Task is still in memory — call ``_finalize_task_state``
         # which already checks for newer control-op markers.
         try:
@@ -948,24 +1041,101 @@ class CronEngine:
                 task_id, exc_info=True,
             )
             return False
-        # M4 batch 3.1.14 (HIGH): propagate False.  ``_finalize_task_state``
-        # returns False when a newer control-op marker exists or the
-        # CAS mismatched — in either case, the marker is stale and
-        # should be popped (``_finalize_task_state`` already pops it
-        # when the operation_id matches).
-        if not ok:
-            # The marker may still be present if _finalize_task_state
-            # returned False due to a newer control-op marker.  Pop
-            # our stale marker if it's still ours.
+        if ok:
+            return True  # Success — marker already popped by _finalize.
+        # M4 batch 3.1.15 (HIGH-3): CAS returned 0 rows.  Do NOT
+        # assume "newer op won" — read back the DB and classify.
+        # ``_finalize_task_state`` may have already popped our marker;
+        # ``_classify_executor_marker`` will re-place it if the DB
+        # is still ``running`` (durability gap).
+        return await self._classify_executor_marker(task_id, marker)
+
+    async def _classify_executor_marker(
+        self, task_id: str, marker: PendingPersistence,
+    ) -> bool:
+        """M4 batch 3.1.15 (HIGH-3): read back the DB and classify
+        the marker's status.
+
+        Called by ``_retry_executor_marker`` after a CAS 0 (or when
+        the task was popped from ``_tasks``).  Returns ``True`` if
+        the marker is resolved (idempotent success or stale), ``False``
+        if there's a durability gap (marker must be kept).
+
+        On durability gap, re-places the marker if it was popped by
+        ``_finalize_task_state`` so the next reconcile retry can
+        attempt it again.
+        """
+        try:
+            row = await self.db.get_scheduled_task(task_id)
+        except Exception:  # noqa: BLE001 — DB unreadable
+            logger.error(
+                "cron task %s: executor reconcile could not read "
+                "DB — durability gap; keeping marker",
+                task_id, exc_info=True,
+            )
+            # Re-place the marker if _finalize_task_state popped it.
+            stored = self._pending_persistence.get(task_id)
+            if stored is None or stored.operation_id != marker.operation_id:
+                self._pending_persistence[task_id] = marker
+            return False
+        if row is None:
+            # Task was removed from the DB — the remove op won.
+            # Idempotent success — pop our marker if still present.
             stored = self._pending_persistence.get(task_id)
             if stored is not None and stored.operation_id == marker.operation_id:
                 self._pending_persistence.pop(task_id, None)
             logger.info(
-                "cron task %s: executor reconcile returned False — "
-                "newer op won; stale marker popped",
+                "cron task %s: executor marker resolved — task removed "
+                "from DB (newer remove op won)",
                 task_id,
             )
-        return True  # Stale marker is "resolved" — not a failure.
+            return True
+        db_status = row.get("status")
+        if db_status == marker.desired_status:
+            # Idempotent success — the previous CAS committed but
+            # raised (commit-then-raise).  Pop the marker.
+            stored = self._pending_persistence.get(task_id)
+            if stored is not None and stored.operation_id == marker.operation_id:
+                self._pending_persistence.pop(task_id, None)
+            logger.info(
+                "cron task %s: executor marker resolved — DB already at "
+                "desired status %r (commit-then-raise idempotent success)",
+                task_id, db_status,
+            )
+            return True
+        # DB is NOT at desired_status.  Check if a newer op won
+        # (DB is at a different terminal / control state).
+        terminal_or_control = {
+            TaskStatus.COMPLETED.value,
+            TaskStatus.FAILED.value,
+            TaskStatus.CANCELLED.value,
+            TaskStatus.PAUSED.value,
+        }
+        if db_status in terminal_or_control:
+            # DB is at a different terminal / control state — a newer
+            # control op won.  Stale marker; pop without writing.
+            stored = self._pending_persistence.get(task_id)
+            if stored is not None and stored.operation_id == marker.operation_id:
+                self._pending_persistence.pop(task_id, None)
+            logger.info(
+                "cron task %s: executor marker stale — DB at %r, "
+                "marker desired %r; newer control op won",
+                task_id, db_status, marker.desired_status,
+            )
+            return True
+        # DB is still ``running`` (or in an unexpected non-terminal
+        # state) — durability gap.  KEEP the marker (re-place it if
+        # _finalize_task_state popped it) and return False.
+        stored = self._pending_persistence.get(task_id)
+        if stored is None or stored.operation_id != marker.operation_id:
+            self._pending_persistence[task_id] = marker
+        logger.error(
+            "cron task %s: executor marker CAS 0 but DB status=%r "
+            "(expected %r) — durability gap; keeping marker for "
+            "next reconcile retry",
+            task_id, db_status, marker.desired_status,
+        )
+        return False
 
     async def create(
         self,

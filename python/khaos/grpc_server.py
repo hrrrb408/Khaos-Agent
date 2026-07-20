@@ -158,6 +158,20 @@ def _ensure_safe_run_dir(run_dir: Path) -> None:
             f"{parent_st.st_uid}, not the current uid {os.getuid()} "
             f"(CRITICAL-2: lockfile safety)"
         )
+    # M4 batch 3.1.15 (HIGH-2): reject group/other-writable parent.
+    # Even though ``~/.khaos/run/`` itself is 0700, a group/other-
+    # writable ``~/.khaos/`` lets another user rename/replace the
+    # ``run/`` directory itself — subsequent path-based ``os.open``
+    # would enter the replacement directory.  Allow 0755/0700 (no
+    # group/other write); reject 0775/0777.
+    parent_mode = stat.S_IMODE(parent_st.st_mode)
+    if parent_mode & 0o022:
+        raise PermissionError(
+            f"khaos dir {khaos_dir} has unsafe mode {parent_mode:o} "
+            f"(group or other writable; expected no group/other write "
+            f"bits) — refusing to use it for lockfile creation "
+            f"(HIGH-2: lockfile parent dir safety)"
+        )
     # Check / create the run dir with strict 0700.
     if not run_dir.exists():
         run_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
@@ -195,8 +209,9 @@ def _ensure_safe_run_dir(run_dir: Path) -> None:
 
 
 def _acquire_instance_lock(db_path: str) -> int | None:
-    """M4 batch 3.1.13 (CRITICAL-3) + 3.1.14 (CRITICAL-2): acquire a
-    process-level exclusive lock on a lockfile in a TRUSTED directory.
+    """M4 batch 3.1.13 (CRITICAL-3) + 3.1.14 (CRITICAL-2) + 3.1.15
+    (HIGH-2): acquire a process-level exclusive lock on a lockfile in
+    a TRUSTED directory.
 
     The lock prevents a second Khaos process from opening the same DB
     and running ``recover_all_running_tasks`` (which marks ALL running
@@ -205,12 +220,12 @@ def _acquire_instance_lock(db_path: str) -> int | None:
     comment assumption — not an enforced safety constraint.
 
     M4 batch 3.1.14 (CRITICAL-2) — symlink truncation fix:
-      Previously the lockfile lived next to the DB (``<db_path>
-      .instance.lock``).  When the DB was in a project directory (the
-      default), a malicious repo could pre-place a symlink at that
-      path pointing to e.g. ``~/.ssh/authorized_keys``.  The old code
-      ``os.open``-ed WITHOUT ``O_NOFOLLOW`` (following the symlink),
-      then ``ftruncate(fd, 0)`` — truncating the symlink target.
+      Previously the lockfile lived next to the DB.  When the DB was
+      in a project directory (the default), a malicious repo could
+      pre-place a symlink at that path pointing to e.g.
+      ``~/.ssh/authorized_keys``.  The old code ``os.open``-ed WITHOUT
+      ``O_NOFOLLOW`` (following the symlink), then ``ftruncate(fd, 0)``
+      — truncating the symlink target.
 
       The lockfile now lives under ``~/.khaos/run/<sha256(db_path)>
       .instance.lock``.  The run dir is verified to be owner-only
@@ -220,6 +235,25 @@ def _acquire_instance_lock(db_path: str) -> int | None:
       disk (no inode swap race), is a regular file, is owned by the
       current UID, and has mode ``0600``.  Only AFTER all these
       checks pass do we ``ftruncate`` and write the PID.
+
+    M4 batch 3.1.15 (HIGH-2) — path-based identity re-verification:
+      The previous post-flock re-check only called ``fstat(fd)`` and
+      compared it to the PRE-flock ``fstat(fd)``.  Since ``flock``
+      locks the fd (not the path), an attacker who replaced the path
+      between ``open`` and ``flock`` would leave us holding a lock on
+      the OLD inode while the path points to a NEW inode — and a
+      second process opening the path would get a different fd with
+      no lock contention.  The old re-check (fstat-vs-fstat) could
+      NOT detect this because both fstats hit the same fd.
+
+      The fix opens the trusted run directory as a ``dir_fd`` and
+      uses ``openat`` (``os.open(..., dir_fd=run_dir_fd)``) to open
+      the lockfile relative to it.  After ``flock``, we re-``lstat``
+      the path via ``dir_fd`` and compare its ``(st_dev, st_ino)``
+      with the lock fd's ``fstat``.  If they differ, the path was
+      replaced after we opened it — the lock fd points to a stale
+      inode while the path points elsewhere, and a second process
+      could acquire a separate lock.  Refuse.
 
     The lock is ``fcntl.LOCK_EX | fcntl.LOCK_NB`` (non-blocking): if
     another process holds it, we fail immediately with
@@ -233,7 +267,31 @@ def _acquire_instance_lock(db_path: str) -> int | None:
     if _fcntl is None:
         return None
     lockfile_path = _instance_lockfile_path(db_path)
-    _ensure_safe_run_dir(lockfile_path.parent)
+    run_dir = lockfile_path.parent
+    _ensure_safe_run_dir(run_dir)
+    lockfile_name = lockfile_path.name  # relative to run_dir
+    # M4 batch 3.1.15 (HIGH-2): open the trusted run directory as a
+    # dir_fd so we can use ``openat`` for the lockfile and re-lstat
+    # the path via the same dir_fd after flock.
+    run_dir_fd = os.open(
+        str(run_dir),
+        os.O_DIRECTORY | os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+    )
+    try:
+        return _acquire_instance_lock_via_dir_fd(
+            run_dir_fd, lockfile_name, lockfile_path,
+        )
+    finally:
+        os.close(run_dir_fd)
+
+
+def _acquire_instance_lock_via_dir_fd(
+    run_dir_fd: int, lockfile_name: str, lockfile_path: Path,
+) -> int:
+    """M4 batch 3.1.15 (HIGH-2): inner lockfile acquisition using
+    ``openat(dir_fd)``.  Separated from ``_acquire_instance_lock`` so
+    the ``run_dir_fd`` lifecycle is clean (caller closes it).
+    """
     # M4 batch 3.1.14 (CRITICAL-2): open with O_NOFOLLOW so a symlink
     # at the lockfile path is NOT followed (raises ELOOP).  O_CLOEXEC
     # so the fd doesn't leak into child processes (exec / subagents).
@@ -241,9 +299,9 @@ def _acquire_instance_lock(db_path: str) -> int | None:
     # lstat BEFORE open to detect a symlink (O_NOFOLLOW already
     # refuses symlinks, but we lstat first for a clearer error
     # message and to detect the race where the file is replaced
-    # between lstat and open).
+    # between lstat and open).  Use dir_fd for the lstat.
     try:
-        pre_lstat = lockfile_path.lstat()
+        pre_lstat = os.lstat(lockfile_name, dir_fd=run_dir_fd)
         if stat.S_ISLNK(pre_lstat.st_mode):
             raise PermissionError(
                 f"refusing to open symlinked lockfile: {lockfile_path} "
@@ -251,7 +309,8 @@ def _acquire_instance_lock(db_path: str) -> int | None:
             )
     except FileNotFoundError:
         pre_lstat = None  # Will be created by open.
-    fd = os.open(lockfile_path, flags, 0o600)
+    # M4 batch 3.1.15 (HIGH-2): openat — lockfile is relative to run_dir_fd.
+    fd = os.open(lockfile_name, flags, 0o600, dir_fd=run_dir_fd)
     try:
         # M4 batch 3.1.14 (CRITICAL-2): validate the fd we just
         # opened.  fstat the fd and compare (st_dev, st_ino) with the
@@ -304,20 +363,38 @@ def _acquire_instance_lock(db_path: str) -> int | None:
         # leak it.  The caller will see the raised exception.
         os.close(fd)
         raise
-    # Re-verify identity AFTER acquiring the flock (another process
-    # might have replaced the file between open and flock — flock
-    # locks the fd, not the path, so a renamed file would still be
-    # locked but the path would now point elsewhere).  This is
-    # defensive; the combination of O_NOFOLLOW + 0600 + trusted dir
-    # already makes this attack very hard.
+    # M4 batch 3.1.15 (HIGH-2): re-verify PATH identity after flock.
+    # ``flock`` locks the fd, not the path.  If an attacker replaced
+    # the path between ``open`` and ``flock``, our fd locks the OLD
+    # inode while the path points to a NEW inode.  A second process
+    # opening the path would get a different fd with no contention.
+    # The old re-check (fstat-vs-fstat) could NOT detect this because
+    # both fstats hit the same fd.  The fix: re-lstat the PATH via
+    # ``dir_fd`` and compare its ``(st_dev, st_ino)`` with the lock
+    # fd's ``fstat``.  If they differ, the path was replaced — refuse.
     post_fstat = os.fstat(fd)
-    if (post_fstat.st_dev, post_fstat.st_ino) != (
-        fstat_info.st_dev, fstat_info.st_ino,
+    try:
+        post_path_lstat = os.lstat(lockfile_name, dir_fd=run_dir_fd)
+    except FileNotFoundError:
+        # The path was unlinked after we opened it.  Our fd still
+        # points to the old inode (now unlinked).  A second process
+        # creating the path would get a NEW inode with no contention.
+        # Refuse — the lock is not protecting the path anymore.
+        os.close(fd)
+        raise PermissionError(
+            f"lockfile {lockfile_path} was unlinked after flock; the "
+            f"path no longer matches the locked inode — refusing to "
+            f"start (HIGH-2: lockfile path identity)"
+        )
+    if (post_path_lstat.st_dev, post_path_lstat.st_ino) != (
+        post_fstat.st_dev, post_fstat.st_ino,
     ):
         os.close(fd)
         raise PermissionError(
-            f"lockfile {lockfile_path} changed identity after flock "
-            f"(TOCTOU race; CRITICAL-2: lockfile safety)"
+            f"lockfile {lockfile_path} path identity changed after "
+            f"flock (path inode != locked inode); a second process "
+            f"could acquire a separate lock — refusing to start "
+            f"(HIGH-2: lockfile path identity)"
         )
     # Write the current PID for diagnostics (not used for locking —
     # the flock is the authoritative lock).
@@ -371,6 +448,71 @@ def _probe_uds_liveness(uds_path: Path) -> bool:
         return True
     finally:
         probe.close()
+
+
+# M4 batch 3.1.15 (CRITICAL-1): process-level retained instance lock.
+# When ``serve_json_lines`` cannot complete a clean shutdown (live cron
+# executors resist cancellation, or emergency cleanup fails), the
+# instance lock fd is parked here so it is NOT closed by the outer
+# ``finally`` block.  The OS reaps the fd when the process exits,
+# preventing a second instance from starting against the same DB while
+# the first process's live owners are still producing side effects.
+# See ``serve_json_lines`` for the full rationale.
+_retained_instance_lock_fd: int | None = None
+
+
+async def _emergency_instance_cleanup(
+    agent: AgentService | None,
+    db: Database | None,
+    subagent_service: SubAgentService | None,
+) -> bool:
+    """M4 batch 3.1.15 (CRITICAL-1 + HIGH-1): attempt to clean up
+    partially-initialized or partially-torn-down resources.
+
+    Called by the ``serve_json_lines`` outer ``finally`` when the inner
+    cleanup did NOT complete cleanly (either init failed after
+    ``agent.start()``, or the inner ``finally`` raised during
+    teardown).  Returns ``True`` only if ALL cleanups succeed — in
+    that case the instance lock can be safely released.  Returns
+    ``False`` if ANY cleanup fails (live owners remain) — the caller
+    must RETAIN the instance lock.
+
+    Each cleanup is best-effort and idempotent:
+      - ``subagent_service.shutdown()`` — bounded by SUBAGENT_SHUTDOWN_TIMEOUT.
+      - ``agent.shutdown()`` — idempotent via ``_shutdown_completed`` flag.
+      - ``db.close()`` — idempotent (sets ``_conn = None``).
+    """
+    ok = True
+    if subagent_service is not None:
+        try:
+            await subagent_service.shutdown(timeout=SUBAGENT_SHUTDOWN_TIMEOUT)
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            logger.error(
+                "emergency cleanup: subagent_service.shutdown() failed; "
+                "live subagent owners may remain",
+                exc_info=True,
+            )
+            ok = False
+    if agent is not None:
+        try:
+            await agent.shutdown()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            logger.error(
+                "emergency cleanup: agent.shutdown() failed; live cron "
+                "executors or chat owners may remain",
+                exc_info=True,
+            )
+            ok = False
+    if db is not None:
+        try:
+            await db.close()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            logger.error(
+                "emergency cleanup: db.close() failed",
+                exc_info=True,
+            )
+            ok = False
+    return ok
 
 
 def _load_rpc_capability() -> str:
@@ -616,6 +758,11 @@ class AgentService:
         self._active_runtimes: dict[int, object] = {}
         self._office_shutdown_task: asyncio.Task | None = None
         self.shutdown_failed = False
+        # M4 batch 3.1.15 (CRITICAL-1): idempotency flag for shutdown().
+        # Set to True only on clean completion.  Allows the outer
+        # emergency-cleanup path to safely re-call shutdown() without
+        # double-closing shared authorities.
+        self._shutdown_completed = False
         # M2 (round-3): admission lock serialises ``chat``'s admission
         # decision + owner reservation against ``shutdown``'s
         # ``_accepting_work = False`` flip + owner snapshot.  Without it,
@@ -642,6 +789,13 @@ class AgentService:
 
     async def shutdown(self) -> None:
         """Stop process-scoped background services."""
+        # M4 batch 3.1.15 (CRITICAL-1): idempotency guard.  If a previous
+        # shutdown() completed cleanly, this is a no-op.  If a previous
+        # call raised, the flag is NOT set and re-entry is allowed (each
+        # internal step is itself idempotent — cron stop via state machine,
+        # chat drain via fresh snapshot, runtime drain via registry scan).
+        if self._shutdown_completed:
+            return
         # Stop producers, then cancel/wait every active turn while shared
         # authorities and the database are still available.
         await self.stop_producers()
@@ -731,6 +885,9 @@ class AgentService:
         if self._audit_logger is not None:
             self._audit_logger.close()
         self.shutdown_failed = False
+        # M4 batch 3.1.15 (CRITICAL-1): mark shutdown as completed so
+        # subsequent calls are no-ops.  Set ONLY on the clean exit path.
+        self._shutdown_completed = True
 
     async def _shutdown_office_authority(
         self, *, attempts: int = 3, timeout_seconds: float = 5.0,
@@ -1309,6 +1466,16 @@ async def serve_json_lines(
     # local variable and released when the process exits (the OS
     # closes the fd).
     instance_lock_fd = _acquire_instance_lock(db_path)
+    # M4 batch 3.1.15 (CRITICAL-1 + HIGH-1): track partially-initialized
+    # resources so the outer ``finally`` can attempt emergency cleanup.
+    # ``inner_cleanup_completed`` is set to True ONLY at the end of the
+    # inner ``finally`` — if the inner cleanup raises (e.g. cron executor
+    # resists cancellation), it stays False and the outer finally retains
+    # the instance lock instead of releasing it.
+    agent: AgentService | None = None
+    db: Database | None = None
+    subagent_service: SubAgentService | None = None
+    inner_cleanup_completed = False
     try:
         if uds_path.exists() or uds_path.is_symlink():
             mode = uds_path.lstat().st_mode
@@ -1560,18 +1727,63 @@ async def serve_json_lines(
             # premature database close and remains observable to the caller.
             await agent.shutdown()
             await db.close()
+            # M4 batch 3.1.15 (CRITICAL-1): mark the inner cleanup as
+            # completed.  If ANY step above raised, this line is NOT
+            # reached, and the outer ``finally`` will attempt emergency
+            # cleanup and potentially retain the instance lock.
+            inner_cleanup_completed = True
     finally:
-        # M4 batch 3.1.14 (MEDIUM): release the instance lock on ANY
-        # exit — including init failures (UDS probe refusal, db.connect,
-        # migrations, agent.start) that raised BEFORE the inner try/finally
-        # began.  Previously the lock release only lived inside the inner
-        # finally, so an init-phase exception leaked the fd and prevented
-        # retry in the same process.
+        # M4 batch 3.1.15 (CRITICAL-1 + HIGH-1): the instance lock is
+        # released ONLY on a clean shutdown.  If the inner cleanup raised
+        # (cron executor resisted cancellation, chat drain timed out,
+        # etc.) OR init failed after ``agent.start()`` (HIGH-1), we
+        # attempt emergency cleanup.  If emergency cleanup succeeds, the
+        # lock is released.  If it fails (live owners remain), the lock
+        # fd is RETAINED in the module-level ``_retained_instance_lock_fd``
+        # so a second instance cannot start against the same DB while the
+        # first process's live executors are still producing side effects.
+        # The OS reaps the fd when the process exits.
         if instance_lock_fd is not None:
-            try:
-                os.close(instance_lock_fd)
-            except OSError:
-                pass
+            if inner_cleanup_completed:
+                # Clean shutdown — release the lock.
+                try:
+                    os.close(instance_lock_fd)
+                except OSError:
+                    pass
+            else:
+                # Inner cleanup did NOT complete.  Attempt emergency
+                # cleanup (HIGH-1: init failed after agent.start(); or
+                # CRITICAL-1: inner finally raised during teardown).
+                cleanup_ok = await _emergency_instance_cleanup(
+                    agent, db, subagent_service,
+                )
+                if cleanup_ok:
+                    try:
+                        os.close(instance_lock_fd)
+                    except OSError:
+                        pass
+                    logger.info(
+                        "serve_json_lines: emergency cleanup succeeded; "
+                        "instance lock released"
+                    )
+                else:
+                    # RETAIN the lock — live owners remain.  Park the fd
+                    # in the module-level holder so it is NOT garbage-
+                    # collected (which would close it) and NOT closed by
+                    # any other finally block.  The OS reaps it when the
+                    # process exits.
+                    global _retained_instance_lock_fd
+                    _retained_instance_lock_fd = instance_lock_fd
+                    logger.error(
+                        "serve_json_lines: shutdown did NOT complete cleanly "
+                        "and emergency cleanup failed (live cron executors / "
+                        "chat owners / subagent runs remain); RETAINING "
+                        "instance lock fd=%d to prevent a second instance "
+                        "from starting against the same DB while live "
+                        "owners remain.  The lock will be released when "
+                        "the process exits. (CRITICAL-1)",
+                        instance_lock_fd,
+                    )
 
 
 def _parse_json_line(line: bytes) -> dict:
