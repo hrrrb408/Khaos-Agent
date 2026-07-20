@@ -749,6 +749,14 @@ class AgentService:
                 log_path=resolve_safe_audit_log_path(
                     self._effective_policy.audit_log_path
                 ),
+                # A2-6: bind the server-lifecycle AuditLogger to the
+                # local-uid principal (matching MemoryService / ModeManager
+                # above) and stamp the effective policy digest on every row
+                # so audit attribution matches the runtime that produced it.
+                # ``runtime_id`` is left None at the server level; per-runtime
+                # AuditLoggers constructed by ``build_runtime`` carry it.
+                principal_id=f"local-uid:{os.getuid()}",
+                policy_digest=self._effective_policy.digest,
             )
             if self._effective_policy.audit_enabled
             else None
@@ -1042,7 +1050,16 @@ class AgentService:
                 self._active_chat_tasks.discard(owner_task)
 
     async def switch_mode(self, session_id: str, target_mode: str) -> dict:
-        mode_manager = ModeManager(self.db, project_root=self.project_root)
+        # A2-5: bind the per-request ModeManager to the local-uid principal
+        # and the request's session_id so the switch is scoped to that
+        # (principal, session) pair.  Multi-principal servers will need to
+        # take principal_id from the request context.
+        mode_manager = ModeManager(
+            self.db,
+            project_root=self.project_root,
+            principal_id=f"local-uid:{os.getuid()}",
+            session_id=session_id,
+        )
         await mode_manager.load()
         mode = ModeManager.parse(target_mode)
         await mode_manager.switch(mode)
@@ -1505,8 +1522,18 @@ async def serve_json_lines(
         await db.run_migrations()
         agent = AgentService(db, project_root=project_root, config_path=config_path, router=router)
         await agent.start()
-        memory = MemoryService(MemoryStore(db))
-        audit_service = AuditService(AuditLogger(db))
+        # A2-4: bind the server-level MemoryService to the local-uid principal
+        # so it sees the same memories as a local AgentLoop run.  Multi-principal
+        # servers (when they exist) will need a per-request MemoryService; for
+        # now every local run shares the same UID.
+        memory = MemoryService(MemoryStore(db, principal_id=f"local-uid:{os.getuid()}"))
+        # A2-6: reuse the AgentService's bound AuditLogger so audit RPC
+        # queries inherit the same principal scoping (local-uid) and
+        # policy_digest as the live agent runtime.  Constructing a fresh
+        # unbound AuditLogger here would default to ``principal_id='legacy'``
+        # and surface the wrong principal's rows (or none at all once
+        # legacy quarantine takes effect).
+        audit_service = AuditService(agent._audit_logger or AuditLogger(db))
         task_service = TaskService(agent.task_manager, agent.approval_broker)
         subagent_service: SubAgentService | None = None
         if enable_subagents:
@@ -1838,10 +1865,14 @@ async def _build_subagent_service(
     """
     root = project_root or Path.cwd()
     resolved_config = config_path or root / "config.yaml"
-    mode_manager = ModeManager(db, project_root=root)
+    # A2-5: bind the SubAgent's ModeManager to the inherited principal_id
+    # so subagent mode switches don't leak into other principals.
+    mode_manager = ModeManager(db, project_root=root, principal_id=principal_id)
     await mode_manager.load()
     router = load_router_from_config(resolved_config, project_root=root)
-    memory_store = MemoryStore(db)
+    # A2-4: bind the SubAgent's memory store to the inherited principal_id
+    # so subagent runs see the same memories as the parent runtime.
+    memory_store = MemoryStore(db, principal_id=principal_id)
     memory_manager = MemoryManager(
         memory_store,
         budget=MemoryBudget(),

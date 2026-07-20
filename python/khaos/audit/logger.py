@@ -116,6 +116,15 @@ class AuditEntry:
     detail: dict[str, Any]
     session_id: str | None
     created_at: str | None = None
+    # A2-6: principal attribution + context fields.  Older rows (and
+    # older callers) leave these as None.
+    principal_id: str | None = None
+    runtime_id: str | None = None
+    task_id: str | None = None
+    operation_id: str | None = None
+    policy_digest: str | None = None
+    authority_generation: int | None = None
+    source_transport: str | None = None
 
     @classmethod
     def from_row(cls, row: dict[str, Any]) -> "AuditEntry":
@@ -127,6 +136,13 @@ class AuditEntry:
             detail=parse_detail(row.get("detail")),
             session_id=row.get("session_id"),
             created_at=row.get("created_at"),
+            principal_id=row.get("principal_id"),
+            runtime_id=row.get("runtime_id"),
+            task_id=row.get("task_id"),
+            operation_id=row.get("operation_id"),
+            policy_digest=row.get("policy_digest"),
+            authority_generation=row.get("authority_generation"),
+            source_transport=row.get("source_transport"),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -151,11 +167,34 @@ class AuditLogger:
     ``open(path, "a")`` that could follow a symlink substituted after
     startup.  The trusted directory is also validated (not a symlink,
     owned by the current UID, mode 0700) before the file is opened.
+
+    M4 batch 3.1.16A-2: AuditLogger is principal-scoped, mirroring
+    PermissionEngine / MemoryStore / ModeManager.  ``principal_id`` is
+    bound at construction and stamped on every persisted row; ``query()``
+    filters by it by default so one principal cannot read another's
+    audit trail.  ``runtime_id`` and ``policy_digest`` are likewise
+    runtime-bound and stamped on every row for attribution.  Per-event
+    context (``task_id``, ``operation_id``, ``authority_generation``,
+    ``source_transport``) flows through ``log()`` and the typed helpers.
     """
 
-    def __init__(self, db, *, log_path: str | os.PathLike[str] | None = None):
+    def __init__(
+        self,
+        db,
+        *,
+        log_path: str | os.PathLike[str] | None = None,
+        principal_id: str = "legacy",
+        runtime_id: str | None = None,
+        policy_digest: str | None = None,
+    ):
         self.db = db
         self.log_path: Path | None = None
+        # A2-6: principal attribution bound at construction.  Stamped on
+        # every insert; used as the default ``query()`` filter so a
+        # principal cannot read another principal's audit trail.
+        self._principal_id = principal_id
+        self._runtime_id = runtime_id
+        self._policy_digest = policy_digest
         # H3: long-lived fd opened at construction; None when file audit
         # is disabled or the path failed safety validation.
         self._fd: int | None = None
@@ -418,6 +457,11 @@ class AuditLogger:
         result: str,
         detail: dict[str, Any] | None = None,
         session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
     ) -> int:
         """Persist one audit row; return its id.
 
@@ -427,6 +471,13 @@ class AuditLogger:
         M1: when ``log_path`` is configured, the record is also appended as
         one JSON line to that file.  The file write is best-effort — a
         failure does NOT suppress the database write.
+
+        A2-6: ``principal_id`` / ``runtime_id`` / ``policy_digest`` come
+        from the logger's construction (they are properties of the runtime
+        that owns this logger).  The per-event keyword args
+        (``task_id`` / ``operation_id`` / ``authority_generation`` /
+        ``source_transport``) describe the immediate caller and are
+        stamped on this row only.
         """
         detail_json = json.dumps(detail or {}, ensure_ascii=False, sort_keys=True)
         # M1: append a copy to the configured file path (best-effort).
@@ -438,6 +489,10 @@ class AuditLogger:
                     result=result,
                     detail_json=detail_json,
                     session_id=session_id,
+                    task_id=task_id,
+                    operation_id=operation_id,
+                    authority_generation=authority_generation,
+                    source_transport=source_transport,
                 )
             except Exception:
                 logger.debug(
@@ -452,6 +507,13 @@ class AuditLogger:
                 result=result,
                 detail=detail_json,
                 session_id=session_id,
+                principal_id=self._principal_id,
+                runtime_id=self._runtime_id,
+                task_id=task_id,
+                operation_id=operation_id,
+                policy_digest=self._policy_digest,
+                authority_generation=authority_generation,
+                source_transport=source_transport,
             )
         except Exception:
             # Audit must never break the calling flow; log and continue.
@@ -466,6 +528,10 @@ class AuditLogger:
         result: str,
         detail_json: str,
         session_id: str | None,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
     ) -> None:
         """Append one audit record as a JSON line to the held fd.
 
@@ -474,17 +540,34 @@ class AuditLogger:
         follow a symlink substituted after startup.  The fd was validated
         (regular file, owner, mode) when opened and is held for the
         logger's lifetime, so the write target cannot be swapped.
+
+        A2-6: the JSON line carries the principal / runtime / policy
+        attribution plus the per-event context fields so the file trail
+        matches the DB row 1:1.
         """
         if self._fd is None:
             return  # file audit disabled or path failed validation
-        record = {
+        record: dict[str, Any] = {
             "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "action": action,
             "target": target,
             "result": result,
             "detail": json.loads(detail_json),
             "session_id": session_id,
+            "principal_id": self._principal_id,
+            "runtime_id": self._runtime_id,
+            "policy_digest": self._policy_digest,
         }
+        # Only include per-event context when set, so the file line stays
+        # compact for the common case (no task / operation / transport).
+        if task_id is not None:
+            record["task_id"] = task_id
+        if operation_id is not None:
+            record["operation_id"] = operation_id
+        if authority_generation is not None:
+            record["authority_generation"] = authority_generation
+        if source_transport is not None:
+            record["source_transport"] = source_transport
         line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
         try:
             os.write(self._fd, line.encode("utf-8"))
@@ -500,6 +583,11 @@ class AuditLogger:
         approved: bool,
         reason: str = "",
         session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
     ) -> int:
         """Record a permission decision (approved/denied)."""
         return await self.log(
@@ -508,6 +596,10 @@ class AuditLogger:
             result=RESULT_APPROVED if approved else RESULT_DENIED,
             detail={"reason": reason},
             session_id=session_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
         )
 
     async def log_tool(
@@ -518,6 +610,11 @@ class AuditLogger:
         duration_ms: int = 0,
         error: str = "",
         session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
     ) -> int:
         """Record a tool execution outcome."""
         return await self.log(
@@ -526,6 +623,10 @@ class AuditLogger:
             result=RESULT_SUCCESS if success else RESULT_ERROR,
             detail={"duration_ms": duration_ms, "error": error},
             session_id=session_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
         )
 
     async def log_security_event(
@@ -535,6 +636,11 @@ class AuditLogger:
         reason: str,
         detail: dict[str, Any] | None = None,
         session_id: str | None = None,
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
     ) -> int:
         """记录安全事件到审计日志。
 
@@ -549,6 +655,10 @@ class AuditLogger:
             result=RESULT_DENIED,
             detail=detail,
             session_id=session_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
         )
 
     async def query(
@@ -558,14 +668,29 @@ class AuditLogger:
         since: str | datetime | None = None,
         until: str | datetime | None = None,
         limit: int = 100,
+        *,
+        principal_id: str | None = "__default__",
     ) -> list[AuditEntry]:
-        """Query audit records, newest first, with optional filters."""
+        """Query audit records, newest first, with optional filters.
+
+        A2-6: by default the query is scoped to this logger's bound
+        ``principal_id`` so one principal cannot read another's audit
+        trail.  Callers that legitimately need a cross-principal view
+        (e.g. a future admin operator) may pass ``principal_id=None`` to
+        disable the filter, or pass an explicit principal id to query a
+        different principal's events.  Both are explicit opt-ins; the
+        default is fail-closed isolation.
+        """
+        effective_principal = (
+            self._principal_id if principal_id == "__default__" else principal_id
+        )
         rows = await self.db.query_audit_logs(
             action=action,
             result=result,
             since=_normalize_time(since),
             until=_normalize_time(until),
             limit=limit,
+            principal_id=effective_principal,
         )
         return [AuditEntry.from_row(row) for row in rows]
 

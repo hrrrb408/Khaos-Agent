@@ -78,11 +78,34 @@ MODE_CONFIGS = {
 
 
 class ModeManager:
-    """Mode switch manager backed by user_config."""
+    """Mode switch manager backed by the principal_modes table.
 
-    def __init__(self, db, project_root: Path | None = None):
+    M4 batch 3.1.16A-2 (CRITICAL #4): mode is now principal-scoped.
+    Each principal has its own current mode, optionally overridden per
+    session.  The lookup order in ``load()`` is:
+
+      1. ``(principal_id, session_id)`` — session-specific override
+      2. ``(principal_id, '')``         — principal default
+      3. system default (office)
+
+    Legacy behaviour stored mode in the global ``user_config.current_mode``
+    key, so every principal on the same database shared one mode.  The
+    global key is no longer read or written; ``user_config`` is retained
+    for genuinely global settings (API keys etc.).
+    """
+
+    def __init__(
+        self,
+        db,
+        project_root: Path | None = None,
+        *,
+        principal_id: str = "legacy",
+        session_id: str = "",
+    ):
         self.db = db
         self.project_root = project_root or Path.cwd()
+        self._principal_id = principal_id
+        self._session_id = session_id
         self._current_mode = Mode.OFFICE
         self._intent_buffer = ""
 
@@ -97,16 +120,34 @@ class ModeManager:
         return MODE_CONFIGS[self._current_mode]
 
     async def load(self) -> Mode:
-        """Load current mode from persisted user configuration."""
-        value = await self.db.get_config("current_mode", Mode.OFFICE.value)
+        """Load current mode from the principal_modes table.
+
+        Lookup order: ``(principal_id, session_id)`` →
+        ``(principal_id, '')`` → system default (office).
+        """
+        value = await self.db.get_principal_mode(
+            self._principal_id,
+            session_id=self._session_id,
+            default=Mode.OFFICE.value,
+        )
         self._current_mode = Mode(value)
         return self._current_mode
 
     async def switch(self, target_mode: Mode, intent_context: str = "") -> Mode:
-        """Switch mode and persist the user's current preference."""
+        """Switch mode and persist the principal's current preference.
+
+        Writes to ``(principal_id, session_id)``.  When ``session_id``
+        is empty (the default), the write targets the principal's
+        default row — every session without its own override sees it.
+        When ``session_id`` is set, only that session is affected.
+        """
         self._intent_buffer = intent_context
         self._current_mode = target_mode
-        await self.db.set_config("current_mode", target_mode.value)
+        await self.db.set_principal_mode(
+            self._principal_id,
+            target_mode.value,
+            session_id=self._session_id,
+        )
         return self._current_mode
 
     async def detect_and_suggest(self, user_input: str) -> Optional[Mode]:

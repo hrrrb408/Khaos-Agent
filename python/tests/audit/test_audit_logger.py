@@ -233,3 +233,106 @@ async def test_file_audit_rejects_symlinked_directory_before_side_effect(
     assert audit._fd is None
     assert not (attacker / "audit" / "events.jsonl").exists()
     await db.close()
+
+
+async def test_log_stamps_principal_id_runtime_id_policy_digest(tmp_path):
+    """A2-6: log() stamps the bound principal/runtime/policy on every row."""
+    db = await _db(tmp_path)
+    audit = AuditLogger(
+        db,
+        principal_id="alice",
+        runtime_id="rt-1",
+        policy_digest="digest-abc",
+    )
+
+    row_id = await audit.log("write_file", "/tmp/x", "success", {"size": 1})
+    assert row_id > 0
+
+    # Direct DB inspection confirms the stamp (query() also filters by
+    # principal so it would surface the row regardless — the column
+    # values are what matter here).
+    rows = await db.list_audit_logs()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["principal_id"] == "alice"
+    assert row["runtime_id"] == "rt-1"
+    assert row["policy_digest"] == "digest-abc"
+    await db.close()
+
+
+async def test_log_forwards_per_event_context_fields(tmp_path):
+    """A2-6: per-event context (task/operation/authority/transport) lands
+    on the row even though principal/runtime/policy come from the logger."""
+    db = await _db(tmp_path)
+    audit = AuditLogger(db, principal_id="alice", runtime_id="rt-1",
+                        policy_digest="d")
+
+    await audit.log(
+        "write_file", "/tmp/x", "success",
+        task_id="task-7", operation_id="op-9",
+        authority_generation=3, source_transport="websocket",
+    )
+
+    rows = await db.list_audit_logs()
+    assert rows[0]["task_id"] == "task-7"
+    assert rows[0]["operation_id"] == "op-9"
+    assert rows[0]["authority_generation"] == 3
+    assert rows[0]["source_transport"] == "websocket"
+    await db.close()
+
+
+async def test_query_default_filters_by_bound_principal(tmp_path):
+    """A2-6: query() with no principal_id arg only returns the bound
+    principal's rows — fail-closed isolation across principals."""
+    db = await _db(tmp_path)
+    alice = AuditLogger(db, principal_id="alice")
+    bob = AuditLogger(db, principal_id="bob")
+
+    await alice.log("write_file", "/a", "success")
+    await bob.log("write_file", "/b", "success")
+
+    # Alice sees only her row; bob sees only his.
+    alice_rows = await alice.query()
+    bob_rows = await bob.query()
+    assert [e.target for e in alice_rows] == ["/a"]
+    assert [e.target for e in bob_rows] == ["/b"]
+    await db.close()
+
+
+async def test_query_principal_id_none_opt_in_returns_all(tmp_path):
+    """A2-6: principal_id=None is an explicit opt-in to query across all
+    principals (future admin operator use case)."""
+    db = await _db(tmp_path)
+    alice = AuditLogger(db, principal_id="alice")
+    bob = AuditLogger(db, principal_id="bob")
+
+    await alice.log("write_file", "/a", "success")
+    await bob.log("write_file", "/b", "success")
+
+    # Explicit opt-in to disable the principal filter.
+    all_rows = await alice.query(principal_id=None)
+    assert sorted(e.target for e in all_rows) == ["/a", "/b"]
+    await db.close()
+
+
+async def test_log_tool_and_log_permission_forward_context(tmp_path):
+    """A2-6: the typed helpers accept and forward per-event context."""
+    db = await _db(tmp_path)
+    audit = AuditLogger(db, principal_id="alice")
+
+    await audit.log_tool(
+        "read_file", "/etc/hosts", success=True, duration_ms=5,
+        task_id="task-1", source_transport="cli",
+    )
+    await audit.log_permission(
+        "terminal", "rm -rf /", approved=False, reason="dangerous",
+        operation_id="op-1",
+    )
+
+    rows = await db.list_audit_logs()
+    tool_row = next(r for r in rows if r["action"] == "read_file")
+    perm_row = next(r for r in rows if r["action"] == "terminal")
+    assert tool_row["task_id"] == "task-1"
+    assert tool_row["source_transport"] == "cli"
+    assert perm_row["operation_id"] == "op-1"
+    await db.close()

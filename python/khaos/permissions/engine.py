@@ -11,6 +11,8 @@ from enum import Enum
 from typing import Optional
 from urllib.parse import urlparse
 
+from khaos.exceptions import PermissionDeniedError
+
 
 class ApprovalMode(Enum):
     """Supported permission approval policies."""
@@ -45,7 +47,24 @@ class PermissionDecision:
 
 
 class PermissionEngine:
-    """Rule matching and audit logging for tool calls."""
+    """Rule matching and audit logging for tool calls.
+
+    M4 batch 3.1.16A-2 (CRITICAL #3): every engine is bound to exactly
+    one ``(principal_id, project_id, policy_digest)`` triple at
+    construction.  Rule load / grant / revoke are all scoped to that
+    principal, so one principal can never match, grant, or revoke
+    another principal's rules.  Legacy rows (``principal_id='legacy'``)
+    in the database are filtered out by ``list_permission_rules`` and
+    are therefore never loaded into the in-memory cache.
+
+    The in-memory ``_rules`` cache is preserved because each engine is
+    constructed per-runtime (per ``AgentLoop``), each runtime belongs to
+    exactly one principal, and ``load_rules`` is called once at startup
+    — the cache is implicitly principal-scoped.  Concurrent runtimes
+    under different principals hold separate engines with separate
+    caches; concurrent runtimes under the same principal share the
+    database but each reload their own cache via ``load_rules``.
+    """
 
     def __init__(
         self,
@@ -53,6 +72,10 @@ class PermissionEngine:
         default_mode: ApprovalMode = ApprovalMode.ASK_EVERY,
         *,
         commands_require_approval: "frozenset[str] | None" = None,
+        principal_id: str = "legacy",
+        project_id: str = "",
+        policy_digest: str = "",
+        runtime_id: str = "",
     ):
         self.db = db
         self._default_mode = default_mode
@@ -61,10 +84,23 @@ class PermissionEngine:
         # rules so an auto-approve rule can never bypass a policy that
         # requires explicit confirmation for a command.
         self._commands_require_approval = commands_require_approval or frozenset()
+        # A2-3: principal binding.  Every rule loaded, granted, or revoked
+        # through this engine is scoped to (principal_id, project_id,
+        # policy_digest).  ``principal_id='legacy'`` is the fail-closed
+        # default — an engine constructed without an authenticated
+        # principal can only match other 'legacy' rules (which should
+        # only exist as migration leftovers).
+        self._principal_id = principal_id
+        self._project_id = project_id
+        self._policy_digest = policy_digest
+        self._runtime_id = runtime_id
 
     async def load_rules(self) -> None:
-        """Load persisted rules from SQLite."""
-        rows = await self.db.list_permission_rules()
+        """Load persisted rules from SQLite, scoped to this principal."""
+        rows = await self.db.list_permission_rules(
+            principal_id=self._principal_id,
+            project_id=self._project_id,
+        )
         self._rules = [
             PermissionRule(
                 id=int(row["id"]),
@@ -145,12 +181,15 @@ class PermissionEngine:
         )
 
     async def grant_rule(self, rule: PermissionRule) -> PermissionRule:
-        """Persist and cache a permission rule."""
+        """Persist and cache a permission rule scoped to this principal."""
         rule_id = await self.db.insert_permission_rule(
             rule.pattern,
             rule.permission_level,
             rule.approval.value,
             rule.mode,
+            principal_id=self._principal_id,
+            project_id=self._project_id,
+            policy_digest=self._policy_digest,
         )
         persisted = PermissionRule(
             id=rule_id,
@@ -164,8 +203,24 @@ class PermissionEngine:
         return persisted
 
     async def revoke_rule(self, rule_id: int) -> None:
-        """Remove a permission rule from storage and cache."""
-        await self.db.delete_permission_rule(rule_id)
+        """Remove a permission rule from storage and cache.
+
+        M4 batch 3.1.16A-2: fail closed — if ``delete_permission_rule``
+        returns 0 rows, the rule either does not exist or belongs to a
+        different principal.  Either way the caller is attempting an
+        unauthorized revoke, so ``PermissionDeniedError`` is raised
+        rather than silently succeeding (the old behaviour silently
+        removed the rule from the in-memory cache even when the DB
+        delete was a no-op, masking the cross-principal revoke attempt).
+        """
+        rowcount = await self.db.delete_permission_rule(
+            rule_id, principal_id=self._principal_id,
+        )
+        if rowcount == 0:
+            raise PermissionDeniedError(
+                f"Permission rule {rule_id} not owned by principal "
+                f"{self._principal_id!r} (or does not exist); revoke refused"
+            )
         self._rules = [rule for rule in self._rules if rule.id != rule_id]
 
     async def audit(
@@ -176,12 +231,25 @@ class PermissionEngine:
         detail: dict | None = None,
         session_id: str | None = None,
         risk_level: str = "safe",
+        *,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
     ) -> None:
         """Write a tool permission/execution audit log.
 
         ``risk_level`` (new, optional) tags the severity of the audited
         decision (e.g. ``"safe"``, ``"risky"``, ``"blocked"``). Existing
         callers that omit it keep the historical ``"safe"`` default.
+
+        M4 batch 3.1.16A-2: every audit row is stamped with this
+        engine's ``principal_id``, ``runtime_id`` and ``policy_digest``
+        so an operator can attribute each row to a specific
+        principal/runtime/policy triple.  Optional context fields
+        (``task_id``, ``operation_id``, ``authority_generation``,
+        ``source_transport``) let callers enrich the row without
+        reaching into ``detail``.
         """
         enriched = dict(detail or {})
         if risk_level and "risk_level" not in enriched:
@@ -192,6 +260,13 @@ class PermissionEngine:
             result=result,
             detail=json.dumps(enriched, ensure_ascii=False),
             session_id=session_id,
+            principal_id=self._principal_id,
+            runtime_id=self._runtime_id,
+            task_id=task_id,
+            operation_id=operation_id,
+            policy_digest=self._policy_digest,
+            authority_generation=authority_generation,
+            source_transport=source_transport,
         )
 
     def normalize_target(self, tool_name: str, params: dict) -> str:

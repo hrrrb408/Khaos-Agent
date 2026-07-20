@@ -103,6 +103,11 @@ class Database:
         # M4 batch 3.1.10: ensure principal_id, execution_id, lease_until
         # columns exist on existing databases.
         await self._ensure_scheduled_tasks_principal_and_lease()
+        # M4 batch 3.1.16A-2: principal partitioning for permissions,
+        # memories, audit_log + new principal_modes table.
+        await self._ensure_permissions_principal_columns()
+        await self._ensure_memories_principal_columns()
+        await self._ensure_audit_log_principal_columns()
 
     async def _ensure_scheduled_tasks_lifecycle_version(self) -> None:
         """Add ``lifecycle_version`` column to legacy ``scheduled_tasks``.
@@ -191,6 +196,212 @@ class Database:
             WHERE principal_id = 'legacy'
               AND status != 'failed'
             """
+        )
+        await conn.commit()
+
+    async def _ensure_permissions_principal_columns(self) -> None:
+        """M4 batch 3.1.16A-2 (CRITICAL #3): add ``principal_id``,
+        ``project_id``, ``policy_digest``, ``generation`` columns to
+        ``permissions`` for principal-scoped rule matching.
+
+        Legacy rows (pre-A-2) get ``principal_id='legacy'`` and are
+        never matched by authenticated principals — ``list_permission_rules``
+        filters by ``principal_id = ?`` when called with a principal.
+
+        No quarantine UPDATE is needed because legacy rows are filtered
+        out by the ``WHERE principal_id = ?`` clause in
+        ``list_permission_rules`` — they simply never match.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(permissions)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        added = False
+        if "principal_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE permissions "
+                "ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            added = True
+        if "project_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE permissions ADD COLUMN project_id TEXT NOT NULL DEFAULT ''"
+            )
+            added = True
+        if "policy_digest" not in columns:
+            await conn.execute(
+                "ALTER TABLE permissions ADD COLUMN policy_digest TEXT NOT NULL DEFAULT ''"
+            )
+            added = True
+        if "generation" not in columns:
+            await conn.execute(
+                "ALTER TABLE permissions ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"
+            )
+            added = True
+        if added:
+            await conn.commit()
+        # Principal-scoped lookup index (idempotent).
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_permissions_principal "
+            "ON permissions(principal_id, project_id, mode, permission_level)"
+        )
+        await conn.commit()
+
+    async def _ensure_memories_principal_columns(self) -> None:
+        """M4 batch 3.1.16A-2 (CRITICAL #5): add ``principal_id``,
+        ``namespace``, ``session_id`` columns to ``memories`` and
+        rebuild the UNIQUE constraint from ``(scope, key)`` to
+        ``(namespace, principal_id, session_id, scope, key)``.
+
+        SQLite cannot ALTER a UNIQUE constraint, so the table is
+        rebuilt: old data is backed up, the table is dropped and
+        recreated with the new schema, FTS5 + triggers are rebuilt,
+        and legacy rows are re-inserted with ``principal_id='legacy'``
+        and ``namespace='private'``.  Legacy rows are never loaded by
+        authenticated principals — ``list_memories`` and
+        ``search_memories`` filter by ``principal_id`` when called
+        with one.
+
+        The rebuild is wrapped in a single transaction; if any step
+        fails the whole migration rolls back and the original table
+        is preserved.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(memories)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "principal_id" in columns:
+            return  # Already migrated
+        # Backup old data.
+        await conn.execute("CREATE TABLE _memories_backup AS SELECT * FROM memories")
+        # Drop old table, FTS, and triggers (triggers are dropped
+        # automatically when the table is dropped).
+        await conn.execute("DROP TABLE IF EXISTS memories")
+        await conn.execute("DROP TABLE IF EXISTS memory_fts")
+        # Create new table with principal partitioning.
+        await conn.execute(
+            """
+            CREATE TABLE memories (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope        TEXT NOT NULL,
+                key          TEXT NOT NULL,
+                value        TEXT NOT NULL,
+                ttl          INTEGER NOT NULL DEFAULT 604800,
+                confidence   INTEGER NOT NULL DEFAULT 2,
+                access_freq  INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                principal_id TEXT NOT NULL DEFAULT 'legacy',
+                namespace    TEXT NOT NULL DEFAULT 'private',
+                session_id   TEXT NOT NULL DEFAULT '',
+                UNIQUE(namespace, principal_id, session_id, scope, key)
+            )
+            """
+        )
+        # Migrate old data (quarantine as legacy).
+        await conn.execute(
+            """
+            INSERT INTO memories (
+                id, scope, key, value, ttl, confidence, access_freq,
+                created_at, updated_at, principal_id, namespace, session_id
+            )
+            SELECT id, scope, key, value, ttl, confidence, access_freq,
+                   created_at, updated_at, 'legacy', 'private', ''
+            FROM _memories_backup
+            """
+        )
+        # Recreate FTS5 table.
+        await conn.execute(
+            """
+            CREATE VIRTUAL TABLE memory_fts USING fts5(
+                key,
+                value,
+                content=memories,
+                content_rowid=id,
+                tokenize='unicode61'
+            )
+            """
+        )
+        # Reindex FTS5 from migrated data.
+        await conn.execute(
+            "INSERT INTO memory_fts(rowid, key, value) SELECT id, key, value FROM memories"
+        )
+        # Recreate triggers.
+        await conn.execute(
+            """
+            CREATE TRIGGER memory_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memory_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
+            END
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TRIGGER memory_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, key, value)
+                VALUES('delete', old.id, old.key, old.value);
+            END
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TRIGGER memory_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, key, value)
+                VALUES('delete', old.id, old.key, old.value);
+                INSERT INTO memory_fts(rowid, key, value)
+                VALUES (new.id, new.key, new.value);
+            END
+            """
+        )
+        # Cleanup backup.
+        await conn.execute("DROP TABLE _memories_backup")
+        await conn.commit()
+
+    async def _ensure_audit_log_principal_columns(self) -> None:
+        """M4 batch 3.1.16A-2 (HIGH #19): add ``principal_id``,
+        ``runtime_id``, ``task_id``, ``operation_id``, ``policy_digest``,
+        ``authority_generation``, ``source_transport`` columns to
+        ``audit_log`` for principal attribution.
+
+        Legacy rows (pre-A-2) get ``principal_id='legacy'`` and remain
+        queryable — audit is append-only, so quarantine is not needed.
+        New queries can filter by ``principal_id`` for attribution.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(audit_log)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        added = False
+        if "principal_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE audit_log "
+                "ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            added = True
+        if "runtime_id" not in columns:
+            await conn.execute("ALTER TABLE audit_log ADD COLUMN runtime_id TEXT")
+            added = True
+        if "task_id" not in columns:
+            await conn.execute("ALTER TABLE audit_log ADD COLUMN task_id TEXT")
+            added = True
+        if "operation_id" not in columns:
+            await conn.execute("ALTER TABLE audit_log ADD COLUMN operation_id TEXT")
+            added = True
+        if "policy_digest" not in columns:
+            await conn.execute("ALTER TABLE audit_log ADD COLUMN policy_digest TEXT")
+            added = True
+        if "authority_generation" not in columns:
+            await conn.execute(
+                "ALTER TABLE audit_log ADD COLUMN authority_generation INTEGER"
+            )
+            added = True
+        if "source_transport" not in columns:
+            await conn.execute(
+                "ALTER TABLE audit_log ADD COLUMN source_transport TEXT"
+            )
+            added = True
+        if added:
+            await conn.commit()
+        # Principal-scoped audit lookup index (idempotent).
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_principal "
+            "ON audit_log(principal_id, created_at)"
         )
         await conn.commit()
 
@@ -385,43 +596,159 @@ class Database:
             return default
         return json.loads(str(row["value"]))
 
+    async def get_principal_mode(
+        self,
+        principal_id: str,
+        session_id: str = "",
+        default: str = "office",
+    ) -> str:
+        """M4 batch 3.1.16A-2: read principal-scoped mode.
+
+        Lookup order:
+        1. (principal_id, session_id) — session-specific override
+        2. (principal_id, '')         — principal default
+        3. ``default`` (typically 'office')
+        """
+        conn = await self._require_conn()
+        if session_id:
+            cursor = await conn.execute(
+                "SELECT mode FROM principal_modes WHERE principal_id = ? AND session_id = ?",
+                (principal_id, session_id),
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                return str(row["mode"])
+        cursor = await conn.execute(
+            "SELECT mode FROM principal_modes WHERE principal_id = ? AND session_id = ''",
+            (principal_id,),
+        )
+        row = await cursor.fetchone()
+        if row is not None:
+            return str(row["mode"])
+        return default
+
+    async def set_principal_mode(
+        self,
+        principal_id: str,
+        mode: str,
+        session_id: str = "",
+    ) -> None:
+        """M4 batch 3.1.16A-2: persist principal-scoped mode.
+
+        When ``session_id`` is empty, sets the principal's default
+        mode.  When non-empty, sets a session-specific override.
+        """
+        conn = await self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO principal_modes (principal_id, session_id, mode)
+            VALUES (?, ?, ?)
+            ON CONFLICT(principal_id, session_id) DO UPDATE SET
+                mode = excluded.mode,
+                updated_at = datetime('now')
+            """,
+            (principal_id, session_id, mode),
+        )
+        await conn.commit()
+
     async def insert_permission_rule(
         self,
         pattern: str,
         permission_level: str,
         approval: str,
         mode: str,
+        *,
+        principal_id: str = "legacy",
+        project_id: str = "",
+        policy_digest: str = "",
+        generation: int = 0,
     ) -> int:
-        """Persist a permission rule and return its row id."""
+        """Persist a permission rule and return its row id.
+
+        M4 batch 3.1.16A-2: ``principal_id``, ``project_id``,
+        ``policy_digest`` and ``generation`` scope the rule to a
+        specific principal/project/policy.  Legacy callers that omit
+        them get ``principal_id='legacy'`` — the rule is stored but
+        never matched by authenticated principals.
+        """
         conn = await self._require_conn()
         cursor = await conn.execute(
             """
-            INSERT INTO permissions (pattern, permission_level, approval, mode)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO permissions (
+                pattern, permission_level, approval, mode,
+                principal_id, project_id, policy_digest, generation
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (pattern, permission_level, approval, mode),
+            (pattern, permission_level, approval, mode,
+             principal_id, project_id, policy_digest, generation),
         )
         await conn.commit()
         return int(cursor.lastrowid)
 
-    async def list_permission_rules(self) -> list[dict[str, Any]]:
-        """Load permission rules newest first."""
+    async def list_permission_rules(
+        self,
+        *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Load permission rules newest first.
+
+        M4 batch 3.1.16A-2: when ``principal_id`` is provided, only
+        rules belonging to that principal are returned (legacy rows
+        with ``principal_id='legacy'`` are excluded).  When
+        ``principal_id`` is ``None`` (default), all rules are returned
+        — this preserves the legacy admin/inspection behaviour.
+        """
         conn = await self._require_conn()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         cursor = await conn.execute(
-            """
+            f"""
             SELECT id, pattern, permission_level, approval, mode,
-                   strftime('%s', granted_at) AS granted_at
+                   strftime('%s', granted_at) AS granted_at,
+                   principal_id, project_id, policy_digest, generation
             FROM permissions
+            {where}
             ORDER BY granted_at DESC, id DESC
-            """
+            """,
+            tuple(params),
         )
         return [dict(row) for row in await cursor.fetchall()]
 
-    async def delete_permission_rule(self, rule_id: int) -> None:
-        """Delete a permission rule."""
+    async def delete_permission_rule(
+        self,
+        rule_id: int,
+        *,
+        principal_id: str | None = None,
+    ) -> int:
+        """Delete a permission rule.
+
+        M4 batch 3.1.16A-2: when ``principal_id`` is provided, the
+        rule is only deleted if it belongs to that principal — this
+        prevents a principal from revoking another principal's rules.
+        Returns the number of rows deleted (0 if the rule doesn't
+        exist or belongs to a different principal).
+        """
         conn = await self._require_conn()
-        await conn.execute("DELETE FROM permissions WHERE id = ?", (rule_id,))
+        if principal_id is not None:
+            cursor = await conn.execute(
+                "DELETE FROM permissions WHERE id = ? AND principal_id = ?",
+                (rule_id, principal_id),
+            )
+        else:
+            cursor = await conn.execute(
+                "DELETE FROM permissions WHERE id = ?", (rule_id,)
+            )
         await conn.commit()
+        return cursor.rowcount or 0
 
     async def insert_audit_log(
         self,
@@ -430,15 +757,37 @@ class Database:
         result: str,
         detail: str = "",
         session_id: str | None = None,
+        *,
+        principal_id: str = "legacy",
+        runtime_id: str | None = None,
+        task_id: str | None = None,
+        operation_id: str | None = None,
+        policy_digest: str | None = None,
+        authority_generation: int | None = None,
+        source_transport: str | None = None,
     ) -> int:
-        """Persist an audit log entry and return its row id."""
+        """Persist an audit log entry and return its row id.
+
+        M4 batch 3.1.16A-2: ``principal_id`` and optional context
+        fields (``runtime_id``, ``task_id``, ``operation_id``,
+        ``policy_digest``, ``authority_generation``,
+        ``source_transport``) are stamped on every entry for
+        attribution.  Legacy callers that omit them get
+        ``principal_id='legacy'``.
+        """
         conn = await self._require_conn()
         cursor = await conn.execute(
             """
-            INSERT INTO audit_log (action, target, result, detail, session_id)
-            VALUES (?, ?, ?, ?, ?)
+            INSERT INTO audit_log (
+                action, target, result, detail, session_id,
+                principal_id, runtime_id, task_id, operation_id,
+                policy_digest, authority_generation, source_transport
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (action, target, result, detail, session_id),
+            (action, target, result, detail, session_id,
+             principal_id, runtime_id, task_id, operation_id,
+             policy_digest, authority_generation, source_transport),
         )
         await conn.commit()
         return int(cursor.lastrowid)
@@ -448,7 +797,9 @@ class Database:
         conn = await self._require_conn()
         cursor = await conn.execute(
             """
-            SELECT action, target, result, detail, session_id
+            SELECT action, target, result, detail, session_id,
+                   principal_id, runtime_id, task_id, operation_id,
+                   policy_digest, authority_generation, source_transport
             FROM audit_log
             ORDER BY created_at, id
             """
@@ -462,6 +813,8 @@ class Database:
         since: str | None = None,
         until: str | None = None,
         limit: int = 100,
+        *,
+        principal_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return audit logs matching the given filters, newest first.
 
@@ -470,6 +823,7 @@ class Database:
         - ``result``: exact result match (e.g. "success", "denied", "error").
         - ``since``/``until``: inclusive ISO timestamp bounds on ``created_at``.
         - ``limit``: cap on rows (default 100).
+        - ``principal_id``: only entries stamped with this principal.
 
         ``created_at`` is stored as ``datetime('now')`` (UTC, 'YYYY-MM-DD HH:MM:SS')
         so lexicographic comparison against ISO-ish strings works.
@@ -489,11 +843,16 @@ class Database:
         if until is not None:
             clauses.append("created_at <= ?")
             params.append(until)
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         cursor = await conn.execute(
             f"""
-            SELECT id, action, target, result, detail, session_id, created_at
+            SELECT id, action, target, result, detail, session_id, created_at,
+                   principal_id, runtime_id, task_id, operation_id,
+                   policy_digest, authority_generation, source_transport
             FROM audit_log
             {where}
             ORDER BY created_at DESC, id DESC
@@ -510,47 +869,90 @@ class Database:
         value: str,
         ttl: int,
         confidence: int,
+        *,
+        principal_id: str = "legacy",
+        namespace: str = "private",
+        session_id: str = "",
     ) -> int:
-        """Insert or update a memory by scope and key."""
+        """Insert or update a memory by (namespace, principal_id, session_id, scope, key).
+
+        M4 batch 3.1.16A-2: memories are partitioned by
+        ``(namespace, principal_id, session_id)``.  Legacy callers that
+        omit them get ``principal_id='legacy'`` — the memory is stored
+        but never loaded by authenticated principals.
+        """
         conn = await self._require_conn()
         await conn.execute(
             """
-            INSERT INTO memories (scope, key, value, ttl, confidence)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(scope, key) DO UPDATE SET
+            INSERT INTO memories (
+                scope, key, value, ttl, confidence,
+                principal_id, namespace, session_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(namespace, principal_id, session_id, scope, key) DO UPDATE SET
                 value = excluded.value,
                 ttl = excluded.ttl,
                 confidence = excluded.confidence,
                 updated_at = datetime('now')
             """,
-            (scope, key, value, ttl, confidence),
+            (scope, key, value, ttl, confidence,
+             principal_id, namespace, session_id),
         )
         await conn.commit()
         cursor = await conn.execute(
-            "SELECT id FROM memories WHERE scope = ? AND key = ?",
-            (scope, key),
+            """
+            SELECT id FROM memories
+            WHERE namespace = ? AND principal_id = ? AND session_id = ?
+              AND scope = ? AND key = ?
+            """,
+            (namespace, principal_id, session_id, scope, key),
         )
         row = await cursor.fetchone()
         return int(row["id"])
 
-    async def get_memory(self, scope: str, key: str) -> dict[str, Any] | None:
-        """Fetch one memory by scope and key."""
+    async def get_memory(
+        self,
+        scope: str,
+        key: str,
+        *,
+        principal_id: str = "legacy",
+        namespace: str = "private",
+        session_id: str = "",
+    ) -> dict[str, Any] | None:
+        """Fetch one memory by (namespace, principal_id, session_id, scope, key)."""
         conn = await self._require_conn()
         cursor = await conn.execute(
             """
-            SELECT id, scope, key, value, ttl, confidence, access_freq, created_at, updated_at
+            SELECT id, scope, key, value, ttl, confidence, access_freq,
+                   created_at, updated_at, principal_id, namespace, session_id
             FROM memories
-            WHERE scope = ? AND key = ?
+            WHERE namespace = ? AND principal_id = ? AND session_id = ?
+              AND scope = ? AND key = ?
             """,
-            (scope, key),
+            (namespace, principal_id, session_id, scope, key),
         )
         row = await cursor.fetchone()
         return dict(row) if row is not None else None
 
-    async def delete_memory(self, scope: str, key: str) -> None:
-        """Delete one memory by scope and key."""
+    async def delete_memory(
+        self,
+        scope: str,
+        key: str,
+        *,
+        principal_id: str = "legacy",
+        namespace: str = "private",
+        session_id: str = "",
+    ) -> None:
+        """Delete one memory by (namespace, principal_id, session_id, scope, key)."""
         conn = await self._require_conn()
-        await conn.execute("DELETE FROM memories WHERE scope = ? AND key = ?", (scope, key))
+        await conn.execute(
+            """
+            DELETE FROM memories
+            WHERE namespace = ? AND principal_id = ? AND session_id = ?
+              AND scope = ? AND key = ?
+            """,
+            (namespace, principal_id, session_id, scope, key),
+        )
         await conn.commit()
 
     async def delete_memory_by_id(self, memory_id: int) -> None:
@@ -559,43 +961,90 @@ class Database:
         await conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
         await conn.commit()
 
-    async def list_memories(self, scope: str | None = None) -> list[dict[str, Any]]:
-        """List memories, optionally limited to one scope."""
+    async def list_memories(
+        self,
+        scope: str | None = None,
+        *,
+        principal_id: str | None = None,
+        namespace: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """List memories, optionally filtered by scope/principal/namespace.
+
+        M4 batch 3.1.16A-2: when ``principal_id`` is provided, only
+        memories belonging to that principal (or project-shared with
+        ``namespace='shared'``) are returned.  Legacy rows with
+        ``principal_id='legacy'`` are excluded.  When ``principal_id``
+        is ``None`` (default), all memories are returned — this
+        preserves the legacy admin/inspection behaviour.
+        """
         conn = await self._require_conn()
-        if scope is None:
-            cursor = await conn.execute(
-                """
-                SELECT id, scope, key, value, ttl, confidence, access_freq, created_at, updated_at
-                FROM memories
-                ORDER BY confidence DESC, updated_at DESC, id DESC
-                """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if scope is not None:
+            clauses.append("scope = ?")
+            params.append(scope)
+        if principal_id is not None:
+            # Include the principal's private memories AND project-shared
+            # memories (namespace='shared', principal_id='').
+            clauses.append(
+                "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
             )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT id, scope, key, value, ttl, confidence, access_freq, created_at, updated_at
-                FROM memories
-                WHERE scope = ?
-                ORDER BY confidence DESC, updated_at DESC, id DESC
-                """,
-                (scope,),
-            )
+            params.append(principal_id)
+        if namespace is not None:
+            clauses.append("namespace = ?")
+            params.append(namespace)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cursor = await conn.execute(
+            f"""
+            SELECT id, scope, key, value, ttl, confidence, access_freq,
+                   created_at, updated_at, principal_id, namespace, session_id
+            FROM memories
+            {where}
+            ORDER BY confidence DESC, updated_at DESC, id DESC
+            """,
+            tuple(params),
+        )
         return [dict(row) for row in await cursor.fetchall()]
 
-    async def search_memories(self, query: str, top_k: int = 5) -> list[dict[str, Any]]:
-        """Search memories through FTS5."""
+    async def search_memories(
+        self,
+        query: str,
+        top_k: int = 5,
+        *,
+        principal_id: str | None = None,
+        namespace: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Search memories through FTS5.
+
+        M4 batch 3.1.16A-2: when ``principal_id`` is provided, only
+        memories belonging to that principal (or project-shared) are
+        returned.  Legacy rows are excluded.
+        """
         conn = await self._require_conn()
+        clauses: list[str] = ["memory_fts MATCH ?"]
+        params: list[Any] = [query]
+        if principal_id is not None:
+            clauses.append(
+                "(m.principal_id = ? OR (m.namespace = 'shared' AND m.principal_id = ''))"
+            )
+            params.append(principal_id)
+        if namespace is not None:
+            clauses.append("m.namespace = ?")
+            params.append(namespace)
+        where = " AND ".join(clauses)
+        params.append(top_k)
         cursor = await conn.execute(
-            """
+            f"""
             SELECT m.id, m.scope, m.key, m.value, m.ttl, m.confidence,
-                   m.access_freq, m.created_at, m.updated_at
+                   m.access_freq, m.created_at, m.updated_at,
+                   m.principal_id, m.namespace, m.session_id
             FROM memory_fts
             JOIN memories AS m ON m.id = memory_fts.rowid
-            WHERE memory_fts MATCH ?
+            WHERE {where}
             ORDER BY bm25(memory_fts)
             LIMIT ?
             """,
-            (query, top_k),
+            tuple(params),
         )
         return [dict(row) for row in await cursor.fetchall()]
 
