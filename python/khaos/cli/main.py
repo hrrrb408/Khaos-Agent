@@ -27,6 +27,7 @@ from khaos.config import (
     set_user_config_value,
 )
 from khaos.db import Database
+from khaos.db.state_root import open_state_db_safely, resolve_state_db_path
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
@@ -38,7 +39,10 @@ from khaos.tools.scheduler import ToolScheduler
 
 async def run_once(args: argparse.Namespace) -> int:
     """Run one user message and print SSE frames to stdout."""
-    db = Database(args.db)
+    db_path = open_state_db_safely(
+        resolve_state_db_path(Path.cwd(), args.db)
+    )
+    db = Database(db_path)
     await db.connect()
     await db.run_migrations()
 
@@ -66,7 +70,10 @@ async def run_once(args: argparse.Namespace) -> int:
 
 async def run_repl(args: argparse.Namespace) -> int:
     """Run a tiny interactive shell for manual P0-A validation."""
-    db = Database(args.db)
+    db_path = open_state_db_safely(
+        resolve_state_db_path(Path.cwd(), args.db)
+    )
+    db = Database(db_path)
     await db.connect()
     await db.run_migrations()
 
@@ -111,7 +118,11 @@ async def run_repl(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     """Create the CLI argument parser."""
     parser = argparse.ArgumentParser(prog="khaos")
-    parser.add_argument("--db", default="khaos.db", help="SQLite database path")
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="SQLite database path (default: ~/.khaos/state/<project-id>/state.db)",
+    )
     parser.add_argument("--session-id", help="Existing or new session id")
     parser.add_argument("--mode", choices=["office", "coding"], help="Initial mode")
     parser.add_argument("--message", help="Run one message and exit (non-interactive)")
@@ -130,13 +141,21 @@ def build_command_parser() -> argparse.ArgumentParser:
     start_parser.add_argument(
         "--socket", default=f"/tmp/khaos-{os.getuid()}/agent.sock"
     )
-    start_parser.add_argument("--db", default="khaos.db")
+    start_parser.add_argument(
+        "--db",
+        default=None,
+        help="SQLite database path (default: ~/.khaos/state/<project-id>/state.db)",
+    )
     start_parser.add_argument("--config", default="config.yaml")
     start_parser.add_argument("--gateway", action="store_true", help="Also start Go gateway")
 
     chat_parser = subparsers.add_parser("chat", help="Interactive chat session")
     chat_parser.add_argument("--mode", default="office", choices=["office", "coding"])
-    chat_parser.add_argument("--db", default="khaos.db")
+    chat_parser.add_argument(
+        "--db",
+        default=None,
+        help="SQLite database path (default: ~/.khaos/state/<project-id>/state.db)",
+    )
     chat_parser.add_argument("--config", default="config.yaml")
     chat_parser.add_argument("--session-id", help="Existing or new session id")
     chat_parser.add_argument("--no-tui", action="store_true", help="Use the line-oriented REPL")
@@ -202,7 +221,10 @@ def cmd_start(args: argparse.Namespace) -> None:
         print("Started Go gateway with an inherited boot capability")
 
     print(f"Starting Khaos agent on Unix socket {args.socket}")
-    print(f"Database: {args.db}")
+    db_path = open_state_db_safely(
+        resolve_state_db_path(Path.cwd(), args.db)
+    )
+    print(f"Database: {db_path}")
     print(f"Config: {args.config}")
     from khaos.grpc_server import serve_json_lines
 
@@ -210,7 +232,7 @@ def cmd_start(args: argparse.Namespace) -> None:
         asyncio.run(
             serve_json_lines(
                 args.socket,
-                args.db,
+                str(db_path),
                 project_root=Path.cwd(),
                 config_path=Path(args.config),
                 gateway_capability=gateway_capability,
@@ -396,7 +418,14 @@ def run_interactive(args: argparse.Namespace) -> None:
     if not getattr(args, "no_tui", False) and _tui_available():
         from khaos.tui.app import run_tui
 
-        run_tui(db_path=args.db, project_root=Path.cwd(), mode=args.mode or "")
+        resolved_db = open_state_db_safely(
+            resolve_state_db_path(Path.cwd(), args.db)
+        )
+        run_tui(
+            db_path=str(resolved_db),
+            project_root=Path.cwd(),
+            mode=args.mode or "",
+        )
         return
     raise SystemExit(asyncio.run(run_repl(args)))
 
