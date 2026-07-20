@@ -240,10 +240,19 @@ CREATE TABLE IF NOT EXISTS coding_tasks (
     status         TEXT NOT NULL,
     state_json     TEXT NOT NULL DEFAULT '{}',
     created_at     TEXT NOT NULL,
-    updated_at     TEXT NOT NULL
+    updated_at     TEXT NOT NULL,
+    -- M4 batch 3.1.16A-3 (CRITICAL): principal-scoped ownership.  Every
+    -- coding task is owned by exactly one principal; ``list_coding_tasks``
+    -- filters by ``principal_id`` so one principal cannot see, cancel, or
+    -- approve another principal's tasks.  Legacy rows (pre-A3) get
+    -- ``'legacy'`` and are quarantined to ``status='failed'`` at
+    -- migration time — they are never executed or surfaced by an
+    -- authenticated principal's TaskManager.
+    principal_id   TEXT NOT NULL DEFAULT 'legacy'
 );
 
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_coding_tasks_principal ON coding_tasks(principal_id, status);
 
 -- Hermes batch 2: session history FTS5 search over messages.
 -- Separate FTS5 table (rowid mirrors messages.id) populated manually by

@@ -475,7 +475,13 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         skill_manager.load_from_dir(skills_dir)
     task_manager = cfg.task_manager
     if task_manager is None:
-        task_manager = TaskManager(db=cfg.db)
+        # A3-5: bind the TaskManager to the runtime's principal so every
+        # coding task is owned by exactly one principal for its entire
+        # lifecycle.  An unauthenticated runtime (``principal_id='legacy'``)
+        # can only see its own 'legacy' tasks (quarantined to
+        # ``status='failed'`` by the migration helper), so it can never
+        # execute or surface an authenticated principal's tasks.
+        task_manager = TaskManager(db=cfg.db, principal_id=cfg.principal_id)
         await task_manager.load()
     workspace_manager = cfg.workspace_manager or WorkspaceManager()
     execution_service = cfg.execution_service or ExecutionService(

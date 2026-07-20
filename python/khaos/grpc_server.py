@@ -706,7 +706,15 @@ class AgentService:
         self.approval_broker = ApprovalBroker(db=db)
         # Shared coding-task tracker so the TUI / TaskService can observe
         # long-running coding turns alongside the AgentLoop.
-        self.task_manager = TaskManager(db=db)
+        # A3-6: bind the server-lifecycle TaskManager to the local-uid
+        # principal (matching the server-lifecycle AuditLogger / MemoryService
+        # above) so tasks created via the JSON-line RPC path are owned by
+        # the local user and invisible to any other authenticated principal.
+        # Per-turn runtimes constructed by ``build_runtime`` carry their own
+        # principal-scoped TaskManager via ``RuntimeConfig.principal_id``.
+        self.task_manager = TaskManager(
+            db=db, principal_id=f"local-uid:{os.getuid()}"
+        )
         self.cron_engine = CronEngine(db=db, executor=self._execute_scheduled_prompt)
         set_cron_engine(self.cron_engine)
         self.channel_registry = ChannelRegistry()
