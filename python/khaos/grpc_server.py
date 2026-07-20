@@ -93,15 +93,133 @@ CHAT_DRAIN_TIMEOUT = 10.0            # active AgentService chat tasks
 SUBAGENT_SHUTDOWN_TIMEOUT = 30.0     # detached SubAgent background tasks
 
 
+def _instance_lockfile_path(db_path: str) -> Path:
+    """M4 batch 3.1.14 (CRITICAL-2): compute the instance lockfile
+    path in a TRUSTED directory (``~/.khaos/run/``).
+
+    Previously the lockfile lived next to the DB (``<db_path>
+    .instance.lock``).  When the DB was in a project directory (the
+    default — ``khaos.db`` in the CWD), a malicious repository could
+    pre-place a symlink at ``khaos.db.instance.lock`` pointing to
+    e.g. ``~/.ssh/authorized_keys``.  The old code ``os.open``-ed
+    WITHOUT ``O_NOFOLLOW`` (following the symlink), then
+    ``ftruncate(fd, 0)`` — truncating the symlink target's content.
+
+    The lockfile is now keyed by ``sha256(realpath(db_path))`` so
+    different DB paths get different lockfiles, but the lockfiles all
+    live under ``~/.khaos/run/`` which the user controls.
+    """
+    import hashlib
+    real_db = str(Path(db_path).resolve())
+    digest = hashlib.sha256(real_db.encode("utf-8")).hexdigest()[:32]
+    return Path.home() / ".khaos" / "run" / f"{digest}.instance.lock"
+
+
+def _ensure_safe_run_dir(run_dir: Path) -> None:
+    """M4 batch 3.1.14 (CRITICAL-2): ensure ``~/.khaos/run/`` exists
+    and is safe (owner-only, not a symlink).
+
+    ``~/.khaos/`` (the parent) is a shared user config dir used by
+    memory, audit, and other Khaos components.  It may legitimately
+    have mode 0755 (default for user dirs).  We only require it to be
+    owned by the current UID and not a symlink — an attacker who
+    doesn't own the UID can't replace the ``run/`` subdir.
+
+    ``~/.khaos/run/`` (the lockfile dir) MUST be owned by the current
+    UID with mode ``0700`` — this is where lockfiles are created, and
+    an attacker with write access here could pre-place a symlink.
+    If the directory doesn't exist, create it with ``0700``.  If it
+    exists but is a symlink, refuse.
+    """
+    khaos_dir = run_dir.parent
+    # Check the parent ``~/.khaos/``: owned by us, not a symlink, is
+    # a directory.  Mode is NOT checked — other Khaos components may
+    # have created it with 0755.
+    if not khaos_dir.exists():
+        khaos_dir.mkdir(mode=0o755, parents=False, exist_ok=True)
+    try:
+        parent_st = khaos_dir.lstat()
+    except OSError as exc:
+        raise PermissionError(
+            f"cannot stat trusted khaos dir {khaos_dir}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(parent_st.st_mode):
+        raise PermissionError(
+            f"refusing to use symlinked khaos dir: {khaos_dir} "
+            f"(CRITICAL-2: lockfile safety)"
+        )
+    if not stat.S_ISDIR(parent_st.st_mode):
+        raise PermissionError(
+            f"khaos dir is not a directory: {khaos_dir}"
+        )
+    if parent_st.st_uid != os.getuid():
+        raise PermissionError(
+            f"khaos dir {khaos_dir} is owned by uid "
+            f"{parent_st.st_uid}, not the current uid {os.getuid()} "
+            f"(CRITICAL-2: lockfile safety)"
+        )
+    # Check / create the run dir with strict 0700.
+    if not run_dir.exists():
+        run_dir.mkdir(mode=0o700, parents=False, exist_ok=True)
+    try:
+        st = run_dir.lstat()
+    except OSError as exc:
+        raise PermissionError(
+            f"cannot stat trusted run directory {run_dir}: {exc}"
+        ) from exc
+    if stat.S_ISLNK(st.st_mode):
+        raise PermissionError(
+            f"refusing to use symlinked trusted directory: {run_dir} "
+            f"(CRITICAL-2: lockfile safety — a symlink could "
+            f"redirect lockfile creation to an attacker-controlled "
+            f"path)"
+        )
+    if not stat.S_ISDIR(st.st_mode):
+        raise PermissionError(
+            f"trusted run path is not a directory: {run_dir}"
+        )
+    if st.st_uid != os.getuid():
+        raise PermissionError(
+            f"trusted run directory {run_dir} is owned by uid "
+            f"{st.st_uid}, not the current uid {os.getuid()} "
+            f"(CRITICAL-2: lockfile safety)"
+        )
+    mode = stat.S_IMODE(st.st_mode)
+    if mode & 0o077:
+        raise PermissionError(
+            f"trusted run directory {run_dir} has unsafe mode "
+            f"{mode:o} (group/other bits set; expected 0700) — "
+            f"refusing to use it for lockfile creation "
+            f"(CRITICAL-2: lockfile safety)"
+        )
+
+
 def _acquire_instance_lock(db_path: str) -> int | None:
-    """M4 batch 3.1.13 (CRITICAL-3): acquire a process-level exclusive
-    lock on a lockfile bound to the DB path.
+    """M4 batch 3.1.13 (CRITICAL-3) + 3.1.14 (CRITICAL-2): acquire a
+    process-level exclusive lock on a lockfile in a TRUSTED directory.
 
     The lock prevents a second Khaos process from opening the same DB
     and running ``recover_all_running_tasks`` (which marks ALL running
     tasks as FAILED) while the first process's executors are still
     alive.  Without this, the "single-instance model" was just a
     comment assumption — not an enforced safety constraint.
+
+    M4 batch 3.1.14 (CRITICAL-2) — symlink truncation fix:
+      Previously the lockfile lived next to the DB (``<db_path>
+      .instance.lock``).  When the DB was in a project directory (the
+      default), a malicious repo could pre-place a symlink at that
+      path pointing to e.g. ``~/.ssh/authorized_keys``.  The old code
+      ``os.open``-ed WITHOUT ``O_NOFOLLOW`` (following the symlink),
+      then ``ftruncate(fd, 0)`` — truncating the symlink target.
+
+      The lockfile now lives under ``~/.khaos/run/<sha256(db_path)>
+      .instance.lock``.  The run dir is verified to be owner-only
+      (0700) and not a symlink.  The lockfile itself is opened with
+      ``O_NOFOLLOW`` (refuses to follow symlinks), and we verify
+      (lstat vs fstat) that the file we opened is the same file on
+      disk (no inode swap race), is a regular file, is owned by the
+      current UID, and has mode ``0600``.  Only AFTER all these
+      checks pass do we ``ftruncate`` and write the PID.
 
     The lock is ``fcntl.LOCK_EX | fcntl.LOCK_NB`` (non-blocking): if
     another process holds it, we fail immediately with
@@ -114,20 +232,93 @@ def _acquire_instance_lock(db_path: str) -> int | None:
     """
     if _fcntl is None:
         return None
-    lockfile_path = str(Path(db_path).resolve()) + ".instance.lock"
-    # Create the lockfile with 0600 (owner-only).  O_CREAT | O_RDWR
-    # so we don't truncate an existing lockfile (another process might
-    # be holding it).
-    fd = os.open(lockfile_path, os.O_CREAT | os.O_RDWR, 0o600)
+    lockfile_path = _instance_lockfile_path(db_path)
+    _ensure_safe_run_dir(lockfile_path.parent)
+    # M4 batch 3.1.14 (CRITICAL-2): open with O_NOFOLLOW so a symlink
+    # at the lockfile path is NOT followed (raises ELOOP).  O_CLOEXEC
+    # so the fd doesn't leak into child processes (exec / subagents).
+    flags = os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    # lstat BEFORE open to detect a symlink (O_NOFOLLOW already
+    # refuses symlinks, but we lstat first for a clearer error
+    # message and to detect the race where the file is replaced
+    # between lstat and open).
     try:
-        _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
-    except OSError as exc:
+        pre_lstat = lockfile_path.lstat()
+        if stat.S_ISLNK(pre_lstat.st_mode):
+            raise PermissionError(
+                f"refusing to open symlinked lockfile: {lockfile_path} "
+                f"(CRITICAL-2: lockfile symlink truncation defense)"
+            )
+    except FileNotFoundError:
+        pre_lstat = None  # Will be created by open.
+    fd = os.open(lockfile_path, flags, 0o600)
+    try:
+        # M4 batch 3.1.14 (CRITICAL-2): validate the fd we just
+        # opened.  fstat the fd and compare (st_dev, st_ino) with the
+        # lstat we did before open — if they differ, someone swapped
+        # the file between lstat and open (TOCTOU race).  Also verify
+        # it's a regular file, owned by us, with mode <= 0600.
+        fstat_info = os.fstat(fd)
+        if not stat.S_ISREG(fstat_info.st_mode):
+            raise PermissionError(
+                f"lockfile {lockfile_path} is not a regular file "
+                f"(CRITICAL-2: lockfile safety)"
+            )
+        if fstat_info.st_uid != os.getuid():
+            raise PermissionError(
+                f"lockfile {lockfile_path} is owned by uid "
+                f"{fstat_info.st_uid}, not the current uid "
+                f"{os.getuid()} (CRITICAL-2: lockfile safety)"
+            )
+        fstat_mode = stat.S_IMODE(fstat_info.st_mode)
+        if fstat_mode & 0o077:
+            raise PermissionError(
+                f"lockfile {lockfile_path} has unsafe mode "
+                f"{fstat_mode:o} (group/other bits set; expected "
+                f"0600) — refusing to truncate (CRITICAL-2: "
+                f"lockfile safety)"
+            )
+        if pre_lstat is not None:
+            if (fstat_info.st_dev, fstat_info.st_ino) != (
+                pre_lstat.st_dev, pre_lstat.st_ino,
+            ):
+                raise PermissionError(
+                    f"lockfile {lockfile_path} changed identity "
+                    f"between lstat and open (TOCTOU race; "
+                    f"CRITICAL-2: lockfile safety)"
+                )
+        # All checks passed — acquire the flock.
+        try:
+            _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+        except OSError as exc:
+            # Another process holds the lock — convert to
+            # PermissionError for a clearer error message.
+            raise PermissionError(
+                f"another Khaos instance holds the exclusive lock on "
+                f"{lockfile_path}; refusing to start (single-instance "
+                f"model enforced — CRITICAL-3)"
+            ) from exc
+    except BaseException:
+        # On ANY failure (including PermissionError from the checks
+        # above, or OSError from flock), close the fd so we don't
+        # leak it.  The caller will see the raised exception.
+        os.close(fd)
+        raise
+    # Re-verify identity AFTER acquiring the flock (another process
+    # might have replaced the file between open and flock — flock
+    # locks the fd, not the path, so a renamed file would still be
+    # locked but the path would now point elsewhere).  This is
+    # defensive; the combination of O_NOFOLLOW + 0600 + trusted dir
+    # already makes this attack very hard.
+    post_fstat = os.fstat(fd)
+    if (post_fstat.st_dev, post_fstat.st_ino) != (
+        fstat_info.st_dev, fstat_info.st_ino,
+    ):
         os.close(fd)
         raise PermissionError(
-            f"another Khaos instance holds the exclusive lock on "
-            f"{lockfile_path}; refusing to start (single-instance "
-            f"model enforced — CRITICAL-3)"
-        ) from exc
+            f"lockfile {lockfile_path} changed identity after flock "
+            f"(TOCTOU race; CRITICAL-2: lockfile safety)"
+        )
     # Write the current PID for diagnostics (not used for locking —
     # the flock is the authoritative lock).
     try:
@@ -1118,105 +1309,70 @@ async def serve_json_lines(
     # local variable and released when the process exits (the OS
     # closes the fd).
     instance_lock_fd = _acquire_instance_lock(db_path)
-    if uds_path.exists() or uds_path.is_symlink():
-        mode = uds_path.lstat().st_mode
-        if not stat.S_ISSOCK(mode):
-            raise PermissionError(f"refusing to replace non-socket RPC path: {uds_path}")
-        # M4 batch 3.1.13 (CRITICAL-3): probe liveness BEFORE unlink.
-        # If a live server is listening, refuse to start.  Only
-        # ``ECONNREFUSED`` (stale socket) is safe to replace.
-        if _probe_uds_liveness(uds_path):
-            raise PermissionError(
-                f"refusing to replace live UDS socket: {uds_path} — "
-                f"another Khaos instance is listening (CRITICAL-3: "
-                f"single-instance model enforced)"
-            )
-        uds_path.unlink()
-
-    db = Database(db_path)
-    await db.connect()
-    await db.run_migrations()
-    agent = AgentService(db, project_root=project_root, config_path=config_path, router=router)
-    await agent.start()
-    memory = MemoryService(MemoryStore(db))
-    audit_service = AuditService(AuditLogger(db))
-    task_service = TaskService(agent.task_manager, agent.approval_broker)
-    subagent_service: SubAgentService | None = None
-    if enable_subagents:
-        # B1: share the AgentService's office authority AND approval broker so
-        # subagent runs reuse the same aggregate storage baseline (no
-        # cross-run quota bypass) and the same approval authority (no parallel
-        # unsupervised permission path).  The runtime borrows these instead of
-        # creating fresh instances; build_runtime constructs the per-run
-        # ToolScheduler with the full SecurityMiddleware stack.
-        subagent_service = await _build_subagent_service(
-            db, project_root, config_path,
-            office_authority=agent._office_authority,
-            approval_broker=agent.approval_broker,
-            principal_id=f"local-uid:{os.getuid()}",
-            # H1: inherit the server-lifecycle AuditLogger so SubAgent
-            # security events land in the SAME audit trail as the main
-            # AgentLoop — no parallel unsupervised audit path.
-            audit_logger=agent._audit_logger,
-        )
-
-    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
-            try:
-                peer_pid = authenticator.verify_peer(writer)
-            except PermissionError:
-                return
-            line = await reader.readline()
-            if not line:
-                return
-            try:
-                request = _parse_json_line(line)
-            except ValueError as exc:
-                writer.write(
-                    (
-                        json.dumps(
-                            {
-                                "event": "error",
-                                "data": {
-                                    "code": "INVALID_JSON",
-                                    "message": str(exc),
-                                    "recoverable": True,
-                                },
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    ).encode("utf-8")
+    try:
+        if uds_path.exists() or uds_path.is_symlink():
+            mode = uds_path.lstat().st_mode
+            if not stat.S_ISSOCK(mode):
+                raise PermissionError(f"refusing to replace non-socket RPC path: {uds_path}")
+            # M4 batch 3.1.13 (CRITICAL-3): probe liveness BEFORE unlink.
+            # If a live server is listening, refuse to start.  Only
+            # ``ECONNREFUSED`` (stale socket) is safe to replace.
+            if _probe_uds_liveness(uds_path):
+                raise PermissionError(
+                    f"refusing to replace live UDS socket: {uds_path} — "
+                    f"another Khaos instance is listening (CRITICAL-3: "
+                    f"single-instance model enforced)"
                 )
-                await writer.drain()
-                return
+            uds_path.unlink()
+
+        db = Database(db_path)
+        await db.connect()
+        await db.run_migrations()
+        agent = AgentService(db, project_root=project_root, config_path=config_path, router=router)
+        await agent.start()
+        memory = MemoryService(MemoryStore(db))
+        audit_service = AuditService(AuditLogger(db))
+        task_service = TaskService(agent.task_manager, agent.approval_broker)
+        subagent_service: SubAgentService | None = None
+        if enable_subagents:
+            # B1: share the AgentService's office authority AND approval broker so
+            # subagent runs reuse the same aggregate storage baseline (no
+            # cross-run quota bypass) and the same approval authority (no parallel
+            # unsupervised permission path).  The runtime borrows these instead of
+            # creating fresh instances; build_runtime constructs the per-run
+            # ToolScheduler with the full SecurityMiddleware stack.
+            subagent_service = await _build_subagent_service(
+                db, project_root, config_path,
+                office_authority=agent._office_authority,
+                approval_broker=agent.approval_broker,
+                principal_id=f"local-uid:{os.getuid()}",
+                # H1: inherit the server-lifecycle AuditLogger so SubAgent
+                # security events land in the SAME audit trail as the main
+                # AgentLoop — no parallel unsupervised audit path.
+                audit_logger=agent._audit_logger,
+            )
+
+        async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
-                principal_id = authenticator.authenticate(request, peer_pid=peer_pid)
-            except PermissionError as exc:
-                writer.write((json.dumps({
-                    "error": "unauthenticated", "message": str(exc),
-                }) + "\n").encode("utf-8"))
-                await writer.drain()
-                return
-            method = request.get("method")
-            payload = request.get("payload", {})
-            if "principal_id" in payload:
-                payload["principal_id"] = principal_id
-            if method == "AgentService.Chat":
                 try:
-                    async for event in agent.chat(ChatRequest(**payload)):
-                        writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
-                        await writer.drain()
-                except Exception as exc:
+                    peer_pid = authenticator.verify_peer(writer)
+                except PermissionError:
+                    return
+                line = await reader.readline()
+                if not line:
+                    return
+                try:
+                    request = _parse_json_line(line)
+                except ValueError as exc:
                     writer.write(
                         (
                             json.dumps(
                                 {
                                     "event": "error",
                                     "data": {
-                                        "code": exc.__class__.__name__,
+                                        "code": "INVALID_JSON",
                                         "message": str(exc),
-                                        "recoverable": False,
+                                        "recoverable": True,
                                     },
                                 },
                                 ensure_ascii=False,
@@ -1224,155 +1380,193 @@ async def serve_json_lines(
                             + "\n"
                         ).encode("utf-8")
                     )
-            elif method == "AgentService.SwitchMode":
-                response = await agent.switch_mode(payload.get("session_id", ""), payload["target_mode"])
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "AgentService.ConfirmPermission":
-                response = await agent.confirm_permission(ConfirmRequest(**payload))
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "AgentService.HandleWebhook":
-                response = await agent.handle_webhook(**payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method in {"ChannelService.List", "ChannelService.Health"}:
-                writer.write((json.dumps(agent.list_channels(), ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method in {"ChannelService.Enable", "ChannelService.Disable"}:
-                response = agent.set_channel_enabled(payload["channel_id"], method.endswith("Enable"))
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "MemoryService.SetMemory":
-                response = await memory.set_memory(**payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "MemoryService.GetMemory":
-                response = await memory.get_memory(**payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "MemoryService.SearchMemory":
-                response = await memory.search_memory(**payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "AuditService.Query":
-                response = await audit_service.query(**payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "TaskService.List":
-                response = await task_service.list(**payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "TaskService.Get":
-                response = await task_service.get(**payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "TaskService.Create":
-                writer.write((json.dumps(await task_service.create(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method in {"TaskService.Cancel", "TaskService.Approve", "TaskService.Reject"}:
-                action = method.rsplit(".", 1)[-1].lower()
-                writer.write((json.dumps(await getattr(task_service, action)(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "TaskService.Artifacts":
-                writer.write((json.dumps(await task_service.artifacts(payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "TaskService.Events":
-                async for event in task_service.task_manager.subscribe(payload["task_id"]):
-                    writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                     await writer.drain()
-            elif method == "SubAgentService.Spawn":
-                response = await _handle_optional_subagent(subagent_service, "spawn", payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "SubAgentService.Collect":
-                response = await _handle_optional_subagent(subagent_service, "collect", payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            elif method == "SubAgentService.Status":
-                response = await _handle_optional_subagent(subagent_service, "status", payload)
-                writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
-            else:
-                writer.write(json.dumps({"error": "unknown method"}).encode("utf-8") + b"\n")
-            await writer.drain()
-        finally:
-            writer.close()
-            try:
-                await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
-            except (asyncio.TimeoutError, ConnectionError, OSError):
-                pass
+                    return
+                try:
+                    principal_id = authenticator.authenticate(request, peer_pid=peer_pid)
+                except PermissionError as exc:
+                    writer.write((json.dumps({
+                        "error": "unauthenticated", "message": str(exc),
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
+                method = request.get("method")
+                payload = request.get("payload", {})
+                if "principal_id" in payload:
+                    payload["principal_id"] = principal_id
+                if method == "AgentService.Chat":
+                    try:
+                        async for event in agent.chat(ChatRequest(**payload)):
+                            writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                            await writer.drain()
+                    except Exception as exc:
+                        writer.write(
+                            (
+                                json.dumps(
+                                    {
+                                        "event": "error",
+                                        "data": {
+                                            "code": exc.__class__.__name__,
+                                            "message": str(exc),
+                                            "recoverable": False,
+                                        },
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            ).encode("utf-8")
+                        )
+                elif method == "AgentService.SwitchMode":
+                    response = await agent.switch_mode(payload.get("session_id", ""), payload["target_mode"])
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "AgentService.ConfirmPermission":
+                    response = await agent.confirm_permission(ConfirmRequest(**payload))
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "AgentService.HandleWebhook":
+                    response = await agent.handle_webhook(**payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method in {"ChannelService.List", "ChannelService.Health"}:
+                    writer.write((json.dumps(agent.list_channels(), ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method in {"ChannelService.Enable", "ChannelService.Disable"}:
+                    response = agent.set_channel_enabled(payload["channel_id"], method.endswith("Enable"))
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "MemoryService.SetMemory":
+                    response = await memory.set_memory(**payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "MemoryService.GetMemory":
+                    response = await memory.get_memory(**payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "MemoryService.SearchMemory":
+                    response = await memory.search_memory(**payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "AuditService.Query":
+                    response = await audit_service.query(**payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.List":
+                    response = await task_service.list(**payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.Get":
+                    response = await task_service.get(**payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.Create":
+                    writer.write((json.dumps(await task_service.create(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method in {"TaskService.Cancel", "TaskService.Approve", "TaskService.Reject"}:
+                    action = method.rsplit(".", 1)[-1].lower()
+                    writer.write((json.dumps(await getattr(task_service, action)(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.Artifacts":
+                    writer.write((json.dumps(await task_service.artifacts(payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "TaskService.Events":
+                    async for event in task_service.task_manager.subscribe(payload["task_id"]):
+                        writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
+                        await writer.drain()
+                elif method == "SubAgentService.Spawn":
+                    response = await _handle_optional_subagent(subagent_service, "spawn", payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "SubAgentService.Collect":
+                    response = await _handle_optional_subagent(subagent_service, "collect", payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "SubAgentService.Status":
+                    response = await _handle_optional_subagent(subagent_service, "status", payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                else:
+                    writer.write(json.dumps({"error": "unknown method"}).encode("utf-8") + b"\n")
+                await writer.drain()
+            finally:
+                writer.close()
+                try:
+                    await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
+                except (asyncio.TimeoutError, ConnectionError, OSError):
+                    pass
 
-    # ``asyncio.start_unix_server`` otherwise creates handler tasks without
-    # giving the application an ownership registry.  Keep every connection
-    # task so shutdown can cancel and await it before shared authorities and
-    # the database are dismantled.
-    handler_tasks: set[asyncio.Task] = set()
+        # ``asyncio.start_unix_server`` otherwise creates handler tasks without
+        # giving the application an ownership registry.  Keep every connection
+        # task so shutdown can cancel and await it before shared authorities and
+        # the database are dismantled.
+        handler_tasks: set[asyncio.Task] = set()
 
-    def accept_connection(
-        reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-    ) -> None:
-        task = asyncio.create_task(handle(reader, writer))
-        handler_tasks.add(task)
-        task.add_done_callback(handler_tasks.discard)
+        def accept_connection(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        ) -> None:
+            task = asyncio.create_task(handle(reader, writer))
+            handler_tasks.add(task)
+            task.add_done_callback(handler_tasks.discard)
 
-    try:
-        server = await asyncio.start_unix_server(
-            accept_connection, path=str(uds_path), limit=RPC_MAX_REQUEST_BYTES,
-        )
-        os.chmod(uds_path, 0o600)
-        socket_stat = uds_path.lstat()
-        if socket_stat.st_uid != os.getuid() or not stat.S_ISSOCK(socket_stat.st_mode):
-            raise PermissionError("RPC socket inode ownership/type validation failed")
-        # Wait until the owner cancels this service.  Do not use
-        # ``Server.serve_forever()`` here: on Python 3.13 its cancellation
-        # path waits for active client connections before returning, while
-        # Khaos must cancel those handlers itself before shared-authority
-        # teardown.  That ordering forms a shutdown deadlock.
-        await asyncio.Future()
-    finally:
-        if "server" in locals():
-            server.close()
-        if uds_path.exists() and stat.S_ISSOCK(uds_path.lstat().st_mode):
-            uds_path.unlink()
-        # 1. Server context has stopped accepting new connections.
-        # 2. Stop cron/webhook producers before cancelling active handlers.
-        # 3. Await handler cancellation; Chat finally blocks close/quarantine
-        #    their RuntimeResult while shared authorities are still alive.
-        await agent.stop_producers()
-        current = asyncio.current_task()
-        active_handlers = [
-            task for task in handler_tasks
-            if task is not current and not task.done()
-        ]
-        for task in active_handlers:
-            task.cancel()
-        if active_handlers:
-            # M1: bounded drain with hard ownership semantics — same
-            # rationale as the chat drain in ``AgentService.shutdown``.  A
-            # handler that swallows CancelledError would have left
-            # ``wait_for(gather)`` to log+continue, dismantling shared
-            # state under a live handler.  Fail closed: pending handlers at
-            # the deadline refuse teardown.
-            done, pending = await asyncio.wait(
-                active_handlers, timeout=SERVER_HANDLER_DRAIN_TIMEOUT,
+        try:
+            server = await asyncio.start_unix_server(
+                accept_connection, path=str(uds_path), limit=RPC_MAX_REQUEST_BYTES,
             )
-            if pending:
-                logger.error(
-                    "server shutdown: %d handler task(s) did not terminate "
-                    "within %.2fs (swallowed cancellation or wedged); "
-                    "refusing to tear down shared authorities",
-                    len(pending), SERVER_HANDLER_DRAIN_TIMEOUT,
+            os.chmod(uds_path, 0o600)
+            socket_stat = uds_path.lstat()
+            if socket_stat.st_uid != os.getuid() or not stat.S_ISSOCK(socket_stat.st_mode):
+                raise PermissionError("RPC socket inode ownership/type validation failed")
+            # Wait until the owner cancels this service.  Do not use
+            # ``Server.serve_forever()`` here: on Python 3.13 its cancellation
+            # path waits for active client connections before returning, while
+            # Khaos must cancel those handlers itself before shared-authority
+            # teardown.  That ordering forms a shutdown deadlock.
+            await asyncio.Future()
+        finally:
+            if "server" in locals():
+                server.close()
+            if uds_path.exists() and stat.S_ISSOCK(uds_path.lstat().st_mode):
+                uds_path.unlink()
+            # 1. Server context has stopped accepting new connections.
+            # 2. Stop cron/webhook producers before cancelling active handlers.
+            # 3. Await handler cancellation; Chat finally blocks close/quarantine
+            #    their RuntimeResult while shared authorities are still alive.
+            await agent.stop_producers()
+            current = asyncio.current_task()
+            active_handlers = [
+                task for task in handler_tasks
+                if task is not current and not task.done()
+            ]
+            for task in active_handlers:
+                task.cancel()
+            if active_handlers:
+                # M1: bounded drain with hard ownership semantics — same
+                # rationale as the chat drain in ``AgentService.shutdown``.  A
+                # handler that swallows CancelledError would have left
+                # ``wait_for(gather)`` to log+continue, dismantling shared
+                # state under a live handler.  Fail closed: pending handlers at
+                # the deadline refuse teardown.
+                done, pending = await asyncio.wait(
+                    active_handlers, timeout=SERVER_HANDLER_DRAIN_TIMEOUT,
                 )
-                raise ServiceShutdownError(
-                    f"{len(pending)} handler task(s) did not terminate within "
-                    f"{SERVER_HANDLER_DRAIN_TIMEOUT}s; shared authorities "
-                    f"cannot be torn down safely"
-                )
-        if "server" in locals():
-            await server.wait_closed()
-        # H1: detached SubAgent background tasks must be torn down BEFORE
-        # the shared Office / Browser / Audit / DB authorities.  SubAgent
-        # runs borrow all four; without this gate the server could close
-        # them under a live task.  ``SubAgentRunner.run`` finally-block
-        # already calls ``close_runtime_or_register``, so the cancelled
-        # runtimes land in the orphan registry for the bounded drain inside
-        # ``AgentService.shutdown``.
-        if subagent_service is not None:
-            await subagent_service.shutdown(timeout=SUBAGENT_SHUTDOWN_TIMEOUT)
-        # Only after every handler/runtime is terminal may the service close
-        # Office/Audit ownership.  A shutdown failure intentionally prevents
-        # premature database close and remains observable to the caller.
-        await agent.shutdown()
-        await db.close()
-        # M4 batch 3.1.13 (CRITICAL-3): release the process-level
-        # exclusive lock so the next instance can start immediately.
-        # The OS would release it on process exit anyway, but explicit
-        # release lets a restart-after-clean-shutdown proceed without
-        # waiting for the OS to reclaim the fd.
+                if pending:
+                    logger.error(
+                        "server shutdown: %d handler task(s) did not terminate "
+                        "within %.2fs (swallowed cancellation or wedged); "
+                        "refusing to tear down shared authorities",
+                        len(pending), SERVER_HANDLER_DRAIN_TIMEOUT,
+                    )
+                    raise ServiceShutdownError(
+                        f"{len(pending)} handler task(s) did not terminate within "
+                        f"{SERVER_HANDLER_DRAIN_TIMEOUT}s; shared authorities "
+                        f"cannot be torn down safely"
+                    )
+            if "server" in locals():
+                await server.wait_closed()
+            # H1: detached SubAgent background tasks must be torn down BEFORE
+            # the shared Office / Browser / Audit / DB authorities.  SubAgent
+            # runs borrow all four; without this gate the server could close
+            # them under a live task.  ``SubAgentRunner.run`` finally-block
+            # already calls ``close_runtime_or_register``, so the cancelled
+            # runtimes land in the orphan registry for the bounded drain inside
+            # ``AgentService.shutdown``.
+            if subagent_service is not None:
+                await subagent_service.shutdown(timeout=SUBAGENT_SHUTDOWN_TIMEOUT)
+            # Only after every handler/runtime is terminal may the service close
+            # Office/Audit ownership.  A shutdown failure intentionally prevents
+            # premature database close and remains observable to the caller.
+            await agent.shutdown()
+            await db.close()
+    finally:
+        # M4 batch 3.1.14 (MEDIUM): release the instance lock on ANY
+        # exit — including init failures (UDS probe refusal, db.connect,
+        # migrations, agent.start) that raised BEFORE the inner try/finally
+        # began.  Previously the lock release only lived inside the inner
+        # finally, so an init-phase exception leaked the fd and prevented
+        # retry in the same process.
         if instance_lock_fd is not None:
             try:
                 os.close(instance_lock_fd)

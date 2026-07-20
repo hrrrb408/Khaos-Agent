@@ -624,89 +624,99 @@ class CronEngine:
             the caller refuses to tear down.  The marker carries the
             immutable ``desired_status`` / ``target_version`` snapshot
             so reconcile doesn't need the (gone) in-memory task.
+
+        M4 batch 3.1.14 (HIGH): generation-fenced reconcile.
+          Previously reconcile iterated the marker snapshot WITHOUT
+          the per-task lock and WITHOUT re-verifying ``operation_id``
+          before writing.  A concurrent control op (Pause/Resume/
+          Remove) called from an active Chat during shutdown could
+          supersede the marker between the snapshot and the retry —
+          and the old reconcile would call ``_persist_task_state``
+          which READS THE DB CURRENT VERSION AND SUPERSEDES the
+          marker, overwriting the newer op's state with the OLD
+          marker's desired state.  Sequence:
+
+            1. Pause A persist fails → marker A (PAUSED)
+            2. shutdown begins → reconcile snapshots marker A
+            3. active Chat calls Remove B → B persists CANCELLED,
+               pops task, supersedes marker A with marker B
+            4. old reconcile still holds snapshot of marker A →
+               calls _persist_task_state(op=A) → reads DB version
+               (now CANCELLED at version N+1) → writes PAUSED at
+               version N+2 → Remove B's CANCELLED is overwritten
+
+          The fix has three pillars:
+            a. Each marker is retried under the per-task lock so a
+               concurrent op cannot supersede it mid-retry.
+            b. Before writing, re-verify ``operation_id`` under the
+               lock — if a newer op superseded this marker, SKIP.
+            c. Control-op retries use ``_retry_control_marker`` which
+               uses the marker's OWN (expected, target) CAS pair —
+               it does NOT call ``_persist_task_state`` (which reads
+               the DB current version and superseds).  This means a
+               stale marker CANNOT overwrite a newer op's state: the
+               CAS expects the DB at ``expected_version`` and writes
+               to ``target_version``; if the DB is already past
+               ``target_version``, the CAS mismatches and we pop the
+               stale marker without writing.
         """
         if not self.db:
             return
         failures: list[str] = []
-        for task_id, pending in list(self._pending_persistence.items()):
-            task = self._tasks.get(task_id)
-            if task is None:
-                # M4 batch 3.1.12 (CRITICAL-1): task not in memory.
-                # Read back the DB to verify the desired state was
-                # actually persisted.  ``pending`` carries the
-                # immutable snapshot.
-                try:
-                    row = await self.db.get_scheduled_task(task_id)
-                except Exception:  # noqa: BLE001 — DB unreadable
-                    logger.error(
-                        "cron engine: could not read back task %s "
-                        "during reconcile — durability gap, refusing "
-                        "to continue teardown",
-                        task_id, exc_info=True,
-                    )
-                    failures.append(task_id)
-                    continue
-                if (
-                    row is not None
-                    and row.get("status") == pending.desired_status
-                ):
-                    # Desired state is durable — safe to pop the marker.
-                    self._pending_persistence.pop(task_id, None)
-                    continue
-                # Desired state was NOT persisted — durability gap.
-                logger.error(
-                    "cron engine: task %s was popped from _tasks but "
-                    "its desired terminal state %r was never persisted "
-                    "(DB status=%r) — refusing to tear down; this "
-                    "would let the task resurrect on restart",
-                    task_id, pending.desired_status,
-                    row.get("status") if row else "<missing>",
+        # M4 batch 3.1.14 (HIGH): snapshot the items first so we
+        # don't iterate a dict that might be mutated by a concurrent
+        # op.  The real protection is the per-task lock + operation_id
+        # re-check below.
+        for task_id, snapshot in list(self._pending_persistence.items()):
+            # M4 batch 3.1.14 (HIGH): acquire the per-task lock so a
+            # concurrent pause/resume/remove cannot supersede the
+            # marker while we're retrying it.  Without this, reconcile
+            # could read the marker, get scheduled out, a new op
+            # superseded it, and reconcile would write the OLD desired
+            # state — overwriting the new op's state.
+            lock = self._task_lock(task_id)
+            try:
+                await asyncio.wait_for(lock.acquire(), timeout=5.0)
+            except asyncio.TimeoutError:
+                # Couldn't get the lock — a concurrent op is holding
+                # it.  Skip this marker; stop() will retry.
+                logger.warning(
+                    "cron engine: reconcile could not acquire per-task "
+                    "lock for task %s within 5s — deferring",
+                    task_id,
                 )
                 failures.append(task_id)
                 continue
             try:
-                if pending.is_control_op:
-                    # M4 batch 3.1.13 (CRITICAL-2 criterion 6): use
-                    # the marker's IMMUTABLE ``desired_status`` instead
-                    # of the mutable ``task.status``.  Previously
-                    # reconcile passed the live ``task`` to
-                    # ``_persist_task_state``, which read
-                    # ``task.status.value`` as the desired state.  If a
-                    # periodic sweep (or any future code path) reloaded
-                    # the task from the DB and changed ``task.status``
-                    # back to ``pending``, reconcile would persist
-                    # ``pending`` instead of the marker's ``paused`` /
-                    # ``cancelled`` — silently dropping the user's
-                    # control intent.
-                    #
-                    # The marker's ``desired_status`` is the immutable
-                    # source of truth for the LATEST control op's
-                    # intent (any newer control op OVERWRITES the
-                    # marker in ``_persist_task_state``).  Setting
-                    # ``task.status`` to the marker's desired value is
-                    # therefore safe and correct.
-                    original_status = task.status
-                    task.status = TaskStatus(pending.desired_status)
-                    try:
-                        await self._persist_task_state(
-                            task, operation_id=pending.operation_id,
-                        )
-                    finally:
-                        # If the persist succeeded, ``task.status``
-                        # already matches the marker's desired state
-                        # (and ``task.lifecycle_version`` was updated).
-                        # If it failed, restore the original status so
-                        # the in-memory state is not corrupted for the
-                        # next reconcile attempt.
-                        if task.status != TaskStatus(pending.desired_status):
-                            task.status = original_status
-                else:
-                    # Executor entry retry — atomic finalize.
-                    await self._finalize_task_state(
-                        task,
-                        expected_version=pending.expected_version,
-                        operation_id=pending.operation_id,
+                # M4 batch 3.1.14 (HIGH): re-verify the marker's
+                # operation_id under the lock.  A newer op may have
+                # superseded this marker between the snapshot and the
+                # lock acquisition.  If so, SKIP — the newer op's
+                # marker is not our responsibility.
+                current = self._pending_persistence.get(task_id)
+                if current is None:
+                    continue  # Marker was cleared (op succeeded).
+                if current.operation_id != snapshot.operation_id:
+                    logger.info(
+                        "cron task %s: reconcile skipped — marker "
+                        "superseded (snapshot op=%s, current op=%s)",
+                        task_id, snapshot.operation_id,
+                        current.operation_id,
                     )
+                    continue
+                # M4 batch 3.1.14 (HIGH): use the marker's IMMUTABLE
+                # fields, NOT the mutable task.status.  See the
+                # method docstring for the full rationale.
+                if snapshot.is_control_op:
+                    ok = await self._retry_control_marker(
+                        task_id, snapshot,
+                    )
+                else:
+                    ok = await self._retry_executor_marker(
+                        task_id, snapshot,
+                    )
+                if not ok:
+                    failures.append(task_id)
             except Exception:  # noqa: BLE001 — collect and raise
                 logger.error(
                     "cron engine: could not persist terminal state for "
@@ -715,11 +725,247 @@ class CronEngine:
                     task_id, exc_info=True,
                 )
                 failures.append(task_id)
+            finally:
+                lock.release()
         if failures:
             raise ServiceShutdownError(
                 f"could not persist terminal state for {len(failures)} "
                 f"cron task(s): {failures}; DB may be closed under live rows"
             )
+
+    async def _retry_control_marker(
+        self, task_id: str, marker: PendingPersistence,
+    ) -> bool:
+        """M4 batch 3.1.14 (HIGH): retry a control-op marker's
+        persistence using the marker's OWN (expected_version,
+        target_version, desired_status) CAS pair.
+
+        This does NOT call ``_persist_task_state`` (which reads the
+        DB's current version and SUPERSEDES any existing marker).
+        Using the marker's own CAS pair means a stale marker CANNOT
+        overwrite a newer op's state: if the DB is already past
+        ``target_version``, the CAS mismatches and we pop the stale
+        marker without writing.
+
+        Returns ``True`` if:
+          - The DB is already at the marker's ``desired_status``
+            (idempotent success — a prior retry committed, or a newer
+            op achieved the same state).
+          - The CAS succeeded (possibly via commit-then-raise
+            recovery).
+          - The marker is stale (DB version > target) — the marker
+            is popped so reconcile doesn't retry forever.  This is
+            NOT a failure — the newer op's state wins.
+
+        Returns ``False`` if:
+          - The DB read or write raised an exception (durability gap
+            — the caller raises ``ServiceShutdownError``).
+        """
+        try:
+            row = await self.db.get_scheduled_task(task_id)
+        except Exception:  # noqa: BLE001 — DB unreadable
+            logger.error(
+                "cron task %s: reconcile could not read DB — "
+                "durability gap",
+                task_id, exc_info=True,
+            )
+            return False
+        if row is None:
+            # Task was deleted out-of-band — treat as success.
+            self._pending_persistence.pop(task_id, None)
+            return True
+        db_version = int(row.get("lifecycle_version", 0))
+        db_status = row.get("status")
+        if db_status == marker.desired_status:
+            # Idempotent success — pop the marker and sync memory.
+            stored = self._pending_persistence.get(task_id)
+            if stored is not None and stored.operation_id == marker.operation_id:
+                self._pending_persistence.pop(task_id, None)
+            task = self._tasks.get(task_id)
+            if task is not None:
+                task.lifecycle_version = db_version
+                self._execution_epoch[task_id] = db_version
+            return True
+        # DB is NOT at our desired state.  Check if a newer op won.
+        if db_version >= marker.target_version:
+            # A newer op won with a DIFFERENT state — do NOT
+            # overwrite.  Pop our stale marker so reconcile doesn't
+            # retry forever.
+            stored = self._pending_persistence.get(task_id)
+            if stored is not None and stored.operation_id == marker.operation_id:
+                self._pending_persistence.pop(task_id, None)
+            logger.info(
+                "cron task %s: reconcile marker (op=%s, desired=%r, "
+                "target=%d) is stale — DB at version %d status %r "
+                "(newer op won); not overwriting",
+                task_id, marker.operation_id, marker.desired_status,
+                marker.target_version, db_version, db_status,
+            )
+            return True  # Stale marker resolved — not a failure.
+        # DB version < target — our CAS might still succeed.  Try it
+        # with the marker's own (expected, target) pair.
+        try:
+            rowcount = await self.db.control_finalize_scheduled_task(
+                task_id,
+                expected_version=marker.expected_version,
+                target_version=marker.target_version,
+                status=marker.desired_status,
+                next_run=None,  # Don't modify next_run on retry.
+                error=None,
+            )
+        except Exception:
+            # Check commit-then-raise: the CAS may have committed
+            # before raising.
+            try:
+                row2 = await self.db.get_scheduled_task(task_id)
+            except Exception:  # noqa: BLE001 — DB unreadable
+                logger.error(
+                    "cron task %s: reconcile CAS raised and read-back "
+                    "failed — durability gap",
+                    task_id, exc_info=True,
+                )
+                return False
+            if (
+                row2 is not None
+                and int(row2.get("lifecycle_version", 0)) == marker.target_version
+                and row2.get("status") == marker.desired_status
+            ):
+                # commit-then-raise — success.
+                stored = self._pending_persistence.get(task_id)
+                if stored is not None and stored.operation_id == marker.operation_id:
+                    self._pending_persistence.pop(task_id, None)
+                task = self._tasks.get(task_id)
+                if task is not None:
+                    task.lifecycle_version = marker.target_version
+                    self._execution_epoch[task_id] = marker.target_version
+                return True
+            logger.error(
+                "cron task %s: reconcile CAS raised and read-back "
+                "does not match target — durability gap",
+                task_id, exc_info=True,
+            )
+            return False
+        if rowcount == 0:
+            # CAS mismatch — check if prior retry committed or a
+            # newer op won.
+            try:
+                row2 = await self.db.get_scheduled_task(task_id)
+            except Exception:  # noqa: BLE001 — treat as failure
+                row2 = None
+            if (
+                row2 is not None
+                and int(row2.get("lifecycle_version", 0)) == marker.target_version
+                and row2.get("status") == marker.desired_status
+            ):
+                # Prior retry committed — idempotent success.
+                stored = self._pending_persistence.get(task_id)
+                if stored is not None and stored.operation_id == marker.operation_id:
+                    self._pending_persistence.pop(task_id, None)
+                task = self._tasks.get(task_id)
+                if task is not None:
+                    task.lifecycle_version = marker.target_version
+                    self._execution_epoch[task_id] = marker.target_version
+                return True
+            # Newer op won — don't overwrite.  Pop the stale marker.
+            stored = self._pending_persistence.get(task_id)
+            if stored is not None and stored.operation_id == marker.operation_id:
+                self._pending_persistence.pop(task_id, None)
+            logger.info(
+                "cron task %s: reconcile CAS returned 0 — newer op "
+                "won with different state; not overwriting",
+                task_id,
+            )
+            return True  # Stale marker resolved — not a failure.
+        # CAS succeeded.
+        stored = self._pending_persistence.get(task_id)
+        if stored is not None and stored.operation_id == marker.operation_id:
+            self._pending_persistence.pop(task_id, None)
+        task = self._tasks.get(task_id)
+        if task is not None:
+            task.lifecycle_version = marker.target_version
+            self._execution_epoch[task_id] = marker.target_version
+        return True
+
+    async def _retry_executor_marker(
+        self, task_id: str, marker: PendingPersistence,
+    ) -> bool:
+        """M4 batch 3.1.14 (HIGH): retry an executor marker's
+        persistence.
+
+        Executor markers are placed by ``_finalize_task_state`` when
+        the executor's terminal write fails.  The retry uses the
+        marker's ``expected_version`` and ``operation_id`` — it does
+        NOT supersede newer control-op markers (``_finalize_task_state``
+        already checks for that at line ~1902).
+
+        If the task was popped from ``_tasks`` (e.g. by a concurrent
+        ``remove``), we can't finalize because we don't have the
+        ``execution_id`` / ``last_run`` / etc.  In that case, read
+        back the DB — if it's already at the marker's desired status,
+        idempotent success; otherwise, durability gap.
+
+        Returns ``True`` on success or idempotent success.
+        Returns ``False`` on durability gap (caller raises
+        ``ServiceShutdownError``).
+        """
+        task = self._tasks.get(task_id)
+        if task is None:
+            # Task was popped — read back the DB.
+            try:
+                row = await self.db.get_scheduled_task(task_id)
+            except Exception:  # noqa: BLE001 — DB unreadable
+                logger.error(
+                    "cron task %s: executor reconcile could not read "
+                    "DB — durability gap",
+                    task_id, exc_info=True,
+                )
+                return False
+            if (
+                row is not None
+                and row.get("status") == marker.desired_status
+            ):
+                self._pending_persistence.pop(task_id, None)
+                return True
+            logger.error(
+                "cron task %s: executor marker desired %r but DB "
+                "status=%r — durability gap",
+                task_id, marker.desired_status,
+                row.get("status") if row else "<missing>",
+            )
+            return False
+        # Task is still in memory — call ``_finalize_task_state``
+        # which already checks for newer control-op markers.
+        try:
+            ok = await self._finalize_task_state(
+                task,
+                expected_version=marker.expected_version,
+                operation_id=marker.operation_id,
+            )
+        except Exception:  # noqa: BLE001 — DB error
+            logger.error(
+                "cron task %s: executor reconcile CAS raised — "
+                "durability gap",
+                task_id, exc_info=True,
+            )
+            return False
+        # M4 batch 3.1.14 (HIGH): propagate False.  ``_finalize_task_state``
+        # returns False when a newer control-op marker exists or the
+        # CAS mismatched — in either case, the marker is stale and
+        # should be popped (``_finalize_task_state`` already pops it
+        # when the operation_id matches).
+        if not ok:
+            # The marker may still be present if _finalize_task_state
+            # returned False due to a newer control-op marker.  Pop
+            # our stale marker if it's still ours.
+            stored = self._pending_persistence.get(task_id)
+            if stored is not None and stored.operation_id == marker.operation_id:
+                self._pending_persistence.pop(task_id, None)
+            logger.info(
+                "cron task %s: executor reconcile returned False — "
+                "newer op won; stale marker popped",
+                task_id,
+            )
+        return True  # Stale marker is "resolved" — not a failure.
 
     async def create(
         self,
@@ -1450,6 +1696,19 @@ class CronEngine:
             # the in-memory state of a task whose ``pause`` persist
             # had failed (in-memory PAUSED, DB PENDING) — the reload
             # changed it to PENDING and the tick re-fired it.
+            #
+            # M4 batch 3.1.14 (CRITICAL-1): once any lease revocation
+            # fails (executor didn't terminate) OR the sweep raises,
+            # the tick MUST NOT start any other due task in the same
+            # iteration.  Previously the sweep set ``_degraded=True``
+            # but kept iterating ``expired_ids`` and then fell through
+            # to ``due_candidates`` — so a Task B that was unrelated
+            # but immediately due would start executing after Task A's
+            # revocation failure, violating the degraded invariant
+            # ("once execution ownership is untrusted, no new side-
+            # effecting execution may start").  Now we break out of
+            # the sweep loop on the first failure and re-check
+            # ``_degraded`` before constructing ``due_candidates``.
             if (
                 self.db
                 and (time.monotonic() - self._last_lease_sweep)
@@ -1488,6 +1747,11 @@ class CronEngine:
                                     "_execute_tasks for stop()",
                                     tid, _CANCEL_IN_FLIGHT_TIMEOUT,
                                 )
+                                # M4 batch 3.1.14 (CRITICAL-1): STOP
+                                # the sweep — do NOT process any more
+                                # expired IDs in this iteration, and
+                                # do NOT fall through to due_candidates.
+                                break
                 except Exception:  # noqa: BLE001 — sweep failure is fatal
                     logger.error(
                         "periodic lease sweep failed; entering "
@@ -1496,6 +1760,16 @@ class CronEngine:
                     )
                     self._degraded = True
                     continue
+            # M4 batch 3.1.14 (CRITICAL-1): re-check degraded AFTER
+            # the sweep.  Even if the sweep ran without raising, a
+            # revocation failure inside it set ``_degraded=True`` and
+            # broke out — we must NOT start any due task in this
+            # iteration.  Previously this check only ran at the TOP of
+            # the loop, so a degraded set mid-sweep still fell through
+            # to due_candidates.
+            if self._degraded:
+                await asyncio.sleep(self._tick_interval)
+                continue
             # M4 batch 3.1.13 (CRITICAL-2): tick MUST skip tasks with
             # pending persistence markers.  A task whose ``pause`` /
             # ``remove`` persist failed has its desired state in the
@@ -1533,6 +1807,15 @@ class CronEngine:
                     # execution for this task_id, do NOT start a
                     # second one.
                     if task.id in self._execute_tasks and not self._execute_tasks[task.id].done():
+                        continue
+                    # M4 batch 3.1.14 (CRITICAL-1 criterion 3): defensive
+                    # re-check of ``_degraded`` right before publishing a
+                    # new executor.  The sweep sets ``_degraded`` and we
+                    # re-check after it, but a long-running candidate
+                    # iteration (e.g. contended per-task locks) could in
+                    # principle let ``_degraded`` flip between the
+                    # post-sweep check and here.  This is the final gate.
+                    if self._degraded:
                         continue
                     # M4 (round-5): track the execution task so
                     # ``stop()`` can cancel + await it.
@@ -2343,7 +2626,14 @@ class CronEngine:
                     "entering DEGRADED mode",
                     task_id, exc_info=True,
                 )
-                return True
+                # M4 batch 3.1.14 (CRITICAL-1): return False so the
+                # tick loop's ``if not ok: break`` fires — no other
+                # due task may start in this iteration.  Previously
+                # this returned True, so the tick kept iterating
+                # ``expired_ids`` and then fell through to
+                # ``due_candidates``, starting unrelated tasks despite
+                # the DB state being untrusted.
+                return False
             if recovered:
                 logger.warning(
                     "cron task %s: lease sweep wrote FAILED (executor "
