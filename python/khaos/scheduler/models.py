@@ -70,3 +70,13 @@ class ScheduledTask:
     # during execution leaves a durable marker for restart recovery.
     execution_id: Optional[str] = None
     lease_until: Optional[datetime] = None
+    # M4 batch 3.1.16B-1 (CRITICAL): security-context snapshot at
+    # creation time.  ``policy_digest`` captures the
+    # ``EffectiveSecurityPolicy.digest`` when the task was created;
+    # ``project_id`` captures ``sha256(realpath(project_root))[:32]``.
+    # B-2 will compare these against the live values at ``start()``
+    # and ``_execute_task`` claim time to detect policy/project drift.
+    # Legacy rows (empty ``policy_digest``) are quarantined to
+    # ``status='failed'`` at migration time — fail-closed.
+    policy_digest: str = ""
+    project_id: str = ""

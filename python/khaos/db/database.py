@@ -111,6 +111,8 @@ class Database:
         await self._ensure_audit_log_principal_columns()
         # M4 batch 3.1.16A-3: principal-scoped ownership for coding_tasks.
         await self._ensure_coding_tasks_principal_columns()
+        # M4 batch 3.1.16B-1: security-context snapshot for scheduled_tasks.
+        await self._ensure_scheduled_tasks_generation_columns()
 
     async def _ensure_scheduled_tasks_lifecycle_version(self) -> None:
         """Add ``lifecycle_version`` column to legacy ``scheduled_tasks``.
@@ -199,6 +201,56 @@ class Database:
             WHERE principal_id = 'legacy'
               AND status != 'failed'
             """
+        )
+        await conn.commit()
+
+    async def _ensure_scheduled_tasks_generation_columns(self) -> None:
+        """M4 batch 3.1.16B-1 (CRITICAL): add ``policy_digest`` and
+        ``project_id`` columns to ``scheduled_tasks`` for security-
+        context snapshotting.
+
+        Every task now captures the ``EffectiveSecurityPolicy.digest``
+        and ``project_id`` (``sha256(realpath(project_root))[:32]``)
+        at creation time.  B-2 will compare these against the live
+        values at ``start()`` and ``_execute_task`` claim time to
+        detect policy/project drift — a task created under policy A
+        must NOT silently execute under policy B if the user tightened
+        security between creation and firing.
+
+        Legacy rows (pre-B-1) have empty ``policy_digest``.  Unlike
+        the ``principal_id='legacy'`` quarantine in batch 3.1.12,
+        B-1 does NOT quarantine legacy rows at migration time —
+        because new tasks created without a ``policy_digest`` (e.g.
+        by test engines) also have empty ``policy_digest``, so a
+        migration-time quarantine would catch them too.  Instead,
+        B-2 adds drift-detection enforcement in ``start()`` and
+        ``_execute_task`` that quarantines tasks with empty or
+        mismatched ``policy_digest`` at load / claim time, when the
+        engine's bound ``policy_digest`` is known.  This cleanly
+        separates schema (B-1) from enforcement (B-2).
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(scheduled_tasks)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        added = False
+        if "policy_digest" not in columns:
+            await conn.execute(
+                "ALTER TABLE scheduled_tasks "
+                "ADD COLUMN policy_digest TEXT NOT NULL DEFAULT ''"
+            )
+            added = True
+        if "project_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE scheduled_tasks "
+                "ADD COLUMN project_id TEXT NOT NULL DEFAULT ''"
+            )
+            added = True
+        if added:
+            await conn.commit()
+        # Policy-scoped lookup index (idempotent).
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_policy "
+            "ON scheduled_tasks(policy_digest, status)"
         )
         await conn.commit()
 
@@ -1452,6 +1504,8 @@ class Database:
         *,
         principal_id: str = "",
         next_run: str | None = None,
+        project_id: str = "",
+        policy_digest: str = "",
     ) -> str:
         """Persist a new scheduled task and return its id.
 
@@ -1465,6 +1519,13 @@ class Database:
             NULL until the first execution — a restart before the first
             fire left the task permanently stuck (tick skips tasks with
             ``next_run IS NULL``).
+
+        M4 batch 3.1.16B-1 (CRITICAL): ``project_id`` and
+        ``policy_digest`` are now persisted atomically with the INSERT
+        so B-2 drift detection can compare the stored snapshot against
+        the live values at ``start()`` and ``_execute_task`` claim
+        time.  Empty ``policy_digest`` is fail-closed — the migration
+        helper quarantines such rows to ``status='failed'``.
         """
         import uuid
 
@@ -1478,11 +1539,11 @@ class Database:
             """
             INSERT INTO scheduled_tasks
                 (id, name, prompt, status, schedule_config, deliver_to, meta,
-                 principal_id, next_run)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 principal_id, next_run, project_id, policy_digest)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (task_id, name, prompt, status, schedule_json, deliver_to, meta_json,
-             principal_id, next_run),
+             principal_id, next_run, project_id, policy_digest),
         )
         await conn.commit()
         return task_id
@@ -1630,6 +1691,10 @@ class Database:
         M4 batch 3.1.10: when ``principal_id`` is provided, only tasks
         belonging to that principal are returned.  ``None`` returns all
         (used by the engine's internal ``_load_tasks`` / reconcile).
+
+        M4 batch 3.1.16B-1: the SELECT now includes ``policy_digest``
+        and ``project_id`` so ``_task_from_row`` can restore the
+        security-context snapshot for B-2 drift detection.
         """
         conn = await self._require_conn()
         if principal_id is not None:
@@ -1637,7 +1702,8 @@ class Database:
                 """
                 SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
                        created_at, last_run, next_run, run_count, last_result, error,
-                       lifecycle_version, principal_id, execution_id, lease_until
+                       lifecycle_version, principal_id, execution_id, lease_until,
+                       policy_digest, project_id
                 FROM scheduled_tasks
                 WHERE principal_id = ?
                 ORDER BY created_at
@@ -1649,7 +1715,8 @@ class Database:
                 """
                 SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
                        created_at, last_run, next_run, run_count, last_result, error,
-                       lifecycle_version, principal_id, execution_id, lease_until
+                       lifecycle_version, principal_id, execution_id, lease_until,
+                       policy_digest, project_id
                 FROM scheduled_tasks
                 ORDER BY created_at
                 """
