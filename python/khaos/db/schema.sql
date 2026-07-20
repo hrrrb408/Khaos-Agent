@@ -229,10 +229,24 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
     -- during execution leaves a durable RUNNING + lease marker that
     -- restart recovery can detect and disclose (at-least-once).
     execution_id    TEXT,
-    lease_until     TEXT
+    lease_until     TEXT,
+    -- M4 batch 3.1.16B-1 (CRITICAL): security-context snapshot at
+    -- creation time.  ``policy_digest`` captures the
+    -- ``EffectiveSecurityPolicy.digest`` when the task was created;
+    -- ``project_id`` captures ``sha256(realpath(project_root))[:32]``.
+    -- B-2 will compare these against the live values at ``start()``
+    -- and ``_execute_task`` claim time to detect policy/project drift
+    -- — a task created under policy A must NOT silently execute under
+    -- policy B if the user tightened security between creation and
+    -- firing.  Legacy rows (empty ``policy_digest``) are quarantined
+    -- to ``status='failed'`` at migration time (fail-closed).
+    policy_digest   TEXT NOT NULL DEFAULT '',
+    project_id      TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status ON scheduled_tasks(status, next_run);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_principal ON scheduled_tasks(principal_id, status);
+CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_policy ON scheduled_tasks(policy_digest, status);
 
 CREATE TABLE IF NOT EXISTS coding_tasks (
     id             TEXT PRIMARY KEY,

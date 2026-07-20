@@ -715,14 +715,6 @@ class AgentService:
         self.task_manager = TaskManager(
             db=db, principal_id=f"local-uid:{os.getuid()}"
         )
-        self.cron_engine = CronEngine(db=db, executor=self._execute_scheduled_prompt)
-        set_cron_engine(self.cron_engine)
-        self.channel_registry = ChannelRegistry()
-        self._webhook_replay_guard = WebhookReplayGuard(
-            consumer=self.db.consume_webhook_event
-        )
-        self._verified_webhook_limiter = WebhookRateLimiter()
-        set_channel_registry(self.channel_registry)
         # H2: compile the *layered* effective policy (user ∩ project ∩
         # platform) once at startup — never consult the raw project policy
         # for enforcement decisions.  An untrusted repo can no longer
@@ -737,6 +729,28 @@ class AgentService:
             self._effective_policy.digest,
             self._effective_policy.audit_enabled,
         )
+        # M4 batch 3.1.16B-1 (CRITICAL): bind the CronEngine to the
+        # effective policy digest + project_id so every scheduled task
+        # captures the security-context snapshot at creation time.  B-2
+        # will compare these against the live values at ``start()`` and
+        # ``_execute_task`` claim time to detect policy/project drift.
+        # ``project_id`` is derived from the project root via
+        # ``state_root.project_id`` (sha256(realpath(root))[:32]).
+        from khaos.db.state_root import project_id as _compute_project_id
+        _bound_project_id = _compute_project_id(self.project_root)
+        self.cron_engine = CronEngine(
+            db=db,
+            executor=self._execute_scheduled_prompt,
+            project_id=_bound_project_id,
+            policy_digest=self._effective_policy.digest,
+        )
+        set_cron_engine(self.cron_engine)
+        self.channel_registry = ChannelRegistry()
+        self._webhook_replay_guard = WebhookReplayGuard(
+            consumer=self.db.consume_webhook_event
+        )
+        self._verified_webhook_limiter = WebhookRateLimiter()
+        set_channel_registry(self.channel_registry)
         # B1: the OfficeMutationAuthority is a server-lifecycle object shared
         # across every chat / webhook / cron turn.  Reusing one instance keeps
         # the aggregate storage baseline stable across turns (closing the

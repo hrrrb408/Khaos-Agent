@@ -146,6 +146,8 @@ class CronEngine:
         tick_interval: float = 30.0,  # 每 30 秒检查一次
         *,
         execution_lease_seconds: float = EXECUTION_LEASE_SECONDS,
+        project_id: str = "",
+        policy_digest: str = "",
     ):
         """
         参数：
@@ -166,12 +168,33 @@ class CronEngine:
         ``TypeError`` from the executor body (not just "wrong arity")
         and re-executed WITHOUT ``principal_id`` — causing double
         execution and a silent identity downgrade to the server UID.
+
+        M4 batch 3.1.16B-1 (CRITICAL): ``project_id`` and
+        ``policy_digest`` are bound at construction time (matching the
+        ``principal_id`` binding pattern from 3.1.10).  Every task
+        created through this engine captures these values at creation
+        time so B-2 can detect policy/project drift at ``start()`` and
+        ``_execute_task`` claim time.  Empty ``policy_digest`` is the
+        fail-closed default — an engine constructed without an
+        authenticated policy snapshot stamps empty strings on new
+        tasks, which are then quarantined by the migration helper.
+        Production callers (``AgentService``) MUST pass the effective
+        policy digest; tests that omit it accept the fail-closed
+        behaviour.
         """
         self.db = db
         self._executor = self._wrap_executor(executor)
         self._on_complete = on_complete
         self._tick_interval = tick_interval
         self._execution_lease_seconds = execution_lease_seconds
+        # M4 batch 3.1.16B-1 (CRITICAL): bind the security-context
+        # snapshot at construction time.  Every task created through
+        # this engine captures these values; B-2 will compare them
+        # against the live values to detect drift.  Empty
+        # ``policy_digest`` is fail-closed — production callers MUST
+        # pass the effective policy digest.
+        self._project_id = project_id
+        self._policy_digest = policy_digest
         self._tasks: dict[str, ScheduledTask] = {}
         self._running = False
         self._loop_task: asyncio.Task | None = None
@@ -1170,6 +1193,12 @@ class CronEngine:
             deliver_to=deliver_to,
             meta=meta or {},
             principal_id=principal_id,
+            # M4 batch 3.1.16B-1: stamp the engine's bound security-
+            # context snapshot so B-2 can detect drift at start() /
+            # _execute_task claim time.  A task created under policy A
+            # must NOT silently execute under policy B.
+            project_id=self._project_id,
+            policy_digest=self._policy_digest,
         )
         task.next_run = self._compute_next_run(task)
         if self.db:
@@ -1178,6 +1207,8 @@ class CronEngine:
                 deliver_to, meta,
                 principal_id=principal_id,
                 next_run=task.next_run.isoformat() if task.next_run else None,
+                project_id=self._project_id,
+                policy_digest=self._policy_digest,
             )
         else:
             task.id = f"task_{len(self._tasks)}"
@@ -2882,6 +2913,14 @@ def _task_from_row(row: dict) -> ScheduledTask | None:
         principal_id=str(row.get("principal_id") or ""),
         execution_id=row.get("execution_id"),
         lease_until=_parse_dt(row.get("lease_until")),
+        # M4 batch 3.1.16B-1: restore the security-context snapshot
+        # so B-2 drift detection can compare against the live values.
+        # Legacy rows (empty policy_digest) are quarantined by the
+        # migration helper, so they'd never reach here — but if a
+        # row somehow reached here without a snapshot, defaulting to
+        # empty strings keeps the invariant (B-2 will fail-closed).
+        policy_digest=str(row.get("policy_digest") or ""),
+        project_id=str(row.get("project_id") or ""),
     )
 
 
