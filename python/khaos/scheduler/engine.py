@@ -148,6 +148,7 @@ class CronEngine:
         execution_lease_seconds: float = EXECUTION_LEASE_SECONDS,
         project_id: str = "",
         policy_digest: str = "",
+        audit_logger: "AuditLogger | None" = None,
     ):
         """
         参数：
@@ -195,6 +196,12 @@ class CronEngine:
         # pass the effective policy digest.
         self._project_id = project_id
         self._policy_digest = policy_digest
+        # M4 batch 3.1.16B-3: optional AuditLogger for drift-quarantine
+        # audit logging.  When None (test engines), quarantine events
+        # are logged only via Python logging (not the audit trail).
+        # Production engines receive the server-lifecycle AuditLogger
+        # from AgentService (see grpc_server.py construction).
+        self._audit_logger = audit_logger
         self._tasks: dict[str, ScheduledTask] = {}
         self._running = False
         self._loop_task: asyncio.Task | None = None
@@ -1616,8 +1623,14 @@ class CronEngine:
           - ``"not_found"``: task_id is not registered OR does not
             belong to ``principal_id`` (M4 batch 3.1.10).
           - ``"invalid_state"``: the task is in a terminal execution
-            state (``COMPLETED`` / ``FAILED``) — these are durable
-            final states and should not be re-cancelled.
+            state (``COMPLETED`` / naturally ``FAILED``) — these are
+            durable final states and should not be re-cancelled.
+          - ``"quarantined"``: M4 batch 3.1.16B-3 — the task is
+            ``FAILED`` with an ``error`` starting ``"quarantined:"``
+            (security-context drift).  Quarantined tasks CAN be
+            removed by an admin to clear them from the list; the
+            removal proceeds like a normal cancel (bump epoch +
+            ``CANCELLED`` + persist + pop).
           - ``"cancellation_pending"``: the in-flight executor did NOT
             terminate within the cancel budget.
           - ``"persistence_pending"``: the executor terminated but the
@@ -1626,6 +1639,14 @@ class CronEngine:
         M4 batch 3.1.10 (CRITICAL): ``principal_id`` is REQUIRED.
         Returns ``not_found`` if the task belongs to a different
         principal (fail-closed).
+
+        M4 batch 3.1.16B-3 (CRITICAL): quarantined tasks (FAILED with
+        ``error.startswith("quarantined:")``) are removable.  Without
+        this, a drift-quarantined task would be permanently stuck —
+        neither ``pause`` (rejected for FAILED) nor ``resume`` (only
+        accepts PAUSED) nor ``remove`` (rejected for FAILED) could
+        clear it.  An admin can now ``remove`` a quarantined task and
+        re-create it under the current policy via ``cron_create``.
 
         H1 (round-11): the per-task lock is held for the ENTIRE
         operation — including cancel + persist.
@@ -1638,8 +1659,21 @@ class CronEngine:
                 return "not_found"
             # H1 (round-12): refuse terminal execution states — these
             # are durable final states and should not be re-cancelled.
-            if task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED):
+            # M4 batch 3.1.16B-3 (CRITICAL): quarantined FAILED tasks
+            # are an EXCEPTION — they can be removed to clear them
+            # from the list.  The quarantine prefix ``"quarantined:"``
+            # is set by ``_quarantine_drifted_task`` and is the only
+            # way a FAILED task becomes removable.  Natural FAILED
+            # tasks (executor exception, unauthenticated principal,
+            # etc.) use a different error prefix and remain immutable.
+            if task.status == TaskStatus.COMPLETED:
                 return "invalid_state"
+            if task.status == TaskStatus.FAILED:
+                if task.error and task.error.startswith("quarantined:"):
+                    # Quarantined — allow removal to proceed.
+                    pass
+                else:
+                    return "invalid_state"
             # H1 (round-9): bump epoch BEFORE cancelling.
             self._bump_epoch(task_id)
             task.status = TaskStatus.CANCELLED
@@ -1773,6 +1807,14 @@ class CronEngine:
         tasks) skips it.  The quarantine is durable — the task stays
         ``failed`` until an admin explicitly re-creates it under the
         current security context.
+
+        M4 batch 3.1.16B-3 (CRITICAL): writes an audit log entry via
+        ``log_security_event`` so drift quarantine is attributable.
+        The audit write happens BEFORE ``_persist_task_state`` so even
+        if the DB write fails, the audit trail already records the
+        quarantine decision.  Audit write failures are swallowed
+        (matching the SecurityMiddleware pattern) — audit must NEVER
+        block the quarantine, which is a safety-critical operation.
         """
         logger.error(
             "cron task %s (%s): QUARANTINED — %s",
@@ -1781,6 +1823,33 @@ class CronEngine:
         self._bump_epoch(task.id)
         task.status = TaskStatus.FAILED
         task.error = f"quarantined: {reason}"
+        # M4 batch 3.1.16B-3: write audit log BEFORE persisting the
+        # FAILED state so the audit trail captures the quarantine
+        # decision even if the DB write fails.
+        if self._audit_logger is not None:
+            try:
+                await self._audit_logger.log_security_event(
+                    event_type="scheduler_drift_quarantine",
+                    tool_name=f"cron:{task.name}",
+                    reason=reason,
+                    detail={
+                        "task_id": task.id,
+                        "task_name": task.name,
+                        "task_policy_digest": task.policy_digest,
+                        "engine_policy_digest": self._policy_digest,
+                        "task_project_id": task.project_id,
+                        "engine_project_id": self._project_id,
+                        "principal_id": task.principal_id,
+                    },
+                    task_id=task.id,
+                    source_transport="cron-engine",
+                )
+            except Exception:  # noqa: BLE001 — audit must not block quarantine
+                logger.warning(
+                    "cron task %s: audit log write failed for drift "
+                    "quarantine — quarantine proceeds anyway",
+                    task.name, exc_info=True,
+                )
         if self.db:
             try:
                 await self._persist_task_state(task)
