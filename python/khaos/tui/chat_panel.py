@@ -206,19 +206,40 @@ def build_diff_renderable(file_path: str, diff_text: str) -> Group:
     header_rule = f"── diff: {file_path} ".ljust(rule_width, "─")
     footer_rule = "─" * rule_width
 
-    spans: list[tuple[str, str]] = [("\n", ""), (header_rule, "dim")]
+    # M4 batch 3.1.16B-4: each diff line is a separate ``Text``
+    # object inside a ``Group``.  Previously ``Text.assemble(*spans)``
+    # concatenated all spans into ONE Text, and Rich merged adjacent
+    # same-style segments — so multi-line diffs rendered as one long
+    # line with embedded ``\n`` characters, breaking per-line style
+    # assertions.  Using ``Group`` with one ``Text`` per line forces
+    # each line to render independently (Rich inserts a newline
+    # between Group children automatically).
+    #
+    # Also: ``+++`` and ``---`` are git diff file headers (file
+    # paths), NOT addition/deletion lines.  Previously they were
+    # mis-classified by the ``startswith("+")`` / ``startswith("-")``
+    # checks, painting ``--- a/note.txt`` red and ``+++ b/note.txt``
+    # green.  Now they keep the default style.
+    lines: list[Text] = [
+        Text("\n"),
+        Text(header_rule, style="dim"),
+    ]
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("@@"):
-            spans.append((raw_line, "yellow"))
+            lines.append(Text(raw_line, style="yellow"))
+        elif raw_line.startswith("+++") or raw_line.startswith("---"):
+            # File header (e.g. ``+++ b/note.txt``) — not an
+            # addition/deletion line.
+            lines.append(Text(raw_line))
         elif raw_line.startswith("+"):
-            spans.append((raw_line, "green"))
+            lines.append(Text(raw_line, style="green"))
         elif raw_line.startswith("-"):
-            spans.append((raw_line, "red"))
+            lines.append(Text(raw_line, style="red"))
         else:
-            spans.append((raw_line, ""))
-    spans.append((footer_rule, "dim"))
+            lines.append(Text(raw_line))
+    lines.append(Text(footer_rule, style="dim"))
 
-    return Group(Text.assemble(*spans))
+    return Group(*lines)
 
 
 def _prompt_line(text: str) -> Text:

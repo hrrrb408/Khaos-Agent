@@ -117,6 +117,19 @@ async def test_python_json_line_server_round_trip(tmp_path):
         signed = (
             f"AgentService.Chat\n{nonce}\n{issued_at}\ngateway\n{digest}"
         ).encode()
+        # M4 batch 3.1.16B-4: the server uses double-layer HMAC —
+        # first derive a per-method key from the gateway capability,
+        # then MAC the signed payload with that key.  The previous
+        # test used single-layer HMAC (capability as direct key),
+        # which the server rejects with "RPC method capability is
+        # invalid".  Sync the test to the server's actual MAC scheme
+        # (introduced in 4ae2157 "fix(rpc): bind gateway identity and
+        # method capabilities").
+        method_key = hmac.new(
+            ("c" * 48).encode(),
+            b"khaos-rpc-method-v1\nAgentService.Chat",
+            hashlib.sha256,
+        ).digest()
         writer.write(
             (
                 json.dumps(
@@ -127,7 +140,7 @@ async def test_python_json_line_server_round_trip(tmp_path):
                             "nonce": nonce, "issued_at": issued_at,
                             "principal_id": "gateway", "payload_digest": digest,
                             "mac": hmac.new(
-                                ("c" * 48).encode(), signed, hashlib.sha256,
+                                method_key, signed, hashlib.sha256,
                             ).hexdigest(),
                         },
                     }
