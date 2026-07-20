@@ -46,7 +46,10 @@ async def run_once(args: argparse.Namespace) -> int:
     await db.connect()
     await db.run_migrations()
 
-    mode_manager = ModeManager(db, project_root=Path.cwd())
+    mode_manager = ModeManager(
+        db, project_root=Path.cwd(),
+        principal_id=f"local-uid:{os.getuid()}",
+    )
     await mode_manager.load()
     if args.mode:
         await mode_manager.switch(ModeManager.parse(args.mode))
@@ -57,7 +60,7 @@ async def run_once(args: argparse.Namespace) -> int:
     from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
-        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args)))
+        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=f"local-uid:{os.getuid()}"))
         print(f"session_id: {session_id}", flush=True)
         async for message in runtime.loop.run(args.message, session_id):
             print(encode_sse(message), end="", flush=True)
@@ -77,14 +80,17 @@ async def run_repl(args: argparse.Namespace) -> int:
     await db.connect()
     await db.run_migrations()
 
-    mode_manager = ModeManager(db, project_root=Path.cwd())
+    mode_manager = ModeManager(
+        db, project_root=Path.cwd(),
+        principal_id=f"local-uid:{os.getuid()}",
+    )
     await mode_manager.load()
     session_id = args.session_id or str(uuid.uuid4())
     await db.create_session(session_id, mode_manager.current_mode.value)
     from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
-        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args)))
+        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=f"local-uid:{os.getuid()}"))
         loop = runtime.loop
         skill_manager = runtime.skill_manager
         print(f"session_id: {session_id}")

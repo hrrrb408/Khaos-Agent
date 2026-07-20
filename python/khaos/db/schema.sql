@@ -57,7 +57,17 @@ CREATE TABLE IF NOT EXISTS memories (
     access_freq INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(scope, key)
+    -- M4 batch 3.1.16A-2 (CRITICAL #5): principal partitioning.  Memories
+    -- are scoped by (namespace, principal_id, session_id, scope, key).
+    -- Legacy rows (pre-A-2) get principal_id='legacy' and are never
+    -- loaded by authenticated principals.
+    --   namespace='private' : principal-private (default)
+    --   namespace='session' : session-private (requires session_id)
+    --   namespace='shared'  : project-shared (principal_id='')
+    principal_id TEXT NOT NULL DEFAULT 'legacy',
+    namespace    TEXT NOT NULL DEFAULT 'private',
+    session_id   TEXT NOT NULL DEFAULT '',
+    UNIQUE(namespace, principal_id, session_id, scope, key)
 );
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
@@ -87,10 +97,20 @@ CREATE TABLE IF NOT EXISTS permissions (
     permission_level TEXT NOT NULL,
     approval         TEXT NOT NULL,
     mode             TEXT NOT NULL DEFAULT 'all',
-    granted_at       TEXT NOT NULL DEFAULT (datetime('now'))
+    granted_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    -- M4 batch 3.1.16A-2 (CRITICAL #3): principal partitioning.  Rules
+    -- are scoped by (principal_id, project_id, policy_digest).  Legacy
+    -- rows (pre-A-2) get principal_id='legacy' and are never matched.
+    principal_id     TEXT NOT NULL DEFAULT 'legacy',
+    project_id       TEXT NOT NULL DEFAULT '',
+    policy_digest    TEXT NOT NULL DEFAULT '',
+    generation       INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_permissions_level ON permissions(permission_level, mode);
+-- M4 batch 3.1.16A-2: principal-scoped lookup index.
+CREATE INDEX IF NOT EXISTS idx_permissions_principal
+    ON permissions(principal_id, project_id, mode, permission_level);
 
 CREATE TABLE IF NOT EXISTS tools (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,16 +130,46 @@ CREATE TABLE IF NOT EXISTS audit_log (
     result      TEXT NOT NULL,
     detail      TEXT DEFAULT '',
     session_id  TEXT REFERENCES sessions(id),
-    created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    -- M4 batch 3.1.16A-2 (HIGH #19): principal attribution.  All audit
+    -- entries are stamped with the principal that triggered the action.
+    -- Legacy rows (pre-A-2) get principal_id='legacy'.
+    principal_id         TEXT NOT NULL DEFAULT 'legacy',
+    runtime_id           TEXT,
+    task_id              TEXT,
+    operation_id         TEXT,
+    policy_digest        TEXT,
+    authority_generation INTEGER,
+    source_transport     TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
 CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
+-- M4 batch 3.1.16A-2: principal-scoped audit lookup.
+CREATE INDEX IF NOT EXISTS idx_audit_log_principal
+    ON audit_log(principal_id, created_at);
 
 CREATE TABLE IF NOT EXISTS user_config (
     key        TEXT PRIMARY KEY,
     value      TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- M4 batch 3.1.16A-2 (CRITICAL #4): per-principal mode storage.
+-- Replaces the global ``user_config.current_mode`` for mode lookup.
+-- ``user_config`` is retained for genuinely global settings (API keys
+-- etc.) but mode is now principal-scoped.
+--
+-- Lookup order in ModeManager:
+--   1. (principal_id, session_id) — session-specific override
+--   2. (principal_id, '')         — principal default
+--   3. system default (office)
+CREATE TABLE IF NOT EXISTS principal_modes (
+    principal_id TEXT NOT NULL,
+    session_id   TEXT NOT NULL DEFAULT '',
+    mode         TEXT NOT NULL,
+    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (principal_id, session_id)
 );
 
 CREATE TABLE IF NOT EXISTS subagent_tasks (

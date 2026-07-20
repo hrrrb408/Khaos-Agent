@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import threading
 import time
 import uuid
@@ -172,7 +173,12 @@ class KhaosApp(App):
         self.db = Database(self.db_path)
         await self.db.connect()
         await self.db.run_migrations()
-        self.mode_manager = ModeManager(self.db, project_root=self.project_root)
+        # A2-5: bind the TUI's ModeManager to the local-uid principal so
+        # mode switches are principal-scoped (matching the runtime below).
+        self.mode_manager = ModeManager(
+            self.db, project_root=self.project_root,
+            principal_id=f"local-uid:{os.getuid()}",
+        )
         await self.mode_manager.load()
         if self.mode_override:
             await self.mode_manager.switch(ModeManager.parse(self.mode_override))
@@ -191,6 +197,7 @@ class KhaosApp(App):
             confirm_callback=self._confirm_callback,
             coding_context_builder=self._build_coding_context_builder(),
             skill_manager=self.skill_manager,
+            principal_id=f"local-uid:{os.getuid()}",
         ))
         self.router = runtime.loop.router
         self.agent_loop = runtime.loop

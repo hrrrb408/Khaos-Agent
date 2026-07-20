@@ -29,6 +29,7 @@ from khaos.rust_bridge import get_token_engine
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_guard import NetworkGuard
 from khaos.security.sandbox import Sandbox
+from khaos.db.state_root import project_id as compute_project_id
 from khaos.skills import SkillGenerator, SkillManager
 from khaos.tools import create_runtime_registry
 from khaos.tools.scheduler import ToolScheduler
@@ -422,7 +423,10 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     if cfg.db is None:
         raise ValueError("RuntimeConfig.db is required")
     root = cfg.project_root.expanduser().resolve()
-    mode_manager = cfg.mode_manager or ModeManager(cfg.db, project_root=root)
+    mode_manager = cfg.mode_manager or ModeManager(
+        cfg.db, project_root=root,
+        principal_id=cfg.principal_id, session_id=cfg.session_id,
+    )
     if cfg.mode_manager is None:
         await mode_manager.load()
     if cfg.mode_override:
@@ -443,13 +447,25 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     from khaos.security.effective_policy import load_effective_policy
     effective_policy = load_effective_policy(root)
     logger.info("effective security policy digest: %s", effective_policy.digest)
+    # A2-3: bind the PermissionEngine to (principal_id, project_id,
+    # policy_digest, runtime_id).  Rules loaded, granted, or revoked
+    # through this engine are scoped to that triple — a different
+    # principal's rules are invisible.  ``project_id`` is the same
+    # identifier used by the state root (sha256(realpath(root))[:32]),
+    # so every runtime under the same project shares the project_id
+    # but is isolated by principal_id.
     permission_engine = PermissionEngine(
         cfg.db,
         commands_require_approval=effective_policy.commands_require_approval,
+        principal_id=cfg.principal_id,
+        project_id=compute_project_id(root),
+        policy_digest=effective_policy.digest,
+        runtime_id=cfg.runtime_id,
     )
     await permission_engine.load_rules()
     memory_manager = cfg.memory_manager or MemoryManager(
-        MemoryStore(cfg.db), budget=MemoryBudget(),
+        MemoryStore(cfg.db, principal_id=cfg.principal_id),
+        budget=MemoryBudget(),
         mode_getter=lambda: mode_manager.current_mode,
         intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
     )
@@ -551,6 +567,9 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
                 log_path=resolve_safe_audit_log_path(
                     effective_policy.audit_log_path
                 ),
+                principal_id=cfg.principal_id,
+                runtime_id=cfg.runtime_id,
+                policy_digest=effective_policy.digest,
             )
         scheduler = ToolScheduler(
             registry, permission_engine,
@@ -572,6 +591,16 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     # The previous module-global ``file_tools._office_authority`` was removed
     # — direct callers must pass ``office_authority`` explicitly or fall back
     # to the legacy unfenced path (only safe for trusted inputs in tests).
+    # A2-7: wire the principal-scoped PermissionEngine + AuditLogger into
+    # the module-level permission_tools globals so the registered tools
+    # (list_permission_rules / grant_permission / revoke_permission /
+    # query_audit_logs / security_status) actually function in production.
+    # Both instances are already bound to ``cfg.principal_id`` at
+    # construction, so every tool call inherits the caller's principal
+    # scope — list/grant/revoke only see this principal's rules, and
+    # query_audit_logs defaults to filtering by this principal.
+    from khaos.tools import permission_tools
+    permission_tools.init_permission_tools(permission_engine, audit_logger)
     compressor = ContextCompressor(router, memory_manager=memory_manager)
     verify_factory = VerifyFixLoop
     skill_generator = SkillGenerator()

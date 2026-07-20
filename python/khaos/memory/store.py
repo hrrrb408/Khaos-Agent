@@ -44,24 +44,61 @@ class Memory:
 
 
 class MemoryStore:
-    """Three-scope memory storage."""
+    """Three-scope memory storage.
 
-    def __init__(self, db):
+    M4 batch 3.1.16A-2 (CRITICAL #5): every store is bound to exactly
+    one ``principal_id`` at construction.  All reads and writes are
+    scoped to that principal — a different principal's memories are
+    invisible.  Project-shared memories (``namespace='shared'``,
+    ``principal_id=''``) are visible to every principal.
+
+    Legacy callers that omit ``principal_id`` get ``'legacy'`` — the
+    memory is stored but never loaded by authenticated principals.
+    """
+
+    def __init__(self, db, *, principal_id: str = "legacy"):
         self.db = db
+        self._principal_id = principal_id
 
-    async def get(self, scope: MemoryScope, key: str) -> Memory | None:
-        row = await self.db.get_memory(scope.value, key)
+    def _effective_principal(self, namespace: str) -> str:
+        """A2-4: project-shared memories live under ``principal_id=''`` so
+        every principal sees them.  Private and session-scoped memories
+        stay bound to this store's principal.  This matches the
+        documented contract: ``namespace='shared'`` is the project-wide
+        cross-principal channel; everything else is principal-scoped."""
+        if namespace == "shared":
+            return ""
+        return self._principal_id
+
+    async def get(
+        self,
+        scope: MemoryScope,
+        key: str,
+        *,
+        namespace: str = "private",
+        session_id: str = "",
+    ) -> Memory | None:
+        row = await self.db.get_memory(
+            scope.value, key,
+            principal_id=self._effective_principal(namespace),
+            namespace=namespace,
+            session_id=session_id,
+        )
         return self._from_row(row) if row is not None else None
 
     async def set(
         self,
         memory: Memory,
         on_conflict: str = "overwrite",
+        *,
+        namespace: str = "private",
+        session_id: str = "",
     ) -> Memory | None:
         """Insert or update a memory.
 
         ``on_conflict`` controls what happens when a memory already exists for
-        the same (scope, key) but with a *different* value:
+        the same (namespace, principal_id, session_id, scope, key) but with a
+        *different* value:
 
         - ``"overwrite"`` (default, backward-compatible): always replace.
         - ``"resolve"``: consult :meth:`resolve_conflict`; if it returns None
@@ -71,9 +108,13 @@ class MemoryStore:
 
         When the value is unchanged the existing row is returned untouched.
         """
-        existing = await self.get(memory.scope, memory.key)
+        existing = await self.get(
+            memory.scope, memory.key, namespace=namespace, session_id=session_id,
+        )
         if existing is None or existing.value == memory.value:
-            return await self._raw_upsert(memory)
+            return await self._raw_upsert(
+                memory, namespace=namespace, session_id=session_id,
+            )
 
         if on_conflict == "resolve":
             winner = self.resolve_conflict(memory, existing)
@@ -86,19 +127,34 @@ class MemoryStore:
                     memory.value,
                 )
                 return None
-            return await self._raw_upsert(winner)
+            return await self._raw_upsert(
+                winner, namespace=namespace, session_id=session_id,
+            )
 
-        return await self._raw_upsert(memory)
+        return await self._raw_upsert(
+            memory, namespace=namespace, session_id=session_id,
+        )
 
-    async def _raw_upsert(self, memory: Memory) -> Memory:
+    async def _raw_upsert(
+        self,
+        memory: Memory,
+        *,
+        namespace: str = "private",
+        session_id: str = "",
+    ) -> Memory:
         memory_id = await self.db.upsert_memory(
             memory.scope.value,
             memory.key,
             memory.value,
             memory.ttl,
             memory.confidence.value,
+            principal_id=self._effective_principal(namespace),
+            namespace=namespace,
+            session_id=session_id,
         )
-        stored = await self.get(memory.scope, memory.key)
+        stored = await self.get(
+            memory.scope, memory.key, namespace=namespace, session_id=session_id,
+        )
         assert stored is not None
         stored.id = memory_id
         return stored
@@ -138,6 +194,10 @@ class MemoryStore:
         A memory is expired when ``updated_at + ttl_seconds < now``. ``now``
         defaults to the current UTC time. Rows with a NULL ``updated_at`` are
         treated as freshly created and never decayed.
+
+        M4 batch 3.1.16A-2: only this principal's memories are decayed —
+        the list_all() call is principal-scoped, so ``delete_memory_by_id``
+        can only receive IDs that belong to this principal.
         """
         moment = now or datetime.utcnow()
         before = len(await self.list_all())
@@ -157,17 +217,54 @@ class MemoryStore:
             logger.info("memory decay removed %d expired entries", removed)
         return removed
 
-    async def delete(self, scope: MemoryScope, key: str) -> None:
-        await self.db.delete_memory(scope.value, key)
+    async def delete(
+        self,
+        scope: MemoryScope,
+        key: str,
+        *,
+        namespace: str = "private",
+        session_id: str = "",
+    ) -> None:
+        await self.db.delete_memory(
+            scope.value, key,
+            principal_id=self._effective_principal(namespace),
+            namespace=namespace,
+            session_id=session_id,
+        )
 
     async def list_by_scope(self, scope: MemoryScope) -> list[Memory]:
-        return [self._from_row(row) for row in await self.db.list_memories(scope.value)]
+        """List all memories for this principal in the given scope.
+
+        Includes the principal's private memories AND project-shared
+        memories (``namespace='shared'``).  Legacy rows are excluded.
+        """
+        return [
+            self._from_row(row)
+            for row in await self.db.list_memories(
+                scope.value, principal_id=self._principal_id,
+            )
+        ]
 
     async def list_all(self) -> list[Memory]:
-        return [self._from_row(row) for row in await self.db.list_memories()]
+        """List all memories visible to this principal.
+
+        Includes the principal's private memories AND project-shared
+        memories.  Legacy rows and other principals' private memories
+        are excluded.
+        """
+        return [
+            self._from_row(row)
+            for row in await self.db.list_memories(principal_id=self._principal_id)
+        ]
 
     async def search(self, query: str, top_k: int = 5) -> list[Memory]:
-        memories = [self._from_row(row) for row in await self.db.search_memories(query, top_k)]
+        """FTS5 search across this principal's visible memories."""
+        memories = [
+            self._from_row(row)
+            for row in await self.db.search_memories(
+                query, top_k, principal_id=self._principal_id,
+            )
+        ]
         for memory in memories:
             if memory.id is not None:
                 await self.touch(memory.id)
