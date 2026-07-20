@@ -1448,6 +1448,14 @@ async def serve_json_lines(
     Previously the code unconditionally ``unlink``-ed any existing
     socket, which let a second process replace the first process's
     live socket.
+
+    M4 batch 3.1.16A-1 (CRITICAL-1): the caller is expected to have
+    resolved ``db_path`` via ``state_root.resolve_state_db_path`` +
+    ``state_root.open_state_db_safely``.  When ``KHAOS_ALLOW_PROJECT_DB=1``
+    is set (tests), the safety checks are bypassed so the test suite
+    can pass ``tmp_path / "khaos.db"`` directly.  Production callers
+    (CLI ``cmd_start``, ``serve_json_lines.main``) MUST resolve the
+    state root path before calling this function.
     """
     uds_path = Path(socket_path).expanduser().resolve()
     capability = gateway_capability or _load_rpc_capability()
@@ -1935,16 +1943,25 @@ def _memory_to_dict(memory: Memory) -> dict:
 
 
 def main() -> None:
+    from khaos.db.state_root import open_state_db_safely, resolve_state_db_path
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--socket", default="/tmp/khaos-agent.sock")
-    parser.add_argument("--db", default="khaos.db")
+    parser.add_argument(
+        "--db",
+        default=None,
+        help="SQLite database path (default: ~/.khaos/state/<project-id>/state.db)",
+    )
     parser.add_argument("--config", default="config.yaml")
     parser.add_argument("--subagents", action="store_true")
     args = parser.parse_args()
+    db_path = open_state_db_safely(
+        resolve_state_db_path(Path.cwd(), args.db)
+    )
     asyncio.run(
         serve_json_lines(
             args.socket,
-            args.db,
+            str(db_path),
             project_root=Path.cwd(),
             config_path=Path(args.config),
             enable_subagents=args.subagents,
