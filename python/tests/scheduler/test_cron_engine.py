@@ -1588,18 +1588,18 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
-        # M4 batch 3.1.11 (HIGH-2): patch ``control_update_scheduled_task``
+        # M4 batch 3.1.11 (HIGH-2): patch ``control_finalize_scheduled_task``
         # (the idempotent CAS used by control ops) to FAIL so remove()'s
         # persist raises and the task is retained in _tasks.  remove()
         # no longer uses the unconditional ``update_scheduled_task`` —
         # it goes through ``_persist_task_state`` (control op path) →
-        # ``control_update_scheduled_task``.
-        original_update = db.control_update_scheduled_task
+        # ``control_finalize_scheduled_task``.
+        original_update = db.control_finalize_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.control_update_scheduled_task = failing_update
+        db.control_finalize_scheduled_task = failing_update
 
         # remove() cancels the executor (clean terminate), then tries
         # to persist CANCELLED — FAILS.  The task is NOT popped from
@@ -1634,9 +1634,9 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
             "cancel completed"
         )
 
-        # Restore control_update_scheduled_task so stop()'s reconcile
+        # Restore control_finalize_scheduled_task so stop()'s reconcile
         # can succeed.
-        db.control_update_scheduled_task = original_update
+        db.control_finalize_scheduled_task = original_update
 
         # stop() retries the persist via reconcile — succeeds.
         await engine.stop(timeout=2.0)
@@ -1893,17 +1893,17 @@ async def test_pause_returns_persistence_pending_on_db_failure(
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
         # M4 batch 3.1.11 (HIGH-2): patch
-        # ``control_update_scheduled_task`` (the idempotent CAS used by
+        # ``control_finalize_scheduled_task`` (the idempotent CAS used by
         # control ops) to FAIL so pause()'s persist raises.  pause() no
         # longer uses the unconditional ``update_scheduled_task`` — it
         # goes through ``_persist_task_state`` (control op path) →
-        # ``control_update_scheduled_task``.
-        original_update = db.control_update_scheduled_task
+        # ``control_finalize_scheduled_task``.
+        original_update = db.control_finalize_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.control_update_scheduled_task = failing_update
+        db.control_finalize_scheduled_task = failing_update
 
         # pause() cancels the executor (clean terminate), then tries
         # to persist PAUSED — FAILS.  Returns persistence_pending.
@@ -1924,9 +1924,9 @@ async def test_pause_returns_persistence_pending_on_db_failure(
             "retry the terminal persist"
         )
 
-        # Restore control_update_scheduled_task so stop()'s reconcile
+        # Restore control_finalize_scheduled_task so stop()'s reconcile
         # can succeed.
-        db.control_update_scheduled_task = original_update
+        db.control_finalize_scheduled_task = original_update
 
         # stop() retries the persist via reconcile — succeeds.
         await engine.stop(timeout=2.0)
@@ -2989,17 +2989,17 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
         # M4 batch 3.1.11 (HIGH-2): patch
-        # ``control_update_scheduled_task`` (the idempotent CAS used by
+        # ``control_finalize_scheduled_task`` (the idempotent CAS used by
         # control ops) to FAIL so pause()'s persist raises.  pause() no
         # longer uses the unconditional ``update_scheduled_task`` — it
         # goes through ``_persist_task_state`` (control op path) →
-        # ``control_update_scheduled_task``.
-        original_update = db.control_update_scheduled_task
+        # ``control_finalize_scheduled_task``.
+        original_update = db.control_finalize_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.control_update_scheduled_task = failing_update
+        db.control_finalize_scheduled_task = failing_update
 
         # First pause() — executor cancels cleanly, but DB write
         # fails → persistence_pending.
@@ -3029,9 +3029,9 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
             "the persist still failing"
         )
 
-        # Restore control_update_scheduled_task so the retry can
+        # Restore control_finalize_scheduled_task so the retry can
         # succeed.
-        db.control_update_scheduled_task = original_update
+        db.control_finalize_scheduled_task = original_update
 
         # Third pause() — DB recovered, persist succeeds → ok.
         result3 = await engine.pause(task_id, principal_id="test")
@@ -3100,17 +3100,17 @@ async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
         assert engine._tasks[task_id].status == TaskStatus.PAUSED
 
         # M4 batch 3.1.11 (HIGH-2): patch
-        # ``control_update_scheduled_task`` to fail so resume's
-        # persist-first DB write raises.  resume() no longer uses the
-        # unconditional ``update_scheduled_task`` with bump_version=True
-        # — it uses the idempotent CAS ``control_update_scheduled_task``
-        # with explicit expected_version + target_version.
-        original_update = db.control_update_scheduled_task
+        # ``control_finalize_scheduled_task`` to fail so resume's
+        # persist-first DB write raises.  resume() uses
+        # ``control_finalize_scheduled_task`` (M4 batch 3.1.12
+        # CRITICAL-2 — atomically clears any residual lease from a
+        # failed pause).
+        original_update = db.control_finalize_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.control_update_scheduled_task = failing_update
+        db.control_finalize_scheduled_task = failing_update
 
         # resume() — DB write fails.  In-memory task MUST stay PAUSED.
         result = await engine.resume(task_id, principal_id="test")
@@ -3123,7 +3123,7 @@ async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
         )
 
         # Restore the DB.  Now resume() should succeed.
-        db.control_update_scheduled_task = original_update
+        db.control_finalize_scheduled_task = original_update
         result = await engine.resume(task_id, principal_id="test")
         assert result == "ok", (
             f"expected ok (DB recovered), got {result!r}"
@@ -3174,15 +3174,15 @@ async def test_resume_persist_first_does_not_fire_tick(tmp_path) -> None:
         assert result == "ok"
 
         # M4 batch 3.1.11 (HIGH-2): patch
-        # ``control_update_scheduled_task`` so resume's persist fails.
-        # resume() uses the idempotent CAS (not the unconditional
-        # ``update_scheduled_task``).
-        original_update = db.control_update_scheduled_task
+        # ``control_finalize_scheduled_task`` so resume's persist fails.
+        # resume() uses the idempotent CAS (M4 batch 3.1.12
+        # CRITICAL-2 — ``control_finalize_scheduled_task``).
+        original_update = db.control_finalize_scheduled_task
 
         async def failing_update(*args, **kwargs):
             raise RuntimeError("DB is being torn down")
 
-        db.control_update_scheduled_task = failing_update
+        db.control_finalize_scheduled_task = failing_update
 
         # resume() — fails.  Task stays PAUSED.
         result = await engine.resume(task_id, principal_id="test")
@@ -3199,7 +3199,7 @@ async def test_resume_persist_first_does_not_fire_tick(tmp_path) -> None:
         )
 
         # Restore DB and resume successfully.
-        db.control_update_scheduled_task = original_update
+        db.control_finalize_scheduled_task = original_update
         result = await engine.resume(task_id, principal_id="test")
         assert result == "ok"
 
