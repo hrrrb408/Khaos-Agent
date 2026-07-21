@@ -27,17 +27,21 @@ var (
 )
 
 // CreateTask creates a persistent coding task.
-func (c PythonClient) CreateTask(ctx context.Context, goal string) (map[string]any, error) {
-	return c.callMap(ctx, "TaskService.Create", map[string]any{"goal": goal})
+//
+// C-1-1: ``principalID`` is the authenticated principal from the
+// Gateway's auth context.  It is written into the RPC auth envelope
+// so Python's RequestContext.principal_id matches the caller.
+func (c PythonClient) CreateTask(ctx context.Context, principalID string, goal string) (map[string]any, error) {
+	return c.callMap(ctx, "TaskService.Create", map[string]any{"goal": goal}, principalID)
 }
-func (c PythonClient) ListTasks(ctx context.Context, activeOnly bool) ([]map[string]any, error) {
-	return c.callList(ctx, "TaskService.List", map[string]any{"active_only": activeOnly})
+func (c PythonClient) ListTasks(ctx context.Context, principalID string, activeOnly bool) ([]map[string]any, error) {
+	return c.callList(ctx, "TaskService.List", map[string]any{"active_only": activeOnly}, principalID)
 }
-func (c PythonClient) GetTask(ctx context.Context, id string) (map[string]any, error) {
-	return c.callMap(ctx, "TaskService.Get", map[string]any{"task_id": id})
+func (c PythonClient) GetTask(ctx context.Context, principalID string, id string) (map[string]any, error) {
+	return c.callMap(ctx, "TaskService.Get", map[string]any{"task_id": id}, principalID)
 }
-func (c PythonClient) CancelTask(ctx context.Context, id string) (api.TransitionResult, error) {
-	return c.taskAction(ctx, "TaskService.Cancel", id)
+func (c PythonClient) CancelTask(ctx context.Context, principalID string, id string) (api.TransitionResult, error) {
+	return c.taskAction(ctx, "TaskService.Cancel", principalID, id)
 }
 func (c PythonClient) ApproveTask(ctx context.Context, id string, principalID string, sessionID string, bindingDigest string) (api.TransitionResult, error) {
 	return c.taskApprovalAction(ctx, "TaskService.Approve", id, principalID, sessionID, bindingDigest)
@@ -50,7 +54,7 @@ func (c PythonClient) taskApprovalAction(ctx context.Context, method, id, princi
 	response, err := c.callMap(ctx, method, map[string]any{
 		"task_id": id, "principal_id": principalID, "session_id": sessionID,
 		"binding_digest": bindingDigest,
-	})
+	}, principalID)
 	if err != nil {
 		return "", err
 	}
@@ -62,11 +66,11 @@ func (c PythonClient) taskApprovalAction(ctx context.Context, method, id, princi
 	}
 	return api.TransitionUpdated, nil
 }
-func (c PythonClient) TaskArtifacts(ctx context.Context, id string) ([]map[string]any, error) {
-	return c.callList(ctx, "TaskService.Artifacts", map[string]any{"task_id": id})
+func (c PythonClient) TaskArtifacts(ctx context.Context, principalID string, id string) ([]map[string]any, error) {
+	return c.callList(ctx, "TaskService.Artifacts", map[string]any{"task_id": id}, principalID)
 }
-func (c PythonClient) taskAction(ctx context.Context, method, id string) (api.TransitionResult, error) {
-	response, err := c.callMap(ctx, method, map[string]any{"task_id": id})
+func (c PythonClient) taskAction(ctx context.Context, method, principalID, id string) (api.TransitionResult, error) {
+	response, err := c.callMap(ctx, method, map[string]any{"task_id": id}, principalID)
 	if err != nil {
 		return "", err
 	}
@@ -80,13 +84,13 @@ func (c PythonClient) taskAction(ctx context.Context, method, id string) (api.Tr
 	return api.TransitionUpdated, nil
 }
 
-func (c PythonClient) TaskEvents(ctx context.Context, id string) (<-chan map[string]any, error) {
+func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id string) (<-chan map[string]any, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
-	if err := c.writeRequest(conn, "TaskService.Events", map[string]any{"task_id": id}); err != nil {
+	if err := c.writeRequest(conn, "TaskService.Events", map[string]any{"task_id": id}, principalID); err != nil {
 		stopCancelWatch()
 		conn.Close()
 		return nil, err
@@ -117,7 +121,20 @@ type PythonClient struct {
 	Capability string
 }
 
-func (c PythonClient) writeRequest(conn net.Conn, method string, payload any) error {
+// writeRequest serializes and signs one JSON-line RPC request.
+//
+// C-1-1: ``principalID`` is the sole source of truth for the
+// principal identity carried in the RPC auth envelope.  Previously
+// this method extracted ``principal_id`` from the payload (defaulting
+// to ``"gateway"``), which caused ~15 RPC methods to lose the
+// caller's identity entirely.  Now every caller must pass the
+// authenticated principal explicitly; Python's
+// ``GatewayRPCAuthenticator`` still verifies that, if the payload
+// contains ``principal_id``, it matches the envelope value (so
+// Chat / ConfirmPermission / Spawn / ApproveTask / RejectTask —
+// which embed ``principal_id`` in the payload for the Python service
+// layer — remain transport-bound).
+func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, principalID string) error {
 	if len(c.Capability) < 32 {
 		return fmt.Errorf("Python AgentService capability is missing or too short")
 	}
@@ -140,12 +157,6 @@ func (c PythonClient) writeRequest(conn net.Conn, method string, payload any) er
 	}
 	nonce := hex.EncodeToString(nonceBytes)
 	issuedAt := time.Now().Unix()
-	principalID := "gateway"
-	if value, ok := normalized.(map[string]any); ok {
-		if principal, ok := value["principal_id"].(string); ok && principal != "" {
-			principalID = principal
-		}
-	}
 	payloadDigest := hex.EncodeToString(digest[:])
 	signed := fmt.Sprintf("%s\n%s\n%d\n%s\n%s", method, nonce, issuedAt, principalID, payloadDigest)
 	methodKey := hmac.New(sha256.New, []byte(c.Capability))
@@ -172,12 +183,17 @@ func canonicalJSON(value any) ([]byte, error) {
 }
 
 // HandleWebhook forwards an inbound webhook to Python without interpreting it.
-func (c PythonClient) HandleWebhook(ctx context.Context, request api.WebhookRequest) (api.WebhookResponse, error) {
+//
+// C-1-1: ``principalID`` is ``""`` for signature-authenticated webhook
+// ingress (no API-key principal in that path); Python's
+// ``AgentService.HandleWebhook`` treats the empty principal as
+// unauthenticated platform ingress.
+func (c PythonClient) HandleWebhook(ctx context.Context, principalID string, request api.WebhookRequest) (api.WebhookResponse, error) {
 	response, err := c.callMap(ctx, "AgentService.HandleWebhook", map[string]any{
 		"platform": request.Platform, "channel_id": request.ChannelID,
 		"headers": request.Headers, "query": request.Query,
 		"body": string(request.Body),
-	})
+	}, principalID)
 	if err != nil {
 		return api.WebhookResponse{}, err
 	}
@@ -185,8 +201,8 @@ func (c PythonClient) HandleWebhook(ctx context.Context, request api.WebhookRequ
 }
 
 // ListChannels returns all registered channels.
-func (c PythonClient) ListChannels(ctx context.Context) ([]api.ChannelInfo, error) {
-	response, err := c.callMap(ctx, "ChannelService.List", map[string]any{})
+func (c PythonClient) ListChannels(ctx context.Context, principalID string) ([]api.ChannelInfo, error) {
+	response, err := c.callMap(ctx, "ChannelService.List", map[string]any{}, principalID)
 	if err != nil {
 		return nil, err
 	}
@@ -200,12 +216,12 @@ func (c PythonClient) ListChannels(ctx context.Context) ([]api.ChannelInfo, erro
 }
 
 // SetChannelEnabled changes one registered channel's enabled state.
-func (c PythonClient) SetChannelEnabled(ctx context.Context, channelID string, enabled bool) error {
+func (c PythonClient) SetChannelEnabled(ctx context.Context, principalID string, channelID string, enabled bool) error {
 	method := "ChannelService.Disable"
 	if enabled {
 		method = "ChannelService.Enable"
 	}
-	response, err := c.callMap(ctx, method, map[string]any{"channel_id": channelID})
+	response, err := c.callMap(ctx, method, map[string]any{"channel_id": channelID}, principalID)
 	if err != nil {
 		return err
 	}
@@ -227,7 +243,7 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 		return nil, err
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
-	if err := c.writeRequest(conn, "AgentService.Chat", req); err != nil {
+	if err := c.writeRequest(conn, "AgentService.Chat", req, req.PrincipalID); err != nil {
 		stopCancelWatch()
 		conn.Close()
 		return nil, err
@@ -267,11 +283,11 @@ func (c PythonClient) ConfirmPermission(ctx context.Context, principalID string,
 		"binding_digest": bindingDigest,
 		"approved":       approved,
 		"remember":       remember,
-	})
+	}, principalID)
 }
 
 // SwitchMode switches mode through Python.
-func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error) {
+func (c PythonClient) SwitchMode(ctx context.Context, principalID string, sessionID string, targetMode string) (string, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return "", err
@@ -280,7 +296,7 @@ func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMo
 	defer closeOnContextDone(ctx, conn)()
 	if err := c.writeRequest(conn, "AgentService.SwitchMode", map[string]any{
 		"session_id": sessionID, "target_mode": targetMode,
-	}); err != nil {
+	}, principalID); err != nil {
 		return "", err
 	}
 	var response map[string]string
@@ -291,7 +307,7 @@ func (c PythonClient) SwitchMode(ctx context.Context, sessionID string, targetMo
 }
 
 // Query queries audit records through Python.
-func (c PythonClient) Query(ctx context.Context, action, result, since, until string, limit int) ([]api.AuditEntry, error) {
+func (c PythonClient) Query(ctx context.Context, principalID string, action, result, since, until string, limit int) ([]api.AuditEntry, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
@@ -313,7 +329,7 @@ func (c PythonClient) Query(ctx context.Context, action, result, since, until st
 	if until != "" {
 		payload["until"] = until
 	}
-	if err := c.writeRequest(conn, "AuditService.Query", payload); err != nil {
+	if err := c.writeRequest(conn, "AuditService.Query", payload, principalID); err != nil {
 		return nil, err
 	}
 	var entries []api.AuditEntry
@@ -331,31 +347,31 @@ func (c PythonClient) Spawn(ctx context.Context, principalID string, goal string
 		"context":      taskContext,
 		"tools":        tools,
 		"timeout":      timeout,
-	})
+	}, principalID)
 }
 
 // CollectResults collects completed subagent results through Python.
 func (c PythonClient) CollectResults(ctx context.Context, principalID string) (map[string]any, error) {
 	return c.callMap(ctx, "SubAgentService.Collect", map[string]any{
 		"principal_id": principalID,
-	})
+	}, principalID)
 }
 
 // Status returns subagent service status through Python.
 func (c PythonClient) Status(ctx context.Context, principalID string) (map[string]any, error) {
 	return c.callMap(ctx, "SubAgentService.Status", map[string]any{
 		"principal_id": principalID,
-	})
+	}, principalID)
 }
 
-func (c PythonClient) callMap(ctx context.Context, method string, payload map[string]any) (map[string]any, error) {
+func (c PythonClient) callMap(ctx context.Context, method string, payload map[string]any, principalID string) (map[string]any, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	if err := c.writeRequest(conn, method, payload); err != nil {
+	if err := c.writeRequest(conn, method, payload, principalID); err != nil {
 		return nil, err
 	}
 	var response map[string]any
@@ -365,14 +381,14 @@ func (c PythonClient) callMap(ctx context.Context, method string, payload map[st
 	return response, nil
 }
 
-func (c PythonClient) callList(ctx context.Context, method string, payload map[string]any) ([]map[string]any, error) {
+func (c PythonClient) callList(ctx context.Context, method string, payload map[string]any, principalID string) ([]map[string]any, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	if err := c.writeRequest(conn, method, payload); err != nil {
+	if err := c.writeRequest(conn, method, payload, principalID); err != nil {
 		return nil, err
 	}
 	var response []map[string]any

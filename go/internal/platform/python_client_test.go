@@ -24,16 +24,23 @@ func TestPythonClientSignsMethodPrincipalAndPayload(t *testing.T) {
 	defer serverConn.Close()
 	client := PythonClient{Capability: "cccccccccccccccccccccccccccccccccccccccccccccccc"}
 	done := make(chan error, 1)
+	// C-1-1: principalID is now passed explicitly to writeRequest
+	// (previously extracted from payload).  The auth envelope's
+	// principal_id must match the caller-supplied value.
+	const principalID = "api-key:deadbeef"
 	go func() {
 		done <- client.writeRequest(clientConn, "TaskService.Approve", map[string]any{
-			"task_id": "task", "principal_id": "principal",
-		})
+			"task_id": "task", "principal_id": principalID,
+		}, principalID)
 	}()
 	var request map[string]any
 	if err := json.NewDecoder(serverConn).Decode(&request); err != nil {
 		t.Fatal(err)
 	}
 	auth := request["auth"].(map[string]any)
+	if auth["principal_id"] != principalID {
+		t.Fatalf("auth principal_id = %v, want %q", auth["principal_id"], principalID)
+	}
 	payload := request["payload"]
 	canonical, _ := json.Marshal(payload)
 	digest := sha256.Sum256(canonical)
@@ -58,7 +65,7 @@ func TestPythonClientRefusesMissingCapability(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
-	if err := (PythonClient{}).writeRequest(clientConn, "TaskService.List", map[string]any{}); err == nil {
+	if err := (PythonClient{}).writeRequest(clientConn, "TaskService.List", map[string]any{}, "api-key:whatever"); err == nil {
 		t.Fatal("expected missing capability to fail closed")
 	}
 }
