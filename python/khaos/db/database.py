@@ -121,6 +121,20 @@ class Database:
         await self._ensure_messages_principal_column()
         await self._ensure_agent_turns_principal_column()
         await self._ensure_session_bookmarks_principal_column()
+        # M4 batch 3.1.16A-5-1 (CRITICAL): project identity closure.
+        # Adds ``project_id`` column to the 8 tables missing it.
+        # Legacy rows get ``project_id=''`` ("unbound").  A-5-1b will
+        # add drift detection (``ctx.project_id != bound_project_id``
+        # → fail-closed) so unbound rows are visible but new writes
+        # always stamp the live project_id.
+        await self._ensure_sessions_project_id_column()
+        await self._ensure_messages_project_id_column()
+        await self._ensure_agent_turns_project_id_column()
+        await self._ensure_session_bookmarks_project_id_column()
+        await self._ensure_memories_project_id_column()
+        await self._ensure_audit_log_project_id_column()
+        await self._ensure_coding_tasks_project_id_column()
+        await self._ensure_scheduler_journal_project_id_column()
 
     async def _ensure_scheduled_tasks_lifecycle_version(self) -> None:
         """Add ``lifecycle_version`` column to legacy ``scheduled_tasks``.
@@ -637,6 +651,136 @@ class Database:
             "ON session_bookmarks(principal_id, session_id)"
         )
         await conn.commit()
+
+    # ------------------------------------------------------------------
+    # M4 batch 3.1.16A-5-1 (CRITICAL): project identity closure.
+    #
+    # The following helpers add a ``project_id`` column to the 8 tables
+    # that were missing it (sessions / messages / agent_turns /
+    # session_bookmarks / memories / audit_log / coding_tasks /
+    # scheduler_operation_journal).  ``scheduled_tasks`` and
+    # ``permissions`` already had ``project_id`` (B-1 and A-2
+    # respectively).
+    #
+    # Legacy rows (pre-A-5-1) get ``project_id=''`` — "unbound".  A-5-1b
+    # will introduce drift detection (``ctx.project_id !=
+    # bound_project_id`` → fail-closed) so unbound rows are visible but
+    # new writes always stamp the live project_id.  A-5-2 may later
+    # provide a ``reclaim`` tool to backfill ``project_id`` on legacy
+    # rows owned by the current project.
+    #
+    # The helpers are idempotent: re-running ``run_migrations`` on an
+    # already-migrated DB is a no-op.
+    # ------------------------------------------------------------------
+
+    async def _ensure_table_project_id_column(
+        self,
+        table: str,
+        index_name: str,
+        index_columns: str,
+    ) -> None:
+        """Generic helper: add ``project_id`` column + index to a table.
+
+        Args:
+            table: Table name (e.g. ``"sessions"``).
+            index_name: Index name (e.g. ``"idx_sessions_project"``).
+            index_columns: Comma-separated columns for the index
+                (e.g. ``"project_id, principal_id, status"``).
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(f"PRAGMA table_info({table})")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "project_id" not in columns:
+            await conn.execute(
+                f"ALTER TABLE {table} "
+                "ADD COLUMN project_id TEXT NOT NULL DEFAULT ''"
+            )
+            await conn.commit()
+        await conn.execute(
+            f"CREATE INDEX IF NOT EXISTS {index_name} "
+            f"ON {table}({index_columns})"
+        )
+        await conn.commit()
+
+    async def _ensure_sessions_project_id_column(self) -> None:
+        """A-5-1: add ``project_id`` to ``sessions``."""
+        await self._ensure_table_project_id_column(
+            "sessions",
+            "idx_sessions_project",
+            "project_id, principal_id, status",
+        )
+
+    async def _ensure_messages_project_id_column(self) -> None:
+        """A-5-1: add ``project_id`` to ``messages``."""
+        await self._ensure_table_project_id_column(
+            "messages",
+            "idx_messages_project",
+            "project_id, principal_id, session_id",
+        )
+
+    async def _ensure_agent_turns_project_id_column(self) -> None:
+        """A-5-1: add ``project_id`` to ``agent_turns``."""
+        await self._ensure_table_project_id_column(
+            "agent_turns",
+            "idx_agent_turns_project",
+            "project_id, principal_id, session_id",
+        )
+
+    async def _ensure_session_bookmarks_project_id_column(self) -> None:
+        """A-5-1: add ``project_id`` to ``session_bookmarks``."""
+        await self._ensure_table_project_id_column(
+            "session_bookmarks",
+            "idx_session_bookmarks_project",
+            "project_id, principal_id, session_id",
+        )
+
+    async def _ensure_memories_project_id_column(self) -> None:
+        """A-5-1: add ``project_id`` to ``memories``.
+
+        Note: ``project_id`` is NOT added to the UNIQUE constraint
+        (``namespace, principal_id, session_id, scope, key``).  Adding
+        it would require a table rebuild (drop + recreate + migrate)
+        and is unnecessary because ``principal_id`` already partitions
+        the namespace — two projects sharing a state DB (which A-1
+        forbids) would still collide on the same principal's memory
+        keys.  The column is for forensics / future sweep queries,
+        not for uniqueness enforcement.
+        """
+        await self._ensure_table_project_id_column(
+            "memories",
+            "idx_memories_project",
+            "project_id, namespace, principal_id, scope",
+        )
+
+    async def _ensure_audit_log_project_id_column(self) -> None:
+        """A-5-1: add ``project_id`` to ``audit_log``."""
+        await self._ensure_table_project_id_column(
+            "audit_log",
+            "idx_audit_log_project",
+            "project_id, principal_id, created_at",
+        )
+
+    async def _ensure_coding_tasks_project_id_column(self) -> None:
+        """A-5-1: add ``project_id`` to ``coding_tasks``."""
+        await self._ensure_table_project_id_column(
+            "coding_tasks",
+            "idx_coding_tasks_project",
+            "project_id, principal_id, status",
+        )
+
+    async def _ensure_scheduler_journal_project_id_column(self) -> None:
+        """A-5-1: add ``project_id`` to ``scheduler_operation_journal``.
+
+        This column was omitted from B-5 (oversight) — the journal
+        table already had ``principal_id`` and ``policy_digest`` but
+        not ``project_id``.  A-5-1 closes the gap so cross-project
+        forensics can disambiguate entries.
+        """
+        await self._ensure_table_project_id_column(
+            "scheduler_operation_journal",
+            "idx_scheduler_journal_project",
+            "project_id, task_id, seq",
+        )
 
     async def create_session(
         self,
