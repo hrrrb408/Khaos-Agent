@@ -20,10 +20,16 @@ type ChatEvent struct {
 }
 
 // AgentClient is implemented by the Python gRPC client and by tests.
+//
+// C-1-1: every method that dispatches to Python must carry the
+// authenticated principal so Python's RequestContext.principal_id
+// (the sole identity authority) matches the Gateway's auth context.
+// ``Chat`` and ``ConfirmPermission`` already took ``principalID``;
+// ``SwitchMode`` now takes it too.
 type AgentClient interface {
 	Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
 	ConfirmPermission(ctx context.Context, principalID string, sessionID string, toolCallID string, bindingDigest string, approved bool, remember bool) error
-	SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error)
+	SwitchMode(ctx context.Context, principalID string, sessionID string, targetMode string) (string, error)
 }
 
 // WebhookRequest preserves an external platform's original webhook data.
@@ -52,10 +58,16 @@ type ChannelInfo struct {
 }
 
 // ChannelClient is the optional channel-management RPC surface.
+//
+// C-1-1: every method now carries the authenticated principal.
+// ``HandleWebhook`` receives ``""`` for signature-authenticated
+// webhook ingress (no API-key principal in that path); Python's
+// ``AgentService.HandleWebhook`` treats empty principal as
+// unauthenticated platform ingress.
 type ChannelClient interface {
-	HandleWebhook(ctx context.Context, request WebhookRequest) (WebhookResponse, error)
-	ListChannels(ctx context.Context) ([]ChannelInfo, error)
-	SetChannelEnabled(ctx context.Context, channelID string, enabled bool) error
+	HandleWebhook(ctx context.Context, principalID string, request WebhookRequest) (WebhookResponse, error)
+	ListChannels(ctx context.Context, principalID string) ([]ChannelInfo, error)
+	SetChannelEnabled(ctx context.Context, principalID string, channelID string, enabled bool) error
 }
 
 // TransitionResult identifies the outcome of a task lifecycle transition.
@@ -69,15 +81,22 @@ const (
 )
 
 // TaskClient manages persistent coding tasks and their event streams.
+//
+// C-1-1: ``principalID`` is now the first argument of every method
+// (after ``ctx``) so Python's TaskService can scope by
+// ``ctx.principal_id`` instead of falling back to ``"gateway"``.
+// ``ApproveTask`` / ``RejectTask`` already took ``principalID`` (in
+// a different position) — their signatures are unchanged for
+// backward compatibility with the approval binding flow.
 type TaskClient interface {
-	CreateTask(ctx context.Context, goal string) (map[string]any, error)
-	ListTasks(ctx context.Context, activeOnly bool) ([]map[string]any, error)
-	GetTask(ctx context.Context, id string) (map[string]any, error)
-	CancelTask(ctx context.Context, id string) (TransitionResult, error)
+	CreateTask(ctx context.Context, principalID string, goal string) (map[string]any, error)
+	ListTasks(ctx context.Context, principalID string, activeOnly bool) ([]map[string]any, error)
+	GetTask(ctx context.Context, principalID string, id string) (map[string]any, error)
+	CancelTask(ctx context.Context, principalID string, id string) (TransitionResult, error)
 	ApproveTask(ctx context.Context, id string, principalID string, sessionID string, bindingDigest string) (TransitionResult, error)
 	RejectTask(ctx context.Context, id string, principalID string, sessionID string, bindingDigest string) (TransitionResult, error)
-	TaskEvents(ctx context.Context, id string) (<-chan map[string]any, error)
-	TaskArtifacts(ctx context.Context, id string) ([]map[string]any, error)
+	TaskEvents(ctx context.Context, principalID string, id string) (<-chan map[string]any, error)
+	TaskArtifacts(ctx context.Context, principalID string, id string) ([]map[string]any, error)
 }
 
 // SubagentClient forwards subagent lifecycle calls to the Python service.
@@ -120,8 +139,12 @@ type AuditEntry struct {
 }
 
 // AuditClient queries audit records from the Python audit service.
+//
+// C-1-1: ``Query`` now carries the authenticated principal so
+// Python's AuditService can scope by ``ctx.principal_id`` instead
+// of returning only ``"gateway"``-attributed entries.
 type AuditClient interface {
-	Query(ctx context.Context, action, result, since, until string, limit int) ([]AuditEntry, error)
+	Query(ctx context.Context, principalID string, action, result, since, until string, limit int) ([]AuditEntry, error)
 }
 
 // ConfigStore abstracts runtime config persistence.

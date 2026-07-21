@@ -39,7 +39,7 @@ func (m mockAgentClient) ConfirmPermission(ctx context.Context, principalID stri
 	return nil
 }
 
-func (m mockAgentClient) SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error) {
+func (m mockAgentClient) SwitchMode(ctx context.Context, principalID string, sessionID string, targetMode string) (string, error) {
 	return targetMode, nil
 }
 

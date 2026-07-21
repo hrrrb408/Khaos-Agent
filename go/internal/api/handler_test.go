@@ -47,7 +47,7 @@ func (m *mockAgent) ConfirmPermission(ctx context.Context, principalID string, s
 	return nil
 }
 
-func (m *mockAgent) SwitchMode(ctx context.Context, sessionID string, targetMode string) (string, error) {
+func (m *mockAgent) SwitchMode(ctx context.Context, principalID string, sessionID string, targetMode string) (string, error) {
 	m.mode = targetMode
 	return targetMode, nil
 }
@@ -64,20 +64,22 @@ type mockChannelAgent struct {
 
 type mockTaskClient struct{ activeOnly bool }
 
-func (m *mockTaskClient) CreateTask(_ context.Context, goal string) (map[string]any, error) {
+func (m *mockTaskClient) CreateTask(_ context.Context, principalID string, goal string) (map[string]any, error) {
 	return map[string]any{"id": "t1", "goal": goal}, nil
 }
-func (m *mockTaskClient) ListTasks(_ context.Context, active bool) ([]map[string]any, error) {
+func (m *mockTaskClient) ListTasks(_ context.Context, principalID string, active bool) ([]map[string]any, error) {
 	m.activeOnly = active
 	return []map[string]any{{"id": "t1"}}, nil
 }
-func (m *mockTaskClient) GetTask(_ context.Context, id string) (map[string]any, error) {
+
+func (m *mockTaskClient) GetTask(_ context.Context, principalID string, id string) (map[string]any, error) {
 	if id == "missing" {
 		return nil, errors.New("not found")
 	}
 	return map[string]any{"id": id}, nil
 }
-func (m *mockTaskClient) CancelTask(_ context.Context, id string) (TransitionResult, error) {
+
+func (m *mockTaskClient) CancelTask(_ context.Context, principalID string, id string) (TransitionResult, error) {
 	return TransitionUpdated, nil
 }
 func (m *mockTaskClient) ApproveTask(_ context.Context, id string, principalID string, sessionID string, bindingDigest string) (TransitionResult, error) {
@@ -86,26 +88,27 @@ func (m *mockTaskClient) ApproveTask(_ context.Context, id string, principalID s
 func (m *mockTaskClient) RejectTask(_ context.Context, id string, principalID string, sessionID string, bindingDigest string) (TransitionResult, error) {
 	return TransitionUpdated, nil
 }
-func (m *mockTaskClient) TaskEvents(_ context.Context, id string) (<-chan map[string]any, error) {
+func (m *mockTaskClient) TaskEvents(_ context.Context, principalID string, id string) (<-chan map[string]any, error) {
 	ch := make(chan map[string]any, 1)
 	ch <- map[string]any{"event_id": "e1", "task_id": id, "sequence": 1, "type": "task.running", "timestamp": "now", "payload": map[string]any{}}
 	close(ch)
 	return ch, nil
 }
-func (m *mockTaskClient) TaskArtifacts(_ context.Context, id string) ([]map[string]any, error) {
+
+func (m *mockTaskClient) TaskArtifacts(_ context.Context, principalID string, id string) ([]map[string]any, error) {
 	return []map[string]any{{"type": "file"}}, nil
 }
 
-func (m *mockChannelAgent) HandleWebhook(_ context.Context, request WebhookRequest) (WebhookResponse, error) {
+func (m *mockChannelAgent) HandleWebhook(_ context.Context, principalID string, request WebhookRequest) (WebhookResponse, error) {
 	m.webhook = request
 	return WebhookResponse{Status: "ok", MessageID: "m1"}, nil
 }
 
-func (m *mockChannelAgent) ListChannels(_ context.Context) ([]ChannelInfo, error) {
+func (m *mockChannelAgent) ListChannels(_ context.Context, principalID string) ([]ChannelInfo, error) {
 	return []ChannelInfo{{ID: "tg", Type: "telegram", Enabled: true, Healthy: true, Status: "enabled"}}, nil
 }
 
-func (m *mockChannelAgent) SetChannelEnabled(_ context.Context, _ string, enabled bool) error {
+func (m *mockChannelAgent) SetChannelEnabled(_ context.Context, principalID string, _ string, enabled bool) error {
 	m.enabled = enabled
 	return nil
 }
@@ -485,7 +488,7 @@ type mockAudit struct {
 	failWith error
 }
 
-func (m *mockAudit) Query(ctx context.Context, action, result, since, until string, limit int) ([]AuditEntry, error) {
+func (m *mockAudit) Query(ctx context.Context, principalID string, action, result, since, until string, limit int) ([]AuditEntry, error) {
 	m.action = action
 	m.result = result
 	m.limit = limit

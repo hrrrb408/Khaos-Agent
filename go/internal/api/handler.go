@@ -208,6 +208,11 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "task service not available")
 		return
 	}
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
 	var request struct {
 		Goal string `json:"goal"`
 	}
@@ -215,14 +220,9 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "goal is required")
 		return
 	}
-	result, err := h.tasks.CreateTask(r.Context(), request.Goal)
+	result, err := h.tasks.CreateTask(r.Context(), principalID, request.Goal)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
-	principalID, authenticated := auth.PrincipalFromContext(r.Context())
-	if !authenticated {
-		writeError(w, http.StatusUnauthorized, "authenticated principal required")
 		return
 	}
 	id, valid := result["id"].(string)
@@ -241,16 +241,20 @@ func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
-	result, err := h.tasks.ListTasks(r.Context(), r.URL.Query().Get("active") == "true")
-	if err != nil {
-		writeError(w, http.StatusBadGateway, err.Error())
-		return
-	}
 	principalID, authenticated := auth.PrincipalFromContext(r.Context())
 	if !authenticated {
 		writeError(w, http.StatusUnauthorized, "authenticated principal required")
 		return
 	}
+	result, err := h.tasks.ListTasks(r.Context(), principalID, r.URL.Query().Get("active") == "true")
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	// C-1-1: Python's TaskService now scopes by ctx.principal_id, so
+	// result already contains only the caller's tasks.  The in-memory
+	// taskOwners filter is retained as defense-in-depth until C-1-2
+	// deletes the Go-side ownership map entirely.
 	filtered := make([]map[string]any, 0, len(result))
 	h.mu.Lock()
 	for _, task := range result {
@@ -272,7 +276,8 @@ func (h *Handler) handleGetTask(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeTask(w, r) {
 		return
 	}
-	result, err := h.tasks.GetTask(r.Context(), r.PathValue("id"))
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	result, err := h.tasks.GetTask(r.Context(), principalID, r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -288,7 +293,10 @@ func (h *Handler) handleCancelTask(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeTask(w, r) {
 		return
 	}
-	h.changeTask(w, r, "cancelled", h.tasks.CancelTask)
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	h.changeTask(w, r, "cancelled", func(ctx context.Context, id string) (TransitionResult, error) {
+		return h.tasks.CancelTask(ctx, principalID, id)
+	})
 }
 func (h *Handler) handleApproveTask(w http.ResponseWriter, r *http.Request) {
 	if h.tasks == nil {
@@ -374,7 +382,8 @@ func (h *Handler) handleTaskEvents(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeTask(w, r) {
 		return
 	}
-	events, err := h.tasks.TaskEvents(r.Context(), r.PathValue("id"))
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	events, err := h.tasks.TaskEvents(r.Context(), principalID, r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -417,7 +426,8 @@ func (h *Handler) handleTaskArtifacts(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeTask(w, r) {
 		return
 	}
-	result, err := h.tasks.TaskArtifacts(r.Context(), r.PathValue("id"))
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	result, err := h.tasks.TaskArtifacts(r.Context(), principalID, r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -455,7 +465,12 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			query[strings.ToLower(key)] = values[0]
 		}
 	}
-	response, err := client.HandleWebhook(r.Context(), WebhookRequest{Platform: r.PathValue("platform"), ChannelID: r.URL.Query().Get("channel_id"), Headers: headers, Query: query, Body: json.RawMessage(body)})
+	// C-1-1: signature-authenticated webhook ingress bypasses the
+	// API-key middleware, so there is no authenticated principal.
+	// Pass ``""`` so Python's AgentService.HandleWebhook treats the
+	// call as unauthenticated platform ingress (same behavior as
+	// before, but explicit instead of defaulting to ``"gateway"``).
+	response, err := client.HandleWebhook(r.Context(), "", WebhookRequest{Platform: r.PathValue("platform"), ChannelID: r.URL.Query().Get("channel_id"), Headers: headers, Query: query, Body: json.RawMessage(body)})
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -474,7 +489,8 @@ func (h *Handler) handleChannelsList(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	channels, err := client.ListChannels(r.Context())
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	channels, err := client.ListChannels(r.Context(), principalID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -495,7 +511,8 @@ func (h *Handler) setChannelEnabled(w http.ResponseWriter, r *http.Request, enab
 	if !ok {
 		return
 	}
-	if err := client.SetChannelEnabled(r.Context(), r.PathValue("id"), enabled); err != nil {
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	if err := client.SetChannelEnabled(r.Context(), principalID, r.PathValue("id"), enabled); err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}
@@ -876,7 +893,8 @@ func (h *Handler) handleMode(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeSession(w, r, body.SessionID) {
 		return
 	}
-	mode, err := h.agent.SwitchMode(r.Context(), body.SessionID, body.TargetMode)
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	mode, err := h.agent.SwitchMode(r.Context(), principalID, body.SessionID, body.TargetMode)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -1073,8 +1091,10 @@ func (h *Handler) handleAudit(w http.ResponseWriter, r *http.Request) {
 	if limit <= 0 || limit > 1000 {
 		limit = 100
 	}
+	principalID, _ := auth.PrincipalFromContext(r.Context())
 	entries, err := h.audit.Query(
 		r.Context(),
+		principalID,
 		query.Get("action"),
 		query.Get("result"),
 		query.Get("since"),
