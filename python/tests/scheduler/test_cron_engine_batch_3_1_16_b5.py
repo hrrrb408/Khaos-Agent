@@ -919,3 +919,118 @@ async def test_acceptance_25_lifecycle_lock_response_helper():
     assert resp["error"] == "engine_degraded"
     assert "task_id" not in resp
     assert "DEGRADED" in resp["message"]
+
+
+# ---------------------------------------------------------------------------
+# 26-27. A-5-1b: project_id stamping on journal entries (service-layer)
+# ---------------------------------------------------------------------------
+
+
+async def test_acceptance_26_pause_stamps_project_id_on_journal(tmp_path):
+    """A5-1b #26: ``pause()`` stamps engine's ``project_id`` on journal row.
+
+    B-5 added the durable operation journal but stamped only
+    ``principal_id`` and ``policy_digest`` — ``project_id`` was an
+    oversight.  A-5-1a added the column; A-5-1b stamps it via
+    ``CronEngine._project_id`` (which flows from
+    ``AgentService._bound_project_id`` — RPC-verified).
+
+    This test verifies the SERVICE-LAYER stamping contract: when a
+    project-bound engine (``project_id="proj-journal"``) pauses a
+    task, the journal row written by ``_record_journal_intent``
+    carries ``project_id="proj-journal"``, NOT the empty default.
+
+    Contrast with Test 18 (DB-layer direct insert) which only
+    verifies the DB method accepts the param; this test exercises
+    the full ``pause()`` → ``_persist_task_state`` → journal path.
+    """
+    db = await _make_db(tmp_path)
+    audit_logger = await _make_audit_logger(db)
+    engine = _make_engine(
+        db,
+        project_id="proj-journal",  # engine is project-bound
+        policy_digest="sha256:policy-journal",
+        audit_logger=audit_logger,
+    )
+    try:
+        await engine.start()
+        task = await engine.create(
+            name="t1", prompt="hello",
+            schedule=ScheduleConfig(cron="0 9"), deliver_to="local",
+            principal_id="alice",
+        )
+        task_id = task.id if hasattr(task, "id") else task
+        result = await engine.pause(task_id, principal_id="alice")
+        assert result == "ok", f"pause should succeed, got {result!r}"
+
+        # The journal row must carry the engine's project_id.
+        conn = await db._require_conn()
+        cursor = await conn.execute(
+            "SELECT project_id, operation_type, desired_status "
+            "FROM scheduler_operation_journal WHERE task_id = ?",
+            (task_id,),
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 1, (
+            f"expected 1 journal entry for pause, got {len(rows)}"
+        )
+        assert rows[0][0] == "proj-journal", (
+            f"journal row must carry engine's project_id='proj-journal', "
+            f"got {rows[0][0]!r}"
+        )
+        assert rows[0][1] == "pause", (
+            f"operation_type must be 'pause', got {rows[0][1]!r}"
+        )
+        assert rows[0][2] == "paused", (
+            f"desired_status must be 'paused', got {rows[0][2]!r}"
+        )
+    finally:
+        await _force_cleanup_engine(engine)
+        await db.close()
+
+
+async def test_acceptance_27_legacy_engine_stamps_empty_project_id(tmp_path):
+    """A5-1b #27: legacy engine (no project_id) stamps '' on journal.
+
+    Engines constructed without ``project_id`` (e.g. test helpers,
+    CLI boot before A-5-1b wiring, or scheduled tasks created before
+    the project-identity feature) stamp the fail-closed default
+    ``''`` on journal rows.  This is backward-compatible: existing
+    rows are distinguishable from project-bound rows but still
+    visible to operators.
+    """
+    db = await _make_db(tmp_path)
+    audit_logger = await _make_audit_logger(db)
+    # Engine constructed WITHOUT project_id (legacy / test mode).
+    engine = _make_engine(
+        db,
+        project_id="",  # legacy / test mode
+        policy_digest="sha256:policy-legacy",
+        audit_logger=audit_logger,
+    )
+    try:
+        await engine.start()
+        task = await engine.create(
+            name="t2", prompt="hello",
+            schedule=ScheduleConfig(cron="0 9"), deliver_to="local",
+            principal_id="bob",
+        )
+        task_id = task.id if hasattr(task, "id") else task
+        result = await engine.pause(task_id, principal_id="bob")
+        assert result == "ok", f"pause should succeed, got {result!r}"
+
+        # Journal row carries the empty-default project_id.
+        conn = await db._require_conn()
+        cursor = await conn.execute(
+            "SELECT project_id FROM scheduler_operation_journal "
+            "WHERE task_id = ?",
+            (task_id,),
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 1
+        assert rows[0][0] == "", (
+            f"legacy engine must stamp project_id='', got {rows[0][0]!r}"
+        )
+    finally:
+        await _force_cleanup_engine(engine)
+        await db.close()
