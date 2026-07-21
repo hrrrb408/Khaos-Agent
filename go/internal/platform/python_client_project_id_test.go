@@ -124,13 +124,13 @@ func TestC_1_3_ProjectIDNotInjectedIntoNonMapPayload(t *testing.T) {
 	}
 }
 
-// TestC_1_3_ProjectIDDoesNotOverrideExistingPayloadValue verifies
+// TestC_1_3_ProjectIDOverridesExistingPayloadValue verifies
 // that if the payload already contains a project_id (e.g. from a
 // legacy caller), the PythonClient.ProjectID overwrites it — the
 // Gateway's configured project is the sole authority, not the
 // caller-asserted value.  Python's drift detection then compares
 // this Gateway-asserted value against agent._bound_project_id.
-func TestC_1_3_ProjectIDDoesNotOverrideExistingPayloadValue(t *testing.T) {
+func TestC_1_3_ProjectIDOverridesExistingPayloadValue(t *testing.T) {
 	clientConn, serverConn := net.Pipe()
 	defer clientConn.Close()
 	defer serverConn.Close()
