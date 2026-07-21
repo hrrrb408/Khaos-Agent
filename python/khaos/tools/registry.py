@@ -247,8 +247,15 @@ class ToolInvocationBroker:
         # so without this injection a principal could never observe the
         # tasks it spawned (spawner returns an empty list for empty
         # principal, defense-in-depth against cross-principal leakage).
+        # M4 batch 3.1.16A-5-1b: also inject ``project_id`` so the spawned
+        # ``SubAgentTask`` inherits the parent runtime's bound project
+        # identity — every row the sub-agent writes (session, message,
+        # turn, audit, memory, coding_task) is then scoped to the same
+        # (principal, project) pair as the parent, and the spawner /
+        # runner propagate it into ``create_session`` + ``RuntimeConfig``.
         if any(capability.name == "subagent.spawn" for capability in capabilities):
             handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["project_id"] = context.get("project_id", "")
         # M4 batch 3.1.10 (CRITICAL): the five cron tools declare the
         # ``cron.manage`` capability so the broker injects the caller's
         # ``principal_id``.  The engine / DB layer filter every read and

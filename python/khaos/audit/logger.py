@@ -176,6 +176,19 @@ class AuditLogger:
     runtime-bound and stamped on every row for attribution.  Per-event
     context (``task_id``, ``operation_id``, ``authority_generation``,
     ``source_transport``) flows through ``log()`` and the typed helpers.
+
+    M4 batch 3.1.16A-5-1b (CRITICAL): ``project_id`` is bound at
+    construction and stamped on every persisted row so an audit record
+    is cryptographically tied to the project that produced it.  This
+    closes the cross-project drift path where a runtime booted under
+    one ``project_root`` could write audit rows attributed to another
+    project (because the DB layer had no column to bind against).  The
+    RPC dispatcher's drift check (``ctx.project_id !=
+    agent._bound_project_id``) is the sole authority — when the
+    AuditLogger is constructed via ``build_runtime`` the
+    ``project_id`` comes from ``RuntimeConfig.project_id`` (set by
+    ``AgentService`` from the verified RPC payload), NOT from
+    ``compute_project_id(root)``.
     """
 
     def __init__(
@@ -186,6 +199,7 @@ class AuditLogger:
         principal_id: str = "legacy",
         runtime_id: str | None = None,
         policy_digest: str | None = None,
+        project_id: str = "",
     ):
         self.db = db
         self.log_path: Path | None = None
@@ -195,6 +209,13 @@ class AuditLogger:
         self._principal_id = principal_id
         self._runtime_id = runtime_id
         self._policy_digest = policy_digest
+        # M4 batch 3.1.16A-5-1b: project identity bound at construction
+        # and stamped on every persisted row.  Default ``''`` ("unbound")
+        # matches the schema column default — legacy callers / tests that
+        # omit it produce ``project_id=''`` rows which are still visible
+        # (no filter is applied on this column yet) but distinguishable
+        # from rows stamped by a project-bound runtime.
+        self._project_id = project_id
         # H3: long-lived fd opened at construction; None when file audit
         # is disabled or the path failed safety validation.
         self._fd: int | None = None
@@ -478,6 +499,9 @@ class AuditLogger:
         (``task_id`` / ``operation_id`` / ``authority_generation`` /
         ``source_transport``) describe the immediate caller and are
         stamped on this row only.
+
+        M4 batch 3.1.16A-5-1b: ``project_id`` likewise comes from the
+        logger's construction — it is a runtime property, not per-event.
         """
         detail_json = json.dumps(detail or {}, ensure_ascii=False, sort_keys=True)
         # M1: append a copy to the configured file path (best-effort).
@@ -514,6 +538,7 @@ class AuditLogger:
                 policy_digest=self._policy_digest,
                 authority_generation=authority_generation,
                 source_transport=source_transport,
+                project_id=self._project_id,
             )
         except Exception:
             # Audit must never break the calling flow; log and continue.
@@ -557,6 +582,9 @@ class AuditLogger:
             "principal_id": self._principal_id,
             "runtime_id": self._runtime_id,
             "policy_digest": self._policy_digest,
+            # M4 batch 3.1.16A-5-1b: project identity stamp so the file
+            # audit trail matches the DB row 1:1.
+            "project_id": self._project_id,
         }
         # Only include per-event context when set, so the file line stays
         # compact for the common case (no task / operation / transport).

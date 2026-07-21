@@ -95,6 +95,15 @@ class RuntimeConfig:
     # ``forbidden``.
     channel_registry: Any = None
     channel_admins: frozenset[str] = field(default_factory=frozenset)
+    # M4 batch 3.1.16A-5-1b (CRITICAL): project identity closure.  When
+    # set (non-empty), ``build_runtime`` uses this value as the project
+    # identity for every component (PermissionEngine, MemoryStore,
+    # AuditLogger, TaskManager, AgentLoop) instead of recomputing it
+    # from ``project_root``.  The RPC dispatcher verifies this matches
+    # ``agent._bound_project_id`` and rejects drift (fail-closed).
+    # Default ``''`` (CLI / tests) falls back to
+    # ``compute_project_id(root)`` for backward compat.
+    project_id: str = ""
 
 
 @dataclass
@@ -465,17 +474,23 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     # identifier used by the state root (sha256(realpath(root))[:32]),
     # so every runtime under the same project shares the project_id
     # but is isolated by principal_id.
+    #
+    # M4 batch 3.1.16A-5-1b: prefer ``cfg.project_id`` (RPC-verified)
+    # over ``compute_project_id(root)`` so the dispatcher's drift
+    # check is the sole authority.  CLI / tests that don't set
+    # ``cfg.project_id`` fall back to recompute.
+    project_id = cfg.project_id or compute_project_id(root)
     permission_engine = PermissionEngine(
         cfg.db,
         commands_require_approval=effective_policy.commands_require_approval,
         principal_id=cfg.principal_id,
-        project_id=compute_project_id(root),
+        project_id=project_id,
         policy_digest=effective_policy.digest,
         runtime_id=cfg.runtime_id,
     )
     await permission_engine.load_rules()
     memory_manager = cfg.memory_manager or MemoryManager(
-        MemoryStore(cfg.db, principal_id=cfg.principal_id),
+        MemoryStore(cfg.db, principal_id=cfg.principal_id, project_id=project_id),
         budget=MemoryBudget(),
         mode_getter=lambda: mode_manager.current_mode,
         intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
@@ -492,7 +507,13 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # can only see its own 'legacy' tasks (quarantined to
         # ``status='failed'`` by the migration helper), so it can never
         # execute or surface an authenticated principal's tasks.
-        task_manager = TaskManager(db=cfg.db, principal_id=cfg.principal_id)
+        #
+        # M4 batch 3.1.16A-5-1b: also stamp ``project_id`` so coding
+        # tasks are project-scoped (see A-5-1a schema closure).
+        task_manager = TaskManager(
+            db=cfg.db, principal_id=cfg.principal_id,
+            project_id=project_id,
+        )
         await task_manager.load()
     workspace_manager = cfg.workspace_manager or WorkspaceManager()
     execution_service = cfg.execution_service or ExecutionService(
@@ -587,6 +608,10 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
                 principal_id=cfg.principal_id,
                 runtime_id=cfg.runtime_id,
                 policy_digest=effective_policy.digest,
+                # M4 batch 3.1.16A-5-1b: stamp the project identity on
+                # every audit row so records are cryptographically tied
+                # to the project that produced them.
+                project_id=project_id,
             )
         scheduler = ToolScheduler(
             registry, permission_engine,
@@ -650,6 +675,13 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # ``channel.read`` / ``channel.manage`` capability injection.
         channel_registry=cfg.channel_registry,
         channel_admins=cfg.channel_admins,
+        # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
+        # project identity into the AgentLoop so every message / turn
+        # write is stamped with it.  ``self._bound_project_id`` (set
+        # from this kwarg) is the value the RPC dispatcher compares
+        # against ``ctx.project_id`` for drift detection (fail-closed
+        # rejection).
+        project_id=project_id,
     )
     return RuntimeResult(
         loop=loop,

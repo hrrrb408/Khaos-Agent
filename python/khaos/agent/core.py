@@ -114,6 +114,15 @@ class AgentLoop:
         # these the handlers fail-closed (``unavailable`` / ``forbidden``).
         channel_registry=None,
         channel_admins: "frozenset[str] | None" = None,
+        # M4 batch 3.1.16A-5-1b (CRITICAL): project identity stamp.
+        # Bound at construction from ``RuntimeConfig.project_id`` (set by
+        # ``AgentService`` from the verified RPC payload) — NOT recomputed
+        # from ``project_root``.  Stamped on every message / turn write so
+        # rows are cryptographically tied to the project that produced
+        # them.  ``_bound_project_id`` (the underscore-prefixed alias) is
+        # the value the RPC dispatcher compares against ``ctx.project_id``
+        # for drift detection (fail-closed rejection).
+        project_id: str = "",
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -173,6 +182,13 @@ class AgentLoop:
         self.channel_admins = (
             channel_admins if channel_admins is not None else frozenset()
         )
+        # M4 batch 3.1.16A-5-1b: project identity stamp (bound from
+        # RuntimeConfig.project_id, NOT recomputed from project_root).
+        # Exposed as ``self.project_id`` for read access and
+        # ``self._bound_project_id`` (alias) for the RPC dispatcher's
+        # drift-check contract.
+        self.project_id = project_id
+        self._bound_project_id = project_id
         self._active_context_facts: list[Message] = []
         if self.execution_service is None:
             from khaos.coding.execution import ExecutionService, UnsupportedBackend
@@ -235,6 +251,9 @@ class AgentLoop:
             session_id=session_id,
             task_id=active_task_id,
             principal_id=self.principal_id,
+            # M4 batch 3.1.16A-5-1b: stamp the project identity on the
+            # agent_turns row.
+            project_id=self.project_id,
         )
         self._active_context_facts = await self._build_durable_task_facts(
             active_task_id
@@ -407,6 +426,15 @@ class AgentLoop:
                         "approval_broker": self.approval_broker,
                         "requester": session_id,
                         "principal_id": self.principal_id,
+                        # M4 batch 3.1.16A-5-1b: stamp the bound project
+                        # identity into ``tool_context`` so the broker can
+                        # inject it into orchestrator tools that spawn
+                        # sub-agents (``spawn_subagent``).  The sub-agent
+                        # inherits this ``project_id`` via ``SubAgentTask``
+                        # → ``create_session`` / ``RuntimeConfig``, keeping
+                        # every row in the spawn chain scoped to the same
+                        # (principal, project) pair as the parent runtime.
+                        "project_id": self.project_id,
                         "turn_id": f"{session_id}:{turn_count}",
                         # H5: pass session_id + runtime_id so browser tools
                         # key their BrowserContext by (principal, session,
@@ -716,9 +744,16 @@ class AgentLoop:
         M4 batch 3.1.16A-4-3: stamp ``self.principal_id`` on the row so
         ``list_messages`` / ``get_session_messages`` / ``search_sessions``
         can scope by the calling principal.
+
+        M4 batch 3.1.16A-5-1b: stamp ``self.project_id`` so the message
+        is cryptographically tied to the project that produced it.
+        ``insert_message``'s ``ON CONFLICT`` does NOT touch
+        ``project_id`` — owner-preserving.
         """
         rowid = await self.db.insert_message(
-            session_id, message, principal_id=self.principal_id
+            session_id, message,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
         )
         await self.db.insert_message_fts(
             session_id, message.role, message.content, message.token_count, rowid=rowid

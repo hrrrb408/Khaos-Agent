@@ -1865,6 +1865,14 @@ class CronEngine:
             target_version=target_version,
             principal_id=task.principal_id,
             policy_digest=self._policy_digest,
+            # M4 batch 3.1.16A-5-1b: stamp the engine's bound project
+            # identity on the journal row so the durable operation
+            # journal is cryptographically tied to the project that
+            # produced it.  ``self._project_id`` is set at engine
+            # construction from the AgentService's _bound_project_id
+            # (which the RPC dispatcher has already verified against
+            # ``ctx.project_id``).
+            project_id=self._project_id,
         )
 
     async def _mark_journal_applied(self, operation_id: str) -> None:

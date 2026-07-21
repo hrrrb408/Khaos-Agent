@@ -788,6 +788,7 @@ class Database:
         mode: str = "office",
         *,
         principal_id: str = "legacy",
+        project_id: str = "",
     ) -> None:
         """Create a session if missing and keep its mode current.
 
@@ -797,24 +798,29 @@ class Database:
         ``'legacy'`` is fail-closed and only used by pre-A-4-3 callers
         that haven't been migrated yet.
 
-        ``ON CONFLICT DO UPDATE`` does NOT touch ``principal_id`` —
-        once a session is bound to a principal, a later ``create_
-        session`` call from a different principal must NOT silently
-        re-stamp ownership.  Cross-principal ``create_session`` for an
-        existing id is a no-op on the principal column (the row keeps
-        its original owner); callers that need to detect the collision
-        should query first.
+        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row
+        for project identity closure.  Default ``''`` is fail-closed
+        (unbound) for pre-A-5-1b callers; production callers pass
+        ``ctx.project_id`` (RPC) or ``compute_project_id(root)`` (CLI).
+
+        ``ON CONFLICT DO UPDATE`` does NOT touch ``principal_id`` or
+        ``project_id`` — once a session is bound to a (principal,
+        project) pair, a later ``create_session`` call from a different
+        context must NOT silently re-stamp ownership.  Cross-context
+        ``create_session`` for an existing id is a no-op on the owner
+        columns (the row keeps its original owner); callers that need
+        to detect the collision should query first.
         """
         conn = await self._require_conn()
         await conn.execute(
             """
-            INSERT INTO sessions (id, mode, principal_id)
-            VALUES (?, ?, ?)
+            INSERT INTO sessions (id, mode, principal_id, project_id)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 mode = excluded.mode,
                 updated_at = datetime('now')
             """,
-            (session_id, mode, principal_id),
+            (session_id, mode, principal_id, project_id),
         )
         await conn.commit()
 
@@ -926,6 +932,7 @@ class Database:
         message: Message,
         *,
         principal_id: str = "legacy",
+        project_id: str = "",
     ) -> int:
         """Persist a chat message and return its row id.
 
@@ -933,15 +940,20 @@ class Database:
         so ``list_messages`` / ``get_session_messages`` / ``search_
         sessions`` can filter without a JOIN.  Callers should pass the
         bound principal (typically ``AgentLoop.principal_id``).
+
+        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row
+        for project identity closure (see ``create_session``).
+        Production callers pass ``AgentLoop.project_id`` (plumbed from
+        ``RuntimeConfig.project_id``).
         """
         conn = await self._require_conn()
         cursor = await conn.execute(
             """
             INSERT INTO messages (
                 session_id, role, content, tool_calls, tool_call_id,
-                token_count, principal_id
+                token_count, principal_id, project_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -951,6 +963,7 @@ class Database:
                 message.tool_call_id,
                 message.token_count,
                 principal_id,
+                project_id,
             ),
         )
         await conn.execute(
@@ -1200,6 +1213,7 @@ class Database:
         policy_digest: str | None = None,
         authority_generation: int | None = None,
         source_transport: str | None = None,
+        project_id: str = "",
     ) -> int:
         """Persist an audit log entry and return its row id.
 
@@ -1209,6 +1223,12 @@ class Database:
         ``source_transport``) are stamped on every entry for
         attribution.  Legacy callers that omit them get
         ``principal_id='legacy'``.
+
+        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on every
+        entry for project identity closure (cross-project forensics).
+        Default ``''`` for pre-A-5-1b callers; production callers
+        pass ``AuditLogger._project_id`` (plumbed from
+        ``RuntimeConfig.project_id`` or ``agent._bound_project_id``).
         """
         conn = await self._require_conn()
         cursor = await conn.execute(
@@ -1216,13 +1236,15 @@ class Database:
             INSERT INTO audit_log (
                 action, target, result, detail, session_id,
                 principal_id, runtime_id, task_id, operation_id,
-                policy_digest, authority_generation, source_transport
+                policy_digest, authority_generation, source_transport,
+                project_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (action, target, result, detail, session_id,
              principal_id, runtime_id, task_id, operation_id,
-             policy_digest, authority_generation, source_transport),
+             policy_digest, authority_generation, source_transport,
+             project_id),
         )
         await conn.commit()
         return int(cursor.lastrowid)
@@ -1308,6 +1330,7 @@ class Database:
         principal_id: str = "legacy",
         namespace: str = "private",
         session_id: str = "",
+        project_id: str = "",
     ) -> int:
         """Insert or update a memory by (namespace, principal_id, session_id, scope, key).
 
@@ -1315,15 +1338,23 @@ class Database:
         ``(namespace, principal_id, session_id)``.  Legacy callers that
         omit them get ``principal_id='legacy'`` — the memory is stored
         but never loaded by authenticated principals.
+
+        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row
+        for project identity closure.  It is NOT part of the UNIQUE
+        constraint (principal_id already partitions the namespace); the
+        column is for forensics / future sweep queries.  ``ON CONFLICT``
+        does NOT touch ``project_id`` (owner-preserving update — once a
+        memory is bound to a project, a later upsert from a different
+        project cannot re-stamp it).
         """
         conn = await self._require_conn()
         await conn.execute(
             """
             INSERT INTO memories (
                 scope, key, value, ttl, confidence,
-                principal_id, namespace, session_id
+                principal_id, namespace, session_id, project_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(namespace, principal_id, session_id, scope, key) DO UPDATE SET
                 value = excluded.value,
                 ttl = excluded.ttl,
@@ -1331,7 +1362,7 @@ class Database:
                 updated_at = datetime('now')
             """,
             (scope, key, value, ttl, confidence,
-             principal_id, namespace, session_id),
+             principal_id, namespace, session_id, project_id),
         )
         await conn.commit()
         cursor = await conn.execute(
@@ -1645,6 +1676,7 @@ class Database:
         summary: str = "",
         *,
         principal_id: str = "legacy",
+        project_id: str = "",
     ) -> None:
         """保存一个会话书签。
 
@@ -1657,14 +1689,18 @@ class Database:
         call from a different principal cannot re-stamp ownership (the
         row keeps its original owner).  Cross-principal upsert is an
         owner-preserving update.
+
+        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row for
+        project identity closure (same owner-preserving policy —
+        ``ON CONFLICT`` does NOT touch ``project_id``).
         """
         conn = await self._require_conn()
         await conn.execute(
             """
             INSERT INTO session_bookmarks
                 (session_id, name, description, mode, project_root, summary,
-                 principal_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                 principal_id, project_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id, name) DO UPDATE SET
                 description  = excluded.description,
                 mode         = excluded.mode,
@@ -1672,7 +1708,7 @@ class Database:
                 summary      = excluded.summary
             """,
             (session_id, name, description, mode, project_root, summary,
-             principal_id),
+             principal_id, project_id),
         )
         await conn.commit()
 
@@ -2556,6 +2592,7 @@ class Database:
         target_version: int,
         principal_id: str = "",
         policy_digest: str = "",
+        project_id: str = "",
     ) -> int:
         """M4 batch 3.1.16B-5 (CRITICAL): record a control op's intent.
 
@@ -2571,6 +2608,11 @@ class Database:
         caller raises on failure, leaving the in-memory marker in place
         so ``stop()`` retries.
 
+        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the entry
+        for cross-project forensics (B-5 oversight — the table had
+        ``principal_id`` and ``policy_digest`` but not ``project_id``).
+        ``CronEngine._project_id`` is the source.
+
         Returns the ``seq`` of the inserted row.
         """
         conn = await self._require_conn()
@@ -2582,13 +2624,13 @@ class Database:
             INSERT INTO scheduler_operation_journal
                 (operation_id, task_id, operation_type, desired_status,
                  expected_version, target_version, principal_id,
-                 policy_digest, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 policy_digest, project_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 operation_id, task_id, operation_type, desired_status,
                 expected_version, target_version, principal_id,
-                policy_digest, created,
+                policy_digest, project_id, created,
             ),
         )
         await conn.commit()
@@ -2708,7 +2750,8 @@ class Database:
         await conn.commit()
 
     async def upsert_coding_task(
-        self, task: dict[str, Any], *, principal_id: str = "legacy"
+        self, task: dict[str, Any], *, principal_id: str = "legacy",
+        project_id: str = "",
     ) -> None:
         """Persist the complete JSON-safe state of one coding task.
 
@@ -2716,21 +2759,29 @@ class Database:
         ``list_coding_tasks`` can filter by it.  Callers should pass the
         bound principal; the default ``'legacy'`` is fail-closed and
         only used by pre-A3 callers that haven't been migrated yet.
+
+        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row for
+        project identity closure.  Unlike ``sessions`` (owner-preserving
+        upsert), coding tasks DO update ``project_id`` on conflict —
+        a coding task's lifecycle is tied to the runtime that owns it,
+        and a task may be re-stamped when resumed under a different
+        project context (mirrors the existing ``principal_id`` policy).
         """
         conn = await self._require_conn()
         await conn.execute(
             """
-            INSERT INTO coding_tasks (id, goal, status, state_json, created_at, updated_at, principal_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO coding_tasks (id, goal, status, state_json, created_at, updated_at, principal_id, project_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET goal=excluded.goal,
                 status=excluded.status, state_json=excluded.state_json,
                 updated_at=excluded.updated_at,
-                principal_id=excluded.principal_id
+                principal_id=excluded.principal_id,
+                project_id=excluded.project_id
             """,
             (
                 task["id"], task["goal"], task["status"],
                 json.dumps(task), task["created_at"], task["updated_at"],
-                principal_id,
+                principal_id, project_id,
             ),
         )
         await conn.commit()
@@ -3051,6 +3102,7 @@ class Database:
         payload: dict[str, Any],
         now: float,
         principal_id: str = "legacy",
+        project_id: str = "",
     ) -> None:
         """Create one durable running turn and its first event atomically.
 
@@ -3059,6 +3111,12 @@ class Database:
         filter without an extra JOIN to ``sessions``.  ``payload`` still
         carries ``principal_id`` in its JSON for backward compatibility
         with older consumers that read the event stream.
+
+        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row for
+        project identity closure.  ``recover_inflight_agent_turns`` is a
+        process-wide sweep and ignores this column (same as
+        ``principal_id``); per-project visibility is enforced by
+        ``list_agent_turn_events`` callers.
         """
         conn = await self._require_conn()
         async with self._turn_event_lock:
@@ -3066,9 +3124,9 @@ class Database:
             try:
                 await conn.execute(
                     "INSERT INTO agent_turns(turn_id,attempt_id,session_id,task_id,"
-                    "status,last_sequence,started_at,principal_id) "
-                    "VALUES(?,?,?,?, 'running',1,?,?)",
-                    (turn_id, attempt_id, session_id, task_id, now, principal_id),
+                    "status,last_sequence,started_at,principal_id,project_id) "
+                    "VALUES(?,?,?,?, 'running',1,?,?,?)",
+                    (turn_id, attempt_id, session_id, task_id, now, principal_id, project_id),
                 )
                 await conn.execute(
                     "INSERT INTO agent_turn_events VALUES(?,1,'turn.started',?,?)",

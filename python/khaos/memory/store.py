@@ -54,11 +54,28 @@ class MemoryStore:
 
     Legacy callers that omit ``principal_id`` get ``'legacy'`` — the
     memory is stored but never loaded by authenticated principals.
+
+    M4 batch 3.1.16A-5-1b (CRITICAL): ``project_id`` is also bound at
+    construction and stamped on every upsert so memories are
+    cryptographically tied to the project that produced them.  The
+    RPC dispatcher's drift check (``ctx.project_id !=
+    agent._bound_project_id``) is the sole authority — when the store
+    is constructed via ``build_runtime`` the ``project_id`` comes from
+    ``RuntimeConfig.project_id`` (set by ``AgentService`` from the
+    verified RPC payload), NOT from ``compute_project_id(root)``.
     """
 
-    def __init__(self, db, *, principal_id: str = "legacy"):
+    def __init__(
+        self, db, *, principal_id: str = "legacy", project_id: str = "",
+    ):
         self.db = db
         self._principal_id = principal_id
+        # M4 batch 3.1.16A-5-1b: project identity stamp.  Default ``''``
+        # ("unbound") matches the schema column default — legacy callers
+        # / tests that omit it produce ``project_id=''`` rows which are
+        # still visible (the UNIQUE key is unchanged) but distinguishable
+        # from rows stamped by a project-bound runtime.
+        self._project_id = project_id
 
     def _effective_principal(self, namespace: str) -> str:
         """A2-4: project-shared memories live under ``principal_id=''`` so
@@ -151,6 +168,12 @@ class MemoryStore:
             principal_id=self._effective_principal(namespace),
             namespace=namespace,
             session_id=session_id,
+            # M4 batch 3.1.16A-5-1b: stamp the project identity on every
+            # upsert.  ``upsert_memory``'s ``ON CONFLICT`` clause does NOT
+            # touch ``project_id`` — owner-preserving — so once a memory
+            # is bound to a (principal, project) pair it cannot be
+            # re-stamped by a later upsert from a different context.
+            project_id=self._project_id,
         )
         stored = await self.get(
             memory.scope, memory.key, namespace=namespace, session_id=session_id,

@@ -116,9 +116,14 @@ class SubAgentRunner:
         # 保证子代理 session 已持久化（与 spawn() 的 create_session 对齐）。
         # M4 batch 3.1.16A-4-3: stamp the task's principal_id so the
         # subagent's session history is scoped to the calling principal.
+        # M4 batch 3.1.16A-5-1b: stamp the task's project_id too
+        # (sub-agents inherit the parent runtime's bound project
+        # identity — there is no legitimate cross-project sub-agent
+        # flow).  Owner-preserving ON CONFLICT.
         await self.db.create_session(
             session_id,
             principal_id=task.principal_id or self.principal_id or "legacy",
+            project_id=task.project_id,
         )
 
         from khaos.runtime import (
@@ -153,6 +158,13 @@ class SubAgentRunner:
             # server's local UID.
             principal_id=task.principal_id or self.principal_id or f"local-uid:{os.getuid()}",
             audit_logger=self.audit_logger,
+            # M4 batch 3.1.16A-5-1b (CRITICAL): inject the task's
+            # project_id so the subagent's AgentLoop._bound_project_id
+            # comes from the parent runtime's bound project identity
+            # (RPC-verified) instead of being recomputed from
+            # project_root.  This guarantees the subagent stamps the
+            # SAME project_id on its writes as the parent runtime.
+            project_id=task.project_id,
             # B1: inherit the server's project_root / config_path so the
             # subagent loads the SAME ``khaos_policy.yaml`` and compiles the
             # SAME EffectivePolicy as the main AgentLoop.  Without this, a

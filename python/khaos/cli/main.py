@@ -27,7 +27,11 @@ from khaos.config import (
     set_user_config_value,
 )
 from khaos.db import Database
-from khaos.db.state_root import open_state_db_safely, resolve_state_db_path
+from khaos.db.state_root import (
+    open_state_db_safely,
+    project_id as compute_project_id,
+    resolve_state_db_path,
+)
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
@@ -55,15 +59,22 @@ async def run_once(args: argparse.Namespace) -> int:
         await mode_manager.switch(ModeManager.parse(args.mode))
 
     session_id = args.session_id or str(uuid.uuid4())
+    # M4 batch 3.1.16A-5-1b: compute the project identity from the CWD
+    # and stamp it on every session row.  ``build_runtime`` recomputes
+    # it from ``project_root`` (which defaults to Path.cwd()) — passing
+    # it explicitly here keeps the session row's stamp in sync with the
+    # runtime's bound identity.
+    cli_project_id = compute_project_id(Path.cwd())
     await db.create_session(
         session_id, mode_manager.current_mode.value,
         principal_id=f"local-uid:{os.getuid()}",
+        project_id=cli_project_id,
     )
 
     from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
-        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=f"local-uid:{os.getuid()}"))
+        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=f"local-uid:{os.getuid()}", project_id=cli_project_id))
         print(f"session_id: {session_id}", flush=True)
         async for message in runtime.loop.run(args.message, session_id):
             print(encode_sse(message), end="", flush=True)
@@ -89,14 +100,17 @@ async def run_repl(args: argparse.Namespace) -> int:
     )
     await mode_manager.load()
     session_id = args.session_id or str(uuid.uuid4())
+    # M4 batch 3.1.16A-5-1b: see run_once for the rationale.
+    cli_project_id = compute_project_id(Path.cwd())
     await db.create_session(
         session_id, mode_manager.current_mode.value,
         principal_id=f"local-uid:{os.getuid()}",
+        project_id=cli_project_id,
     )
     from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
-        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=f"local-uid:{os.getuid()}"))
+        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=f"local-uid:{os.getuid()}", project_id=cli_project_id))
         loop = runtime.loop
         skill_manager = runtime.skill_manager
         print(f"session_id: {session_id}")
@@ -116,6 +130,7 @@ async def run_repl(args: argparse.Namespace) -> int:
                 await db.create_session(
                     session_id, target.value,
                     principal_id=f"local-uid:{os.getuid()}",
+                    project_id=cli_project_id,
                 )
                 print(f"mode: {target.value}")
                 continue

@@ -45,6 +45,7 @@ class TurnCoordinator:
         session_id: str,
         task_id: str | None,
         principal_id: str,
+        project_id: str = "",
     ) -> "TurnCoordinator":
         await _recover_once(db)
         turn_id = uuid.uuid4().hex
@@ -66,6 +67,11 @@ class TurnCoordinator:
             # can filter without a JOIN.  ``payload`` still carries it
             # for backward compatibility with event-stream consumers.
             principal_id=principal_id,
+            # M4 batch 3.1.16A-5-1b: stamp project_id as a top-level
+            # column so per-project turn queries can filter without a
+            # JOIN.  Default ``''`` keeps backward compatibility with
+            # older callers that don't pass it (ad-hoc test loops).
+            project_id=project_id,
         )
         return cls(db, turn_id=turn_id, attempt_id=attempt_id)
 
