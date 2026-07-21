@@ -7,6 +7,15 @@ import pytest
 from khaos.agent.approval import ApprovalBinding, ApprovalBroker
 from khaos.coding.task_manager import TaskManager, TaskStatus
 from khaos.grpc_server import TaskService
+from khaos.runtime import RequestContext
+
+
+def _test_ctx() -> RequestContext:
+    """M4 batch 3.1.16A-4-1: TaskService methods now take ctx as the
+    first parameter.  This test doesn't care about multi-principal
+    scoping, so use the CLI principal — matching pre-A-4-1 behavior.
+    ``for_cli`` is Windows-safe (falls back to ``local-uid:windows``)."""
+    return RequestContext.for_cli()
 
 
 async def test_task_approval_resolves_waiting_tool_decision():
@@ -27,6 +36,7 @@ async def test_task_approval_resolves_waiting_tool_decision():
     # The task endpoint performs the same operation as the HTTP approve path.
     await asyncio.sleep(0)
     response = await service.approve(
+        _test_ctx(),
         task.id,
         principal_id=binding.principal_id,
         session_id=binding.session_id,

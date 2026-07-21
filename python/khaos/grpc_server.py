@@ -69,6 +69,7 @@ from khaos.permissions import PermissionEngine
 from khaos.rust_bridge import get_token_engine
 from khaos.routing.router import create_default_router
 from khaos.routing import ModelRouter
+from khaos.runtime import RequestContext
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
 from khaos.skills import SkillGenerator, SkillManager
@@ -766,7 +767,11 @@ class AgentService:
         # ``project_id`` is derived from the project root via
         # ``state_root.project_id`` (sha256(realpath(root))[:32]).
         from khaos.db.state_root import project_id as _compute_project_id
-        _bound_project_id = _compute_project_id(self.project_root)
+        # M4 batch 3.1.16A-4-1: store as a member so the RPC dispatcher
+        # can build RequestContext with the correct project_id without
+        # recomputing it per request.
+        self._bound_project_id = _compute_project_id(self.project_root)
+        _bound_project_id = self._bound_project_id
         # H1: a single server-lifecycle AuditLogger shared by the main runtime
         # AND every SubAgent run, so security events from both paths land in
         # the same audit trail.  ``log_path`` comes from the effective policy
@@ -1007,8 +1012,18 @@ class AgentService:
         ``CronEngine._execute_task`` calls this as a 3-arg executor;
         the engine keeps a 2-arg fallback for older test executors.
         """
+        # M4 batch 3.1.16A-4-1: build a cron-sourced RequestContext
+        # for this chat turn.  The ctx is constructed from the task's
+        # bound principal_id (stamped at creation time) — not the
+        # server's local-uid.
+        cron_ctx = RequestContext.for_cron(
+            principal_id,
+            project_id=self._bound_project_id,
+            policy_digest=self._effective_policy.digest,
+        )
         contents: list[str] = []
         async for event in self.chat(
+            cron_ctx,
             ChatRequest(f"cron:{task_id}", prompt, "office", principal_id=principal_id)
         ):
             if event.get("event") == "message":
@@ -1017,7 +1032,7 @@ class AgentService:
                     contents.append(str(content))
         return "\n".join(contents)
 
-    async def chat(self, request: ChatRequest) -> AsyncIterator[dict]:
+    async def chat(self, ctx: RequestContext, request: ChatRequest) -> AsyncIterator[dict]:
         """Stream chat events.
 
         B1: hold the full RuntimeResult and close it in ``finally`` so the
@@ -1071,10 +1086,13 @@ class AgentService:
             # Build OUTSIDE the lock — a slow / wedged build no longer
             # blocks shutdown from acquiring the lock and running its
             # bounded drain.  Cancellation from shutdown propagates here.
+            # M4 batch 3.1.16A-4-1: bind session_id into ctx so
+            # downstream ModeManager / AgentLoop see the correct
+            # (principal, session) pair.
             runtime = await self._build_runtime(
+                ctx.with_session(session_id),
                 session_id,
                 request.mode,
-                request.principal_id or f"local-uid:{os.getuid()}",
             )
             # Publish under the lock so shutdown's snapshot of
             # _active_runtimes is consistent.  If shutdown closed
@@ -1105,15 +1123,18 @@ class AgentService:
             if owner_task is not None:
                 self._active_chat_tasks.discard(owner_task)
 
-    async def switch_mode(self, session_id: str, target_mode: str) -> dict:
-        # A2-5: bind the per-request ModeManager to the local-uid principal
-        # and the request's session_id so the switch is scoped to that
-        # (principal, session) pair.  Multi-principal servers will need to
-        # take principal_id from the request context.
+    async def switch_mode(self, ctx: RequestContext, session_id: str, target_mode: str) -> dict:
+        # M4 batch 3.1.16A-4-1: use ctx.principal_id (transport-
+        # authenticated) instead of the hardcoded ``local-uid``.
+        # Previously a remote API principal A calling SwitchMode would
+        # modify the local-uid's mode, then A's Chat runtime would
+        # load A's principal — producing inconsistent authority and
+        # UI state.  Now the switch is scoped to (ctx.principal_id,
+        # session_id), matching the Chat runtime's principal binding.
         mode_manager = ModeManager(
             self.db,
             project_root=self.project_root,
-            principal_id=f"local-uid:{os.getuid()}",
+            principal_id=ctx.principal_id,
             session_id=session_id,
         )
         await mode_manager.load()
@@ -1123,7 +1144,12 @@ class AgentService:
             await self.db.create_session(session_id, mode.value)
         return {"current_mode": mode.value}
 
-    async def confirm_permission(self, request: ConfirmRequest) -> dict:
+    async def confirm_permission(self, ctx: RequestContext, request: ConfirmRequest) -> dict:
+        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
+        # ConfirmRequest.principal_id is still populated by the
+        # dispatcher (backward compat) but ctx.principal_id is the
+        # verified transport principal.  A-4-2 will switch the
+        # ApprovalBroker call to use ctx.principal_id directly.
         if not request.principal_id or not request.binding_digest:
             return {"ok": False, "error": "approval principal/binding required"}
         return {
@@ -1139,6 +1165,7 @@ class AgentService:
 
     async def handle_webhook(
         self,
+        ctx: RequestContext,
         platform: str,
         channel_id: str,
         headers: dict[str, str],
@@ -1182,7 +1209,17 @@ class AgentService:
             f"webhook:{channel_id}:{message.channel.value}:"
             f"{identity['sender'] or 'unknown'}"
         )
-        async for _event in self.chat(ChatRequest(
+        # M4 batch 3.1.16A-4-1: build a webhook-sourced RequestContext
+        # for this chat turn.  The ctx is constructed from the derived
+        # webhook principal (not the original RPC caller's principal —
+        # webhook turns belong to the webhook sender, not the Gateway
+        # operator who dispatched the webhook event).
+        webhook_ctx = RequestContext.for_webhook(
+            principal_id,
+            project_id=self._bound_project_id,
+            policy_digest=self._effective_policy.digest,
+        )
+        async for _event in self.chat(webhook_ctx, ChatRequest(
             session_id,
             message.to_agent_input(),
             principal_id=principal_id,
@@ -1190,15 +1227,15 @@ class AgentService:
             pass
         self.channel_registry.record_success(channel_id, received=True)
 
-    def list_channels(self) -> dict[str, object]:
+    def list_channels(self, ctx: RequestContext) -> dict[str, object]:
         return {"channels": self.channel_registry.get_health_report()}
 
-    def set_channel_enabled(self, channel_id: str, enabled: bool) -> dict[str, object]:
+    def set_channel_enabled(self, ctx: RequestContext, channel_id: str, enabled: bool) -> dict[str, object]:
         changed = self.channel_registry.enable(channel_id) if enabled else self.channel_registry.disable(channel_id)
         return {"ok": changed, "channel_id": channel_id}
 
     async def _build_runtime(
-        self, session_id: str, mode: str, principal_id: str = ""
+        self, ctx: RequestContext, session_id: str, mode: str,
     ):
         """Build a per-turn runtime that borrows the shared Office authority.
 
@@ -1210,6 +1247,16 @@ class AgentService:
         H1: reuses the server-lifecycle ``self._audit_logger`` so security
         events from the main AgentLoop and every SubAgent run land in the
         SAME audit trail (no parallel unsupervised audit path).
+
+        M4 batch 3.1.16A-4-1: takes a :class:`RequestContext` instead of
+        a bare ``principal_id`` string.  The context is the sole
+        authority for principal identity; ``RuntimeConfig`` now
+        receives ``session_id`` from ``ctx.session_id`` (previously
+        always ``""``, which broke ModeManager's (principal, session)
+        binding).  ``principal_id`` still falls back to ``local-uid``
+        for legacy callers that construct ctx via
+        :meth:`RequestContext.for_cli` without a session_id — but the
+        RPC path always provides a non-empty ctx.principal_id.
         """
         await self.db.create_session(session_id, mode or "office")
         from khaos.runtime import RuntimeConfig, build_runtime
@@ -1222,7 +1269,8 @@ class AgentService:
             approval_broker=self.approval_broker,
             router=self._router,
             office_authority=self._office_authority,
-            principal_id=principal_id or f"local-uid:{os.getuid()}",
+            principal_id=ctx.principal_id,
+            session_id=session_id,
         ))
 
     async def _wait_for_confirmation(self, request: dict) -> dict:
@@ -1295,7 +1343,10 @@ class MemoryService:
     def __init__(self, store: MemoryStore):
         self.store = store
 
-    async def get_memory(self, scope: str, key: str) -> dict:
+    async def get_memory(self, ctx: RequestContext, scope: str, key: str) -> dict:
+        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
+        # A-4-2 will switch self.store (currently bound to local-uid)
+        # to use ctx.principal_id for per-principal scoping.
         memory = await self.store.get(MemoryScope(scope), key)
         if memory is None:
             raise KeyError(key)
@@ -1303,12 +1354,16 @@ class MemoryService:
 
     async def set_memory(
         self,
+        ctx: RequestContext,
         scope: str,
         key: str,
         value: str,
         ttl: int = 604800,
         confidence: int = 2,
     ) -> dict:
+        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
+        # A-4-2 will switch self.store (currently bound to local-uid)
+        # to use ctx.principal_id for per-principal scoping.
         memory = await self.store.set(
             Memory(
                 id=None,
@@ -1321,11 +1376,14 @@ class MemoryService:
         )
         return {"ok": True, "id": memory.id}
 
-    async def delete_memory(self, memory_id: int) -> dict:
+    async def delete_memory(self, ctx: RequestContext, memory_id: int) -> dict:
         await self.store.db.delete_memory_by_id(memory_id)
         return {"ok": True}
 
-    async def search_memory(self, query: str, top_k: int = 5) -> list[dict]:
+    async def search_memory(self, ctx: RequestContext, query: str, top_k: int = 5) -> list[dict]:
+        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
+        # A-4-2 will switch self.store (currently bound to local-uid)
+        # to use ctx.principal_id for per-principal scoping.
         return [_memory_to_dict(memory) for memory in await self.store.search(query, top_k)]
 
 
@@ -1337,12 +1395,16 @@ class AuditService:
 
     async def query(
         self,
+        ctx: RequestContext,
         action: str | None = None,
         result: str | None = None,
         since: str | None = None,
         until: str | None = None,
         limit: int = 100,
     ) -> list[dict]:
+        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
+        # A-4-2 will switch self.logger (currently bound to local-uid)
+        # to use ctx.principal_id for per-principal audit scoping.
         entries = await self.logger.query(
             action=action, result=result, since=since, until=until, limit=limit
         )
@@ -1356,25 +1418,36 @@ class TaskService:
         self.task_manager = task_manager
         self.approval_broker = approval_broker
 
-    async def list(self, active_only: bool = False) -> list[dict]:
-        """List tasks — active ones by default, all when ``active_only`` is set."""
+    async def list(self, ctx: RequestContext, active_only: bool = False) -> list[dict]:
+        """List tasks — active ones by default, all when ``active_only`` is set.
+
+        M4 batch 3.1.16A-4-1: ``ctx`` carries the transport-authenticated
+        principal.  A-4-2 will switch ``task_manager`` to a per-principal
+        filter; for now the parameter is accepted and ``ctx.principal_id``
+        is logged so downstream work can bind to it without re-plumbing
+        the dispatcher.
+        """
+        _ = ctx  # A-4-2 will pass ctx.principal_id into the DB filter.
         if active_only:
             return await self.task_manager.list_active()
         return await self.task_manager.list_all()
 
-    async def get(self, task_id: str) -> dict:
+    async def get(self, ctx: RequestContext, task_id: str) -> dict:
         """Return one task's state, or ``{"error": "not found"}``."""
+        _ = ctx  # A-4-2 will scope by ctx.principal_id.
         task = await self.task_manager.get(task_id)
         if task is None:
             return {"error": "task not found", "task_id": task_id}
         return task.to_dict()
 
-    async def create(self, goal: str) -> dict:
+    async def create(self, ctx: RequestContext, goal: str) -> dict:
+        _ = ctx  # A-4-2 will stamp ctx.principal_id as the durable owner.
         return (await self.task_manager.create(goal)).to_dict()
 
-    async def cancel(self, task_id: str) -> dict:
+    async def cancel(self, ctx: RequestContext, task_id: str) -> dict:
         from khaos.coding.task_manager import TransitionResult
 
+        _ = ctx  # A-4-2 will reject cross-principal cancellation.
         result = await self.task_manager.cancel(task_id)
         if result == TransitionResult.NOT_FOUND:
             return {"ok": False, "error": "task not found", "task_id": task_id}
@@ -1384,6 +1457,7 @@ class TaskService:
 
     async def approve(
         self,
+        ctx: RequestContext,
         task_id: str,
         principal_id: str = "",
         session_id: str = "",
@@ -1435,6 +1509,7 @@ class TaskService:
 
     async def reject(
         self,
+        ctx: RequestContext,
         task_id: str,
         principal_id: str = "",
         session_id: str = "",
@@ -1484,7 +1559,8 @@ class TaskService:
         )
         return {"ok": resolved, "task_id": task_id}
 
-    async def artifacts(self, task_id: str) -> list[dict]:
+    async def artifacts(self, ctx: RequestContext, task_id: str) -> list[dict]:
+        _ = ctx  # A-4-2 will scope by ctx.principal_id.
         task = await self.task_manager.get(task_id)
         if task is None:
             return []
@@ -1650,11 +1726,42 @@ async def serve_json_lines(
                     return
                 method = request.get("method")
                 payload = request.get("payload", {})
+                # M4 batch 3.1.16A-4-1: build an immutable RequestContext
+                # from the transport-authenticated principal.  This is
+                # the SOLE authority for principal identity — payload
+                # ``principal_id`` is no longer trusted (a compromised
+                # Gateway could forge it).  All service methods receive
+                # ``ctx`` as their first parameter.
+                #
+                # Backward compat: methods that historically read
+                # ``principal_id`` from the payload (ChatRequest,
+                # ConfirmRequest, TaskService.approve/reject, SubAgent
+                # handlers) still work — we inject ctx.principal_id
+                # into the payload so ``**payload`` unpacking picks it
+                # up.  A-4-2 will remove this crutch and read directly
+                # from ctx.
+                #
+                # CONDITIONAL injection (M4 batch 3.1.16A-4-1): only
+                # overwrite when the Go side already sent
+                # ``principal_id``.  Methods whose signatures don't
+                # accept ``principal_id`` (TaskService.list/get/create/
+                # cancel/artifacts, MemoryService.*, AuditService.query,
+                # AgentService.switch_mode/list_channels/
+                # set_channel_enabled/handle_webhook) would raise
+                # TypeError on ``**payload`` unpacking if we injected
+                # unconditionally.  SubAgent handlers get their
+                # principal stamped inside ``_handle_optional_subagent``
+                # so they don't depend on this branch.
+                ctx = RequestContext.for_rpc(
+                    principal_id,
+                    project_id=agent._bound_project_id,
+                    policy_digest=agent._effective_policy.digest,
+                )
                 if "principal_id" in payload:
-                    payload["principal_id"] = principal_id
+                    payload["principal_id"] = ctx.principal_id
                 if method == "AgentService.Chat":
                     try:
-                        async for event in agent.chat(ChatRequest(**payload)):
+                        async for event in agent.chat(ctx, ChatRequest(**payload)):
                             writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                             await writer.drain()
                     except Exception as exc:
@@ -1675,56 +1782,56 @@ async def serve_json_lines(
                             ).encode("utf-8")
                         )
                 elif method == "AgentService.SwitchMode":
-                    response = await agent.switch_mode(payload.get("session_id", ""), payload["target_mode"])
+                    response = await agent.switch_mode(ctx, payload.get("session_id", ""), payload["target_mode"])
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "AgentService.ConfirmPermission":
-                    response = await agent.confirm_permission(ConfirmRequest(**payload))
+                    response = await agent.confirm_permission(ctx, ConfirmRequest(**payload))
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "AgentService.HandleWebhook":
-                    response = await agent.handle_webhook(**payload)
+                    response = await agent.handle_webhook(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method in {"ChannelService.List", "ChannelService.Health"}:
-                    writer.write((json.dumps(agent.list_channels(), ensure_ascii=False) + "\n").encode("utf-8"))
+                    writer.write((json.dumps(agent.list_channels(ctx), ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method in {"ChannelService.Enable", "ChannelService.Disable"}:
-                    response = agent.set_channel_enabled(payload["channel_id"], method.endswith("Enable"))
+                    response = agent.set_channel_enabled(ctx, payload["channel_id"], method.endswith("Enable"))
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "MemoryService.SetMemory":
-                    response = await memory.set_memory(**payload)
+                    response = await memory.set_memory(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "MemoryService.GetMemory":
-                    response = await memory.get_memory(**payload)
+                    response = await memory.get_memory(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "MemoryService.SearchMemory":
-                    response = await memory.search_memory(**payload)
+                    response = await memory.search_memory(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "AuditService.Query":
-                    response = await audit_service.query(**payload)
+                    response = await audit_service.query(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "TaskService.List":
-                    response = await task_service.list(**payload)
+                    response = await task_service.list(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "TaskService.Get":
-                    response = await task_service.get(**payload)
+                    response = await task_service.get(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "TaskService.Create":
-                    writer.write((json.dumps(await task_service.create(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
+                    writer.write((json.dumps(await task_service.create(ctx, **payload), ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method in {"TaskService.Cancel", "TaskService.Approve", "TaskService.Reject"}:
                     action = method.rsplit(".", 1)[-1].lower()
-                    writer.write((json.dumps(await getattr(task_service, action)(**payload), ensure_ascii=False) + "\n").encode("utf-8"))
+                    writer.write((json.dumps(await getattr(task_service, action)(ctx, **payload), ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "TaskService.Artifacts":
-                    writer.write((json.dumps(await task_service.artifacts(payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
+                    writer.write((json.dumps(await task_service.artifacts(ctx, payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "TaskService.Events":
                     async for event in task_service.task_manager.subscribe(payload["task_id"]):
                         writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()
                 elif method == "SubAgentService.Spawn":
-                    response = await _handle_optional_subagent(subagent_service, "spawn", payload)
+                    response = await _handle_optional_subagent(subagent_service, "spawn", ctx, payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "SubAgentService.Collect":
-                    response = await _handle_optional_subagent(subagent_service, "collect", payload)
+                    response = await _handle_optional_subagent(subagent_service, "collect", ctx, payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "SubAgentService.Status":
-                    response = await _handle_optional_subagent(subagent_service, "status", payload)
+                    response = await _handle_optional_subagent(subagent_service, "status", ctx, payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 else:
                     writer.write(json.dumps({"error": "unknown method"}).encode("utf-8") + b"\n")
@@ -1983,10 +2090,25 @@ async def _build_subagent_service(
 async def _handle_optional_subagent(
     subagent_service: SubAgentService | None,
     action: str,
+    ctx: RequestContext,
     payload: dict,
 ) -> dict:
+    """Dispatch a SubAgent RPC action with the transport ``ctx``.
+
+    M4 batch 3.1.16A-4-1: ``ctx`` is the authoritative principal carrier.
+    ``payload["principal_id"]`` is also normalized to ``ctx.principal_id``
+    so the existing B1/M2 principal checks inside ``SubAgentService``
+    continue to work without a signature rewrite in this batch.  A-4-2
+    will move SubAgentService to accept ``ctx`` directly.
+    """
     if subagent_service is None:
         return {"ok": False, "error": "subagents not enabled"}
+    # Backward-compat: stamp the transport principal onto the payload so
+    # SubAgentService's existing ``principal_id`` checks see the
+    # authenticated value.  This closes the gap where the Go gateway
+    # forwards no principal and the payload resolved to "" (rejected by
+    # M2).  A-4-2 will replace this with a real ctx-scoped handler.
+    payload = {**payload, "principal_id": ctx.principal_id}
     if action == "spawn":
         return await subagent_service.handle_spawn(payload)
     if action == "collect":

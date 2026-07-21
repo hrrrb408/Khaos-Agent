@@ -1,3 +1,4 @@
+from khaos.runtime.context import RequestContext
 from khaos.runtime.factory import (
     RuntimeConfig,
     RuntimeResult,
@@ -7,6 +8,7 @@ from khaos.runtime.factory import (
 )
 
 __all__ = [
+    "RequestContext",
     "RuntimeConfig",
     "RuntimeResult",
     "build_runtime",
