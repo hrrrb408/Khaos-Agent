@@ -116,6 +116,27 @@ func main() {
 			}
 			log.Printf("project-id: %s (drift detection enabled)", pid)
 		}
+		// C-1-4: fetch policy_digest via the Bootstrap.GetPolicyDigest
+		// startup handshake.  Python is the sole authority for
+		// policy_digest — Go never computes it independently.  The
+		// returned digest is stamped on PythonClient.PolicyDigest and
+		// injected into every subsequent RPC payload so Python's
+		// dispatcher can detect policy drift.  Failure is non-fatal:
+		// if the Python server is not yet running or the handshake
+		// errors, drift detection is disabled (Python accepts empty
+		// policy_digest claims for backward compat).
+		bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		if digest, err := client.BootstrapPolicyDigest(bootstrapCtx); err != nil {
+			log.Printf("policy-digest: %v (drift detection disabled)", err)
+		} else if digest != "" {
+			client.PolicyDigest = digest
+			if pc, ok := agent.(platform.PythonClient); ok {
+				pc.PolicyDigest = digest
+				agent = pc
+			}
+			log.Printf("policy-digest: %s (drift detection enabled)", digest)
+		}
+		bootstrapCancel()
 		handler = handler.WithAudit(client)
 		handler = handler.WithTasks(client)
 		if *enableSubagents {
