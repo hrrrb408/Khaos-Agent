@@ -413,6 +413,13 @@ class AgentLoop:
                             "audit_logger",
                             None,
                         ),
+                        # M4 batch 3.1.16A-4-4-2: inject ``db`` so the
+                        # three history tools (history_search /
+                        # history_browse / history_read) can construct a
+                        # per-call ``SessionSearch(db, principal_id=...)``
+                        # via the ``history.read`` broker injection —
+                        # no module-global holder, no cross-principal leak.
+                        "db": self.db,
                     },
                 }
                 if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:
