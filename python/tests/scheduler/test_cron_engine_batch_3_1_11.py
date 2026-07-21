@@ -802,14 +802,18 @@ async def test_acceptance_10_lease_recovery_failure_degraded_mode(tmp_path) -> N
     a lease-recovery failure left crashed tasks un-recovered AND
     continued accepting new executions, compounding the inconsistency.
 
+    M4 batch 3.1.16B-5 (CRITICAL): ``create()`` now refuses degraded
+    mode (raises ``RuntimeError("engine_degraded")``) — a stricter
+    form of the same safety guarantee.  Previously ``create()``
+    succeeded but the tick loop refused to fire; now the refusal
+    happens at creation time, giving the caller an immediate signal.
+
     Sequence:
       1. Create a DB with a task.
       2. Patch ``recover_expired_leases`` to raise.
       3. Create a CronEngine and start it.
       4. The engine MUST be in ``_degraded`` mode.
-      5. Create a task that's immediately due.
-      6. Let tick fire.
-      7. The executor MUST NOT be called (degraded mode refuses).
+      5. ``create()`` MUST raise ``RuntimeError("engine_degraded")``.
     """
     db = await _make_db(tmp_path)
     try:
@@ -837,22 +841,16 @@ async def test_acceptance_10_lease_recovery_failure_degraded_mode(tmp_path) -> N
             "crashed-task state"
         )
 
-        # Create a task that's immediately due.
+        # M4 batch 3.1.16B-5: create() MUST raise in degraded mode.
         iso = datetime.utcnow().isoformat()
-        await engine.create(
-            "degraded", "p", ScheduleConfig(iso_time=iso),
-            principal_id="alice",
-        )
+        with pytest.raises(RuntimeError, match="engine_degraded"):
+            await engine.create(
+                "degraded", "p", ScheduleConfig(iso_time=iso),
+                principal_id="alice",
+            )
 
-        # Let tick fire a few times.
-        await asyncio.sleep(0.3)
-
-        # The executor MUST NOT have been called (degraded mode).
-        assert len(executor_calls) == 0, (
-            f"executor was called {len(executor_calls)} time(s) despite "
-            "degraded mode — the engine accepted a new execution with "
-            "unknown crashed-task state"
-        )
+        # The executor MUST NOT have been called (no task was created).
+        assert len(executor_calls) == 0
 
         await engine.stop(timeout=2.0)
     finally:

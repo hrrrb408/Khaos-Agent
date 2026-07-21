@@ -2398,6 +2398,127 @@ class Database:
         return cursor.rowcount
 
     # ------------------------------------------------------------------
+    # M4 batch 3.1.16B-5: scheduler operation journal (durable intent)
+    # ------------------------------------------------------------------
+
+    async def insert_scheduler_journal_entry(
+        self,
+        *,
+        operation_id: str,
+        task_id: str,
+        operation_type: str,
+        desired_status: str,
+        expected_version: int,
+        target_version: int,
+        principal_id: str = "",
+        policy_digest: str = "",
+    ) -> int:
+        """M4 batch 3.1.16B-5 (CRITICAL): record a control op's intent.
+
+        Called by ``CronEngine._persist_task_state`` (control-op branch)
+        AFTER the in-memory ``_pending_persistence`` marker is placed
+        and BEFORE the CAS UPDATE is attempted.  ``applied_at`` stays
+        NULL until the CAS is confirmed successful (or the entry is
+        marked stale by replay).
+
+        The INSERT is atomic — if it fails, the caller MUST NOT proceed
+        with the CAS (the journal entry is the durability proof; a CAS
+        without a journal entry would be unrecoverable on crash).  The
+        caller raises on failure, leaving the in-memory marker in place
+        so ``stop()`` retries.
+
+        Returns the ``seq`` of the inserted row.
+        """
+        conn = await self._require_conn()
+        from datetime import datetime as _dt
+
+        created = _dt.utcnow().isoformat()
+        cursor = await conn.execute(
+            """
+            INSERT INTO scheduler_operation_journal
+                (operation_id, task_id, operation_type, desired_status,
+                 expected_version, target_version, principal_id,
+                 policy_digest, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                operation_id, task_id, operation_type, desired_status,
+                expected_version, target_version, principal_id,
+                policy_digest, created,
+            ),
+        )
+        await conn.commit()
+        return int(cursor.lastrowid or 0)
+
+    async def mark_scheduler_journal_applied(
+        self, operation_id: str,
+    ) -> int:
+        """M4 batch 3.1.16B-5: mark a journal entry as applied.
+
+        Called by ``CronEngine._persist_task_state`` after a successful
+        CAS (or after replay confirms the entry is stale / idempotent).
+        Sets ``applied_at`` so the next ``start()`` does not replay it.
+
+        Returns rowcount (1 = marked, 0 = entry not found — already
+        marked or never inserted; both are safe).
+        """
+        conn = await self._require_conn()
+        from datetime import datetime as _dt
+
+        applied = _dt.utcnow().isoformat()
+        cursor = await conn.execute(
+            "UPDATE scheduler_operation_journal SET applied_at = ? "
+            "WHERE operation_id = ? AND applied_at IS NULL",
+            (applied, operation_id),
+        )
+        await conn.commit()
+        return cursor.rowcount
+
+    async def list_pending_scheduler_journal_entries(
+        self,
+    ) -> list[dict[str, Any]]:
+        """M4 batch 3.1.16B-5: scan ``applied_at IS NULL`` entries in
+        ``seq`` order.
+
+        Called by ``CronEngine.start()`` BEFORE
+        ``recover_all_running_tasks`` so replay can roll forward
+        pause/remove intents before the bulk FAILED sweep would
+        otherwise lose them.
+
+        Returns a list of dicts with keys: ``seq``, ``operation_id``,
+        ``task_id``, ``operation_type``, ``desired_status``,
+        ``expected_version``, ``target_version``, ``principal_id``,
+        ``policy_digest``, ``created_at``.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            """
+            SELECT seq, operation_id, task_id, operation_type,
+                   desired_status, expected_version, target_version,
+                   principal_id, policy_digest, created_at
+            FROM scheduler_operation_journal
+            WHERE applied_at IS NULL
+            ORDER BY seq ASC
+            """
+        )
+        rows = await cursor.fetchall()
+        return [
+            {
+                "seq": int(row[0]),
+                "operation_id": str(row[1]),
+                "task_id": str(row[2]),
+                "operation_type": str(row[3]),
+                "desired_status": str(row[4]),
+                "expected_version": int(row[5]),
+                "target_version": int(row[6]),
+                "principal_id": str(row[7]),
+                "policy_digest": str(row[8]),
+                "created_at": str(row[9]),
+            }
+            for row in rows
+        ]
+
+    # ------------------------------------------------------------------
     # Hermes batch 2: session history FTS5 search
     # ------------------------------------------------------------------
 
