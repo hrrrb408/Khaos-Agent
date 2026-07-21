@@ -14,12 +14,22 @@ import pytest
 
 from khaos.db import Database
 from khaos.grpc_server import AgentService, ChatRequest
+from khaos.runtime import RequestContext
+
+
+def _test_ctx() -> RequestContext:
+    """M4 batch 3.1.16A-4-1: build a RequestContext for mock service tests.
+
+    Uses :meth:`RequestContext.for_cli` which is Windows-safe.
+    """
+    return RequestContext.for_cli()
 
 
 class MockAgentService:
     """Small mock agent service with the same chat surface."""
 
-    async def chat(self, request: ChatRequest):
+    async def chat(self, ctx: RequestContext, request: ChatRequest):
+        del ctx  # Mock does not scope by principal.
         yield {
             "event": "message",
             "data": {"role": "assistant", "content": f"mock reply: {request.message}", "token_count": 2},
@@ -37,7 +47,7 @@ async def serve_test_json_lines(socket_path: Path, agent: MockAgentService):
             method = request.get("method")
             payload = request.get("payload", {})
             if method == "AgentService.Chat":
-                async for event in agent.chat(ChatRequest(**payload)):
+                async for event in agent.chat(_test_ctx(), ChatRequest(**payload)):
                     writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                     await writer.drain()
             else:
@@ -109,8 +119,8 @@ async def test_real_agent_service_can_be_mocked_for_json_lines(tmp_path):
     """Keep the real service import path exercised without real model calls."""
 
     class FixedAgentService(AgentService):
-        async def chat(self, request: ChatRequest):
-            del request
+        async def chat(self, ctx: RequestContext, request: ChatRequest):
+            del ctx, request
             yield {"event": "message", "data": {"role": "assistant", "content": "fixed", "token_count": 1}}
             yield {"event": "done", "data": {"total_tokens": 1, "stop_reason": "end_turn"}}
 
@@ -118,7 +128,7 @@ async def test_real_agent_service_can_be_mocked_for_json_lines(tmp_path):
     await db.connect()
     await db.run_migrations()
     service = FixedAgentService(db, project_root=Path(tmp_path))
-    events = [event async for event in service.chat(ChatRequest("s", "hello", "office"))]
+    events = [event async for event in service.chat(_test_ctx(), ChatRequest("s", "hello", "office"))]
 
     assert events[0]["data"]["content"] == "fixed"
     await db.close()

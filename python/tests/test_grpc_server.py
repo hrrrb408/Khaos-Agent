@@ -27,6 +27,28 @@ from khaos.grpc_server import (
 )
 from khaos.memory import MemoryStore
 from khaos.channels import ChannelType, PlatformMessage, Sender
+from khaos.runtime import RequestContext
+
+
+def _test_ctx(*, principal_id: str = "", session_id: str = "") -> RequestContext:
+    """M4 batch 3.1.16A-4-1: build a RequestContext for direct service tests.
+
+    Defaults to the CLI principal so tests that don't care about
+    multi-principal scoping behave the same as before A-4-1.  Tests that
+    DO care (e.g. SwitchMode principal binding) pass an explicit
+    ``principal_id``.  Uses :meth:`RequestContext.for_cli` which is
+    Windows-safe (falls back to ``local-uid:windows``).
+    """
+    if not principal_id:
+        ctx = RequestContext.for_cli()
+        if session_id:
+            ctx = ctx.with_session(session_id)
+        return ctx
+    return RequestContext(
+        principal_id=principal_id,
+        session_id=session_id,
+        source_transport="test",
+    )
 
 
 async def test_agent_service_chat_streams_events(tmp_path):
@@ -38,7 +60,7 @@ async def test_agent_service_chat_streams_events(tmp_path):
     await db.run_migrations()
     service = AgentService(db, project_root=tmp_path)
 
-    events = [event async for event in service.chat(ChatRequest("s1", "hello", "office"))]
+    events = [event async for event in service.chat(_test_ctx(), ChatRequest("s1", "hello", "office"))]
 
     assert events[0]["event"] == "message"
     assert events[-1]["event"] == "done"
@@ -54,8 +76,8 @@ async def test_agent_service_switch_and_confirm(tmp_path):
     await db.run_migrations()
     service = AgentService(db, project_root=tmp_path)
 
-    mode = await service.switch_mode("s1", "coding")
-    confirmation = await service.confirm_permission(ConfirmRequest("s1", "call_1", True, False))
+    mode = await service.switch_mode(_test_ctx(), "s1", "coding")
+    confirmation = await service.confirm_permission(_test_ctx(), ConfirmRequest("s1", "call_1", True, False))
 
     assert mode == {"current_mode": "coding"}
     assert confirmation["ok"] is False
@@ -91,7 +113,7 @@ async def test_agent_service_owns_shared_audit_logger_across_turns(tmp_path):
     shared = MagicMock()
     service._audit_logger = shared
 
-    runtime = await service._build_runtime("s1", "office")
+    runtime = await service._build_runtime(_test_ctx(), "s1", "office")
     assert runtime.audit_logger is shared
     assert runtime.owns_audit_logger is False
     await runtime.aclose()
@@ -147,7 +169,7 @@ async def test_agent_service_chat_quarantines_failed_runtime_close(
     monkeypatch.setattr(service, "_build_runtime", fake_build)
     try:
         with pytest.raises(RuntimeCloseError):
-            [event async for event in service.chat(ChatRequest("s1", "hi", "office"))]
+            [event async for event in service.chat(_test_ctx(), ChatRequest("s1", "hi", "office"))]
         assert any(item is runtime for item in _orphan_runtimes)
         assert runtime.quarantined is True
     finally:
@@ -164,7 +186,11 @@ async def test_webhook_session_and_principal_are_channel_bound(tmp_path, monkeyp
     service = AgentService(db, project_root=tmp_path)
     requests = []
 
-    async def fake_chat(request):
+    async def fake_chat(ctx, request):
+        # M4 batch 3.1.16A-4-1: chat now takes ctx as the first arg.
+        # ``ctx`` carries the webhook principal; the test asserts the
+        # derived principal is stamped onto ``request.principal_id``.
+        del ctx
         requests.append(request)
         if False:
             yield {}
@@ -198,11 +224,11 @@ async def test_task_service_only_approves_or_rejects_blocked_tasks():
     manager = TaskManager()
     service = TaskService(manager)
     task = await manager.create("approval")
-    not_blocked = await service.approve(task.id)
+    not_blocked = await service.approve(_test_ctx(), task.id)
     await manager.update_status(task.id, "blocked")
-    approved = await service.approve(task.id)
+    approved = await service.approve(_test_ctx(), task.id)
     await manager.update_status(task.id, "blocked")
-    rejected = await service.reject(task.id)
+    rejected = await service.reject(_test_ctx(), task.id)
     assert not not_blocked["ok"]
     assert not approved["ok"]
     assert not rejected["ok"]
@@ -233,7 +259,7 @@ async def test_task_approval_is_consumed_before_running_is_observable():
     service = TaskService(manager, broker)
 
     approved = await service.approve(
-        task.id, principal_id="principal", session_id="session",
+        _test_ctx(), task.id, principal_id="principal", session_id="session",
         binding_digest=binding_digest,
     )
 
@@ -250,7 +276,7 @@ async def test_task_approval_is_consumed_before_running_is_observable():
     record = broker._tool_approvals[binding.tool_call_id]
     assert record.used and record.dispatched
     replay = await service.approve(
-        task.id, principal_id="principal", session_id="session",
+        _test_ctx(), task.id, principal_id="principal", session_id="session",
         binding_digest=binding_digest,
     )
     assert replay["ok"] is False
@@ -270,7 +296,7 @@ async def test_stale_task_approval_never_publishes_running_state():
         },
     )
     response = await TaskService(manager, broker).approve(
-        task.id, principal_id="principal", session_id="session",
+        _test_ctx(), task.id, principal_id="principal", session_id="session",
         binding_digest="digest",
     )
 
@@ -294,13 +320,14 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
     service = AgentService(db, project_root=project)
     target = "agent.txt"
 
-    stream = service.chat(ChatRequest("s1", f"/tool write_file {target} hello", "coding"))
+    stream = service.chat(_test_ctx(), ChatRequest("s1", f"/tool write_file {target} hello", "coding"))
     first = await stream.__anext__()
     second = await stream.__anext__()
     assert first["event"] == "tool_call"
     assert second["event"] == "permission_request"
 
     confirmation = await service.confirm_permission(
+        _test_ctx(),
         ConfirmRequest(
             "s1",
             second["data"]["id"],
@@ -357,7 +384,7 @@ async def test_agent_service_shutdown_waits_for_active_chat_runtime(
     )
 
     async def consume():
-        async for _ in service.chat(ChatRequest("active", "wait", "office")):
+        async for _ in service.chat(_test_ctx(), ChatRequest("active", "wait", "office")):
             pass
 
     chat_task = asyncio.create_task(consume())
@@ -756,7 +783,7 @@ async def test_chat_owner_reservation_visible_to_shutdown_during_build(
     async def drive_chat():
         request = ChatRequest(session_id="race", message="x", mode="office")
         try:
-            async for _event in service.chat(request):
+            async for _event in service.chat(_test_ctx(), request):
                 pass
         except (_SSE, asyncio.CancelledError):
             pass
@@ -840,7 +867,7 @@ async def test_shutdown_reaches_drain_promptly_when_build_is_slow(
     async def drive_chat():
         request = ChatRequest(session_id="slow", message="x", mode="office")
         try:
-            async for _event in service.chat(request):
+            async for _event in service.chat(_test_ctx(), request):
                 pass
         except (_SSE, asyncio.CancelledError, RuntimeError):
             pass
@@ -904,7 +931,7 @@ async def test_chat_owner_cleaned_up_when_build_raises(tmp_path, monkeypatch):
     request = ChatRequest(session_id="fail", message="x", mode="office")
     # The chat generator surfaces the build failure.
     with pytest.raises(RuntimeError, match="simulated config"):
-        async for _event in service.chat(request):
+        async for _event in service.chat(_test_ctx(), request):
             pass
 
     # The owner reservation MUST have been cleaned up — no leftover
@@ -919,7 +946,7 @@ async def test_chat_owner_cleaned_up_when_build_raises(tmp_path, monkeypatch):
 async def _drain_chat(service: AgentService) -> None:
     """Consume the chat event stream so the runtime actually starts."""
     request = ChatRequest(session_id="wedged", message="x", mode="office")
-    async for _event in service.chat(request):
+    async for _event in service.chat(_test_ctx(), request):
         pass
 
 
@@ -929,10 +956,10 @@ async def test_memory_service_crud_search(tmp_path):
     await db.run_migrations()
     service = MemoryService(MemoryStore(db))
 
-    stored = await service.set_memory("global", "user", "Ruibang likes tests")
-    memory = await service.get_memory("global", "user")
-    results = await service.search_memory("tests")
-    deleted = await service.delete_memory(stored["id"])
+    stored = await service.set_memory(_test_ctx(), "global", "user", "Ruibang likes tests")
+    memory = await service.get_memory(_test_ctx(), "global", "user")
+    results = await service.search_memory(_test_ctx(), "tests")
+    deleted = await service.delete_memory(_test_ctx(), stored["id"])
 
     assert stored["ok"]
     assert memory["value"] == "Ruibang likes tests"
@@ -1182,7 +1209,7 @@ async def test_build_runtime_wires_token_engine_and_skills(tmp_path):
     # B1: ``_build_runtime`` now returns the full ``RuntimeResult``; the
     # caller owns it and must close it.  The loop is the same instance
     # carried by the result.
-    runtime = await service._build_runtime("s1", "office")
+    runtime = await service._build_runtime(_test_ctx(), "s1", "office")
     loop = runtime.loop
 
     try:
@@ -1209,7 +1236,7 @@ async def test_audit_service_query_roundtrip(tmp_path):
     service = AuditService(logger)
 
     await logger.log("write_file", "/tmp/x", "success", {"size": 1})
-    entries = await service.query(limit=10)
+    entries = await service.query(_test_ctx(), limit=10)
 
     assert len(entries) == 1
     assert entries[0]["action"] == "write_file"
