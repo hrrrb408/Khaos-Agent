@@ -131,6 +131,17 @@ class SubAgentRunner:
             build_runtime,
             close_runtime_or_register,
         )
+        # B1: use the TASK's principal_id (set from the authenticated
+        # RPC payload), NOT the server-fixed self.principal_id.  This
+        # ensures the subagent's BrowserContext / Memory scope /
+        # audit events are bound to the CALLING principal, not the
+        # server's local UID.
+        #
+        # C-1-5a: build_runtime fail-closed on empty principal_id, so
+        # if both task.principal_id and self.principal_id are empty
+        # the runtime construction raises ValueError.  No implicit
+        # local-uid fallback in the build_runtime path.
+        principal_id = task.principal_id or self.principal_id
         runtime = await build_runtime(RuntimeConfig(
             db=self.db, mode_manager=self.mode_manager, router=self.router,
             # B1: pass ``tool_scheduler=None`` (the default) so build_runtime
@@ -151,12 +162,7 @@ class SubAgentRunner:
             # so approvals and audit events are bound to the same authority
             # as the main AgentLoop.
             approval_broker=self.approval_broker,
-            # B1: use the TASK's principal_id (set from the authenticated
-            # RPC payload), NOT the server-fixed self.principal_id.  This
-            # ensures the subagent's BrowserContext / Memory scope /
-            # audit events are bound to the CALLING principal, not the
-            # server's local UID.
-            principal_id=task.principal_id or self.principal_id or f"local-uid:{os.getuid()}",
+            principal_id=principal_id,
             audit_logger=self.audit_logger,
             # M4 batch 3.1.16A-5-1b (CRITICAL): inject the task's
             # project_id so the subagent's AgentLoop._bound_project_id

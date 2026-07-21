@@ -741,9 +741,17 @@ class AgentService:
         # the local user and invisible to any other authenticated principal.
         # Per-turn runtimes constructed by ``build_runtime`` carry their own
         # principal-scoped TaskManager via ``RuntimeConfig.principal_id``.
-        self.task_manager = TaskManager(
-            db=db, principal_id=f"local-uid:{os.getuid()}"
-        )
+        #
+        # C-1-5a: the server-level ``TaskManager(local-uid)`` singleton
+        # is REMOVED.  ``TaskService`` now holds ``db`` and constructs
+        # per-principal ``TaskManager`` instances on demand (cached for
+        # the process lifetime).  This allows API principals to
+        # ``create`` / ``list`` / ``get`` / ``cancel`` their own tasks
+        # (previously ``create`` was rejected and ``list``/``get``
+        # returned empty for API principals).  ``_build_runtime`` no
+        # longer passes a shared task_manager — ``build_runtime``
+        # constructs a per-turn manager from ``cfg.principal_id``
+        # (factory.py:502-517).
         # H2: compile the *layered* effective policy (user ∩ project ∩
         # platform) once at startup — never consult the raw project policy
         # for enforcement decisions.  An untrusted repo can no longer
@@ -865,7 +873,9 @@ class AgentService:
 
     async def start(self) -> None:
         """Start process-scoped background services."""
-        await self.task_manager.load()
+        # C-1-5a: ``TaskService`` now lazily constructs per-principal
+        # TaskManagers on first use (``_manager(ctx)``), so there's no
+        # server-level ``task_manager.load()`` at startup.
         await self.cron_engine.start()
 
     async def stop_producers(self) -> None:
@@ -1299,7 +1309,13 @@ class AgentService:
             project_root=self.project_root, config_path=self.config_path,
             mode_override=mode or None, confirm_callback=self._wait_for_confirmation,
             db=self.db, audit_logger=self._audit_logger,
-            task_manager=self.task_manager,
+            # C-1-5a: do NOT pass a shared task_manager — let
+            # ``build_runtime`` construct a per-turn TaskManager from
+            # ``cfg.principal_id`` (factory.py:502-517).  Previously
+            # this passed the server-level ``TaskManager(local-uid)``
+            # singleton, which meant per-turn coding tasks landed in
+            # the local-uid cache — invisible to the API principal's
+            # ``TaskService.list``.
             approval_broker=self.approval_broker,
             router=self._router,
             office_authority=self._office_authority,
@@ -1485,41 +1501,73 @@ class AuditService:
 
 
 class TaskService:
-    """Coding-task RPC service backed by a shared :class:`TaskManager`."""
+    """Coding-task RPC service with per-principal TaskManager.
 
-    def __init__(self, task_manager: TaskManager, approval_broker: ApprovalBroker | None = None):
-        self.task_manager = task_manager
+    C-1-5a: previously this service held a server-level
+    ``TaskManager(local-uid)`` singleton, which (a) rejected ``create``
+    from API principals (fail-closed with a "deferred to A-4-3/A-4-4"
+    error) and (b) returned empty ``list``/``get``/``cancel`` results
+    for API principals because the cache only held local-uid tasks.
+
+    Now the service holds ``db`` + ``approval_broker`` and constructs
+    a per-principal ``TaskManager`` on demand (cached for the
+    process lifetime).  Each principal gets an isolated cache loaded
+    from the DB, so ``create``/``list``/``get``/``cancel`` all work
+    correctly for any authenticated principal.  Cross-principal
+    isolation is enforced both by the manager's principal-scoped cache
+    AND by the explicit ``task.principal_id != ctx.principal_id``
+    checks (defense in depth).
+    """
+
+    def __init__(self, db, approval_broker: ApprovalBroker | None = None):
+        self.db = db
         self.approval_broker = approval_broker
+        # C-1-5a: per-principal TaskManager cache.  Each principal
+        # gets its own manager with its own in-memory cache loaded
+        # from the DB.  The cache is keyed by principal_id and lives
+        # for the process lifetime — a principal that connects, goes
+        # away, and comes back reuses the same manager.
+        self._managers: dict[str, TaskManager] = {}
+
+    async def _manager(self, ctx: RequestContext) -> TaskManager:
+        """Get or create the per-principal TaskManager."""
+        manager = self._managers.get(ctx.principal_id)
+        if manager is None:
+            manager = TaskManager(
+                db=self.db, principal_id=ctx.principal_id,
+                project_id=ctx.project_id,
+            )
+            await manager.load()
+            self._managers[ctx.principal_id] = manager
+        return manager
 
     async def list(self, ctx: RequestContext, active_only: bool = False) -> list[dict]:
         """List tasks — active ones by default, all when ``active_only`` is set.
 
-        M4 batch 3.1.16A-4-2: filter the returned tasks by
-        ``ctx.principal_id``.  The shared ``TaskManager`` is bound to
-        ``local-uid`` at server startup, so its cache contains only
-        local-uid-owned tasks; an API principal calling this method
-        therefore sees an empty list (fail-closed).  The filter is
-        defense in depth — the manager's cache is already principal-
-        scoped at load time, but the explicit caller-supplied filter
-        guarantees that a future code path mixing principals in one
-        cache cannot leak across the boundary.
+        C-1-5a: the per-principal TaskManager's cache only contains
+        tasks owned by ``ctx.principal_id``, so the caller sees exactly
+        their own tasks.  The explicit ``principal_id`` filter is
+        defense in depth.
         """
+        manager = await self._manager(ctx)
         if active_only:
-            return await self.task_manager.list_active(
+            return await manager.list_active(
                 principal_id=ctx.principal_id,
             )
-        return await self.task_manager.list_all(
+        return await manager.list_all(
             principal_id=ctx.principal_id,
         )
 
     async def get(self, ctx: RequestContext, task_id: str) -> dict:
         """Return one task's state, or ``{"error": "not found"}``.
 
-        M4 batch 3.1.16A-4-2: a task owned by a different principal is
-        treated as ``not found`` — existence is hidden to avoid leaking
-        that another principal has work in flight.
+        C-1-5a: a task owned by a different principal is treated as
+        ``not found`` — existence is hidden to avoid leaking that
+        another principal has work in flight.  (Defense in depth: the
+        per-principal cache already excludes foreign tasks.)
         """
-        task = await self.task_manager.get(task_id)
+        manager = await self._manager(ctx)
+        task = await manager.get(task_id)
         if task is None or task.principal_id != ctx.principal_id:
             return {"error": "task not found", "task_id": task_id}
         return task.to_dict()
@@ -1527,38 +1575,26 @@ class TaskService:
     async def create(self, ctx: RequestContext, goal: str) -> dict:
         """Create a task owned by ``ctx.principal_id``.
 
-        M4 batch 3.1.16A-4-2: the server-level ``TaskManager`` is bound
-        to ``local-uid`` at startup.  An RPC caller whose transport
-        principal differs from the manager's bound principal is
-        rejected up-front — silently stamping ``ctx.principal_id`` on a
-        task stored in a foreign-principal cache would create an
-        inconsistent ownership graph (the task would be invisible to
-        the manager's bound principal's ``list_all``, and visible only
-        via the filtered RPC path).  The proper fix is per-principal
-        ``TaskManager`` construction (deferred to A-4-3 / A-4-4).  For
-        now the CLI path (``ctx.principal_id == manager.principal_id``)
-        works unchanged, and the API path fails closed.
+        C-1-5a: the per-principal TaskManager stamps
+        ``ctx.principal_id`` on the new task and stores it in the
+        caller's cache.  Previously this rejected API principals with
+        a "per-principal TaskManager required" error (deferred to
+        A-4-3/A-4-4) — C-1-5a fulfills that deferral.
         """
-        if ctx.principal_id != self.task_manager.principal_id:
-            return {
-                "ok": False,
-                "error": (
-                    "task_manager bound to a different principal; "
-                    "per-principal TaskManager required for RPC create"
-                ),
-            }
-        return (await self.task_manager.create(goal)).to_dict()
+        manager = await self._manager(ctx)
+        return (await manager.create(goal)).to_dict()
 
     async def cancel(self, ctx: RequestContext, task_id: str) -> dict:
         from khaos.coding.task_manager import TransitionResult
 
-        # M4 batch 3.1.16A-4-2: hide cross-principal tasks (treat as
-        # not found) so an API principal cannot enumerate or cancel
-        # another principal's tasks.
-        task = await self.task_manager.get(task_id)
+        # C-1-5a: hide cross-principal tasks (treat as not found) so
+        # an API principal cannot enumerate or cancel another
+        # principal's tasks.  (Defense in depth.)
+        manager = await self._manager(ctx)
+        task = await manager.get(task_id)
         if task is None or task.principal_id != ctx.principal_id:
             return {"ok": False, "error": "task not found", "task_id": task_id}
-        result = await self.task_manager.cancel(task_id)
+        result = await manager.cancel(task_id)
         if result == TransitionResult.NOT_FOUND:
             return {"ok": False, "error": "task not found", "task_id": task_id}
         if result == TransitionResult.INVALID_TRANSITION:
@@ -1586,7 +1622,8 @@ class TaskService:
                 "error": "payload principal_id does not match transport principal",
                 "task_id": task_id,
             }
-        task = await self.task_manager.get(task_id)
+        manager = await self._manager(ctx)
+        task = await manager.get(task_id)
         if task is None or task.principal_id != ctx.principal_id:
             return {"ok": False, "error": "task not found", "task_id": task_id}
         if task.status != TaskStatus.BLOCKED:
@@ -1604,7 +1641,7 @@ class TaskService:
                 "task_id": task_id,
             }
         async def commit() -> bool:
-            result = await self.task_manager.transition(
+            result = await manager.transition(
                 task_id, expected={TaskStatus.BLOCKED},
                 target=TaskStatus.RUNNING, pending_approval=None,
                 approval_consumption={
@@ -1647,7 +1684,8 @@ class TaskService:
                 "error": "payload principal_id does not match transport principal",
                 "task_id": task_id,
             }
-        task = await self.task_manager.get(task_id)
+        manager = await self._manager(ctx)
+        task = await manager.get(task_id)
         if task is None or task.principal_id != ctx.principal_id:
             return {"ok": False, "error": "task not found", "task_id": task_id}
         if task.status != TaskStatus.BLOCKED:
@@ -1665,7 +1703,7 @@ class TaskService:
                 "task_id": task_id,
             }
         async def commit() -> bool:
-            result = await self.task_manager.transition(
+            result = await manager.transition(
                 task_id, expected={TaskStatus.BLOCKED}, target=TaskStatus.FAILED,
                 error="rejected by user", pending_approval=None,
                 approval_consumption={
@@ -1695,7 +1733,8 @@ class TaskService:
         M4 batch 3.1.16A-4-2: cross-principal tasks return an empty
         list (existence hidden) — symmetric with ``get`` / ``cancel``.
         """
-        task = await self.task_manager.get(task_id)
+        manager = await self._manager(ctx)
+        task = await manager.get(task_id)
         if task is None or task.principal_id != ctx.principal_id:
             return []
         return ([{"type": "file", "path": path} for path in task.files_modified] + [{"type": "test_result", "data": result} for result in task.test_results])
@@ -1710,10 +1749,11 @@ class TaskService:
         an API principal cannot subscribe to another principal's
         task events.
         """
-        task = await self.task_manager.get(task_id)
+        manager = await self._manager(ctx)
+        task = await manager.get(task_id)
         if task is None or task.principal_id != ctx.principal_id:
             return
-        async for event in self.task_manager.subscribe(task_id):
+        async for event in manager.subscribe(task_id):
             yield event
 
 
@@ -1811,7 +1851,9 @@ async def serve_json_lines(
         # principal could read/write the local-uid's memories.
         memory = MemoryService(db)
         audit_service = AuditService(agent._audit_logger or AuditLogger(db))
-        task_service = TaskService(agent.task_manager, agent.approval_broker)
+        # C-1-5a: TaskService now takes ``db`` (not a TaskManager) and
+        # constructs per-principal managers on demand.
+        task_service = TaskService(db, agent.approval_broker)
         subagent_service: SubAgentService | None = None
         if enable_subagents:
             # B1: share the AgentService's office authority AND approval broker so

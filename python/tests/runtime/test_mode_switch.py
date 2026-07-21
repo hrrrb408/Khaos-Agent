@@ -10,7 +10,7 @@ async def test_office_to_coding_switch_enables_per_turn_components(tmp_path):
     await db.connect()
     await db.run_migrations()
     await db.create_session("switch")
-    runtime = await build_runtime(RuntimeConfig(db=db, project_root=tmp_path))
+    runtime = await build_runtime(RuntimeConfig(db=db, project_root=tmp_path, principal_id="local-uid:test"))
     assert runtime.task_manager is not None
     assert runtime.loop.verify_fix_loop is None
     await runtime.mode_manager.switch(runtime.mode_manager.parse("coding"))

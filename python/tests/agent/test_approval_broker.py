@@ -20,11 +20,16 @@ def _test_ctx(principal_id: str = "principal") -> RequestContext:
     return RequestContext.for_rpc(principal_id)
 
 
-async def test_task_approval_resolves_waiting_tool_decision():
+async def test_task_approval_resolves_waiting_tool_decision(tmp_path):
+    from khaos.db import Database
+    db = Database(tmp_path / "approval-broker-test.db")
+    await db.connect()
+    await db.run_migrations()
     broker = ApprovalBroker()
     binding = _binding("call-1")
     digest = await broker.register_tool_approval(binding)
-    manager = TaskManager(principal_id="principal")
+    manager = TaskManager(db=db, principal_id="principal")
+    await manager.load()
     task = await manager.create("protected tool")
     await manager.update_status(task.id, TaskStatus.BLOCKED, pending_approval={
         "tool_call_id": "call-1", "tool_name": "write_file", "target": "x",
@@ -34,7 +39,7 @@ async def test_task_approval_resolves_waiting_tool_decision():
     waiter = asyncio.create_task(
         broker.wait("call-1", timeout=1, binding_digest=digest)
     )
-    service = TaskService(manager, broker)
+    service = TaskService(db, broker)
     # The task endpoint performs the same operation as the HTTP approve path.
     await asyncio.sleep(0)
     response = await service.approve(
@@ -47,7 +52,13 @@ async def test_task_approval_resolves_waiting_tool_decision():
     decision = await waiter
     assert response["ok"] is True
     assert decision == {"approved": True, "remember": False}
-    assert (await manager.get(task.id)).status == TaskStatus.RUNNING
+    # C-1-5a: ``service.approve`` operates on the service's internal
+    # per-principal TaskManager (a different instance from the setup
+    # ``manager``), so verify the transition via the service's manager
+    # — the setup manager's in-memory cache is stale.
+    service_manager = await service._manager(_test_ctx())
+    assert (await service_manager.get(task.id)).status == TaskStatus.RUNNING
+    await db.close()
 
 
 async def test_approval_broker_rejects_cross_session_and_digest_replay():

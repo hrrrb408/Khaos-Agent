@@ -32,7 +32,7 @@ async def _build(tmp_path: Path, policy_yaml: str):
     await db.run_migrations()
     await db.create_session("s1")
     (tmp_path / "khaos_policy.yaml").write_text(policy_yaml, encoding="utf-8")
-    cfg = RuntimeConfig(project_root=tmp_path, db=db)
+    cfg = RuntimeConfig(project_root=tmp_path, db=db, principal_id="local-uid:test")
     result = await build_runtime(cfg)
     return result, db
 

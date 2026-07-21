@@ -16,8 +16,8 @@ async def test_factory_wires_office_and_coding_runtime(tmp_path):
     db = Database(tmp_path / "runtime.db")
     await db.connect()
     await db.run_migrations()
-    office = await build_runtime(RuntimeConfig(db=db, project_root=tmp_path))
-    coding = await build_runtime(RuntimeConfig(db=db, project_root=tmp_path, mode_override="coding"))
+    office = await build_runtime(RuntimeConfig(db=db, project_root=tmp_path, principal_id="local-uid:test"))
+    coding = await build_runtime(RuntimeConfig(db=db, project_root=tmp_path, mode_override="coding", principal_id="local-uid:test"))
     assert office.loop and office.tool_scheduler and office.task_manager is not None
     assert coding.task_manager and coding.skill_generator and coding.new_verify_fix_loop
     assert coding.new_verify_fix_loop() is not coding.new_verify_fix_loop()
