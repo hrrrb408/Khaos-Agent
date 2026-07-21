@@ -266,7 +266,13 @@ class SubAgentSpawner:
             # no longer blocks shutdown from acquiring the lock and
             # running its bounded drain.  Cancellation from shutdown
             # propagates here.
-            await self.db.create_session(task.parent_session_id)
+            # M4 batch 3.1.16A-4-3: stamp the task's principal_id on the
+            # parent session so list_sessions / search_sessions scope by
+            # the calling principal, not the server's local-uid.
+            await self.db.create_session(
+                task.parent_session_id,
+                principal_id=task.principal_id or "legacy",
+            )
             await self.db.insert_subagent_task(
                 task.id,
                 task.parent_session_id,
@@ -376,7 +382,13 @@ class SubAgentSpawner:
             # idempotently first — ``create_session`` uses
             # ``ON CONFLICT DO UPDATE``, so this is safe even if the
             # session already exists.
-            await self.db.create_session(task.parent_session_id)
+            # M4 batch 3.1.16A-4-3: stamp the task's principal_id on the
+            # parent session so list_sessions / search_sessions scope by
+            # the calling principal, not the server's local-uid.
+            await self.db.create_session(
+                task.parent_session_id,
+                principal_id=task.principal_id or "legacy",
+            )
             tools_json = json.dumps(task.tools or [])
             await self.db.insert_subagent_task(
                 task.id,

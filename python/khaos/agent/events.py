@@ -61,6 +61,11 @@ class TurnCoordinator:
                 "attempt_id": attempt_id,
             },
             now=time.time(),
+            # M4 batch 3.1.16A-4-3: stamp principal_id as a top-level
+            # column on ``agent_turns`` so per-principal turn queries
+            # can filter without a JOIN.  ``payload`` still carries it
+            # for backward compatibility with event-stream consumers.
+            principal_id=principal_id,
         )
         return cls(db, turn_id=turn_id, attempt_id=attempt_id)
 

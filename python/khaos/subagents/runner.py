@@ -114,7 +114,12 @@ class SubAgentRunner:
             stream_timeout=self.stream_timeout,
         )
         # 保证子代理 session 已持久化（与 spawn() 的 create_session 对齐）。
-        await self.db.create_session(session_id)
+        # M4 batch 3.1.16A-4-3: stamp the task's principal_id so the
+        # subagent's session history is scoped to the calling principal.
+        await self.db.create_session(
+            session_id,
+            principal_id=task.principal_id or self.principal_id or "legacy",
+        )
 
         from khaos.runtime import (
             RuntimeConfig,

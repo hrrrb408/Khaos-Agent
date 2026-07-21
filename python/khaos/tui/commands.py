@@ -7,6 +7,7 @@ unit-testable without a running Textual app. The TUI widgets call into
 
 from __future__ import annotations
 
+import os
 import shlex
 from dataclasses import dataclass, field
 from typing import Any, Callable, Awaitable
@@ -186,7 +187,10 @@ async def _cmd_mode(args: list[str], ctx: TuiContext) -> CommandResult:
         return CommandResult(handled=True, message=f"invalid mode: {exc}")
     await ctx.mode_manager.switch(target)
     if ctx.db and ctx.session_id:
-        await ctx.db.create_session(ctx.session_id, target.value)
+        await ctx.db.create_session(
+            ctx.session_id, target.value,
+            principal_id=f"local-uid:{os.getuid()}",
+        )
     return CommandResult(handled=True, message=f"mode: {target.value}")
 
 

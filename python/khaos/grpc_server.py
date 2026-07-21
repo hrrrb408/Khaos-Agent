@@ -1141,7 +1141,9 @@ class AgentService:
         mode = ModeManager.parse(target_mode)
         await mode_manager.switch(mode)
         if session_id:
-            await self.db.create_session(session_id, mode.value)
+            await self.db.create_session(
+                session_id, mode.value, principal_id=ctx.principal_id
+            )
         return {"current_mode": mode.value}
 
     async def confirm_permission(self, ctx: RequestContext, request: ConfirmRequest) -> dict:
@@ -1258,7 +1260,9 @@ class AgentService:
         :meth:`RequestContext.for_cli` without a session_id — but the
         RPC path always provides a non-empty ctx.principal_id.
         """
-        await self.db.create_session(session_id, mode or "office")
+        await self.db.create_session(
+            session_id, mode or "office", principal_id=ctx.principal_id
+        )
         from khaos.runtime import RuntimeConfig, build_runtime
 
         return await build_runtime(RuntimeConfig(

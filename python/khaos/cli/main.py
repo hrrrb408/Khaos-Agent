@@ -55,7 +55,10 @@ async def run_once(args: argparse.Namespace) -> int:
         await mode_manager.switch(ModeManager.parse(args.mode))
 
     session_id = args.session_id or str(uuid.uuid4())
-    await db.create_session(session_id, mode_manager.current_mode.value)
+    await db.create_session(
+        session_id, mode_manager.current_mode.value,
+        principal_id=f"local-uid:{os.getuid()}",
+    )
 
     from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
@@ -86,7 +89,10 @@ async def run_repl(args: argparse.Namespace) -> int:
     )
     await mode_manager.load()
     session_id = args.session_id or str(uuid.uuid4())
-    await db.create_session(session_id, mode_manager.current_mode.value)
+    await db.create_session(
+        session_id, mode_manager.current_mode.value,
+        principal_id=f"local-uid:{os.getuid()}",
+    )
     from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
@@ -107,7 +113,10 @@ async def run_repl(args: argparse.Namespace) -> int:
             if user_input.startswith("/mode "):
                 target = ModeManager.parse(user_input.removeprefix("/mode "))
                 await mode_manager.switch(target)
-                await db.create_session(session_id, target.value)
+                await db.create_session(
+                    session_id, target.value,
+                    principal_id=f"local-uid:{os.getuid()}",
+                )
                 print(f"mode: {target.value}")
                 continue
             if not user_input:

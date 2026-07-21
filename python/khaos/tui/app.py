@@ -182,7 +182,10 @@ class KhaosApp(App):
         await self.mode_manager.load()
         if self.mode_override:
             await self.mode_manager.switch(ModeManager.parse(self.mode_override))
-        await self.db.create_session(self.session_id, self.mode_manager.current_mode.value)
+        await self.db.create_session(
+            self.session_id, self.mode_manager.current_mode.value,
+            principal_id=f"local-uid:{os.getuid()}",
+        )
         if check_needs_setup():
             return False
         await self._bootstrap_agent_runtime()
@@ -468,7 +471,10 @@ class KhaosApp(App):
         self._total_tokens = 0
         if self.db is not None and self.mode_manager is not None:
             asyncio.ensure_future(
-                self.db.create_session(self.session_id, self.mode_manager.current_mode.value)
+                self.db.create_session(
+                    self.session_id, self.mode_manager.current_mode.value,
+                    principal_id=f"local-uid:{os.getuid()}",
+                )
             )
         self._sync_status()
         return self.session_id

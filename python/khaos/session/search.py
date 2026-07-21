@@ -43,10 +43,17 @@ class MessageWindow:
 
 
 class SessionSearch:
-    """跨会话历史搜索。"""
+    """跨会话历史搜索。
 
-    def __init__(self, db):
+    M4 batch 3.1.16A-4-3: ``principal_id`` scopes every underlying DB
+    call.  ``None`` means admin opt-in (no scoping, legacy behavior) so
+    existing callers/tests keep working; a non-None value restricts
+    search/browse/scroll/read to that principal's owned rows.
+    """
+
+    def __init__(self, db, *, principal_id: str | None = None):
         self.db = db
+        self.principal_id = principal_id
 
     async def search(
         self,
@@ -55,7 +62,9 @@ class SessionSearch:
         offset: int = 0,
     ) -> list[SearchResult]:
         """FTS5 搜索。支持 AND/OR/NOT/引号短语/前缀通配。"""
-        rows = await self.db.search_sessions(query, limit, offset)
+        rows = await self.db.search_sessions(
+            query, limit, offset, principal_id=self.principal_id
+        )
         return [
             SearchResult(
                 session_id=str(row["session_id"]),
@@ -74,14 +83,18 @@ class SessionSearch:
         offset: int = 0,
     ) -> list[SessionSummary]:
         """按时间倒序浏览最近的会话。"""
-        sessions = await self.db.list_sessions(limit, offset)
+        sessions = await self.db.list_sessions(
+            limit, offset, principal_id=self.principal_id
+        )
         summaries: list[SessionSummary] = []
         for session in sessions:
             sid = str(session["id"])
             # Title = first user message of the session.
             title = ""
             try:
-                first = await self.db.get_session_messages(sid, 1, 0)
+                first = await self.db.get_session_messages(
+                    sid, 1, 0, principal_id=self.principal_id
+                )
                 if first:
                     title = str(first[0].get("content", ""))[:100]
             except Exception:  # noqa: BLE001
@@ -104,11 +117,18 @@ class SessionSearch:
         window: int = 5,
     ) -> MessageWindow:
         """获取围绕锚点消息的上下文窗口。"""
-        messages = await self.db.get_message_window(session_id, around_message_id, window)
+        messages = await self.db.get_message_window(
+            session_id,
+            around_message_id,
+            window,
+            principal_id=self.principal_id,
+        )
         # Efficient before/after counts relative to the window's edges.
         if messages:
             before, after = await self.db.count_messages_before_after(
-                session_id, around_message_id
+                session_id,
+                around_message_id,
+                principal_id=self.principal_id,
             )
             has_before = before > 0
             has_after = after > 0
@@ -123,8 +143,12 @@ class SessionSearch:
 
     async def read_session(self, session_id: str) -> list[dict]:
         """读取完整会话（分页加载）。"""
-        return await self.db.get_session_messages(session_id, 50, 0)
+        return await self.db.get_session_messages(
+            session_id, 50, 0, principal_id=self.principal_id
+        )
 
     async def _count_session_messages(self, session_id: str) -> int:
-        count = await self.db.count_session_messages(session_id)
+        count = await self.db.count_session_messages(
+            session_id, principal_id=self.principal_id
+        )
         return int(count) if count else 0
