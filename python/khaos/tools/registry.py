@@ -263,6 +263,27 @@ class ToolInvocationBroker:
         # ever bypassed — fail-closed on the broker injection path.
         if any(capability.name == "cron.manage" for capability in capabilities):
             handler_params["principal_id"] = context.get("principal_id", "")
+        # M4 batch 3.1.16A-4-4-1 (CRITICAL): the five permission tools
+        # declare ``permission.read`` / ``permission.manage`` so the
+        # broker injects the caller's ``principal_id`` +
+        # ``permission_engine`` + ``audit_logger`` from
+        # ``tool_context``.  Before A-4-4-1 the handlers read module-
+        # global holders that were last-write-wins across concurrent
+        # principals — see ``permission_tools.py`` docstring for the
+        # race description.  ``permission_engine`` is constructed
+        # per-runtime by ``factory.build_runtime`` and bound to
+        # ``cfg.principal_id``; ``audit_logger`` may be the server-
+        # lifecycle singleton (bound to ``local-uid``), but
+        # ``query_audit_logs`` / ``security_status`` pass
+        # ``principal_id`` explicitly to ``audit_logger.query`` so the
+        # logger's bound default is overridden per-call.
+        if any(
+            capability.name in {"permission.read", "permission.manage"}
+            for capability in capabilities
+        ):
+            handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["permission_engine"] = context.get("permission_engine")
+            handler_params["audit_logger"] = context.get("audit_logger")
         if mode == "coding" and name in _WORKSPACE_FILE_TOOLS and any(
             capability.name in {"filesystem.read", "filesystem.write"}
             for capability in capabilities
@@ -1579,6 +1600,28 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             capabilities=(_SUBAGENT_SPAWN_CAP,),
         )
     )
+    # M4 batch 3.1.16A-4-4-1 (CRITICAL): the five permission tools
+    # declare ``permission.read`` / ``permission.manage`` so
+    # ``ToolInvocationBroker.invoke`` injects the caller's
+    # ``principal_id`` + ``permission_engine`` + ``audit_logger`` from
+    # ``tool_context``.  Without a declared capability the broker treats
+    # them as no-capability tools and the handlers receive
+    # ``principal_id=""`` / ``permission_engine=None`` /
+    # ``audit_logger=None`` — fail-closed returns ``not initialized``
+    # for every call, breaking permission administration entirely.
+    # Worse, before A-4-4-1 the handlers read module-global holders
+    # that were last-write-wins across concurrent principals — see
+    # ``permission_tools.py`` docstring for the race description.
+    _PERMISSION_READ_CAP = ToolCapability(
+        "permission.read",
+        frozenset({"office"}),
+        frozenset({"app-data"}),
+    )
+    _PERMISSION_MANAGE_CAP = ToolCapability(
+        "permission.manage",
+        frozenset({"office"}),
+        frozenset({"app-data"}),
+    )
     registry.register(
         ToolDefinition(
             name="list_permission_rules",
@@ -1587,6 +1630,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office"],
             permission_level="read",
             parallel=True,
+            capabilities=(_PERMISSION_READ_CAP,),
         )
     )
     registry.register(
@@ -1621,6 +1665,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office"],
             permission_level="write",
             parallel=False,
+            capabilities=(_PERMISSION_MANAGE_CAP,),
         )
     )
     registry.register(
@@ -1635,6 +1680,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office"],
             permission_level="write",
             parallel=False,
+            capabilities=(_PERMISSION_MANAGE_CAP,),
         )
     )
     registry.register(
@@ -1659,6 +1705,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office"],
             permission_level="read",
             parallel=True,
+            capabilities=(_PERMISSION_READ_CAP,),
         )
     )
     registry.register(
@@ -1669,6 +1716,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["office"],
             permission_level="read",
             parallel=True,
+            capabilities=(_PERMISSION_READ_CAP,),
         )
     )
     # Hermes batch 5: cron + history tools (available in all modes).
