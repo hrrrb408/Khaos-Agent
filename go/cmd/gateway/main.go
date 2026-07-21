@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -58,6 +60,7 @@ func main() {
 	allowedOrigins := flag.String("cors-origins", defaultAllowedOrigins, "comma-separated exact browser origins")
 	allowedHosts := flag.String("allowed-hosts", defaultAllowedHosts, "comma-separated HTTP Host names")
 	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService Unix socket path")
+	projectRoot := flag.String("project-root", os.Getenv("KHAOS_PROJECT_ROOT"), "project root directory (used to compute project_id for drift detection; empty disables)")
 	mockAgent := flag.Bool("mock-agent", false, "use in-process mock agent")
 	enableSubagents := flag.Bool("subagents", false, "enable subagent proxy")
 	flag.Parse()
@@ -97,6 +100,21 @@ func main() {
 	if !*mockAgent {
 		client := platform.PythonClient{
 			Address: *pythonAddr, Capability: pythonCapability,
+		}
+		// C-1-3: compute project_id from --project-root so Python's
+		// dispatcher can detect project drift.  Empty project root
+		// disables injection (Python accepts empty claim for backward
+		// compat with older Gateways).
+		if pid, err := computeProjectID(*projectRoot); err != nil {
+			log.Printf("project-id: %v (drift detection disabled)", err)
+		} else if pid != "" {
+			client.ProjectID = pid
+			// Also stamp on the agent client used for Chat/Confirm/SwitchMode.
+			if pc, ok := agent.(platform.PythonClient); ok {
+				pc.ProjectID = pid
+				agent = pc
+			}
+			log.Printf("project-id: %s (drift detection enabled)", pid)
 		}
 		handler = handler.WithAudit(client)
 		handler = handler.WithTasks(client)
@@ -326,4 +344,28 @@ func allowedHostnames(addr string, configured []string) []string {
 		result = append(result, "localhost", "127.0.0.1", "::1")
 	}
 	return result
+}
+
+// computeProjectID mirrors Python's ``compute_project_id(project_root)``:
+// ``sha256(realpath(project_root))[:32]``.  An empty ``projectRoot``
+// returns an empty string (drift detection disabled).  Symlinks are
+// resolved first so a project reached via different symlink paths
+// maps to the same id — matching Python's ``Path.resolve()``.
+func computeProjectID(projectRoot string) (string, error) {
+	trimmed := strings.TrimSpace(projectRoot)
+	if trimmed == "" {
+		return "", nil
+	}
+	resolved, err := filepath.Abs(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("resolve project root: %w", err)
+	}
+	if real, err := filepath.EvalSymlinks(resolved); err == nil {
+		resolved = real
+	}
+	// filepath.EvalSymlinks error (e.g. path doesn't exist) is
+	// non-fatal — fall back to Abs path.  Python's resolve() also
+	// returns the lexical path when the target doesn't exist.
+	hash := sha256.Sum256([]byte(resolved))
+	return hex.EncodeToString(hash[:])[:32], nil
 }
