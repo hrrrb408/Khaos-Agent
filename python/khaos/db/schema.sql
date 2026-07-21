@@ -14,11 +14,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- another's conversation history.  Legacy rows (pre-A-4-3) get
     -- ``'legacy'`` and are hidden from every authenticated principal
     -- (fail-closed).  See ``_ensure_sessions_principal_column``.
-    principal_id TEXT NOT NULL DEFAULT 'legacy'
+    principal_id TEXT NOT NULL DEFAULT 'legacy',
+    -- M4 batch 3.1.16A-5-1 (CRITICAL): project identity closure.  Every
+    -- row is stamped with the project_id (sha256(realpath(root))[:32])
+    -- of the runtime that created it.  Legacy rows (pre-A-5-1) get
+    -- ``''`` and are treated as "unbound" — A-5-1b will fail-closed
+    -- on drift (``ctx.project_id != bound_project_id``).  See
+    -- ``_ensure_sessions_project_id_column``.
+    project_id   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_principal
     ON sessions(principal_id, status, updated_at);
+-- M4 batch 3.1.16A-5-1: project-scoped index is created by
+-- ``_ensure_sessions_project_id_column`` (not here, because legacy
+-- DBs don't have the project_id column yet when this script runs).
 
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -34,12 +44,15 @@ CREATE TABLE IF NOT EXISTS messages (
     -- can filter without an extra JOIN to ``sessions``.  Must match the
     -- session's principal (enforced by application code, not a DB
     -- constraint, because SQLite CHECK can't reference other tables).
-    principal_id TEXT NOT NULL DEFAULT 'legacy'
+    principal_id TEXT NOT NULL DEFAULT 'legacy',
+    -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
+    project_id   TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_messages_principal
     ON messages(principal_id, session_id, created_at);
+-- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
 CREATE TABLE IF NOT EXISTS agent_turns (
     turn_id       TEXT PRIMARY KEY,
@@ -56,7 +69,9 @@ CREATE TABLE IF NOT EXISTS agent_turns (
     -- ``recover_inflight_agent_turns`` is a process-wide sweep and
     -- ignores this column; per-principal visibility is enforced by
     -- ``list_agent_turn_events`` callers.
-    principal_id  TEXT NOT NULL DEFAULT 'legacy'
+    principal_id  TEXT NOT NULL DEFAULT 'legacy',
+    -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
+    project_id    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS agent_turn_events (
@@ -70,6 +85,7 @@ CREATE TABLE IF NOT EXISTS agent_turn_events (
 
 CREATE INDEX IF NOT EXISTS idx_agent_turns_session
 ON agent_turns(session_id, started_at);
+-- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
 CREATE TABLE IF NOT EXISTS memories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,8 +107,11 @@ CREATE TABLE IF NOT EXISTS memories (
     principal_id TEXT NOT NULL DEFAULT 'legacy',
     namespace    TEXT NOT NULL DEFAULT 'private',
     session_id   TEXT NOT NULL DEFAULT '',
+    -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
+    project_id   TEXT NOT NULL DEFAULT '',
     UNIQUE(namespace, principal_id, session_id, scope, key)
 );
+-- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(
     key,
@@ -164,7 +183,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     operation_id         TEXT,
     policy_digest        TEXT,
     authority_generation INTEGER,
-    source_transport     TEXT
+    source_transport     TEXT,
+    -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
+    project_id           TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
@@ -172,6 +193,7 @@ CREATE INDEX IF NOT EXISTS idx_audit_log_action ON audit_log(action);
 -- M4 batch 3.1.16A-2: principal-scoped audit lookup.
 CREATE INDEX IF NOT EXISTS idx_audit_log_principal
     ON audit_log(principal_id, created_at);
+-- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
 CREATE TABLE IF NOT EXISTS user_config (
     key        TEXT PRIMARY KEY,
@@ -229,11 +251,14 @@ CREATE TABLE IF NOT EXISTS session_bookmarks (
     -- Legacy rows get ``'legacy'`` and are invisible to authenticated
     -- principals (fail-closed).
     principal_id TEXT NOT NULL DEFAULT 'legacy',
+    -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
+    project_id   TEXT NOT NULL DEFAULT '',
     UNIQUE(session_id, name)
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_bookmarks_principal
     ON session_bookmarks(principal_id, session_id);
+-- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
 -- Hermes batch 1: scheduled (cron) tasks
 CREATE TABLE IF NOT EXISTS scheduled_tasks (
@@ -316,7 +341,13 @@ CREATE TABLE IF NOT EXISTS scheduler_operation_journal (
     principal_id     TEXT NOT NULL DEFAULT '',
     policy_digest    TEXT NOT NULL DEFAULT '',
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
-    applied_at       TEXT
+    applied_at       TEXT,
+    -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
+    -- Stamped at journal-write time so cross-project forensics can
+    -- disambiguate entries when multiple projects share a state DB
+    -- (defensive — A-1 isolates DBs by project, but the column
+    -- future-proofs against accidental cross-DB contamination).
+    project_id       TEXT NOT NULL DEFAULT ''
 );
 
 -- Pending-entry lookup (partial index — only NULL rows).
@@ -325,6 +356,7 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_journal_pending
 -- Per-task history (reconcile / forensics).
 CREATE INDEX IF NOT EXISTS idx_scheduler_journal_task
     ON scheduler_operation_journal(task_id, seq);
+-- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
 CREATE TABLE IF NOT EXISTS coding_tasks (
     id             TEXT PRIMARY KEY,
@@ -340,11 +372,14 @@ CREATE TABLE IF NOT EXISTS coding_tasks (
     -- ``'legacy'`` and are quarantined to ``status='failed'`` at
     -- migration time — they are never executed or surfaced by an
     -- authenticated principal's TaskManager.
-    principal_id   TEXT NOT NULL DEFAULT 'legacy'
+    principal_id   TEXT NOT NULL DEFAULT 'legacy',
+    -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
+    project_id     TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_status ON coding_tasks(status, updated_at);
 CREATE INDEX IF NOT EXISTS idx_coding_tasks_principal ON coding_tasks(principal_id, status);
+-- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
 -- Hermes batch 2: session history FTS5 search over messages.
 -- Separate FTS5 table (rowid mirrors messages.id) populated manually by
