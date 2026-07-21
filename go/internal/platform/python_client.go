@@ -116,9 +116,18 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 }
 
 // PythonClient talks to the Python AgentService JSON-line endpoint.
+//
+// C-1-3: ``ProjectID`` is the Gateway-level project identity
+// (``sha256(realpath(project_root))[:32]``).  When non-empty it is
+// injected into every RPC payload so Python's dispatcher (A-5-1b)
+// can detect project drift (Gateway booted under project A routing
+// to a Python server booted under project B).  Empty means the
+// Gateway was not configured with a project root — Python accepts
+// the empty claim for backward compatibility.
 type PythonClient struct {
 	Address    string
 	Capability string
+	ProjectID  string
 }
 
 // writeRequest serializes and signs one JSON-line RPC request.
@@ -134,6 +143,15 @@ type PythonClient struct {
 // Chat / ConfirmPermission / Spawn / ApproveTask / RejectTask —
 // which embed ``principal_id`` in the payload for the Python service
 // layer — remain transport-bound).
+//
+// C-1-3: ``c.ProjectID`` (Gateway-level, not per-request) is injected
+// into the payload before digest computation.  Python's dispatcher
+// (A-5-1b) compares ``payload["project_id"]`` against
+// ``agent._bound_project_id``; a mismatch is rejected as
+// ``project_drift`` (fail-closed).  An empty ``ProjectID`` is
+// accepted by Python (backward compat with older Gateways).  The
+// injection happens before ``canonicalJSON`` so ``payload_digest``
+// covers the injected value — Python's digest check passes.
 func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, principalID string) error {
 	if len(c.Capability) < 32 {
 		return fmt.Errorf("Python AgentService capability is missing or too short")
@@ -145,6 +163,17 @@ func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, pr
 	var normalized any
 	if err := json.Unmarshal(raw, &normalized); err != nil {
 		return err
+	}
+	// C-1-3: inject project_id for drift detection.  project_id is
+	// Gateway-level (all requests share the same project), so it
+	// lives on PythonClient rather than in per-method args.  Only
+	// inject when the payload is a map — streaming/webhook payloads
+	// that are not maps skip injection (Python treats missing
+	// project_id as an empty claim, which is accepted).
+	if c.ProjectID != "" {
+		if m, ok := normalized.(map[string]any); ok {
+			m["project_id"] = c.ProjectID
+		}
 	}
 	canonical, err := canonicalJSON(normalized)
 	if err != nil {
