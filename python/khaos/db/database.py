@@ -113,6 +113,14 @@ class Database:
         await self._ensure_coding_tasks_principal_columns()
         # M4 batch 3.1.16B-1: security-context snapshot for scheduled_tasks.
         await self._ensure_scheduled_tasks_generation_columns()
+        # M4 batch 3.1.16A-4-3: durable principal owner for sessions /
+        # messages / agent_turns / session_bookmarks.  Legacy rows get
+        # ``principal_id='legacy'`` and are hidden from every
+        # authenticated principal (fail-closed).
+        await self._ensure_sessions_principal_column()
+        await self._ensure_messages_principal_column()
+        await self._ensure_agent_turns_principal_column()
+        await self._ensure_session_bookmarks_principal_column()
 
     async def _ensure_scheduled_tasks_lifecycle_version(self) -> None:
         """Add ``lifecycle_version`` column to legacy ``scheduled_tasks``.
@@ -538,18 +546,131 @@ class Database:
                 )
             await conn.commit()
 
-    async def create_session(self, session_id: str, mode: str = "office") -> None:
-        """Create a session if missing and keep its mode current."""
+    async def _ensure_sessions_principal_column(self) -> None:
+        """M4 batch 3.1.16A-4-3 (CRITICAL): add ``principal_id`` column
+        to ``sessions`` for durable principal ownership.
+
+        Legacy rows (pre-A-4-3) get ``principal_id='legacy'`` and are
+        hidden from every authenticated principal by ``list_sessions``
+        / ``search_sessions`` (fail-closed).  Unlike ``coding_tasks``
+        we do NOT quarantine legacy rows to a special status — sessions
+        have no execution semantics, so hiding them in principal-scoped
+        queries is sufficient.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "principal_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE sessions "
+                "ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            await conn.commit()
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sessions_principal "
+            "ON sessions(principal_id, status, updated_at)"
+        )
+        await conn.commit()
+
+    async def _ensure_messages_principal_column(self) -> None:
+        """M4 batch 3.1.16A-4-3 (CRITICAL): add ``principal_id`` column
+        to ``messages``.
+
+        Legacy rows get ``principal_id='legacy'``.  A principal scoped
+        query (``list_messages(principal_id=...)``) does not see them.
+        ``search_sessions`` filters via the sessions JOIN so legacy
+        sessions' messages are excluded too.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(messages)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "principal_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE messages "
+                "ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            await conn.commit()
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_messages_principal "
+            "ON messages(principal_id, session_id, created_at)"
+        )
+        await conn.commit()
+
+    async def _ensure_agent_turns_principal_column(self) -> None:
+        """M4 batch 3.1.16A-4-3 (CRITICAL): add ``principal_id`` column
+        to ``agent_turns``.
+
+        Legacy rows get ``principal_id='legacy'``.  ``recover_inflight_
+        agent_turns`` is a process-wide startup sweep and ignores the
+        column (it must mark every stale ``running`` turn as
+        ``interrupted`` regardless of owner).  Per-principal visibility
+        is enforced by ``list_agent_turn_events`` callers.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(agent_turns)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "principal_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE agent_turns "
+                "ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            await conn.commit()
+
+    async def _ensure_session_bookmarks_principal_column(self) -> None:
+        """M4 batch 3.1.16A-4-3 (CRITICAL): add ``principal_id`` column
+        to ``session_bookmarks``.
+
+        Legacy rows get ``principal_id='legacy'`` and are invisible to
+        authenticated principals via ``list_bookmarks`` / ``load_bookmark``.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(session_bookmarks)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "principal_id" not in columns:
+            await conn.execute(
+                "ALTER TABLE session_bookmarks "
+                "ADD COLUMN principal_id TEXT NOT NULL DEFAULT 'legacy'"
+            )
+            await conn.commit()
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_session_bookmarks_principal "
+            "ON session_bookmarks(principal_id, session_id)"
+        )
+        await conn.commit()
+
+    async def create_session(
+        self,
+        session_id: str,
+        mode: str = "office",
+        *,
+        principal_id: str = "legacy",
+    ) -> None:
+        """Create a session if missing and keep its mode current.
+
+        M4 batch 3.1.16A-4-3: ``principal_id`` is stamped on the row
+        so ``list_sessions`` / ``search_sessions`` can filter by it.
+        Callers should pass the bound principal; the default
+        ``'legacy'`` is fail-closed and only used by pre-A-4-3 callers
+        that haven't been migrated yet.
+
+        ``ON CONFLICT DO UPDATE`` does NOT touch ``principal_id`` —
+        once a session is bound to a principal, a later ``create_
+        session`` call from a different principal must NOT silently
+        re-stamp ownership.  Cross-principal ``create_session`` for an
+        existing id is a no-op on the principal column (the row keeps
+        its original owner); callers that need to detect the collision
+        should query first.
+        """
         conn = await self._require_conn()
         await conn.execute(
             """
-            INSERT INTO sessions (id, mode)
-            VALUES (?, ?)
+            INSERT INTO sessions (id, mode, principal_id)
+            VALUES (?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 mode = excluded.mode,
                 updated_at = datetime('now')
             """,
-            (session_id, mode),
+            (session_id, mode, principal_id),
         )
         await conn.commit()
 
@@ -655,15 +776,28 @@ class Database:
             await conn.rollback()
             raise
 
-    async def insert_message(self, session_id: str, message: Message) -> int:
-        """Persist a chat message and return its row id."""
+    async def insert_message(
+        self,
+        session_id: str,
+        message: Message,
+        *,
+        principal_id: str = "legacy",
+    ) -> int:
+        """Persist a chat message and return its row id.
+
+        M4 batch 3.1.16A-4-3: ``principal_id`` is stamped on the row
+        so ``list_messages`` / ``get_session_messages`` / ``search_
+        sessions`` can filter without a JOIN.  Callers should pass the
+        bound principal (typically ``AgentLoop.principal_id``).
+        """
         conn = await self._require_conn()
         cursor = await conn.execute(
             """
             INSERT INTO messages (
-                session_id, role, content, tool_calls, tool_call_id, token_count
+                session_id, role, content, tool_calls, tool_call_id,
+                token_count, principal_id
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 session_id,
@@ -672,6 +806,7 @@ class Database:
                 json.dumps(message.tool_calls),
                 message.tool_call_id,
                 message.token_count,
+                principal_id,
             ),
         )
         await conn.execute(
@@ -681,18 +816,41 @@ class Database:
         await conn.commit()
         return int(cursor.lastrowid)
 
-    async def list_messages(self, session_id: str) -> list[Message]:
-        """Load persisted messages for a session in chronological order."""
+    async def list_messages(
+        self,
+        session_id: str,
+        *,
+        principal_id: str | None = None,
+    ) -> list[Message]:
+        """Load persisted messages for a session in chronological order.
+
+        M4 batch 3.1.16A-4-3: when ``principal_id`` is given, only
+        rows owned by that principal are returned.  ``principal_id=
+        None`` (default) is the explicit admin opt-in that returns
+        every row regardless of owner — used by migration / admin
+        tooling, never by an authenticated principal's AgentLoop.
+        """
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT role, content, tool_calls, tool_call_id, token_count
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY created_at, id
-            """,
-            (session_id,),
-        )
+        if principal_id is None:
+            cursor = await conn.execute(
+                """
+                SELECT role, content, tool_calls, tool_call_id, token_count
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY created_at, id
+                """,
+                (session_id,),
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT role, content, tool_calls, tool_call_id, token_count
+                FROM messages
+                WHERE session_id = ? AND principal_id = ?
+                ORDER BY created_at, id
+                """,
+                (session_id, principal_id),
+            )
         rows = await cursor.fetchall()
         return [
             Message(
@@ -1341,74 +1499,138 @@ class Database:
         mode: str = "office",
         project_root: str | None = None,
         summary: str = "",
+        *,
+        principal_id: str = "legacy",
     ) -> None:
         """保存一个会话书签。
 
         同一 (session_id, name) 已存在时整体覆盖更新（upsert）。
+
+        M4 batch 3.1.16A-4-3: ``principal_id`` is stamped on the row so
+        ``list_bookmarks`` / ``load_bookmark`` can filter by it.  The
+        ``ON CONFLICT DO UPDATE`` does NOT touch ``principal_id`` —
+        once a bookmark is bound to a principal, a later ``save_bookmark``
+        call from a different principal cannot re-stamp ownership (the
+        row keeps its original owner).  Cross-principal upsert is an
+        owner-preserving update.
         """
         conn = await self._require_conn()
         await conn.execute(
             """
             INSERT INTO session_bookmarks
-                (session_id, name, description, mode, project_root, summary)
-            VALUES (?, ?, ?, ?, ?, ?)
+                (session_id, name, description, mode, project_root, summary,
+                 principal_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(session_id, name) DO UPDATE SET
                 description  = excluded.description,
                 mode         = excluded.mode,
                 project_root = excluded.project_root,
                 summary      = excluded.summary
             """,
-            (session_id, name, description, mode, project_root, summary),
+            (session_id, name, description, mode, project_root, summary,
+             principal_id),
         )
         await conn.commit()
 
-    async def load_bookmark(self, session_id: str, name: str) -> dict[str, Any] | None:
-        """加载指定书签。不存在时返回 None。"""
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT id, session_id, name, description, mode, project_root,
-                   summary, created_at
-            FROM session_bookmarks
-            WHERE session_id = ? AND name = ?
-            """,
-            (session_id, name),
-        )
-        row = await cursor.fetchone()
-        return dict(row) if row is not None else None
+    async def load_bookmark(
+        self,
+        session_id: str,
+        name: str,
+        *,
+        principal_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """加载指定书签。不存在时返回 None。
 
-    async def list_bookmarks(self, session_id: str | None = None) -> list[dict[str, Any]]:
-        """列出书签，可按 session 过滤。按创建时间倒序返回。"""
+        M4 batch 3.1.16A-4-3: when ``principal_id`` is given, only a
+        bookmark owned by that principal is returned — a foreign-
+        principal bookmark is treated as ``None`` (existence hidden,
+        matching the ``TaskService.get`` pattern).
+        """
         conn = await self._require_conn()
-        if session_id is None:
+        if principal_id is None:
             cursor = await conn.execute(
                 """
                 SELECT id, session_id, name, description, mode, project_root,
-                       summary, created_at
+                       summary, created_at, principal_id
                 FROM session_bookmarks
-                ORDER BY created_at DESC, id DESC
-                """
+                WHERE session_id = ? AND name = ?
+                """,
+                (session_id, name),
             )
         else:
             cursor = await conn.execute(
                 """
                 SELECT id, session_id, name, description, mode, project_root,
-                       summary, created_at
+                       summary, created_at, principal_id
                 FROM session_bookmarks
-                WHERE session_id = ?
-                ORDER BY created_at DESC, id DESC
+                WHERE session_id = ? AND name = ? AND principal_id = ?
                 """,
-                (session_id,),
+                (session_id, name, principal_id),
             )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
+    async def list_bookmarks(
+        self,
+        session_id: str | None = None,
+        *,
+        principal_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """列出书签，可按 session 过滤。按创建时间倒序返回。
+
+        M4 batch 3.1.16A-4-3: when ``principal_id`` is given, only
+        bookmarks owned by that principal are returned.  ``principal_id
+        =None`` (default) is the admin opt-in.
+        """
+        conn = await self._require_conn()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(session_id)
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cursor = await conn.execute(
+            f"""
+            SELECT id, session_id, name, description, mode, project_root,
+                   summary, created_at, principal_id
+            FROM session_bookmarks
+            {where}
+            ORDER BY created_at DESC, id DESC
+            """,
+            tuple(params),
+        )
         return [dict(row) for row in await cursor.fetchall()]
 
-    async def delete_bookmark(self, session_id: str, name: str) -> None:
-        """删除指定书签。不存在的书签静默忽略。"""
+    async def delete_bookmark(
+        self,
+        session_id: str,
+        name: str,
+        *,
+        principal_id: str | None = None,
+    ) -> None:
+        """删除指定书签。不存在的书签静默忽略。
+
+        M4 batch 3.1.16A-4-3: when ``principal_id`` is given, the
+        DELETE is scoped to that principal — preventing cross-principal
+        deletion.  ``principal_id=None`` (default) preserves the legacy
+        unscoped behavior for admin callers.
+        """
         conn = await self._require_conn()
-        await conn.execute(
-            "DELETE FROM session_bookmarks WHERE session_id = ? AND name = ?",
-            (session_id, name),
-        )
+        if principal_id is None:
+            await conn.execute(
+                "DELETE FROM session_bookmarks "
+                "WHERE session_id = ? AND name = ?",
+                (session_id, name),
+            )
+        else:
+            await conn.execute(
+                "DELETE FROM session_bookmarks "
+                "WHERE session_id = ? AND name = ? AND principal_id = ?",
+                (session_id, name, principal_id),
+            )
         await conn.commit()
 
     async def _ensure_sessions_metadata_column(self, column: str) -> None:
@@ -2192,6 +2414,15 @@ class Database:
         ``rowid`` should be the messages.id so the FTS row mirrors the base
         row — this lets search results link back to the exact message. When
         omitted, FTS auto-assigns a rowid (still searchable, just not joined).
+
+        M4 batch 3.1.16A-4-3: ``messages_fts`` itself has no ``principal_id``
+        column (it is a standalone FTS5 table, not external-content).
+        Principal scoping for search is enforced by ``search_sessions``
+        via a JOIN to ``sessions`` / ``messages`` on the principal_id
+        column.  This method therefore needs no ``principal_id``
+        parameter — the caller (``AgentLoop._persist_message``) already
+        stamped principal_id on the base ``messages`` row, and the FTS
+        row mirrors that rowid.
         """
         conn = await self._require_conn()
         from datetime import datetime as _dt
@@ -2264,110 +2495,230 @@ class Database:
         return [json.loads(str(row["state_json"])) for row in await cursor.fetchall()]
 
     async def search_sessions(
-        self, query: str, limit: int = 10, offset: int = 0
+        self,
+        query: str,
+        limit: int = 10,
+        offset: int = 0,
+        *,
+        principal_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """FTS5 BM25 search across all session messages.
 
         Returns rows with id, session_id, role, created_at, rank, and a
         snippet() with the matched term highlighted.
+
+        M4 batch 3.1.16A-4-3: when ``principal_id`` is given, results
+        are scoped to messages owned by that principal via a JOIN to
+        the base ``messages`` table on rowid.  Legacy rows
+        (``principal_id='legacy'``) are excluded.  ``principal_id=None``
+        (default) is the admin opt-in.
         """
         conn = await self._require_conn()
         # snippet: highlight matches with [ ... ]; bm25() rank (lower = better).
-        cursor = await conn.execute(
-            """
-            SELECT rowid AS id, session_id, role, created_at,
-                   rank,
-                   snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
-            FROM messages_fts
-            WHERE messages_fts MATCH ?
-            ORDER BY rank
-            LIMIT ? OFFSET ?
-            """,
-            (query, limit, offset),
-        )
+        if principal_id is None:
+            cursor = await conn.execute(
+                """
+                SELECT rowid AS id, session_id, role, created_at,
+                       rank,
+                       snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
+                FROM messages_fts
+                WHERE messages_fts MATCH ?
+                ORDER BY rank
+                LIMIT ? OFFSET ?
+                """,
+                (query, limit, offset),
+            )
+        else:
+            # JOIN the base messages table to enforce principal scoping.
+            # messages_fts.rowid mirrors messages.id, so the JOIN is a
+            # primary-key lookup (cheap).
+            cursor = await conn.execute(
+                """
+                SELECT fts.rowid AS id, fts.session_id, fts.role,
+                       fts.created_at, fts.rank,
+                       snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
+                FROM messages_fts AS fts
+                JOIN messages AS m ON m.id = fts.rowid
+                WHERE fts.messages_fts MATCH ?
+                  AND m.principal_id = ?
+                ORDER BY fts.rank
+                LIMIT ? OFFSET ?
+                """,
+                (query, principal_id, limit, offset),
+            )
         return [dict(row) for row in await cursor.fetchall()]
 
     async def get_session_messages(
-        self, session_id: str, limit: int = 50, offset: int = 0
+        self,
+        session_id: str,
+        limit: int = 50,
+        offset: int = 0,
+        *,
+        principal_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return messages for a session, newest-aware pagination."""
+        """Return messages for a session, newest-aware pagination.
+
+        M4 batch 3.1.16A-4-3: when ``principal_id`` is given, only
+        rows owned by that principal are returned.
+        """
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT id, session_id, role, content, token_count, created_at
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY created_at, id
-            LIMIT ? OFFSET ?
-            """,
-            (session_id, limit, offset),
-        )
+        if principal_id is None:
+            cursor = await conn.execute(
+                """
+                SELECT id, session_id, role, content, token_count, created_at
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY created_at, id
+                LIMIT ? OFFSET ?
+                """,
+                (session_id, limit, offset),
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT id, session_id, role, content, token_count, created_at
+                FROM messages
+                WHERE session_id = ? AND principal_id = ?
+                ORDER BY created_at, id
+                LIMIT ? OFFSET ?
+                """,
+                (session_id, principal_id, limit, offset),
+            )
         return [dict(row) for row in await cursor.fetchall()]
 
     async def get_message_window(
-        self, session_id: str, message_id: int, window: int = 5
+        self,
+        session_id: str,
+        message_id: int,
+        window: int = 5,
+        *,
+        principal_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return up to ``window`` messages before and after ``message_id``."""
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT id, session_id, role, content, token_count, created_at
-            FROM messages
-            WHERE session_id = ?
-            ORDER BY ABS(id - ?), id
-            LIMIT ?
-            """,
-            (session_id, message_id, window * 2 + 1),
-        )
+        if principal_id is None:
+            cursor = await conn.execute(
+                """
+                SELECT id, session_id, role, content, token_count, created_at
+                FROM messages
+                WHERE session_id = ?
+                ORDER BY ABS(id - ?), id
+                LIMIT ?
+                """,
+                (session_id, message_id, window * 2 + 1),
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT id, session_id, role, content, token_count, created_at
+                FROM messages
+                WHERE session_id = ? AND principal_id = ?
+                ORDER BY ABS(id - ?), id
+                LIMIT ?
+                """,
+                (session_id, principal_id, message_id, window * 2 + 1),
+            )
         rows = [dict(row) for row in await cursor.fetchall()]
         # Re-sort chronologically after the ABS-based proximity selection.
         rows.sort(key=lambda r: r["id"])
         return rows
 
-    async def count_session_messages(self, session_id: str) -> int:
+    async def count_session_messages(
+        self,
+        session_id: str,
+        *,
+        principal_id: str | None = None,
+    ) -> int:
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
-            (session_id,),
-        )
+        if principal_id is None:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT COUNT(*) AS n FROM messages "
+                "WHERE session_id = ? AND principal_id = ?",
+                (session_id, principal_id),
+            )
         row = await cursor.fetchone()
         return int(row["n"]) if row else 0
 
     async def count_messages_before_after(
-        self, session_id: str, message_id: int
+        self,
+        session_id: str,
+        message_id: int,
+        *,
+        principal_id: str | None = None,
     ) -> tuple[int, int]:
         """Return (count_before, count_after) relative to ``message_id``."""
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT "
-            "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
-            "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
-            "FROM messages WHERE session_id = ?",
-            (message_id, message_id, session_id),
-        )
+        if principal_id is None:
+            cursor = await conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
+                "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
+                "FROM messages WHERE session_id = ?",
+                (message_id, message_id, session_id),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT "
+                "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
+                "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
+                "FROM messages WHERE session_id = ? AND principal_id = ?",
+                (message_id, message_id, session_id, principal_id),
+            )
         row = await cursor.fetchone()
         if not row:
             return (0, 0)
         return (int(row["before_n"] or 0), int(row["after_n"] or 0))
 
     async def list_sessions(
-        self, limit: int = 20, offset: int = 0
+        self,
+        limit: int = 20,
+        offset: int = 0,
+        *,
+        principal_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List sessions newest-first, with a message-count + last-message preview."""
+        """List sessions newest-first, with a message-count + last-message preview.
+
+        M4 batch 3.1.16A-4-3: when ``principal_id`` is given, only
+        sessions owned by that principal are returned.  Legacy rows
+        (``principal_id='legacy'``) are excluded.  ``principal_id=None``
+        (default) is the admin opt-in.
+        """
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT s.id, s.mode, s.created_at,
-                   (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
-                   (SELECT content FROM messages m WHERE m.session_id = s.id
-                    ORDER BY m.id DESC LIMIT 1) AS preview
-            FROM sessions s
-            WHERE s.status = 'active'
-            ORDER BY s.updated_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            (limit, offset),
-        )
+        if principal_id is None:
+            cursor = await conn.execute(
+                """
+                SELECT s.id, s.mode, s.created_at,
+                       (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
+                       (SELECT content FROM messages m WHERE m.session_id = s.id
+                        ORDER BY m.id DESC LIMIT 1) AS preview
+                FROM sessions s
+                WHERE s.status = 'active'
+                ORDER BY s.updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (limit, offset),
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT s.id, s.mode, s.created_at,
+                       (SELECT COUNT(*) FROM messages m
+                        WHERE m.session_id = s.id AND m.principal_id = s.principal_id) AS message_count,
+                       (SELECT content FROM messages m
+                        WHERE m.session_id = s.id AND m.principal_id = s.principal_id
+                        ORDER BY m.id DESC LIMIT 1) AS preview
+                FROM sessions s
+                WHERE s.status = 'active' AND s.principal_id = ?
+                ORDER BY s.updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                (principal_id, limit, offset),
+            )
         return [dict(row) for row in await cursor.fetchall()]
 
     async def register_operation_approval(
@@ -2434,16 +2785,25 @@ class Database:
         task_id: str | None,
         payload: dict[str, Any],
         now: float,
+        principal_id: str = "legacy",
     ) -> None:
-        """Create one durable running turn and its first event atomically."""
+        """Create one durable running turn and its first event atomically.
+
+        M4 batch 3.1.16A-4-3: ``principal_id`` is stamped as a top-level
+        column on ``agent_turns`` so per-principal turn queries can
+        filter without an extra JOIN to ``sessions``.  ``payload`` still
+        carries ``principal_id`` in its JSON for backward compatibility
+        with older consumers that read the event stream.
+        """
         conn = await self._require_conn()
         async with self._turn_event_lock:
             await conn.execute("BEGIN IMMEDIATE")
             try:
                 await conn.execute(
                     "INSERT INTO agent_turns(turn_id,attempt_id,session_id,task_id,"
-                    "status,last_sequence,started_at) VALUES(?,?,?,?, 'running',1,?)",
-                    (turn_id, attempt_id, session_id, task_id, now),
+                    "status,last_sequence,started_at,principal_id) "
+                    "VALUES(?,?,?,?, 'running',1,?,?)",
+                    (turn_id, attempt_id, session_id, task_id, now, principal_id),
                 )
                 await conn.execute(
                     "INSERT INTO agent_turn_events VALUES(?,1,'turn.started',?,?)",

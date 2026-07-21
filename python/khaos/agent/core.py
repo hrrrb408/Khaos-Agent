@@ -640,8 +640,15 @@ class AgentLoop:
                     )
 
     async def _persist_message(self, session_id: str, message: Message) -> None:
-        """Persist and index a message as one logical core-loop operation."""
-        rowid = await self.db.insert_message(session_id, message)
+        """Persist and index a message as one logical core-loop operation.
+
+        M4 batch 3.1.16A-4-3: stamp ``self.principal_id`` on the row so
+        ``list_messages`` / ``get_session_messages`` / ``search_sessions``
+        can scope by the calling principal.
+        """
+        rowid = await self.db.insert_message(
+            session_id, message, principal_id=self.principal_id
+        )
         await self.db.insert_message_fts(
             session_id, message.role, message.content, message.token_count, rowid=rowid
         )
@@ -705,7 +712,9 @@ class AgentLoop:
                 },
             )
         ]
-        messages.extend(await self.db.list_messages(session_id))
+        messages.extend(
+            await self.db.list_messages(session_id, principal_id=self.principal_id)
+        )
         messages.extend(self._active_context_facts)
 
         relevant = self._build_relevant_files_message(user_input)

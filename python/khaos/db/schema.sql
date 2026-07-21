@@ -7,8 +7,18 @@ CREATE TABLE IF NOT EXISTS sessions (
     status      TEXT NOT NULL DEFAULT 'active',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    metadata    TEXT DEFAULT '{}'
+    metadata    TEXT DEFAULT '{}',
+    -- M4 batch 3.1.16A-4-3 (CRITICAL): durable principal owner.  Every
+    -- session belongs to exactly one principal; ``list_sessions`` /
+    -- ``search_sessions`` filter by it so one principal cannot see
+    -- another's conversation history.  Legacy rows (pre-A-4-3) get
+    -- ``'legacy'`` and are hidden from every authenticated principal
+    -- (fail-closed).  See ``_ensure_sessions_principal_column``.
+    principal_id TEXT NOT NULL DEFAULT 'legacy'
 );
+
+CREATE INDEX IF NOT EXISTS idx_sessions_principal
+    ON sessions(principal_id, status, updated_at);
 
 CREATE TABLE IF NOT EXISTS messages (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -18,10 +28,18 @@ CREATE TABLE IF NOT EXISTS messages (
     tool_calls   TEXT DEFAULT '[]',
     tool_call_id TEXT,
     token_count  INTEGER NOT NULL DEFAULT 0,
-    created_at   TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    -- M4 batch 3.1.16A-4-3: principal owner stamped at insert time so
+    -- ``list_messages`` / ``get_session_messages`` / ``search_sessions``
+    -- can filter without an extra JOIN to ``sessions``.  Must match the
+    -- session's principal (enforced by application code, not a DB
+    -- constraint, because SQLite CHECK can't reference other tables).
+    principal_id TEXT NOT NULL DEFAULT 'legacy'
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_principal
+    ON messages(principal_id, session_id, created_at);
 
 CREATE TABLE IF NOT EXISTS agent_turns (
     turn_id       TEXT PRIMARY KEY,
@@ -32,7 +50,13 @@ CREATE TABLE IF NOT EXISTS agent_turns (
     last_sequence INTEGER NOT NULL DEFAULT 0,
     error_code    TEXT,
     started_at    REAL NOT NULL,
-    finished_at   REAL
+    finished_at   REAL,
+    -- M4 batch 3.1.16A-4-3: principal owner stamped at turn start so
+    -- turn history queries can be scoped without JOINing sessions.
+    -- ``recover_inflight_agent_turns`` is a process-wide sweep and
+    -- ignores this column; per-principal visibility is enforced by
+    -- ``list_agent_turn_events`` callers.
+    principal_id  TEXT NOT NULL DEFAULT 'legacy'
 );
 
 CREATE TABLE IF NOT EXISTS agent_turn_events (
@@ -200,8 +224,16 @@ CREATE TABLE IF NOT EXISTS session_bookmarks (
     project_root TEXT,
     summary     TEXT NOT NULL DEFAULT '',
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+    -- M4 batch 3.1.16A-4-3: principal owner so ``list_bookmarks`` /
+    -- ``load_bookmark`` / ``delete_bookmark`` can scope by principal.
+    -- Legacy rows get ``'legacy'`` and are invisible to authenticated
+    -- principals (fail-closed).
+    principal_id TEXT NOT NULL DEFAULT 'legacy',
     UNIQUE(session_id, name)
 );
+
+CREATE INDEX IF NOT EXISTS idx_session_bookmarks_principal
+    ON session_bookmarks(principal_id, session_id);
 
 -- Hermes batch 1: scheduled (cron) tasks
 CREATE TABLE IF NOT EXISTS scheduled_tasks (

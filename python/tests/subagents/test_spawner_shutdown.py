@@ -329,10 +329,10 @@ async def test_spawn_during_shutdown_is_rejected_or_tracked(tmp_path):
     # shutdown the chance to race.
     original_create_session = db.create_session
 
-    async def stalling_create_session(session_id):
+    async def stalling_create_session(session_id, **kwargs):
         spawn_entered_db.set()
         await spawn_can_finish.wait()
-        return await original_create_session(session_id)
+        return await original_create_session(session_id, **kwargs)
 
     db.create_session = stalling_create_session
     spawner.db = db  # ensure spawner sees the wrapped method
@@ -406,7 +406,7 @@ async def test_spawn_db_work_does_not_block_shutdown_lock(tmp_path):
 
         original_create = db.create_session
 
-        async def stalling_create(session_id):
+        async def stalling_create(session_id, **kwargs):
             spawn_in_db.set()
             # Probe: can shutdown's lock be acquired while we're parked
             # here?  It MUST be (DB work is outside the lock now).
@@ -419,7 +419,7 @@ async def test_spawn_db_work_does_not_block_shutdown_lock(tmp_path):
             except asyncio.TimeoutError:
                 lock_free_during_db.append(False)
             await release_db.wait()
-            return await original_create(session_id)
+            return await original_create(session_id, **kwargs)
 
         db.create_session = stalling_create
         spawner.db = db
@@ -464,10 +464,10 @@ async def test_spawn_aborts_when_shutdown_begins_during_db_work(tmp_path):
         release_db = asyncio.Event()
         original_create = db.create_session
 
-        async def stalling_create(session_id):
+        async def stalling_create(session_id, **kwargs):
             spawn_in_db.set()
             await release_db.wait()
-            return await original_create(session_id)
+            return await original_create(session_id, **kwargs)
 
         db.create_session = stalling_create
         spawner.db = db
@@ -588,15 +588,15 @@ async def test_max_concurrent_counts_initializing_reservations(tmp_path):
 
         original_create = db.create_session
 
-        async def stalling_create_a(session_id):
+        async def stalling_create_a(session_id, **kwargs):
             spawn_a_in_db.set()
             await release_a.wait()
-            return await original_create(session_id)
+            return await original_create(session_id, **kwargs)
 
-        async def stalling_create_b(session_id):
+        async def stalling_create_b(session_id, **kwargs):
             spawn_b_in_db.set()
             await release_b.wait()
-            return await original_create(session_id)
+            return await original_create(session_id, **kwargs)
 
         # Spawn A: stall inside DB work so its reservation is held.
         db.create_session = stalling_create_a
@@ -968,10 +968,10 @@ async def test_pre_insert_cancel_persists_terminal_row(tmp_path):
         spawn_in_db = asyncio.Event()
         original_create = db.create_session
 
-        async def stalling_create(session_id):
+        async def stalling_create(session_id, **kwargs):
             spawn_in_db.set()
             await asyncio.Event().wait()  # never resolves — spawn will be cancelled
-            return await original_create(session_id)
+            return await original_create(session_id, **kwargs)
 
         db.create_session = stalling_create
         spawner.db = db
