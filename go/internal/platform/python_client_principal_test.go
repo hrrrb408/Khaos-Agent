@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"khaos/go/internal/api"
 )
@@ -15,11 +16,11 @@ import (
 // PythonClient method carries the caller-supplied principalID into
 // the RPC auth envelope (regression coverage for the C-1-1 bug where
 // ~15 RPC methods lost the caller's identity, defaulting to
-// ``"gateway"``).
+// “"gateway"“).
 //
 // The test stands up a fake Python AgentService on a Unix socket,
 // calls each PythonClient method, and verifies the auth envelope's
-// ``principal_id`` field matches the caller-supplied value.
+// “principal_id“ field matches the caller-supplied value.
 func TestC_1_1_MethodsPassPrincipalIDToWriteRequest(t *testing.T) {
 	const principal = "api-key:deadbeef-c-1-1"
 	// macOS limits Unix socket paths to ~104 chars; t.TempDir() can
@@ -86,6 +87,15 @@ func TestC_1_1_MethodsPassPrincipalIDToWriteRequest(t *testing.T) {
 		{"GetTask", func() error { _, err := client.GetTask(ctx, principal, "t1"); return err }, principal},
 		{"CancelTask", func() error { _, err := client.CancelTask(ctx, principal, "t1"); return err }, principal},
 		{"TaskArtifacts", func() error { _, err := client.TaskArtifacts(ctx, principal, "t1"); return err }, principal},
+		// TaskEvents is a streaming method with its own code path
+		// (separate dial + goroutine scanner); verify the envelope
+		// principal reaches writeRequest despite the early return.
+		{"TaskEvents", func() error { _, err := client.TaskEvents(ctx, principal, "t1"); return err }, principal},
+		// ApproveTask / RejectTask embed ``principal_id`` in the
+		// payload (A-4-1 transport-bound path) — verify the envelope
+		// principal matches the payload principal.
+		{"ApproveTask", func() error { _, err := client.ApproveTask(ctx, "t1", principal, "s1", "digest"); return err }, principal},
+		{"RejectTask", func() error { _, err := client.RejectTask(ctx, "t1", principal, "s1", "digest"); return err }, principal},
 		{"SwitchMode", func() error { _, err := client.SwitchMode(ctx, principal, "s1", "coding"); return err }, principal},
 		{"Query", func() error { _, err := client.Query(ctx, principal, "", "", "", "", 10); return err }, principal},
 		{"ListChannels", func() error { _, err := client.ListChannels(ctx, principal); return err }, principal},
@@ -130,7 +140,7 @@ func TestC_1_1_MethodsPassPrincipalIDToWriteRequest(t *testing.T) {
 				if got != tc.want {
 					t.Errorf("auth.principal_id = %q, want %q", got, tc.want)
 				}
-			default:
+			case <-time.After(500 * time.Millisecond):
 				t.Fatal("no request received on fake server")
 			}
 		})

@@ -30,10 +30,11 @@ Contract covered:
      authenticator returns ``""`` (webhook ingress path, where Go
      passes ``""`` because signature-authenticated webhooks bypass
      the API-key middleware).
-  5. Envelope principal ``"api-key:alice"`` + payload WITHOUT
-     ``principal_id`` → dispatcher sets
-     ``ctx.principal_id == "api-key:alice"`` (end-to-end: the
-     envelope principal reaches the service layer).
+  5. Envelope principal ``"gateway"`` + payload WITHOUT
+     ``principal_id`` → authenticator returns ``"gateway"``
+     (backward compat: an older pre-C-1-1 Gateway binary still
+     sending ``"gateway"`` as the envelope principal must not
+     break during a rolling upgrade).
 """
 
 from __future__ import annotations
