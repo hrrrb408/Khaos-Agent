@@ -189,6 +189,19 @@ class TaskManager:
         # migration leftovers, quarantined to ``status='failed'``).
         self._principal_id = principal_id
 
+    @property
+    def principal_id(self) -> str:
+        """M4 batch 3.1.16A-4-2: read-only accessor for the bound
+        principal.  ``TaskService`` uses this to decide whether an
+        RPC caller (``ctx.principal_id``) is allowed to create tasks
+        through this manager.  A mismatch means the server-level
+        manager is bound to a different principal (e.g. ``local-uid``)
+        than the transport principal — per-principal TaskManager
+        construction is required to support that path (deferred to
+        A-4-3 / A-4-4).
+        """
+        return self._principal_id
+
     def set_lease_invalidation_hook(self, hook: Any) -> None:
         """Register a callable invoked during cancel to release execution leases."""
         self._lease_invalidation_hook = hook
@@ -362,19 +375,40 @@ class TaskManager:
             task.touch()
             await self._persist(task)
 
-    async def list_active(self) -> list[dict]:
-        """Return all in-flight tasks (not completed/cancelled/failed)."""
+    async def list_active(
+        self, *, principal_id: str | None = None,
+    ) -> list[dict]:
+        """Return all in-flight tasks (not completed/cancelled/failed).
+
+        M4 batch 3.1.16A-4-2: when ``principal_id`` is provided, only
+        tasks owned by that principal are returned.  This is a defense-
+        in-depth filter — the cache is already scoped to the manager's
+        bound principal at load time, but an explicit caller-supplied
+        filter ensures that a future code path that mixes principals
+        in one cache cannot leak across the boundary.
+        """
         async with self._lock:
             return [
                 task.to_dict()
                 for task in self._tasks.values()
                 if task.status in ACTIVE_STATUSES
+                and (principal_id is None or task.principal_id == principal_id)
             ]
 
-    async def list_all(self) -> list[dict]:
-        """Return every known task."""
+    async def list_all(
+        self, *, principal_id: str | None = None,
+    ) -> list[dict]:
+        """Return every known task.
+
+        M4 batch 3.1.16A-4-2: see ``list_active`` for the principal
+        filter semantics.
+        """
         async with self._lock:
-            return [task.to_dict() for task in self._tasks.values()]
+            return [
+                task.to_dict()
+                for task in self._tasks.values()
+                if principal_id is None or task.principal_id == principal_id
+            ]
 
     async def cancel(self, task_id: str) -> TransitionResult:
         """Cancel an active task without overwriting a terminal state.

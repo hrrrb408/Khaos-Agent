@@ -139,6 +139,7 @@ def test_request_context_with_runtime_id_preserves_principal_and_session():
         (TaskService.approve, "TaskService.approve"),
         (TaskService.reject, "TaskService.reject"),
         (TaskService.artifacts, "TaskService.artifacts"),
+        (TaskService.events, "TaskService.events"),
     ],
 )
 def test_service_method_first_param_is_ctx(fn, name):
@@ -161,27 +162,30 @@ def test_service_method_first_param_is_ctx(fn, name):
 
 
 # ---------------------------------------------------------------------------
-# _handle_optional_subagent stamps ctx.principal_id onto the payload
+# _handle_optional_subagent passes ctx directly to the handler
+# (A-4-2: no longer stamps payload)
 # ---------------------------------------------------------------------------
 
 
-async def test_handle_optional_subagent_stamps_transport_principal():
-    """``_handle_optional_subagent`` MUST stamp ``ctx.principal_id`` onto
-    the payload so the existing B1/M2 principal checks inside
-    ``SubAgentService`` see the authenticated value (not the empty
-    string the Go gateway forwards when it doesn't know about
-    principal)."""
+async def test_handle_optional_subagent_passes_ctx_to_handler():
+    """``_handle_optional_subagent`` MUST pass ``ctx`` directly to the
+    SubAgent handler so it reads ``ctx.principal_id`` (not the payload).
+    """
+    captured_ctxs: list[RequestContext] = []
     captured_payloads: list[dict] = []
 
     class _StubService:
-        async def handle_spawn(self, payload):
+        async def handle_spawn(self, ctx, payload):
+            captured_ctxs.append(ctx)
             captured_payloads.append(payload)
             return {"ok": True, "task_id": "t1"}
 
     ctx = RequestContext.for_rpc("api:web-user-42")
     result = await _handle_optional_subagent(_StubService(), "spawn", ctx, {"goal": "x"})
     assert result["ok"] is True
-    assert captured_payloads == [{"goal": "x", "principal_id": "api:web-user-42"}]
+    assert captured_ctxs == [ctx]
+    # Payload is NOT modified — no principal_id stamped on it.
+    assert captured_payloads == [{"goal": "x"}]
 
 
 async def test_handle_optional_subagent_rejects_when_service_is_none():
@@ -190,22 +194,23 @@ async def test_handle_optional_subagent_rejects_when_service_is_none():
     assert result == {"ok": False, "error": "subagents not enabled"}
 
 
-async def test_handle_optional_subagent_overwrites_payload_principal():
+async def test_handle_optional_subagent_ignores_payload_principal():
     """A compromised Gateway that sends ``principal_id: 'admin'`` in
-    the payload MUST NOT win — the transport ``ctx.principal_id`` is
-    authoritative and overwrites the payload."""
-    captured: list[dict] = []
+    the payload MUST NOT win — the handler reads ``ctx.principal_id``
+    directly (A-4-2: no longer stamped on payload)."""
+    captured_ctxs: list[RequestContext] = []
 
     class _StubService:
-        async def handle_spawn(self, payload):
-            captured.append(payload)
+        async def handle_spawn(self, ctx, payload):
+            captured_ctxs.append(ctx)
             return {"ok": True}
 
     ctx = RequestContext.for_rpc("api:low-privilege-user")
     await _handle_optional_subagent(
         _StubService(), "spawn", ctx, {"principal_id": "admin"},
     )
-    assert captured[0]["principal_id"] == "api:low-privilege-user"
+    # The handler received ctx with the correct principal.
+    assert captured_ctxs[0].principal_id == "api:low-privilege-user"
 
 
 # ---------------------------------------------------------------------------

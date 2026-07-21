@@ -1,7 +1,23 @@
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+from khaos.runtime import RequestContext
 from khaos.subagents.service import SubAgentService
+
+
+def _ctx(principal_id: str = "") -> RequestContext:
+    """M4 batch 3.1.16A-4-2: build a RequestContext for SubAgent tests.
+
+    An empty ``principal_id`` simulates the security-rejection path
+    (the RPC authenticator should always provide one; a missing one is
+    a bug or an attack).
+    """
+    if not principal_id:
+        return RequestContext(
+            principal_id="",
+            source_transport="test",
+        )
+    return RequestContext.for_rpc(principal_id)
 
 
 async def test_handle_spawn_success():
@@ -16,13 +32,13 @@ async def test_handle_spawn_success():
     service = SubAgentService(spawner, runner=None)
 
     result = await service.handle_spawn(
+        _ctx("user1"),
         {
-            "principal_id": "user1",
             "goal": "inspect",
             "context": "ctx",
             "tools": ["read_file"],
             "timeout": 300,
-        }
+        },
     )
 
     assert result == {"ok": True, "task_id": "task_1", "status": "running"}
@@ -51,7 +67,7 @@ async def test_handle_spawn_returns_failed_when_aborted():
     service = SubAgentService(spawner, runner=None)
 
     result = await service.handle_spawn(
-        {"principal_id": "user1", "goal": "inspect"}
+        _ctx("user1"), {"goal": "inspect"}
     )
 
     assert result == {
@@ -67,21 +83,49 @@ async def test_handle_spawn_error():
     spawner.spawn = AsyncMock(side_effect=RuntimeError("boom"))
     service = SubAgentService(spawner, runner=None)
 
-    result = await service.handle_spawn({"principal_id": "user1", "goal": "inspect"})
+    result = await service.handle_spawn(_ctx("user1"), {"goal": "inspect"})
 
     assert result == {"ok": False, "error": "boom"}
 
 
 async def test_handle_spawn_rejects_empty_principal():
-    """M2: empty ``principal_id`` is rejected before calling the spawner."""
+    """M2: empty ``principal_id`` is rejected before calling the spawner.
+
+    M4 batch 3.1.16A-4-2: principal comes from ``ctx`` (transport-
+    authenticated), not the payload.  An empty ctx.principal_id
+    simulates a misconfigured authenticator.
+    """
     spawner = MagicMock()
     spawner.spawn = AsyncMock(return_value=SimpleNamespace(id="task_1"))
     service = SubAgentService(spawner, runner=None)
 
-    result = await service.handle_spawn({"goal": "inspect"})
+    result = await service.handle_spawn(_ctx(), {"goal": "inspect"})
 
     assert result == {"ok": False, "error": "principal_id is required"}
     spawner.spawn.assert_not_awaited()
+
+
+async def test_handle_spawn_ignores_payload_principal():
+    """M4 batch 3.1.16A-4-2: a compromised Gateway that sends
+    ``principal_id: 'admin'`` in the payload MUST NOT win — the
+    handler reads ``ctx.principal_id`` directly.
+    """
+    spawner = MagicMock()
+    spawner.spawn = AsyncMock(
+        return_value=SimpleNamespace(id="task_1", status="running")
+    )
+    service = SubAgentService(spawner, runner=None)
+
+    result = await service.handle_spawn(
+        _ctx("user1"),
+        {"principal_id": "admin", "goal": "inspect"},
+    )
+
+    assert result == {"ok": True, "task_id": "task_1", "status": "running"}
+    task = spawner.spawn.call_args.args[0]
+    # Stamped with ctx.principal_id, NOT the payload's "admin".
+    assert task.principal_id == "user1"
+    assert task.parent_session_id == "subagent:user1"
 
 
 async def test_handle_collect_success():
@@ -106,7 +150,7 @@ async def test_handle_collect_success():
     )
     service = SubAgentService(spawner, runner=None)
 
-    result = await service.handle_collect({"principal_id": "user1"})
+    result = await service.handle_collect(_ctx("user1"), {})
 
     assert result["ok"] is True
     assert result["total"] == 2
@@ -114,6 +158,8 @@ async def test_handle_collect_success():
     assert result["failed"] == 1
     assert result["results"][0]["task_id"] == "task_1"
     assert result["results"][1]["error"] == "boom"
+    # M4 batch 3.1.16A-4-2: ctx.principal_id is forwarded to the spawner.
+    assert spawner.wait_all.call_args.kwargs["principal_id"] == "user1"
 
 
 async def test_handle_collect_rejects_empty_principal():
@@ -122,7 +168,7 @@ async def test_handle_collect_rejects_empty_principal():
     spawner.wait_all = AsyncMock(return_value=[])
     service = SubAgentService(spawner, runner=None)
 
-    result = await service.handle_collect({})
+    result = await service.handle_collect(_ctx(), {})
 
     assert result == {"ok": False, "error": "principal_id is required"}
     spawner.wait_all.assert_not_awaited()
@@ -133,9 +179,11 @@ async def test_handle_status():
     spawner.stats.return_value = {"active": 1, "total": 2}
     service = SubAgentService(spawner, runner=None)
 
-    result = await service.handle_status({"principal_id": "user1"})
+    result = await service.handle_status(_ctx("user1"), {})
 
     assert result == {"ok": True, "stats": {"active": 1, "total": 2}}
+    # M4 batch 3.1.16A-4-2: ctx.principal_id is forwarded to the spawner.
+    assert spawner.stats.call_args.kwargs["principal_id"] == "user1"
 
 
 async def test_handle_status_rejects_empty_principal():
@@ -144,7 +192,7 @@ async def test_handle_status_rejects_empty_principal():
     spawner.stats.return_value = {"active": 1, "total": 2}
     service = SubAgentService(spawner, runner=None)
 
-    result = await service.handle_status({})
+    result = await service.handle_status(_ctx(), {})
 
     assert result == {"ok": False, "error": "principal_id is required"}
     spawner.stats.assert_not_called()

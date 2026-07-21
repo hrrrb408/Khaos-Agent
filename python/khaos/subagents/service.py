@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from khaos.runtime import RequestContext
 from khaos.subagents.runner import SubAgentRunner
 from khaos.subagents.spawner import SubAgentSpawner, SubAgentTask
 
@@ -14,10 +15,9 @@ logger = logging.getLogger(__name__)
 class SubAgentService:
     """Handle SubAgent RPC requests from the Go gateway.
 
-    B1: every method reads ``principal_id`` from the authenticated RPC
-    payload and scopes results to that principal.  A different principal
-    cannot observe another's goal / result / error / status — closing
-    the cross-tenant data leakage.
+    B1: every method scopes results to ``ctx.principal_id``.  A different
+    principal cannot observe another's goal / result / error / status —
+    closing the cross-tenant data leakage.
 
     M2: every handler rejects an empty ``principal_id`` BEFORE calling
     the spawner.  Previously, a missing ``principal_id`` resolved to the
@@ -25,6 +25,12 @@ class SubAgentService:
     tasks" (legacy behavior) — a fail-open security boundary.  Now the
     service rejects empty principal up-front, and the spawner's empty-
     principal path returns NOTHING (defense in depth).
+
+    M4 batch 3.1.16A-4-2: ``principal_id`` is now read from the
+    immutable :class:`RequestContext` (transport-authenticated) instead
+    of the RPC payload (which could be forged by a compromised
+    Gateway).  The ``_handle_optional_subagent`` dispatcher no longer
+    needs to stamp ``principal_id`` onto the payload.
     """
 
     def __init__(self, spawner: SubAgentSpawner, runner: SubAgentRunner | None):
@@ -43,16 +49,17 @@ class SubAgentService:
         """
         await self.spawner.shutdown(timeout=timeout)
 
-    async def handle_spawn(self, payload: dict) -> dict[str, Any]:
+    async def handle_spawn(
+        self, ctx: RequestContext, payload: dict,
+    ) -> dict[str, Any]:
         """Handle a Spawn request.
 
-        B1: ``principal_id`` is read from the authenticated payload and
+        ``ctx.principal_id`` is the transport-authenticated principal —
         stamped onto the task so ``collect`` / ``status`` can filter by
-        it.  M2: empty ``principal_id`` is rejected up-front — the Go
-        gateway always forwards the authenticated principal, so a missing
-        one is a bug or an attack.
+        it.  Empty principal is rejected up-front (the RPC authenticator
+        always provides one; a missing one is a bug or an attack).
         """
-        principal_id = str(payload.get("principal_id") or "")
+        principal_id = ctx.principal_id
         if not principal_id:
             return {"ok": False, "error": "principal_id is required"}
         task = SubAgentTask(
@@ -88,15 +95,17 @@ class SubAgentService:
             logger.warning("subagent spawn failed: %s", exc)
             return {"ok": False, "error": str(exc)}
 
-    async def handle_collect(self, payload: dict) -> dict[str, Any]:
+    async def handle_collect(
+        self, ctx: RequestContext, payload: dict,
+    ) -> dict[str, Any]:
         """Handle a Collect request.
 
-        B1: only returns tasks owned by the authenticated principal.
-        M2: empty ``principal_id`` is rejected up-front.
+        Only returns tasks owned by ``ctx.principal_id``.
         """
-        principal_id = str(payload.get("principal_id") or "")
+        principal_id = ctx.principal_id
         if not principal_id:
             return {"ok": False, "error": "principal_id is required"}
+        _ = payload  # No payload fields are read.
         try:
             tasks = await self.spawner.wait_all(timeout=600, principal_id=principal_id)
             results = []
@@ -127,13 +136,15 @@ class SubAgentService:
             logger.warning("subagent collect failed: %s", exc)
             return {"ok": False, "error": str(exc)}
 
-    async def handle_status(self, payload: dict) -> dict[str, Any]:
+    async def handle_status(
+        self, ctx: RequestContext, payload: dict,
+    ) -> dict[str, Any]:
         """Handle a Status request.
 
-        B1: only counts tasks owned by the authenticated principal.
-        M2: empty ``principal_id`` is rejected up-front.
+        Only counts tasks owned by ``ctx.principal_id``.
         """
-        principal_id = str(payload.get("principal_id") or "")
+        principal_id = ctx.principal_id
         if not principal_id:
             return {"ok": False, "error": "principal_id is required"}
+        _ = payload  # No payload fields are read.
         return {"ok": True, "stats": self.spawner.stats(principal_id=principal_id)}

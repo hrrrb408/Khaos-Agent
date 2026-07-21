@@ -1338,16 +1338,26 @@ class AgentService:
 
 
 class MemoryService:
-    """Memory RPC service backed by MemoryStore."""
+    """Memory RPC service backed by a per-request :class:`MemoryStore`.
 
-    def __init__(self, store: MemoryStore):
-        self.store = store
+    M4 batch 3.1.16A-4-2: the service holds the ``db`` handle and
+    constructs a fresh ``MemoryStore`` scoped to ``ctx.principal_id``
+    on every call.  Previously the service was bound to a server-level
+    ``MemoryStore(local-uid)`` singleton, so an API principal could
+    read/write the local-uid's memories.  Each principal now sees only
+    their own private memories plus project-shared memories
+    (``namespace='shared'``).
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    def _store(self, ctx: RequestContext) -> MemoryStore:
+        return MemoryStore(self.db, principal_id=ctx.principal_id)
 
     async def get_memory(self, ctx: RequestContext, scope: str, key: str) -> dict:
-        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
-        # A-4-2 will switch self.store (currently bound to local-uid)
-        # to use ctx.principal_id for per-principal scoping.
-        memory = await self.store.get(MemoryScope(scope), key)
+        store = self._store(ctx)
+        memory = await store.get(MemoryScope(scope), key)
         if memory is None:
             raise KeyError(key)
         return _memory_to_dict(memory)
@@ -1361,10 +1371,8 @@ class MemoryService:
         ttl: int = 604800,
         confidence: int = 2,
     ) -> dict:
-        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
-        # A-4-2 will switch self.store (currently bound to local-uid)
-        # to use ctx.principal_id for per-principal scoping.
-        memory = await self.store.set(
+        store = self._store(ctx)
+        memory = await store.set(
             Memory(
                 id=None,
                 scope=MemoryScope(scope),
@@ -1377,14 +1385,19 @@ class MemoryService:
         return {"ok": True, "id": memory.id}
 
     async def delete_memory(self, ctx: RequestContext, memory_id: int) -> dict:
-        await self.store.db.delete_memory_by_id(memory_id)
+        # M4 batch 3.1.16A-4-2: principal-scoped deletion.  Previously
+        # ``delete_memory_by_id`` had no principal filter, so any
+        # principal could delete any other principal's memory by id.
+        # Now the DELETE is scoped to ``ctx.principal_id`` (or
+        # project-shared rows with ``principal_id=''``).
+        await self.db.delete_memory_by_id(
+            memory_id, principal_id=ctx.principal_id,
+        )
         return {"ok": True}
 
     async def search_memory(self, ctx: RequestContext, query: str, top_k: int = 5) -> list[dict]:
-        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
-        # A-4-2 will switch self.store (currently bound to local-uid)
-        # to use ctx.principal_id for per-principal scoping.
-        return [_memory_to_dict(memory) for memory in await self.store.search(query, top_k)]
+        store = self._store(ctx)
+        return [_memory_to_dict(memory) for memory in await store.search(query, top_k)]
 
 
 class AuditService:
@@ -1402,11 +1415,20 @@ class AuditService:
         until: str | None = None,
         limit: int = 100,
     ) -> list[dict]:
-        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
-        # A-4-2 will switch self.logger (currently bound to local-uid)
-        # to use ctx.principal_id for per-principal audit scoping.
+        # M4 batch 3.1.16A-4-2: scope audit queries to the transport
+        # principal.  Previously the query used the server-level
+        # AuditLogger's bound principal (``local-uid``), so an API
+        # principal could read the local-uid's audit trail.  The
+        # underlying ``AuditLogger.query`` already supports a
+        # ``principal_id`` parameter; we now pass ``ctx.principal_id``
+        # explicitly so each principal sees only their own audit events.
         entries = await self.logger.query(
-            action=action, result=result, since=since, until=until, limit=limit
+            action=action,
+            result=result,
+            since=since,
+            until=until,
+            limit=limit,
+            principal_id=ctx.principal_id,
         )
         return [entry.to_dict() for entry in entries]
 
@@ -1421,33 +1443,70 @@ class TaskService:
     async def list(self, ctx: RequestContext, active_only: bool = False) -> list[dict]:
         """List tasks — active ones by default, all when ``active_only`` is set.
 
-        M4 batch 3.1.16A-4-1: ``ctx`` carries the transport-authenticated
-        principal.  A-4-2 will switch ``task_manager`` to a per-principal
-        filter; for now the parameter is accepted and ``ctx.principal_id``
-        is logged so downstream work can bind to it without re-plumbing
-        the dispatcher.
+        M4 batch 3.1.16A-4-2: filter the returned tasks by
+        ``ctx.principal_id``.  The shared ``TaskManager`` is bound to
+        ``local-uid`` at server startup, so its cache contains only
+        local-uid-owned tasks; an API principal calling this method
+        therefore sees an empty list (fail-closed).  The filter is
+        defense in depth — the manager's cache is already principal-
+        scoped at load time, but the explicit caller-supplied filter
+        guarantees that a future code path mixing principals in one
+        cache cannot leak across the boundary.
         """
-        _ = ctx  # A-4-2 will pass ctx.principal_id into the DB filter.
         if active_only:
-            return await self.task_manager.list_active()
-        return await self.task_manager.list_all()
+            return await self.task_manager.list_active(
+                principal_id=ctx.principal_id,
+            )
+        return await self.task_manager.list_all(
+            principal_id=ctx.principal_id,
+        )
 
     async def get(self, ctx: RequestContext, task_id: str) -> dict:
-        """Return one task's state, or ``{"error": "not found"}``."""
-        _ = ctx  # A-4-2 will scope by ctx.principal_id.
+        """Return one task's state, or ``{"error": "not found"}``.
+
+        M4 batch 3.1.16A-4-2: a task owned by a different principal is
+        treated as ``not found`` — existence is hidden to avoid leaking
+        that another principal has work in flight.
+        """
         task = await self.task_manager.get(task_id)
-        if task is None:
+        if task is None or task.principal_id != ctx.principal_id:
             return {"error": "task not found", "task_id": task_id}
         return task.to_dict()
 
     async def create(self, ctx: RequestContext, goal: str) -> dict:
-        _ = ctx  # A-4-2 will stamp ctx.principal_id as the durable owner.
+        """Create a task owned by ``ctx.principal_id``.
+
+        M4 batch 3.1.16A-4-2: the server-level ``TaskManager`` is bound
+        to ``local-uid`` at startup.  An RPC caller whose transport
+        principal differs from the manager's bound principal is
+        rejected up-front — silently stamping ``ctx.principal_id`` on a
+        task stored in a foreign-principal cache would create an
+        inconsistent ownership graph (the task would be invisible to
+        the manager's bound principal's ``list_all``, and visible only
+        via the filtered RPC path).  The proper fix is per-principal
+        ``TaskManager`` construction (deferred to A-4-3 / A-4-4).  For
+        now the CLI path (``ctx.principal_id == manager.principal_id``)
+        works unchanged, and the API path fails closed.
+        """
+        if ctx.principal_id != self.task_manager.principal_id:
+            return {
+                "ok": False,
+                "error": (
+                    "task_manager bound to a different principal; "
+                    "per-principal TaskManager required for RPC create"
+                ),
+            }
         return (await self.task_manager.create(goal)).to_dict()
 
     async def cancel(self, ctx: RequestContext, task_id: str) -> dict:
         from khaos.coding.task_manager import TransitionResult
 
-        _ = ctx  # A-4-2 will reject cross-principal cancellation.
+        # M4 batch 3.1.16A-4-2: hide cross-principal tasks (treat as
+        # not found) so an API principal cannot enumerate or cancel
+        # another principal's tasks.
+        task = await self.task_manager.get(task_id)
+        if task is None or task.principal_id != ctx.principal_id:
+            return {"ok": False, "error": "task not found", "task_id": task_id}
         result = await self.task_manager.cancel(task_id)
         if result == TransitionResult.NOT_FOUND:
             return {"ok": False, "error": "task not found", "task_id": task_id}
@@ -1465,8 +1524,19 @@ class TaskService:
     ) -> dict:
         from khaos.coding.task_manager import TaskStatus, TransitionResult
 
+        # M4 batch 3.1.16A-4-2: a compromised Gateway could forge the
+        # payload's ``principal_id`` to match the task's pending
+        # approval principal.  The transport ``ctx.principal_id`` is
+        # the authority — reject if the payload principal disagrees.
+        # Also hide cross-principal tasks (treat as not found).
+        if principal_id and principal_id != ctx.principal_id:
+            return {
+                "ok": False,
+                "error": "payload principal_id does not match transport principal",
+                "task_id": task_id,
+            }
         task = await self.task_manager.get(task_id)
-        if task is None:
+        if task is None or task.principal_id != ctx.principal_id:
             return {"ok": False, "error": "task not found", "task_id": task_id}
         if task.status != TaskStatus.BLOCKED:
             return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
@@ -1517,8 +1587,17 @@ class TaskService:
     ) -> dict:
         from khaos.coding.task_manager import TaskStatus, TransitionResult
 
+        # M4 batch 3.1.16A-4-2: see ``approve`` — payload principal
+        # must agree with transport principal, and cross-principal
+        # tasks are hidden.
+        if principal_id and principal_id != ctx.principal_id:
+            return {
+                "ok": False,
+                "error": "payload principal_id does not match transport principal",
+                "task_id": task_id,
+            }
         task = await self.task_manager.get(task_id)
-        if task is None:
+        if task is None or task.principal_id != ctx.principal_id:
             return {"ok": False, "error": "task not found", "task_id": task_id}
         if task.status != TaskStatus.BLOCKED:
             return {"ok": False, "error": f"task is {task.status.value}, not blocked", "task_id": task_id}
@@ -1560,11 +1639,31 @@ class TaskService:
         return {"ok": resolved, "task_id": task_id}
 
     async def artifacts(self, ctx: RequestContext, task_id: str) -> list[dict]:
-        _ = ctx  # A-4-2 will scope by ctx.principal_id.
+        """Return a task's produced artifacts (files + test results).
+
+        M4 batch 3.1.16A-4-2: cross-principal tasks return an empty
+        list (existence hidden) — symmetric with ``get`` / ``cancel``.
+        """
         task = await self.task_manager.get(task_id)
-        if task is None:
+        if task is None or task.principal_id != ctx.principal_id:
             return []
         return ([{"type": "file", "path": path} for path in task.files_modified] + [{"type": "test_result", "data": result} for result in task.test_results])
+
+    async def events(self, ctx: RequestContext, task_id: str):
+        """Subscribe to a task's event stream.
+
+        M4 batch 3.1.16A-4-2: previously the dispatcher reached into
+        ``task_manager.subscribe`` directly, bypassing the service
+        layer — so the principal check on ``ctx`` was never enforced.
+        This wrapper hides cross-principal tasks (yields nothing) so
+        an API principal cannot subscribe to another principal's
+        task events.
+        """
+        task = await self.task_manager.get(task_id)
+        if task is None or task.principal_id != ctx.principal_id:
+            return
+        async for event in self.task_manager.subscribe(task_id):
+            yield event
 
 
 async def serve_json_lines(
@@ -1654,17 +1753,12 @@ async def serve_json_lines(
         await db.run_migrations()
         agent = AgentService(db, project_root=project_root, config_path=config_path, router=router)
         await agent.start()
-        # A2-4: bind the server-level MemoryService to the local-uid principal
-        # so it sees the same memories as a local AgentLoop run.  Multi-principal
-        # servers (when they exist) will need a per-request MemoryService; for
-        # now every local run shares the same UID.
-        memory = MemoryService(MemoryStore(db, principal_id=f"local-uid:{os.getuid()}"))
-        # A2-6: reuse the AgentService's bound AuditLogger so audit RPC
-        # queries inherit the same principal scoping (local-uid) and
-        # policy_digest as the live agent runtime.  Constructing a fresh
-        # unbound AuditLogger here would default to ``principal_id='legacy'``
-        # and surface the wrong principal's rows (or none at all once
-        # legacy quarantine takes effect).
+        # M4 batch 3.1.16A-4-2: MemoryService now holds ``db`` and
+        # constructs a per-request ``MemoryStore`` scoped to
+        # ``ctx.principal_id``.  Previously it was bound to a
+        # server-level ``MemoryStore(local-uid)`` singleton, so an API
+        # principal could read/write the local-uid's memories.
+        memory = MemoryService(db)
         audit_service = AuditService(agent._audit_logger or AuditLogger(db))
         task_service = TaskService(agent.task_manager, agent.approval_broker)
         subagent_service: SubAgentService | None = None
@@ -1821,7 +1915,10 @@ async def serve_json_lines(
                 elif method == "TaskService.Artifacts":
                     writer.write((json.dumps(await task_service.artifacts(ctx, payload["task_id"]), ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "TaskService.Events":
-                    async for event in task_service.task_manager.subscribe(payload["task_id"]):
+                    # M4 batch 3.1.16A-4-2: route through the service
+                    # layer so ``ctx.principal_id`` is enforced (cross-
+                    # principal subscriptions yield nothing).
+                    async for event in task_service.events(ctx, payload["task_id"]):
                         writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                         await writer.drain()
                 elif method == "SubAgentService.Spawn":
@@ -2095,26 +2192,19 @@ async def _handle_optional_subagent(
 ) -> dict:
     """Dispatch a SubAgent RPC action with the transport ``ctx``.
 
-    M4 batch 3.1.16A-4-1: ``ctx`` is the authoritative principal carrier.
-    ``payload["principal_id"]`` is also normalized to ``ctx.principal_id``
-    so the existing B1/M2 principal checks inside ``SubAgentService``
-    continue to work without a signature rewrite in this batch.  A-4-2
-    will move SubAgentService to accept ``ctx`` directly.
+    M4 batch 3.1.16A-4-2: ``ctx`` is passed directly to the SubAgent
+    handler — no longer stamped onto the payload.  The SubAgentService
+    reads ``ctx.principal_id`` directly, so a compromised Gateway that
+    sends ``principal_id: 'admin'`` in the payload cannot win.
     """
     if subagent_service is None:
         return {"ok": False, "error": "subagents not enabled"}
-    # Backward-compat: stamp the transport principal onto the payload so
-    # SubAgentService's existing ``principal_id`` checks see the
-    # authenticated value.  This closes the gap where the Go gateway
-    # forwards no principal and the payload resolved to "" (rejected by
-    # M2).  A-4-2 will replace this with a real ctx-scoped handler.
-    payload = {**payload, "principal_id": ctx.principal_id}
     if action == "spawn":
-        return await subagent_service.handle_spawn(payload)
+        return await subagent_service.handle_spawn(ctx, payload)
     if action == "collect":
-        return await subagent_service.handle_collect(payload)
+        return await subagent_service.handle_collect(ctx, payload)
     if action == "status":
-        return await subagent_service.handle_status(payload)
+        return await subagent_service.handle_status(ctx, payload)
     return {"ok": False, "error": "unknown subagent action"}
 
 

@@ -38,7 +38,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from khaos.db import Database
-from khaos.runtime import RuntimeConfig, build_runtime
+from khaos.runtime import RequestContext, RuntimeConfig, build_runtime
 from khaos.runtime.factory import RuntimeResult
 from khaos.security.command_guard import CommandGuard
 from khaos.security.effective_policy import (
@@ -697,7 +697,8 @@ async def test_main_runtime_wires_effective_policy_into_middleware(tmp_path):
 
 
 async def test_subagent_service_spawn_stamps_principal_onto_task(tmp_path):
-    """B1: ``handle_spawn`` reads ``principal_id`` from the payload and
+    """B1: ``handle_spawn`` reads ``principal_id`` from the transport-
+    authenticated :class:`RequestContext` (M4 batch 3.1.16A-4-2) and
     stamps it onto the created task.  The parent session is namespaced
     by principal so tasks from different principals don't share a
     session namespace.
@@ -712,18 +713,18 @@ async def test_subagent_service_spawn_stamps_principal_onto_task(tmp_path):
         spawner = SubAgentSpawner(SubAgentConfig(), db)
         service = SubAgentService(spawner, runner=None)
         result = await service.handle_spawn(
+            RequestContext.for_rpc("user-alice"),
             {
-                "principal_id": "user-alice",
                 "goal": "secret-A",
                 "context": "ctx",
                 "tools": [],
                 "timeout": 1,
-            }
+            },
         )
         assert result["ok"] is True
         task_id = result["task_id"]
         task = spawner._tasks[task_id]
-        # B1: principal_id is stamped from the authenticated payload.
+        # B1: principal_id is stamped from the authenticated ctx.
         assert task.principal_id == "user-alice"
         # B1: parent_session_id is namespaced per principal.
         assert task.parent_session_id == "subagent:user-alice"
@@ -753,25 +754,29 @@ async def test_subagent_service_collect_filters_by_principal(tmp_path):
         # Principal A spawns two tasks.
         for goal in ("A-secret-1", "A-secret-2"):
             await service.handle_spawn(
+                RequestContext.for_rpc("user-alice"),
                 {
-                    "principal_id": "user-alice",
                     "goal": goal,
                     "context": "",
                     "tools": [],
                     "timeout": 5,
-                }
+                },
             )
         await spawner.wait_all(principal_id="user-alice")
 
         # Principal B collects — must see ZERO tasks.
-        b_result = await service.handle_collect({"principal_id": "user-bob"})
+        b_result = await service.handle_collect(
+            RequestContext.for_rpc("user-bob"), {}
+        )
         assert b_result["ok"] is True
         assert b_result["total"] == 0
         assert b_result["completed"] == 0
         assert b_result["results"] == []
 
         # Principal A collects — must see both tasks.
-        a_result = await service.handle_collect({"principal_id": "user-alice"})
+        a_result = await service.handle_collect(
+            RequestContext.for_rpc("user-alice"), {}
+        )
         assert a_result["ok"] is True
         assert a_result["total"] == 2
         assert a_result["completed"] == 2
@@ -798,18 +803,24 @@ async def test_subagent_service_status_filters_by_principal(tmp_path):
         spawner = SubAgentSpawner(SubAgentConfig(), db)
         service = SubAgentService(spawner, runner=None)
         await service.handle_spawn(
-            {"principal_id": "user-alice", "goal": "g1", "context": "", "tools": [], "timeout": 1}
+            RequestContext.for_rpc("user-alice"),
+            {"goal": "g1", "context": "", "tools": [], "timeout": 1},
         )
         await service.handle_spawn(
-            {"principal_id": "user-alice", "goal": "g2", "context": "", "tools": [], "timeout": 1}
+            RequestContext.for_rpc("user-alice"),
+            {"goal": "g2", "context": "", "tools": [], "timeout": 1},
         )
         await spawner.wait_all(principal_id="user-alice")
 
-        a_status = await service.handle_status({"principal_id": "user-alice"})
+        a_status = await service.handle_status(
+            RequestContext.for_rpc("user-alice"), {}
+        )
         assert a_status["stats"]["total"] == 2
         assert a_status["stats"]["completed"] == 2
 
-        b_status = await service.handle_status({"principal_id": "user-bob"})
+        b_status = await service.handle_status(
+            RequestContext.for_rpc("user-bob"), {}
+        )
         assert b_status["stats"]["total"] == 0
         assert b_status["stats"]["completed"] == 0
     finally:
