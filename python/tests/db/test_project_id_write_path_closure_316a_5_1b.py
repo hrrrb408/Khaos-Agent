@@ -58,6 +58,7 @@ from khaos.grpc_server import (
 from khaos.memory import Memory, MemoryConfidence, MemoryScope, MemoryStore
 from khaos.permissions import PermissionEngine
 from khaos.runtime import RequestContext
+from khaos.scheduler import ScheduleConfig
 from khaos.subagents.service import SubAgentService
 from khaos.subagents.spawner import SubAgentTask
 from khaos.tools import orchestrator_tools
@@ -775,5 +776,183 @@ async def test_acceptance_19_scheduler_journal_default_empty_project_id(tmp_path
             db, "scheduler_operation_journal", "operation_id='op-pause-2'",
         )
         assert stamped == ""
+    finally:
+        await db.close()
+
+
+# ─────────────── session_bookmarks stamping + owner-preserving ─────────
+
+
+async def test_acceptance_20_save_bookmark_stamps_project_id(tmp_path):
+    """A5-1b #20: ``save_bookmark`` stamps project_id on insert.
+
+    ``session_bookmarks`` is one of the 8 tables that received the
+    ``project_id`` column in A-5-1a.  A-5-1b stamps the live
+    ``project_id`` via the ``save_bookmark`` kwarg (plumbed from
+    ``RuntimeConfig.project_id`` / ``agent._bound_project_id``).
+
+    Verifies the DB-layer stamping contract: ``save_bookmark(...,
+    project_id=X)`` produces a row with ``project_id=X``.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        await db.create_session("s1", "office", principal_id="u1", project_id=PROJECT_ID_A)
+        await db.save_bookmark(
+            session_id="s1",
+            name="bm-1",
+            description="checkpoint",
+            mode="office",
+            summary="reached step 3",
+            principal_id="u1",
+            project_id=PROJECT_ID_A,
+        )
+        stamped = await _fetch_project_id(
+            db, "session_bookmarks", "name='bm-1'",
+        )
+        assert stamped == PROJECT_ID_A
+    finally:
+        await db.close()
+
+
+async def test_acceptance_21_save_bookmark_owner_preserving_on_conflict(tmp_path):
+    """A5-1b #21: re-save bookmark with different project_id does NOT re-stamp.
+
+    ``session_bookmarks`` UNIQUE key is ``(session_id, name)``; the
+    ``ON CONFLICT DO UPDATE`` clause updates ``description`` / ``mode``
+    / ``project_root`` / ``summary`` but NOT ``principal_id`` or
+    ``project_id`` — once a bookmark is bound to a (principal, project),
+    a later ``save_bookmark`` call from a different project context
+    cannot re-stamp ownership.  This mirrors the owner-preserving
+    policy on ``sessions`` / ``messages`` / ``memories``.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        await db.create_session("s1", "office", principal_id="u1", project_id=PROJECT_ID_A)
+        # First save: stamps PROJECT_ID_A.
+        await db.save_bookmark(
+            session_id="s1", name="bm-shared", description="v1",
+            summary="first", principal_id="u1", project_id=PROJECT_ID_A,
+        )
+        # Second save (same session_id+name) with different project_id:
+        # must NOT overwrite the original project_id stamp.
+        await db.save_bookmark(
+            session_id="s1", name="bm-shared", description="v2",
+            summary="second", principal_id="u1", project_id=PROJECT_ID_B,
+        )
+        stamped = await _fetch_project_id(
+            db, "session_bookmarks", "name='bm-shared'",
+        )
+        assert stamped == PROJECT_ID_A, (
+            "session_bookmarks ON CONFLICT must be owner-preserving "
+            "(project_id not re-stamped)"
+        )
+        # Sanity check: the mutable columns DID update.
+        conn = await db._require_conn()
+        cursor = await conn.execute(
+            "SELECT description, summary FROM session_bookmarks "
+            "WHERE name='bm-shared'"
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        assert row[0] == "v2"
+        assert row[1] == "second"
+    finally:
+        await db.close()
+
+
+# ─────────────── scheduled_tasks stamping (DB layer) ──────────────────
+
+
+async def test_acceptance_22_insert_scheduled_task_stamps_project_id(tmp_path):
+    """A5-1b #22: ``insert_scheduled_task`` stamps project_id on the row.
+
+    B-1 added ``project_id`` / ``policy_digest`` columns to
+    ``scheduled_tasks`` for B-2 drift detection.  A-5-1b stamps the
+    live ``project_id`` via the ``insert_scheduled_task`` kwarg, which
+    flows from ``CronEngine._project_id`` (RPC-verified).
+
+    Verifies the DB-layer stamping contract: ``insert_scheduled_task(
+    ..., project_id=X)`` produces a row with ``project_id=X``.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        task_id = await db.insert_scheduled_task(
+            name="cron-1", prompt="hello", status="pending",
+            schedule=ScheduleConfig(cron="0 9"), deliver_to="local",
+            meta={}, principal_id="u1",
+            project_id=PROJECT_ID_A, policy_digest="sha256:policy-a",
+        )
+        stamped = await _fetch_project_id(
+            db, "scheduled_tasks", f"id='{task_id}'",
+        )
+        assert stamped == PROJECT_ID_A
+    finally:
+        await db.close()
+
+
+async def test_acceptance_23_insert_scheduled_task_default_empty_project_id(tmp_path):
+    """A5-1b #23: ``insert_scheduled_task`` default project_id=''.
+
+    Legacy callers that omit ``project_id`` produce ``project_id=''``
+    rows — fail-closed default matching the schema column default.
+    These rows are still visible (no filter is applied on this column
+    at the DB layer) but B-2 drift detection will quarantine tasks
+    with empty ``project_id`` if the live runtime is project-bound.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        task_id = await db.insert_scheduled_task(
+            name="cron-legacy", prompt="hello", status="pending",
+            schedule=ScheduleConfig(cron="0 9"), deliver_to="local",
+            meta={}, principal_id="u1",
+            # Omit project_id — should default to ''.
+        )
+        stamped = await _fetch_project_id(
+            db, "scheduled_tasks", f"id='{task_id}'",
+        )
+        assert stamped == ""
+    finally:
+        await db.close()
+
+
+# ─────────────── permissions stamping (DB layer) ──────────────────────
+
+
+async def test_acceptance_24_insert_permission_rule_stamps_project_id(tmp_path):
+    """A5-1b #24: ``insert_permission_rule`` stamps project_id on the row.
+
+    ``permissions`` already had ``project_id`` since A-2 (CRITICAL #3),
+    but A-5-1b re-confirms the stamping contract: rules are scoped by
+    ``(principal_id, project_id, policy_digest)`` so a rule granted
+    under project A does NOT match a runtime booted under project B.
+
+    Verifies the DB-layer stamping contract: ``insert_permission_rule(
+    ..., project_id=X)`` produces a row with ``project_id=X``, and
+    ``list_permission_rules(project_id=X)`` filters by it.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        await db.insert_permission_rule(
+            pattern="read_file:/tmp/**", permission_level="read",
+            approval="auto", mode="office",
+            principal_id="u1", project_id=PROJECT_ID_A,
+            policy_digest="sha256:policy-a", generation=0,
+        )
+        # Row is stamped with PROJECT_ID_A.
+        stamped = await _fetch_project_id(
+            db, "permissions", "pattern='read_file:/tmp/**'",
+        )
+        assert stamped == PROJECT_ID_A
+
+        # list_permission_rules(project_id=...) filters by it.
+        rules_a = await db.list_permission_rules(
+            principal_id="u1", project_id=PROJECT_ID_A,
+        )
+        assert any(r["pattern"] == "read_file:/tmp/**" for r in rules_a)
+        # A different project sees no rules.
+        rules_b = await db.list_permission_rules(
+            principal_id="u1", project_id=PROJECT_ID_B,
+        )
+        assert not any(r["pattern"] == "read_file:/tmp/**" for r in rules_b)
     finally:
         await db.close()

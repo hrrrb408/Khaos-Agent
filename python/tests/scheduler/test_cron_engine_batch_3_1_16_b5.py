@@ -1034,3 +1034,61 @@ async def test_acceptance_27_legacy_engine_stamps_empty_project_id(tmp_path):
     finally:
         await _force_cleanup_engine(engine)
         await db.close()
+
+
+async def test_acceptance_28_create_stamps_project_id_on_scheduled_task_row(tmp_path):
+    """A5-1b #28: ``create()`` stamps engine's ``project_id`` on the
+    ``scheduled_tasks`` row (not just the journal row).
+
+    Test 26 verifies the journal row carries ``project_id``; this test
+    verifies the TASK row itself carries it.  Both stamps flow from
+    ``CronEngine._project_id`` but through different code paths:
+      - task row: ``create()`` → ``insert_scheduled_task(project_id=...)``
+      - journal row: ``_record_journal_intent`` →
+        ``insert_scheduler_journal_entry(project_id=...)``
+
+    The task row's ``project_id`` is what B-2 drift detection compares
+    against the live runtime value at ``start()`` and ``_execute_task``
+    claim time, so a missing stamp here would silently bypass drift
+    detection.
+    """
+    db = await _make_db(tmp_path)
+    audit_logger = await _make_audit_logger(db)
+    engine = _make_engine(
+        db,
+        project_id="proj-task-row",  # engine is project-bound
+        policy_digest="sha256:policy-task-row",
+        audit_logger=audit_logger,
+    )
+    try:
+        await engine.start()
+        task = await engine.create(
+            name="t-row", prompt="hello",
+            schedule=ScheduleConfig(cron="0 9"), deliver_to="local",
+            principal_id="alice",
+        )
+        task_id = task.id if hasattr(task, "id") else task
+
+        # The scheduled_tasks row must carry the engine's project_id.
+        conn = await db._require_conn()
+        cursor = await conn.execute(
+            "SELECT project_id, policy_digest, principal_id "
+            "FROM scheduled_tasks WHERE id = ?",
+            (task_id,),
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 1, (
+            f"expected 1 scheduled_task row, got {len(rows)}"
+        )
+        assert rows[0][0] == "proj-task-row", (
+            f"scheduled_tasks.project_id must be 'proj-task-row', "
+            f"got {rows[0][0]!r}"
+        )
+        assert rows[0][1] == "sha256:policy-task-row", (
+            f"scheduled_tasks.policy_digest must be stamped too, "
+            f"got {rows[0][1]!r}"
+        )
+        assert rows[0][2] == "alice"
+    finally:
+        await _force_cleanup_engine(engine)
+        await db.close()
