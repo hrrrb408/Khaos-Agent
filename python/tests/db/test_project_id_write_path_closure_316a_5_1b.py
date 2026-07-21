@@ -265,17 +265,18 @@ async def test_acceptance_7_permission_engine_audit_stamps_project_id(tmp_path):
         await db.close()
 
 
-# ─────────────── Owner-preserving ON CONFLICT (audit_log) ───────────────
+# ─────────────── Owner-preserving INSERT (audit_log) ────────────────
 
 
 async def test_acceptance_8_audit_log_owner_preserving_on_conflict(tmp_path):
     """A5-1b #8: re-log with different project_id does NOT re-stamp.
 
-    ``audit_log`` uses ``(session_id, action, target, principal_id)`` as
-    the conflict key (or similar) and does NOT update ``project_id`` on
-    conflict — once a row is bound to a (principal, project) pair, a
-    later upsert from a different project context cannot re-stamp
-    ownership.
+    ``audit_log`` uses a plain INSERT (no ON CONFLICT clause) — each
+    ``log()`` call appends a new row.  This test verifies the FIRST
+    row keeps its original ``project_id`` stamp even after a second
+    ``log()`` call from a different project context.  Both rows exist
+    in the table; the first is bound to PROJECT_ID_A and cannot be
+    re-stamped by the second call.
     """
     db = await _make_db(tmp_path / "khaos.db")
     try:
@@ -619,5 +620,160 @@ async def test_acceptance_15_subagent_service_spawn_uses_ctx_project_id(tmp_path
         assert len(captured_tasks) == 1
         assert captured_tasks[0].project_id == PROJECT_ID_A
         assert captured_tasks[0].principal_id == "u1"
+    finally:
+        await db.close()
+
+
+# ─────────── coding_tasks RE-STAMPING ON CONFLICT (inverse) ────────────
+
+
+async def test_acceptance_16_coding_tasks_re_stamps_project_id_on_conflict(tmp_path):
+    """A5-1b #16: ``coding_tasks`` DOES re-stamp project_id on conflict.
+
+    Unlike ``sessions`` / ``messages`` / ``memories`` / ``audit_log`` /
+    ``session_bookmarks`` (owner-preserving — ``ON CONFLICT`` does NOT
+    touch ``project_id``), ``coding_tasks`` DOES update both
+    ``principal_id`` and ``project_id`` on conflict.  Rationale: a
+    coding task's lifecycle is tied to the runtime that owns it, so a
+    re-attach by the same principal under a different project context
+    (e.g. after a ``project_root`` move) is a legitimate lifecycle
+    event that re-binds ownership.
+
+    This test verifies the inverse policy:
+      1. ``upsert_coding_task`` with ``project_id=A`` → row stamped A.
+      2. ``upsert_coding_task`` (same task id) with ``project_id=B``
+         → row RE-STAMPED to B (not owner-preserving).
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        task_dict = {
+            "id": "task-rebind-1",
+            "goal": "build feature",
+            "status": "in_progress",
+            "created_at": "2026-07-21T00:00:00Z",
+            "updated_at": "2026-07-21T00:00:00Z",
+        }
+        # First upsert: stamps PROJECT_ID_A.
+        await db.upsert_coding_task(
+            task_dict, principal_id="u1", project_id=PROJECT_ID_A,
+        )
+        stamped_a = await _fetch_project_id(db, "coding_tasks", "id='task-rebind-1'")
+        assert stamped_a == PROJECT_ID_A
+
+        # Second upsert (same id): RE-STAMPS to PROJECT_ID_B.
+        # The task dict must carry an updated timestamp so the ON
+        # CONFLICT clause's ``updated_at=excluded.updated_at`` is
+        # observable, but the project_id re-stamp happens regardless.
+        task_dict["updated_at"] = "2026-07-21T01:00:00Z"
+        await db.upsert_coding_task(
+            task_dict, principal_id="u1", project_id=PROJECT_ID_B,
+        )
+        stamped_b = await _fetch_project_id(db, "coding_tasks", "id='task-rebind-1'")
+        assert stamped_b == PROJECT_ID_B, (
+            "coding_tasks ON CONFLICT must re-stamp project_id "
+            "(unlike sessions/messages/memories which are owner-preserving)"
+        )
+    finally:
+        await db.close()
+
+
+async def test_acceptance_17_coding_tasks_re_stamps_via_task_manager(tmp_path):
+    """A5-1b #17: TaskManager re-persist re-stamps project_id (lifecycle).
+
+    Integration-level check: when a task created under manager_a
+    (``project_id=A``) is later persisted through manager_b
+    (``project_id=B``), the DB row's ``project_id`` is re-stamped to
+    B.  This mirrors the real-world scenario where a task is resumed
+    under a different project context after a ``project_root`` move.
+
+    The re-stamp happens because ``TaskManager._persist`` always passes
+    ``self._project_id`` to ``upsert_coding_task``, and the DB method's
+    ``ON CONFLICT`` clause updates ``project_id=excluded.project_id``.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        # manager_a creates the task → row stamped A.
+        manager_a = TaskManager(db=db, principal_id="u1", project_id=PROJECT_ID_A)
+        task = await manager_a.create("goal: lifecycle rebind")
+        stamped_a = await _fetch_project_id(db, "coding_tasks", f"id='{task.id}'")
+        assert stamped_a == PROJECT_ID_A
+
+        # manager_b re-persists the SAME task object → row re-stamped B.
+        manager_b = TaskManager(db=db, principal_id="u1", project_id=PROJECT_ID_B)
+        # ``_persist`` is the internal write path used by ``create`` /
+        # ``update_status`` / ``transition``.  Calling it directly
+        # simulates a re-attach without going through the task cache.
+        await manager_b._persist(task)
+        stamped_b = await _fetch_project_id(db, "coding_tasks", f"id='{task.id}'")
+        assert stamped_b == PROJECT_ID_B
+    finally:
+        await db.close()
+
+
+# ───────────── scheduler_operation_journal stamping ────────────────────
+
+
+async def test_acceptance_18_scheduler_journal_stamps_project_id(tmp_path):
+    """A5-1b #18: ``insert_scheduler_journal_entry`` stamps project_id.
+
+    B-5 added the ``scheduler_operation_journal`` table with
+    ``principal_id`` and ``policy_digest`` columns but NOT
+    ``project_id`` (oversight).  A-5-1a added the column; A-5-1b
+    stamps it via ``CronEngine._project_id`` (which flows from
+    ``AgentService._bound_project_id`` — RPC-verified).
+
+    This test verifies the DB-layer stamping contract directly:
+    ``insert_scheduler_journal_entry(..., project_id=X)`` produces a
+    row with ``project_id=X``.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        # ``scheduler_operation_journal`` has no FK to ``scheduled_tasks``
+        # (it's an append-only operation log), so we can insert a
+        # journal entry directly without creating a scheduled task first.
+        await db.insert_scheduler_journal_entry(
+            operation_id="op-pause-1",
+            task_id="cron-task-1",
+            operation_type="pause",
+            desired_status="paused",
+            expected_version=1,
+            target_version=2,
+            principal_id="u1",
+            policy_digest="digest-xyz",
+            project_id=PROJECT_ID_A,
+        )
+        stamped = await _fetch_project_id(
+            db, "scheduler_operation_journal", "operation_id='op-pause-1'",
+        )
+        assert stamped == PROJECT_ID_A
+    finally:
+        await db.close()
+
+
+async def test_acceptance_19_scheduler_journal_default_empty_project_id(tmp_path):
+    """A5-1b #19: ``insert_scheduler_journal_entry`` default project_id=''.
+
+    Legacy callers that omit ``project_id`` produce ``project_id=''``
+    rows — fail-closed default matching the schema column default.
+    These rows are still visible (no filter is applied on this column
+    yet) but distinguishable from rows stamped by a project-bound
+    runtime.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        # Omit project_id — should default to ''.
+        await db.insert_scheduler_journal_entry(
+            operation_id="op-pause-2",
+            task_id="cron-task-2",
+            operation_type="pause",
+            desired_status="paused",
+            expected_version=1,
+            target_version=2,
+            principal_id="u1",
+        )
+        stamped = await _fetch_project_id(
+            db, "scheduler_operation_journal", "operation_id='op-pause-2'",
+        )
+        assert stamped == ""
     finally:
         await db.close()
