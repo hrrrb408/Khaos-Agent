@@ -597,16 +597,17 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     # The previous module-global ``file_tools._office_authority`` was removed
     # — direct callers must pass ``office_authority`` explicitly or fall back
     # to the legacy unfenced path (only safe for trusted inputs in tests).
-    # A2-7: wire the principal-scoped PermissionEngine + AuditLogger into
-    # the module-level permission_tools globals so the registered tools
-    # (list_permission_rules / grant_permission / revoke_permission /
-    # query_audit_logs / security_status) actually function in production.
-    # Both instances are already bound to ``cfg.principal_id`` at
-    # construction, so every tool call inherits the caller's principal
-    # scope — list/grant/revoke only see this principal's rules, and
-    # query_audit_logs defaults to filtering by this principal.
-    from khaos.tools import permission_tools
-    permission_tools.init_permission_tools(permission_engine, audit_logger)
+    # M4 batch 3.1.16A-4-4-1 (CRITICAL): the principal-scoped
+    # PermissionEngine + AuditLogger are no longer wired into module-
+    # global holders (the old ``init_permission_tools`` call).  The five
+    # permission tools now receive them per-call via the
+    # ``permission.read`` / ``permission.manage`` broker injection from
+    # ``tool_context`` (assembled by ``AgentLoop`` from
+    # ``tool_scheduler.permission_engine`` and
+    # ``tool_scheduler.security_middleware.audit_logger``).  This closes
+    # the cross-principal race where concurrent ``build_runtime`` calls
+    # overwrote each other's holder — see ``permission_tools.py``
+    # docstring for the race description.
     compressor = ContextCompressor(router, memory_manager=memory_manager)
     verify_factory = VerifyFixLoop
     skill_generator = SkillGenerator()

@@ -392,6 +392,27 @@ class AgentLoop:
                         # same UID get independent contexts.
                         "session_id": session_id,
                         "runtime_id": self.runtime_id,
+                        # M4 batch 3.1.16A-4-4-1 (CRITICAL): inject the
+                        # caller's principal-scoped PermissionEngine and
+                        # the runtime's AuditLogger so the five permission
+                        # tools (list_permission_rules / grant_permission /
+                        # revoke_permission / query_audit_logs /
+                        # security_status) receive them via the
+                        # ``permission.read`` / ``permission.manage``
+                        # broker injection — no module-global holders, no
+                        # cross-principal race.  ``audit_logger`` may be
+                        # the server-lifecycle singleton (bound to
+                        # ``local-uid``), but the handlers pass
+                        # ``principal_id`` explicitly to ``query()`` so
+                        # the logger's bound default is overridden per-call.
+                        "permission_engine": getattr(
+                            self.tool_scheduler, "permission_engine", None
+                        ),
+                        "audit_logger": getattr(
+                            getattr(self.tool_scheduler, "security_middleware", None),
+                            "audit_logger",
+                            None,
+                        ),
                     },
                 }
                 if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:
