@@ -424,11 +424,16 @@ func TestTaskEventReplayCursorAndOwnership(t *testing.T) {
 	if rec.Code != http.StatusOK || strings.Contains(rec.Body.String(), `"sequence":1`) {
 		t.Fatalf("replay cursor status=%d body=%s", rec.Code, rec.Body.String())
 	}
-	apiHandler.mu.Lock()
-	apiHandler.taskOwners["t1"] = "api-key:another"
-	apiHandler.mu.Unlock()
-	if rec := serve(handler, http.MethodGet, "/v1/tasks/t1", "", "secret"); rec.Code != http.StatusForbidden {
-		t.Fatalf("cross-principal task=%d", rec.Code)
+	// C-1-2: Go no longer maintains an in-memory taskOwners map.
+	// Cross-principal task access is enforced durably by Python's
+	// TaskService (ctx.principal_id scoping hides foreign tasks as
+	// "not found").  The Go layer only checks authentication — any
+	// authenticated principal can reach the Python service, which
+	// then scopes the response.  Verify the Go layer no longer 403s
+	// on cross-principal access (the mock returns the task regardless
+	// of principal; real Python would return "not found").
+	if rec := serve(handler, http.MethodGet, "/v1/tasks/t1", "", "secret"); rec.Code != http.StatusOK {
+		t.Fatalf("post-C-1-2 task access=%d (Go should not 403; Python scopes)", rec.Code)
 	}
 }
 

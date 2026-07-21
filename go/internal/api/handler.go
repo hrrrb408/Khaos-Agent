@@ -40,7 +40,6 @@ type Handler struct {
 	streams              map[string]<-chan ChatEvent
 	sessions             map[string]ChatRequest
 	sessionOwners        map[string]string
-	taskOwners           map[string]string
 	tools                []map[string]any
 }
 
@@ -89,7 +88,6 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 		streams:        map[string]<-chan ChatEvent{},
 		sessions:       map[string]ChatRequest{},
 		sessionOwners:  map[string]string{},
-		taskOwners:     map[string]string{},
 		tools: []map[string]any{
 			{"name": "read_file", "modes": []string{"all"}, "permission_level": "read"},
 			{"name": "write_file", "modes": []string{"coding"}, "permission_level": "write"},
@@ -230,9 +228,6 @@ func (h *Handler) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "task service returned no task id")
 		return
 	}
-	h.mu.Lock()
-	h.taskOwners[id] = principalID
-	h.mu.Unlock()
 	writeJSON(w, http.StatusCreated, result)
 }
 
@@ -251,20 +246,13 @@ func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	// C-1-1: Python's TaskService now scopes by ctx.principal_id, so
-	// result already contains only the caller's tasks.  The in-memory
-	// taskOwners filter is retained as defense-in-depth until C-1-2
-	// deletes the Go-side ownership map entirely.
-	filtered := make([]map[string]any, 0, len(result))
-	h.mu.Lock()
-	for _, task := range result {
-		id, _ := task["id"].(string)
-		if h.taskOwners[id] == principalID {
-			filtered = append(filtered, task)
-		}
+	// C-1-2: Python's TaskService.list scopes by ctx.principal_id, so
+	// result already contains only the caller's tasks.  The Go-side
+	// in-memory taskOwners map has been deleted — durable ownership
+	// in Python is the sole authority.
+	if result == nil {
+		result = []map[string]any{}
 	}
-	h.mu.Unlock()
-	result = filtered
 	writeJSON(w, http.StatusOK, result)
 }
 
@@ -619,18 +607,15 @@ func (h *Handler) authorizeSession(w http.ResponseWriter, r *http.Request, sessi
 }
 
 func (h *Handler) authorizeTask(w http.ResponseWriter, r *http.Request) bool {
-	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	_, authenticated := auth.PrincipalFromContext(r.Context())
 	if !authenticated {
 		writeError(w, http.StatusUnauthorized, "authenticated principal required")
 		return false
 	}
-	h.mu.Lock()
-	owner := h.taskOwners[r.PathValue("id")]
-	h.mu.Unlock()
-	if owner == "" || owner != principalID {
-		writeError(w, http.StatusForbidden, "task is not owned by authenticated principal")
-		return false
-	}
+	// C-1-2: task ownership is enforced durably by Python's
+	// TaskService (ctx.principal_id scoping).  The Go-side
+	// in-memory taskOwners map has been deleted — cross-principal
+	// access is hidden as "not found" by Python, not 403 here.
 	return true
 }
 
