@@ -250,6 +250,9 @@ func (h *Handler) handleListTasks(w http.ResponseWriter, r *http.Request) {
 	// result already contains only the caller's tasks.  The Go-side
 	// in-memory taskOwners map has been deleted — durable ownership
 	// in Python is the sole authority.
+	if result == nil {
+		result = []map[string]any{}
+	}
 	writeJSON(w, http.StatusOK, result)
 }
 
