@@ -40,12 +40,8 @@ Verifies
 from __future__ import annotations
 
 import asyncio
-import io
-import os
-import sys
 import uuid
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -66,15 +62,28 @@ from khaos.db.state_root import project_id as compute_project_id
 # ─────────────────────────────── helpers ────────────────────────────────
 
 
-PROJECT_ROOT_A = Path("/tmp/project-a")  # not real; resolve() handles it
-
-
 async def _make_db(path: Path) -> Database:
     """Open a fresh Database with migrations applied."""
     db = Database(path)
     await db.connect()
     await db.run_migrations()
     return db
+
+
+async def _ensure_session(db: Database, session_id: str) -> None:
+    """INSERT OR IGNORE a session row so FK-referencing tables can use it.
+
+    ``agent_turns`` and ``messages`` have ``session_id REFERENCES
+    sessions(id)``; this helper ensures the parent row exists before
+    we insert a child row with ``project_id=''``.
+    """
+    conn = await db._require_conn()
+    await conn.execute(
+        "INSERT OR IGNORE INTO sessions (id, mode, principal_id) "
+        "VALUES (?, 'office', 'u1')",
+        (session_id,),
+    )
+    await conn.commit()
 
 
 async def _insert_legacy_row(
@@ -96,12 +105,15 @@ async def _insert_legacy_row(
             (session_id,),
         )
     elif table == "messages":
+        await _ensure_session(db, session_id)
         await conn.execute(
             "INSERT INTO messages (session_id, role, content, principal_id) "
             "VALUES (?, 'user', 'hello', 'u1')",
             (session_id,),
         )
     elif table == "agent_turns":
+        # agent_turns.session_id REFERENCES sessions(id); ensure parent exists.
+        await _ensure_session(db, session_id)
         await conn.execute(
             "INSERT INTO agent_turns (turn_id, attempt_id, session_id, status, "
             "started_at, principal_id) "
@@ -126,9 +138,13 @@ async def _insert_legacy_row(
             (session_id, f"bm-{uuid.uuid4().hex[:8]}"),
         )
     elif table == "coding_tasks":
+        # coding_tasks.created_at / updated_at are NOT NULL without DEFAULT;
+        # supply explicit values so the INSERT succeeds.
         await conn.execute(
-            "INSERT INTO coding_tasks (id, goal, status, principal_id) "
-            "VALUES (?, 'goal', 'in_progress', 'u1')",
+            "INSERT INTO coding_tasks (id, goal, status, principal_id, "
+            "created_at, updated_at) "
+            "VALUES (?, 'goal', 'in_progress', 'u1', "
+            "datetime('now'), datetime('now'))",
             (task_id,),
         )
     elif table == "scheduler_operation_journal":
@@ -454,3 +470,118 @@ def test_acceptance_15_cli_no_subcommand_prints_usage_and_returns_2(
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "usage" in captured.err.lower()
+
+
+# ─────────────── per-table backfill coverage (H3 fix) ──────────────────
+#
+# Tests 7-10 verify run_backfill returns reports for all 8 tables, but
+# only sessions / audit_log / memories / session_bookmarks actually had
+# legacy rows inserted.  coding_tasks and agent_turns were never
+# exercised end-to-end (their helpers had NOT NULL / FK bugs that
+# masked the gap — fixed above).  These two tests close that gap.
+
+
+async def test_acceptance_16_coding_tasks_backfill_end_to_end(tmp_path):
+    """A5-2 #16: coding_tasks backfill stamps project_id end-to-end.
+
+    Verifies the full path: insert legacy coding_task row →
+    run_backfill → row's project_id is stamped.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        await _insert_legacy_row(db, "coding_tasks", task_id="t1")
+        await _insert_legacy_row(db, "coding_tasks", task_id="t2")
+        assert await count_legacy_rows(db, "coding_tasks") == 2
+
+        result = await run_backfill(db, tmp_path)
+        coding_report = next(
+            r for r in result.reports if r.table == "coding_tasks"
+        )
+        assert coding_report.rows_updated == 2
+
+        # Verify the rows are stamped.
+        conn = await db._require_conn()
+        cursor = await conn.execute(
+            "SELECT project_id FROM coding_tasks WHERE id IN ('t1', 't2')",
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        assert len(rows) == 2
+        for row in rows:
+            assert row[0] == result.project_id, (
+                f"coding_tasks row not stamped: got {row[0]!r}, "
+                f"expected {result.project_id!r}"
+            )
+    finally:
+        await db.close()
+
+
+async def test_acceptance_17_agent_turns_backfill_end_to_end(tmp_path):
+    """A5-2 #17: agent_turns backfill stamps project_id end-to-end.
+
+    Verifies the full path: insert legacy agent_turn row (with parent
+    session) → run_backfill → row's project_id is stamped.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        await _insert_legacy_row(db, "agent_turns", session_id="s1")
+        await _insert_legacy_row(db, "agent_turns", session_id="s1")
+        assert await count_legacy_rows(db, "agent_turns") == 2
+
+        result = await run_backfill(db, tmp_path)
+        turns_report = next(
+            r for r in result.reports if r.table == "agent_turns"
+        )
+        assert turns_report.rows_updated == 2
+
+        # Verify the rows are stamped.
+        conn = await db._require_conn()
+        cursor = await conn.execute(
+            "SELECT project_id FROM agent_turns WHERE project_id != ''",
+        )
+        rows = await cursor.fetchall()
+        await cursor.close()
+        assert len(rows) == 2
+        for row in rows:
+            assert row[0] == result.project_id
+    finally:
+        await db.close()
+
+
+async def test_acceptance_18_all_eight_tables_backfilled_in_single_run(tmp_path):
+    """A5-2 #18: a single ``run_backfill`` stamps all 8 tables.
+
+    Comprehensive integration test: insert legacy rows in every A-5-1a
+    table, run a single backfill, verify every table was stamped.
+    Catches any per-table regression that individual table tests
+    might miss.
+    """
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        # Insert one legacy row per table (where the helper supports it).
+        await _insert_legacy_row(db, "sessions", session_id="s1")
+        await _insert_legacy_row(db, "messages", session_id="s1")
+        await _insert_legacy_row(db, "agent_turns", session_id="s1")
+        await _insert_legacy_row(db, "memories")
+        await _insert_legacy_row(db, "audit_log")
+        await _insert_legacy_row(db, "session_bookmarks", session_id="s1")
+        await _insert_legacy_row(db, "coding_tasks", task_id="t1")
+        await _insert_legacy_row(db, "scheduler_operation_journal")
+
+        result = await run_backfill(db, tmp_path)
+
+        # Every table must report exactly 1 row updated.
+        for report in result.reports:
+            assert report.rows_updated == 1, (
+                f"{report.table}: expected 1 row updated, "
+                f"got {report.rows_updated}"
+            )
+        assert result.total_rows == 8
+
+        # Every table must have 0 legacy rows remaining.
+        for table in A_5_1A_TABLES:
+            assert await _count_project_id_empty(db, table) == 0, (
+                f"{table}: legacy rows remain after backfill"
+            )
+    finally:
+        await db.close()
