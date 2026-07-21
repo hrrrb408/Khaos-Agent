@@ -794,6 +794,16 @@ class AgentService:
                 # AuditLoggers constructed by ``build_runtime`` carry it.
                 principal_id=f"local-uid:{os.getuid()}",
                 policy_digest=self._effective_policy.digest,
+                # M4 batch 3.1.16A-5-1b: stamp the server-bound project
+                # identity on every audit row.  The dispatcher's drift
+                # check guarantees every RPC reaching a service method
+                # has ``ctx.project_id == self._bound_project_id``, so
+                # this is the canonical project identity for all server-
+                # lifecycle audit events (webhook / cron / channel
+                # mutations).  Per-runtime AuditLoggers constructed by
+                # ``build_runtime`` get the same value via
+                # ``RuntimeConfig.project_id``.
+                project_id=_bound_project_id,
             )
             if self._effective_policy.audit_enabled
             else None
@@ -1149,7 +1159,12 @@ class AgentService:
         await mode_manager.switch(mode)
         if session_id:
             await self.db.create_session(
-                session_id, mode.value, principal_id=ctx.principal_id
+                session_id, mode.value,
+                principal_id=ctx.principal_id,
+                # M4 batch 3.1.16A-5-1b: stamp the RPC-verified project
+                # identity (owner-preserving ON CONFLICT — see
+                # ``_build_runtime`` for the rationale).
+                project_id=ctx.project_id,
             )
         return {"current_mode": mode.value}
 
@@ -1268,7 +1283,15 @@ class AgentService:
         RPC path always provides a non-empty ctx.principal_id.
         """
         await self.db.create_session(
-            session_id, mode or "office", principal_id=ctx.principal_id
+            session_id, mode or "office",
+            principal_id=ctx.principal_id,
+            # M4 batch 3.1.16A-5-1b: stamp the RPC-verified project
+            # identity on the session row.  ``create_session``'s
+            # ``ON CONFLICT`` clause does NOT touch ``project_id``
+            # (owner-preserving), so once a session is bound to a
+            # (principal, project) pair a later ``create_session``
+            # call from a different project cannot re-stamp it.
+            project_id=ctx.project_id,
         )
         from khaos.runtime import RuntimeConfig, build_runtime
 
@@ -1282,6 +1305,15 @@ class AgentService:
             office_authority=self._office_authority,
             principal_id=ctx.principal_id,
             session_id=session_id,
+            # M4 batch 3.1.16A-5-1b (CRITICAL): inject the RPC-verified
+            # project identity so ``AgentLoop._bound_project_id`` (and
+            # every component constructed by ``build_runtime``:
+            # PermissionEngine, MemoryStore, AuditLogger, TaskManager)
+            # comes from ``ctx.project_id`` (server-bound) instead of
+            # being recomputed from ``project_root``.  The dispatcher's
+            # drift check above guarantees ``ctx.project_id ==
+            # agent._bound_project_id`` here.
+            project_id=ctx.project_id,
             # M4 batch 3.1.16A-4-4-3: inject the server-lifecycle
             # ChannelRegistry + the effective policy's compiled
             # ``channel_admins`` allowlist so the four channel tools
@@ -1872,6 +1904,42 @@ async def serve_json_lines(
                 )
                 if "principal_id" in payload:
                     payload["principal_id"] = ctx.principal_id
+                # M4 batch 3.1.16A-5-1b (CRITICAL): project identity
+                # drift detection.  The Go side may claim a
+                # ``project_id`` in the payload (caller-asserted).
+                # Compare it against ``agent._bound_project_id`` (the
+                # server-computed identity of this AgentService's
+                # ``project_root``).  A mismatch means the Gateway
+                # routed a request for project A to a server booted
+                # under project B — either a misconfiguration or an
+                # attempt to cross-contaminate project state (e.g.
+                # write audit rows / memories / coding tasks attributed
+                # to the wrong project).  Fail-closed: reject before
+                # any service method runs.  An empty claim (Go side
+                # didn't send ``project_id``) is accepted — backward
+                # compat with older Gateways — and ``ctx.project_id``
+                # remains the server-bound value.
+                claimed_project_id = payload.get("project_id", "")
+                if (
+                    claimed_project_id
+                    and claimed_project_id != agent._bound_project_id
+                ):
+                    writer.write((json.dumps({
+                        "error": "project_drift",
+                        "message": (
+                            f"payload project_id {claimed_project_id!r} "
+                            f"does not match server-bound project_id "
+                            f"{agent._bound_project_id!r}"
+                        ),
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
+                # Pop ``project_id`` from the payload so downstream
+                # ``ChatRequest(**payload)`` / ``ConfirmRequest(**payload)``
+                # etc. don't receive an unexpected keyword.  The
+                # verified value lives on ``ctx.project_id`` (always
+                # equal to ``agent._bound_project_id`` here).
+                payload.pop("project_id", None)
                 if method == "AgentService.Chat":
                     try:
                         async for event in agent.chat(ctx, ChatRequest(**payload)):

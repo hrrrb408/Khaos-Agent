@@ -22,6 +22,7 @@ from khaos.agent.core import Message
 from khaos.agent.error_handler import ErrorHandler
 from khaos.config import PROVIDER_DEFAULTS, check_needs_setup, write_provider_config
 from khaos.db import Database
+from khaos.db.state_root import project_id as compute_project_id
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
@@ -185,11 +186,30 @@ class KhaosApp(App):
         await self.db.create_session(
             self.session_id, self.mode_manager.current_mode.value,
             principal_id=f"local-uid:{os.getuid()}",
+            # M4 batch 3.1.16A-5-1b: stamp the project identity on every
+            # TUI session row.  ``self._tui_project_id`` is computed once
+            # in ``__init__`` (or here on first use) from the TUI's
+            # project_root and reused for every session / runtime so the
+            # stamps stay in sync.
+            project_id=self._tui_project_id,
         )
         if check_needs_setup():
             return False
         await self._bootstrap_agent_runtime()
         return True
+
+    @property
+    def _tui_project_id(self) -> str:
+        """M4 batch 3.1.16A-5-1b: lazily compute and cache the project
+        identity from the TUI's ``project_root``.  Cached on the instance
+        so every session / runtime in this TUI process stamps the SAME
+        value (a mid-process cwd change would otherwise produce drift).
+        """
+        cached = getattr(self, "_cached_project_id", None)
+        if cached is None:
+            cached = compute_project_id(self.project_root)
+            self._cached_project_id = cached
+        return cached
 
     async def _bootstrap_agent_runtime(self) -> None:
         if self.db is None or self.mode_manager is None:
@@ -201,6 +221,10 @@ class KhaosApp(App):
             coding_context_builder=self._build_coding_context_builder(),
             skill_manager=self.skill_manager,
             principal_id=f"local-uid:{os.getuid()}",
+            # M4 batch 3.1.16A-5-1b: pass the cached project identity so
+            # the runtime's AgentLoop._bound_project_id matches the
+            # session row's stamp above.
+            project_id=self._tui_project_id,
         ))
         self.router = runtime.loop.router
         self.agent_loop = runtime.loop
@@ -461,6 +485,10 @@ class KhaosApp(App):
             skill_manager=self.skill_manager,
             task_manager=self.task_manager,
             session_id=self.session_id,
+            # M4 batch 3.1.16A-5-1b: pass the cached project identity so
+            # slash commands (e.g. ``/mode``) stamp the SAME project_id
+            # on session rows as the runtime.
+            project_id=self._tui_project_id,
             on_clear=lambda: self.query_one(ChatPanel).clear(),
             on_quit=self.exit,
             on_new_session=self._new_session,
@@ -474,6 +502,9 @@ class KhaosApp(App):
                 self.db.create_session(
                     self.session_id, self.mode_manager.current_mode.value,
                     principal_id=f"local-uid:{os.getuid()}",
+                    # M4 batch 3.1.16A-5-1b: stamp the cached project
+                    # identity (see ``_tui_project_id``).
+                    project_id=self._tui_project_id,
                 )
             )
         self._sync_status()

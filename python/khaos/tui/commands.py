@@ -40,6 +40,11 @@ class TuiContext:
     session_search: Any = None
     channel_registry: Any = None
     session_id: str = ""
+    # M4 batch 3.1.16A-5-1b: cached project identity, set by the TUI
+    # app from ``KhaosTUI._tui_project_id`` so slash commands that
+    # create sessions (e.g. ``/mode``) stamp the SAME project_id as
+    # the runtime.
+    project_id: str = ""
     # Callbacks the app wires up for state-changing commands.
     on_clear: Callable[[], None] | None = None
     on_quit: Callable[[], None] | None = None
@@ -190,6 +195,9 @@ async def _cmd_mode(args: list[str], ctx: TuiContext) -> CommandResult:
         await ctx.db.create_session(
             ctx.session_id, target.value,
             principal_id=f"local-uid:{os.getuid()}",
+            # M4 batch 3.1.16A-5-1b: stamp the cached project identity
+            # (set by the TUI app from ``KhaosTUI._tui_project_id``).
+            project_id=ctx.project_id,
         )
     return CommandResult(handled=True, message=f"mode: {target.value}")
 

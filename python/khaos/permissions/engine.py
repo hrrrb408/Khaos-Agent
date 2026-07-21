@@ -267,6 +267,7 @@ class PermissionEngine:
             policy_digest=self._policy_digest,
             authority_generation=authority_generation,
             source_transport=source_transport,
+            project_id=self._project_id,
         )
 
     def normalize_target(self, tool_name: str, params: dict) -> str:

@@ -157,6 +157,19 @@ class TaskManager:
     different principals hold separate managers with separate caches;
     concurrent runtimes under the same principal share the database but
     each reload their own cache via ``load``.
+
+    M4 batch 3.1.16A-5-1b (CRITICAL): ``project_id`` is also bound at
+    construction and stamped on every persist so coding tasks are
+    cryptographically tied to the project that owns them.  The RPC
+    dispatcher's drift check (``ctx.project_id !=
+    agent._bound_project_id``) is the sole authority — when the manager
+    is constructed via ``build_runtime`` the ``project_id`` comes from
+    ``RuntimeConfig.project_id`` (set by ``AgentService`` from the
+    verified RPC payload), NOT from ``compute_project_id(root)``.
+    Note: ``upsert_coding_task``'s ``ON CONFLICT`` clause DOES re-stamp
+    ``project_id`` (mirroring ``principal_id``), because a task's
+    lifecycle is tied to the runtime that owns it (a re-attach by the
+    same principal in the same project is a normal lifecycle event).
     """
 
     def __init__(
@@ -165,6 +178,7 @@ class TaskManager:
         db: Any = None,
         *,
         principal_id: str = "legacy",
+        project_id: str = "",
     ) -> None:
         self._tasks: dict[str, CodingTask] = {}
         self._max_active = max_active
@@ -188,6 +202,14 @@ class TaskManager:
         # only see its own 'legacy' tasks (which should only exist as
         # migration leftovers, quarantined to ``status='failed'``).
         self._principal_id = principal_id
+        # M4 batch 3.1.16A-5-1b: project identity binding.  Every task
+        # persisted through this manager is stamped with this project
+        # identity.  Default ``''`` ("unbound") matches the schema column
+        # default — legacy callers / tests that omit it produce
+        # ``project_id=''`` rows which are still visible (no filter is
+        # applied on this column yet) but distinguishable from rows
+        # stamped by a project-bound runtime.
+        self._project_id = project_id
 
     @property
     def principal_id(self) -> str:
@@ -489,9 +511,18 @@ class TaskManager:
             # it explicitly here so a row can never silently inherit
             # the DB default ('legacy') if a future code path constructs
             # a task with a different principal.
+            #
+            # M4 batch 3.1.16A-5-1b: stamp the project identity too.
+            # ``upsert_coding_task``'s ``ON CONFLICT`` clause re-stamps
+            # both ``principal_id`` and ``project_id`` (a task's lifecycle
+            # is tied to the runtime that owns it), so passing the
+            # manager's bound ``project_id`` here keeps the row's project
+            # identity in sync with the runtime that is currently
+            # persisting it (e.g. a re-attach after restart).
             await self._db.upsert_coding_task(
                 task.to_dict(include_internal=True),
                 principal_id=task.principal_id,
+                project_id=self._project_id,
             )
         event = {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": task.event_sequence, "type": f"task.{task.status.value}", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
         for queue in self._subscribers.get(task.id, []):

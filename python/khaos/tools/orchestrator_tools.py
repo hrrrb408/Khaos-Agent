@@ -110,6 +110,7 @@ async def spawn_subagent(
     timeout: int = 300,
     *,
     principal_id: str = "",
+    project_id: str = "",
 ) -> dict[str, Any]:
     """启动一个子代理执行指定任务。
 
@@ -162,6 +163,11 @@ async def spawn_subagent(
         parent_session_id="orchestrator",
         depth=1,
         principal_id=principal_id,
+        # M4 batch 3.1.16A-5-1b: inherit the parent runtime's bound
+        # project identity so the sub-agent's session / message / turn /
+        # audit / memory / coding_task rows are all scoped to the same
+        # (principal, project) pair.
+        project_id=project_id,
     )
     try:
         result = await _spawner.spawn(task)
@@ -195,12 +201,19 @@ async def spawn_subagent(
 async def collect_results(
     *,
     principal_id: str = "",
+    project_id: str = "",
 ) -> dict[str, Any]:
     """等待所有子任务完成并收集结果。
 
     参数：
     - principal_id: 调用方主体 ID（由 ToolInvocationBroker 注入）。
       必须非空。只收集属于该 principal 的任务。
+    - project_id: 调用方绑定的项目身份（由 ToolInvocationBroker
+      通过 ``subagent.spawn`` capability 注入）。  收集操作本身是
+      principal-scoped 的读路径，不写入任何行，因此这个参数被
+      接受但未使用——仅为保持 broker 注入契约的对称性（四个
+      orchestrator 工具共享同一 capability，broker 会对全部四个
+      注入相同的 kwargs）。
 
     返回：
         ``{"ok": True, "results": [...], "total": int, "completed": int, "failed": int}``
@@ -247,6 +260,7 @@ async def execute_plan(
     plan_json: str,
     *,
     principal_id: str = "",
+    project_id: str = "",
 ) -> dict[str, Any]:
     """执行一个任务计划（JSON 格式）。
 
@@ -255,6 +269,10 @@ async def execute_plan(
     - principal_id: 调用方主体 ID（由 ToolInvocationBroker 注入）。
       必须非空。每个计划任务的 principal_id 都设为该值，确保
       collect_results / subagent_status 能正确过滤。
+    - project_id: 调用方绑定的项目身份（由 ToolInvocationBroker
+      通过 ``subagent.spawn`` capability 注入）。每个计划任务的
+      project_id 都设为该值，确保子代理写入的每一行都归属到与
+      父运行时相同的 (principal, project) 对。
 
     返回：
         ``{"ok": True, "plan_id": "...", "results": [...], "total": int,
@@ -268,6 +286,13 @@ async def execute_plan(
 
     MEDIUM (batch 3.1.9): refuses empty ``principal_id`` instead of
         falling back to a shared pseudo-principal.
+
+    M4 batch 3.1.16A-5-1b: stamps the caller's bound ``project_id`` on
+        every task in the plan, mirroring the ``principal_id`` stamping
+        pattern.  The planner's ``from_json`` / ``create_simple_tasks``
+        leave ``project_id`` empty (dataclass default); this handler
+        fills it in after parse so the spawner / runner propagate it
+        into ``create_session`` + ``RuntimeConfig``.
     """
     if _spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
@@ -286,8 +311,12 @@ async def execute_plan(
     # MEDIUM (batch 3.1.8): stamp every task in the plan with the
     # caller's principal so collect_results / subagent_status can
     # observe them.
+    # M4 batch 3.1.16A-5-1b: also stamp the bound project_id so every
+    # row the sub-agent writes inherits the parent runtime's project
+    # identity.
     for task in plan.tasks:
         task.principal_id = principal_id
+        task.project_id = project_id
 
     try:
         tasks = await TaskPlanner.execute_plan(plan, _spawner)
@@ -310,12 +339,19 @@ async def execute_plan(
 async def subagent_status(
     *,
     principal_id: str = "",
+    project_id: str = "",
 ) -> dict[str, Any]:
     """查看当前所有子任务状态（不等待）。
 
     参数：
     - principal_id: 调用方主体 ID（由 ToolInvocationBroker 注入）。
       必须非空。只统计属于该 principal 的任务。
+    - project_id: 调用方绑定的项目身份（由 ToolInvocationBroker
+      通过 ``subagent.spawn`` capability 注入）。  状态查询是
+      principal-scoped 的读路径，不写入任何行，因此这个参数被
+      接受但未使用——仅为保持 broker 注入契约的对称性（四个
+      orchestrator 工具共享同一 capability，broker 会对全部四个
+      注入相同的 kwargs）。
 
     返回：
         ``{"ok": True, "stats": {"active": int, "total": int, "completed": int,

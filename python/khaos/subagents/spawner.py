@@ -30,6 +30,14 @@ class SubAgentTask:
     B1: ``principal_id`` binds the task to the authenticated caller so
     ``collect`` / ``status`` only return the caller's own tasks — a
     different principal cannot observe another's goal / result / error.
+
+    M4 batch 3.1.16A-5-1b (CRITICAL): ``project_id`` binds the task to
+    the project that owns it.  Sub-agents inherit the parent runtime's
+    bound project identity (a sub-agent spawned from a chat turn is
+    operating on the SAME project state root as the parent — there is
+    no legitimate cross-project sub-agent flow).  Stamped on every
+    ``create_session`` / ``insert_subagent_task`` call so rows are
+    cryptographically tied to the project that produced them.
     """
 
     id: str
@@ -46,6 +54,14 @@ class SubAgentTask:
     # the authenticated RPC payload; used by ``wait_all`` / ``stats`` /
     # ``collect_results`` to filter results.
     principal_id: str = ""
+    # M4 batch 3.1.16A-5-1b: the project identity that owns this task.
+    # Set by the service from ``ctx.project_id`` (RPC-verified) at
+    # spawn time.  Default ``''`` ("unbound") matches the schema column
+    # default — legacy callers / tests that omit it produce
+    # ``project_id=''`` rows which are still visible (no filter is
+    # applied on this column yet) but distinguishable from rows stamped
+    # by a project-bound runtime.
+    project_id: str = ""
 
 
 Runner = Callable[[SubAgentTask], Awaitable[str]]
@@ -269,9 +285,14 @@ class SubAgentSpawner:
             # M4 batch 3.1.16A-4-3: stamp the task's principal_id on the
             # parent session so list_sessions / search_sessions scope by
             # the calling principal, not the server's local-uid.
+            # M4 batch 3.1.16A-5-1b: stamp the task's project_id too
+            # (owner-preserving ON CONFLICT — once a session is bound to
+            # a (principal, project) pair a later create_session from a
+            # different project cannot re-stamp it).
             await self.db.create_session(
                 task.parent_session_id,
                 principal_id=task.principal_id or "legacy",
+                project_id=task.project_id,
             )
             await self.db.insert_subagent_task(
                 task.id,
@@ -385,9 +406,12 @@ class SubAgentSpawner:
             # M4 batch 3.1.16A-4-3: stamp the task's principal_id on the
             # parent session so list_sessions / search_sessions scope by
             # the calling principal, not the server's local-uid.
+            # M4 batch 3.1.16A-5-1b: stamp the task's project_id too
+            # (see the spawn-path call above for the rationale).
             await self.db.create_session(
                 task.parent_session_id,
                 principal_id=task.principal_id or "legacy",
+                project_id=task.project_id,
             )
             tools_json = json.dumps(task.tools or [])
             await self.db.insert_subagent_task(

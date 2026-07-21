@@ -73,6 +73,13 @@ class SubAgentService:
             parent_session_id=f"subagent:{principal_id}",
             depth=1,
             principal_id=principal_id,
+            # M4 batch 3.1.16A-5-1b: inherit the RPC-verified project
+            # identity so the subagent's create_session / AgentLoop
+            # stamps the SAME project_id as the parent runtime.  The
+            # dispatcher's drift check guarantees ctx.project_id ==
+            # agent._bound_project_id, so this is the canonical project
+            # identity for the subagent.
+            project_id=ctx.project_id,
         )
         try:
             result = await self.spawner.spawn(task)
