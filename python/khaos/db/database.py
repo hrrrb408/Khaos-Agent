@@ -1088,10 +1088,29 @@ class Database:
         )
         await conn.commit()
 
-    async def delete_memory_by_id(self, memory_id: int) -> None:
-        """Delete one memory by id."""
+    async def delete_memory_by_id(
+        self, memory_id: int, *, principal_id: str | None = None,
+    ) -> None:
+        """Delete one memory by id.
+
+        M4 batch 3.1.16A-4-2: when ``principal_id`` is provided, the
+        DELETE is scoped to that principal — preventing cross-principal
+        deletion.  ``principal_id=None`` (the default) preserves the
+        legacy unscoped behavior for internal/admin callers.
+        """
         conn = await self._require_conn()
-        await conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        if principal_id is None:
+            await conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+        else:
+            # Principal-scoped: only delete if the memory belongs to
+            # this principal OR is project-shared (principal_id='').
+            await conn.execute(
+                """
+                DELETE FROM memories
+                WHERE id = ? AND (principal_id = ? OR principal_id = '')
+                """,
+                (memory_id, principal_id),
+            )
         await conn.commit()
 
     async def list_memories(

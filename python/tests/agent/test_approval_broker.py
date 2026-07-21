@@ -10,19 +10,21 @@ from khaos.grpc_server import TaskService
 from khaos.runtime import RequestContext
 
 
-def _test_ctx() -> RequestContext:
-    """M4 batch 3.1.16A-4-1: TaskService methods now take ctx as the
-    first parameter.  This test doesn't care about multi-principal
-    scoping, so use the CLI principal — matching pre-A-4-1 behavior.
-    ``for_cli`` is Windows-safe (falls back to ``local-uid:windows``)."""
-    return RequestContext.for_cli()
+def _test_ctx(principal_id: str = "principal") -> RequestContext:
+    """M4 batch 3.1.16A-4-2: TaskService.approve now enforces that the
+    task's owner, the binding's principal, and ctx.principal_id all
+    agree.  The binding created by ``_binding`` uses ``principal_id=
+    "principal"``, so the ctx and TaskManager must be aligned to the
+    same value — otherwise the new cross-principal guard hides the
+    task as "not found"."""
+    return RequestContext.for_rpc(principal_id)
 
 
 async def test_task_approval_resolves_waiting_tool_decision():
     broker = ApprovalBroker()
     binding = _binding("call-1")
     digest = await broker.register_tool_approval(binding)
-    manager = TaskManager()
+    manager = TaskManager(principal_id="principal")
     task = await manager.create("protected tool")
     await manager.update_status(task.id, TaskStatus.BLOCKED, pending_approval={
         "tool_call_id": "call-1", "tool_name": "write_file", "target": "x",

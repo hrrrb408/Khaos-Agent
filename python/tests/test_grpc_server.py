@@ -221,14 +221,17 @@ async def test_webhook_session_and_principal_are_channel_bound(tmp_path, monkeyp
 async def test_task_service_only_approves_or_rejects_blocked_tasks():
     from khaos.coding.task_manager import TaskManager
 
-    manager = TaskManager()
+    # M4 batch 3.1.16A-4-2: TaskManager and ctx must agree on the
+    # principal — otherwise the service hides the task as "not found".
+    ctx = _test_ctx(principal_id="principal")
+    manager = TaskManager(principal_id="principal")
     service = TaskService(manager)
     task = await manager.create("approval")
-    not_blocked = await service.approve(_test_ctx(), task.id)
+    not_blocked = await service.approve(ctx, task.id)
     await manager.update_status(task.id, "blocked")
-    approved = await service.approve(_test_ctx(), task.id)
+    approved = await service.approve(ctx, task.id)
     await manager.update_status(task.id, "blocked")
-    rejected = await service.reject(_test_ctx(), task.id)
+    rejected = await service.reject(ctx, task.id)
     assert not not_blocked["ok"]
     assert not approved["ok"]
     assert not rejected["ok"]
@@ -238,7 +241,10 @@ async def test_task_approval_is_consumed_before_running_is_observable():
     from khaos.coding.task_manager import TaskManager, TaskStatus
 
     broker = ApprovalBroker()
-    manager = TaskManager()
+    # M4 batch 3.1.16A-4-2: bind the manager to the same principal as
+    # the ctx and the ApprovalBinding so all three agree.
+    ctx = _test_ctx(principal_id="principal")
+    manager = TaskManager(principal_id="principal")
     task = await manager.create("atomic approval")
     binding = ApprovalBinding(
         principal_id="principal", session_id="session", task_id=task.id,
@@ -259,7 +265,7 @@ async def test_task_approval_is_consumed_before_running_is_observable():
     service = TaskService(manager, broker)
 
     approved = await service.approve(
-        _test_ctx(), task.id, principal_id="principal", session_id="session",
+        ctx, task.id, principal_id="principal", session_id="session",
         binding_digest=binding_digest,
     )
 
@@ -276,7 +282,7 @@ async def test_task_approval_is_consumed_before_running_is_observable():
     record = broker._tool_approvals[binding.tool_call_id]
     assert record.used and record.dispatched
     replay = await service.approve(
-        _test_ctx(), task.id, principal_id="principal", session_id="session",
+        ctx, task.id, principal_id="principal", session_id="session",
         binding_digest=binding_digest,
     )
     assert replay["ok"] is False
@@ -286,7 +292,8 @@ async def test_stale_task_approval_never_publishes_running_state():
     from khaos.coding.task_manager import TaskManager, TaskStatus
 
     broker = ApprovalBroker()
-    manager = TaskManager()
+    ctx = _test_ctx(principal_id="principal")
+    manager = TaskManager(principal_id="principal")
     task = await manager.create("stale approval")
     await manager.update_status(
         task.id, TaskStatus.BLOCKED,
@@ -296,7 +303,7 @@ async def test_stale_task_approval_never_publishes_running_state():
         },
     )
     response = await TaskService(manager, broker).approve(
-        _test_ctx(), task.id, principal_id="principal", session_id="session",
+        ctx, task.id, principal_id="principal", session_id="session",
         binding_digest="digest",
     )
 
@@ -954,7 +961,7 @@ async def test_memory_service_crud_search(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    service = MemoryService(MemoryStore(db))
+    service = MemoryService(db)
 
     stored = await service.set_memory(_test_ctx(), "global", "user", "Ruibang likes tests")
     memory = await service.get_memory(_test_ctx(), "global", "user")
@@ -1232,14 +1239,17 @@ async def test_audit_service_query_roundtrip(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    logger = AuditLogger(db)
+    # M4 batch 3.1.16A-4-2: AuditService.query now scopes by
+    # ctx.principal_id.  Construct the logger with the same principal
+    # so the logged event is visible to the query.
+    ctx = _test_ctx()
+    logger = AuditLogger(db, principal_id=ctx.principal_id)
     service = AuditService(logger)
 
     await logger.log("write_file", "/tmp/x", "success", {"size": 1})
-    entries = await service.query(_test_ctx(), limit=10)
+    entries = await service.query(ctx, limit=10)
 
     assert len(entries) == 1
     assert entries[0]["action"] == "write_file"
     assert entries[0]["result"] == "success"
     await db.close()
-    GatewayRPCAuthenticator,
