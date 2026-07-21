@@ -1871,6 +1871,20 @@ async def serve_json_lines(
                     return
                 method = request.get("method")
                 payload = request.get("payload", {})
+                # C-1-4: Bootstrap.GetPolicyDigest — Gateway startup
+                # handshake.  Returns the server-bound policy_digest so
+                # the Gateway can stamp it on all subsequent RPC payloads
+                # for drift detection.  This must run BEFORE ctx creation
+                # and BEFORE any drift detection — the bootstrap call
+                # itself carries no policy_digest claim (it's fetching
+                # the digest).  Python is the sole authority for
+                # policy_digest; Go never computes it independently.
+                if method == "Bootstrap.GetPolicyDigest":
+                    writer.write((json.dumps({
+                        "policy_digest": agent._effective_policy.digest,
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
                 # M4 batch 3.1.16A-4-1: build an immutable RequestContext
                 # from the transport-authenticated principal.  This is
                 # the SOLE authority for principal identity — payload
@@ -1940,6 +1954,44 @@ async def serve_json_lines(
                 # verified value lives on ``ctx.project_id`` (always
                 # equal to ``agent._bound_project_id`` here).
                 payload.pop("project_id", None)
+                # M4 batch 3.1.16C-1-4 (CRITICAL): policy identity drift
+                # detection — symmetric to project_id drift detection
+                # above.  The Go side may claim a ``policy_digest`` in
+                # the payload (Gateway-asserted, sourced from the
+                # Bootstrap.GetPolicyDigest handshake at startup).
+                # Compare it against ``agent._effective_policy.digest``
+                # (the server-computed digest of this AgentService's
+                # compiled EffectiveSecurityPolicy).  A mismatch means
+                # the Gateway booted against a Python server with policy
+                # A, then routed a request to a Python server with
+                # policy B — either a restart with a different
+                # khaos_policy.yaml, or a misconfigured multi-server
+                # deployment.  Fail-closed: reject before any service
+                # method runs.  An empty claim (Go side didn't send
+                # ``policy_digest``, e.g. older Gateway or bootstrap
+                # handshake failed) is accepted — backward compat — and
+                # ``ctx.policy_digest`` remains the server-bound value.
+                claimed_policy_digest = payload.get("policy_digest", "")
+                if (
+                    claimed_policy_digest
+                    and claimed_policy_digest != agent._effective_policy.digest
+                ):
+                    writer.write((json.dumps({
+                        "error": "policy_drift",
+                        "message": (
+                            f"payload policy_digest {claimed_policy_digest!r} "
+                            f"does not match server-bound policy_digest "
+                            f"{agent._effective_policy.digest!r}"
+                        ),
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
+                # Pop ``policy_digest`` from the payload so downstream
+                # ``ChatRequest(**payload)`` / ``ConfirmRequest(**payload)``
+                # etc. don't receive an unexpected keyword.  The
+                # verified value lives on ``ctx.policy_digest`` (always
+                # equal to ``agent._effective_policy.digest`` here).
+                payload.pop("policy_digest", None)
                 if method == "AgentService.Chat":
                     try:
                         async for event in agent.chat(ctx, ChatRequest(**payload)):

@@ -124,10 +124,22 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 // to a Python server booted under project B).  Empty means the
 // Gateway was not configured with a project root — Python accepts
 // the empty claim for backward compatibility.
+//
+// C-1-4: ``PolicyDigest`` is the Gateway-level policy identity
+// (sha256 of the canonical EffectiveSecurityPolicy).  It is fetched
+// once at startup via the Bootstrap.GetPolicyDigest RPC handshake —
+// Python is the sole authority for policy_digest, Go never computes
+// it independently.  When non-empty it is injected into every RPC
+// payload so Python's dispatcher can detect policy drift (Gateway
+// booted against a Python server with policy A, then routed to a
+// Python server with policy B).  Empty means the bootstrap handshake
+// failed or was skipped — Python accepts the empty claim for backward
+// compatibility with older Gateways.
 type PythonClient struct {
-	Address    string
-	Capability string
-	ProjectID  string
+	Address      string
+	Capability   string
+	ProjectID    string
+	PolicyDigest string
 }
 
 // writeRequest serializes and signs one JSON-line RPC request.
@@ -152,6 +164,16 @@ type PythonClient struct {
 // accepted by Python (backward compat with older Gateways).  The
 // injection happens before ``canonicalJSON`` so ``payload_digest``
 // covers the injected value — Python's digest check passes.
+//
+// C-1-4: ``c.PolicyDigest`` (Gateway-level, not per-request) is
+// injected into the payload alongside ``project_id``, before digest
+// computation.  Python's dispatcher compares
+// ``payload["policy_digest"]`` against
+// ``agent._effective_policy.digest``; a mismatch is rejected as
+// ``policy_drift`` (fail-closed).  An empty ``PolicyDigest`` is
+// accepted by Python (backward compat with older Gateways or when
+// the bootstrap handshake failed).  The injection happens before
+// ``canonicalJSON`` so ``payload_digest`` covers the injected value.
 func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, principalID string) error {
 	if len(c.Capability) < 32 {
 		return fmt.Errorf("Python AgentService capability is missing or too short")
@@ -173,6 +195,18 @@ func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, pr
 	if c.ProjectID != "" {
 		if m, ok := normalized.(map[string]any); ok {
 			m["project_id"] = c.ProjectID
+		}
+	}
+	// C-1-4: inject policy_digest for drift detection — symmetric
+	// to project_id injection above.  policy_digest is Gateway-level
+	// (all requests share the same EffectiveSecurityPolicy), sourced
+	// from the Bootstrap.GetPolicyDigest handshake at startup.  Only
+	// inject when the payload is a map; non-map payloads skip
+	// injection (Python treats missing policy_digest as an empty
+	// claim, which is accepted).
+	if c.PolicyDigest != "" {
+		if m, ok := normalized.(map[string]any); ok {
+			m["policy_digest"] = c.PolicyDigest
 		}
 	}
 	canonical, err := canonicalJSON(normalized)
@@ -391,6 +425,23 @@ func (c PythonClient) Status(ctx context.Context, principalID string) (map[strin
 	return c.callMap(ctx, "SubAgentService.Status", map[string]any{
 		"principal_id": principalID,
 	}, principalID)
+}
+
+// BootstrapPolicyDigest fetches the server-bound policy_digest via the
+// Bootstrap.GetPolicyDigest RPC handshake.  Called once at Gateway
+// startup to enable policy drift detection (C-1-4) on all subsequent
+// RPCs.  Python is the sole authority for policy_digest — Go never
+// computes it independently.  Uses an empty principal because this is
+// a Gateway-level bootstrap call, not a user request.  The returned
+// digest is stamped on PythonClient.PolicyDigest and injected into
+// every subsequent writeRequest payload.
+func (c PythonClient) BootstrapPolicyDigest(ctx context.Context) (string, error) {
+	response, err := c.callMap(ctx, "Bootstrap.GetPolicyDigest", map[string]any{}, "")
+	if err != nil {
+		return "", err
+	}
+	digest, _ := response["policy_digest"].(string)
+	return digest, nil
 }
 
 func (c PythonClient) callMap(ctx context.Context, method string, payload map[string]any, principalID string) (map[string]any, error) {
