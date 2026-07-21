@@ -205,6 +205,51 @@ def build_command_parser() -> argparse.ArgumentParser:
     config_group.add_argument("--set", type=str, help="Set a config value (KEY=VALUE)")
 
     subparsers.add_parser("version", help="Show version")
+
+    migrate_parser = subparsers.add_parser(
+        "migrate",
+        help="Trusted state migration tools (A-5-2)",
+        description=(
+            "Backfill project_id on legacy rows left by A-5-1a/A-5-1b. "
+            "Legacy rows have project_id='' (the fail-closed default); "
+            "this tool stamps the state DB's owning project_id on every "
+            "empty row so they participate in cross-project forensic "
+            "queries and future project-scoped filters."
+        ),
+    )
+    migrate_sub = migrate_parser.add_subparsers(dest="migrate_command")
+
+    pi_parser = migrate_sub.add_parser(
+        "project-identity",
+        help="Backfill project_id on legacy rows (A-5-2)",
+    )
+    pi_parser.add_argument(
+        "--project-root",
+        default=None,
+        help="Project root to compute project_id from (default: CWD).",
+    )
+    pi_parser.add_argument(
+        "--db",
+        default=None,
+        help="Override state DB path (default: ~/.khaos/state/<project-id>/state.db).",
+    )
+    pi_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Preview would-update counts without writing.",
+    )
+    pi_parser.add_argument(
+        "--yes",
+        action="store_true",
+        help="Skip the interactive confirmation prompt.",
+    )
+    pi_parser.add_argument(
+        "--table",
+        action="append",
+        dest="tables",
+        help="Backfill only this table (repeatable). Default: all 8 A-5-1a tables.",
+    )
+
     return parser
 
 
@@ -369,6 +414,140 @@ def cmd_version() -> None:
     print("Python + Go + Rust")
 
 
+def cmd_migrate(args: argparse.Namespace) -> int:
+    """Trusted state migration entrypoint (A-5-2).
+
+    Dispatches to ``migrate project-identity`` — the only subcommand
+    today.  Returns 0 on success, 2 on argument error, 3 on state-root
+    violation.
+
+    Flow:
+      1. Resolve state DB path (state-root enforcement).
+      2. Open DB, run migrations, close.
+      3. Preview pass (dry-run) → per-table legacy-row counts.
+      4. Print preview.
+      5. If --dry-run: stop here.
+      6. If not --yes: prompt for confirmation.
+      7. Write pass → UPDATE each table, print per-table updated counts.
+    """
+    if getattr(args, "migrate_command", None) != "project-identity":
+        print(
+            "usage: khaos migrate project-identity [--project-root PATH] "
+            "[--db PATH] [--dry-run] [--yes] [--table NAME]",
+            file=sys.stderr,
+        )
+        return 2
+
+    from khaos.db.migrations_cli import (
+        MigrationError,
+        resolve_backfill_db_path,
+        run_backfill,
+    )
+    from khaos.db.state_root import StateRootError
+
+    project_root = Path(args.project_root) if args.project_root else Path.cwd()
+
+    try:
+        db_path = resolve_backfill_db_path(project_root, args.db)
+    except StateRootError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 3
+
+    print(f"Project root: {project_root.resolve()}")
+    print(f"State DB:     {db_path}")
+    if args.tables:
+        print(f"Tables:       {', '.join(args.tables)}")
+    else:
+        print("Tables:       all 8 A-5-1a tables")
+    print()
+
+    async def _open_db():
+        from khaos.db import Database
+        db = Database(db_path)
+        await db.connect()
+        await db.run_migrations()
+        return db
+
+    async def _preview():
+        db = await _open_db()
+        try:
+            return await run_backfill(
+                db, project_root, tables=args.tables, dry_run=True,
+            )
+        finally:
+            await db.close()
+
+    async def _write():
+        db = await _open_db()
+        try:
+            return await run_backfill(
+                db, project_root, tables=args.tables, dry_run=False,
+            )
+        finally:
+            await db.close()
+
+    # Step 1: preview (dry-run).
+    try:
+        preview = asyncio.run(_preview())
+    except MigrationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print(f"Project ID:   {preview.project_id}")
+    print(f"Mode:         {'dry-run (no writes)' if args.dry_run else 'preview then write'}")
+    print()
+    print(f"{'Table':<32} {'Legacy rows':>12}")
+    print("-" * 46)
+    for report in preview.reports:
+        print(f"{report.table:<32} {report.rows_updated:>12}")
+    print("-" * 46)
+    print(f"{'TOTAL':<32} {preview.total_rows:>12}")
+    print()
+
+    if preview.total_rows == 0:
+        print("No legacy rows to backfill — database is already at A-5-1b parity.")
+        return 0
+
+    if args.dry_run:
+        print(f"Dry run complete — {preview.total_rows} rows would be updated.")
+        return 0
+
+    # Step 2: confirm (unless --yes).
+    if not args.yes:
+        if sys.stdin.isatty():
+            answer = input(
+                f"Proceed with backfilling {preview.total_rows} rows? [y/N] "
+            ).strip().lower()
+            if answer not in {"y", "yes"}:
+                print("Aborted — no rows written.")
+                return 0
+        else:
+            print(
+                "Refusing to write in non-interactive mode without --yes. "
+                "Re-run with --yes to proceed.",
+                file=sys.stderr,
+            )
+            return 2
+
+    # Step 3: write.
+    try:
+        result = asyncio.run(_write())
+    except MigrationError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    print()
+    print(f"{'Table':<32} {'Updated':>10}")
+    print("-" * 44)
+    for report in result.reports:
+        print(f"{report.table:<32} {report.rows_updated:>10}")
+    print("-" * 44)
+    print(f"{'TOTAL':<32} {result.total_rows:>10}")
+    print()
+    print(f"Backfill complete — {result.total_rows} rows stamped with project_id={result.project_id}.")
+    return 0
+
+
 def _project_root() -> Path:
     """Return the repository root from the installed source layout."""
     return Path(__file__).resolve().parents[3]
@@ -468,7 +647,7 @@ def main() -> None:
       2. Legacy flags such as ``--message`` for scriptable SSE output.
     """
     argv = sys.argv[1:]
-    command_names = {"start", "chat", "test", "config", "version"}
+    command_names = {"start", "chat", "test", "config", "version", "migrate"}
     if not argv:
         parser = build_command_parser()
         parser.print_help()
@@ -488,6 +667,8 @@ def main() -> None:
             cmd_config(args)
         elif args.command == "version":
             cmd_version()
+        elif args.command == "migrate":
+            raise SystemExit(cmd_migrate(args))
         return
 
     parser = build_parser()
