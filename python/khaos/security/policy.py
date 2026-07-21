@@ -93,6 +93,18 @@ class SandboxPolicy:
     audit_enabled: bool = True
     audit_log_path: str | None = None
 
+    # M4 batch 3.1.16A-4-4-3: channel admin principals — the set of
+    # principals allowed to mutate (enable / disable) registered
+    # communication channels via the channel tools.  ``None`` means
+    # "this layer does not configure an admin list" (the effective
+    # policy compiler uses OR semantics across layers — user ∪ project);
+    # an empty list means "this layer explicitly denies all admins"
+    # (still contributes nothing to the union, but is distinct from
+    # "unset" for digest / audit purposes).  Default ``None`` so the
+    # *effective* policy defaults to an empty frozenset — fail-closed
+    # for channel mutations until an admin is explicitly declared.
+    channel_admins: list[str] | None = None
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SandboxPolicy":
         """从字典构建策略。
@@ -114,6 +126,7 @@ class SandboxPolicy:
         commands = data.get("commands", {}) or {}
         secrets = data.get("secrets", {}) or {}
         audit = data.get("audit", {}) or {}
+        channels = data.get("channels", {}) or {}
 
         return cls(
             mode=sandbox.get("mode", "workspace-write"),
@@ -142,6 +155,11 @@ class SandboxPolicy:
             secrets_block_env_dump=secrets.get("block_env_dump", True),
             audit_enabled=audit.get("enabled", True),
             audit_log_path=audit.get("log_path"),
+            # M4 batch 3.1.16A-4-4-3: ``channels.admin_principals`` — None
+            # when the key is absent (layer does not configure an admin
+            # list), the list when present (including an explicitly empty
+            # list = this layer contributes no admins).
+            channel_admins=channels.get("admin_principals"),
         )
 
 
@@ -195,7 +213,7 @@ def load_policy(path: Path | None = None) -> SandboxPolicy:
 
 
 # Valid keys at each nesting level.  Used to fail closed on typos.
-_ALLOWED_TOP_LEVEL = frozenset({"sandbox", "commands", "secrets", "audit"})
+_ALLOWED_TOP_LEVEL = frozenset({"sandbox", "commands", "secrets", "audit", "channels"})
 _ALLOWED_SANDBOX_KEYS = frozenset({
     "mode", "network", "allowed_domains", "blocked_domains",
     "allowed_paths", "denied_paths",
@@ -205,6 +223,10 @@ _ALLOWED_SECRETS_KEYS = frozenset({
     "scan_on_output", "scan_before_tool_result", "block_env_dump",
 })
 _ALLOWED_AUDIT_KEYS = frozenset({"enabled", "log_path"})
+# M4 batch 3.1.16A-4-4-3: ``channels`` section currently carries only the
+# admin principal allowlist.  Extend here when new channel-scoped fields
+# are added.
+_ALLOWED_CHANNELS_KEYS = frozenset({"admin_principals"})
 
 
 def _reject_unknown_keys(data: dict[str, Any]) -> None:
@@ -214,6 +236,7 @@ def _reject_unknown_keys(data: dict[str, Any]) -> None:
     _check_section(data.get("commands") or {}, _ALLOWED_COMMANDS_KEYS, "commands")
     _check_section(data.get("secrets") or {}, _ALLOWED_SECRETS_KEYS, "secrets")
     _check_section(data.get("audit") or {}, _ALLOWED_AUDIT_KEYS, "audit")
+    _check_section(data.get("channels") or {}, _ALLOWED_CHANNELS_KEYS, "channels")
 
 
 def _check_section(mapping: object, allowed: frozenset[str], where: str) -> None:
