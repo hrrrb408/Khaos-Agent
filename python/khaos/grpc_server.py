@@ -75,7 +75,6 @@ from khaos.security.middleware import SecurityMiddleware
 from khaos.skills import SkillGenerator, SkillManager
 from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
 from khaos.tools import create_runtime_registry
-from khaos.tools.channel_tools import set_channel_registry
 from khaos.tools.cron_tools import set_cron_engine
 from khaos.tools.scheduler import ToolScheduler
 
@@ -814,7 +813,15 @@ class AgentService:
             consumer=self.db.consume_webhook_event
         )
         self._verified_webhook_limiter = WebhookRateLimiter()
-        set_channel_registry(self.channel_registry)
+        # M4 batch 3.1.16A-4-4-3: the module-global ``set_channel_registry``
+        # call has been removed.  The four channel tools now receive
+        # ``channel_registry`` + ``principal_id`` (+ ``channel_admins`` for
+        # mutations) per-call via the ``channel.read`` / ``channel.manage``
+        # broker injection from ``tool_context`` (assembled by
+        # ``AgentLoop`` from ``self.channel_registry`` and
+        # ``self._effective_policy.channel_admins``).  See
+        # ``channel_tools.py`` docstring for the cross-principal mutation
+        # risk that the holder posed.
         # B1: the OfficeMutationAuthority is a server-lifecycle object shared
         # across every chat / webhook / cron turn.  Reusing one instance keeps
         # the aggregate storage baseline stable across turns (closing the
@@ -1275,6 +1282,14 @@ class AgentService:
             office_authority=self._office_authority,
             principal_id=ctx.principal_id,
             session_id=session_id,
+            # M4 batch 3.1.16A-4-4-3: inject the server-lifecycle
+            # ChannelRegistry + the effective policy's compiled
+            # ``channel_admins`` allowlist so the four channel tools
+            # receive them via the ``channel.read`` / ``channel.manage``
+            # broker injection (no module-global holder, no
+            # cross-principal mutation).
+            channel_registry=self.channel_registry,
+            channel_admins=self._effective_policy.channel_admins,
         ))
 
     async def _wait_for_confirmation(self, request: dict) -> dict:

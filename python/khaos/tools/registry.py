@@ -296,6 +296,30 @@ class ToolInvocationBroker:
         if any(capability.name == "history.read" for capability in capabilities):
             handler_params["principal_id"] = context.get("principal_id", "")
             handler_params["db"] = context.get("db")
+        # M4 batch 3.1.16A-4-4-3 (CRITICAL): the four channel tools
+        # declare ``channel.read`` (list / health) or ``channel.manage``
+        # (enable / disable) so the broker injects ``channel_registry``
+        # + ``principal_id`` from ``tool_context``.  ``channel.manage``
+        # additionally receives ``channel_admins`` — the admin principal
+        # allowlist compiled into the immutable
+        # :class:`EffectiveSecurityPolicy` from
+        # ``khaos_policy.yaml``'s ``channels.admin_principals`` field
+        # (user ∪ project, OR semantics).  Without this injection the
+        # handlers receive ``principal_id=""`` / ``channel_registry=None``
+        # / ``channel_admins=None`` and fail-closed returns
+        # ``unavailable`` / ``forbidden`` for every call.  Worse, before
+        # A-4-4-3 the handlers read a module-global ``_registry`` holder
+        # installed at server startup — every principal sharing the
+        # process could enable/disable any channel, bypassing the gRPC
+        # RPC path's ``ctx.principal_id`` authorization.
+        if any(
+            capability.name in {"channel.read", "channel.manage"}
+            for capability in capabilities
+        ):
+            handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["channel_registry"] = context.get("channel_registry")
+        if any(capability.name == "channel.manage" for capability in capabilities):
+            handler_params["channel_admins"] = context.get("channel_admins", frozenset())
         if mode == "coding" and name in _WORKSPACE_FILE_TOOLS and any(
             capability.name in {"filesystem.read", "filesystem.write"}
             for capability in capabilities
@@ -453,7 +477,45 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     from khaos.tools.channel_tools import CHANNEL_TOOLS
     from khaos.tools.github_tools import GITHUB_TOOL_SPECS
 
-    for spec in [*CHANNEL_TOOLS, *GITHUB_TOOL_SPECS]:
+    # M4 batch 3.1.16A-4-4-3: register channel tools separately so they
+    # carry the ``channel.read`` / ``channel.manage`` capabilities.  The
+    # original loop registered them with no capability (``capabilities
+    # = ()``), so the broker treated them as no-capability tools and the
+    # handlers fell open to the module-global ``_registry`` holder —
+    # every principal sharing the process could enable/disable any
+    # channel.  With declared capabilities the broker injects
+    # ``channel_registry`` + ``principal_id`` (+ ``channel_admins`` for
+    # mutations) from ``tool_context`` and the handlers fail-closed on
+    # missing principal / missing admin grant.
+    _CHANNEL_READ_CAP_LOCAL = ToolCapability(
+        "channel.read",
+        frozenset({"all"}),
+        frozenset({"app-data"}),
+    )
+    _CHANNEL_MANAGE_CAP_LOCAL = ToolCapability(
+        "channel.manage",
+        frozenset({"all"}),
+        frozenset({"app-data"}),
+    )
+    _CHANNEL_CAPS = {
+        "channel_list": _CHANNEL_READ_CAP_LOCAL,
+        "channel_health": _CHANNEL_READ_CAP_LOCAL,
+        "channel_enable": _CHANNEL_MANAGE_CAP_LOCAL,
+        "channel_disable": _CHANNEL_MANAGE_CAP_LOCAL,
+    }
+    for spec in CHANNEL_TOOLS:
+        registry.register(
+            ToolDefinition(
+                name=spec["name"],
+                description=spec["description"],
+                parameters=spec["parameters"],
+                modes=["all"],
+                permission_level="write" if spec["name"] in {"channel_enable", "channel_disable"} else "read",
+                parallel=spec["name"] in {"channel_list", "channel_health"},
+                capabilities=(_CHANNEL_CAPS[spec["name"]],),
+            )
+        )
+    for spec in GITHUB_TOOL_SPECS:
         classification = spec.get("classification")
         capabilities: tuple[ToolCapability, ...] = ()
         modes = ["all"]
@@ -471,8 +533,8 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 description=spec["description"],
                 parameters=spec["parameters"],
                 modes=modes,
-                permission_level="write" if spec["name"] in {"channel_enable", "channel_disable", "github_create_pr", "github_comment_issue", "github_request_review"} else "read",
-                parallel=spec["name"] in {"channel_list", "channel_health", "github_read_issue"},
+                permission_level="write" if spec["name"] in {"github_create_pr", "github_comment_issue", "github_request_review"} else "read",
+                parallel=spec["name"] in {"github_read_issue"},
                 capabilities=capabilities,
             )
         )
@@ -1758,6 +1820,11 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         frozenset({"office", "coding"}),
         frozenset({"app-data"}),
     )
+    # M4 batch 3.1.16A-4-4-3: the four channel tools' capabilities
+    # (``channel.read`` / ``channel.manage``) are declared inside
+    # ``register_builtin_tools`` (they need to be set at registration
+    # time so the broker gate fires).  Nothing to do here — handler
+    # binding happens below.
     for spec in CRON_TOOL_SPECS:
         registry.register(
             ToolDefinition(

@@ -84,6 +84,17 @@ class RuntimeConfig:
     # declared subset.  ``None`` (the default) means "no pruning" — the
     # full runtime registry is installed (the main AgentLoop path).
     tool_allowlist: list[str] | None = None
+    # M4 batch 3.1.16A-4-4-3: the server-lifecycle ChannelRegistry and
+    # the admin principal allowlist compiled into the immutable
+    # EffectiveSecurityPolicy.  Populated by ``AgentService._build_runtime``
+    # (production) so the four channel tools receive them via the
+    # ``channel.read`` / ``channel.manage`` broker injection.  ``None``
+    # (the default for ad-hoc / test runtimes) means the channel tools
+    # fail-closed — ``channel_list`` / ``channel_health`` return
+    # ``unavailable``, ``channel_enable`` / ``channel_disable`` return
+    # ``forbidden``.
+    channel_registry: Any = None
+    channel_admins: frozenset[str] = field(default_factory=frozenset)
 
 
 @dataclass
@@ -633,6 +644,12 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # NOT close a concurrent runtime's page).
         runtime_id=cfg.runtime_id,
         session_id=cfg.session_id,
+        # M4 batch 3.1.16A-4-4-3: carry the channel registry + admin
+        # allowlist into the AgentLoop so ``tool_context`` exposes them
+        # to the broker — the four channel tools read them via the
+        # ``channel.read`` / ``channel.manage`` capability injection.
+        channel_registry=cfg.channel_registry,
+        channel_admins=cfg.channel_admins,
     )
     return RuntimeResult(
         loop=loop,

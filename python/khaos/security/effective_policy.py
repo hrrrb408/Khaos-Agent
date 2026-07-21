@@ -127,6 +127,15 @@ class EffectiveSecurityPolicy:
     audit_log_path: str | None = None
     secrets_scan_before_tool_result: bool = True
     secrets_block_env_dump: bool = True
+    # M4 batch 3.1.16A-4-4-3: principals permitted to mutate (enable /
+    # disable) registered communication channels via the channel tools.
+    # Compiled with OR semantics: ``user.channel_admins ∪
+    # project.channel_admins`` (admin is an authorization grant, not a
+    # restriction, so a stricter layer cannot revoke a more permissive
+    # layer's grant — same shape as ``audit_enabled``).  Defaults to an
+    # empty frozenset so channel mutations are fail-closed until an
+    # admin is explicitly declared in either layer.
+    channel_admins: frozenset[str] = field(default_factory=frozenset)
     digest: str = ""
 
     def __post_init__(self) -> None:
@@ -289,6 +298,19 @@ def compile_effective_policy(
         # to an arbitrary host path.
         audit_log_path = None
 
+    # M4 batch 3.1.16A-4-4-3: ``channel_admins`` uses OR (union) semantics
+    # — admin is an authorization grant, not a restriction, so a stricter
+    # layer cannot revoke a more permissive layer's grant.  This is the
+    # same shape as ``audit_enabled``: if user OR project declares an
+    # admin, the admin is permitted.  ``None`` on either layer means
+    # "this layer contributes no admins"; an empty list likewise
+    # contributes nothing.  The default effective value is therefore an
+    # empty frozenset — channel mutations are fail-closed until an admin
+    # is explicitly declared in either layer.
+    channel_admins: frozenset[str] = _frozen(project_policy.channel_admins)
+    if user is not None:
+        channel_admins = channel_admins | _frozen(user.channel_admins)
+
     return EffectiveSecurityPolicy(
         mode=mode,
         network_enabled=network_enabled,
@@ -304,6 +326,7 @@ def compile_effective_policy(
         audit_log_path=audit_log_path,
         secrets_scan_before_tool_result=secrets_scan_before_tool_result,
         secrets_block_env_dump=secrets_block_env_dump,
+        channel_admins=channel_admins,
     )
 
 
@@ -372,7 +395,7 @@ def load_effective_policy(
 # Internal helpers
 # --------------------------------------------------------------------------- #
 
-_ALLOWED_TOP_LEVEL = frozenset({"sandbox", "commands", "secrets", "audit"})
+_ALLOWED_TOP_LEVEL = frozenset({"sandbox", "commands", "secrets", "audit", "channels"})
 _ALLOWED_SANDBOX_KEYS = frozenset({
     "mode", "network", "allowed_domains", "blocked_domains",
     "allowed_paths", "denied_paths",
@@ -382,6 +405,10 @@ _ALLOWED_SECRETS_KEYS = frozenset({
     "scan_on_output", "scan_before_tool_result", "block_env_dump",
 })
 _ALLOWED_AUDIT_KEYS = frozenset({"enabled", "log_path"})
+# M4 batch 3.1.16A-4-4-3: ``channels`` section currently carries only the
+# admin principal allowlist.  Extend here when new channel-scoped fields
+# are added.
+_ALLOWED_CHANNELS_KEYS = frozenset({"admin_principals"})
 
 
 def validate_policy_dict(data: object, *, source: str = "policy") -> None:
@@ -446,6 +473,21 @@ def validate_policy_dict(data: object, *, source: str = "policy") -> None:
     _check_keys(audit, _ALLOWED_AUDIT_KEYS, f"{source}.audit")
     _check_bool(audit.get("enabled"), "audit.enabled", source)
     _check_str(audit.get("log_path"), "audit.log_path", source)
+
+    # M4 batch 3.1.16A-4-4-3: ``channels`` section carries the admin
+    # principal allowlist for channel mutations.  ``admin_principals``
+    # must be a list of strings (each a principal identifier).  An
+    # absent key is fine (the layer contributes no admins); an
+    # explicitly empty list means "this layer denies all admins".
+    channels = data.get("channels", {})
+    if channels is None:
+        channels = {}
+    _check_keys(channels, _ALLOWED_CHANNELS_KEYS, f"{source}.channels")
+    _check_list_of_str(
+        channels.get("admin_principals"),
+        "channels.admin_principals",
+        source,
+    )
 
 
 def _check_keys(mapping: object, allowed: frozenset[str], where: str) -> None:
@@ -618,6 +660,10 @@ def _canonical_dict(policy: EffectiveSecurityPolicy) -> dict:
         "audit_log_path": policy.audit_log_path,
         "secrets_scan_before_tool_result": policy.secrets_scan_before_tool_result,
         "secrets_block_env_dump": policy.secrets_block_env_dump,
+        # M4 batch 3.1.16A-4-4-3: include channel_admins so an approval
+        # made under one admin set is invalidated if the policy later
+        # adds/removes admins.
+        "channel_admins": sorted(policy.channel_admins),
     }
 
 

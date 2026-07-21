@@ -105,6 +105,15 @@ class AgentLoop:
         # the broker can inject them into browser tools.
         runtime_id: str = "",
         session_id: str = "",
+        # M4 batch 3.1.16A-4-4-3: the server-lifecycle ChannelRegistry and
+        # the admin principal allowlist compiled into the immutable
+        # EffectiveSecurityPolicy.  Propagated into ``tool_context`` so the
+        # four channel tools (channel_list / channel_health /
+        # channel_enable / channel_disable) receive them via the
+        # ``channel.read`` / ``channel.manage`` broker injection.  Without
+        # these the handlers fail-closed (``unavailable`` / ``forbidden``).
+        channel_registry=None,
+        channel_admins: "frozenset[str] | None" = None,
     ):
         self.config = config
         self.mode_manager = mode_manager
@@ -151,6 +160,19 @@ class AgentLoop:
         # same UID get independent BrowserContexts.
         self.runtime_id = runtime_id
         self.session_id = session_id
+        # M4 batch 3.1.16A-4-4-3: channel registry + admin allowlist,
+        # injected by ``build_runtime`` from RuntimeConfig (which in turn
+        # is populated by ``AgentService`` from the server-lifecycle
+        # ChannelRegistry and the effective policy's compiled
+        # ``channel_admins`` frozenset).  ``getattr(self, "channel_registry",
+        # None)`` / ``getattr(self, "channel_admins", frozenset())`` in
+        # the ``tool_context`` assembly below tolerate older callers that
+        # do not pass these kwargs (e.g. ad-hoc test loops) — they get
+        # ``None`` / empty frozenset and the handlers fail-closed.
+        self.channel_registry = channel_registry
+        self.channel_admins = (
+            channel_admins if channel_admins is not None else frozenset()
+        )
         self._active_context_facts: list[Message] = []
         if self.execution_service is None:
             from khaos.coding.execution import ExecutionService, UnsupportedBackend
@@ -420,6 +442,27 @@ class AgentLoop:
                         # via the ``history.read`` broker injection —
                         # no module-global holder, no cross-principal leak.
                         "db": self.db,
+                        # M4 batch 3.1.16A-4-4-3: inject ``channel_registry``
+                        # + ``channel_admins`` so the four channel tools
+                        # (channel_list / channel_health / channel_enable /
+                        # channel_disable) receive them via the
+                        # ``channel.read`` / ``channel.manage`` broker
+                        # injection.  ``channel_registry`` is the server-
+                        # lifecycle ChannelRegistry (previously installed
+                        # into a module-global holder by
+                        # ``set_channel_registry``); ``channel_admins`` is
+                        # the admin principal allowlist compiled into the
+                        # immutable EffectiveSecurityPolicy from
+                        # ``khaos_policy.yaml``'s ``channels.admin_principals``
+                        # field (user ∪ project, OR semantics).  Without
+                        # this injection the handlers fall open to the
+                        # holder and any principal can mutate channels.
+                        "channel_registry": getattr(
+                            self, "channel_registry", None
+                        ),
+                        "channel_admins": getattr(
+                            self, "channel_admins", frozenset()
+                        ),
                     },
                 }
                 if "tool_context" not in inspect.signature(self.tool_scheduler.stream_batch).parameters:
