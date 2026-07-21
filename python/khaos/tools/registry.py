@@ -284,6 +284,18 @@ class ToolInvocationBroker:
             handler_params["principal_id"] = context.get("principal_id", "")
             handler_params["permission_engine"] = context.get("permission_engine")
             handler_params["audit_logger"] = context.get("audit_logger")
+        # M4 batch 3.1.16A-4-4-2: the three history tools declare
+        # ``history.read`` so the broker injects the caller's
+        # ``principal_id`` + ``db`` from ``tool_context``.  The handler
+        # constructs a fresh ``SessionSearch(db, principal_id=principal_id)``
+        # per call — ``SessionSearch.__init__`` is just two attribute
+        # stores, so this is cheaper than maintaining a holder.  No
+        # module-global state, no cross-principal leak, no "unavailable"
+        # dead code (the old ``set_session_search`` was never called
+        # from production).
+        if any(capability.name == "history.read" for capability in capabilities):
+            handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["db"] = context.get("db")
         if mode == "coding" and name in _WORKSPACE_FILE_TOOLS and any(
             capability.name in {"filesystem.read", "filesystem.write"}
             for capability in capabilities
@@ -1736,6 +1748,16 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
         frozenset({"office", "coding"}),
         frozenset({"app-data"}),
     )
+    # M4 batch 3.1.16A-4-4-2: the three history tools declare
+    # ``history.read`` so the broker injects the caller's
+    # ``principal_id`` + ``db`` from ``tool_context``.  The handler
+    # constructs a fresh ``SessionSearch(db, principal_id=principal_id)``
+    # per call — no module-global holder, no cross-principal leak.
+    _HISTORY_READ_CAP = ToolCapability(
+        "history.read",
+        frozenset({"office", "coding"}),
+        frozenset({"app-data"}),
+    )
     for spec in CRON_TOOL_SPECS:
         registry.register(
             ToolDefinition(
@@ -1757,6 +1779,19 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 modes=["all"],
                 permission_level="read",
                 parallel=True,
+                # M4 batch 3.1.16A-4-4-2: the three history tools declare
+                # ``history.read`` so ``ToolInvocationBroker.invoke``
+                # injects the caller's ``principal_id`` + ``db`` from
+                # ``tool_context``.  Without a declared capability the
+                # broker treats them as no-capability tools and the
+                # handlers receive ``principal_id=""`` / ``db=None`` —
+                # fail-closed returns ``unavailable`` for every call,
+                # breaking session history search entirely.  Worse,
+                # before A-4-4-2 the handlers read a module-global
+                # ``_session_search`` holder that was never wired in
+                # production (dead code) — see ``history_tools.py``
+                # docstring for details.
+                capabilities=(_HISTORY_READ_CAP,),
             )
         )
 
