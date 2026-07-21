@@ -835,14 +835,19 @@ async def test_acceptance_9_load_tasks_failure_enters_degraded_mode(
     invisible (and could be re-created with the same name, racing
     the hidden rows).
 
+    M4 batch 3.1.16B-5 (CRITICAL): ``create()`` now refuses degraded
+    mode (raises ``RuntimeError("engine_degraded")``) — a stricter
+    form of the same safety guarantee.  Previously ``create()``
+    succeeded but the tick loop refused to fire; now the refusal
+    happens at creation time, giving the caller an immediate signal.
+
     Sequence:
       1. Create a DB with a task.
       2. Patch ``list_scheduled_tasks`` to raise ``RuntimeError``.
       3. Create an engine, ``start()``.
       4. ``engine._degraded == True``.
       5. ``engine._running == True`` (tick loop active for control ops).
-      6. Create a PENDING task with past ISO time, wait — executor
-         NOT called (degraded mode refuses).
+      6. ``create()`` MUST raise ``RuntimeError("engine_degraded")``.
       7. Restore ``list_scheduled_tasks``, ``stop()``.
     """
     db = await _make_db(tmp_path)
@@ -884,22 +889,16 @@ async def test_acceptance_9_load_tasks_failure_enters_degraded_mode(
             "would not work"
         )
 
-        # Create a PENDING task with past ISO time (immediately due).
+        # M4 batch 3.1.16B-5: create() MUST raise in degraded mode.
         iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
-        await engine.create(
-            "degraded-fire", "p", ScheduleConfig(iso_time=iso),
-            principal_id="alice",
-        )
+        with pytest.raises(RuntimeError, match="engine_degraded"):
+            await engine.create(
+                "degraded-fire", "p", ScheduleConfig(iso_time=iso),
+                principal_id="alice",
+            )
 
-        # Let the tick loop fire a few times.
-        await asyncio.sleep(0.3)
-
-        # The executor MUST NOT have been called (degraded mode).
-        assert len(executor_calls) == 0, (
-            f"executor was called {len(executor_calls)} time(s) despite "
-            "degraded mode — the engine accepted a new execution with "
-            "unknown DB state"
-        )
+        # The executor MUST NOT have been called (no task was created).
+        assert len(executor_calls) == 0
 
         # Restore list_scheduled_tasks for clean shutdown.
         db.list_scheduled_tasks = original_list

@@ -13,6 +13,15 @@ stamps the principal on the task; ``cron_list`` / ``cron_pause`` /
 ``cron_resume`` / ``cron_remove`` filter / verify ownership.  Empty
 principal is rejected — fail-closed (no fallback to a shared pseudo-
 principal).
+
+M4 batch 3.1.16B-5 (CRITICAL): all mutating handlers (create / pause /
+resume / remove) now convert the engine's lifecycle-lock return values
+(``engine_unavailable`` / ``engine_degraded``) into structured
+``{"status": "error", ...}`` responses.  Previously a QUARANTINED
+engine (whose ``stop()`` failed with live owners retained) would
+silently accept ``pause()`` calls — compounding the DB inconsistency.
+Now the user sees a clear "engine is stopping / quarantined / degraded"
+error and knows to retry against a fresh engine.
 """
 
 from __future__ import annotations
@@ -46,6 +55,51 @@ def _require_principal(principal_id: str) -> dict[str, Any] | None:
     if not principal_id:
         return {"status": "error", "error": "principal_id is required"}
     return None
+
+
+def _lifecycle_lock_response(lock_error: str, task_id: str | None = None) -> dict[str, Any]:
+    """M4 batch 3.1.16B-5 (CRITICAL): convert the engine's lifecycle-
+    lock return value into a structured ``{"status": "error", ...}``
+    response.
+
+    ``lock_error`` is one of:
+      - ``"engine_unavailable"`` — engine is STOPPING or QUARANTINED.
+        The caller MUST NOT retry against this engine instance; they
+        should wait for ``stop()`` to complete (or restart the process)
+        and retry against a fresh engine.
+      - ``"engine_degraded"`` — engine is in degraded mode (lease
+        recovery or task load failed).  Only ``create`` refuses
+        degraded; ``pause`` / ``resume`` / ``remove`` still accept.
+        This error is only returned by ``cron_create``.
+
+    The response includes a ``retry_after`` hint so the caller knows
+    this is a transient condition (not a permanent failure).
+    """
+    if lock_error == "engine_degraded":
+        msg = (
+            "cron engine is in DEGRADED mode (lease recovery or task "
+            "load failed) — new task creation is refused; existing "
+            "tasks can still be paused / resumed / removed.  Retry "
+            "after the engine recovers or is restarted."
+        )
+    else:
+        # engine_unavailable
+        msg = (
+            "cron engine is STOPPING or QUARANTINED (previous stop() "
+            "may have failed with live owners retained) — mutating "
+            "operations are refused to avoid compounding DB "
+            "inconsistency.  Wait for stop() to complete or restart "
+            "the process, then retry against a fresh engine."
+        )
+    resp: dict[str, Any] = {
+        "status": "error",
+        "error": lock_error,
+        "message": msg,
+        "retry_after": "engine_restart",
+    }
+    if task_id is not None:
+        resp["task_id"] = task_id
+    return resp
 
 
 async def cron_create(name: str, prompt: str, schedule: str, *, principal_id: str = "", **kwargs: Any) -> dict:
@@ -84,6 +138,19 @@ async def cron_create(name: str, prompt: str, schedule: str, *, principal_id: st
     except ValueError as exc:
         # principal_id validation failure
         return {"status": "error", "error": str(exc), "name": name}
+    except RuntimeError as exc:
+        # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable /
+        # engine_degraded) — convert to structured response.  The
+        # engine raises RuntimeError because create() is a construction
+        # path (no per-task lock to return through); pause / resume /
+        # remove return the lock_error string directly.
+        lock_error = str(exc)
+        if lock_error in ("engine_unavailable", "engine_degraded"):
+            resp = _lifecycle_lock_response(lock_error)
+            resp["name"] = name
+            return resp
+        # Unknown RuntimeError — re-raise (don't swallow real bugs).
+        raise
     return {
         "status": "created",
         "task_id": task.id,
@@ -156,6 +223,11 @@ async def cron_remove(task_id: str, *, principal_id: str = "", **kwargs: Any) ->
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
     result = await _cron_engine.remove(task_id, principal_id=principal_id)
+    # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
+    # FIRST because the lock runs before the per-task lock and returns
+    # before any task-level branching.
+    if result in ("engine_unavailable", "engine_degraded"):
+        return _lifecycle_lock_response(result, task_id=task_id)
     if result == "ok":
         return {"status": "removed", "task_id": task_id}
     if result == "not_found":
@@ -201,6 +273,10 @@ async def cron_pause(task_id: str, *, principal_id: str = "", **kwargs: Any) -> 
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
     result = await _cron_engine.pause(task_id, principal_id=principal_id)
+    # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
+    # FIRST because the lock runs before the per-task lock.
+    if result in ("engine_unavailable", "engine_degraded"):
+        return _lifecycle_lock_response(result, task_id=task_id)
     if result == "ok":
         return {"status": "paused", "task_id": task_id}
     if result == "not_found":
@@ -252,6 +328,10 @@ async def cron_resume(task_id: str, *, principal_id: str = "", **kwargs: Any) ->
     if _cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
     result = await _cron_engine.resume(task_id, principal_id=principal_id)
+    # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
+    # FIRST because the lock runs before the per-task lock.
+    if result in ("engine_unavailable", "engine_degraded"):
+        return _lifecycle_lock_response(result, task_id=task_id)
     if result == "ok":
         return {"status": "resumed", "task_id": task_id}
     if result == "not_found":

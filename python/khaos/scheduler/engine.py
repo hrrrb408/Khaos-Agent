@@ -419,6 +419,17 @@ class CronEngine:
         # previous process).
         if self.db:
             try:
+                # M4 batch 3.1.16B-5 (CRITICAL): replay pending journal
+                # entries BEFORE the bulk FAILED sweep so the user's
+                # pause / remove / quarantine intent wins over recovery.
+                # Without this, a crash between journal INSERT and CAS
+                # UPDATE would lose the intent — the task would be
+                # marked FAILED by ``recover_all_running_tasks``,
+                # silently violating the "I paused / removed this"
+                # contract.  Replay runs AFTER drift detection so drift
+                # quarantine (safety-critical) wins over pre-crash
+                # user intents.
+                await self._replay_pending_journal_entries()
                 # M4 batch 3.1.13 (CRITICAL-2): query the task IDs
                 # that will be recovered BEFORE the bulk UPDATE, so we
                 # can per-task reload them afterwards (instead of the
@@ -1216,7 +1227,19 @@ class CronEngine:
             the DB row's ``next_run`` stayed NULL until the first
             execution — a restart before the first fire left the task
             permanently stuck.
+
+        M4 batch 3.1.16B-5 (CRITICAL): lifecycle lock — ``create``
+        refuses if the engine is in ``STOPPING`` / ``QUARANTINED``
+        state, or if ``_degraded`` is set (a degraded engine cannot
+        fire new tasks, so it must not accept them either).  Raises
+        ``RuntimeError`` with the lock error so cron_tools can convert
+        it to a structured ``{"status": "error", ...}`` response.
         """
+        # M4 batch 3.1.16B-5: lifecycle lock — refuse mutating ops
+        # while the engine is shutting down / quarantined / degraded.
+        lock_error = self._check_lifecycle_lock(refuse_degraded=True)
+        if lock_error is not None:
+            raise RuntimeError(lock_error)
         if not principal_id:
             raise ValueError("principal_id is required for scheduled task creation")
         task = ScheduledTask(
@@ -1311,7 +1334,21 @@ class CronEngine:
 
         H1 (round-11): the per-task lock is held for the ENTIRE
         operation — including cancel + persist.
+
+        M4 batch 3.1.16B-5 (CRITICAL): lifecycle lock — ``pause``
+        refuses if the engine is in ``STOPPING`` / ``QUARANTINED``
+        state.  ``_degraded`` is allowed (the user needs to clean up
+        existing tasks even when the engine can't fire new ones).
+        Returns ``"engine_unavailable"`` so cron_tools can convert it
+        to a structured ``{"status": "error", ...}`` response.
         """
+        # M4 batch 3.1.16B-5: lifecycle lock — refuse mutating ops
+        # while the engine is shutting down / quarantined.  Check
+        # BEFORE acquiring the per-task lock so a STOPPING engine
+        # does not block on a long-held lock.
+        lock_error = self._check_lifecycle_lock(refuse_degraded=False)
+        if lock_error is not None:
+            return lock_error
         async with self._task_lock(task_id):
             task = self._check_principal(
                 self._tasks.get(task_id), principal_id,
@@ -1364,7 +1401,9 @@ class CronEngine:
                         # stayed ``True`` and ``pause`` returned ``ok``
                         # despite the DB NOT being at ``paused``.
                         persist_ok = await self._persist_task_state(
-                            task, operation_id=existing_marker.operation_id,
+                            task,
+                            operation_id=existing_marker.operation_id,
+                            operation_type="pause",
                         )
                     except Exception:  # noqa: BLE001 — stop() will retry
                         persist_ok = False
@@ -1403,7 +1442,9 @@ class CronEngine:
                     # ``pause`` returned ``ok`` despite the DB NOT
                     # being at ``paused`` — forming a user-visible vs
                     # durable-state inconsistency.
-                    persist_ok = await self._persist_task_state(task)
+                    persist_ok = await self._persist_task_state(
+                        task, operation_type="pause",
+                    )
                 except Exception:  # noqa: BLE001 — stop() will retry
                     persist_ok = False
                     logger.error(
@@ -1475,7 +1516,19 @@ class CronEngine:
         the in-memory ``_bump_epoch`` is applied only AFTER the persist
         succeeds so the in-memory ``task.lifecycle_version`` matches
         the post-write DB version.
+
+        M4 batch 3.1.16B-5 (CRITICAL): lifecycle lock — ``resume``
+        refuses if the engine is in ``STOPPING`` / ``QUARANTINED``
+        state.  ``_degraded`` is allowed (the user needs to clean up
+        existing tasks even when the engine can't fire new ones).
+        Returns ``"engine_unavailable"`` so cron_tools can convert it
+        to a structured ``{"status": "error", ...}`` response.
         """
+        # M4 batch 3.1.16B-5: lifecycle lock — refuse mutating ops
+        # while the engine is shutting down / quarantined.
+        lock_error = self._check_lifecycle_lock(refuse_degraded=False)
+        if lock_error is not None:
+            return lock_error
         async with self._task_lock(task_id):
             task = self._check_principal(
                 self._tasks.get(task_id), principal_id,
@@ -1650,7 +1703,19 @@ class CronEngine:
 
         H1 (round-11): the per-task lock is held for the ENTIRE
         operation — including cancel + persist.
+
+        M4 batch 3.1.16B-5 (CRITICAL): lifecycle lock — ``remove``
+        refuses if the engine is in ``STOPPING`` / ``QUARANTINED``
+        state.  ``_degraded`` is allowed (the user needs to clean up
+        existing tasks even when the engine can't fire new ones).
+        Returns ``"engine_unavailable"`` so cron_tools can convert it
+        to a structured ``{"status": "error", ...}`` response.
         """
+        # M4 batch 3.1.16B-5: lifecycle lock — refuse mutating ops
+        # while the engine is shutting down / quarantined.
+        lock_error = self._check_lifecycle_lock(refuse_degraded=False)
+        if lock_error is not None:
+            return lock_error
         async with self._task_lock(task_id):
             task = self._check_principal(
                 self._tasks.get(task_id), principal_id,
@@ -1689,7 +1754,9 @@ class CronEngine:
             persist_ok = True
             if self.db:
                 try:
-                    persist_ok = await self._persist_task_state(task)
+                    persist_ok = await self._persist_task_state(
+                        task, operation_type="remove",
+                    )
                 except Exception:  # noqa: BLE001 — stop() will retry
                     persist_ok = False
                     logger.error(
@@ -1713,6 +1780,262 @@ class CronEngine:
             self._tasks.pop(task_id, None)
             self._task_locks.pop(task_id, None)
             return "ok"
+
+    def _check_lifecycle_lock(self, *, refuse_degraded: bool = False) -> str | None:
+        """M4 batch 3.1.16B-5 (CRITICAL): lifecycle lock on mutating ops.
+
+        Returns an error string if the engine is in a state that refuses
+        mutating operations (create / pause / resume / remove), else
+        ``None``.
+
+        State matrix:
+          - ``STOPPING`` / ``QUARANTINED`` → ``"engine_unavailable"`` —
+            the engine is shutting down or has live owners retained
+            from a failed stop(); accepting a new mutating op would
+            compound inconsistency (the DB may be wedged, reconcile
+            may be mid-flight, or live executors may still be producing
+            side effects).  The caller MUST return this to the user
+            so they retry against a fresh engine.
+          - ``_degraded=True`` AND ``refuse_degraded=True`` →
+            ``"engine_degraded"`` — only ``create`` refuses degraded
+            mode (a degraded engine should not accept NEW tasks while
+            it can't fire existing ones).  ``pause`` / ``resume`` /
+            ``remove`` still accept (the user needs to clean up
+            existing tasks even when the engine is degraded).
+          - ``NEW`` / ``RUNNING`` / ``STOPPED`` → ``None`` — proceed.
+
+        This closes Gap C: previously ``create`` / ``pause`` / ``resume``
+        / ``remove`` did NOT check ``_lifecycle_state`` — a
+        ``QUARANTINED`` engine (whose ``stop()`` failed with live
+        owners retained) still accepted ``pause()`` calls, bumped the
+        epoch, and attempted to persist — compounding the DB
+        inconsistency that caused the quarantine in the first place.
+        """
+        if self._lifecycle_state in (
+            CronEngineState.STOPPING, CronEngineState.QUARANTINED,
+        ):
+            return "engine_unavailable"
+        if refuse_degraded and self._degraded:
+            return "engine_degraded"
+        return None
+
+    async def _write_journal_entry(
+        self,
+        *,
+        operation_id: str,
+        task: ScheduledTask,
+        operation_type: str,
+        desired_status: str,
+        expected_version: int,
+        target_version: int,
+    ) -> None:
+        """M4 batch 3.1.16B-5 (CRITICAL): write a durable journal entry.
+
+        Called BEFORE the CAS UPDATE so a crash (SIGKILL / power loss)
+        between this INSERT and the CAS leaves the intent durable.
+        ``start()`` scans ``applied_at IS NULL`` entries and replays
+        them (roll-forward for pause / remove / resume; stale marking
+        for entries superseded by a newer op or by recovery).
+
+        The INSERT is atomic — if it fails, the caller MUST NOT proceed
+        with the CAS.  A CAS without a journal entry would be
+        unrecoverable on crash: ``recover_all_running_tasks`` would
+        unconditionally mark the task FAILED, silently violating the
+        user's "I paused / removed this" contract.  The caller raises
+        on failure, leaving the in-memory marker in place so ``stop()``
+        retries.
+
+        ``operation_type`` is one of ``"pause"`` / ``"resume"`` /
+        ``"remove"`` / ``"quarantine"``.  ``create`` is NOT journaled
+        — the INSERT itself is atomic, so a crash either leaves the
+        row created or not created, with no ambiguity to recover from.
+        Executor finalize writes are also NOT journaled here — a
+        crash mid-execution is correctly disclosed as FAILED by
+        ``recover_all_running_tasks`` (at-least-once semantics), not
+        silently rolled forward.
+        """
+        if not self.db:
+            return
+        await self.db.insert_scheduler_journal_entry(
+            operation_id=operation_id,
+            task_id=task.id,
+            operation_type=operation_type,
+            desired_status=desired_status,
+            expected_version=expected_version,
+            target_version=target_version,
+            principal_id=task.principal_id,
+            policy_digest=self._policy_digest,
+        )
+
+    async def _mark_journal_applied(self, operation_id: str) -> None:
+        """M4 batch 3.1.16B-5: mark a journal entry as applied.
+
+        Called after a CAS succeeds (or after replay confirms the entry
+        is stale / idempotent).  Failures are swallowed — a stale
+        ``applied_at IS NULL`` entry is harmless: the next ``start()``
+        will re-scan it, see the DB is at the desired state, and mark
+        it applied (idempotent).
+        """
+        if not self.db:
+            return
+        try:
+            await self.db.mark_scheduler_journal_applied(operation_id)
+        except Exception:  # noqa: BLE001 — stale NULL is harmless
+            logger.warning(
+                "could not mark journal entry %s as applied — "
+                "next start() will re-scan and idempotently resolve",
+                operation_id, exc_info=True,
+            )
+
+    async def _replay_pending_journal_entries(self) -> None:
+        """M4 batch 3.1.16B-5 (CRITICAL): replay journal entries whose
+        CAS was never confirmed (``applied_at IS NULL``).
+
+        Called by ``start()`` BEFORE ``recover_all_running_tasks`` so
+        the user's pause / remove / quarantine intent wins over the
+        bulk FAILED sweep.  Without this, a crash between journal
+        INSERT and CAS UPDATE would lose the user's intent — the task
+        would be marked FAILED by recovery, silently violating the "I
+        paused / removed this" contract.
+
+        Replay strategy (per entry, in ``seq`` ASC order):
+          1. Read the DB row for ``task_id``.
+          2. Row is None (task deleted): mark applied (stale).
+          3. DB status is ``running``: mark applied — recovery will
+             achieve a terminal state.  Re-applying pause/remove on a
+             ``running`` row would race with the recovery sweep; the
+             recovery outcome (FAILED) is "close enough" to the user's
+             intent (PAUSED / CANCELLED ≈ task inactive; FAILED = exact
+             match for quarantine).
+          4. DB status already matches ``desired_status``: mark applied
+             (idempotent — prior CAS committed, or a newer op achieved
+             the same state).
+          5. DB status is terminal (``failed`` / ``cancelled``): mark
+             applied (stale — a newer op or recovery already won).
+          6. Otherwise (DB at ``pending`` / ``paused``): roll-forward
+             via ``_persist_task_state`` with the entry's
+             ``operation_id`` so the existing journal entry is marked
+             applied (not a new one).
+
+        Resume intents (``desired_status=pending``) are NOT rolled
+        forward if the DB is at ``failed`` — a FAILED row from recovery
+        must NOT be silently resurrected.  The user must explicitly
+        ``resume`` again after inspecting the failure.  Step 5 handles
+        this: ``failed`` is terminal, so the entry is marked stale.
+
+        Replay failures (DB unreadable, CAS raises) leave the entry
+        pending — the next ``start()`` will re-scan it.  This is the
+        same fail-safe as the rest of the engine: a stuck entry is a
+        loud signal (visible via ``list_pending_scheduler_journal_entries``),
+        not a silent data loss.
+        """
+        if not self.db:
+            return
+        try:
+            entries = await self.db.list_pending_scheduler_journal_entries()
+        except Exception:  # noqa: BLE001 — journal unreadable
+            logger.warning(
+                "cron engine start: could not read pending journal "
+                "entries — replay skipped; recovery will proceed",
+                exc_info=True,
+            )
+            return
+        if not entries:
+            return
+        replayed = 0
+        skipped_stale = 0
+        for entry in entries:
+            op_id = entry["operation_id"]
+            task_id = entry["task_id"]
+            desired = entry["desired_status"]
+            op_type = entry["operation_type"]
+            try:
+                row = await self.db.get_scheduled_task(task_id)
+            except Exception:  # noqa: BLE001 — DB unreadable
+                logger.warning(
+                    "cron engine start: could not read task %s for "
+                    "journal replay of op %s — leaving entry pending",
+                    task_id, op_id, exc_info=True,
+                )
+                continue
+            if row is None:
+                # Task was deleted out-of-band.  Mark applied (stale).
+                await self._mark_journal_applied(op_id)
+                skipped_stale += 1
+                continue
+            db_status = row.get("status")
+            if db_status == "running":
+                # Recovery will achieve a terminal state — don't race.
+                # Mark applied so the next start() doesn't re-scan.
+                await self._mark_journal_applied(op_id)
+                skipped_stale += 1
+                continue
+            if db_status == desired:
+                # Idempotent — prior CAS committed or newer op matched.
+                await self._mark_journal_applied(op_id)
+                skipped_stale += 1
+                continue
+            if db_status in ("failed", "cancelled"):
+                # Terminal DB state with a different status — stale
+                # entry (a newer op or recovery already won).  Do NOT
+                # roll forward: a ``failed`` row from recovery must not
+                # be silently resurrected by a resume intent.
+                await self._mark_journal_applied(op_id)
+                skipped_stale += 1
+                continue
+            # Non-terminal, non-running, non-matching: roll forward.
+            task = self._tasks.get(task_id)
+            if task is None:
+                # Task was removed from memory (e.g. ``remove()``
+                # popped it before the crash).  Reconstruct a minimal
+                # ScheduledTask from the DB row so _persist_task_state
+                # can do its CAS.  The reconstructed task is NOT added
+                # to ``_tasks`` — the caller (start()) will reload
+                # tasks via the per-task reload path after recovery.
+                task = _task_from_row(row)
+                if task is None:
+                    logger.warning(
+                        "cron engine start: could not reconstruct task "
+                        "%s from DB row for journal replay of op %s — "
+                        "marking entry stale",
+                        task_id, op_id,
+                    )
+                    await self._mark_journal_applied(op_id)
+                    skipped_stale += 1
+                    continue
+            # Set the desired status on the in-memory task so
+            # _persist_task_state reads it via ``task.status.value``.
+            try:
+                task.status = TaskStatus(desired)
+            except ValueError:
+                logger.warning(
+                    "cron engine start: journal entry %s has unknown "
+                    "desired_status %r — marking stale",
+                    op_id, desired,
+                )
+                await self._mark_journal_applied(op_id)
+                skipped_stale += 1
+                continue
+            try:
+                await self._persist_task_state(
+                    task,
+                    operation_id=op_id,  # retry — skip journal write
+                    operation_type=op_type,
+                )
+                replayed += 1
+            except Exception:  # noqa: BLE001 — replay failure
+                logger.error(
+                    "cron engine start: could not roll-forward journal "
+                    "entry %s for task %s — leaving entry pending for "
+                    "next start()",
+                    op_id, task_id, exc_info=True,
+                )
+        if replayed or skipped_stale:
+            logger.info(
+                "cron engine start: journal replay — %d rolled forward, "
+                "%d marked stale",
+                replayed, skipped_stale,
+            )
 
     def _bump_epoch(self, task_id: str) -> int:
         """H1 (round-9): increment the execution epoch for ``task_id``.
@@ -1815,6 +2138,15 @@ class CronEngine:
         quarantine decision.  Audit write failures are swallowed
         (matching the SecurityMiddleware pattern) — audit must NEVER
         block the quarantine, which is a safety-critical operation.
+
+        M4 batch 3.1.16B-5 (CRITICAL): the persist call now passes
+        ``operation_type="quarantine"`` so a journal entry is written
+        BEFORE the CAS.  A crash between the audit write and the CAS
+        would otherwise leave the quarantine intent lost — the task
+        would stay ``pending`` in the DB and re-fire on restart.  The
+        journal entry ensures ``start()`` replay rolls the quarantine
+        forward.  The audit write still happens FIRST (audit is the
+        attributable record; journal is the durability record).
         """
         logger.error(
             "cron task %s (%s): QUARANTINED — %s",
@@ -1852,7 +2184,13 @@ class CronEngine:
                 )
         if self.db:
             try:
-                await self._persist_task_state(task)
+                # M4 batch 3.1.16B-5: pass operation_type="quarantine"
+                # so the journal records the quarantine intent.  A
+                # crash between audit write and CAS would otherwise
+                # leave the task re-fireable on restart.
+                await self._persist_task_state(
+                    task, operation_type="quarantine",
+                )
             except Exception:  # noqa: BLE001 — stop() will retry
                 logger.error(
                     "cron task %s: could not persist FAILED state for "
@@ -2301,7 +2639,9 @@ class CronEngine:
             )
             if self.db:
                 try:
-                    await self._persist_task_state(task)
+                    await self._persist_task_state(
+                        task, operation_type="quarantine",
+                    )
                 except Exception:  # noqa: BLE001 — stop() will retry
                     logger.error(
                         "cron task %s: could not persist FAILED state "
@@ -2668,6 +3008,7 @@ class CronEngine:
         *,
         expected_version: int | None = None,
         operation_id: str | None = None,
+        operation_type: str = "control",
     ) -> bool:
         """Persist the current task state to the DB (control op path).
 
@@ -2714,6 +3055,19 @@ class CronEngine:
         independently while the control op's persist had actually
         FAILED, leaving ``status='running' + NULL lease``.
 
+        M4 batch 3.1.16B-5 (CRITICAL): durable operation journal.
+        For NEW control ops (``operation_id is None``), a journal
+        entry is written BEFORE the CAS UPDATE so a crash leaves the
+        intent durable.  ``start()`` replays pending entries
+        (``applied_at IS NULL``) to roll forward pause / remove /
+        quarantine intents.  Retries (``operation_id`` supplied) skip
+        the journal write — the entry already exists from the first
+        attempt.  On CAS success (or idempotent read-back), the entry
+        is marked ``applied_at``.  ``operation_type`` is one of
+        ``"pause"`` / ``"remove"`` / ``"quarantine"`` (default
+        ``"control"`` for callers that don't care about replay
+        semantics).
+
         Returns ``True`` on success (or when there is no DB).
         Returns ``False`` if a newer control op already won AND the
         DB does NOT match our desired state — the caller must NOT
@@ -2722,7 +3076,8 @@ class CronEngine:
         """
         if not self.db:
             return True
-        if operation_id is None:
+        is_new_op = operation_id is None
+        if is_new_op:
             import uuid as _uuid
             operation_id = _uuid.uuid4().hex
         is_control_op = expected_version is None
@@ -2763,6 +3118,10 @@ class CronEngine:
             # Task was deleted from the DB out-of-band.  Nothing to
             # persist — treat as success.
             self._pending_persistence.pop(task.id, None)
+            # M4 batch 3.1.16B-5: mark any prior journal entry stale
+            # so start() does not replay a no-op intent.
+            if not is_new_op:
+                await self._mark_journal_applied(operation_id)
             return True
         db_version = int(row.get("lifecycle_version", 0))
         db_status = row.get("status")
@@ -2781,6 +3140,10 @@ class CronEngine:
             task.lifecycle_version = db_version
             self._execution_epoch[task.id] = db_version
             self._pending_persistence.pop(task.id, None)
+            # M4 batch 3.1.16B-5: mark journal applied — the op is
+            # satisfied (either by this call's CAS or by a prior one).
+            if not is_new_op:
+                await self._mark_journal_applied(operation_id)
             return True
         # M4 batch 3.1.12 (CRITICAL-1): the DB is NOT at our desired
         # state.  We must persist.  Use (db_version, db_version + 1)
@@ -2796,6 +3159,32 @@ class CronEngine:
             is_control_op=True,
             target_version=target,
         )
+        # M4 batch 3.1.16B-5 (CRITICAL): write the durable journal
+        # entry BEFORE the CAS.  If the CAS crashes (SIGKILL), the
+        # journal entry survives and start() replays it.  Only write
+        # for NEW ops — retries already have a journal entry from the
+        # first attempt (matched by operation_id).  If the journal
+        # write fails, raise WITHOUT popping the marker — stop() will
+        # retry the marker, and the next _persist_task_state call for
+        # this task will reuse the same operation_id (passed by the
+        # retry path) and skip the journal write.
+        if is_new_op:
+            try:
+                await self._write_journal_entry(
+                    operation_id=operation_id,
+                    task=task,
+                    operation_type=operation_type,
+                    desired_status=desired,
+                    expected_version=expected,
+                    target_version=target,
+                )
+            except Exception:
+                logger.error(
+                    "cron task %s: could not write journal entry for "
+                    "op %s; keeping marker for stop() retry",
+                    task.name, operation_id, exc_info=True,
+                )
+                raise
         try:
             rowcount = await self.db.control_finalize_scheduled_task(
                 task.id,
@@ -2828,6 +3217,9 @@ class CronEngine:
                     self._pending_persistence.pop(task.id, None)
                 task.lifecycle_version = target
                 self._execution_epoch[task.id] = target
+                # M4 batch 3.1.16B-5: CAS committed (commit-then-raise)
+                # — mark journal applied.
+                await self._mark_journal_applied(operation_id)
                 return True
             raise
         if rowcount == 0:
@@ -2856,6 +3248,8 @@ class CronEngine:
                     self._pending_persistence.pop(task.id, None)
                 task.lifecycle_version = target
                 self._execution_epoch[task.id] = target
+                # M4 batch 3.1.16B-5: idempotent success — mark journal.
+                await self._mark_journal_applied(operation_id)
                 return True
             # A newer control op won AND achieved a DIFFERENT state.
             # Don't overwrite — but return False so the caller knows
@@ -2870,6 +3264,9 @@ class CronEngine:
             stored = self._pending_persistence.get(task.id)
             if stored is not None and stored.operation_id == operation_id:
                 self._pending_persistence.pop(task.id, None)
+            # M4 batch 3.1.16B-5: stale entry — mark applied so
+            # start() does not replay a superseded intent.
+            await self._mark_journal_applied(operation_id)
             return False
         # Success — update in-memory version + clear marker.
         task.lifecycle_version = target
@@ -2877,6 +3274,8 @@ class CronEngine:
         stored = self._pending_persistence.get(task.id)
         if stored is not None and stored.operation_id == operation_id:
             self._pending_persistence.pop(task.id, None)
+        # M4 batch 3.1.16B-5: CAS succeeded — mark journal applied.
+        await self._mark_journal_applied(operation_id)
         return True
 
     async def _load_tasks(self) -> None:

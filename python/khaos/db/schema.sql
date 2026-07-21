@@ -280,6 +280,52 @@ CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status ON scheduled_tasks(status,
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_principal ON scheduled_tasks(principal_id, status);
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_policy ON scheduled_tasks(policy_digest, status);
 
+-- M4 batch 3.1.16B-5 (CRITICAL): durable operation journal for
+-- scheduler control ops.  Closes the gap where ``_pending_persistence``
+-- was a pure in-memory dict — a process crash (SIGKILL / power loss)
+-- left the user's pause/resume/remove intent lost.  On restart
+-- ``recover_all_running_tasks`` unconditionally marked every running
+-- task FAILED, silently violating the "I paused this" contract.
+--
+-- This table records each control op's intent BEFORE the CAS UPDATE
+-- is attempted.  On restart, ``CronEngine.start()`` replays entries
+-- with ``applied_at IS NULL``: pause/remove intents are re-applied
+-- (roll-forward) if the DB is still at a non-terminal state; resume
+-- intents are re-applied if the DB is still at ``paused``.  Executor
+-- finalize writes are NOT journaled here — a crash mid-execution is
+-- correctly disclosed as FAILED by ``recover_all_running_tasks``
+-- (at-least-once semantics), not silently rolled forward.
+--
+-- ``operation_type`` is one of: ``pause`` / ``resume`` / ``remove`` /
+-- ``quarantine`` (drift quarantine from B-2).  ``create`` is NOT
+-- journaled — the INSERT itself is atomic, so a crash either leaves
+-- the row created or not created, with no ambiguity to recover from.
+--
+-- ``applied_at`` is NULL for entries whose CAS has not yet been
+-- confirmed successful.  ``start()`` scans these in ``seq`` order
+-- and either re-applies them or marks them stale (superseded by a
+-- newer op or by recovery).
+CREATE TABLE IF NOT EXISTS scheduler_operation_journal (
+    seq              INTEGER PRIMARY KEY AUTOINCREMENT,
+    operation_id     TEXT NOT NULL,
+    task_id          TEXT NOT NULL,
+    operation_type   TEXT NOT NULL,
+    desired_status   TEXT NOT NULL,
+    expected_version INTEGER NOT NULL,
+    target_version   INTEGER NOT NULL,
+    principal_id     TEXT NOT NULL DEFAULT '',
+    policy_digest    TEXT NOT NULL DEFAULT '',
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    applied_at       TEXT
+);
+
+-- Pending-entry lookup (partial index — only NULL rows).
+CREATE INDEX IF NOT EXISTS idx_scheduler_journal_pending
+    ON scheduler_operation_journal(seq) WHERE applied_at IS NULL;
+-- Per-task history (reconcile / forensics).
+CREATE INDEX IF NOT EXISTS idx_scheduler_journal_task
+    ON scheduler_operation_journal(task_id, seq);
+
 CREATE TABLE IF NOT EXISTS coding_tasks (
     id             TEXT PRIMARY KEY,
     goal           TEXT NOT NULL,
