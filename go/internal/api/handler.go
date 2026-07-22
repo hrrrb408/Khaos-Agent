@@ -952,6 +952,11 @@ func (h *Handler) handleSubagentStatus(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMemoryGet(w http.ResponseWriter, r *http.Request) {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
 	query := r.URL.Query()
 	scope := query.Get("scope")
 	if scope == "" {
@@ -962,7 +967,7 @@ func (h *Handler) handleMemoryGet(w http.ResponseWriter, r *http.Request) {
 		topK = 5
 	}
 	if query.Get("query") != "" {
-		memories, err := h.memory.Search(r.Context(), scope, query.Get("query"), topK)
+		memories, err := h.memory.Search(r.Context(), principalID, scope, query.Get("query"), topK)
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
@@ -970,7 +975,7 @@ func (h *Handler) handleMemoryGet(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, memories)
 		return
 	}
-	memory, err := h.memory.Get(r.Context(), scope, query.Get("key"))
+	memory, err := h.memory.Get(r.Context(), principalID, scope, query.Get("key"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, err.Error())
 		return
@@ -979,12 +984,17 @@ func (h *Handler) handleMemoryGet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMemorySet(w http.ResponseWriter, r *http.Request) {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
 	var memory Memory
 	if err := decodeJSON(r, &memory); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
-	stored, err := h.memory.Set(r.Context(), memory)
+	stored, err := h.memory.Set(r.Context(), principalID, memory)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -993,12 +1003,17 @@ func (h *Handler) handleMemorySet(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleMemoryDelete(w http.ResponseWriter, r *http.Request) {
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
 	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := h.memory.Delete(r.Context(), id); err != nil {
+	if err := h.memory.Delete(r.Context(), principalID, id); err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -1154,19 +1169,23 @@ func eventSequence(value any) uint64 {
 	return 0
 }
 
-// MemoryMap is an in-memory MemoryClient used by the gateway binary and tests.
+// MemoryMap is an in-memory MemoryClient used by tests.  C-2-2 (HIGH
+// 6): no longer used by the production Gateway binary, which now
+// proxies Python ``MemoryService`` via ``PythonClient``.  Retained
+// here so existing handler tests that don't exercise the Python socket
+// can still construct an isolated in-memory store.
 type MemoryMap struct {
 	mu     sync.Mutex
 	nextID int64
 	items  map[int64]Memory
 }
 
-// NewMemoryMap creates a memory map.
+// NewMemoryMap creates a memory map.  Test-only.
 func NewMemoryMap() *MemoryMap {
 	return &MemoryMap{nextID: 1, items: map[int64]Memory{}}
 }
 
-func (m *MemoryMap) Get(ctx context.Context, scope string, key string) (Memory, error) {
+func (m *MemoryMap) Get(ctx context.Context, principalID string, scope string, key string) (Memory, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, memory := range m.items {
@@ -1177,7 +1196,7 @@ func (m *MemoryMap) Get(ctx context.Context, scope string, key string) (Memory, 
 	return Memory{}, errors.New("memory not found")
 }
 
-func (m *MemoryMap) Set(ctx context.Context, memory Memory) (Memory, error) {
+func (m *MemoryMap) Set(ctx context.Context, principalID string, memory Memory) (Memory, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if memory.ID == 0 {
@@ -1188,14 +1207,14 @@ func (m *MemoryMap) Set(ctx context.Context, memory Memory) (Memory, error) {
 	return memory, nil
 }
 
-func (m *MemoryMap) Delete(ctx context.Context, id int64) error {
+func (m *MemoryMap) Delete(ctx context.Context, principalID string, id int64) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	delete(m.items, id)
 	return nil
 }
 
-func (m *MemoryMap) Search(ctx context.Context, scope string, query string, topK int) ([]Memory, error) {
+func (m *MemoryMap) Search(ctx context.Context, principalID string, scope string, query string, topK int) ([]Memory, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	results := []Memory{}

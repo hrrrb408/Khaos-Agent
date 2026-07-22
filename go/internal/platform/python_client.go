@@ -24,6 +24,7 @@ var (
 	_ api.SubagentClient = PythonClient{}
 	_ api.ChannelClient  = PythonClient{}
 	_ api.TaskClient     = PythonClient{}
+	_ api.MemoryClient   = PythonClient{} // C-2-2 (HIGH 6): Gateway now proxies Python MemoryService.
 )
 
 // CreateTask creates a persistent coding task.
@@ -292,6 +293,141 @@ func (c PythonClient) SetChannelEnabled(ctx context.Context, principalID string,
 		return fmt.Errorf("channel not found: %s", channelID)
 	}
 	return nil
+}
+
+// Get fetches one memory by scope+key from the Python MemoryService.
+//
+// C-2-2 (HIGH 6): the Gateway no longer keeps an in-process MemoryMap;
+// every REST /api/memory call proxies to Python's per-principal
+// MemoryService.  ``principalID`` is the authenticated caller — Python
+// scopes the read to the caller's own memories + project-shared rows.
+func (c PythonClient) Get(ctx context.Context, principalID string, scope string, key string) (api.Memory, error) {
+	response, err := c.callMap(ctx, "MemoryService.GetMemory", map[string]any{
+		"scope": scope, "key": key,
+	}, principalID)
+	if err != nil {
+		return api.Memory{}, err
+	}
+	return memoryFromMap(response), nil
+}
+
+// Set creates or updates a memory via the Python MemoryService.
+func (c PythonClient) Set(ctx context.Context, principalID string, memory api.Memory) (api.Memory, error) {
+	response, err := c.callMap(ctx, "MemoryService.SetMemory", map[string]any{
+		"scope":     memory.Scope,
+		"key":       memory.Key,
+		"value":     memory.Value,
+		"ttl":       memory.TTL,
+		"confidence": memory.Confidence,
+	}, principalID)
+	if err != nil {
+		return api.Memory{}, err
+	}
+	if ok, _ := response["ok"].(bool); !ok {
+		return api.Memory{}, fmt.Errorf("MemoryService.SetMemory returned ok=false: %v", response)
+	}
+	// Python returns {"ok": true, "id": <int>}.  Refetch to get the
+	// full record (created_at, updated_at, etc.) so the REST caller
+	// sees the durable row, not just the input echo.
+	id := int64FromAny(response["id"])
+	if id == 0 {
+		// Python didn't return a valid id — return the input memory
+		// as-is (id=0 signals the caller that no durable row was
+		// created).  In practice Python ``set_memory`` always returns
+		// a non-zero DB id, so this branch is a defensive fallback.
+		memory.ID = 0
+		return memory, nil
+	}
+	// Refetch by (scope, key) — the MemoryService has no Get-by-id RPC.
+	fetched, err := c.Get(ctx, principalID, memory.Scope, memory.Key)
+	if err != nil {
+		// Refetch failed; return the input with the id stamped.
+		memory.ID = id
+		return memory, nil
+	}
+	fetched.ID = id
+	return fetched, nil
+}
+
+// Delete deletes a memory by id via the Python MemoryService.
+//
+// C-2-2: previously the Python dispatcher had no MemoryService.DeleteMemory
+// route, so REST DELETE /api/memory/{id} only mutated the in-process
+// MemoryMap and the durable row survived.  Python now exposes the
+// DeleteMemory route and scopes deletion to ``ctx.principal_id``.
+func (c PythonClient) Delete(ctx context.Context, principalID string, id int64) error {
+	response, err := c.callMap(ctx, "MemoryService.DeleteMemory", map[string]any{
+		"memory_id": id,
+	}, principalID)
+	if err != nil {
+		return err
+	}
+	if ok, _ := response["ok"].(bool); !ok {
+		return fmt.Errorf("MemoryService.DeleteMemory returned ok=false: %v", response)
+	}
+	return nil
+}
+
+// Search performs a BM25 full-text search via the Python MemoryService.
+func (c PythonClient) Search(ctx context.Context, principalID string, scope string, query string, topK int) ([]api.Memory, error) {
+	response, err := c.callList(ctx, "MemoryService.SearchMemory", map[string]any{
+		"query": query, "top_k": topK,
+	}, principalID)
+	if err != nil {
+		return nil, err
+	}
+	results := make([]api.Memory, 0, len(response))
+	for _, item := range response {
+		results = append(results, memoryFromMap(item))
+	}
+	return results, nil
+}
+
+// memoryFromMap converts a Python MemoryService dict into an api.Memory.
+// Missing fields default to zero values.  Numeric fields are coerced
+// from any json.Number/float64/int payload.
+func memoryFromMap(m map[string]any) api.Memory {
+	return api.Memory{
+		ID:         int64FromAny(m["id"]),
+		Scope:      stringValue(m["scope"]),
+		Key:        stringValue(m["key"]),
+		Value:      stringValue(m["value"]),
+		TTL:        intFromAny(m["ttl"]),
+		Confidence: intFromAny(m["confidence"]),
+		AccessFreq: intFromAny(m["access_freq"]),
+		CreatedAt:  stringValue(m["created_at"]),
+		UpdatedAt:  stringValue(m["updated_at"]),
+	}
+}
+
+func int64FromAny(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	}
+	return 0
+}
+
+func intFromAny(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int64:
+		return int(n)
+	case int:
+		return n
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i)
+	}
+	return 0
 }
 
 func stringValue(value any) string {

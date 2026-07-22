@@ -112,9 +112,21 @@ func main() {
 		agent = pythonClient
 	}
 
+	// C-2-2 (HIGH 6): the production Gateway no longer keeps an
+	// in-process MemoryMap — REST /api/memory proxies Python's
+	// per-principal MemoryService via the same pythonClient that
+	// carries project_id + policy_digest drift claims.  The mock-agent
+	// path (development only) still uses NewMemoryMap() so /api/memory
+	// works without a Python backend.
+	var memoryClient api.MemoryClient
+	if *mockAgent {
+		memoryClient = api.NewMemoryMap()
+	} else {
+		memoryClient = pythonClient
+	}
 	handler := api.NewHandler(
 		agent,
-		api.NewMemoryMap(),
+		memoryClient,
 		api.NewMapConfig(map[string]any{"started_at": time.Now().Format(time.RFC3339)}),
 		resolvedKey,
 		rate.NewTokenBucket(60, 10),

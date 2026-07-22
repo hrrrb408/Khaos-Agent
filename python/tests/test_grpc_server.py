@@ -1278,3 +1278,102 @@ async def test_audit_service_query_roundtrip(tmp_path):
     assert entries[0]["action"] == "write_file"
     assert entries[0]["result"] == "success"
     await db.close()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Unix peer credentials require a UDS")
+async def test_c_2_2_dispatcher_routes_memory_delete_memory(tmp_path):
+    """C-2-2 (HIGH 6): verify the json-line dispatcher routes
+    ``MemoryService.DeleteMemory`` to ``memory.delete_memory``.
+
+    Before C-2-2 the dispatcher had SetMemory/GetMemory/SearchMemory
+    branches but NO DeleteMemory branch — so Go REST
+    ``DELETE /api/memory/{id}`` could never reach Python.  The in-process
+    Gateway ``MemoryMap`` silently swallowed the call and the durable
+    row survived in the DB.  This test starts a real server, exercises
+    the full Set → Get → Delete → Get cycle via signed RPCs, and
+    confirms Delete actually removes the durable row.
+    """
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding", encoding="utf-8")
+
+    socket_parent = Path("/tmp") / f"krpc-c-2-2-{uuid.uuid4().hex[:12]}"
+    socket_parent.mkdir(mode=0o700)
+    socket_path = socket_parent / "agent.sock"
+    task = asyncio.create_task(
+        serve_json_lines(
+            str(socket_path), str(tmp_path / "khaos.db"),
+            project_root=tmp_path, gateway_capability="c" * 48,
+        )
+    )
+    for _ in range(100):
+        if socket_path.exists() or task.done():
+            break
+        await asyncio.sleep(0.01)
+    try:
+        if task.done():
+            exc = task.exception()
+            if exc:
+                pytest.skip(f"server failed to start: {exc!r}")
+            await task
+        reader, writer = await asyncio.open_unix_connection(str(socket_path))
+
+        async def rpc(method: str, payload: dict) -> dict:
+            # Each RPC needs a unique nonce — the authenticator rejects
+            # replayed nonces.  Use a counter so the 4 calls in this
+            # test don't collide.
+            nonce = ("n" * 28) + f"{rpc.counter:04d}"
+            rpc.counter += 1
+            request = _signed_rpc_request(method, payload, nonce=nonce)
+            writer.write((json.dumps(request) + "\n").encode("utf-8"))
+            await writer.drain()
+            return json.loads((await reader.readline()).decode("utf-8"))
+        rpc.counter = 0
+
+        # Set a memory via the dispatcher.
+        set_resp = await rpc("MemoryService.SetMemory", {
+            "scope": "global", "key": "c-2-2", "value": "delete-me",
+            "ttl": 604800, "confidence": 2,
+        })
+        assert set_resp.get("ok") is True, f"SetMemory failed: {set_resp}"
+        memory_id = set_resp.get("id")
+        assert memory_id, f"SetMemory returned no id: {set_resp}"
+
+        # Get confirms it's durable.
+        get_resp = await rpc("MemoryService.GetMemory", {
+            "scope": "global", "key": "c-2-2",
+        })
+        assert get_resp.get("value") == "delete-me", f"GetMemory failed: {get_resp}"
+
+        # C-2-2 core assertion: DeleteMemory MUST be routed (previously
+        # the dispatcher had no such branch, so the RPC would hit the
+        # fallback "unknown method" path and return an error).
+        del_resp = await rpc("MemoryService.DeleteMemory", {
+            "memory_id": memory_id,
+        })
+        assert del_resp.get("ok") is True, f"DeleteMemory failed: {del_resp}"
+
+        # Get confirms the row is gone from the durable DB.
+        get_after = await rpc("MemoryService.GetMemory", {
+            "scope": "global", "key": "c-2-2",
+        })
+        # Service raises KeyError when not found; the dispatcher
+        # surfaces it as an error dict.  Either an "error" field or
+        # an empty value is acceptable — the key assertion is that
+        # "delete-me" is no longer returned.
+        assert get_after.get("value") != "delete-me", (
+            f"DeleteMemory did not remove the durable row: {get_after}"
+        )
+
+        writer.close()
+        await writer.wait_closed()
+    except (PermissionError, OSError) as exc:
+        pytest.skip(f"sandbox does not allow a peer-credential UDS: {exc}")
+    finally:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, OSError, PermissionError):
+            pass
+        if socket_parent.exists():
+            socket_parent.rmdir()

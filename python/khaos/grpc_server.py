@@ -2084,6 +2084,18 @@ async def serve_json_lines(
                 elif method == "MemoryService.SearchMemory":
                     response = await memory.search_memory(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "MemoryService.DeleteMemory":
+                    # C-2-2: route DELETE through the service layer so
+                    # ``ctx.principal_id`` is enforced (cross-principal
+                    # deletion yields ``{"ok": True}`` but only affects
+                    # rows owned by the caller or project-shared rows).
+                    # Previously the dispatcher had no DeleteMemory branch,
+                    # so Go REST ``DELETE /api/memory/{id}`` could never
+                    # reach Python — the in-memory Gateway ``MemoryMap``
+                    # silently swallowed the call and the durable row
+                    # survived in the DB.
+                    response = await memory.delete_memory(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "AuditService.Query":
                     response = await audit_service.query(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))

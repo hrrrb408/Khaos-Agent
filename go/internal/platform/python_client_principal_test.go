@@ -59,10 +59,17 @@ func TestC_1_1_MethodsPassPrincipalIDToWriteRequest(t *testing.T) {
 					_, _ = conn.Write([]byte(`{"ok": true}` + "\n"))
 				case method == "AgentService.HandleWebhook":
 					_, _ = conn.Write([]byte(`{"status": "ok"}` + "\n"))
+				case method == "MemoryService.SetMemory":
+					_, _ = conn.Write([]byte(`{"ok": true, "id": 1}` + "\n"))
+				case method == "MemoryService.DeleteMemory":
+					_, _ = conn.Write([]byte(`{"ok": true}` + "\n"))
+				case method == "MemoryService.GetMemory":
+					_, _ = conn.Write([]byte(`{"id": 1, "scope": "global", "key": "k", "value": "v"}` + "\n"))
 				case method == "AuditService.Query",
 					strings.Contains(method, "List"),
 					strings.Contains(method, "Artifacts"),
-					strings.Contains(method, "Events"):
+					strings.Contains(method, "Events"),
+					method == "MemoryService.SearchMemory":
 					_, _ = conn.Write([]byte("[]\n"))
 				default:
 					_, _ = conn.Write([]byte("{}\n"))
@@ -113,6 +120,23 @@ func TestC_1_1_MethodsPassPrincipalIDToWriteRequest(t *testing.T) {
 		{"Spawn", func() error { _, err := client.Spawn(ctx, principal, "g", "c", nil, 0); return err }, principal},
 		{"CollectResults", func() error { _, err := client.CollectResults(ctx, principal); return err }, principal},
 		{"Status", func() error { _, err := client.Status(ctx, principal); return err }, principal},
+		// C-2-2 (HIGH 6): Memory methods MUST carry principal so
+		// Python's MemoryService can scope reads/writes to the caller.
+		{"GetMemory", func() error {
+			_, err := client.Get(ctx, principal, "global", "k")
+			return err
+		}, principal},
+		{"SetMemory", func() error {
+			_, err := client.Set(ctx, principal, api.Memory{Scope: "global", Key: "k", Value: "v"})
+			return err
+		}, principal},
+		{"DeleteMemory", func() error {
+			return client.Delete(ctx, principal, 1)
+		}, principal},
+		{"SearchMemory", func() error {
+			_, err := client.Search(ctx, principal, "global", "q", 5)
+			return err
+		}, principal},
 	}
 
 	for _, tc := range cases {
