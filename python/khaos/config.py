@@ -142,21 +142,43 @@ def load_config(
     strict_env: bool = True,
     project_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    """Read config and expand supported environment placeholders.
+    """Load the effective configuration with source-derived authority.
 
     With no explicit path, the project template is loaded first and
     ``~/.khaos/config.yaml`` is merged on top so user config wins.
+
+    An explicit file path is still file-backed, untrusted project input.  It
+    is never promoted to a runtime override merely because a caller supplied
+    its name.  Runtime overrides must be parsed structured values from an
+    authenticated caller; this API deliberately has no file-backed runtime
+    override path.
     """
     if path is not None:
         config_path = Path(path).expanduser()
-        raw = _read_yaml_file(config_path)
-        expanded = expand_config_placeholders(raw, source=str(config_path), strict=strict_env)
-        return EffectiveConfig(
-            expanded,
-            _field_provenance(
-                expanded, ConfigAuthority.RUNTIME_OVERRIDE, str(config_path)
-            ),
+        project = _read_yaml_file(config_path)
+        _validate_project_config(project, source=str(config_path))
+        user_path = user_config_path()
+        user = _read_yaml_file(user_path) if user_path.exists() else {}
+        expanded_user = expand_config_placeholders(
+            user, source=str(user_path), strict=strict_env
         )
+        managed = _managed_provider_config()
+        merged = deep_merge(managed, project)
+        merged = deep_merge(merged, expanded_user)
+        provenance = _field_provenance(
+            managed, ConfigAuthority.MANAGED_REQUIREMENT, "trusted environment"
+        )
+        provenance.update(
+            _field_provenance(
+                project, ConfigAuthority.PROJECT_RESTRICTION, str(config_path)
+            )
+        )
+        provenance.update(
+            _field_provenance(
+                expanded_user, ConfigAuthority.USER_GRANT, str(user_path)
+            )
+        )
+        return EffectiveConfig(merged, provenance)
 
     project_path = Path(project_path or PROJECT_CONFIG_PATH).expanduser().resolve()
     user_path = user_config_path()

@@ -1150,32 +1150,23 @@ def test_parse_json_line_rejects_non_object_payload():
 
 async def test_load_router_from_nvidia_config(tmp_path, monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "secret")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     config = tmp_path / "config.yaml"
     config.write_text(
         """
 models:
-  providers:
-    nvidia:
-      type: openai_compatible
-      base_url: "https://integrate.api.nvidia.com/v1"
-      api_key: "${NVIDIA_API_KEY}"
-      models:
-        - name: "qwen/qwen3-8b"
-          max_context_tokens: 32768
-          supports_tools: true
-          supports_vision: false
-  default_model: "qwen/qwen3-8b"
+  default_model: "qwen/qwen3.5-122b-a10b"
   router:
     type: single
 """,
         encoding="utf-8",
     )
 
-    router = load_router_from_config(config)
+    router = load_router_from_config(config, project_root=tmp_path)
     model = await router.resolve_model("agent_loop")
     provider = router.provider_manager.get_provider("nvidia")
 
-    assert model.model == "qwen/qwen3-8b"
+    assert model.model == "qwen/qwen3.5-122b-a10b"
     assert provider.api_key == "secret"
 
 

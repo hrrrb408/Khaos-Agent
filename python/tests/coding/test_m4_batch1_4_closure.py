@@ -407,7 +407,7 @@ def test_safe_config_snapshot_external_symlink_zero_reads(tmp_path: Path):
 
     snap = SafeConfigSnapshot.capture(workspace, "pyproject.toml", reader=_reader)
     assert snap.exists is False
-    assert snap.rejection_code == "escape"
+    assert snap.rejection_code == "read-error"
     assert snap.reader_call_count == 0, f"external symlink was read {snap.reader_call_count} times"
     assert read_count == 0, f"reader was called {read_count} times for external symlink"
 
@@ -432,13 +432,13 @@ def test_safe_config_snapshot_package_json_external_zero_reads(tmp_path: Path):
 
     snap = SafeConfigSnapshot.capture(workspace, "package.json", reader=_reader)
     assert snap.exists is False
-    assert snap.rejection_code == "escape"
+    assert snap.rejection_code == "read-error"
     assert snap.reader_call_count == 0
     assert read_count == 0
 
 
-def test_safe_config_snapshot_internal_symlink_read_once(tmp_path: Path):
-    """Internal symlink (pointing inside workspace) is read exactly once."""
+def test_safe_config_snapshot_internal_symlink_is_rejected(tmp_path: Path):
+    """Internal symlinks are rejected rather than reopened by path."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     target = workspace / "real_config.toml"
@@ -456,9 +456,10 @@ def test_safe_config_snapshot_internal_symlink_read_once(tmp_path: Path):
         return path.read_bytes()
 
     snap = SafeConfigSnapshot.capture(workspace, "pyproject.toml", reader=_reader)
-    assert snap.exists is True
-    assert snap.reader_call_count == 1
-    assert read_count == 1
+    assert snap.exists is False
+    assert snap.rejection_code == "read-error"
+    assert snap.reader_call_count == 0
+    assert read_count == 0
 
 
 def test_safe_config_snapshot_broken_symlink(tmp_path: Path):
@@ -543,7 +544,7 @@ def test_safe_config_snapshot_no_absolute_path_in_diagnostic(tmp_path: Path):
 
     snap = SafeConfigSnapshot.capture(workspace, "pyproject.toml")
     assert snap.exists is False
-    assert snap.rejection_code == "escape"
+    assert snap.rejection_code == "read-error"
     # Diagnostic must NOT contain the absolute path of the external target
     assert str(external) not in snap.diagnostic, f"absolute path leaked: {snap.diagnostic}"
     assert str(tmp_path) not in snap.diagnostic, f"absolute path leaked: {snap.diagnostic}"

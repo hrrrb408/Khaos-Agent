@@ -8,6 +8,7 @@ import json
 import mimetypes
 import os
 import stat
+import tempfile
 from difflib import SequenceMatcher
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,9 +33,8 @@ TREE_EXCLUDE_DIRS = {
 # the fence.  The authority is now injected explicitly through the
 # ToolScheduler's ``office_authority`` instance attribute (set in
 # ``build_runtime``) and threaded into ``copy_file`` / ``move_file`` via the
-# scheduler's ``invocation_context``.  Direct callers that do not pass
-# ``office_authority=...`` fall back to the legacy bare ``to_thread`` path
-# (only safe for trusted inputs in tests).
+# scheduler's ``invocation_context``.  Mutations fail closed when that
+# authority is absent; there is no unfenced production or test fallback.
 
 async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
     """Read a file page with one-based line numbers."""
@@ -52,7 +52,7 @@ async def read_file(path: str, offset: int = 1, limit: int = 500, workspace_mana
     raise PermissionError("read_file requires a Workspace root capability")
 
 
-async def write_file(path: str, content: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
+async def write_file(path: str, content: str, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None, office_authority=None) -> dict[str, Any]:
     """Overwrite a file, creating parent directories as needed."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -70,13 +70,19 @@ async def write_file(path: str, content: str, workspace_manager=None, task_id: s
             ),
         )
     if workspace_root is not None:
-        return await asyncio.to_thread(
-            _office_write_sync, workspace_root, path, content
+        if office_authority is None:
+            raise PermissionError("OfficeMutationAuthority is required for writes")
+        workspace = await office_authority.workspace_for_root(workspace_root)
+        return await office_authority.mutate(
+            workspace,
+            lambda cancel_event: _office_write_mutation(
+                workspace_root, path, content, cancel_event=cancel_event
+            ),
         )
     raise PermissionError("write_file requires a Workspace root capability")
 
 
-async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> dict[str, Any]:
+async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None, office_authority=None) -> dict[str, Any]:
     """Atomically replace text in a file, with optional fuzzy block matching."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -93,13 +99,24 @@ async def patch(path: str, old: str, new: str, fuzzy: bool = True, workspace_man
             ),
         )
     if workspace_root is not None:
-        return await asyncio.to_thread(
-            _office_patch_sync, workspace_root, path, old, new, fuzzy
+        if office_authority is None:
+            raise PermissionError("OfficeMutationAuthority is required for patch")
+        workspace = await office_authority.workspace_for_root(workspace_root)
+        return await office_authority.mutate(
+            workspace,
+            lambda cancel_event: _office_patch_mutation(
+                workspace_root,
+                path,
+                old,
+                new,
+                fuzzy,
+                cancel_event=cancel_event,
+            ),
         )
     raise PermissionError("patch requires a Workspace root capability")
 
 
-async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None) -> str:
+async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_id: str | None = None, workspace_id: str | None = None, workspace_root: Path | None = None, office_authority=None) -> str:
     """Apply multiple exact search-and-replace edits to one file atomically."""
     if workspace_manager is not None:
         workspace = workspace_manager.get(workspace_id or "")
@@ -116,8 +133,14 @@ async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_
             ),
         )
     if workspace_root is not None:
-        return await asyncio.to_thread(
-            _office_multi_edit_sync, workspace_root, path, edits
+        if office_authority is None:
+            raise PermissionError("OfficeMutationAuthority is required for edits")
+        workspace = await office_authority.workspace_for_root(workspace_root)
+        return await office_authority.mutate(
+            workspace,
+            lambda cancel_event: _office_multi_edit_mutation(
+                workspace_root, path, edits, cancel_event=cancel_event
+            ),
         )
     raise PermissionError("multi_edit requires a Workspace root capability")
 
@@ -241,12 +264,7 @@ async def copy_file(src: str, dst: str, workspace_manager=None, task_id: str | N
                     workspace_root, src, dst, cancel_event=cancel_event,
                 ),
             )
-        # B1: no authority injected — legacy unfenced path (only safe for
-        # trusted inputs in tests; production paths always inject via the
-        # scheduler's invocation_context).
-        return await asyncio.to_thread(
-            _office_copy_sync, workspace_root, src, dst
-        )
+        raise PermissionError("OfficeMutationAuthority is required for copy")
     raise PermissionError("copy_file requires a Workspace root capability")
 
 
@@ -271,12 +289,7 @@ async def move_file(src: str, dst: str, workspace_manager=None, task_id: str | N
                     workspace_root, src, dst, cancel_event=cancel_event,
                 ),
             )
-        # B1: no authority injected — legacy unfenced path (only safe for
-        # trusted inputs in tests; production paths always inject via the
-        # scheduler's invocation_context).
-        return await asyncio.to_thread(
-            _office_move_sync, workspace_root, src, dst
-        )
+        raise PermissionError("OfficeMutationAuthority is required for move")
     raise PermissionError("move_file requires a Workspace root capability")
 
 
@@ -328,7 +341,12 @@ async def _workspace_mutate(
 
 
 def _workspace_write_sync(
-    root: Path, recovery_root: Path, path: str, content: str
+    root: Path,
+    recovery_root: Path,
+    path: str,
+    content: str,
+    *,
+    cancel_event=None,
 ) -> object:
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
@@ -338,7 +356,7 @@ def _workspace_write_sync(
         before = filesystem.snapshot_file(path, recovery_root=recovery_root)
         try:
             encoded = content.encode("utf-8")
-            filesystem.write_bytes(path, encoded)
+            filesystem.write_bytes(path, encoded, cancel_event=cancel_event)
             after = filesystem.snapshot_file(path)
         except Exception:
             before.cleanup()
@@ -598,6 +616,117 @@ def _office_move_mutation(
             )
 
     return WorkspaceMutation(value=value, rollback=rollback, finalize=lambda: None)
+
+
+def _private_recovery_root() -> Path:
+    root = Path(tempfile.mkdtemp(prefix="khaos-office-recovery-"))
+    root.chmod(0o700)
+    return root
+
+
+def _with_recovery_cleanup(
+    mutation,
+    recovery_root: Path,
+    *,
+    rollback_created_parents=lambda: None,
+):
+    from khaos.coding.workspace.storage import WorkspaceMutation
+
+    def cleanup() -> None:
+        mutation.finalize()
+        try:
+            recovery_root.rmdir()
+        except FileNotFoundError:
+            pass
+
+    def rollback() -> None:
+        try:
+            mutation.rollback()
+            rollback_created_parents()
+        finally:
+            cleanup()
+
+    return WorkspaceMutation(mutation.value, rollback, cleanup)
+
+
+def _office_write_mutation(
+    root: Path, path: str, content: str, *, cancel_event=None
+) -> object:
+    recovery_root = _private_recovery_root()
+    created_parents = ()
+    try:
+        from khaos.coding.workspace.boundary import SafeWorkspaceFS
+
+        with SafeWorkspaceFS(root) as filesystem:
+            created_parents = filesystem.ensure_parent_directories(path)
+        mutation = _workspace_write_sync(
+            root,
+            recovery_root,
+            path,
+            content,
+            cancel_event=cancel_event,
+        )
+    except Exception:
+        if created_parents:
+            with SafeWorkspaceFS(root) as filesystem:
+                filesystem.remove_empty_directories(created_parents)
+        recovery_root.rmdir()
+        raise
+
+    def rollback_created_parents() -> None:
+        if created_parents:
+            with SafeWorkspaceFS(root) as filesystem:
+                filesystem.remove_empty_directories(created_parents)
+
+    return _with_recovery_cleanup(
+        mutation,
+        recovery_root,
+        rollback_created_parents=rollback_created_parents,
+    )
+
+
+def _office_patch_mutation(
+    root: Path,
+    path: str,
+    old: str,
+    new: str,
+    fuzzy: bool,
+    *,
+    cancel_event=None,
+) -> object:
+    recovery_root = _private_recovery_root()
+    try:
+        mutation = _workspace_patch_sync(
+            root,
+            recovery_root,
+            path,
+            old,
+            new,
+            fuzzy,
+            cancel_event=cancel_event,
+        )
+    except Exception:
+        recovery_root.rmdir()
+        raise
+    return _with_recovery_cleanup(mutation, recovery_root)
+
+
+def _office_multi_edit_mutation(
+    root: Path, path: str, edits: list[dict], *, cancel_event=None
+) -> object:
+    recovery_root = _private_recovery_root()
+    try:
+        mutation = _workspace_multi_edit_sync(
+            root,
+            recovery_root,
+            path,
+            edits,
+            cancel_event=cancel_event,
+        )
+    except Exception:
+        recovery_root.rmdir()
+        raise
+    return _with_recovery_cleanup(mutation, recovery_root)
 
 
 def _destination_relative(root: Path, target: str) -> str:
@@ -920,7 +1049,7 @@ def _compile_search_pattern(pattern: str):
 
 def _workspace_patch_sync(
     root: Path, recovery_root: Path, path: str,
-    old: str, new: str, fuzzy: bool,
+    old: str, new: str, fuzzy: bool, *, cancel_event=None,
 ) -> object:
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
@@ -944,7 +1073,9 @@ def _workspace_patch_sync(
             return original[:start] + new + original[end:]
 
         try:
-            filesystem.transform_text(path, transform)
+            filesystem.transform_text(
+                path, transform, cancel_event=cancel_event
+            )
             after = filesystem.snapshot_file(path)
         except Exception:
             before.cleanup()
@@ -958,7 +1089,12 @@ def _workspace_patch_sync(
 
 
 def _workspace_multi_edit_sync(
-    root: Path, recovery_root: Path, path: str, edits: list[dict]
+    root: Path,
+    recovery_root: Path,
+    path: str,
+    edits: list[dict],
+    *,
+    cancel_event=None,
 ) -> object:
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
     from khaos.coding.workspace.storage import WorkspaceMutation
@@ -1002,7 +1138,11 @@ def _workspace_multi_edit_sync(
             updated = updated.replace(edit["old_text"], edit["new_text"], 1)
             applied.append({"index": original_index, "old_text": edit["old_text"]})
         try:
-            filesystem.write_bytes(path, updated.encode("utf-8"))
+            filesystem.write_bytes(
+                path,
+                updated.encode("utf-8"),
+                cancel_event=cancel_event,
+            )
             after = filesystem.snapshot_file(path)
         except Exception:
             before.cleanup()

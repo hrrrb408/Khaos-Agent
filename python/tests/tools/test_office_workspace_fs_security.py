@@ -7,7 +7,17 @@ from khaos.coding.workspace.boundary import (
     SafeWorkspaceFS,
     WorkspaceBoundaryError,
 )
+from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.tools.file_tools import copy_file, move_file, read_file
+
+
+@pytest.fixture
+async def office_authority():
+    authority = OfficeMutationAuthority()
+    try:
+        yield authority
+    finally:
+        await authority.shutdown()
 
 
 async def test_office_read_requires_internal_workspace_capability(tmp_path):
@@ -36,7 +46,7 @@ async def test_office_read_rejects_runtime_memory_dos_file(tmp_path):
         await read_file("large.txt", workspace_root=tmp_path)
 
 
-async def test_office_recursive_copy_is_bounded_and_no_follow(tmp_path):
+async def test_office_recursive_copy_is_bounded_and_no_follow(tmp_path, office_authority):
     workspace = tmp_path / "workspace"
     source = workspace / "bundle"
     source.mkdir(parents=True)
@@ -46,7 +56,7 @@ async def test_office_recursive_copy_is_bounded_and_no_follow(tmp_path):
     (outside / "secret.txt").write_text("HOST_SECRET", encoding="utf-8")
     (source / "leak").symlink_to(outside, target_is_directory=True)
 
-    result = await copy_file("bundle", "copied", workspace_root=workspace)
+    result = await copy_file("bundle", "copied", workspace_root=workspace, office_authority=office_authority)
 
     assert result["ok"] is False
     assert "symlink" in result["error"]
@@ -54,7 +64,7 @@ async def test_office_recursive_copy_is_bounded_and_no_follow(tmp_path):
     assert not any(workspace.glob(".khaos-tree-*"))
 
 
-async def test_office_recursive_copy_rejects_hardlinks(tmp_path):
+async def test_office_recursive_copy_rejects_hardlinks(tmp_path, office_authority):
     workspace = tmp_path / "workspace"
     source = workspace / "bundle"
     source.mkdir(parents=True)
@@ -62,7 +72,7 @@ async def test_office_recursive_copy_rejects_hardlinks(tmp_path):
     original.write_text("secret", encoding="utf-8")
     os.link(original, source / "alias.txt")
 
-    result = await copy_file("bundle", "copied", workspace_root=workspace)
+    result = await copy_file("bundle", "copied", workspace_root=workspace, office_authority=office_authority)
 
     assert result["ok"] is False
     assert "hardlink" in result["error"]
@@ -70,43 +80,45 @@ async def test_office_recursive_copy_rejects_hardlinks(tmp_path):
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO unavailable")
-async def test_office_recursive_copy_rejects_fifo(tmp_path):
+async def test_office_recursive_copy_rejects_fifo(tmp_path, office_authority):
     workspace = tmp_path / "workspace"
     source = workspace / "bundle"
     source.mkdir(parents=True)
     os.mkfifo(source / "pipe")
 
-    result = await copy_file("bundle", "copied", workspace_root=workspace)
+    result = await copy_file("bundle", "copied", workspace_root=workspace, office_authority=office_authority)
 
     assert result["ok"] is False
     assert "special file" in result["error"]
     assert not (workspace / "copied").exists()
 
 
-async def test_office_recursive_copy_succeeds_without_unsafe_objects(tmp_path):
+async def test_office_recursive_copy_succeeds_without_unsafe_objects(tmp_path, office_authority):
     source = tmp_path / "bundle"
     nested = source / "nested"
     nested.mkdir(parents=True)
     (source / "a.txt").write_text("a", encoding="utf-8")
     (nested / "b.txt").write_text("bb", encoding="utf-8")
 
-    result = await copy_file("bundle", "copied", workspace_root=tmp_path)
+    result = await copy_file("bundle", "copied", workspace_root=tmp_path, office_authority=office_authority)
 
     assert result["ok"] is True
     assert result["size_bytes"] == 3
     assert (tmp_path / "copied" / "nested" / "b.txt").read_text() == "bb"
 
 
-async def test_office_copy_and_move_reject_destination_inside_source(tmp_path):
+async def test_office_copy_and_move_reject_destination_inside_source(tmp_path, office_authority):
     source = tmp_path / "bundle"
     source.mkdir()
     (source / "a.txt").write_text("a", encoding="utf-8")
 
     copy_result = await copy_file(
-        "bundle", "bundle/copied", workspace_root=tmp_path
+        "bundle", "bundle/copied", workspace_root=tmp_path,
+        office_authority=office_authority,
     )
     move_result = await move_file(
-        "bundle", "bundle/moved", workspace_root=tmp_path
+        "bundle", "bundle/moved", workspace_root=tmp_path,
+        office_authority=office_authority,
     )
 
     assert copy_result["ok"] is False
@@ -116,14 +128,14 @@ async def test_office_copy_and_move_reject_destination_inside_source(tmp_path):
     assert source.exists()
 
 
-async def test_office_move_rejects_tree_with_nested_symlink(tmp_path):
+async def test_office_move_rejects_tree_with_nested_symlink(tmp_path, office_authority):
     source = tmp_path / "bundle"
     source.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
     (source / "leak").symlink_to(outside, target_is_directory=True)
 
-    result = await move_file("bundle", "moved", workspace_root=tmp_path)
+    result = await move_file("bundle", "moved", workspace_root=tmp_path, office_authority=office_authority)
 
     assert result["ok"] is False
     assert "symlink" in result["error"]

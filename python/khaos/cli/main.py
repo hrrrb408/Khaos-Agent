@@ -74,7 +74,7 @@ async def run_once(args: argparse.Namespace) -> int:
     from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
-        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=f"local-uid:{os.getuid()}", project_id=cli_project_id))
+        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_confirm_from_args(args), principal_id=f"local-uid:{os.getuid()}", source_transport="cli", foreground_session=True, project_id=cli_project_id))
         print(f"session_id: {session_id}", flush=True)
         async for message in runtime.loop.run(args.message, session_id):
             print(encode_sse(message), end="", flush=True)
@@ -110,7 +110,7 @@ async def run_repl(args: argparse.Namespace) -> int:
     from khaos.runtime import RuntimeConfig, build_runtime, close_runtime_or_register
     runtime = None
     try:
-        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=f"local-uid:{os.getuid()}", project_id=cli_project_id))
+        runtime = await build_runtime(RuntimeConfig(db=db, mode_manager=mode_manager, confirm_callback=_interactive_confirm(args), principal_id=f"local-uid:{os.getuid()}", source_transport="cli", foreground_session=True, project_id=cli_project_id))
         loop = runtime.loop
         skill_manager = runtime.skill_manager
         print(f"session_id: {session_id}")

@@ -1,3 +1,6 @@
+import pytest
+
+from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.tools.file_tools import (
     copy_file,
     file_info,
@@ -6,6 +9,15 @@ from khaos.tools.file_tools import (
     move_file,
     tree_view,
 )
+
+
+@pytest.fixture
+async def office_authority():
+    authority = OfficeMutationAuthority()
+    try:
+        yield authority
+    finally:
+        await authority.shutdown()
 
 
 class TestListDirectory:
@@ -142,38 +154,38 @@ class TestTreeView:
 
 
 class TestCopyFile:
-    async def test_copy_file_success(self, tmp_path):
+    async def test_copy_file_success(self, tmp_path, office_authority):
         src = tmp_path / "source.txt"
         dst = tmp_path / "target.txt"
         src.write_text("hello", encoding="utf-8")
 
-        result = await copy_file("source.txt", "target.txt", workspace_root=tmp_path)
+        result = await copy_file("source.txt", "target.txt", workspace_root=tmp_path, office_authority=office_authority)
 
         assert result["ok"] is True
         assert dst.read_text(encoding="utf-8") == "hello"
         assert result["size_bytes"] == 5
 
-    async def test_missing_source_returns_error(self, tmp_path):
-        result = await copy_file("missing.txt", "target.txt", workspace_root=tmp_path)
+    async def test_missing_source_returns_error(self, tmp_path, office_authority):
+        result = await copy_file("missing.txt", "target.txt", workspace_root=tmp_path, office_authority=office_authority)
 
         assert result["ok"] is False
         assert "source does not exist" in result["error"]
 
 
 class TestMoveFile:
-    async def test_move_file_success(self, tmp_path):
+    async def test_move_file_success(self, tmp_path, office_authority):
         src = tmp_path / "source.txt"
         dst = tmp_path / "renamed.txt"
         src.write_text("hello", encoding="utf-8")
 
-        result = await move_file("source.txt", "renamed.txt", workspace_root=tmp_path)
+        result = await move_file("source.txt", "renamed.txt", workspace_root=tmp_path, office_authority=office_authority)
 
         assert result["ok"] is True
         assert not src.exists()
         assert dst.read_text(encoding="utf-8") == "hello"
 
-    async def test_missing_source_returns_error(self, tmp_path):
-        result = await move_file("missing.txt", "target.txt", workspace_root=tmp_path)
+    async def test_missing_source_returns_error(self, tmp_path, office_authority):
+        result = await move_file("missing.txt", "target.txt", workspace_root=tmp_path, office_authority=office_authority)
 
         assert result["ok"] is False
         assert "source does not exist" in result["error"]

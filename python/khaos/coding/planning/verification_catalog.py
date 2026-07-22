@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 _CONTROL_TOKENS = (";", "&&", "||", "|", ">", "<", "`", "$(")
 _CATALOG_PARSER_VERSION = "v3-safe-snapshot-2026-07-12"
 _CONFIG_FILES = ("pyproject.toml", "package.json", "go.mod", "Cargo.toml")
+_MAX_CONFIG_BYTES = 1024 * 1024
 
 
 def _validate_repo_relative(path: str) -> str:
@@ -67,11 +68,10 @@ def _validate_repo_relative(path: str) -> str:
 class SafeConfigSnapshot:
     """Immutable snapshot of a config file read through boundary validation.
 
-    A SafeConfigSnapshot is created by resolving both the repository root and
-    the candidate path, confirming the candidate is inside the root, and then
-    reading the content ONCE. The same snapshot is used for both fingerprint
-    computation and catalog parsing — this guarantees they see the same bytes
-    and prevents TOCTOU (time-of-check-to-time-of-use) divergence.
+    A SafeConfigSnapshot is read through ``SafeWorkspaceFS``: a fixed root
+    descriptor, component-wise ``O_NOFOLLOW`` traversal, regular/single-link
+    validation, a hard size bound, and an identity-stable descriptor read.
+    The same bytes drive both fingerprinting and parsing.
 
     SYMLINK SAFETY: If the resolved candidate escapes the workspace root (via
     symlink, absolute path, or ``..`` traversal), ``exists=False`` and
@@ -104,49 +104,55 @@ class SafeConfigSnapshot:
         Args:
             root: repository root path (None → empty snapshot)
             filename: repo-relative filename (e.g. ``pyproject.toml``)
-            reader: optional callable(path: Path) -> bytes for testing.
-                    When provided, the snapshot records how many times it
-                    was called, proving that external symlinks trigger zero reads.
+            reader: deprecated test hook retained for call compatibility. It
+                    is never invoked because a path-based callback would
+                    reintroduce the check/use race this type prevents.
         """
         if root is None:
             return SafeConfigSnapshot(filename, "", b"", "", False, "", "", 0)
 
-        # Step 1: resolve repository root
+        # Import lazily: ``workspace.boundary`` itself depends on the planning
+        # package's safe-path primitives, so a module-level import would form
+        # a package-initialization cycle.
+        from khaos.coding.workspace.boundary import (
+            SafeWorkspaceFS,
+            WorkspaceBoundaryError,
+        )
+
         try:
-            root_resolved = root.resolve()
-        except OSError:
+            relative = _validate_repo_relative(filename)
+            filesystem = SafeWorkspaceFS(root)
+        except (OSError, ValueError, WorkspaceBoundaryError):
             return SafeConfigSnapshot(filename, "", b"", "", False, "root-unresolvable",
                                       f"cannot resolve repository root for: {filename}", 0)
-
-        # Step 2: resolve candidate (non-strict — broken symlinks still resolve)
-        candidate = root / filename
         try:
-            candidate_resolved = candidate.resolve(strict=False)
-        except OSError:
-            return SafeConfigSnapshot(filename, "", b"", "", False, "broken",
-                                      f"broken symlink for config file: {filename}", 0)
-
-        # Step 3: confirm candidate is inside root
-        try:
-            candidate_resolved.relative_to(root_resolved)
-        except ValueError:
-            # ESCAPE: candidate resolves outside workspace root.
-            # DO NOT read the target content — return immediately.
-            return SafeConfigSnapshot(filename, "", b"", "", False, "escape",
-                                      f"config file escapes workspace root: {filename}", 0)
-
-        # Step 4: read content ONCE via the resolved path
-        read_count = 0
-        try:
-            if reader is not None:
-                content_bytes = reader(candidate_resolved)
+            try:
+                filesystem.stat(relative)
+            except FileNotFoundError:
+                return SafeConfigSnapshot(
+                    filename, "", b"", "", False, "", "", 0
+                )
+            except (OSError, WorkspaceBoundaryError):
+                return SafeConfigSnapshot(
+                    filename,
+                    "",
+                    b"",
+                    "",
+                    False,
+                    "read-error",
+                    f"cannot safely read config file: {filename}",
+                    0,
+                )
+            try:
+                content_bytes = filesystem.read_bytes(
+                    relative, max_bytes=_MAX_CONFIG_BYTES
+                )
                 read_count = 1
-            else:
-                content_bytes = candidate_resolved.read_bytes()
-                read_count = 1
-        except OSError:
-            return SafeConfigSnapshot(filename, "", b"", "", False, "read-error",
-                                      f"cannot read config file: {filename}", read_count)
+            except (OSError, WorkspaceBoundaryError):
+                return SafeConfigSnapshot(filename, "", b"", "", False, "read-error",
+                                          f"cannot safely read config file: {filename}", 0)
+        finally:
+            filesystem.close()
         try:
             content = content_bytes.decode("utf-8")
         except UnicodeDecodeError:

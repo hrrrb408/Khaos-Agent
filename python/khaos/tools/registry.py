@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -23,14 +24,66 @@ _OFFICE_WORKSPACE_FILE_TOOLS = frozenset({
     # root (no symlink escape, no arbitrary host file exfiltration).
     "browser_file_upload",
 })
-from dataclasses import field
-
-
 @dataclass(frozen=True)
 class ToolCapability:
     name: str
     modes: frozenset[str]
     scopes: frozenset[str]
+
+
+def _capability(
+    name: str,
+    modes: set[str],
+    scopes: set[str],
+) -> tuple[ToolCapability, ...]:
+    return (ToolCapability(name, frozenset(modes), frozenset(scopes)),)
+
+
+# Explicit migration manifest for declarations that predate ToolCapability.
+# This is intentionally a closed, name-indexed table: production registration
+# never derives authority from permission_level, naming conventions, or tool
+# descriptions.  New tools must either declare capabilities on ToolDefinition
+# or add a reviewed entry here.
+_BUILTIN_CAPABILITY_MANIFEST: dict[str, tuple[ToolCapability, ...]] = {
+    "read_file": _capability("filesystem.read", {"all"}, {"task-workspace", "user-selected"}),
+    "search_files": _capability("filesystem.read", {"all"}, {"task-workspace", "user-selected"}),
+    "list_directory": _capability("filesystem.read", {"office", "coding"}, {"task-workspace", "user-selected"}),
+    "file_info": _capability("filesystem.read", {"office", "coding"}, {"task-workspace", "user-selected"}),
+    "tree_view": _capability("filesystem.read", {"office", "coding"}, {"task-workspace", "user-selected"}),
+    "file_search_content": _capability("filesystem.read", {"office", "coding"}, {"task-workspace", "user-selected"}),
+    "code_search": _capability("filesystem.read", {"coding"}, {"task-workspace"}),
+    "code_symbols": _capability("filesystem.read", {"coding"}, {"task-workspace"}),
+    "write_file": _capability("filesystem.write", {"coding"}, {"task-workspace"}),
+    "multi_edit": _capability("filesystem.write", {"coding"}, {"task-workspace"}),
+    "patch": _capability("filesystem.write", {"coding"}, {"task-workspace"}),
+    "copy_file": _capability("filesystem.write", {"office", "coding"}, {"task-workspace", "user-selected"}),
+    "move_file": _capability("filesystem.write", {"office", "coding"}, {"task-workspace", "user-selected"}),
+    "quick_note": _capability("host.notes.write", {"office"}, {"local-interactive-user"}),
+    "search_notes": _capability("host.notes.read", {"office"}, {"local-interactive-user"}),
+    "list_notes": _capability("host.notes.read", {"office"}, {"local-interactive-user"}),
+    "delete_note": _capability("host.notes.write", {"office"}, {"local-interactive-user"}),
+    "markdown_to_text": _capability("compute.local", {"office"}, {"in-memory"}),
+    "extract_headings": _capability("compute.local", {"office"}, {"in-memory"}),
+    "count_words": _capability("compute.local", {"office"}, {"in-memory"}),
+    "format_markdown_table": _capability("compute.local", {"office"}, {"in-memory"}),
+    "clipboard_read": _capability("host.clipboard.read", {"office"}, {"local-interactive-user"}),
+    "clipboard_write": _capability("host.clipboard.write", {"office"}, {"local-interactive-user"}),
+    "terminal": _capability("process.execute", {"coding"}, {"task-workspace"}),
+    "process": _capability("process.execute", {"coding"}, {"task-workspace"}),
+    "test_run": _capability("process.execute", {"coding"}, {"task-workspace"}),
+    "git_diff": _capability("vcs.read", {"coding"}, {"task-workspace"}),
+    "git_log": _capability("vcs.read", {"coding"}, {"task-workspace"}),
+    "git_status": _capability("vcs.read", {"coding", "office"}, {"task-workspace"}),
+    "git_pr_body": _capability("vcs.read", {"coding"}, {"task-workspace"}),
+    "git_commit": _capability("vcs.write", {"coding"}, {"task-workspace"}),
+    "git_branch": _capability("vcs.write", {"coding"}, {"task-workspace"}),
+    "git_smart_commit": _capability("vcs.write", {"coding"}, {"task-workspace"}),
+    "git_undo": _capability("vcs.write", {"coding"}, {"task-workspace"}),
+    "git_create_branch": _capability("vcs.write", {"coding"}, {"task-workspace"}),
+    "todo_write": _capability("task.state.write", {"coding"}, {"runtime"}),
+    "todo_read": _capability("task.state.read", {"coding"}, {"runtime"}),
+    "todo_update": _capability("task.state.write", {"coding"}, {"runtime"}),
+}
 
 
 @dataclass
@@ -51,17 +104,27 @@ class ToolDefinition:
 class ToolRegistry:
     """Runtime registry for declared tools."""
 
-    def __init__(self, enforce_capabilities: bool = False):
+    def __init__(
+        self,
+        enforce_capabilities: bool = False,
+        *,
+        capability_manifest: dict[str, tuple[ToolCapability, ...]] | None = None,
+    ):
         self._tools: dict[str, ToolDefinition] = {}
         self.enforce_capabilities = enforce_capabilities
+        self._capability_manifest = capability_manifest or {}
 
     def register(self, definition: ToolDefinition) -> None:
         """Register a tool definition."""
         if definition.name in self._tools:
             raise ValueError(f"tool already registered: {definition.name}")
         if self.enforce_capabilities and not definition.capabilities:
-            capability = _infer_capability(definition)
-            definition.capabilities = (capability,) if capability is not None else ()
+            declared = self._capability_manifest.get(definition.name)
+            if not declared:
+                raise ValueError(
+                    f"tool {definition.name} must declare explicit capabilities"
+                )
+            definition.capabilities = declared
         self._tools[definition.name] = definition
 
     def get(self, name: str) -> ToolDefinition:
@@ -120,9 +183,7 @@ class ToolRegistry:
             definition = self._tools.get(name)
             if definition is None:
                 continue
-            # Re-register by writing directly to the internal dict so the
-            # ``enforce_capabilities`` inference path does not re-infer
-            # capabilities for a definition that already declares them.
+            # Re-register the already-validated immutable security contract.
             pruned._tools[name] = definition
         return pruned
 
@@ -189,6 +250,21 @@ class ToolInvocationBroker:
                 raise PermissionError("network.access requires server-authorized network policy")
             if capability.name == "host.integration" and mode == "coding":
                 raise PermissionError("host integration is unavailable to Coding Agent")
+            if capability.name.startswith(("host.notes.", "host.clipboard.")):
+                local_uid = (
+                    f"local-uid:{os.getuid()}"
+                    if hasattr(os, "getuid")
+                    else "local-uid:windows"
+                )
+                if (
+                    context.get("principal_id") != local_uid
+                    or context.get("source_transport") not in {"cli", "tui"}
+                    or context.get("foreground_session") is not True
+                ):
+                    raise PermissionError(
+                        f"{capability.name} requires the local interactive "
+                        "OS user in a foreground CLI/TUI session"
+                    )
         if definition.handler is None:
             raise ToolNotFoundError(f"tool handler not configured: {name}")
         handler_params = dict(params)
@@ -209,6 +285,7 @@ class ToolInvocationBroker:
         if any(capability.name == "network.access" for capability in capabilities):
             handler_params["network_policy"] = context.get("network_policy", "none")
             handler_params["credential_context"] = context.get("credential_context")
+            handler_params["network_guard"] = context.get("network_guard")
             # H1: pass principal_id so browser tools can select a per-principal
             # BrowserContext (cookie / DOM isolation between principals).
             handler_params["principal_id"] = context.get("principal_id", "")
@@ -343,7 +420,7 @@ class ToolInvocationBroker:
             handler_params["workspace_root"] = workspace_root
             # H1: mutations (copy/move) are fenced through the shared authority
             # so cancellation/timeout cannot abandon a running thread.
-            if name in {"copy_file", "move_file"}:
+            if name in {"write_file", "patch", "multi_edit", "copy_file", "move_file"}:
                 handler_params["office_authority"] = context.get("office_authority")
         return await definition.handler(**handler_params)
 
@@ -376,21 +453,6 @@ class ToolInvocationBroker:
                 return True
             return all(self._validate_schema_value(item_schema, item) for item in value)
         return True
-
-
-def _infer_capability(definition: ToolDefinition) -> ToolCapability | None:
-    name = definition.name
-    if name in {"terminal", "test_run", "sandbox_exec"} or name in {"process"}:
-        return ToolCapability("process.execute", frozenset(definition.modes), frozenset({"task-workspace"}))
-    if name in {"write_file", "multi_edit", "patch", "file_patch", "mkdir", "delete_file", "copy_file", "move_file"}:
-        return ToolCapability("filesystem.write", frozenset(definition.modes), frozenset({"task-workspace"}))
-    if name.startswith("git_"):
-        return ToolCapability("vcs.write" if definition.permission_level == "write" else "vcs.read", frozenset(definition.modes), frozenset({"task-workspace"}))
-    if name.startswith("github_"):
-        return ToolCapability("network.access", frozenset(definition.modes), frozenset({"user-selected"}))
-    if definition.permission_level == "read":
-        return ToolCapability("filesystem.read", frozenset(definition.modes), frozenset({"task-workspace", "app-data", "user-selected"}))
-    return ToolCapability("host.integration", frozenset(definition.modes), frozenset({"app-data", "user-selected"}))
 
 
 # Hermes batch 5: declarative specs for cron + history tools. Defined here
@@ -1502,6 +1564,11 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             )
         )
     # ── Phase 6 web content tools (HTML→Markdown, tables, metadata) ──
+    _WEB_NETWORK_CAP = ToolCapability(
+        "network.access",
+        frozenset({"office", "coding"}),
+        frozenset({"user-selected"}),
+    )
     for name, description, parameters in [
         (
             "web_fetch",
@@ -1548,6 +1615,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
                 modes=["office", "coding"],
                 permission_level="read",
                 parallel=True,
+                capabilities=(_WEB_NETWORK_CAP,),
             )
         )
     registry.register(
@@ -1872,7 +1940,10 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
 
 def create_builtin_registry() -> ToolRegistry:
     """Create a registry with the Phase 1 built-in declarations."""
-    registry = ToolRegistry(enforce_capabilities=True)
+    registry = ToolRegistry(
+        enforce_capabilities=True,
+        capability_manifest=_BUILTIN_CAPABILITY_MANIFEST,
+    )
     register_builtin_tools(registry)
     return registry
 

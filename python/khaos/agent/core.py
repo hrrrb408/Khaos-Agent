@@ -99,6 +99,8 @@ class AgentLoop:
         execution_service=None,
         approval_broker=None,
         principal_id: str | None = None,
+        source_transport: str = "unknown",
+        foreground_session: bool = False,
         # H5: runtime_id + session_id extend the per-session BrowserContext
         # key so two concurrent local sessions under the same UID get
         # independent BrowserContexts.  Propagated into ``tool_context`` so
@@ -171,6 +173,8 @@ class AgentLoop:
         # that should not enforce this — the RuntimeConfig gate is the
         # right place for fail-closed.
         self.principal_id = principal_id or f"local-uid:{os.getuid()}"
+        self.source_transport = source_transport
+        self.foreground_session = foreground_session
         # H5: per-runtime + per-session identifiers propagated to the
         # browser tools via the broker so concurrent sessions under the
         # same UID get independent BrowserContexts.
@@ -433,6 +437,8 @@ class AgentLoop:
                         "approval_broker": self.approval_broker,
                         "requester": session_id,
                         "principal_id": self.principal_id,
+                        "source_transport": self.source_transport,
+                        "foreground_session": self.foreground_session,
                         # M4 batch 3.1.16A-5-1b: stamp the bound project
                         # identity into ``tool_context`` so the broker can
                         # inject it into orchestrator tools that spawn

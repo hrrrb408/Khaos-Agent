@@ -46,6 +46,15 @@ class WorkspaceFileSnapshot:
             self.recovery_path.unlink(missing_ok=True)
 
 
+@dataclass(frozen=True)
+class CreatedDirectoryIdentity:
+    """Identity of a parent directory created by one mutation."""
+
+    relative: str
+    device: int
+    inode: int
+
+
 PROTECTED_WORKSPACE_NAMES = frozenset({".git", ".agents", ".codex", ".khaos"})
 DEFAULT_FILE_TOOL_BYTES = 16 * 1024 * 1024
 DEFAULT_TREE_BYTES = 64 * 1024 * 1024
@@ -441,13 +450,23 @@ class SafeWorkspaceFS:
             raise
         return entries
 
-    def ensure_parent_directories(self, target: str | Path) -> None:
-        """Create missing parents through the fixed root without symlinks."""
+    def ensure_parent_directories(
+        self, target: str | Path
+    ) -> tuple[CreatedDirectoryIdentity, ...]:
+        """Create missing parents through the fixed root without symlinks.
+
+        Returns the created directory paths in creation order so an enclosing
+        mutation authority can remove them if publish is cancelled or rolled
+        back.
+        """
         relative = self.relative(target)
         parts = Path(relative).parts[:-1]
+        created: list[CreatedDirectoryIdentity] = []
+        prefix: list[str] = []
         descriptor = os.dup(self._handle.root_fd)
         try:
             for part in parts:
+                prefix.append(part)
                 try:
                     child = os.open(
                         part,
@@ -462,10 +481,43 @@ class SafeWorkspaceFS:
                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                         dir_fd=descriptor,
                     )
+                    info = os.fstat(child)
+                    created.append(
+                        CreatedDirectoryIdentity(
+                            relative="/".join(prefix),
+                            device=info.st_dev,
+                            inode=info.st_ino,
+                        )
+                    )
                 os.close(descriptor)
                 descriptor = child
         finally:
             os.close(descriptor)
+        return tuple(created)
+
+    def remove_empty_directories(
+        self, directories: tuple[CreatedDirectoryIdentity, ...]
+    ) -> None:
+        """Remove unchanged authority-created directories in reverse order."""
+        for directory in reversed(directories):
+            parent = self._parent(directory.relative)
+            try:
+                info = parent.lstat()
+                if info is None:
+                    continue
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_dev != directory.device
+                    or info.st_ino != directory.inode
+                ):
+                    raise WorkspaceBoundaryError(
+                        "created parent directory identity changed"
+                    )
+                parent.revalidate()
+                os.rmdir(parent.leaf, dir_fd=parent.parent_fd)
+                parent.fsync()
+            finally:
+                parent.close()
 
     def copy_path(
         self,
@@ -931,7 +983,12 @@ class SafeWorkspaceFS:
             raise
 
     def write_bytes(
-        self, target: str | Path, content: bytes, *, mode: int = 0o600
+        self,
+        target: str | Path,
+        content: bytes,
+        *,
+        mode: int = 0o600,
+        cancel_event: threading.Event | None = None,
     ) -> None:
         relative = self.relative(target)
         parent = self._parent(relative)
@@ -949,23 +1006,46 @@ class SafeWorkspaceFS:
                 selected_mode = mode & 0o666
         finally:
             parent.close()
-        phase: Callable[..., None] = lambda *_args, **_kwargs: None
+        def phase(*_args, **_kwargs) -> None:
+            return None
+
+        def before_publish() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise MutationCancelled("mutation cancelled before publish")
+
         try:
             if expected_inode is None:
-                self._handle.create(relative, content, selected_mode, phase)
+                self._handle.create(
+                    relative,
+                    content,
+                    selected_mode,
+                    phase,
+                    before_publish,
+                )
             else:
                 self._handle.update(
-                    relative, content, selected_mode, expected_inode, phase
+                    relative,
+                    content,
+                    selected_mode,
+                    expected_inode,
+                    phase,
+                    before_publish,
                 )
         except (OSError, SafePathError) as exc:
             raise WorkspaceBoundaryError(str(exc)) from exc
 
     def transform_text(
-        self, target: str | Path, transform: Callable[[str], str]
+        self,
+        target: str | Path,
+        transform: Callable[[str], str],
+        *,
+        cancel_event: threading.Event | None = None,
     ) -> str:
         original = self.read_bytes(target).decode("utf-8")
         updated = transform(original)
-        self.write_bytes(target, updated.encode("utf-8"))
+        self.write_bytes(
+            target, updated.encode("utf-8"), cancel_event=cancel_event
+        )
         return updated
 
     def copy_file(

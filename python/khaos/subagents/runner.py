@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
@@ -179,6 +178,8 @@ class SubAgentRunner:
             # as the main AgentLoop.
             approval_broker=self.approval_broker,
             principal_id=principal_id,
+            source_transport="subagent",
+            foreground_session=False,
             audit_logger=self.audit_logger,
             # M4 batch 3.1.16A-5-1b (CRITICAL): inject the task's
             # project_id so the subagent's AgentLoop._bound_project_id

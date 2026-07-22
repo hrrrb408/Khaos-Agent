@@ -1,4 +1,16 @@
+import pytest
+
+from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.tools.file_tools import patch, read_file, search_files, write_file
+
+
+@pytest.fixture
+async def office_authority():
+    authority = OfficeMutationAuthority()
+    try:
+        yield authority
+    finally:
+        await authority.shutdown()
 
 
 async def test_read_file_paginates_with_line_numbers(tmp_path):
@@ -13,21 +25,27 @@ async def test_read_file_paginates_with_line_numbers(tmp_path):
     assert result["content"] == "2: b\n3: c"
 
 
-async def test_write_file_creates_parent_and_overwrites(tmp_path):
+async def test_write_file_creates_parent_and_overwrites(tmp_path, office_authority):
     file_path = tmp_path / "nested" / "note.txt"
 
-    result = await write_file(str(file_path), "hello", workspace_root=tmp_path)
+    result = await write_file(
+        str(file_path),
+        "hello",
+        workspace_root=tmp_path,
+        office_authority=office_authority,
+    )
 
     assert file_path.read_text(encoding="utf-8") == "hello"
     assert result["bytes"] == 5
 
 
-async def test_patch_exact_replace(tmp_path):
+async def test_patch_exact_replace(tmp_path, office_authority):
     file_path = tmp_path / "note.txt"
     file_path.write_text("alpha\nbeta\n", encoding="utf-8")
 
     result = await patch(
-        str(file_path), "beta", "gamma", workspace_root=tmp_path
+        str(file_path), "beta", "gamma", workspace_root=tmp_path,
+        office_authority=office_authority,
     )
 
     assert result["replaced"] == 1
@@ -35,20 +53,21 @@ async def test_patch_exact_replace(tmp_path):
     assert file_path.read_text(encoding="utf-8") == "alpha\ngamma\n"
 
 
-async def test_patch_fuzzy_replace(tmp_path):
+async def test_patch_fuzzy_replace(tmp_path, office_authority):
     file_path = tmp_path / "note.txt"
     file_path.write_text("alpha\ncolour blue\nomega\n", encoding="utf-8")
 
     result = await patch(
         str(file_path), "color blue", "color green", fuzzy=True,
         workspace_root=tmp_path,
+        office_authority=office_authority,
     )
 
     assert result["fuzzy"] is True
     assert "color green" in file_path.read_text(encoding="utf-8")
 
 
-async def test_patch_raises_when_missing(tmp_path):
+async def test_patch_raises_when_missing(tmp_path, office_authority):
     file_path = tmp_path / "note.txt"
     file_path.write_text("alpha\n", encoding="utf-8")
 
@@ -56,6 +75,7 @@ async def test_patch_raises_when_missing(tmp_path):
         await patch(
             str(file_path), "missing", "new", fuzzy=False,
             workspace_root=tmp_path,
+            office_authority=office_authority,
         )
     except ValueError as exc:
         assert "not found" in str(exc)

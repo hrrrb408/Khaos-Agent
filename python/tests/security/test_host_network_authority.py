@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 from urllib.parse import urlparse
 
 from khaos.security.host_network import HostNetworkAuthority, HostNetworkDeniedError
+from khaos.security.network_guard import NetworkGuard
 from khaos.tools import web_tools
 
 
@@ -86,11 +87,19 @@ async def test_web_transport_revalidates_redirect_and_disables_proxy(monkeypatch
         async def __aexit__(self, *_args):
             return False
 
-        async def request(self, _method: str, _url: str):
+        def stream(self, _method: str, _url: str):
             response = MagicMock()
             response.status_code = 302
             response.headers = {"location": "http://127.0.0.1:8080/private"}
-            return response
+
+            class Stream:
+                async def __aenter__(self):
+                    return response
+
+                async def __aexit__(self, *_args):
+                    return False
+
+            return Stream()
 
     monkeypatch.setattr(web_tools, "_HOST_NETWORK_AUTHORITY", Authority())
     monkeypatch.setattr(web_tools.httpx, "AsyncClient", Client)
@@ -102,3 +111,113 @@ async def test_web_transport_revalidates_redirect_and_disables_proxy(monkeypatch
     ]
     assert client_options[0]["trust_env"] is False
     assert client_options[0]["follow_redirects"] is False
+
+
+async def test_redirect_to_non_allowlisted_public_domain_is_denied(monkeypatch) -> None:
+    validated_hosts: list[str] = []
+
+    class PublicAuthority:
+        async def validate_url(self, url: str, **_kwargs):
+            parsed = urlparse(url)
+            validated_hosts.append(parsed.hostname or "")
+            return web_tools.ValidatedTarget(
+                url, parsed, parsed.hostname or "", ("93.184.216.34",)
+            )
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def stream(self, _method: str, _url: str):
+            response = MagicMock()
+            response.status_code = 302
+            response.headers = {"location": "https://attacker.example/collect"}
+
+            class Stream:
+                async def __aenter__(self):
+                    return response
+
+                async def __aexit__(self, *_args):
+                    return False
+
+            return Stream()
+
+    guard = NetworkGuard(
+        network_enabled=True,
+        allowed_domains=["docs.safe.example"],
+        host_authority=PublicAuthority(),
+    )
+    monkeypatch.setattr(web_tools.httpx, "AsyncClient", Client)
+
+    with pytest.raises(HostNetworkDeniedError, match="not in allowlist"):
+        await web_tools._request_httpx(
+            "GET",
+            "https://docs.safe.example/page",
+            5,
+            network_guard=guard,
+        )
+
+    assert validated_hosts == ["docs.safe.example"]
+
+
+async def test_streaming_body_limit_stops_before_overflow(monkeypatch) -> None:
+    yielded = 0
+
+    class Authority:
+        async def authorize_url(self, url: str, **_kwargs):
+            parsed = urlparse(url)
+            return web_tools.ValidatedTarget(
+                url, parsed, parsed.hostname or "", ("93.184.216.34",)
+            )
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def stream(self, _method: str, _url: str):
+            response = MagicMock()
+            response.status_code = 200
+            response.headers = {"content-type": "text/html"}
+            response.encoding = "utf-8"
+
+            async def chunks():
+                nonlocal yielded
+                for chunk in (b"12345678", b"abcdefgh", b"unreachable"):
+                    yielded += 1
+                    yield chunk
+
+            response.aiter_bytes = chunks
+
+            class Stream:
+                async def __aenter__(self):
+                    return response
+
+                async def __aexit__(self, *_args):
+                    return False
+
+            return Stream()
+
+    monkeypatch.setattr(web_tools.httpx, "AsyncClient", Client)
+
+    with pytest.raises(ValueError, match="response body exceeds 10 bytes"):
+        await web_tools._request_httpx(
+            "GET",
+            "https://public.example/large",
+            5,
+            network_guard=Authority(),
+            body_limit=10,
+        )
+
+    assert yielded == 2

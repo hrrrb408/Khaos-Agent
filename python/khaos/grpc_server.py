@@ -21,7 +21,7 @@ import time
 import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 # M4 batch 3.1.13 (CRITICAL-3): fcntl-based process-level exclusive
 # lock to enforce the single-instance model.  Without this, a second
@@ -1342,6 +1342,8 @@ class AgentService:
             router=self._router,
             office_authority=self._office_authority,
             principal_id=ctx.principal_id,
+            source_transport=ctx.source_transport,
+            foreground_session=False,
             session_id=session_id,
             # M4 batch 3.1.16A-5-1b (CRITICAL): inject the RPC-verified
             # project identity so ``AgentLoop._bound_project_id`` (and
