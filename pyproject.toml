@@ -9,7 +9,7 @@ description = "Khaos AI Agent platform"
 requires-python = ">=3.11"
 dependencies = [
     "aiosqlite>=0.19",
-    "httpx>=0.28",
+    "httpx>=0.28.1",
     "cryptography>=42",
     "PyYAML>=6",
     "google-re2>=1",
