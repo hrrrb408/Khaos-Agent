@@ -499,8 +499,23 @@ func (h *Handler) setChannelEnabled(w http.ResponseWriter, r *http.Request, enab
 	if !ok {
 		return
 	}
-	principalID, _ := auth.PrincipalFromContext(r.Context())
+	// C-2-4 (HIGH 4): fail-closed on missing principal — previously
+	// ``principalID, _ := ...`` silently passed an empty string to
+	// Python, which then had no caller identity to admin-check.
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
 	if err := client.SetChannelEnabled(r.Context(), principalID, r.PathValue("id"), enabled); err != nil {
+		// C-2-4: Python returns ``status: "forbidden"`` when the
+		// caller is not in ``channel_admins``; PythonClient wraps
+		// that as :var:`api.ErrForbidden`.  Map to 403 so the REST
+		// caller distinguishes authorization failure from 404.
+		if errors.Is(err, ErrForbidden) {
+			writeError(w, http.StatusForbidden, err.Error())
+			return
+		}
 		writeError(w, http.StatusNotFound, err.Error())
 		return
 	}

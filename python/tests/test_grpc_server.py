@@ -1377,3 +1377,96 @@ async def test_c_2_2_dispatcher_routes_memory_delete_memory(tmp_path):
             pass
         if socket_parent.exists():
             socket_parent.rmdir()
+
+
+# ---------------------------------------------------------------------------
+# C-2-4 (HIGH 4): REST channel mutations must be admin-gated.
+# ---------------------------------------------------------------------------
+
+
+async def test_c_2_4_set_channel_enabled_rejects_non_admin(tmp_path):
+    """C-2-4 (HIGH 4): ``AgentService.set_channel_enabled`` MUST reject
+    callers not in ``channel_admins`` (compiled into
+    :class:`EffectiveSecurityPolicy``).  Previously the REST path
+    (Go ``POST /api/channels/{id}/enable``) bypassed admin validation
+    entirely — any authenticated principal could enable/disable any
+    channel.  The tool path (``channel_tools._require_admin``) was
+    already gated, but the REST path had no equivalent check.
+    """
+    from dataclasses import replace
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    # Override only ``channel_admins`` on the policy already compiled by
+    # the ``AgentService`` constructor (which loaded the default user
+    # layer for ``tmp_path``).  ``dataclasses.replace`` preserves every
+    # other field (mode, network, root_capabilities, …) so the policy
+    # remains a valid compilation; resetting ``digest`` to ``""`` lets
+    # ``__post_init__`` recompute it so the digest reflects the new
+    # admin set (matching production ``compile_effective_policy``
+    # semantics where ``channel_admins`` is part of the digest).
+    service._effective_policy = replace(
+        service._effective_policy,
+        channel_admins=frozenset({"api:alice"}),
+        digest="",
+    )
+
+    # Non-admin principal → forbidden.
+    ctx_bob = _test_ctx(principal_id="api:bob")
+    result = service.set_channel_enabled(ctx_bob, "telegram", enabled=True)
+    assert result["ok"] is False, f"non-admin should be rejected: {result}"
+    assert result["status"] == "forbidden", (
+        f"expected status=forbidden, got: {result}"
+    )
+    assert "admin" in result["error"].lower(), (
+        f"error should mention admin, got: {result}"
+    )
+
+    # Admin principal → allowed (channel may not exist, but NOT forbidden).
+    ctx_alice = _test_ctx(principal_id="api:alice")
+    result_alice = service.set_channel_enabled(ctx_alice, "telegram", enabled=True)
+    assert result_alice.get("status") != "forbidden", (
+        f"admin should not be forbidden: {result_alice}"
+    )
+    await db.close()
+
+
+async def test_c_2_4_set_channel_enabled_fail_closed_when_no_admins(tmp_path):
+    """C-2-4 (HIGH 4): when ``channel_admins`` is empty (the default),
+    NO principal can mutate channels — fail-closed until an admin is
+    explicitly declared in ``khaos_policy.yaml``.
+    """
+    from dataclasses import replace
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    service = AgentService(db, project_root=tmp_path)
+    # Explicitly assert the default: no admins declared.  The
+    # ``AgentService`` constructor already compiles a policy with
+    # ``channel_admins=frozenset()`` for ``tmp_path`` (no
+    # ``khaos_policy.yaml``); ``replace`` makes the intent explicit
+    # and resets the digest for consistency.
+    service._effective_policy = replace(
+        service._effective_policy,
+        channel_admins=frozenset(),
+        digest="",
+    )
+
+    # Even a "real" principal is rejected when no admins are declared.
+    ctx = _test_ctx(principal_id="api:alice")
+    result = service.set_channel_enabled(ctx, "telegram", enabled=True)
+    assert result["ok"] is False, (
+        f"should fail-closed when no admins declared: {result}"
+    )
+    assert result["status"] == "forbidden"
+    await db.close()
+
