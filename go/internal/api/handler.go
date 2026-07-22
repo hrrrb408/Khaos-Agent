@@ -27,6 +27,7 @@ type Handler struct {
 	audit                AuditClient
 	subagents            SubagentClient
 	tasks                TaskClient
+	sessionClient        SessionClient
 	config               ConfigStore
 	authenticatedLimiter *rate.KeyedBuckets
 	webhookLimiter       *rate.KeyedBuckets
@@ -39,7 +40,6 @@ type Handler struct {
 	mu                   sync.Mutex
 	streams              map[string]<-chan ChatEvent
 	sessions             map[string]ChatRequest
-	sessionOwners        map[string]string
 	tools                []map[string]any
 }
 
@@ -65,6 +65,13 @@ func (h *Handler) WithAudit(audit AuditClient) *Handler {
 	return h
 }
 
+// WithSessions attaches a durable session client so GET /api/sessions
+// and GET /api/sessions/{id} proxy to Python's SessionService (C-2-3).
+func (h *Handler) WithSessions(sessions SessionClient) *Handler {
+	h.sessionClient = sessions
+	return h
+}
+
 // NewHandler creates an API handler.
 func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiKey string, limiter *rate.TokenBucket) *Handler {
 	ratePerMinute, burst := 60, 10
@@ -87,7 +94,6 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 		startedAt:      time.Now(),
 		streams:        map[string]<-chan ChatEvent{},
 		sessions:       map[string]ChatRequest{},
-		sessionOwners:  map[string]string{},
 		tools: []map[string]any{
 			{"name": "read_file", "modes": []string{"all"}, "permission_level": "read"},
 			{"name": "write_file", "modes": []string{"coding"}, "permission_level": "write"},
@@ -622,9 +628,19 @@ func (h *Handler) authorizeSession(w http.ResponseWriter, r *http.Request, sessi
 		return false
 	}
 	h.mu.Lock()
-	owner := h.sessionOwners[sessionID]
+	// C-2-3: the in-memory ``sessionOwners`` map has been removed;
+	// ownership for the active-stream / confirm path is read from
+	// ``h.sessions[sessionID].PrincipalID`` instead, which is set at
+	// chat-creation time.  This is intentionally an in-memory check:
+	// the active stream itself (``h.streams[sessionID]``) lives only
+	// in this Go process, so the ownership check must share that
+	// lifetime — a restart loses both the stream and the session row
+	// consistently.  Durable session reads (list/detail) are proxied
+	// to Python's SessionService (see handleSessions /
+	// handleSessionDetail).
+	session, ok := h.sessions[sessionID]
 	h.mu.Unlock()
-	if owner == "" || owner != principalID {
+	if !ok || session.PrincipalID != principalID {
 		writeError(w, http.StatusForbidden, "session is not owned by authenticated principal")
 		return false
 	}
@@ -749,9 +765,12 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	req.PrincipalID = principalID
 	h.mu.Lock()
-	owner := h.sessionOwners[req.SessionID]
+	// C-2-3: ownership collision check now reads from
+	// ``h.sessions[req.SessionID].PrincipalID`` (the in-memory active
+	// session map) instead of the deleted ``sessionOwners`` map.
+	existing, ok := h.sessions[req.SessionID]
 	h.mu.Unlock()
-	if owner != "" && owner != req.PrincipalID {
+	if ok && existing.PrincipalID != req.PrincipalID {
 		writeError(w, http.StatusForbidden, "session belongs to another principal")
 		return
 	}
@@ -763,7 +782,6 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 	h.mu.Lock()
 	h.streams[req.SessionID] = stream
 	h.sessions[req.SessionID] = req
-	h.sessionOwners[req.SessionID] = req.PrincipalID
 	h.mu.Unlock()
 	writeJSON(w, http.StatusOK, map[string]string{"session_id": req.SessionID})
 }
@@ -822,9 +840,12 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 	}
 	req.PrincipalID = principalID
 	h.mu.Lock()
-	owner := h.sessionOwners[sessionID]
+	// C-2-3: same ownership collision check as handleChat — read from
+	// ``h.sessions[sessionID].PrincipalID`` instead of the deleted
+	// ``sessionOwners`` map.
+	existing, ok := h.sessions[sessionID]
 	h.mu.Unlock()
-	if owner != "" && owner != req.PrincipalID {
+	if ok && existing.PrincipalID != req.PrincipalID {
 		writeError(w, http.StatusForbidden, "session belongs to another principal")
 		return
 	}
@@ -834,7 +855,6 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	h.mu.Lock()
-	h.sessionOwners[sessionID] = req.PrincipalID
 	h.sessions[sessionID] = req
 	h.mu.Unlock()
 	w.Header().Set("Content-Type", "application/x-ndjson")
@@ -1065,31 +1085,63 @@ func (h *Handler) handleTools(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleSessions(w http.ResponseWriter, r *http.Request) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	sessions := []ChatRequest{}
+	// C-2-3: proxy to Python's SessionService.List (durable sessions
+	// table, principal-scoped) instead of the Go in-memory
+	// ``sessions`` + ``sessionOwners`` maps.  The in-memory maps were
+	// lost on restart and blind to sessions created directly against
+	// Python (CLI, subagents, webhooks).
 	principalID, authenticated := auth.PrincipalFromContext(r.Context())
-	for id, session := range h.sessions {
-		if authenticated && h.sessionOwners[id] != principalID {
-			continue
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	if h.sessionClient == nil {
+		writeError(w, http.StatusServiceUnavailable, "session service not available")
+		return
+	}
+	limit, offset := 20, 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			limit = n
 		}
-		sessions = append(sessions, session)
+	}
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	sessions, err := h.sessionClient.ListSessions(r.Context(), principalID, limit, offset)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
 	}
 	writeJSON(w, http.StatusOK, sessions)
 }
 
 func (h *Handler) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
-	if !h.authorizeSession(w, r, r.PathValue("id")) {
+	// C-2-3: proxy to Python's SessionService.Get (durable session row
+	// + messages, principal-scoped).  Cross-principal access is hidden
+	// by Python as ``{"ok": false, "error": "session not found"}`` so
+	// the REST caller cannot enumerate other principals' session ids.
+	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
 		return
 	}
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	session, ok := h.sessions[r.PathValue("id")]
-	if !ok {
+	if h.sessionClient == nil {
+		writeError(w, http.StatusServiceUnavailable, "session service not available")
+		return
+	}
+	response, err := h.sessionClient.GetSession(r.Context(), principalID, r.PathValue("id"))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if ok, _ := response["ok"].(bool); !ok {
 		writeError(w, http.StatusNotFound, "session not found")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"session": session, "messages": []any{}})
+	writeJSON(w, http.StatusOK, response)
 }
 
 func (h *Handler) handleConfigGet(w http.ResponseWriter, r *http.Request) {

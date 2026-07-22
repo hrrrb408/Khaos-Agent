@@ -236,8 +236,14 @@ func TestAuthenticatedSessionOwnershipIsFailClosed(t *testing.T) {
 	if rec := serve(handler, http.MethodPost, "/api/chat", `{"session_id":"owned","message":"hello"}`, "secret"); rec.Code != http.StatusOK {
 		t.Fatalf("create=%d", rec.Code)
 	}
+	// C-2-3: simulate a cross-principal collision by re-stamping the
+	// in-memory session's PrincipalID to another principal.  The
+	// deleted ``sessionOwners`` map would have done the same; now the
+	// ownership check reads from ``sessions[id].PrincipalID``.
 	apiHandler.mu.Lock()
-	apiHandler.sessionOwners["owned"] = "api-key:another"
+	session := apiHandler.sessions["owned"]
+	session.PrincipalID = "api-key:another"
+	apiHandler.sessions["owned"] = session
 	apiHandler.mu.Unlock()
 	if rec := serve(handler, http.MethodGet, "/api/chat/owned/stream", "", "secret"); rec.Code != http.StatusForbidden {
 		t.Fatalf("cross-principal stream=%d", rec.Code)
@@ -294,7 +300,12 @@ func TestMemoryEndpoints(t *testing.T) {
 
 func TestConfigToolsSessionsHealth(t *testing.T) {
 	handler, _ := newTestHandler("")
-	paths := []string{"/api/config", "/api/tools?mode=coding", "/api/sessions", "/api/health"}
+	// C-2-3: ``/api/sessions`` is no longer in this list because it
+	// now proxies to Python's SessionService and returns 503 when no
+	// session client is wired (verified separately by
+	// TestC_2_3_SessionsEndpointsProxyToPython).  The other endpoints
+	// remain in-process Go-only.
+	paths := []string{"/api/config", "/api/tools?mode=coding", "/api/health"}
 	for _, path := range paths {
 		if rec := serve(handler, http.MethodGet, path, "", ""); rec.Code != http.StatusOK {
 			t.Fatalf("%s status=%d", path, rec.Code)
@@ -454,6 +465,123 @@ type mockLeaseInvalidationTaskClient struct{ mockTaskClient }
 
 func (m *mockLeaseInvalidationTaskClient) CancelTask(_ context.Context, _ string, _ string) (TransitionResult, error) {
 	return TransitionLeaseInvalidationFailed, nil
+}
+
+// --- C-2-3: REST /api/sessions proxies to Python SessionService ---
+
+// mockSessionClient implements SessionClient for the C-2-3 acceptance
+// tests.  It returns a deterministic list for one principal and a
+// not-found response for unknown sessions / cross-principal callers.
+type mockSessionClient struct {
+	listErr      error
+	getResponse  map[string]any
+	getErr       error
+	listCalled   bool
+	listPrincipal string
+}
+
+func (m *mockSessionClient) ListSessions(_ context.Context, principalID string, _, _ int) ([]SessionSummary, error) {
+	m.listCalled = true
+	m.listPrincipal = principalID
+	if m.listErr != nil {
+		return nil, m.listErr
+	}
+	return []SessionSummary{
+		{ID: "s1", Mode: "office", CreatedAt: "2026-07-22T00:00:00Z", MessageCount: 2, Preview: "hello"},
+	}, nil
+}
+
+func (m *mockSessionClient) GetSession(_ context.Context, _ string, _ string) (map[string]any, error) {
+	if m.getErr != nil {
+		return nil, m.getErr
+	}
+	if m.getResponse == nil {
+		return map[string]any{"ok": false, "error": "session not found"}, nil
+	}
+	return m.getResponse, nil
+}
+
+// TestC_2_3_SessionsEndpointsProxyToPython verifies the C-2-3 fix:
+// GET /api/sessions and GET /api/sessions/{id} now proxy to Python's
+// SessionService (via the SessionClient interface) instead of reading
+// the Go in-memory ``sessions`` + ``sessionOwners`` maps.
+//
+// Coverage:
+//   - unauthenticated request → 401 (fail-closed)
+//   - no session client wired → 503 (graceful degradation, not a 5xx
+//     crash or empty 200 that would mislead the caller)
+//   - authenticated list → 200 + the principal-scoped list from the
+//     mock, with the caller's principal forwarded to the client
+//   - session detail not found → 404 (cross-principal hidden as 404)
+//   - session detail found → 200 + the service response
+func TestC_2_3_SessionsEndpointsProxyToPython(t *testing.T) {
+	// 1. No session client wired → 503.
+	bare := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).Routes()
+	if rec := serve(bare, http.MethodGet, "/api/sessions", "", testAPIKey); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no-client list status=%d, want 503", rec.Code)
+	}
+	if rec := serve(bare, http.MethodGet, "/api/sessions/s1", "", testAPIKey); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("no-client detail status=%d, want 503", rec.Code)
+	}
+
+	// 2. Unauthenticated → 401.
+	mock := &mockSessionClient{}
+	authed := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithSessions(mock).Routes()
+	if rec := serveUnauthenticated(authed, http.MethodGet, "/api/sessions", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated list status=%d, want 401", rec.Code)
+	}
+	if rec := serveUnauthenticated(authed, http.MethodGet, "/api/sessions/s1", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated detail status=%d, want 401", rec.Code)
+	}
+
+	// 3. Authenticated list → 200 + principal forwarded.
+	listRec := serve(authed, http.MethodGet, "/api/sessions", "", testAPIKey)
+	if listRec.Code != http.StatusOK {
+		t.Fatalf("authenticated list status=%d, want 200: %s", listRec.Code, listRec.Body.String())
+	}
+	if !mock.listCalled {
+		t.Fatal("ListSessions was not called for /api/sessions")
+	}
+	if !strings.HasPrefix(mock.listPrincipal, "api-key:") {
+		t.Fatalf("principal not forwarded to ListSessions: %q", mock.listPrincipal)
+	}
+	if !strings.Contains(listRec.Body.String(), "s1") {
+		t.Fatalf("list body should contain s1, got: %s", listRec.Body.String())
+	}
+
+	// 4. Detail not found → 404.
+	notFoundMock := &mockSessionClient{getResponse: nil} // returns ok:false
+	notFoundHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithSessions(notFoundMock).Routes()
+	if rec := serve(notFoundHandler, http.MethodGet, "/api/sessions/unknown", "", testAPIKey); rec.Code != http.StatusNotFound {
+		t.Fatalf("not-found detail status=%d, want 404", rec.Code)
+	}
+
+	// 5. Detail found → 200 + service response.
+	foundMock := &mockSessionClient{getResponse: map[string]any{
+		"ok": true, "session_id": "s1",
+		"session": map[string]any{"id": "s1", "mode": "office"},
+		"messages": []any{},
+	}}
+	foundHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithSessions(foundMock).Routes()
+	foundRec := serve(foundHandler, http.MethodGet, "/api/sessions/s1", "", testAPIKey)
+	if foundRec.Code != http.StatusOK {
+		t.Fatalf("found detail status=%d, want 200: %s", foundRec.Code, foundRec.Body.String())
+	}
+	if !strings.Contains(foundRec.Body.String(), "s1") {
+		t.Fatalf("detail body should contain s1, got: %s", foundRec.Body.String())
+	}
+}
+
+// TestC_2_3_SessionsEndpointBadGatewayOnUpstreamError verifies that
+// when the SessionClient returns an error (e.g. Python unreachable),
+// the handler maps it to 502 (not 200 with an empty body that would
+// mislead the caller into thinking there are no sessions).
+func TestC_2_3_SessionsEndpointBadGatewayOnUpstreamError(t *testing.T) {
+	mock := &mockSessionClient{listErr: errors.New("python unreachable")}
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithSessions(mock).Routes()
+	if rec := serve(handler, http.MethodGet, "/api/sessions", "", testAPIKey); rec.Code != http.StatusBadGateway {
+		t.Fatalf("upstream-error list status=%d, want 502", rec.Code)
+	}
 }
 
 func TestTaskRESTAndEvents(t *testing.T) {
