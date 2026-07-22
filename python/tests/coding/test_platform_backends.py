@@ -115,6 +115,54 @@ def test_linux_cgroup_v2_leaf_has_hard_limits(tmp_path: Path, monkeypatch):
     assert "rbps=" in (group / "io.max").read_text()
 
 
+@pytest.mark.asyncio
+async def test_linux_execute_joins_cgroup_before_bwrap_and_seccomp_after(
+    tmp_path: Path, monkeypatch,
+):
+    """The host cgroup join precedes bwrap; seccomp is installed inside it."""
+    from khaos.coding.execution import platform as platform_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    cgroup = tmp_path / "exec-cgroup"
+    cgroup.mkdir()
+    (cgroup / "cgroup.procs").write_text("", encoding="ascii")
+    launcher = Path("/trusted/khaos-sandbox-launcher")
+    captured: dict[str, tuple[str, ...]] = {}
+
+    class RecordingSupervisor:
+        async def run(self, request, **_kwargs):
+            captured["argv"] = request.argv
+            return object()
+
+        async def terminate(self, _execution_id):
+            return None
+
+    monkeypatch.setattr(
+        platform_module, "_create_linux_cgroup",
+        lambda _budget, _workspace: cgroup,
+    )
+    monkeypatch.setattr(
+        platform_module, "_linux_sandbox_launcher", lambda: launcher,
+    )
+    backend = LinuxBubblewrapBackend(supervisor=RecordingSupervisor())
+
+    await backend.execute(ExecutionRequest(
+        ("/bin/echo", "ok"), workspace,
+        permission_profile=PermissionProfile(
+            filesystem=FileSystemAccess.WORKSPACE_WRITE,
+        ).bind_workspace(workspace),
+    ))
+
+    argv = captured["argv"]
+    assert argv[:4] == (
+        str(launcher), "--join-cgroup", str(cgroup / "cgroup.procs"), "--",
+    )
+    assert argv[4] == "bwrap"
+    assert (str(launcher), "--", "/bin/echo", "ok") == argv[-4:]
+    assert "/run/khaos-cgroup.procs" not in argv
+
+
 def test_macos_profile_uses_positive_read_allowlist(tmp_path: Path):
     workspace = tmp_path / "workspace"
     workspace.mkdir()

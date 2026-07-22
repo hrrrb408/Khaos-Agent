@@ -24,7 +24,12 @@ mod linux {
     const BPF_RET: u16 = 0x06;
 
     fn stmt(code: u16, k: u32) -> libc::sock_filter {
-        libc::sock_filter { code, jt: 0, jf: 0, k }
+        libc::sock_filter {
+            code,
+            jt: 0,
+            jf: 0,
+            k,
+        }
     }
 
     fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
@@ -32,10 +37,14 @@ mod linux {
     }
 
     #[cfg(target_arch = "x86_64")]
-    fn audit_arch() -> u32 { AUDIT_ARCH_X86_64 }
+    fn audit_arch() -> u32 {
+        AUDIT_ARCH_X86_64
+    }
 
     #[cfg(target_arch = "aarch64")]
-    fn audit_arch() -> u32 { AUDIT_ARCH_AARCH64 }
+    fn audit_arch() -> u32 {
+        AUDIT_ARCH_AARCH64
+    }
 
     fn denied_syscalls() -> &'static [libc::c_long] {
         &[
@@ -80,7 +89,10 @@ mod linux {
         }
         filter.push(stmt(BPF_RET | BPF_K, SECCOMP_RET_ALLOW));
         let mut program = libc::sock_fprog {
-            len: filter.len().try_into().map_err(|_| io::Error::other("filter too large"))?,
+            len: filter
+                .len()
+                .try_into()
+                .map_err(|_| io::Error::other("filter too large"))?,
             filter: filter.as_mut_ptr(),
         };
         let no_new_privs = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -100,28 +112,13 @@ mod linux {
         Ok(())
     }
 
-    pub fn run() -> io::Result<()> {
-        let mut args: Vec<_> = env::args_os().skip(1).collect();
-        let cgroup = if args.first().is_some_and(|arg| arg == "--cgroup-procs") {
-            if args.len() < 4 || args[2] != "--" {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "expected --cgroup-procs PATH -- COMMAND",
-                ));
-            }
-            let path = PathBuf::from(args.remove(1));
-            args.drain(0..2);
-            Some(path)
-        } else {
-            None
-        };
+    fn exec(args: &[std::ffi::OsString]) -> io::Result<()> {
         if args.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "command required"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "command required",
+            ));
         }
-        if let Some(path) = cgroup {
-            std::fs::write(path, b"0")?;
-        }
-        install_seccomp()?;
         let program = CString::new(args[0].as_bytes())?;
         let c_args: Result<Vec<_>, _> = args
             .iter()
@@ -132,6 +129,30 @@ mod linux {
         pointers.push(std::ptr::null());
         unsafe { libc::execvp(program.as_ptr(), pointers.as_ptr()) };
         Err(io::Error::last_os_error())
+    }
+
+    pub fn run() -> io::Result<()> {
+        let mut args: Vec<_> = env::args_os().skip(1).collect();
+        if args.first().is_some_and(|arg| arg == "--join-cgroup") {
+            if args.len() < 4 || args[2] != "--" {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "expected --join-cgroup PATH -- COMMAND",
+                ));
+            }
+            let path = PathBuf::from(args.remove(1));
+            args.drain(0..2);
+            // This stage runs before bubblewrap creates a user namespace.
+            // Joining the delegated cgroup from inside that namespace is
+            // rejected by the kernel even when cgroup.procs is bind-mounted.
+            std::fs::write(path, b"0")?;
+            return exec(&args);
+        }
+        if args.first().is_some_and(|arg| arg == "--") {
+            args.remove(0);
+        }
+        install_seccomp()?;
+        exec(&args)
     }
 }
 

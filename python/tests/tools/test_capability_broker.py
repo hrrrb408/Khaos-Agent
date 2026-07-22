@@ -1,7 +1,6 @@
-import os
-
 import pytest
 
+from khaos.runtime.context import RequestContext
 from khaos.tools.registry import (
     ToolCapability,
     ToolDefinition,
@@ -90,7 +89,7 @@ async def test_host_notes_reject_remote_and_background_principals():
             "list_notes",
             mode="office",
             context={
-                "principal_id": f"local-uid:{os.getuid()}",
+                "principal_id": RequestContext.for_cli().principal_id,
                 "source_transport": "cron",
                 "foreground_session": False,
             },
@@ -120,7 +119,7 @@ async def test_host_notes_allow_local_foreground_cli():
         "list_notes",
         mode="office",
         context={
-            "principal_id": f"local-uid:{os.getuid()}",
+            "principal_id": RequestContext.for_cli().principal_id,
             "source_transport": "cli",
             "foreground_session": True,
         },

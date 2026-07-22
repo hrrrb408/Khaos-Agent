@@ -352,12 +352,12 @@ class LinuxBubblewrapBackend:
                 prefix = self.argv_prefix(
                     Path(tmp), cwd=Path(tmp), synthetic_home=Path(home),
                     resources=budget, command=("/bin/sh",),
-                    cgroup_procs=cgroup / "cgroup.procs",
                 )
                 completed = subprocess.run(
                     (
-                        *prefix, "--", str(launcher), "--cgroup-procs",
-                        "/run/khaos-cgroup.procs", "--", "/bin/sh", "-c",
+                        str(launcher), "--join-cgroup",
+                        str(cgroup / "cgroup.procs"), "--", *prefix, "--",
+                        str(launcher), "--", "/bin/sh", "-c",
                         "echo probe > .probe && cat .probe",
                     ),
                     capture_output=True,
@@ -400,7 +400,6 @@ class LinuxBubblewrapBackend:
         resources: ResourceBudget | None = None,
         command: tuple[str, ...] = (),
         environment: dict[str, str] | None = None,
-        cgroup_procs: Path | None = None,
     ) -> tuple[str, ...]:
         canonical_worktree = worktree.expanduser().resolve()
         canonical_cwd = (cwd or canonical_worktree).expanduser().resolve()
@@ -444,10 +443,6 @@ class LinuxBubblewrapBackend:
         launcher = _linux_sandbox_launcher()
         if launcher is not None:
             prefix.extend(("--ro-bind", str(launcher), str(launcher)))
-        if cgroup_procs is not None:
-            prefix.extend((
-                "--bind", str(cgroup_procs), "/run/khaos-cgroup.procs",
-            ))
         safe_environment = _sandbox_environment(
             None, environment or {}, home="/home/khaos", tmpdir="/tmp"
         )
@@ -485,7 +480,6 @@ class LinuxBubblewrapBackend:
                 resources=profile.resources,
                 command=request.argv,
                 environment=request.environment,
-                cgroup_procs=cgroup / "cgroup.procs",
             )
             launcher = _linux_sandbox_launcher()
             if launcher is None:
@@ -493,8 +487,9 @@ class LinuxBubblewrapBackend:
                     "execution refused: no_new_privs/seccomp launcher unavailable"
                 )
             sandboxed = replace(request, argv=(
-                *prefix, "--", str(launcher), "--cgroup-procs",
-                "/run/khaos-cgroup.procs", "--", *request.argv,
+                str(launcher), "--join-cgroup",
+                str(cgroup / "cgroup.procs"), "--", *prefix, "--",
+                str(launcher), "--", *request.argv,
             ))
             supervisor = self.supervisor or ProcessSupervisor()
             self.supervisor = supervisor
