@@ -163,6 +163,13 @@ class AgentLoop:
 
             approval_broker = ApprovalBroker(db=db)
         self.approval_broker = approval_broker
+        # C-1-5a: ``principal_id`` defaults to local-uid for backward
+        # compat with ad-hoc test constructions.  Production paths go
+        # through ``RuntimeConfig`` which fail-closed on empty
+        # principal_id (CLI/TUI explicitly pass local-uid; RPC paths
+        # pass ctx.principal_id).  AgentLoop is a lower-level class
+        # that should not enforce this — the RuntimeConfig gate is the
+        # right place for fail-closed.
         self.principal_id = principal_id or f"local-uid:{os.getuid()}"
         # H5: per-runtime + per-session identifiers propagated to the
         # browser tools via the broker so concurrent sessions under the

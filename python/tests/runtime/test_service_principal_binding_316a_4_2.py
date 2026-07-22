@@ -262,17 +262,28 @@ async def test_subagent_spawn_stamps_ctx_principal_not_payload():
 # ---------------------------------------------------------------------------
 
 
-async def _make_alice_manager_with_task() -> tuple[TaskManager, str]:
-    """Async helper: build a TaskManager bound to ``api:alice`` with one task."""
-    manager = TaskManager(principal_id="api:alice")
+async def _make_db_with_alice_task(tmp_path) -> tuple[Database, str]:
+    """Async helper: build a real DB with one task owned by ``api:alice``.
+
+    C-1-5a: TaskService now takes ``db`` (not a TaskManager) and
+    constructs per-principal managers on demand.  Tests must use a
+    real DB so the per-principal manager can ``load()`` the task.
+    """
+    db = Database(tmp_path / "task-service-test.db")
+    await db.connect()
+    await db.run_migrations()
+    manager = TaskManager(db=db, principal_id="api:alice")
+    await manager.load()
     task = await manager.create("alice-task")
-    return manager, task.id
+    await db.close()
+    return db, task.id
 
 
-async def test_task_service_list_is_principal_scoped():
+async def test_task_service_list_is_principal_scoped(tmp_path):
     """Principal B's list returns 0 tasks even if Principal A has tasks."""
-    manager, _ = await _make_alice_manager_with_task()
-    service = TaskService(manager)
+    db, _ = await _make_db_with_alice_task(tmp_path)
+    await db.connect()
+    service = TaskService(db)
 
     alice_tasks = await service.list(_ctx("api:alice"))
     assert len(alice_tasks) == 1
@@ -283,16 +294,18 @@ async def test_task_service_list_is_principal_scoped():
 
     bob_active = await service.list(_ctx("api:bob"), active_only=True)
     assert bob_active == []
+    await db.close()
 
 
-async def test_task_service_get_hides_cross_principal_task():
+async def test_task_service_get_hides_cross_principal_task(tmp_path):
     """Principal B's get on Principal A's task returns ``not found``.
 
     Existence is hidden — Principal B cannot enumerate another
     principal's task ids by probing.
     """
-    manager, task_id = await _make_alice_manager_with_task()
-    service = TaskService(manager)
+    db, task_id = await _make_db_with_alice_task(tmp_path)
+    await db.connect()
+    service = TaskService(db)
 
     alice_get = await service.get(_ctx("api:alice"), task_id)
     assert alice_get["goal"] == "alice-task"
@@ -300,12 +313,14 @@ async def test_task_service_get_hides_cross_principal_task():
     bob_get = await service.get(_ctx("api:bob"), task_id)
     assert bob_get["error"] == "task not found"
     assert bob_get["task_id"] == task_id
+    await db.close()
 
 
-async def test_task_service_cancel_hides_cross_principal_task():
+async def test_task_service_cancel_hides_cross_principal_task(tmp_path):
     """Principal B cannot cancel Principal A's task — returns ``not found``."""
-    manager, task_id = await _make_alice_manager_with_task()
-    service = TaskService(manager)
+    db, task_id = await _make_db_with_alice_task(tmp_path)
+    await db.connect()
+    service = TaskService(db)
 
     bob_cancel = await service.cancel(_ctx("api:bob"), task_id)
     assert bob_cancel["ok"] is False
@@ -314,26 +329,32 @@ async def test_task_service_cancel_hides_cross_principal_task():
     # Principal A can still cancel their own task.
     alice_cancel = await service.cancel(_ctx("api:alice"), task_id)
     assert alice_cancel["ok"] is True
+    await db.close()
 
 
-async def test_task_service_artifacts_hides_cross_principal_task():
+async def test_task_service_artifacts_hides_cross_principal_task(tmp_path):
     """Principal B's artifacts on Principal A's task returns ``[]``."""
-    manager, task_id = await _make_alice_manager_with_task()
-    # Modify the task to have some artifacts.
+    db, task_id = await _make_db_with_alice_task(tmp_path)
+    await db.connect()
+    # Modify the task to have some artifacts (via a per-principal manager).
+    manager = TaskManager(db=db, principal_id="api:alice")
+    await manager.load()
     await manager.track_file_modified(task_id, "/tmp/alice-file.txt")
-    service = TaskService(manager)
+    service = TaskService(db)
 
     alice_artifacts = await service.artifacts(_ctx("api:alice"), task_id)
     assert any(a["path"] == "/tmp/alice-file.txt" for a in alice_artifacts)
 
     bob_artifacts = await service.artifacts(_ctx("api:bob"), task_id)
     assert bob_artifacts == []
+    await db.close()
 
 
-async def test_task_service_events_hides_cross_principal_task():
+async def test_task_service_events_hides_cross_principal_task(tmp_path):
     """Principal B's events subscription on Principal A's task yields nothing."""
-    manager, task_id = await _make_alice_manager_with_task()
-    service = TaskService(manager)
+    db, task_id = await _make_db_with_alice_task(tmp_path)
+    await db.connect()
+    service = TaskService(db)
 
     # Principal A's subscription would yield events when the task
     # transitions.  Principal B's subscription yields nothing.
@@ -341,34 +362,44 @@ async def test_task_service_events_hides_cross_principal_task():
     async for event in service.events(_ctx("api:bob"), task_id):
         bob_events.append(event)
     assert bob_events == []
+    await db.close()
 
 
-async def test_task_service_create_fails_closed_for_mismatched_principal():
-    """``create`` rejects when ``ctx.principal_id != manager.principal_id``.
+async def test_task_service_create_succeeds_per_principal(tmp_path):
+    """``create`` succeeds for any authenticated principal (C-1-5a).
 
-    The shared server-level ``TaskManager`` is bound to ``local-uid``.
-    An API principal calling ``create`` through that manager would
-    create a task stamped with ``local-uid`` — invisible to the API
-    principal's filtered ``list``.  A-4-2 fails closed: the create is
-    rejected with a clear error, deferring the proper fix (per-principal
-    TaskManager) to A-4-3 / A-4-4.
+    C-1-5a: previously ``create`` was rejected for API principals
+    because the server-level ``TaskManager(local-uid)`` singleton
+    rejected mismatched principals (fail-closed, deferred to
+    A-4-3/A-4-4).  Now TaskService constructs per-principal
+    TaskManagers on demand, so any authenticated principal can
+    create tasks.  The task is stamped with ``ctx.principal_id``
+    and visible only to that principal's ``list``.
     """
-    manager = TaskManager(principal_id="local-uid:501")
-    service = TaskService(manager)
+    db = Database(tmp_path / "task-create-test.db")
+    await db.connect()
+    await db.run_migrations()
+    service = TaskService(db)
 
-    # Local user (matching principal) can create — to_dict() includes
-    # ``error: None`` (the task-level error field), so we assert on
-    # the task goal instead.
+    # Local user can create.
     local_create = await service.create(_ctx("local-uid:501"), "local-task")
     assert local_create["goal"] == "local-task"
 
-    # API principal (mismatched principal) is rejected.
+    # API principal can ALSO create (previously rejected).
     api_create = await service.create(_ctx("api:alice"), "api-task")
-    assert api_create["ok"] is False
-    assert "per-principal TaskManager required" in api_create["error"]
+    assert api_create["goal"] == "api-task"
+
+    # Alice's task is visible only to alice, not to bob.
+    alice_tasks = await service.list(_ctx("api:alice"))
+    assert len(alice_tasks) == 1
+    assert alice_tasks[0]["goal"] == "api-task"
+
+    bob_tasks = await service.list(_ctx("api:bob"))
+    assert bob_tasks == []
+    await db.close()
 
 
-async def test_task_service_approve_rejects_forged_payload_principal():
+async def test_task_service_approve_rejects_forged_payload_principal(tmp_path):
     """``approve`` rejects when the payload's ``principal_id`` disagrees
     with ``ctx.principal_id``.
 
@@ -376,8 +407,12 @@ async def test_task_service_approve_rejects_forged_payload_principal():
     match the task's pending approval principal.  The transport
     ``ctx.principal_id`` is the authority — any mismatch is rejected.
     """
+    db = Database(tmp_path / "approve-test.db")
+    await db.connect()
+    await db.run_migrations()
     broker = ApprovalBroker()
-    manager = TaskManager(principal_id="api:alice")
+    manager = TaskManager(db=db, principal_id="api:alice")
+    await manager.load()
     task = await manager.create("approval-task")
     binding = ApprovalBinding(
         principal_id="api:alice", session_id="session-1", task_id=task.id,
@@ -395,7 +430,7 @@ async def test_task_service_approve_rejects_forged_payload_principal():
             "binding_digest": binding_digest,
         },
     )
-    service = TaskService(manager, broker)
+    service = TaskService(db, broker)
 
     # Forged payload: ctx is "api:bob" but payload claims "api:alice".
     forged = await service.approve(
@@ -415,12 +450,17 @@ async def test_task_service_approve_rejects_forged_payload_principal():
         binding_digest=binding_digest,
     )
     assert legit["ok"] is True
+    await db.close()
 
 
-async def test_task_service_reject_rejects_forged_payload_principal():
+async def test_task_service_reject_rejects_forged_payload_principal(tmp_path):
     """``reject`` symmetrically rejects a forged payload principal."""
+    db = Database(tmp_path / "reject-test.db")
+    await db.connect()
+    await db.run_migrations()
     broker = ApprovalBroker()
-    manager = TaskManager(principal_id="api:alice")
+    manager = TaskManager(db=db, principal_id="api:alice")
+    await manager.load()
     task = await manager.create("approval-task")
     binding = ApprovalBinding(
         principal_id="api:alice", session_id="session-1", task_id=task.id,
@@ -438,7 +478,7 @@ async def test_task_service_reject_rejects_forged_payload_principal():
             "binding_digest": binding_digest,
         },
     )
-    service = TaskService(manager, broker)
+    service = TaskService(db, broker)
 
     forged = await service.reject(
         _ctx("api:bob"), task.id,
@@ -448,6 +488,7 @@ async def test_task_service_reject_rejects_forged_payload_principal():
     )
     assert forged["ok"] is False
     assert "does not match transport principal" in forged["error"]
+    await db.close()
 
 
 # ---------------------------------------------------------------------------

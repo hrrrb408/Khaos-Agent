@@ -65,9 +65,14 @@ class RuntimeConfig:
     # turns (closing the cross-turn quota bypass) and the lifecycle is owned
     # by the caller — ``RuntimeResult.aclose`` will NOT shut it down.
     office_authority: OfficeMutationAuthority | None = None
-    principal_id: str = field(
-        default_factory=lambda: f"local-uid:{os.getuid()}"
-    )
+    # C-1-5a: ``principal_id`` is REQUIRED — no implicit local-uid
+    # fallback.  CLI/TUI callers explicitly pass
+    # ``f"local-uid:{os.getuid()}"`` (the OS user identity is the
+    # correct principal for single-user local scenarios).  RPC paths
+    # pass the authenticated principal from ``RequestContext``.  If
+    # a caller forgets to set it, ``build_runtime`` raises ValueError
+    # (fail-closed) instead of silently running as the local OS user.
+    principal_id: str = ""
     # H5: session_id + runtime_id extend the per-session BrowserContext key
     # so two concurrent local sessions under the same UID get independent
     # contexts (cookie / DOM / page isolation).  ``runtime_id`` defaults to
@@ -442,6 +447,16 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     """Build and initialize a complete runtime; this is the sole loop factory."""
     if cfg.db is None:
         raise ValueError("RuntimeConfig.db is required")
+    # C-1-5a: fail-closed if principal_id is empty.  CLI/TUI explicitly
+    # pass ``f"local-uid:{os.getuid()}"``; RPC paths pass the
+    # authenticated principal from ``RequestContext``.  An empty
+    # principal_id here means a caller forgot to set it — running as
+    # the local OS user would be a silent privilege escalation.
+    if not cfg.principal_id:
+        raise ValueError(
+            "RuntimeConfig.principal_id is required (CLI/TUI pass "
+            "f'local-uid:{os.getuid()}'; RPC paths pass ctx.principal_id)"
+        )
     root = cfg.project_root.expanduser().resolve()
     mode_manager = cfg.mode_manager or ModeManager(
         cfg.db, project_root=root,

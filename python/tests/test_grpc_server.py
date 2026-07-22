@@ -218,14 +218,19 @@ async def test_webhook_session_and_principal_are_channel_bound(tmp_path, monkeyp
     await db.close()
 
 
-async def test_task_service_only_approves_or_rejects_blocked_tasks():
+async def test_task_service_only_approves_or_rejects_blocked_tasks(tmp_path):
     from khaos.coding.task_manager import TaskManager
 
     # M4 batch 3.1.16A-4-2: TaskManager and ctx must agree on the
     # principal — otherwise the service hides the task as "not found".
+    # C-1-5a: TaskService now takes db (not a TaskManager).
+    db = Database(tmp_path / "task-blocked-test.db")
+    await db.connect()
+    await db.run_migrations()
     ctx = _test_ctx(principal_id="principal")
-    manager = TaskManager(principal_id="principal")
-    service = TaskService(manager)
+    manager = TaskManager(db=db, principal_id="principal")
+    await manager.load()
+    service = TaskService(db)
     task = await manager.create("approval")
     not_blocked = await service.approve(ctx, task.id)
     await manager.update_status(task.id, "blocked")
@@ -235,16 +240,22 @@ async def test_task_service_only_approves_or_rejects_blocked_tasks():
     assert not not_blocked["ok"]
     assert not approved["ok"]
     assert not rejected["ok"]
+    await db.close()
 
 
-async def test_task_approval_is_consumed_before_running_is_observable():
+async def test_task_approval_is_consumed_before_running_is_observable(tmp_path):
     from khaos.coding.task_manager import TaskManager, TaskStatus
 
     broker = ApprovalBroker()
     # M4 batch 3.1.16A-4-2: bind the manager to the same principal as
     # the ctx and the ApprovalBinding so all three agree.
+    # C-1-5a: TaskService now takes db (not a TaskManager).
+    db = Database(tmp_path / "task-approval-test.db")
+    await db.connect()
+    await db.run_migrations()
     ctx = _test_ctx(principal_id="principal")
-    manager = TaskManager(principal_id="principal")
+    manager = TaskManager(db=db, principal_id="principal")
+    await manager.load()
     task = await manager.create("atomic approval")
     binding = ApprovalBinding(
         principal_id="principal", session_id="session", task_id=task.id,
@@ -262,7 +273,7 @@ async def test_task_approval_is_consumed_before_running_is_observable():
             "binding_digest": binding_digest,
         },
     )
-    service = TaskService(manager, broker)
+    service = TaskService(db, broker)
 
     approved = await service.approve(
         ctx, task.id, principal_id="principal", session_id="session",
@@ -270,7 +281,12 @@ async def test_task_approval_is_consumed_before_running_is_observable():
     )
 
     assert approved["ok"] is True
-    approved_task = await manager.get(task.id)
+    # C-1-5a: ``service.approve`` operates on the service's internal
+    # per-principal TaskManager (a different instance from the setup
+    # ``manager``), so verify the transition + metadata via the
+    # service's manager — the setup manager's in-memory cache is stale.
+    service_manager = await service._manager(ctx)
+    approved_task = await service_manager.get(task.id)
     assert approved_task.status is TaskStatus.RUNNING
     evidence = approved_task.metadata["approval_consumption"]
     assert evidence["tool_call_id"] == "tool-call"
@@ -286,14 +302,19 @@ async def test_task_approval_is_consumed_before_running_is_observable():
         binding_digest=binding_digest,
     )
     assert replay["ok"] is False
+    await db.close()
 
 
-async def test_stale_task_approval_never_publishes_running_state():
+async def test_stale_task_approval_never_publishes_running_state(tmp_path):
     from khaos.coding.task_manager import TaskManager, TaskStatus
 
     broker = ApprovalBroker()
+    db = Database(tmp_path / "task-stale-test.db")
+    await db.connect()
+    await db.run_migrations()
     ctx = _test_ctx(principal_id="principal")
-    manager = TaskManager(principal_id="principal")
+    manager = TaskManager(db=db, principal_id="principal")
+    await manager.load()
     task = await manager.create("stale approval")
     await manager.update_status(
         task.id, TaskStatus.BLOCKED,
@@ -302,13 +323,14 @@ async def test_stale_task_approval_never_publishes_running_state():
             "session_id": "session", "binding_digest": "digest",
         },
     )
-    response = await TaskService(manager, broker).approve(
+    response = await TaskService(db, broker).approve(
         ctx, task.id, principal_id="principal", session_id="session",
         binding_digest="digest",
     )
 
     assert response["ok"] is False
     assert (await manager.get(task.id)).status is TaskStatus.BLOCKED
+    await db.close()
 
 
 async def test_agent_service_permission_waits_for_confirm(tmp_path):
@@ -348,8 +370,11 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
     events = [event async for event in stream]
 
     assert any(event["event"] == "tool_result" and event["data"]["success"] for event in events)
-    task = next(iter(service.task_manager._tasks.values()))
-    target_path = task.metadata["worktree_path"]
+    # C-1-5a: AgentService no longer holds a server-level task_manager.
+    # Query the DB directly to find the per-turn task's worktree_path.
+    tasks = await db.list_coding_tasks(principal_id=f"local-uid:{os.getuid()}")
+    assert len(tasks) == 1
+    target_path = tasks[0].get("metadata", {}).get("worktree_path")
     from pathlib import Path
     assert (Path(target_path) / target).read_text(encoding="utf-8") == "hello"
     assert not (project / target).exists()
