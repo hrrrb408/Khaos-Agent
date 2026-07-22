@@ -1470,3 +1470,84 @@ async def test_c_2_4_set_channel_enabled_fail_closed_when_no_admins(tmp_path):
     assert result["status"] == "forbidden"
     await db.close()
 
+
+# ---------------------------------------------------------------------------
+# C-2-5 (HIGH 2): TaskService.cancel must surface LEASE_INVALIDATION_FAILED.
+# ---------------------------------------------------------------------------
+
+
+async def test_c_2_5_cancel_surfaces_lease_invalidation_failed(tmp_path):
+    """C-2-5 (HIGH 2): when ``TaskManager.cancel`` returns
+    ``LEASE_INVALIDATION_FAILED``, ``TaskService.cancel`` MUST return
+    ``{"ok": False, "status": "lease_invalidation_failed"}`` — NOT the
+    previous ``{"ok": True}`` that silently treated a fail-closed
+    refusal as success.
+
+    The TaskManager keeps the task in its pre-cancel state (Batch 2.6
+    §4) so the caller can retry; the RPC layer must not mask that as a
+    successful cancel, or the REST caller sees HTTP 200 while the task
+    is still active.
+    """
+    db = Database(tmp_path / "c-2-5.db")
+    await db.connect()
+    await db.run_migrations()
+    ctx = _test_ctx(principal_id="principal")
+    service = TaskService(db)
+
+    # Create a real task via the service so the per-principal manager
+    # cache is populated.
+    created = await service.create(ctx, "lease fail test")
+    task_id = created["id"]
+
+    # Install a failing lease-invalidation hook on the service's
+    # per-principal manager (the same hook the approval runtime
+    # registers in production via ``set_lease_invalidation_hook``).
+    manager = await service._manager(ctx)
+
+    def failing_hook(*, task_id: str):
+        raise RuntimeError("lease invalidation broken")
+
+    manager.set_lease_invalidation_hook(failing_hook)
+
+    result = await service.cancel(ctx, task_id)
+
+    # The RPC layer MUST surface the failure, not swallow it as success.
+    assert result["ok"] is False, (
+        f"LEASE_INVALIDATION_FAILED must not be swallowed as ok=True: {result}"
+    )
+    assert result["status"] == "lease_invalidation_failed", (
+        f"expected status=lease_invalidation_failed, got: {result}"
+    )
+    assert "lease" in result["error"].lower(), (
+        f"error should mention lease, got: {result}"
+    )
+    # The task MUST still be non-terminal (fail-closed).
+    task_after = await manager.get(task_id)
+    assert task_after.status.value not in {"cancelled", "completed", "failed"}, (
+        f"task must not be terminal after lease invalidation failure: {task_after.status}"
+    )
+    await db.close()
+
+
+async def test_c_2_5_cancel_succeeds_when_no_hook_registered(tmp_path):
+    """C-2-5 regression guard: when no lease-invalidation hook is
+    registered (the current RPC ``TaskService`` default), cancel MUST
+    still succeed normally — the explicit ``LEASE_INVALIDATION_FAILED``
+    branch must not interfere with the happy path.
+    """
+    db = Database(tmp_path / "c-2-5-nohook.db")
+    await db.connect()
+    await db.run_migrations()
+    ctx = _test_ctx(principal_id="principal")
+    service = TaskService(db)
+
+    created = await service.create(ctx, "happy path cancel")
+    task_id = created["id"]
+
+    result = await service.cancel(ctx, task_id)
+    assert result["ok"] is True, (
+        f"cancel without hook should succeed: {result}"
+    )
+    assert result["task_id"] == task_id
+    await db.close()
+

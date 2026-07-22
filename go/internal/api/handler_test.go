@@ -424,6 +424,38 @@ func (m *mockForbiddenChannelAgent) SetChannelEnabled(_ context.Context, _ strin
 	return fmt.Errorf("%w: principal is not a channel admin", ErrForbidden)
 }
 
+// TestC_2_5_CancelMapsLeaseInvalidationFailedTo503 verifies the C-2-5
+// fix: when the Python TaskService returns
+// ``{"ok": false, "status": "lease_invalidation_failed"}``, the Go
+// handler MUST return HTTP 503 (transient infrastructure failure —
+// retry) rather than the pre-C-2-5 behaviour of HTTP 200 (silently
+// swallowed as success by Python) or HTTP 409 (collapsed into
+// ``TransitionInvalid`` by ``taskAction``).
+//
+// The 503 signals to the REST caller that the task is still active
+// and the cancel can be retried (Batch 2.6 §4 fail-closed).
+func TestC_2_5_CancelMapsLeaseInvalidationFailedTo503(t *testing.T) {
+	tasks := &mockLeaseInvalidationTaskClient{}
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithTasks(tasks).Routes()
+
+	rec := serve(handler, http.MethodPost, "/v1/tasks/t1/cancel", "", testAPIKey)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("lease invalidation cancel status=%d, want 503 (not 200 or 409): %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "lease") {
+		t.Fatalf("503 body should mention lease, got: %s", rec.Body.String())
+	}
+}
+
+// mockLeaseInvalidationTaskClient returns
+// TransitionLeaseInvalidationFailed for CancelTask, simulating
+// Python's ``{"ok": false, "status": "lease_invalidation_failed"}``.
+type mockLeaseInvalidationTaskClient struct{ mockTaskClient }
+
+func (m *mockLeaseInvalidationTaskClient) CancelTask(_ context.Context, _ string, _ string) (TransitionResult, error) {
+	return TransitionLeaseInvalidationFailed, nil
+}
+
 func TestTaskRESTAndEvents(t *testing.T) {
 	tasks := &mockTaskClient{}
 	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithTasks(tasks).Routes()

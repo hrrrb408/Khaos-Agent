@@ -1621,6 +1621,22 @@ class TaskService:
             return {"ok": False, "error": "task not found", "task_id": task_id}
         if result == TransitionResult.INVALID_TRANSITION:
             return {"ok": False, "error": "task already terminal", "task_id": task_id}
+        # C-2-5 (HIGH 2): ``LEASE_INVALIDATION_FAILED`` means the
+        # task's workspace lease could not be released — the
+        # TaskManager kept the task in its pre-cancel state so the
+        # caller can retry (Batch 2.6 §4 fail-closed).  Previously
+        # this fell through to ``{"ok": True}``, silently treating a
+        # fail-closed refusal as success: the REST caller saw HTTP 200
+        # while the task was still active.  The explicit ``status``
+        # field lets the Go client distinguish this from
+        # ``INVALID_TRANSITION`` (which maps to 409, not 503).
+        if result == TransitionResult.LEASE_INVALIDATION_FAILED:
+            return {
+                "ok": False,
+                "error": "lease invalidation failed",
+                "task_id": task_id,
+                "status": "lease_invalidation_failed",
+            }
         return {"ok": True, "task_id": task_id}
 
     async def approve(

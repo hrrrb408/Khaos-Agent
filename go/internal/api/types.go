@@ -90,6 +90,19 @@ const (
 	TransitionUnchanged TransitionResult = "unchanged"
 	TransitionNotFound  TransitionResult = "not_found"
 	TransitionInvalid   TransitionResult = "invalid_transition"
+	// TransitionLeaseInvalidationFailed signals that the TaskManager
+	// refused to cancel the task because its workspace lease could not
+	// be released (Batch 2.6 §4 fail-closed).  The task stays in its
+	// pre-cancel state so the caller can retry.
+	//
+	// C-2-5 (HIGH 2): previously this outcome was silently swallowed
+	// by the Python ``TaskService.cancel`` (returned ``{"ok": true}``)
+	// and unmappable on the Go side (``taskAction`` collapsed it into
+	// ``TransitionInvalid``).  The REST caller saw HTTP 200 while the
+	// task was still active.  The handler now maps this to HTTP 503
+	// (transient infrastructure failure — retry) rather than 409
+	// (client-side state conflict).
+	TransitionLeaseInvalidationFailed TransitionResult = "lease_invalidation_failed"
 )
 
 // TaskClient manages persistent coding tasks and their event streams.
