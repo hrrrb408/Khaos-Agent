@@ -65,9 +65,18 @@ jobs:
               echo "+$controller" > /sys/fs/cgroup/khaos/cgroup.subtree_control
             fi
           done
+          sudo mkdir -p /sys/fs/cgroup/khaos/runner /sys/fs/cgroup/khaos/workloads
+          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/khaos
+          for controller in cpu memory pids io; do
+            if grep -qw "$controller" /sys/fs/cgroup/khaos/workloads/cgroup.controllers; then
+              echo "+$controller" > /sys/fs/cgroup/khaos/workloads/cgroup.subtree_control
+            fi
+          done
           test -w /sys/fs/cgroup/khaos
           test -w /sys/fs/cgroup/khaos/cgroup.procs
           test -w /sys/fs/cgroup/khaos/cgroup.subtree_control
+          test -w /sys/fs/cgroup/khaos/runner/cgroup.procs
+          test -w /sys/fs/cgroup/khaos/workloads/cgroup.procs
       - name: Prepare block-backed sandbox workspace
         run: |
           # GitHub-hosted runners may place /tmp on an overlay/pseudo device.
@@ -108,9 +117,28 @@ jobs:
       - name: Run real bwrap isolation E2E
         env:
           KHAOS_REQUIRE_PLATFORM_SANDBOX: "1"
-          KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos
+          KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos/workloads
           KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
-        run: python -m pytest python/tests/coding/test_platform_backends.py -q -k real_bwrap -v
+        run: |
+          runner_uid="$(id -u)"
+          runner_gid="$(id -g)"
+          python_bin="$(command -v python)"
+          runner_home="$HOME"
+          runner_path="$PATH"
+          runner_ld_library_path="${LD_LIBRARY_PATH:-}"
+          launcher="$KHAOS_SANDBOX_LAUNCHER"
+          sudo bash -c '
+            echo "$$" > /sys/fs/cgroup/khaos/runner/cgroup.procs
+            exec setpriv --reuid="$1" --regid="$2" --init-groups \
+              env HOME="$4" PATH="$5" LD_LIBRARY_PATH="$7" \
+              TMPDIR=/mnt/khaos-sandbox-workspace \
+              KHAOS_REQUIRE_PLATFORM_SANDBOX=1 \
+              KHAOS_CGROUP_ROOT=/sys/fs/cgroup/khaos/workloads \
+              KHAOS_SANDBOX_LAUNCHER="$6" \
+              "$3" -m pytest python/tests/coding/test_platform_backends.py \
+              -q -k real_bwrap -v
+          ' bash "$runner_uid" "$runner_gid" "$python_bin" \
+            "$runner_home" "$runner_path" "$launcher" "$runner_ld_library_path"
       - name: Capture post-test diagnostics
         if: always()
         run: |

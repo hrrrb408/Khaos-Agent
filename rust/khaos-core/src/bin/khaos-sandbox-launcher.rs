@@ -145,7 +145,12 @@ mod linux {
             // This stage runs before bubblewrap creates a user namespace.
             // Joining the delegated cgroup from inside that namespace is
             // rejected by the kernel even when cgroup.procs is bind-mounted.
-            std::fs::write(path, b"0")?;
+            std::fs::write(&path, b"0").map_err(|error| {
+                io::Error::new(
+                    error.kind(),
+                    format!("join cgroup {}: {error}", path.display()),
+                )
+            })?;
             return exec(&args);
         }
         if args.first().is_some_and(|arg| arg == "--") {
