@@ -280,6 +280,12 @@ func (c PythonClient) ListChannels(ctx context.Context, principalID string) ([]a
 }
 
 // SetChannelEnabled changes one registered channel's enabled state.
+//
+// C-2-4 (HIGH 4): Python now gates channel mutations on
+// ``channel_admins``; a non-admin caller receives
+// ``{"ok": false, "status": "forbidden", ...}``.  We translate that
+// into :var:`api.ErrForbidden` so the REST handler can return 403
+// instead of masking the authorization failure as 404.
 func (c PythonClient) SetChannelEnabled(ctx context.Context, principalID string, channelID string, enabled bool) error {
 	method := "ChannelService.Disable"
 	if enabled {
@@ -288,6 +294,13 @@ func (c PythonClient) SetChannelEnabled(ctx context.Context, principalID string,
 	response, err := c.callMap(ctx, method, map[string]any{"channel_id": channelID}, principalID)
 	if err != nil {
 		return err
+	}
+	if status, _ := response["status"].(string); status == "forbidden" {
+		msg, _ := response["error"].(string)
+		if msg == "" {
+			msg = "principal is not a channel admin"
+		}
+		return fmt.Errorf("%w: %s", api.ErrForbidden, msg)
 	}
 	if ok, _ := response["ok"].(bool); !ok {
 		return fmt.Errorf("channel not found: %s", channelID)

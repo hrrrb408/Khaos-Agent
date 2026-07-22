@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -382,6 +383,45 @@ func TestWebhookAndChannelEndpoints(t *testing.T) {
 	if rec := serve(handler, http.MethodPost, "/api/channels/tg/enable", "", "gateway-key"); rec.Code != http.StatusOK || !agent.enabled {
 		t.Fatalf("enable status=%d enabled=%v", rec.Code, agent.enabled)
 	}
+}
+
+// TestC_2_4_ChannelEnableMapsForbiddenTo403 verifies the C-2-4 fix:
+// when the Python service rejects a channel mutation with
+// ``status: "forbidden"``, the Go handler MUST return 403 (not 404
+// as it did pre-C-2-4), and an unauthenticated request MUST return
+// 401 (fail-closed, previously the empty principal was silently
+// forwarded to Python).
+func TestC_2_4_ChannelEnableMapsForbiddenTo403(t *testing.T) {
+	// mockForbiddenChannelAgent returns ErrForbidden for enable/disable,
+	// simulating Python's ``{"ok": false, "status": "forbidden"}``.
+	agent := &mockForbiddenChannelAgent{}
+	handler := NewHandler(agent, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).Routes()
+
+	// C-2-4: unauthenticated request → 401 (fail-closed).  Pre-C-2-4
+	// the handler used ``principalID, _ := ...`` and forwarded an
+	// empty string to Python, which then had no caller identity to
+	// admin-check.
+	rec := serveUnauthenticated(handler, http.MethodPost, "/api/channels/tg/enable", "")
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated enable status=%d, want 401 (fail-closed)", rec.Code)
+	}
+
+	// C-2-4: Python returns forbidden → Go wraps as ErrForbidden →
+	// handler maps to 403 (not 404 as pre-C-2-4).
+	rec = serve(handler, http.MethodPost, "/api/channels/tg/disable", "", testAPIKey)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("forbidden disable status=%d, want 403 (not 404)", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "admin") {
+		t.Fatalf("forbidden body should mention admin, got: %s", rec.Body.String())
+	}
+}
+
+// mockForbiddenChannelAgent returns ErrForbidden for SetChannelEnabled.
+type mockForbiddenChannelAgent struct{ mockChannelAgent }
+
+func (m *mockForbiddenChannelAgent) SetChannelEnabled(_ context.Context, _ string, _ string, _ bool) error {
+	return fmt.Errorf("%w: principal is not a channel admin", ErrForbidden)
 }
 
 func TestTaskRESTAndEvents(t *testing.T) {

@@ -1265,6 +1265,28 @@ class AgentService:
         return {"channels": self.channel_registry.get_health_report()}
 
     def set_channel_enabled(self, ctx: RequestContext, channel_id: str, enabled: bool) -> dict[str, object]:
+        # C-2-4 (HIGH 4): channel mutations via REST must be gated on
+        # the admin principal allowlist compiled into the
+        # :class:`EffectiveSecurityPolicy` — symmetric to the tool
+        # path (``channel_tools._require_admin``).  Previously the
+        # REST path (Go ``POST /api/channels/{id}/enable`` → Python
+        # ``AgentService.set_channel_enabled``) bypassed admin
+        # validation entirely, so any authenticated principal could
+        # enable/disable any channel.
+        #
+        # ``channel_admins`` is sourced from
+        # ``self._effective_policy.channel_admins`` (user ∪ project,
+        # OR semantics).  An empty allowlist means NO principal can
+        # mutate channels — fail-closed until an admin is explicitly
+        # declared in ``khaos_policy.yaml``'s
+        # ``channels.admin_principals``.
+        admins = self._effective_policy.channel_admins
+        if not admins or ctx.principal_id not in admins:
+            return {
+                "ok": False,
+                "error": "principal is not a channel admin",
+                "status": "forbidden",
+            }
         changed = self.channel_registry.enable(channel_id) if enabled else self.channel_registry.disable(channel_id)
         return {"ok": changed, "channel_id": channel_id}
 

@@ -3,7 +3,19 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"errors"
 )
+
+// ErrForbidden is returned by a Client method when the Python service
+// rejects the call with ``status: "forbidden"`` (e.g. the caller is not
+// in ``channel_admins`` for channel mutations).  The HTTP handler
+// maps it to 403 so the REST caller can distinguish authorization
+// failures from not-found / upstream errors.
+//
+// C-2-4 (HIGH 4): channel enable/disable via REST is now admin-gated
+// on the Python side; without a distinguishable error type the handler
+// would mask forbidden as 404 (the pre-C-2-4 behaviour).
+var ErrForbidden = errors.New("forbidden")
 
 // ChatRequest is the REST request body for POST /api/chat.
 type ChatRequest struct {
