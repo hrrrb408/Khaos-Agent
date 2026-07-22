@@ -47,6 +47,7 @@ from urllib.parse import urlparse
 import pytest
 
 from khaos.security.network_guard import NetworkGuard
+from khaos.security.host_network import ValidatedTarget
 from khaos.tools import browser_tools
 from khaos.tools.browser_tools import (
     BrowserManager,
@@ -967,8 +968,14 @@ async def test_websocket_to_allowlisted_domain_is_not_aborted_by_guard(
 class _BrowserE2EHostAuthority:
     """Permit the test server; SSRF behavior has dedicated authority tests."""
 
-    async def validate_url(self, url: str, **_kwargs: object) -> str:
-        return url
+    async def validate_url(self, url: str, **_kwargs: object) -> ValidatedTarget:
+        parsed = urlparse(url)
+        return ValidatedTarget(
+            url=url,
+            parsed=parsed,
+            hostname=parsed.hostname or "127.0.0.1",
+            addresses=("127.0.0.1",),
+        )
 
 
 def _browser_guard(allowed_domains: list[str]) -> NetworkGuard:
