@@ -84,6 +84,10 @@ async def test_cancelled_nested_write_cannot_publish_or_leave_parents(
     )
     assert await asyncio.to_thread(started.wait, 5)
     task.cancel()
+    # Let the authority observe cancellation and set the cooperative fence
+    # before releasing the worker; otherwise CI event-loop timing can race
+    # this test's intended pre-publish cancellation point.
+    await asyncio.sleep(0)
     release.set()
 
     with pytest.raises(asyncio.CancelledError):

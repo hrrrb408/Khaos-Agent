@@ -349,11 +349,6 @@ class LinuxBubblewrapBackend:
                     tempfile.TemporaryDirectory(prefix="khaos-home-") as home:
                 budget = ResourceBudget()
                 cgroup = _create_linux_cgroup(budget, Path(tmp))
-                if cgroup is None:
-                    return BackendAvailability(
-                        self.name, False, False,
-                        "delegated cgroup v2 root unavailable; hard resource limits are required",
-                    )
                 prefix = self.argv_prefix(
                     Path(tmp), cwd=Path(tmp), synthetic_home=Path(home),
                     resources=budget, command=("/bin/sh",),
@@ -475,11 +470,12 @@ class LinuxBubblewrapBackend:
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
         with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
-            cgroup = _create_linux_cgroup(profile.resources, worktree)
-            if cgroup is None:
+            try:
+                cgroup = _create_linux_cgroup(profile.resources, worktree)
+            except OSError as exc:
                 raise PermissionError(
-                    "execution refused: delegated cgroup v2 limits unavailable"
-                )
+                    f"execution refused: delegated cgroup v2 limits unavailable: {exc}"
+                ) from exc
             prefix = self.argv_prefix(
                 worktree,
                 cwd=request.cwd,
@@ -564,12 +560,13 @@ def _linux_cgroup_root() -> Path | None:
 
 def _create_linux_cgroup(
     budget: ResourceBudget, workspace: Path,
-) -> Path | None:
+) -> Path:
     """Create and fully configure a per-execution cgroup-v2 leaf."""
     root = _linux_cgroup_root()
     if root is None:
-        return None
+        raise OSError("cgroup root is not a writable delegated v2 subtree")
     group = root / f"exec-{os.getpid()}-{secrets.token_hex(8)}"
+    current_limit = "create leaf"
     try:
         group.mkdir(mode=0o700)
         period = 100_000
@@ -593,11 +590,12 @@ def _create_linux_cgroup(
             ),
         }
         for name, value in limits.items():
+            current_limit = name
             (group / name).write_text(value, encoding="ascii")
         return group
-    except OSError:
+    except OSError as exc:
         _remove_linux_cgroup(group)
-        return None
+        raise OSError(f"failed to configure {current_limit}: {exc}") from exc
 
 
 def _remove_linux_cgroup(group: Path) -> None:
