@@ -1866,7 +1866,12 @@ async def serve_json_lines(
                 db, project_root, config_path,
                 office_authority=agent._office_authority,
                 approval_broker=agent.approval_broker,
-                principal_id=f"local-uid:{os.getuid()}",
+                # C-1-5b: no server-level principal_id — the subagent's
+                # ModeManager / MemoryManager are constructed per-turn by
+                # ``build_runtime`` from ``task.principal_id`` (set from
+                # ``ctx.principal_id``).  Previously this passed
+                # ``f"local-uid:{os.getuid()}"`` which bound the subagent's
+                # mode / memory scope to the local OS user.
                 # H1: inherit the server-lifecycle AuditLogger so SubAgent
                 # security events land in the SAME audit trail as the main
                 # AgentLoop — no parallel unsupervised audit path.
@@ -2287,7 +2292,6 @@ async def _build_subagent_service(
     *,
     office_authority: OfficeMutationAuthority | None = None,
     approval_broker: Any = None,
-    principal_id: str = "",
     audit_logger: Any = None,
 ) -> SubAgentService:
     """Build the SubAgent service bound to the server's shared security stack.
@@ -2300,26 +2304,26 @@ async def _build_subagent_service(
     ``build_runtime`` constructs a fresh scheduler per run with the full
     security stack compiled from the same layered effective policy as the
     main AgentLoop.  The server-level ``approval_broker`` /
-    ``principal_id`` / ``audit_logger`` / ``office_authority`` are inherited
-    so approvals, audit events and the Office storage baseline are shared
-    with the main runtime, not forked.
+    ``audit_logger`` / ``office_authority`` are inherited so approvals,
+    audit events and the Office storage baseline are shared with the main
+    runtime, not forked.
+
+    C-1-5b: the server-level ``ModeManager(local-uid)`` /
+    ``MemoryStore(local-uid)`` / ``MemoryManager`` singletons are REMOVED.
+    Previously they were bound to ``principal_id=f"local-uid:{os.getuid()}"``
+    and passed to ``SubAgentRunner``, which forwarded them to
+    ``RuntimeConfig`` — so ``build_runtime`` reused the local-uid-bound
+    instances instead of constructing per-turn ones scoped to
+    ``task.principal_id``.  Now ``SubAgentRunner`` receives ``None`` for
+    both, and ``build_runtime`` constructs a per-turn ``ModeManager`` +
+    ``MemoryManager`` from ``cfg.principal_id`` (= ``task.principal_id``,
+    set from the authenticated RPC payload).  This guarantees the
+    subagent's mode switches / memory scope are bound to the CALLING
+    principal, not the server's local UID.
     """
     root = project_root or Path.cwd()
     resolved_config = config_path or root / "config.yaml"
-    # A2-5: bind the SubAgent's ModeManager to the inherited principal_id
-    # so subagent mode switches don't leak into other principals.
-    mode_manager = ModeManager(db, project_root=root, principal_id=principal_id)
-    await mode_manager.load()
     router = load_router_from_config(resolved_config, project_root=root)
-    # A2-4: bind the SubAgent's memory store to the inherited principal_id
-    # so subagent runs see the same memories as the parent runtime.
-    memory_store = MemoryStore(db, principal_id=principal_id)
-    memory_manager = MemoryManager(
-        memory_store,
-        budget=MemoryBudget(),
-        mode_getter=lambda: mode_manager.current_mode,
-        intent_getter=lambda: getattr(mode_manager, "_intent_buffer", ""),
-    )
     skill_manager = SkillManager()
     skills_dir = root / "skills"
     if skills_dir.is_dir():
@@ -2327,17 +2331,27 @@ async def _build_subagent_service(
     runner = SubAgentRunner(
         router=router,
         db=db,
-        mode_manager=mode_manager,
+        # C-1-5b: do NOT pass server-level ModeManager / MemoryManager —
+        # let ``build_runtime`` construct per-turn instances from
+        # ``cfg.principal_id`` (= ``task.principal_id``).  Previously
+        # these were bound to ``local-uid`` and reused across every
+        # subagent run, so an API principal's subagent saw the local
+        # user's mode state and memories.
+        mode_manager=None,
         # B1: do NOT pass a bare ToolScheduler — let build_runtime construct
         # one per run with the full SecurityMiddleware stack and a registry
         # pruned to ``task.tools``.
         tool_scheduler=None,
-        memory_manager=memory_manager,
+        memory_manager=None,
         skill_manager=skill_manager if len(skill_manager.registry) > 0 else None,
         token_engine=get_token_engine(),
         office_authority=office_authority,
         approval_broker=approval_broker,
-        principal_id=principal_id,
+        # C-1-5b: no server-level principal_id — the runner relies on
+        # ``task.principal_id`` (set from ``ctx.principal_id`` by
+        # ``SubAgentService.handle_spawn``) and ``build_runtime``'s
+        # fail-closed gate on empty principal_id.
+        principal_id="",
         audit_logger=audit_logger,
         # B1: inherit the server's project_root / config_path so the subagent
         # loads the SAME ``khaos_policy.yaml`` and compiles the SAME

@@ -1047,3 +1047,109 @@ async def test_subagent_runner_falls_back_to_server_principal_when_task_unscoped
         runtime_mod.build_runtime = original
 
     assert captured["principal_id"] == "server-fixed-uid"
+
+
+async def test_subagent_runner_passes_none_mode_manager_in_production():
+    """C-1-5b: when ``mode_manager=None`` (the production path after
+    C-1-5b), ``SubAgentRunner.run`` passes ``mode_manager=None`` to
+    ``RuntimeConfig`` so ``build_runtime`` constructs a per-turn
+    ``ModeManager`` from ``cfg.principal_id`` (= ``task.principal_id``).
+
+    Previously ``_build_subagent_service`` constructed a server-level
+    ``ModeManager(local-uid)`` singleton and passed it to the runner,
+    which forwarded it to ``RuntimeConfig`` — so ``build_runtime``
+    reused the local-uid-bound instance and the subagent's mode
+    switches leaked into the local OS user's mode state.
+    """
+    from khaos.subagents.runner import SubAgentRunner
+    from khaos.subagents.spawner import SubAgentTask
+
+    captured: dict = {}
+
+    async def _fake_build_runtime(cfg):
+        captured["mode_manager"] = cfg.mode_manager
+        captured["memory_manager"] = cfg.memory_manager
+        captured["principal_id"] = cfg.principal_id
+        runtime = MagicMock()
+        runtime.aclose = AsyncMock()
+        runtime.loop = MagicMock()
+
+        async def _empty_run(*args, **kwargs):
+            return
+            yield  # pragma: no cover - generator marker
+
+        runtime.loop.run = _empty_run
+        return runtime
+
+    import khaos.runtime as runtime_mod
+
+    original = runtime_mod.build_runtime
+    runtime_mod.build_runtime = _fake_build_runtime
+    try:
+        db = MagicMock()
+        db.create_session = AsyncMock()
+        # C-1-5b: production path passes mode_manager=None,
+        # memory_manager=None, principal_id="" (no server-level binding).
+        runner = SubAgentRunner(
+            router=MagicMock(),
+            db=db,
+            mode_manager=None,
+            memory_manager=None,
+            principal_id="",
+        )
+        task = SubAgentTask(
+            id="t1", goal="g", context="c", tools=[],
+            principal_id="api:alice",
+        )
+        await runner.run(task)
+    finally:
+        runtime_mod.build_runtime = original
+
+    # C-1-5b: build_runtime receives None for mode_manager / memory_manager
+    # so it constructs per-turn instances from cfg.principal_id.
+    assert captured["mode_manager"] is None
+    assert captured["memory_manager"] is None
+    # The per-turn principal_id comes from the task (not a server-level fallback).
+    assert captured["principal_id"] == "api:alice"
+
+
+async def test_subagent_runner_fail_closed_when_principal_empty():
+    """C-1-5b: when both ``task.principal_id`` and ``self.principal_id``
+    are empty (production path with no server-level fallback),
+    ``build_runtime`` raises ``ValueError`` (fail-closed).
+
+    This replaces the previous ``or f"local-uid:{os.getuid()}"`` fallback
+    that silently ran the subagent as the local OS user.
+    """
+    from khaos.subagents.runner import SubAgentRunner
+    from khaos.subagents.spawner import SubAgentTask
+
+    async def _fake_build_runtime(cfg):
+        # C-1-5a: build_runtime fail-closed on empty principal_id.
+        if not cfg.principal_id:
+            raise ValueError(
+                "RuntimeConfig.principal_id is required"
+            )
+        raise AssertionError("build_runtime should not reach here")
+
+    import khaos.runtime as runtime_mod
+
+    original = runtime_mod.build_runtime
+    runtime_mod.build_runtime = _fake_build_runtime
+    try:
+        db = MagicMock()
+        db.create_session = AsyncMock()
+        runner = SubAgentRunner(
+            router=MagicMock(),
+            db=db,
+            mode_manager=None,
+            principal_id="",
+        )
+        task = SubAgentTask(
+            id="t1", goal="g", context="c", tools=[],
+            principal_id="",
+        )
+        with pytest.raises(ValueError, match="principal_id is required"):
+            await runner.run(task)
+    finally:
+        runtime_mod.build_runtime = original

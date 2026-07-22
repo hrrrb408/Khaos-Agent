@@ -39,7 +39,7 @@ class SubAgentRunner:
         self,
         router,                          # ModelRouter 实例
         db,                              # Database 实例
-        mode_manager,                    # ModeManager 实例
+        mode_manager=None,               # C-1-5b: 默认 None，让 build_runtime 按 per-turn principal 构造
         tool_scheduler=None,             # B1: 不再接收裸 scheduler；默认 None
         memory_manager: Optional["MemoryManager"] = None,  # 可选，默认不共享记忆
         skill_manager: Optional["SkillManager"] = None,    # 可选
@@ -58,6 +58,13 @@ class SubAgentRunner:
     ):
         self.router = router
         self.db = db
+        # C-1-5b: ``mode_manager`` defaults to ``None`` — the production
+        # path (``_build_subagent_service``) no longer passes a server-level
+        # ``ModeManager(local-uid)`` singleton.  When ``None``,
+        # ``build_runtime`` constructs a per-turn ``ModeManager`` from
+        # ``cfg.principal_id`` (= ``task.principal_id``), so the subagent's
+        # mode switches are scoped to the CALLING principal.  Legacy / test
+        # callers may still pass a mock for ad-hoc construction.
         self.mode_manager = mode_manager
         # B1: ``tool_scheduler`` 保留为可选向后兼容字段，但生产路径
         # （``_build_subagent_service``）不再传入裸 scheduler。当为 ``None``
@@ -65,6 +72,9 @@ class SubAgentRunner:
         # SecurityMiddleware（Sandbox / NetworkGuard / EffectivePolicy /
         # AuditLogger）的全新 ToolScheduler，与主 AgentLoop 共享同一安全栈。
         self.tool_scheduler = tool_scheduler
+        # C-1-5b: ``memory_manager`` defaults to ``None`` — same rationale
+        # as ``mode_manager``.  ``build_runtime`` constructs a per-turn
+        # ``MemoryManager`` from ``cfg.principal_id``.
         self.memory_manager = memory_manager
         self.skill_manager = skill_manager
         self.coding_context_builder = coding_context_builder
@@ -143,7 +153,13 @@ class SubAgentRunner:
         # local-uid fallback in the build_runtime path.
         principal_id = task.principal_id or self.principal_id
         runtime = await build_runtime(RuntimeConfig(
-            db=self.db, mode_manager=self.mode_manager, router=self.router,
+            db=self.db,
+            # C-1-5b: pass ``mode_manager=None`` (production path) so
+            # ``build_runtime`` constructs a per-turn ``ModeManager`` from
+            # ``cfg.principal_id`` (= ``task.principal_id``).  Legacy / test
+            # callers may pass a mock, which ``build_runtime`` reuses as-is.
+            mode_manager=self.mode_manager,
+            router=self.router,
             # B1: pass ``tool_scheduler=None`` (the default) so build_runtime
             # constructs a fresh ToolScheduler with the full SecurityMiddleware
             # stack (Sandbox / NetworkGuard / EffectivePolicy / AuditLogger).
