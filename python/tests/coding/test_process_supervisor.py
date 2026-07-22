@@ -251,14 +251,18 @@ async def test_supervisor_enforces_workspace_relative_entry_budget(tmp_path: Pat
     workspace.mkdir()
     (workspace / "baseline").write_text("existing", encoding="utf-8")
     baseline = capture_workspace_snapshot(workspace)
+    # Seed the post-baseline overage before the supervised process starts.
+    # Creating the files inside the child races the watchdog's repeated
+    # stability scans on Windows, correctly producing the fail-closed
+    # ``workspace-observation`` diagnostic instead of a deterministic count.
+    for index in range(12):
+        (workspace / f"new-{index}").touch()
     supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
     request = ExecutionRequest(
         (
             sys.executable,
             "-c",
-            "from pathlib import Path; import time; "
-            "[(Path('.') / f'new-{i}').touch() for i in range(12)]; "
-            "time.sleep(30)",
+            "import time; time.sleep(30)",
         ),
         workspace,
         budget=ResourceBudget(workspace_entries=10),
