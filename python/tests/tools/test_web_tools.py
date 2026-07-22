@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from unittest.mock import AsyncMock, MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 
@@ -340,21 +341,28 @@ def mock_httpx_client(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-        async def get(self, url):
-            if isinstance(self.get_response, Exception):
-                raise self.get_response
-            return self.get_response
+        async def request(self, method, url):
+            response = self.head_response if method == "HEAD" else self.get_response
+            if isinstance(response, Exception):
+                raise response
+            return response
 
-        async def head(self, url):
-            if isinstance(self.head_response, Exception):
-                raise self.head_response
-            return self.head_response
+    class _FakeAuthority:
+        async def validate_url(self, url, **_kwargs):
+            parsed = urlparse(url)
+            return web_tools.ValidatedTarget(
+                url=url,
+                parsed=parsed,
+                hostname=parsed.hostname or "",
+                addresses=("93.184.216.34",),
+            )
 
     _fake_state = {
         "get_response": _mock_httpx_response(text="<html></html>"),
         "head_response": _mock_httpx_response(text="<html></html>"),
     }
     monkeypatch.setattr(web_tools.httpx, "AsyncClient", _FakeAsyncClient)
+    monkeypatch.setattr(web_tools, "_HOST_NETWORK_AUTHORITY", _FakeAuthority())
     return _fake_state
 
 

@@ -42,7 +42,6 @@ import hashlib
 import os
 import struct
 import sys
-from typing import Any
 from urllib.parse import urlparse
 
 import pytest
@@ -118,7 +117,6 @@ async def fresh_manager(monkeypatch):
     process; it's idempotent so the ``try/finally`` is safe even if
     the test already closed it.
     """
-    original = browser_tools._manager
     mgr = BrowserManager()
     monkeypatch.setattr(browser_tools, "_manager", mgr)
     try:
@@ -177,6 +175,14 @@ async def websocket_echo_server():
                 )
             writer.write(response_header + echoed)
             await writer.drain()
+            # Keep the server side open long enough for Playwright's routed
+            # WebSocket proxy to forward the final data frame to the page.
+            # Closing immediately after ``drain`` can race that forwarding
+            # and surface only the close event on fast local runs.
+            try:
+                await asyncio.wait_for(reader.read(2), timeout=1)
+            except asyncio.TimeoutError:
+                pass
         except (asyncio.IncompleteReadError, KeyError):
             pass
         finally:
@@ -249,7 +255,7 @@ async def test_browser_navigate_public_tool_loads_page(fresh_manager, http_serve
     binding is exercised for real.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     result = await browser_navigate(
         http_server.url,
         principal_id="test-nav",
@@ -265,7 +271,7 @@ async def test_browser_navigate_public_tool_loads_page(fresh_manager, http_serve
 async def test_browser_snapshot_public_tool_returns_html(fresh_manager, http_server):
     """B1: ``browser_snapshot`` returns the page's HTML content."""
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     await browser_navigate(
         http_server.url,
         principal_id="test-snap",
@@ -286,7 +292,7 @@ async def test_browser_snapshot_public_tool_returns_html(fresh_manager, http_ser
 async def test_browser_click_public_tool_clicks_element(fresh_manager, http_server):
     """B1: ``browser_click`` actually clicks an element on the page."""
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     await browser_navigate(
         http_server.url,
         principal_id="test-click",
@@ -308,7 +314,7 @@ async def test_browser_click_public_tool_clicks_element(fresh_manager, http_serv
 async def test_browser_type_public_tool_types_text(fresh_manager, http_server):
     """B1: ``browser_type`` actually types text into an input."""
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     await browser_navigate(
         http_server.url,
         principal_id="test-type",
@@ -330,7 +336,7 @@ async def test_browser_type_public_tool_types_text(fresh_manager, http_server):
 async def test_browser_evaluate_public_tool_runs_js(fresh_manager, http_server):
     """B1: ``browser_evaluate`` actually evaluates a JS expression."""
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     await browser_navigate(
         http_server.url,
         principal_id="test-eval",
@@ -352,7 +358,7 @@ async def test_browser_evaluate_public_tool_runs_js(fresh_manager, http_server):
 async def test_browser_scroll_public_tool_scrolls_page(fresh_manager, http_server):
     """B1: ``browser_scroll`` actually scrolls the page."""
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     await browser_navigate(
         http_server.url,
         principal_id="test-scroll",
@@ -375,7 +381,7 @@ async def test_browser_scroll_public_tool_scrolls_page(fresh_manager, http_serve
 async def test_browser_screenshot_public_tool_returns_base64(fresh_manager, http_server):
     """B1: ``browser_screenshot`` returns base64-encoded image bytes."""
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     await browser_navigate(
         http_server.url,
         principal_id="test-shot",
@@ -408,7 +414,7 @@ async def test_full_browser_tool_sequence(fresh_manager, http_server):
     that ``_safe_execute``'s call frame did not have access to.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     principal = "test-sequence"
     session = "s1"
     runtime = "r1"
@@ -454,7 +460,7 @@ async def test_route_guard_allows_listed_domain(fresh_manager, http_server):
     route guard lets the navigation through and the page loads.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     result = await browser_navigate(
         http_server.url,
         principal_id="test-allow",
@@ -469,7 +475,7 @@ async def test_route_guard_blocks_unlisted_domain(fresh_manager, http_server):
     """H2: when ``allowed_domains`` does NOT list the test server's
     host, the route guard aborts the navigation.
     """
-    guard = NetworkGuard(network_enabled=True, allowed_domains=["example.invalid"])
+    guard = _browser_guard(["example.invalid"])
     result = await browser_navigate(
         http_server.url,
         principal_id="test-block",
@@ -492,7 +498,7 @@ async def test_route_guard_installation_failure_is_fail_closed(fresh_manager, mo
     and ``ensure_page`` returns ``None`` — never continue with an
     unguarded context.
     """
-    guard = NetworkGuard(network_enabled=True, allowed_domains=["example.com"])
+    guard = _browser_guard(["example.com"])
 
     from playwright.async_api import BrowserContext as _RealCtx
 
@@ -534,7 +540,7 @@ async def test_route_guard_blocks_file_scheme(fresh_manager, tmp_path):
     secret = tmp_path / "secret.txt"
     secret.write_text("top-secret-content", encoding="utf-8")
 
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[])
+    guard = _browser_guard([])
     result = await browser_navigate(
         f"file://{secret}",
         principal_id="test-scheme",
@@ -556,7 +562,7 @@ async def test_refcount_does_not_bump_on_reentry_under_same_runtime(fresh_manage
     refcount beyond 1.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
     common = {
         "principal_id": "p1",
         "session_id": "s1",
@@ -584,7 +590,7 @@ async def test_close_runtime_releases_all_contexts_across_sessions(fresh_manager
     runtime acquired, even across different principal / session keys.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
 
     await browser_navigate(http_server.url, principal_id="p1", session_id="s1", runtime_id="r1", network_guard=guard)
     await browser_navigate(http_server.url, principal_id="p1", session_id="s2", runtime_id="r1", network_guard=guard)
@@ -605,7 +611,7 @@ async def test_concurrent_sessions_get_independent_contexts(fresh_manager, http_
     independent ``BrowserContext`` instances — different cookies.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
 
     # First use is genuinely concurrent; lifecycle serialization must still
     # create one independent context per key without corrupting manager state.
@@ -648,7 +654,7 @@ async def test_route_guard_blocks_subresource_fetch(fresh_manager, http_server, 
     ``fetch()`` a blocked domain must fail.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
 
     (tmp_path / "index.html").write_text(
         """
@@ -717,7 +723,7 @@ async def test_service_worker_registration_is_blocked(fresh_manager, http_server
     the controller never becomes non-null.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
 
     # Drop a real SW script so registration isn't rejected for 404.
     (tmp_path / "sw.js").write_text(
@@ -823,7 +829,7 @@ async def test_websocket_to_unlisted_domain_is_blocked(fresh_manager, http_serve
     the blocklist is a separate, redundant defense.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
 
     (tmp_path / "index.html").write_text(
         """
@@ -898,7 +904,7 @@ async def test_websocket_to_allowlisted_domain_is_not_aborted_by_guard(
     expressions containing 'WebSocket'.
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
-    guard = NetworkGuard(network_enabled=True, allowed_domains=[host])
+    guard = _browser_guard([host])
 
     (tmp_path / "index.html").write_text(
         f"""
@@ -957,4 +963,17 @@ async def test_websocket_to_allowlisted_domain_is_not_aborted_by_guard(
     assert ev["ok"], f"evaluate failed: {ev}"
     assert ev["result"] == "echo:ping", (
         f"allowlisted WebSocket did not complete echo round-trip: {ev}"
+    )
+class _BrowserE2EHostAuthority:
+    """Permit the test server; SSRF behavior has dedicated authority tests."""
+
+    async def validate_url(self, url: str, **_kwargs: object) -> str:
+        return url
+
+
+def _browser_guard(allowed_domains: list[str]) -> NetworkGuard:
+    return NetworkGuard(
+        network_enabled=True,
+        allowed_domains=allowed_domains,
+        host_authority=_BrowserE2EHostAuthority(),
     )

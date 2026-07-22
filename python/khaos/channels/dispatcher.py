@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 
 from khaos.channels.models import ChannelType, DeliveryResult, Message
+from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +63,10 @@ class LogFileChannel(Channel):
         self._log_dir.mkdir(parents=True, exist_ok=True)
 
     async def send(self, message: Message) -> DeliveryResult:
-        from datetime import datetime
-
         path = self._log_dir / f"{message.target or 'default'}.log"
         try:
             with open(path, "a", encoding="utf-8") as f:
-                ts = datetime.utcnow().isoformat()
+                ts = utc_now_naive().isoformat()
                 f.write(f"[{ts}] {message.content}\n")
             return DeliveryResult(
                 success=True,

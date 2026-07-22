@@ -4,16 +4,22 @@ from __future__ import annotations
 
 import copy
 import getpass
+import logging
 import os
 import re
 import secrets
 import stat
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+from collections.abc import Iterator
 from typing import Any
 
 import yaml
 
 from khaos.exceptions import KhaosError
+
+logger = logging.getLogger(__name__)
 
 
 class ConfigError(KhaosError):
@@ -23,6 +29,47 @@ class ConfigError(KhaosError):
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 USER_CONFIG_PATH = Path("~/.khaos/config.yaml")
 PROJECT_CONFIG_PATH = Path("config.yaml")
+
+
+class ConfigAuthority(Enum):
+    """Authorities that may contribute effective configuration fields."""
+
+    MANAGED_REQUIREMENT = "managed-requirement"
+    USER_GRANT = "user-grant"
+    PROJECT_RESTRICTION = "project-restriction"
+    RUNTIME_OVERRIDE = "runtime-override"
+
+
+@dataclass(frozen=True)
+class ConfigProvenance:
+    """Source metadata for one effective dotted configuration field."""
+
+    authority: ConfigAuthority
+    source: str
+
+
+class EffectiveConfig(dict[str, Any]):
+    """Dictionary-compatible effective config with field provenance."""
+
+    def __init__(
+        self,
+        value: dict[str, Any],
+        provenance: dict[str, ConfigProvenance],
+    ) -> None:
+        super().__init__(value)
+        self.provenance = dict(provenance)
+
+
+# Project repositories are untrusted input.  These paths control host-side
+# credential destinations or host integrations and therefore may only come
+# from a user/managed/runtime authority.  Prefix matching intentionally makes
+# the entire provider object trusted-only: allowing selected children would
+# make future credential/header fields fail open when the schema grows.
+_PROJECT_FORBIDDEN_PREFIXES = (
+    "models.providers",
+    "gateway",
+    "agent.socket",
+)
 
 PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "nvidia": {
@@ -43,6 +90,11 @@ PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
         "base_url": "https://api.openai.com/v1",
         "model": "gpt-4o",
     },
+}
+_PROVIDER_ENV_KEYS = {
+    "nvidia": "NVIDIA_API_KEY",
+    "anthropic": "ANTHROPIC_API_KEY",
+    "openai": "OPENAI_API_KEY",
 }
 
 
@@ -84,7 +136,12 @@ def expand_config_placeholders(value: Any, *, source: str = "config.yaml", stric
     return value
 
 
-def load_config(path: str | Path | None = None, *, strict_env: bool = True) -> dict[str, Any]:
+def load_config(
+    path: str | Path | None = None,
+    *,
+    strict_env: bool = True,
+    project_path: str | Path | None = None,
+) -> dict[str, Any]:
     """Read config and expand supported environment placeholders.
 
     With no explicit path, the project template is loaded first and
@@ -93,13 +150,123 @@ def load_config(path: str | Path | None = None, *, strict_env: bool = True) -> d
     if path is not None:
         config_path = Path(path).expanduser()
         raw = _read_yaml_file(config_path)
-        return expand_config_placeholders(raw, source=str(config_path), strict=strict_env)
+        expanded = expand_config_placeholders(raw, source=str(config_path), strict=strict_env)
+        return EffectiveConfig(
+            expanded,
+            _field_provenance(
+                expanded, ConfigAuthority.RUNTIME_OVERRIDE, str(config_path)
+            ),
+        )
 
-    merged: dict[str, Any] = {}
-    for config_path in [PROJECT_CONFIG_PATH, user_config_path()]:
-        if config_path.exists():
-            merged = deep_merge(merged, _read_yaml_file(config_path))
-    return expand_config_placeholders(merged, source="merged config", strict=strict_env)
+    project_path = Path(project_path or PROJECT_CONFIG_PATH).expanduser().resolve()
+    user_path = user_config_path()
+    project = _read_yaml_file(project_path) if project_path.exists() else {}
+    _validate_project_config(project, source=str(project_path))
+    user = _read_yaml_file(user_path) if user_path.exists() else {}
+
+    # Environment expansion is deliberately performed only on the trusted
+    # user layer.  A repository must never be able to name a host secret even
+    # when the merged destination field would otherwise come from the user.
+    expanded_user = expand_config_placeholders(
+        user, source=str(user_path), strict=strict_env
+    )
+    managed = _managed_provider_config()
+    merged = deep_merge(managed, project)
+    merged = deep_merge(merged, expanded_user)
+    provenance = _field_provenance(
+        managed, ConfigAuthority.MANAGED_REQUIREMENT, "trusted environment"
+    )
+    provenance.update(
+        _field_provenance(
+            project, ConfigAuthority.PROJECT_RESTRICTION, str(project_path)
+        )
+    )
+    provenance.update(
+        _field_provenance(
+            expanded_user, ConfigAuthority.USER_GRANT, str(user_path)
+        )
+    )
+    return EffectiveConfig(merged, provenance)
+
+
+def _managed_provider_config() -> dict[str, Any]:
+    """Build fixed-endpoint providers from explicitly named host secrets."""
+    providers: dict[str, Any] = {}
+    for provider_name, env_name in _PROVIDER_ENV_KEYS.items():
+        api_key = os.environ.get(env_name, "").strip()
+        if not api_key:
+            continue
+        defaults = PROVIDER_DEFAULTS[provider_name]
+        providers[provider_name] = {
+            "type": defaults["type"],
+            "base_url": defaults["base_url"],
+            "api_key": api_key,
+            "models": [
+                {
+                    "name": defaults["model"],
+                    "max_context_tokens": 128000,
+                }
+            ],
+        }
+    return {"models": {"providers": providers}} if providers else {}
+
+
+def config_field_provenance(
+    config: dict[str, Any], dotted_path: str
+) -> ConfigProvenance | None:
+    """Return the authority/source for an effective config field."""
+    provenance = getattr(config, "provenance", {})
+    return provenance.get(dotted_path)
+
+
+def _validate_project_config(config: dict[str, Any], *, source: str) -> None:
+    """Reject project fields that can grant host authority or read secrets."""
+    for dotted_path, value in _walk_config(config):
+        if any(
+            dotted_path == prefix or dotted_path.startswith(f"{prefix}.")
+            for prefix in _PROJECT_FORBIDDEN_PREFIXES
+        ):
+            logger.error(
+                "security.config_rejected source=%s field=%s reason=trusted-only",
+                source,
+                dotted_path,
+            )
+            raise ConfigError(
+                f"Project config field {dotted_path!r} from {source} is "
+                "trusted-only and must be moved to ~/.khaos/config.yaml"
+            )
+        if isinstance(value, str) and _ENV_PATTERN.search(value):
+            logger.error(
+                "security.config_rejected source=%s field=%s reason=project-env",
+                source,
+                dotted_path,
+            )
+            raise ConfigError(
+                f"Project config field {dotted_path!r} from {source} cannot "
+                "reference host environment variables"
+            )
+
+
+def _walk_config(value: Any, prefix: str = "") -> Iterator[tuple[str, Any]]:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            yield from _walk_config(child, path)
+        return
+    if isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _walk_config(child, f"{prefix}[{index}]")
+        return
+    yield prefix, value
+
+
+def _field_provenance(
+    config: dict[str, Any], authority: ConfigAuthority, source: str
+) -> dict[str, ConfigProvenance]:
+    return {
+        path: ConfigProvenance(authority=authority, source=source)
+        for path, _value in _walk_config(config)
+    }
 
 
 def check_needs_setup(config: dict[str, Any] | None = None) -> bool:
@@ -142,7 +309,14 @@ def write_provider_config(provider: str, api_key: str, path: str | Path | None =
     target = Path(path).expanduser() if path is not None else user_config_path()
     defaults = PROVIDER_DEFAULTS[provider_name]
     config = _read_yaml_file(target) if target.exists() else {}
+    set_nested_value(config, f"models.providers.{provider_name}.type", defaults["type"])
+    set_nested_value(config, f"models.providers.{provider_name}.base_url", defaults["base_url"])
     set_nested_value(config, f"models.providers.{provider_name}.api_key", api_key)
+    set_nested_value(
+        config,
+        f"models.providers.{provider_name}.models",
+        [{"name": defaults["model"], "max_context_tokens": 128000}],
+    )
     set_nested_value(config, "models.default_model", defaults["model"])
     _write_yaml_file(target, config)
     return target

@@ -12,6 +12,7 @@ from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
 from khaos.agent.approval import ApprovalBinding
+from khaos.exceptions import PermissionDeniedError
 from khaos.security.middleware import SecurityMiddleware
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 
@@ -425,6 +426,28 @@ class ToolScheduler:
                     )
             approved_calls.append(normalized)
 
+        # Bind this dispatch batch to the latest database-authoritative epoch
+        # after all interactive grants have completed.  Each handler validates
+        # the snapshot again immediately before its security pre-check.
+        if approved_calls:
+            try:
+                dispatch_epoch = await self.permission_engine.authorization_snapshot()
+            except PermissionDeniedError as exc:
+                for call in approved_calls:
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=call["id"],
+                            name=call["name"],
+                            success=False,
+                            error=f"Permission denied: {exc}",
+                            arguments=call["arguments"],
+                        ),
+                    )
+                return
+            for call in approved_calls:
+                call["_authorization_epoch"] = dispatch_epoch
+
         parallel_calls, serial_calls = self.registry.get_parallel_tools(approved_calls)
         if parallel_calls:
             tasks = [self._execute_one(call, session_id, mode, tool_context or {}) for call in parallel_calls]
@@ -460,6 +483,9 @@ class ToolScheduler:
                 arguments=call["arguments"],
             )
         try:
+            await self.permission_engine.validate_dispatch_epoch(
+                int(call.get("_authorization_epoch", 0))
+            )
             security = await self.security_middleware.pre_check(
                 tool.name,
                 call.get("arguments", {}),

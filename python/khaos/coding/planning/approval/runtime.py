@@ -286,6 +286,11 @@ class ApprovalRuntime:
         self._approved_image_attestation_digest: str = ""
         self._approved_toolchain_attestation_digests: tuple[str, ...] = ()
         self._verification_docker_executable = verification_docker_executable
+        # ``require_ready`` and the guard both consult the same authoritative
+        # SQLite connection used by the mutation engine. Serialize the entire
+        # synchronous public mutation route so concurrent worker threads cannot
+        # race those preflight reads before the engine's own session lock.
+        self._planned_mutation_lock = threading.Lock()
 
     @property
     def state(self) -> RuntimeState:
@@ -493,8 +498,9 @@ class ApprovalRuntime:
 
     def apply_edit_bundle(self, *, context: Any, bundle: Any) -> Any:
         """Only public planned-mutation route: Runtime → Guard → Engine."""
-        self.require_ready()
-        return self.guard.planned_workspace_edit(context, bundle=bundle)
+        with self._planned_mutation_lock:
+            self.require_ready()
+            return self.guard.planned_workspace_edit(context, bundle=bundle)
 
     def configure_trusted_verification(
         self, *, config: Any, command_factory: Any, profile: Any,

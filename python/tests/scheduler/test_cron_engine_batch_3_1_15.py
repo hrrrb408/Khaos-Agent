@@ -34,6 +34,7 @@ from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, TaskStatus
 from khaos.scheduler.engine import CronEngineState, PendingPersistence
+from khaos.time_utils import utc_now_naive
 
 
 # ---------------------------------------------------------------------------
@@ -334,7 +335,7 @@ async def test_acceptance_3_failed_stop_then_start_rejected(tmp_path) -> None:
         assert engine._lifecycle_state == CronEngineState.RUNNING
 
         # Create a task that's immediately due → executor starts.
-        past_iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        past_iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task_a = await engine.create(
             "task-a-resistant", "a", ScheduleConfig(iso_time=past_iso),
             principal_id="alice",
@@ -400,7 +401,7 @@ async def test_acceptance_4_failed_stop_no_recover_all_running(tmp_path) -> None
         )
         await engine.start()
 
-        past_iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        past_iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task_a = await engine.create(
             "task-a-resistant", "a", ScheduleConfig(iso_time=past_iso),
             principal_id="alice",
@@ -468,7 +469,7 @@ async def test_acceptance_5_failed_stop_no_pending_executions(tmp_path) -> None:
         )
         await engine.start()
 
-        past_iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        past_iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task_a = await engine.create(
             "task-a-resistant", "a", ScheduleConfig(iso_time=past_iso),
             principal_id="alice",
@@ -477,7 +478,7 @@ async def test_acceptance_5_failed_stop_no_pending_executions(tmp_path) -> None:
         assert task_a.id in engine._execute_tasks
 
         # Create Task B with a far-future schedule (not due yet).
-        future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task_b = await engine.create(
             "task-b-future", "task-b", ScheduleConfig(iso_time=future_iso),
             principal_id="alice",
@@ -775,7 +776,7 @@ async def test_acceptance_9_executor_marker_cas0_running_keeps_marker(
         engine = CronEngine(db=db)
         await engine.start()
 
-        future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "task-marker", "p", ScheduleConfig(iso_time=future_iso),
             principal_id="alice",
@@ -857,7 +858,7 @@ async def test_acceptance_10_executor_commit_then_raise_clears_marker(
         engine = CronEngine(db=db)
         await engine.start()
 
-        future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "task-commit-raise", "p", ScheduleConfig(iso_time=future_iso),
             principal_id="alice",

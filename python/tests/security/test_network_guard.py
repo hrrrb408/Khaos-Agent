@@ -112,3 +112,21 @@ def test_empty_url_allowed() -> None:
     result = guard.check_tool("browser_navigate", {"url": ""})
 
     assert result.allowed is True
+
+
+def test_websocket_url_uses_the_same_domain_allowlist() -> None:
+    """WebSocket schemes are parsed before applying the domain policy."""
+    guard = NetworkGuard(
+        network_enabled=True,
+        allowed_domains=["socket.example.com"],
+    )
+
+    allowed = guard.check_tool(
+        "browser_navigate", {"url": "wss://socket.example.com/events"}
+    )
+    denied = guard.check_tool(
+        "browser_navigate", {"url": "ws://other.example.com/events"}
+    )
+
+    assert allowed.allowed is True
+    assert denied.allowed is False

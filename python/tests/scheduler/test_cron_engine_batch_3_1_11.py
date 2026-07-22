@@ -26,6 +26,7 @@ import pytest
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, TaskStatus
+from khaos.time_utils import utc_now_naive
 import khaos.scheduler.engine as _engine_mod
 
 
@@ -87,7 +88,7 @@ async def test_acceptance_1_claim_exception_no_executor_call(tmp_path) -> None:
         db.claim_scheduled_task = failing_claim
 
         # Create a task that's immediately due.
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "claim-fail", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -162,7 +163,7 @@ async def test_acceptance_2_claim_commit_then_raise_read_back(tmp_path) -> None:
         db.claim_scheduled_task = commit_then_raise
 
         # Create a task that's immediately due.
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "commit-raise", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -234,7 +235,7 @@ async def test_acceptance_3_terminal_write_failure_retains_lease(tmp_path) -> No
         db.finalize_scheduled_task = failing_finalize
 
         # Create a task that's immediately due.
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "lease-retain", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -313,7 +314,7 @@ async def test_acceptance_4_terminal_write_failure_restart_recovers_as_failed(
         db.finalize_scheduled_task = failing_finalize
 
         # Create a task that's immediately due.
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "restart-recover", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -339,7 +340,7 @@ async def test_acceptance_4_terminal_write_failure_restart_recovers_as_failed(
         conn = await db2._require_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
-            ((datetime.utcnow() - timedelta(seconds=1)).isoformat(), task.id),
+            ((utc_now_naive() - timedelta(seconds=1)).isoformat(), task.id),
         )
         await conn.commit()
     finally:
@@ -412,7 +413,7 @@ async def test_acceptance_5_executor_typeerror_no_double_execution(tmp_path) -> 
         )
         await engine.start()
 
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "typeerror", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -479,7 +480,7 @@ async def test_acceptance_6_empty_principal_rejected_in_execute(tmp_path) -> Non
         )
         await engine.start()
 
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "empty-principal", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -582,7 +583,7 @@ async def test_acceptance_7_stale_executor_does_not_overwrite_control_marker(
         )
         await engine.start()
 
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "stale-exec", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -842,7 +843,7 @@ async def test_acceptance_10_lease_recovery_failure_degraded_mode(tmp_path) -> N
         )
 
         # M4 batch 3.1.16B-5: create() MUST raise in degraded mode.
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         with pytest.raises(RuntimeError, match="engine_degraded"):
             await engine.create(
                 "degraded", "p", ScheduleConfig(iso_time=iso),

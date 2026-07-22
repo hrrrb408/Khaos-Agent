@@ -15,6 +15,7 @@ from khaos.memory import (
 )
 from khaos.memory.store import extract_memories_from_messages, extract_memories_from_text
 from khaos.modes import Mode
+from khaos.time_utils import utc_now_naive
 
 
 async def _store(tmp_path):
@@ -39,7 +40,7 @@ async def test_decay_removes_expired_memories(tmp_path):
     await store.set(Memory(None, MemoryScope.GLOBAL, "short", "v", ttl=1))
 
     # Travel 2 seconds into the future.
-    future = datetime.utcnow() + timedelta(seconds=2)
+    future = utc_now_naive() + timedelta(seconds=2)
     removed = await store.decay(now=future)
 
     assert removed == 1
@@ -51,7 +52,7 @@ async def test_decay_keeps_fresh_memories(tmp_path):
     db, store = await _store(tmp_path)
     await store.set(Memory(None, MemoryScope.GLOBAL, "long", "v", ttl=86400))
 
-    removed = await store.decay(now=datetime.utcnow())
+    removed = await store.decay(now=utc_now_naive())
 
     assert removed == 0
     assert (await store.get(MemoryScope.GLOBAL, "long")) is not None

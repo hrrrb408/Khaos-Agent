@@ -10,6 +10,7 @@ of Khaos keeps working without a Rust toolchain.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import logging
@@ -31,11 +32,14 @@ _CANDIDATE_PROFILES = ("release", "debug")
 def load_rust_module():
     """Load the compiled Rust extension, or return None if unavailable.
 
-    Searches release then debug profiles, and accepts either ``.so`` or
-    ``.dylib`` (macOS). On macOS the loader needs the file to end in ``.so``
-    for ``importlib`` to recognize it, so we load from a renamed copy when only
-    the ``.dylib`` is present.
+    Prefer the extension installed by Maturin, which carries the correct
+    Python ABI filename and linker metadata. Fall back to release/debug
+    artifacts for developer builds.
     """
+    try:
+        return importlib.import_module(_MODULE_NAME)
+    except ImportError:
+        pass
     for profile in _CANDIDATE_PROFILES:
         for suffix in _CANDIDATE_SUFFIXES:
             candidate = _TARGET_DIR / profile / f"{_LIB_BASENAME}{suffix}"

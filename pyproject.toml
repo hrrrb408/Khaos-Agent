@@ -23,6 +23,7 @@ test = [
 tui = [
     "textual>=0.47",
     "rich>=13",
+    "Pillow>=10",
 ]
 # M2: browser E2E extra.  Pulls in Playwright so the security route guard,
 # BrowserContext lifecycle and concurrent-session isolation tests can run
@@ -41,6 +42,9 @@ tree-sitter = [
     "tree-sitter-typescript==0.23.2",
     "tree-sitter-go==0.25.0",
     "tree-sitter-rust==0.24.2",
+]
+lsp = [
+    "pyright>=1.1",
 ]
 
 [tool.setuptools]

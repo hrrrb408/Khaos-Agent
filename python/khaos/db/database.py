@@ -16,6 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only in bare envs
     aiosqlite = None
 
 from khaos.agent.core import Message
+from khaos.time_utils import utc_now_naive
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
@@ -75,6 +76,7 @@ class Database:
         self._operation_approval_lock = asyncio.Lock()
         self._turn_event_lock = asyncio.Lock()
         self._webhook_replay_lock = asyncio.Lock()
+        self._authorization_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Open the SQLite connection if it is not already open."""
@@ -107,6 +109,7 @@ class Database:
         # M4 batch 3.1.16A-2: principal partitioning for permissions,
         # memories, audit_log + new principal_modes table.
         await self._ensure_permissions_principal_columns()
+        await self._ensure_authorization_contexts()
         await self._ensure_memories_principal_columns()
         await self._ensure_audit_log_principal_columns()
         # M4 batch 3.1.16A-3: principal-scoped ownership for coding_tasks.
@@ -318,8 +321,29 @@ class Database:
             await conn.commit()
         # Principal-scoped lookup index (idempotent).
         await conn.execute(
-            "CREATE INDEX IF NOT EXISTS idx_permissions_principal "
-            "ON permissions(principal_id, project_id, mode, permission_level)"
+            "DROP INDEX IF EXISTS idx_permissions_principal"
+        )
+        await conn.execute(
+            "CREATE INDEX idx_permissions_principal "
+            "ON permissions(principal_id, project_id, policy_digest, "
+            "generation, mode, permission_level)"
+        )
+        await conn.commit()
+
+    async def _ensure_authorization_contexts(self) -> None:
+        """Create the authoritative per-principal/project revocation epoch."""
+        conn = await self._require_conn()
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS authorization_contexts (
+                principal_id TEXT NOT NULL,
+                project_id TEXT NOT NULL,
+                policy_digest TEXT NOT NULL,
+                epoch INTEGER NOT NULL DEFAULT 1 CHECK (epoch >= 1),
+                updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (principal_id, project_id)
+            )
+            """
         )
         await conn.commit()
 
@@ -1120,25 +1144,65 @@ class Database:
         never matched by authenticated principals.
         """
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            INSERT INTO permissions (
-                pattern, permission_level, approval, mode,
-                principal_id, project_id, policy_digest, generation
+        await self._authorization_lock.acquire()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            row = await self._authorization_context_row(
+                conn, principal_id, project_id
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (pattern, permission_level, approval, mode,
-             principal_id, project_id, policy_digest, generation),
-        )
-        await conn.commit()
-        return int(cursor.lastrowid)
+            if row is None:
+                epoch = 1
+                await conn.execute(
+                    "INSERT INTO authorization_contexts "
+                    "(principal_id, project_id, policy_digest, epoch) "
+                    "VALUES (?, ?, ?, ?)",
+                    (principal_id, project_id, policy_digest, epoch),
+                )
+            else:
+                if str(row["policy_digest"]) != policy_digest:
+                    raise ValueError(
+                        "permission grant policy digest does not match the "
+                        "authoritative authorization context"
+                    )
+                epoch = int(row["epoch"]) + 1
+                await conn.execute(
+                    "UPDATE authorization_contexts SET epoch = ?, "
+                    "updated_at = datetime('now') "
+                    "WHERE principal_id = ? AND project_id = ?",
+                    (epoch, principal_id, project_id),
+                )
+            await conn.execute(
+                "UPDATE permissions SET generation = ? "
+                "WHERE principal_id = ? AND project_id = ? "
+                "AND policy_digest = ?",
+                (epoch, principal_id, project_id, policy_digest),
+            )
+            cursor = await conn.execute(
+                """
+                INSERT INTO permissions (
+                    pattern, permission_level, approval, mode,
+                    principal_id, project_id, policy_digest, generation
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (pattern, permission_level, approval, mode,
+                 principal_id, project_id, policy_digest, epoch),
+            )
+            await conn.commit()
+            return int(cursor.lastrowid)
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            self._authorization_lock.release()
 
     async def list_permission_rules(
         self,
         *,
         principal_id: str | None = None,
         project_id: str | None = None,
+        policy_digest: str | None = None,
+        generation: int | None = None,
     ) -> list[dict[str, Any]]:
         """Load permission rules newest first.
 
@@ -1157,6 +1221,12 @@ class Database:
         if project_id is not None:
             clauses.append("project_id = ?")
             params.append(project_id)
+        if policy_digest is not None:
+            clauses.append("policy_digest = ?")
+            params.append(policy_digest)
+        if generation is not None:
+            clauses.append("generation = ?")
+            params.append(generation)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         cursor = await conn.execute(
             f"""
@@ -1176,6 +1246,8 @@ class Database:
         rule_id: int,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
+        policy_digest: str | None = None,
     ) -> int:
         """Delete a permission rule.
 
@@ -1186,17 +1258,109 @@ class Database:
         exist or belongs to a different principal).
         """
         conn = await self._require_conn()
-        if principal_id is not None:
+        if principal_id is None or project_id is None or policy_digest is None:
             cursor = await conn.execute(
-                "DELETE FROM permissions WHERE id = ? AND principal_id = ?",
-                (rule_id, principal_id),
+                "DELETE FROM permissions WHERE id = ?"
+                + (" AND principal_id = ?" if principal_id is not None else ""),
+                (rule_id, principal_id) if principal_id is not None else (rule_id,),
             )
-        else:
+            await conn.commit()
+            return cursor.rowcount or 0
+        await self._authorization_lock.acquire()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            row = await self._authorization_context_row(
+                conn, principal_id, project_id
+            )
+            if row is None or str(row["policy_digest"]) != policy_digest:
+                await conn.rollback()
+                return 0
             cursor = await conn.execute(
-                "DELETE FROM permissions WHERE id = ?", (rule_id,)
+                "DELETE FROM permissions WHERE id = ? AND principal_id = ? "
+                "AND project_id = ? AND policy_digest = ?",
+                (rule_id, principal_id, project_id, policy_digest),
             )
-        await conn.commit()
-        return cursor.rowcount or 0
+            if not (cursor.rowcount or 0):
+                await conn.rollback()
+                return 0
+            epoch = int(row["epoch"]) + 1
+            await conn.execute(
+                "UPDATE authorization_contexts SET epoch = ?, "
+                "updated_at = datetime('now') "
+                "WHERE principal_id = ? AND project_id = ?",
+                (epoch, principal_id, project_id),
+            )
+            await conn.execute(
+                "UPDATE permissions SET generation = ? "
+                "WHERE principal_id = ? AND project_id = ? "
+                "AND policy_digest = ?",
+                (epoch, principal_id, project_id, policy_digest),
+            )
+            await conn.commit()
+            return cursor.rowcount or 0
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            self._authorization_lock.release()
+
+    async def bind_authorization_context(
+        self, principal_id: str, project_id: str, policy_digest: str
+    ) -> int:
+        """Bind the current policy, bumping epoch when the digest changes."""
+        conn = await self._require_conn()
+        await self._authorization_lock.acquire()
+        try:
+            await conn.execute("BEGIN IMMEDIATE")
+            row = await self._authorization_context_row(
+                conn, principal_id, project_id
+            )
+            if row is None:
+                epoch = 1
+                await conn.execute(
+                    "INSERT INTO authorization_contexts "
+                    "(principal_id, project_id, policy_digest, epoch) "
+                    "VALUES (?, ?, ?, ?)",
+                    (principal_id, project_id, policy_digest, epoch),
+                )
+            elif str(row["policy_digest"]) == policy_digest:
+                epoch = int(row["epoch"])
+            else:
+                epoch = int(row["epoch"]) + 1
+                await conn.execute(
+                    "UPDATE authorization_contexts SET policy_digest = ?, "
+                    "epoch = ?, updated_at = datetime('now') "
+                    "WHERE principal_id = ? AND project_id = ?",
+                    (policy_digest, epoch, principal_id, project_id),
+                )
+            await conn.commit()
+            return epoch
+        except BaseException:
+            await conn.rollback()
+            raise
+        finally:
+            self._authorization_lock.release()
+
+    async def get_authorization_context(
+        self, principal_id: str, project_id: str
+    ) -> dict[str, Any] | None:
+        conn = await self._require_conn()
+        async with self._authorization_lock:
+            row = await self._authorization_context_row(
+                conn, principal_id, project_id
+            )
+        return dict(row) if row is not None else None
+
+    async def _authorization_context_row(
+        self, conn, principal_id: str, project_id: str
+    ):
+        cursor = await conn.execute(
+            "SELECT principal_id, project_id, policy_digest, epoch "
+            "FROM authorization_contexts WHERE principal_id = ? "
+            "AND project_id = ?",
+            (principal_id, project_id),
+        )
+        return await cursor.fetchone()
 
     async def insert_audit_log(
         self,
@@ -2616,9 +2780,7 @@ class Database:
         Returns the ``seq`` of the inserted row.
         """
         conn = await self._require_conn()
-        from datetime import datetime as _dt
-
-        created = _dt.utcnow().isoformat()
+        created = utc_now_naive().isoformat()
         cursor = await conn.execute(
             """
             INSERT INTO scheduler_operation_journal
@@ -2649,9 +2811,7 @@ class Database:
         marked or never inserted; both are safe).
         """
         conn = await self._require_conn()
-        from datetime import datetime as _dt
-
-        applied = _dt.utcnow().isoformat()
+        applied = utc_now_naive().isoformat()
         cursor = await conn.execute(
             "UPDATE scheduler_operation_journal SET applied_at = ? "
             "WHERE operation_id = ? AND applied_at IS NULL",
@@ -2732,9 +2892,7 @@ class Database:
         row mirrors that rowid.
         """
         conn = await self._require_conn()
-        from datetime import datetime as _dt
-
-        created = _dt.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        created = utc_now_naive().strftime("%Y-%m-%d %H:%M:%S")
         if rowid is not None:
             await conn.execute(
                 "INSERT INTO messages_fts (rowid, session_id, role, content, created_at) "

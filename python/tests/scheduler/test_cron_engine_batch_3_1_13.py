@@ -37,6 +37,7 @@ from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, TaskStatus
 from khaos.scheduler.engine import PendingPersistence
+from khaos.time_utils import utc_now_naive
 
 
 # ---------------------------------------------------------------------------
@@ -112,7 +113,7 @@ async def test_acceptance_1_lease_sweep_revokes_executor_before_failed(tmp_path)
         await engine.start()
 
         # Create a task with a past ISO time (immediately due).
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "lease-sweep-revoke", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -142,7 +143,7 @@ async def test_acceptance_1_lease_sweep_revokes_executor_before_failed(tmp_path)
         )
 
         # Expire the lease in the DB.
-        expired_iso = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
+        expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
         conn = await db._require_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
@@ -152,7 +153,7 @@ async def test_acceptance_1_lease_sweep_revokes_executor_before_failed(tmp_path)
 
         # Call _revoke_and_recover_lease directly.
         ok = await engine._revoke_and_recover_lease(
-            task_id, now_iso=datetime.utcnow().isoformat(),
+            task_id, now_iso=utc_now_naive().isoformat(),
         )
 
         # Verify: revoke succeeded.
@@ -245,7 +246,7 @@ async def test_acceptance_2_cancellation_resistant_enters_degraded(tmp_path) -> 
         )
         await engine.start()
 
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "resistant-exec", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -258,7 +259,7 @@ async def test_acceptance_2_cancellation_resistant_enters_degraded(tmp_path) -> 
         await asyncio.wait_for(executor_started.wait(), timeout=2.0)
 
         # Expire the lease.
-        expired_iso = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
+        expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
         conn = await db._require_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
@@ -268,7 +269,7 @@ async def test_acceptance_2_cancellation_resistant_enters_degraded(tmp_path) -> 
 
         # Call _revoke_and_recover_lease.
         ok = await engine._revoke_and_recover_lease(
-            task_id, now_iso=datetime.utcnow().isoformat(),
+            task_id, now_iso=utc_now_naive().isoformat(),
         )
 
         # Verify: returns False (executor did not terminate).
@@ -360,7 +361,7 @@ async def test_acceptance_3_tick_skips_pending_persistence_tasks(tmp_path) -> No
         await engine.start()
 
         # Create a task with a past ISO time (immediately due).
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "skip-pending-persist", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -444,7 +445,7 @@ async def test_acceptance_4_lease_recovery_does_not_full_reload_others(
         await engine.start()
 
         # Create two tasks with future ISO times (not due).
-        future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task_a = await engine.create(
             "task-a-paused", "p", ScheduleConfig(iso_time=future_iso),
             principal_id="alice",
@@ -478,8 +479,8 @@ async def test_acceptance_4_lease_recovery_does_not_full_reload_others(
 
         # Expire task B's lease in the DB.
         # First, claim task B so it has a lease.
-        started_at = datetime.utcnow().isoformat()
-        lease_until = (datetime.utcnow() - timedelta(minutes=5)).isoformat()
+        started_at = utc_now_naive().isoformat()
+        lease_until = (utc_now_naive() - timedelta(minutes=5)).isoformat()
         await db.claim_scheduled_task(
             task_b.id,
             execution_id="exec-b",
@@ -492,7 +493,7 @@ async def test_acceptance_4_lease_recovery_does_not_full_reload_others(
 
         # Call _revoke_and_recover_lease(B) — simulates the sweep.
         ok = await engine._revoke_and_recover_lease(
-            task_b.id, now_iso=datetime.utcnow().isoformat(),
+            task_b.id, now_iso=utc_now_naive().isoformat(),
         )
         assert ok is True, "revoke of task B should succeed (no live executor)"
 
@@ -552,7 +553,7 @@ async def test_acceptance_5_reconcile_uses_marker_desired_status(tmp_path) -> No
         engine = CronEngine(db=db, tick_interval=999.0)
         await engine.start()
 
-        future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "reconcile-marker", "p", ScheduleConfig(iso_time=future_iso),
             principal_id="alice",
@@ -638,7 +639,7 @@ async def test_acceptance_6_pause_propagates_persist_false(tmp_path) -> None:
         engine = CronEngine(db=db, tick_interval=999.0)
         await engine.start()
 
-        future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "pause-propagate-false", "p", ScheduleConfig(iso_time=future_iso),
             principal_id="alice",
@@ -677,7 +678,7 @@ async def test_acceptance_6_pause_propagates_persist_false(tmp_path) -> None:
                 "lease_until": future_iso,
                 "deliver_to": "local",
                 "meta": "{}",
-                "created_at": datetime.utcnow().isoformat(),
+                "created_at": utc_now_naive().isoformat(),
             }
 
         db.get_scheduled_task = fake_get
@@ -704,7 +705,9 @@ async def test_acceptance_6_pause_propagates_persist_false(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_acceptance_7_second_instance_rejected_by_lock(tmp_path) -> None:
+async def test_acceptance_7_second_instance_rejected_by_lock(
+    tmp_path, monkeypatch,
+) -> None:
     """Criterion 8: a second process that tries to start against the
     same DB MUST be rejected BEFORE recovery runs.
 
@@ -721,6 +724,9 @@ async def test_acceptance_7_second_instance_rejected_by_lock(tmp_path) -> None:
     """
     from khaos.grpc_server import _acquire_instance_lock
 
+    # Keep the production contract (the lock lives below ``Path.home()``)
+    # while isolating the test from the developer's real ~/.khaos tree.
+    monkeypatch.setenv("HOME", str(tmp_path))
     db_path = tmp_path / "khaos.db"
     db_path.touch()
 
@@ -782,10 +788,13 @@ async def test_acceptance_8_live_uds_not_unlinked() -> None:
             pass
 
     # Create a real UDS server.
-    server = await asyncio.start_unix_server(
-        lambda r, w: w.close(),  # immediately close incoming connections
-        path=str(uds_path),
-    )
+    try:
+        server = await asyncio.start_unix_server(
+            lambda r, w: w.close(),  # immediately close incoming connections
+            path=str(uds_path),
+        )
+    except PermissionError as exc:
+        pytest.skip(f"environment forbids AF_UNIX socket creation: {exc}")
     try:
         # Verify the socket exists.
         assert uds_path.exists(), "UDS socket should exist"
@@ -841,7 +850,7 @@ async def test_acceptance_9_stop_then_start_same_engine(tmp_path) -> None:
         engine = CronEngine(db=db, tick_interval=999.0)
         await engine.start()
 
-        future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "stop-start", "p", ScheduleConfig(iso_time=future_iso),
             principal_id="alice",
@@ -919,14 +928,14 @@ async def test_acceptance_10_pause_fail_plus_lease_sweep_combination(
         await engine.start()
 
         # Create task A (future ISO — not due).
-        future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task_a = await engine.create(
             "task-a-pause-fail", "p", ScheduleConfig(iso_time=future_iso),
             principal_id="alice",
         )
 
         # Create task B (past ISO — due).
-        past_iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        past_iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task_b = await engine.create(
             "task-b-lease-expire", "p", ScheduleConfig(iso_time=past_iso),
             principal_id="alice",
@@ -958,7 +967,7 @@ async def test_acceptance_10_pause_fail_plus_lease_sweep_combination(
         assert task_b.id in executor_calls, "task B executor should have been called"
 
         # Expire task B's lease.
-        expired_iso = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
+        expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
         conn = await db._require_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
@@ -968,7 +977,7 @@ async def test_acceptance_10_pause_fail_plus_lease_sweep_combination(
 
         # Call _revoke_and_recover_lease(B) — simulates the sweep.
         ok = await engine._revoke_and_recover_lease(
-            task_b.id, now_iso=datetime.utcnow().isoformat(),
+            task_b.id, now_iso=utc_now_naive().isoformat(),
         )
         assert ok is True, "revoke of task B should succeed"
 

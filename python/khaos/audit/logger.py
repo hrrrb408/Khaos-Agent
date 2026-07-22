@@ -39,6 +39,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from khaos.time_utils import utc_now_naive
+
+
 logger = logging.getLogger(__name__)
 
 # Canonical result values. Producers should prefer these; arbitrary strings are
@@ -573,7 +576,7 @@ class AuditLogger:
         if self._fd is None:
             return  # file audit disabled or path failed validation
         record: dict[str, Any] = {
-            "ts": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "ts": utc_now_naive().strftime("%Y-%m-%dT%H:%M:%SZ"),
             "action": action,
             "target": target,
             "result": result,

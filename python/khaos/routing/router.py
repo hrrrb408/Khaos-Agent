@@ -8,6 +8,7 @@ import json
 import shlex
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import AsyncIterator
 
 from khaos.agent.core import Message
@@ -257,7 +258,12 @@ def _tool_call_from_parts(parts: list[str]) -> dict | None:
         }
     return None
 
-def create_default_router(config_path: str | None = None, *, honor_no_config: bool = True) -> ModelRouter:
+def create_default_router(
+    config_path: str | None = None,
+    *,
+    honor_no_config: bool = True,
+    project_root: Path | None = None,
+) -> ModelRouter:
     """Create router from config.yaml, falling back to mock if no config.
 
     Tests can set KHAOS_NO_CONFIG=1 to force mock mode.
@@ -270,7 +276,8 @@ def create_default_router(config_path: str | None = None, *, honor_no_config: bo
         expanded_path = expand_env_placeholders(os.path.expanduser(config_path), source="router config path")
         config = load_config(expanded_path, strict_env=False) if os.path.isfile(expanded_path) else {}
     else:
-        config = load_config(strict_env=False)
+        project_config = (project_root / "config.yaml") if project_root else None
+        config = load_config(strict_env=False, project_path=project_config)
 
     models_config = config.get("models", {})
 

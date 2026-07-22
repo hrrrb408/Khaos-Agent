@@ -25,6 +25,7 @@ import pytest
 from khaos.db import Database
 from khaos.scheduler import CronEngine, ScheduleConfig, ScheduledTask, TaskStatus
 from khaos.scheduler.engine import PendingPersistence
+from khaos.time_utils import utc_now_naive
 from khaos.tools.cron_tools import (
     cron_create,
     cron_list,
@@ -237,7 +238,7 @@ async def test_acceptance_3_executor_receives_principal_id(tmp_path) -> None:
         )
         await engine.start()
         # Use a one-shot ISO task in the past so it's immediately due.
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "principal-exec", "p", ScheduleConfig(iso_time=iso),
             principal_id="creator-alice",
@@ -267,7 +268,7 @@ async def test_acceptance_3_executor_falls_back_to_2arg() -> None:
 
     engine = CronEngine(executor=legacy_2arg_executor)
     task = await engine.create(
-        "legacy-exec", "p", ScheduleConfig(iso_time=datetime.utcnow().isoformat()),
+        "legacy-exec", "p", ScheduleConfig(iso_time=utc_now_naive().isoformat()),
         principal_id="creator",
     )
     await engine._execute_task(task)
@@ -287,7 +288,7 @@ async def test_acceptance_4_next_run_persisted_atomically(tmp_path) -> None:
     db = await _make_db(tmp_path)
     try:
         engine = CronEngine(db=db)
-        before = datetime.utcnow()
+        before = utc_now_naive()
         task = await engine.create(
             "atomic-next-run", "p",
             ScheduleConfig(interval_seconds=3600),
@@ -329,7 +330,7 @@ async def test_acceptance_5_create_then_restart_still_fires(tmp_path) -> None:
         # persisted in the INSERT — without that, the task's
         # ``next_run`` would be NULL after restart and tick would
         # skip it (permanently stuck).
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         await engine.create(
             "restart-fire", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -398,7 +399,7 @@ async def test_acceptance_6_durable_lease_claimed_before_execution(tmp_path) -> 
             db=db, executor=quick_executor, tick_interval=0.01,
         )
         await engine.start()
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "lease-claim", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -478,7 +479,7 @@ async def test_acceptance_7_crashed_execution_recovered_as_failed(tmp_path) -> N
             execution_lease_seconds=0.1,  # short lease so it expires fast
         )
         await engine.start()
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "crash-recovery", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -531,6 +532,19 @@ async def test_acceptance_7_crashed_execution_recovered_as_failed(tmp_path) -> N
         await engine2.stop()
     finally:
         await db2.close()
+        # The first engine represents the crashed process and deliberately
+        # was not stopped before recovery evidence was collected. Tear down
+        # its in-process task objects now so pytest's loop shutdown does not
+        # cancel them after the database fixture has gone away; that late
+        # cancellation can reopen SQLite while persisting a terminal state.
+        residual = list(engine._execute_tasks.values())
+        if engine._loop_task is not None:
+            residual.append(engine._loop_task)
+        for owner in residual:
+            owner.cancel()
+        if residual:
+            await asyncio.gather(*residual, return_exceptions=True)
+        await db.close()
 
 
 # ---------------------------------------------------------------------------
@@ -572,7 +586,7 @@ async def test_acceptance_8_stale_executor_cannot_clear_newer_control_marker(tmp
             db=db, executor=stalling_executor, tick_interval=0.01,
         )
         await engine.start()
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "stale-exec", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -680,8 +694,8 @@ async def test_acceptance_9_commit_then_raise_no_version_drift(tmp_path) -> None
         # execution_id — ``finalize_scheduled_task`` checks it in the
         # WHERE clause.  Mirror the execution_id on the in-memory task.
         execution_id = "test-exec-id-9"
-        started_at = datetime.utcnow().isoformat()
-        lease_until = (datetime.utcnow() + timedelta(seconds=600)).isoformat()
+        started_at = utc_now_naive().isoformat()
+        lease_until = (utc_now_naive() + timedelta(seconds=600)).isoformat()
         rowcount = await db.claim_scheduled_task(
             task.id,
             execution_id=execution_id,

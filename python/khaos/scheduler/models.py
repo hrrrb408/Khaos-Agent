@@ -7,6 +7,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Optional
 
+from khaos.time_utils import utc_now_naive
+
 
 class TaskStatus(Enum):
     """Scheduled task lifecycle."""
@@ -39,7 +41,7 @@ class ScheduledTask:
     prompt: str                         # 执行时的 prompt
     status: TaskStatus = TaskStatus.PENDING
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
-    created_at: datetime = field(default_factory=datetime.utcnow)
+    created_at: datetime = field(default_factory=utc_now_naive)
     last_run: Optional[datetime] = None
     next_run: Optional[datetime] = None
     run_count: int = 0

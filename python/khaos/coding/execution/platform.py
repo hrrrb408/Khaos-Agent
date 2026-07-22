@@ -507,32 +507,45 @@ def _runtime_read_roots(
     located = shutil.which(executable) if not Path(executable).is_absolute() else executable
     if not located:
         return ()
+    lexical = Path(located).expanduser().absolute()
     resolved = Path(located).expanduser().resolve()
     canonical_workspace = workspace.expanduser().resolve()
+    venv_roots: tuple[Path, ...] = ()
+    if len(lexical.parents) >= 2:
+        possible_venv = lexical.parents[1]
+        if (
+            (possible_venv / "pyvenv.cfg").is_file()
+            and possible_venv != canonical_workspace
+            and canonical_workspace not in possible_venv.parents
+        ):
+            # Python resolves the executable symlink to its base install, but
+            # ``site.py`` still reads pyvenv.cfg through the lexical venv
+            # path. Both narrow roots are therefore required.
+            venv_roots = (possible_venv.resolve(),)
     if resolved == canonical_workspace or canonical_workspace in resolved.parents:
-        return ()
+        return venv_roots
     for root in _macos_system_read_roots():
         if resolved == root or root in resolved.parents:
-            return ()
+            return venv_roots
     parents = resolved.parents
     if len(parents) < 2:
-        return (resolved,)
+        return (*venv_roots, resolved)
     # /opt/homebrew/bin/python -> /opt/homebrew; framework and application
     # binaries receive their product root rather than the user's whole HOME.
     if resolved.parts[:3] == ("/", "opt", "homebrew"):
-        return (Path("/opt/homebrew"),)
+        return (*venv_roots, Path("/opt/homebrew"))
     if "Library" in resolved.parts and "Frameworks" in resolved.parts:
         index = resolved.parts.index("Frameworks")
-        return (Path(*resolved.parts[: index + 2]),)
+        return (*venv_roots, Path(*resolved.parts[: index + 2]))
     if ".app" in "".join(resolved.parts):
         for index, part in enumerate(resolved.parts):
             if part.endswith(".app"):
-                return (Path(*resolved.parts[: index + 1]),)
+                return (*venv_roots, Path(*resolved.parts[: index + 1]))
     candidate = parents[1]
     home = Path.home().resolve()
     if candidate == home or candidate in home.parents:
-        return (resolved,)
-    return (candidate,)
+        return (*venv_roots, resolved)
+    return (*venv_roots, candidate)
 
 
 def _macos_system_read_roots() -> tuple[Path, ...]:

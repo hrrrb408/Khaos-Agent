@@ -2266,6 +2266,19 @@ async def serve_json_lines(
                 else:
                     writer.write(json.dumps({"error": "unknown method"}).encode("utf-8") + b"\n")
                 await writer.drain()
+            except Exception as exc:
+                # A service-level miss or validation error must remain a
+                # framed RPC response. Letting it escape silently closes the
+                # one-request UDS connection, producing an empty JSON line and
+                # an unowned handler-task exception on the server.
+                try:
+                    writer.write((json.dumps({
+                        "error": exc.__class__.__name__,
+                        "message": str(exc),
+                    }, ensure_ascii=False) + "\n").encode("utf-8"))
+                    await writer.drain()
+                except (ConnectionError, OSError):
+                    pass
             finally:
                 writer.close()
                 try:
@@ -2559,7 +2572,10 @@ def load_router_from_config(config_path: Path, project_root: Path | None = None)
     project_config = (root / "config.yaml").resolve()
     resolved_config = expanded_config.resolve()
     if resolved_config == project_config:
-        return create_default_router(honor_no_config=False)
+        return create_default_router(
+            honor_no_config=False,
+            project_root=root,
+        )
     return create_default_router(str(expanded_config), honor_no_config=False)
 
 
