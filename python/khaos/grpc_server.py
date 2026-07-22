@@ -1098,6 +1098,15 @@ class AgentService:
         ``_active_chat_tasks`` (closing the round-3 M3 leak where the
         reservation was only cleaned up after a successful build).
         """
+        if not ctx.project_id:
+            ctx = RequestContext(
+                principal_id=ctx.principal_id,
+                project_id=self._bound_project_id,
+                session_id=ctx.session_id,
+                runtime_id=ctx.runtime_id,
+                source_transport=ctx.source_transport,
+                policy_digest=ctx.policy_digest,
+            )
         owner_task = asyncio.current_task()
         runtime = None
         # Register the reservation BEFORE any await so shutdown's snapshot
@@ -1110,6 +1119,25 @@ class AgentService:
                 self._active_chat_tasks.add(owner_task)
         try:
             session_id = request.session_id or str(uuid.uuid4())
+            await self.db.create_session(
+                session_id,
+                request.mode or "office",
+                principal_id=ctx.principal_id,
+                project_id=ctx.project_id,
+            )
+            started_sequence = await self.db.append_chat_stream_event(
+                session_id=session_id,
+                principal_id=ctx.principal_id,
+                project_id=ctx.project_id,
+                event_type="started",
+                data={"session_id": session_id},
+                now=time.time(),
+            )
+            yield {
+                "event": "started",
+                "data": {"session_id": session_id},
+                "sequence": started_sequence,
+            }
             # Build OUTSIDE the lock — a slow / wedged build no longer
             # blocks shutdown from acquiring the lock and running its
             # bounded drain.  Cancellation from shutdown propagates here.
@@ -1136,7 +1164,16 @@ class AgentService:
                     )
                 self._active_runtimes[id(runtime)] = runtime
             async for message in runtime.loop.run(request.message, session_id):
-                yield _message_to_event(message)
+                event = _message_to_event(message)
+                sequence = await self.db.append_chat_stream_event(
+                    session_id=session_id,
+                    principal_id=ctx.principal_id,
+                    project_id=ctx.project_id,
+                    event_type=str(event["event"]),
+                    data=dict(event["data"]),
+                    now=time.time(),
+                )
+                yield {**event, "sequence": sequence}
         finally:
             # Covers build failure, build cancellation, and normal exit.
             # Without this wrap, a _build_runtime raise would leak the
@@ -1149,6 +1186,46 @@ class AgentService:
                     self._active_runtimes.pop(id(runtime), None)
             if owner_task is not None:
                 self._active_chat_tasks.discard(owner_task)
+
+    async def chat_events(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+        after_sequence: int = 0,
+    ) -> AsyncIterator[dict]:
+        """Replay and tail one principal's durable chat event ledger."""
+        if not ctx.project_id:
+            ctx = RequestContext(
+                principal_id=ctx.principal_id,
+                project_id=self._bound_project_id,
+                session_id=ctx.session_id,
+                runtime_id=ctx.runtime_id,
+                source_transport=ctx.source_transport,
+                policy_digest=ctx.policy_digest,
+            )
+        session = await self.db.get_session(
+            session_id, principal_id=ctx.principal_id,
+        )
+        if session is None or session.get("project_id") != ctx.project_id:
+            return
+        cursor = max(0, int(after_sequence))
+        idle_deadline = time.monotonic() + 30.0
+        while time.monotonic() < idle_deadline:
+            events = await self.db.list_chat_stream_events(
+                session_id=session_id,
+                principal_id=ctx.principal_id,
+                project_id=ctx.project_id,
+                after_sequence=cursor,
+            )
+            if not events:
+                await asyncio.sleep(0.05)
+                continue
+            idle_deadline = time.monotonic() + 30.0
+            for event in events:
+                cursor = int(event["sequence"])
+                yield event
+            if events[-1]["terminal"]:
+                return
 
     async def switch_mode(self, ctx: RequestContext, session_id: str, target_mode: str) -> dict:
         # M4 batch 3.1.16A-4-1: use ctx.principal_id (transport-
@@ -1960,6 +2037,7 @@ async def serve_json_lines(
         db = Database(db_path)
         await db.connect()
         await db.run_migrations()
+        await db.recover_inflight_chat_streams(now=time.time())
         agent = AgentService(db, project_root=project_root, config_path=config_path, router=router)
         await agent.start()
         # M4 batch 3.1.16A-4-2: MemoryService now holds ``db`` and
@@ -2185,6 +2263,18 @@ async def serve_json_lines(
                                 + "\n"
                             ).encode("utf-8")
                         )
+                elif method == "AgentService.ChatEvents":
+                    async for event in agent.chat_events(
+                        ctx,
+                        str(payload.get("session_id", "")),
+                        int(payload.get("after_sequence", 0)),
+                    ):
+                        writer.write(
+                            (json.dumps(event, ensure_ascii=False) + "\n").encode(
+                                "utf-8"
+                            )
+                        )
+                        await writer.drain()
                 elif method == "AgentService.SwitchMode":
                     response = await agent.switch_mode(ctx, payload.get("session_id", ""), payload["target_mode"])
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))

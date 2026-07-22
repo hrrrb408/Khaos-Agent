@@ -40,6 +40,7 @@ Coverage:
 from __future__ import annotations
 
 import time
+import sqlite3
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -258,7 +259,7 @@ async def test_list_messages_filters_by_principal(tmp_path):
     await db.close()
 
 
-async def test_get_session_messages_filters_by_principal(tmp_path):
+async def test_get_session_messages_rejects_mismatched_principal(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
@@ -267,57 +268,56 @@ async def test_get_session_messages_filters_by_principal(tmp_path):
         "s1", Message(role="user", content="m1", token_count=1),
         principal_id="api:alice",
     )
-    await db.insert_message(
-        "s1", Message(role="user", content="m2", token_count=1),
-        principal_id="api:bob",
-    )
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        await db.insert_message(
+            "s1", Message(role="user", content="m2", token_count=1),
+            principal_id="api:bob",
+        )
 
     alice_msgs = await db.get_session_messages("s1", principal_id="api:alice")
     assert len(alice_msgs) == 1
     assert alice_msgs[0]["content"] == "m1"
 
     bob_msgs = await db.get_session_messages("s1", principal_id="api:bob")
-    assert len(bob_msgs) == 1
-    assert bob_msgs[0]["content"] == "m2"
+    assert bob_msgs == []
 
     admin_msgs = await db.get_session_messages("s1", principal_id=None)
-    assert len(admin_msgs) == 2
+    assert len(admin_msgs) == 1
     await db.close()
 
 
-async def test_get_message_window_filters_by_principal(tmp_path):
+async def test_get_message_window_rejects_mismatched_principal(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
     await db.create_session("s1", principal_id="api:alice")
-    # Insert 3 messages: 2 alice, 1 bob (interleaved by id).
-    await db.insert_message(
+    # The database rejects a different principal before read filtering is
+    # needed; valid same-owner rows remain queryable as a window.
+    a1_rowid = await db.insert_message(
         "s1", Message(role="user", content="a1", token_count=1),
         principal_id="api:alice",
     )
-    bob_rowid = await db.insert_message(
-        "s1", Message(role="user", content="b1", token_count=1),
-        principal_id="api:bob",
-    )
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        await db.insert_message(
+            "s1", Message(role="user", content="b1", token_count=1),
+            principal_id="api:bob",
+        )
     await db.insert_message(
         "s1", Message(role="user", content="a2", token_count=1),
         principal_id="api:alice",
     )
 
-    # Anchor on bob's message — alice's window excludes it.
     alice_window = await db.get_message_window(
-        "s1", bob_rowid, 5, principal_id="api:alice",
+        "s1", a1_rowid, 5, principal_id="api:alice",
     )
     alice_contents = [m["content"] for m in alice_window]
     assert "b1" not in alice_contents
     assert set(alice_contents) == {"a1", "a2"}
 
-    # Bob's window only sees his own message.
     bob_window = await db.get_message_window(
-        "s1", bob_rowid, 5, principal_id="api:bob",
+        "s1", a1_rowid, 5, principal_id="api:bob",
     )
-    assert len(bob_window) == 1
-    assert bob_window[0]["content"] == "b1"
+    assert bob_window == []
     await db.close()
 
 
@@ -331,14 +331,15 @@ async def test_count_session_messages_filters_by_principal(tmp_path):
             "s1", Message(role="user", content=f"a{i}", token_count=1),
             principal_id="api:alice",
         )
-    await db.insert_message(
-        "s1", Message(role="user", content="b1", token_count=1),
-        principal_id="api:bob",
-    )
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        await db.insert_message(
+            "s1", Message(role="user", content="b1", token_count=1),
+            principal_id="api:bob",
+        )
 
     assert await db.count_session_messages("s1", principal_id="api:alice") == 3
-    assert await db.count_session_messages("s1", principal_id="api:bob") == 1
-    assert await db.count_session_messages("s1", principal_id=None) == 4
+    assert await db.count_session_messages("s1", principal_id="api:bob") == 0
+    assert await db.count_session_messages("s1", principal_id=None) == 3
     await db.close()
 
 
@@ -351,32 +352,32 @@ async def test_count_messages_before_after_filters_by_principal(tmp_path):
         "s1", Message(role="user", content="a1", token_count=1),
         principal_id="api:alice",
     )
-    b1 = await db.insert_message(
-        "s1", Message(role="user", content="b1", token_count=1),
-        principal_id="api:bob",
-    )
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        await db.insert_message(
+            "s1", Message(role="user", content="b1", token_count=1),
+            principal_id="api:bob",
+        )
     a2 = await db.insert_message(
         "s1", Message(role="user", content="a2", token_count=1),
         principal_id="api:alice",
     )
 
-    # Anchor on b1 — alice sees 1 before (a1) and 1 after (a2).
+    # Alice sees the valid row after a1.
     before, after = await db.count_messages_before_after(
-        "s1", b1, principal_id="api:alice",
+        "s1", a1, principal_id="api:alice",
     )
-    assert (before, after) == (1, 1)
+    assert (before, after) == (0, 1)
 
-    # Bob sees 0 before and 0 after his own message.
     before, after = await db.count_messages_before_after(
-        "s1", b1, principal_id="api:bob",
+        "s1", a1, principal_id="api:bob",
     )
     assert (before, after) == (0, 0)
 
-    # Admin sees 1 before and 1 after.
+    # Admin sees the same two valid rows.
     before, after = await db.count_messages_before_after(
-        "s1", b1, principal_id=None,
+        "s1", a1, principal_id=None,
     )
-    assert (before, after) == (1, 1)
+    assert (before, after) == (0, 1)
     await db.close()
 
 
@@ -452,6 +453,7 @@ async def test_save_bookmark_stamps_principal_id(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("s1", principal_id="api:alice")
     await db.save_bookmark(
         "s1", "mark1", summary="alice's bookmark",
         principal_id="api:alice",
@@ -476,21 +478,22 @@ async def test_save_bookmark_on_conflict_preserves_original_owner(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("s1", principal_id="api:alice")
     await db.save_bookmark(
         "s1", "mark1", summary="alice-original",
         principal_id="api:alice",
     )
-    # Principal B attempts to overwrite.
-    await db.save_bookmark(
-        "s1", "mark1", summary="bob-attempt", mode="coding",
-        principal_id="api:bob",
-    )
+    # Principal B cannot mutate even the non-owner fields through UPSERT.
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        await db.save_bookmark(
+            "s1", "mark1", summary="bob-attempt", mode="coding",
+            principal_id="api:bob",
+        )
 
     bm = await db.load_bookmark("s1", "mark1", principal_id=None)
-    # Owner stays Alice; summary refreshes to Bob's value.
+    # Owner and mutable fields remain Alice's values.
     assert bm["principal_id"] == "api:alice"
-    assert bm["summary"] == "bob-attempt"
-    assert bm["mode"] == "coding"
+    assert bm["summary"] == "alice-original"
     await db.close()
 
 
@@ -500,6 +503,7 @@ async def test_load_bookmark_filters_by_principal(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("s1", principal_id="api:alice")
     await db.save_bookmark(
         "s1", "mark1", principal_id="api:alice",
     )
@@ -520,9 +524,11 @@ async def test_list_bookmarks_filters_by_principal(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("s1", principal_id="api:alice")
     await db.save_bookmark("s1", "a1", principal_id="api:alice")
     await db.save_bookmark("s1", "a2", principal_id="api:alice")
-    await db.save_bookmark("s1", "b1", principal_id="api:bob")
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        await db.save_bookmark("s1", "b1", principal_id="api:bob")
 
     alice_bms = await db.list_bookmarks("s1", principal_id="api:alice")
     alice_names = {b["name"] for b in alice_bms}
@@ -530,11 +536,11 @@ async def test_list_bookmarks_filters_by_principal(tmp_path):
 
     bob_bms = await db.list_bookmarks("s1", principal_id="api:bob")
     bob_names = {b["name"] for b in bob_bms}
-    assert bob_names == {"b1"}
+    assert bob_names == set()
 
     admin_bms = await db.list_bookmarks("s1", principal_id=None)
     admin_names = {b["name"] for b in admin_bms}
-    assert admin_names == {"a1", "a2", "b1"}
+    assert admin_names == {"a1", "a2"}
     await db.close()
 
 
@@ -546,6 +552,7 @@ async def test_delete_bookmark_is_principal_scoped(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
+    await db.create_session("s1", principal_id="api:alice")
     await db.save_bookmark("s1", "mark1", principal_id="api:alice")
 
     # Bob's delete is a no-op.
@@ -667,10 +674,11 @@ async def test_session_search_passes_principal_id_to_read_session(tmp_path):
         "s1", Message(role="user", content="alice-secret", token_count=1),
         principal_id="api:alice",
     )
-    await db.insert_message(
-        "s1", Message(role="user", content="bob-injected", token_count=1),
-        principal_id="api:bob",
-    )
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        await db.insert_message(
+            "s1", Message(role="user", content="bob-injected", token_count=1),
+            principal_id="api:bob",
+        )
 
     alice_search = SessionSearch(db, principal_id="api:alice")
     msgs = await alice_search.read_session("s1")
@@ -679,8 +687,7 @@ async def test_session_search_passes_principal_id_to_read_session(tmp_path):
 
     bob_search = SessionSearch(db, principal_id="api:bob")
     msgs = await bob_search.read_session("s1")
-    assert len(msgs) == 1
-    assert msgs[0]["content"] == "bob-injected"
+    assert msgs == []
     await db.close()
 
 
@@ -743,11 +750,12 @@ async def test_agent_loop_build_context_filters_by_self_principal_id(tmp_path):
         "s1", Message(role="user", content="alice-context", token_count=1),
         principal_id="api:alice",
     )
-    # Bob's message in the same session — must NOT appear in alice's context.
-    await db.insert_message(
-        "s1", Message(role="user", content="bob-poison", token_count=1),
-        principal_id="api:bob",
-    )
+    # Bob's message is rejected before it can poison Alice's context.
+    with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+        await db.insert_message(
+            "s1", Message(role="user", content="bob-poison", token_count=1),
+            principal_id="api:bob",
+        )
 
     loop = _build_loop(db, principal_id="api:alice")
     messages = await loop._build_context("s1", "next user input")

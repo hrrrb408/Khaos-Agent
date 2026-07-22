@@ -838,9 +838,18 @@ async def test_subagent_spawner_stats_filters_by_principal(tmp_path):
     await db.run_migrations()
     try:
         spawner = SubAgentSpawner(SubAgentConfig(max_concurrent=4), db)
-        await spawner.spawn(SubAgentTask("t1", "g", "c", [], principal_id="alice"))
-        await spawner.spawn(SubAgentTask("t2", "g", "c", [], principal_id="alice"))
-        await spawner.spawn(SubAgentTask("t3", "g", "c", [], principal_id="bob"))
+        await spawner.spawn(SubAgentTask(
+            "t1", "g", "c", [], parent_session_id="alice-root",
+            principal_id="alice",
+        ))
+        await spawner.spawn(SubAgentTask(
+            "t2", "g", "c", [], parent_session_id="alice-root",
+            principal_id="alice",
+        ))
+        await spawner.spawn(SubAgentTask(
+            "t3", "g", "c", [], parent_session_id="bob-root",
+            principal_id="bob",
+        ))
         await spawner.wait_all(principal_id="alice")
         await spawner.wait_all(principal_id="bob")
 
@@ -868,8 +877,14 @@ async def test_subagent_spawner_collect_results_filters_by_principal(tmp_path):
     await db.run_migrations()
     try:
         spawner = SubAgentSpawner(SubAgentConfig(max_concurrent=4), db, runner=_runner)
-        await spawner.spawn(SubAgentTask("t1", "g", "c", [], principal_id="alice"))
-        await spawner.spawn(SubAgentTask("t2", "g", "c", [], principal_id="bob"))
+        await spawner.spawn(SubAgentTask(
+            "t1", "g", "c", [], parent_session_id="alice-root",
+            principal_id="alice",
+        ))
+        await spawner.spawn(SubAgentTask(
+            "t2", "g", "c", [], parent_session_id="bob-root",
+            principal_id="bob",
+        ))
         await spawner.wait_all(principal_id="alice")
         await spawner.wait_all(principal_id="bob")
 
@@ -893,8 +908,8 @@ async def test_database_persists_subagent_principal_id(tmp_path):
     await db.connect()
     await db.run_migrations()
     try:
-        await db.create_session("sess-alice")
-        await db.create_session("sess-bob")
+        await db.create_session("sess-alice", principal_id="user-alice")
+        await db.create_session("sess-bob", principal_id="user-bob")
         await db.insert_subagent_task(
             "t1", "sess-alice", "A-goal", "ctx", "[]", "completed",
             principal_id="user-alice",

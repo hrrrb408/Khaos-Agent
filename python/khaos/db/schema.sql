@@ -1,6 +1,14 @@
 PRAGMA journal_mode = WAL;
 PRAGMA foreign_keys = ON;
 
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version     INTEGER PRIMARY KEY,
+    name        TEXT NOT NULL,
+    checksum    TEXT NOT NULL,
+    applied_at  TEXT NOT NULL,
+    app_version TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS sessions (
     id          TEXT PRIMARY KEY,
     mode        TEXT NOT NULL DEFAULT 'office',
@@ -21,7 +29,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     -- ``''`` and are treated as "unbound" — A-5-1b will fail-closed
     -- on drift (``ctx.project_id != bound_project_id``).  See
     -- ``_ensure_sessions_project_id_column``.
-    project_id   TEXT NOT NULL DEFAULT ''
+    project_id   TEXT NOT NULL DEFAULT '',
+    UNIQUE(id, principal_id, project_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_sessions_principal
@@ -46,7 +55,9 @@ CREATE TABLE IF NOT EXISTS messages (
     -- constraint, because SQLite CHECK can't reference other tables).
     principal_id TEXT NOT NULL DEFAULT 'legacy',
     -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
-    project_id   TEXT NOT NULL DEFAULT ''
+    project_id   TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(session_id, principal_id, project_id)
+        REFERENCES sessions(id, principal_id, project_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, created_at);
@@ -71,7 +82,9 @@ CREATE TABLE IF NOT EXISTS agent_turns (
     -- ``list_agent_turn_events`` callers.
     principal_id  TEXT NOT NULL DEFAULT 'legacy',
     -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
-    project_id    TEXT NOT NULL DEFAULT ''
+    project_id    TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(session_id, principal_id, project_id)
+        REFERENCES sessions(id, principal_id, project_id)
 );
 
 CREATE TABLE IF NOT EXISTS agent_turn_events (
@@ -86,6 +99,25 @@ CREATE TABLE IF NOT EXISTS agent_turn_events (
 CREATE INDEX IF NOT EXISTS idx_agent_turns_session
 ON agent_turns(session_id, started_at);
 -- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
+
+-- Gateway-facing chat events are a durable broadcast log.  Every subscriber
+-- reads independently by sequence; Go never owns or consumes the only copy.
+CREATE TABLE IF NOT EXISTS chat_stream_events (
+    session_id   TEXT NOT NULL,
+    principal_id TEXT NOT NULL,
+    project_id   TEXT NOT NULL DEFAULT '',
+    sequence     INTEGER NOT NULL,
+    event_type   TEXT NOT NULL,
+    data_json    TEXT NOT NULL DEFAULT '{}',
+    is_terminal  INTEGER NOT NULL DEFAULT 0 CHECK(is_terminal IN (0, 1)),
+    created_at   REAL NOT NULL,
+    PRIMARY KEY(session_id, sequence),
+    FOREIGN KEY(session_id, principal_id, project_id)
+        REFERENCES sessions(id, principal_id, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_stream_events_owner
+ON chat_stream_events(principal_id, project_id, session_id, sequence);
 
 CREATE TABLE IF NOT EXISTS memories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -194,7 +226,9 @@ CREATE TABLE IF NOT EXISTS audit_log (
     authority_generation INTEGER,
     source_transport     TEXT,
     -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
-    project_id           TEXT NOT NULL DEFAULT ''
+    project_id           TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(session_id, principal_id, project_id)
+        REFERENCES sessions(id, principal_id, project_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_audit_log_time ON audit_log(created_at);
@@ -242,7 +276,10 @@ CREATE TABLE IF NOT EXISTS subagent_tasks (
     -- spawner / service stamps the authenticated principal here so
     -- collect / status can filter by it.  NOT NULL DEFAULT '' keeps
     -- backward compatibility with rows written before the column existed.
-    principal_id      TEXT NOT NULL DEFAULT ''
+    principal_id      TEXT NOT NULL DEFAULT '',
+    project_id        TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY(parent_session_id, principal_id, project_id)
+        REFERENCES sessions(id, principal_id, project_id)
 );
 
 -- Phase 6: Session bookmarks for task persistence across sessions
@@ -262,7 +299,9 @@ CREATE TABLE IF NOT EXISTS session_bookmarks (
     principal_id TEXT NOT NULL DEFAULT 'legacy',
     -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
     project_id   TEXT NOT NULL DEFAULT '',
-    UNIQUE(session_id, name)
+    UNIQUE(session_id, name),
+    FOREIGN KEY(session_id, principal_id, project_id)
+        REFERENCES sessions(id, principal_id, project_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_session_bookmarks_principal
@@ -313,6 +352,33 @@ CREATE TABLE IF NOT EXISTS scheduled_tasks (
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_status ON scheduled_tasks(status, next_run);
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_principal ON scheduled_tasks(principal_id, status);
 CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_policy ON scheduled_tasks(policy_digest, status);
+
+-- Versioned migrations run once, so legacy ownership must also be rejected at
+-- the write boundary.  Raw/imported rows cannot become executable merely by
+-- being inserted after the migration ledger has advanced.
+CREATE TRIGGER IF NOT EXISTS trg_scheduled_tasks_quarantine_legacy_insert
+AFTER INSERT ON scheduled_tasks
+WHEN NEW.principal_id = 'legacy' AND NEW.status != 'failed'
+BEGIN
+    UPDATE scheduled_tasks
+    SET status = 'failed',
+        error = 'quarantined: legacy write - task has no authenticated owner; an admin must re-claim it with a real principal before it can run',
+        execution_id = NULL,
+        lease_until = NULL
+    WHERE id = NEW.id;
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_scheduled_tasks_quarantine_legacy_update
+AFTER UPDATE OF principal_id, status ON scheduled_tasks
+WHEN NEW.principal_id = 'legacy' AND NEW.status != 'failed'
+BEGIN
+    UPDATE scheduled_tasks
+    SET status = 'failed',
+        error = 'quarantined: legacy write - task has no authenticated owner; an admin must re-claim it with a real principal before it can run',
+        execution_id = NULL,
+        lease_until = NULL
+    WHERE id = NEW.id;
+END;
 
 -- M4 batch 3.1.16B-5 (CRITICAL): durable operation journal for
 -- scheduler control ops.  Closes the gap where ``_pending_persistence``

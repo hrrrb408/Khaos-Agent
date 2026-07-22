@@ -37,6 +37,18 @@ func (m mockAgentClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan 
 	return ch, nil
 }
 
+func (m mockAgentClient) ChatEvents(_ context.Context, _ string, _ string, after uint64) (<-chan api.ChatEvent, error) {
+	ch := make(chan api.ChatEvent, 2)
+	if after < 1 {
+		ch <- api.ChatEvent{Sequence: 1, Event: "message", Data: map[string]any{"role": "assistant", "content": "Khaos gateway mock response.", "token_count": 4}}
+	}
+	if after < 2 {
+		ch <- api.ChatEvent{Sequence: 2, Event: "done", Data: map[string]any{"total_tokens": 4}}
+	}
+	close(ch)
+	return ch, nil
+}
+
 func (m mockAgentClient) ConfirmPermission(ctx context.Context, principalID string, sessionID string, toolCallID string, bindingDigest string, approved bool, remember bool) error {
 	return nil
 }
@@ -390,7 +402,7 @@ type digestBootstrapFunc func(ctx context.Context) (string, error)
 //   - empty digest rejects startup
 //
 // Returns the resolved PythonClient with ProjectID + PolicyDigest stamped.
-// The Address/Capability from ``initial`` are preserved.
+// The Address/Capability from “initial“ are preserved.
 func resolvePythonClient(initial platform.PythonClient, projectRoot string, bootstrapDigest digestBootstrapFunc) (platform.PythonClient, error) {
 	if strings.TrimSpace(projectRoot) == "" {
 		return platform.PythonClient{}, errors.New("gateway: --project-root is required in production (drift detection cannot be disabled)")
@@ -416,11 +428,11 @@ func resolvePythonClient(initial platform.PythonClient, projectRoot string, boot
 	return initial, nil
 }
 
-// computeProjectID mirrors Python's ``compute_project_id(project_root)``:
-// ``sha256(realpath(project_root))[:32]``.  An empty ``projectRoot``
+// computeProjectID mirrors Python's “compute_project_id(project_root)“:
+// “sha256(realpath(project_root))[:32]“.  An empty “projectRoot“
 // returns an empty string (drift detection disabled).  Symlinks are
 // resolved first so a project reached via different symlink paths
-// maps to the same id — matching Python's ``Path.resolve()``.
+// maps to the same id — matching Python's “Path.resolve()“.
 func computeProjectID(projectRoot string) (string, error) {
 	trimmed := strings.TrimSpace(projectRoot)
 	if trimmed == "" {

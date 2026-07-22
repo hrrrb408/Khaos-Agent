@@ -22,11 +22,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock
-
-import pytest
-
-from khaos.agent.core import AgentConfig
+from unittest.mock import MagicMock
 from khaos.db import Database
 from khaos.modes import ModeManager
 from khaos.subagents.runner import SubAgentRunner
@@ -52,6 +48,11 @@ async def _build_runner(
     The router stub below satisfies the ``ModelRouter`` contract without
     any I/O.
     """
+    prompts_dir = tmp_path / "prompts"
+    prompts_dir.mkdir()
+    (prompts_dir / "office.md").write_text(
+        "You are a test office agent.", encoding="utf-8",
+    )
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
@@ -109,7 +110,7 @@ async def test_runner_run_closes_borrowed_runtime_on_success(tmp_path):
         )
         await spawner.wait_all(principal_id="user1", timeout=15)
 
-        assert task.status == "completed"
+        assert task.status == "completed", task.error
         # The orphan registry must be empty: the runtime was closed cleanly
         # by the runner's finally block, not leaked.
         from khaos.runtime.factory import _orphan_runtimes

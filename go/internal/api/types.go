@@ -7,8 +7,8 @@ import (
 )
 
 // ErrForbidden is returned by a Client method when the Python service
-// rejects the call with ``status: "forbidden"`` (e.g. the caller is not
-// in ``channel_admins`` for channel mutations).  The HTTP handler
+// rejects the call with “status: "forbidden"“ (e.g. the caller is not
+// in “channel_admins“ for channel mutations).  The HTTP handler
 // maps it to 403 so the REST caller can distinguish authorization
 // failures from not-found / upstream errors.
 //
@@ -27,8 +27,9 @@ type ChatRequest struct {
 
 // ChatEvent is the gateway-neutral event shape streamed as SSE.
 type ChatEvent struct {
-	Event string         `json:"event"`
-	Data  map[string]any `json:"data"`
+	Sequence uint64         `json:"sequence,omitempty"`
+	Event    string         `json:"event"`
+	Data     map[string]any `json:"data"`
 }
 
 // AgentClient is implemented by the Python gRPC client and by tests.
@@ -36,12 +37,17 @@ type ChatEvent struct {
 // C-1-1: every method that dispatches to Python must carry the
 // authenticated principal so Python's RequestContext.principal_id
 // (the sole identity authority) matches the Gateway's auth context.
-// ``Chat`` and ``ConfirmPermission`` already took ``principalID``;
-// ``SwitchMode`` now takes it too.
+// “Chat“ and “ConfirmPermission“ already took “principalID“;
+// “SwitchMode“ now takes it too.
 type AgentClient interface {
 	Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error)
 	ConfirmPermission(ctx context.Context, principalID string, sessionID string, toolCallID string, bindingDigest string, approved bool, remember bool) error
 	SwitchMode(ctx context.Context, principalID string, sessionID string, targetMode string) (string, error)
+}
+
+// ChatEventClient reads the Python-owned durable broadcast ledger.
+type ChatEventClient interface {
+	ChatEvents(ctx context.Context, principalID string, sessionID string, afterSequence uint64) (<-chan ChatEvent, error)
 }
 
 // WebhookRequest preserves an external platform's original webhook data.
@@ -72,9 +78,9 @@ type ChannelInfo struct {
 // ChannelClient is the optional channel-management RPC surface.
 //
 // C-1-1: every method now carries the authenticated principal.
-// ``HandleWebhook`` receives ``""`` for signature-authenticated
+// “HandleWebhook“ receives “""“ for signature-authenticated
 // webhook ingress (no API-key principal in that path); Python's
-// ``AgentService.HandleWebhook`` treats empty principal as
+// “AgentService.HandleWebhook“ treats empty principal as
 // unauthenticated platform ingress.
 type ChannelClient interface {
 	HandleWebhook(ctx context.Context, principalID string, request WebhookRequest) (WebhookResponse, error)
@@ -107,10 +113,10 @@ const (
 
 // TaskClient manages persistent coding tasks and their event streams.
 //
-// C-1-1: ``principalID`` is now the first argument of every method
-// (after ``ctx``) so Python's TaskService can scope by
-// ``ctx.principal_id`` instead of falling back to ``"gateway"``.
-// ``ApproveTask`` / ``RejectTask`` already took ``principalID`` (in
+// C-1-1: “principalID“ is now the first argument of every method
+// (after “ctx“) so Python's TaskService can scope by
+// “ctx.principal_id“ instead of falling back to “"gateway"“.
+// “ApproveTask“ / “RejectTask“ already took “principalID“ (in
 // a different position) — their signatures are unchanged for
 // backward compatibility with the approval binding flow.
 type TaskClient interface {
@@ -146,12 +152,12 @@ type Memory struct {
 
 // MemoryClient is implemented by the Python memory service and by tests.
 //
-// C-2-2 (HIGH 6): every method now carries ``principalID`` so the
-// Python ``MemoryService`` can scope reads/writes to the authenticated
-// caller.  Previously the Gateway called an in-process ``MemoryMap``
+// C-2-2 (HIGH 6): every method now carries “principalID“ so the
+// Python “MemoryService“ can scope reads/writes to the authenticated
+// caller.  Previously the Gateway called an in-process “MemoryMap“
 // with no principal — REST-saved memories never reached Python, were
 // not principal-scoped, and were lost on Gateway restart.  The
-// ``MemoryMap`` test double still exists but is no longer wired into
+// “MemoryMap“ test double still exists but is no longer wired into
 // the production Gateway binary.
 type MemoryClient interface {
 	Get(ctx context.Context, principalID string, scope string, key string) (Memory, error)
@@ -173,18 +179,18 @@ type AuditEntry struct {
 
 // AuditClient queries audit records from the Python audit service.
 //
-// C-1-1: ``Query`` now carries the authenticated principal so
-// Python's AuditService can scope by ``ctx.principal_id`` instead
-// of returning only ``"gateway"``-attributed entries.
+// C-1-1: “Query“ now carries the authenticated principal so
+// Python's AuditService can scope by “ctx.principal_id“ instead
+// of returning only “"gateway"“-attributed entries.
 type AuditClient interface {
 	Query(ctx context.Context, principalID string, action, result, since, until string, limit int) ([]AuditEntry, error)
 }
 
-// SessionSummary is one row returned by ``GET /api/sessions``.
+// SessionSummary is one row returned by “GET /api/sessions“.
 //
 // C-2-3: the REST list endpoint now proxies to Python's
-// ``SessionService.List`` (durable ``sessions`` table scoped to the
-// caller's principal) instead of the Go in-memory ``sessions`` map.
+// “SessionService.List“ (durable “sessions“ table scoped to the
+// caller's principal) instead of the Go in-memory “sessions“ map.
 type SessionSummary struct {
 	ID           string `json:"id"`
 	Mode         string `json:"mode"`
@@ -194,12 +200,12 @@ type SessionSummary struct {
 }
 
 // SessionClient abstracts the durable session store backed by Python's
-// ``SessionService`` RPC.
+// “SessionService“ RPC.
 //
-// C-2-3: ``GET /api/sessions`` and ``GET /api/sessions/{id}`` proxy
+// C-2-3: “GET /api/sessions“ and “GET /api/sessions/{id}“ proxy
 // through this client so the reads are sourced from the durable
-// ``sessions`` table (principal-scoped) rather than the Go in-memory
-// ``sessionOwners`` map (lost on restart, blind to Python-side
+// “sessions“ table (principal-scoped) rather than the Go in-memory
+// “sessionOwners“ map (lost on restart, blind to Python-side
 // sessions, and unable to reconcile across Gateway instances).
 type SessionClient interface {
 	ListSessions(ctx context.Context, principalID string, limit, offset int) ([]SessionSummary, error)

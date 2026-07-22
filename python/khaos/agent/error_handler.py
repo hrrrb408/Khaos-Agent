@@ -74,11 +74,22 @@ class ModelContextTooLongError(Exception):
 class ErrorHandler:
     """Classify errors, audit them, and provide recovery operations."""
 
-    def __init__(self, db=None, router=None, compressor=None, max_retries: int = 3):
+    def __init__(
+        self,
+        db=None,
+        router=None,
+        compressor=None,
+        max_retries: int = 3,
+        *,
+        principal_id: str = "legacy",
+        project_id: str = "",
+    ):
         self.db = db
         self.router = router
         self.compressor = compressor
         self.max_retries = max_retries
+        self.principal_id = principal_id
+        self.project_id = project_id
 
     def classify(self, error: Exception) -> ErrorCode:
         """Map an exception to a stable error code."""
@@ -116,6 +127,8 @@ class ErrorHandler:
             result="error",
             detail=json.dumps({"message": message, **(detail or {})}, ensure_ascii=False),
             session_id=session_id,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
         )
 
     async def handle(

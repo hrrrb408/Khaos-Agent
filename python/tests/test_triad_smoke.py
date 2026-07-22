@@ -160,8 +160,9 @@ async def test_python_json_line_server_round_trip(tmp_path):
             pytest.fail(f"timed out waiting for events; got {len(events)} so far: {events}")
         writer.close()
         await writer.wait_closed()
-        assert len(events) >= 1, "expected at least one event"
-        assert events[0]["event"] == "message", f"first event was {events[0]}"
+        assert len(events) >= 2, "expected durable start and response events"
+        assert events[0]["event"] == "started", f"first event was {events[0]}"
+        assert events[1]["event"] == "message", f"second event was {events[1]}"
         assert events[-1]["event"] == "done", f"last event was {events[-1]}"
     finally:
         task.cancel()

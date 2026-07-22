@@ -23,6 +23,7 @@ import (
 // Handler serves Khaos Phase 2 REST and SSE endpoints.
 type Handler struct {
 	agent                AgentClient
+	chatEvents           ChatEventClient
 	memory               MemoryClient
 	audit                AuditClient
 	subagents            SubagentClient
@@ -38,8 +39,6 @@ type Handler struct {
 	allowedOrigins       map[string]struct{}
 	startedAt            time.Time
 	mu                   sync.Mutex
-	streams              map[string]<-chan ChatEvent
-	sessions             map[string]ChatRequest
 	tools                []map[string]any
 }
 
@@ -78,7 +77,7 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 	if limiter != nil {
 		ratePerMinute, burst = limiter.Config()
 	}
-	return &Handler{
+	handler := &Handler{
 		agent:                agent,
 		memory:               memory,
 		config:               config,
@@ -92,14 +91,16 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 		},
 		allowedOrigins: map[string]struct{}{},
 		startedAt:      time.Now(),
-		streams:        map[string]<-chan ChatEvent{},
-		sessions:       map[string]ChatRequest{},
 		tools: []map[string]any{
 			{"name": "read_file", "modes": []string{"all"}, "permission_level": "read"},
 			{"name": "write_file", "modes": []string{"coding"}, "permission_level": "write"},
 			{"name": "terminal", "modes": []string{"coding"}, "permission_level": "execute"},
 		},
 	}
+	if events, ok := agent.(ChatEventClient); ok {
+		handler.chatEvents = events
+	}
+	return handler
 }
 
 // WithAllowedHosts replaces the HTTP Host allowlist used to prevent DNS
@@ -622,28 +623,13 @@ func (h *Handler) limitRequestBody(next http.Handler) http.Handler {
 }
 
 func (h *Handler) authorizeSession(w http.ResponseWriter, r *http.Request, sessionID string) bool {
-	principalID, authenticated := auth.PrincipalFromContext(r.Context())
+	_, authenticated := auth.PrincipalFromContext(r.Context())
 	if !authenticated {
 		writeError(w, http.StatusUnauthorized, "authenticated principal required")
 		return false
 	}
-	h.mu.Lock()
-	// C-2-3: the in-memory ``sessionOwners`` map has been removed;
-	// ownership for the active-stream / confirm path is read from
-	// ``h.sessions[sessionID].PrincipalID`` instead, which is set at
-	// chat-creation time.  This is intentionally an in-memory check:
-	// the active stream itself (``h.streams[sessionID]``) lives only
-	// in this Go process, so the ownership check must share that
-	// lifetime — a restart loses both the stream and the session row
-	// consistently.  Durable session reads (list/detail) are proxied
-	// to Python's SessionService (see handleSessions /
-	// handleSessionDetail).
-	session, ok := h.sessions[sessionID]
-	h.mu.Unlock()
-	if !ok || session.PrincipalID != principalID {
-		writeError(w, http.StatusForbidden, "session is not owned by authenticated principal")
-		return false
-	}
+	// Ownership is enforced by the Python durable service using the
+	// authenticated principal.  Go intentionally keeps no session authority.
 	return true
 }
 
@@ -764,25 +750,32 @@ func (h *Handler) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	req.PrincipalID = principalID
-	h.mu.Lock()
-	// C-2-3: ownership collision check now reads from
-	// ``h.sessions[req.SessionID].PrincipalID`` (the in-memory active
-	// session map) instead of the deleted ``sessionOwners`` map.
-	existing, ok := h.sessions[req.SessionID]
-	h.mu.Unlock()
-	if ok && existing.PrincipalID != req.PrincipalID {
-		writeError(w, http.StatusForbidden, "session belongs to another principal")
-		return
-	}
-	stream, err := h.agent.Chat(r.Context(), req)
+	chatCtx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Minute)
+	stream, err := h.agent.Chat(chatCtx, req)
 	if err != nil {
+		cancel()
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	h.mu.Lock()
-	h.streams[req.SessionID] = stream
-	h.sessions[req.SessionID] = req
-	h.mu.Unlock()
+	select {
+	case _, open := <-stream:
+		if !open {
+			cancel()
+			writeError(w, http.StatusBadGateway, "chat producer closed before durable start")
+			return
+		}
+	case <-time.After(15 * time.Second):
+		cancel()
+		writeError(w, http.StatusGatewayTimeout, "chat durable start timed out")
+		return
+	}
+	// Drain the producer independently of the short POST request. Python
+	// persists every item before sending it; SSE clients replay separately.
+	go func() {
+		defer cancel()
+		for range stream {
+		}
+	}()
 	writeJSON(w, http.StatusOK, map[string]string{"session_id": req.SessionID})
 }
 
@@ -791,11 +784,15 @@ func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	if !h.authorizeSession(w, r, sessionID) {
 		return
 	}
-	h.mu.Lock()
-	stream := h.streams[sessionID]
-	h.mu.Unlock()
-	if stream == nil {
-		writeError(w, http.StatusNotFound, "session stream not found")
+	principalID, _ := auth.PrincipalFromContext(r.Context())
+	lastSequence, _ := strconv.ParseUint(r.Header.Get("Last-Event-ID"), 10, 64)
+	if h.chatEvents == nil {
+		writeError(w, http.StatusServiceUnavailable, "durable chat event service not available")
+		return
+	}
+	stream, err := h.chatEvents.ChatEvents(r.Context(), principalID, sessionID, lastSequence)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -810,6 +807,9 @@ func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			payload, _ := json.Marshal(event.Data)
+			if event.Sequence > 0 {
+				fmt.Fprintf(w, "id: %d\n", event.Sequence)
+			}
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Event, payload)
 			if flusher != nil {
 				flusher.Flush()
@@ -839,24 +839,11 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	req.PrincipalID = principalID
-	h.mu.Lock()
-	// C-2-3: same ownership collision check as handleChat — read from
-	// ``h.sessions[sessionID].PrincipalID`` instead of the deleted
-	// ``sessionOwners`` map.
-	existing, ok := h.sessions[sessionID]
-	h.mu.Unlock()
-	if ok && existing.PrincipalID != req.PrincipalID {
-		writeError(w, http.StatusForbidden, "session belongs to another principal")
-		return
-	}
 	stream, err := h.agent.Chat(r.Context(), req)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	h.mu.Lock()
-	h.sessions[sessionID] = req
-	h.mu.Unlock()
 	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.Header().Set("Transfer-Encoding", "chunked")
 	w.Header().Set("X-Accel-Buffering", "no")
@@ -1248,7 +1235,7 @@ func eventSequence(value any) uint64 {
 
 // MemoryMap is an in-memory MemoryClient used by tests.  C-2-2 (HIGH
 // 6): no longer used by the production Gateway binary, which now
-// proxies Python ``MemoryService`` via ``PythonClient``.  Retained
+// proxies Python “MemoryService“ via “PythonClient“.  Retained
 // here so existing handler tests that don't exercise the Python socket
 // can still construct an isolated in-memory store.
 type MemoryMap struct {

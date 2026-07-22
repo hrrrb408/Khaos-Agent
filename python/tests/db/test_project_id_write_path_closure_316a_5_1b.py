@@ -37,6 +37,7 @@ import hashlib
 import hmac
 import json
 import os
+import sqlite3
 import time
 import uuid
 from pathlib import Path
@@ -137,7 +138,9 @@ async def test_acceptance_1_audit_logger_stamps_project_id(tmp_path):
     """A5-1b #1: AuditLogger constructed with project_id stamps it on rows."""
     db = await _make_db(tmp_path / "khaos.db")
     try:
-        await db.create_session("s1", "office", principal_id="u1")
+        await db.create_session(
+            "s1", "office", principal_id="u1", project_id=PROJECT_ID_A,
+        )
         audit = AuditLogger(db, principal_id="u1", project_id=PROJECT_ID_A)
         await audit.log("write_file", "/tmp/x", "success", {"size": 42}, session_id="s1")
         stamped = await _fetch_project_id(db, "audit_log", "action='write_file'")
@@ -814,8 +817,8 @@ async def test_acceptance_20_save_bookmark_stamps_project_id(tmp_path):
         await db.close()
 
 
-async def test_acceptance_21_save_bookmark_owner_preserving_on_conflict(tmp_path):
-    """A5-1b #21: re-save bookmark with different project_id does NOT re-stamp.
+async def test_acceptance_21_save_bookmark_rejects_cross_project_conflict(tmp_path):
+    """A5-1b #21: re-save bookmark with different project_id fails closed.
 
     ``session_bookmarks`` UNIQUE key is ``(session_id, name)``; the
     ``ON CONFLICT DO UPDATE`` clause updates ``description`` / ``mode``
@@ -833,12 +836,13 @@ async def test_acceptance_21_save_bookmark_owner_preserving_on_conflict(tmp_path
             session_id="s1", name="bm-shared", description="v1",
             summary="first", principal_id="u1", project_id=PROJECT_ID_A,
         )
-        # Second save (same session_id+name) with different project_id:
-        # must NOT overwrite the original project_id stamp.
-        await db.save_bookmark(
-            session_id="s1", name="bm-shared", description="v2",
-            summary="second", principal_id="u1", project_id=PROJECT_ID_B,
-        )
+        # A conflicting caller cannot use an owner-preserving UPSERT to
+        # mutate another project's bookmark fields.
+        with pytest.raises(sqlite3.IntegrityError, match="identity mismatch"):
+            await db.save_bookmark(
+                session_id="s1", name="bm-shared", description="v2",
+                summary="second", principal_id="u1", project_id=PROJECT_ID_B,
+            )
         stamped = await _fetch_project_id(
             db, "session_bookmarks", "name='bm-shared'",
         )
@@ -846,7 +850,7 @@ async def test_acceptance_21_save_bookmark_owner_preserving_on_conflict(tmp_path
             "session_bookmarks ON CONFLICT must be owner-preserving "
             "(project_id not re-stamped)"
         )
-        # Sanity check: the mutable columns DID update.
+        # The rejected write leaves both ownership and content unchanged.
         conn = await db._require_conn()
         cursor = await conn.execute(
             "SELECT description, summary FROM session_bookmarks "
@@ -854,8 +858,8 @@ async def test_acceptance_21_save_bookmark_owner_preserving_on_conflict(tmp_path
         )
         row = await cursor.fetchone()
         await cursor.close()
-        assert row[0] == "v2"
-        assert row[1] == "second"
+        assert row[0] == "v1"
+        assert row[1] == "first"
     finally:
         await db.close()
 
