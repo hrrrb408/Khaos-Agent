@@ -180,6 +180,32 @@ type AuditClient interface {
 	Query(ctx context.Context, principalID string, action, result, since, until string, limit int) ([]AuditEntry, error)
 }
 
+// SessionSummary is one row returned by ``GET /api/sessions``.
+//
+// C-2-3: the REST list endpoint now proxies to Python's
+// ``SessionService.List`` (durable ``sessions`` table scoped to the
+// caller's principal) instead of the Go in-memory ``sessions`` map.
+type SessionSummary struct {
+	ID           string `json:"id"`
+	Mode         string `json:"mode"`
+	CreatedAt    string `json:"created_at"`
+	MessageCount int    `json:"message_count"`
+	Preview      string `json:"preview"`
+}
+
+// SessionClient abstracts the durable session store backed by Python's
+// ``SessionService`` RPC.
+//
+// C-2-3: ``GET /api/sessions`` and ``GET /api/sessions/{id}`` proxy
+// through this client so the reads are sourced from the durable
+// ``sessions`` table (principal-scoped) rather than the Go in-memory
+// ``sessionOwners`` map (lost on restart, blind to Python-side
+// sessions, and unable to reconcile across Gateway instances).
+type SessionClient interface {
+	ListSessions(ctx context.Context, principalID string, limit, offset int) ([]SessionSummary, error)
+	GetSession(ctx context.Context, principalID string, sessionID string) (map[string]any, error)
+}
+
 // ConfigStore abstracts runtime config persistence.
 type ConfigStore interface {
 	Get() map[string]any

@@ -138,9 +138,13 @@ func main() {
 	// C-2-1: all interfaces receive the SAME pythonClient (which is also
 	// `agent`) so Chat/Confirm/SwitchMode and Audit/Tasks/Subagents share
 	// identical project_id + policy_digest claims.
+	// C-2-3: SessionsService is also proxied through the same client so
+	// ``GET /api/sessions`` reads from the durable ``sessions`` table
+	// (principal-scoped) instead of the Go in-memory map.
 	if !*mockAgent {
 		handler = handler.WithAudit(pythonClient)
 		handler = handler.WithTasks(pythonClient)
+		handler = handler.WithSessions(pythonClient)
 		if *enableSubagents {
 			handler = handler.WithSubagents(pythonClient)
 		}

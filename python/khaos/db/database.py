@@ -3037,6 +3037,43 @@ class Database:
             )
         return [dict(row) for row in await cursor.fetchall()]
 
+    async def get_session(
+        self,
+        session_id: str,
+        *,
+        principal_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        """Return one session row, or ``None`` if missing.
+
+        C-2-3: when ``principal_id`` is given, only a row owned by
+        that principal is returned (cross-principal access yields
+        ``None``, hidden as "not found" by the caller).  This is the
+        single-row counterpart to :meth:`list_sessions`.
+        """
+        conn = await self._require_conn()
+        if principal_id is None:
+            cursor = await conn.execute(
+                """
+                SELECT id, mode, principal_id, project_id, status,
+                       created_at, updated_at
+                FROM sessions
+                WHERE id = ?
+                """,
+                (session_id,),
+            )
+        else:
+            cursor = await conn.execute(
+                """
+                SELECT id, mode, principal_id, project_id, status,
+                       created_at, updated_at
+                FROM sessions
+                WHERE id = ? AND principal_id = ?
+                """,
+                (session_id, principal_id),
+            )
+        row = await cursor.fetchone()
+        return dict(row) if row is not None else None
+
     async def register_operation_approval(
         self,
         *,

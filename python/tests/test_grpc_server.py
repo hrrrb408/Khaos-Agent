@@ -1551,3 +1551,128 @@ async def test_c_2_5_cancel_succeeds_when_no_hook_registered(tmp_path):
     assert result["task_id"] == task_id
     await db.close()
 
+
+# ---------------------------------------------------------------------------
+# C-2-3 (MEDIUM): SessionService proxies REST /api/sessions to the
+# durable ``sessions`` table, scoped to ctx.principal_id.
+# ---------------------------------------------------------------------------
+
+
+async def test_c_2_3_session_service_list_returns_only_caller_sessions(tmp_path):
+    """C-2-3 (MEDIUM): ``SessionService.list`` returns only sessions
+    owned by ``ctx.principal_id``.  Previously the REST
+    ``GET /api/sessions`` endpoint read from the Go Gateway's in-memory
+    ``sessions`` + ``sessionOwners`` maps (lost on restart, blind to
+    Python-side sessions).  Now it proxies to this service, which
+    reads the durable ``sessions`` table with a principal-scoped
+    WHERE clause.
+    """
+    from khaos.grpc_server import SessionService
+    from khaos.agent.core import Message
+
+    db = Database(tmp_path / "c-2-3-list.db")
+    await db.connect()
+    await db.run_migrations()
+
+    # Create three sessions: two owned by alice, one by bob.
+    await db.create_session("alice-1", "office", principal_id="api:alice")
+    await db.create_session("alice-2", "coding", principal_id="api:alice")
+    await db.create_session("bob-1", "office", principal_id="api:bob")
+    # Insert a message in alice-1 so list_sessions returns a preview.
+    await db.insert_message(
+        "alice-1", Message(role="user", content="hello from alice"),
+        principal_id="api:alice",
+    )
+
+    service = SessionService(db)
+
+    alice_ctx = _test_ctx(principal_id="api:alice")
+    alice_sessions = await service.list(alice_ctx)
+    alice_ids = {s["id"] for s in alice_sessions}
+    assert alice_ids == {"alice-1", "alice-2"}, (
+        f"alice should see only her sessions, got: {alice_ids}"
+    )
+
+    bob_ctx = _test_ctx(principal_id="api:bob")
+    bob_sessions = await service.list(bob_ctx)
+    bob_ids = {s["id"] for s in bob_sessions}
+    assert bob_ids == {"bob-1"}, (
+        f"bob should see only his sessions, got: {bob_ids}"
+    )
+    await db.close()
+
+
+async def test_c_2_3_session_service_get_hides_cross_principal_as_not_found(tmp_path):
+    """C-2-3 (MEDIUM): ``SessionService.get`` returns
+    ``{"ok": False, "error": "session not found"}`` when the caller
+    asks for a session owned by another principal — symmetric to
+    ``TaskService.get`` so the REST caller cannot enumerate other
+    principals' session ids via timing or response-shape differences.
+    """
+    from khaos.grpc_server import SessionService
+    from khaos.agent.core import Message
+
+    db = Database(tmp_path / "c-2-3-get.db")
+    await db.connect()
+    await db.run_migrations()
+
+    await db.create_session("alice-1", "office", principal_id="api:alice")
+    await db.insert_message(
+        "alice-1", Message(role="user", content="alice's secret"),
+        principal_id="api:alice",
+    )
+
+    service = SessionService(db)
+
+    # Owner can fetch her own session.
+    alice_ctx = _test_ctx(principal_id="api:alice")
+    owned = await service.get(alice_ctx, "alice-1")
+    assert owned["ok"] is True, f"owner should see her session: {owned}"
+    assert owned["session"]["id"] == "alice-1"
+    assert owned["session"]["principal_id"] == "api:alice"
+    assert len(owned["messages"]) == 1
+    assert owned["messages"][0]["content"] == "alice's secret"
+
+    # Bob cannot fetch alice's session — hidden as "not found".
+    bob_ctx = _test_ctx(principal_id="api:bob")
+    cross = await service.get(bob_ctx, "alice-1")
+    assert cross["ok"] is False, (
+        f"cross-principal access must be hidden as not-found: {cross}"
+    )
+    assert cross["error"] == "session not found"
+    assert "session" not in cross, (
+        f"cross-principal response must not leak session data: {cross}"
+    )
+    assert "messages" not in cross, (
+        f"cross-principal response must not leak messages: {cross}"
+    )
+
+    # Genuinely missing session also returns not-found (same shape).
+    missing = await service.get(alice_ctx, "does-not-exist")
+    assert missing["ok"] is False
+    assert missing["error"] == "session not found"
+    await db.close()
+
+
+async def test_c_2_3_session_service_list_with_empty_principal_returns_nothing(tmp_path):
+    """C-2-3 fail-closed: an empty ``principal_id`` MUST NOT fall open
+    to the admin opt-in path (``principal_id=None`` returns ALL
+    sessions).  It must pass the empty string to ``list_sessions`` so
+    the SQL filter ``s.principal_id = ''`` matches nothing.
+    """
+    from khaos.grpc_server import SessionService
+
+    db = Database(tmp_path / "c-2-3-empty.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1", "office", principal_id="api:alice")
+
+    service = SessionService(db)
+    # Empty principal_id (e.g. unauthenticated ctx) → empty list.
+    empty_ctx = _test_ctx(principal_id="")
+    rows = await service.list(empty_ctx)
+    assert rows == [], (
+        f"empty principal must return no sessions (fail-closed), got: {rows}"
+    )
+    await db.close()
+

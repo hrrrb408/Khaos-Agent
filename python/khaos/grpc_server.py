@@ -1489,6 +1489,84 @@ class MemoryService:
         return [_memory_to_dict(memory) for memory in await store.search(query, top_k)]
 
 
+class SessionService:
+    """Session RPC service backed by the durable ``sessions`` table.
+
+    C-2-3 (MEDIUM): the REST ``GET /api/sessions`` and
+    ``GET /api/sessions/{id}`` endpoints previously read from the Go
+    Gateway's in-memory ``sessions`` map filtered by an equally
+    in-memory ``sessionOwners`` map.  That map is lost on restart,
+    does not include sessions created directly against Python (CLI,
+    subagents, webhooks), and cannot reconcile across multiple
+    Gateway instances.  This service proxies the list/detail reads to
+    the durable ``sessions`` table, scoped to ``ctx.principal_id`` so
+    a caller only sees their own sessions (cross-principal access is
+    hidden as "not found" — symmetric to ``TaskService`` and the
+    ``list_sessions`` principal filter added in
+    3.1.16A-4-3).
+    """
+
+    def __init__(self, db: Database):
+        self.db = db
+
+    async def list(
+        self,
+        ctx: RequestContext,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> list[dict[str, object]]:
+        """List the caller's sessions newest-first.
+
+        ``ctx.principal_id`` is always passed to
+        :meth:`Database.list_sessions` so cross-principal rows are
+        filtered at the SQL layer (3.1.16A-4-3).  An empty
+        ``principal_id`` yields an empty list (fail-closed) rather
+        than the admin opt-in path (``principal_id=None``).
+        """
+        principal_id = ctx.principal_id or ""
+        # ``list_sessions(principal_id=None)`` is the admin opt-in that
+        # returns ALL principals' sessions.  We must NEVER pass ``None``
+        # for an unauthenticated RPC caller — pass the empty string so
+        # the SQL filter ``s.principal_id = ''`` matches nothing
+        # (legacy rows with ``principal_id='legacy'`` are excluded by
+        # the A-4-3 filter, and production principals are never empty).
+        rows = await self.db.list_sessions(limit, offset, principal_id=principal_id)
+        return [dict(row) for row in rows]
+
+    async def get(
+        self,
+        ctx: RequestContext,
+        session_id: str,
+        message_limit: int = 50,
+    ) -> dict[str, object]:
+        """Return one session + its messages, scoped to the caller.
+
+        Cross-principal access is hidden as ``{"ok": false, "error":
+        "session not found"}`` (symmetric to ``TaskService.get``) so
+        the REST caller cannot enumerate other principals' session
+        ids via timing or response-shape differences.
+        """
+        principal_id = ctx.principal_id or ""
+        session = await self.db.get_session(
+            session_id, principal_id=principal_id,
+        )
+        if session is None:
+            return {
+                "ok": False,
+                "error": "session not found",
+                "session_id": session_id,
+            }
+        messages = await self.db.get_session_messages(
+            session_id, limit=message_limit, offset=0,
+            principal_id=principal_id,
+        )
+        return {
+            "ok": True,
+            "session": session,
+            "messages": [dict(m) for m in messages],
+        }
+
+
 class AuditService:
     """Audit RPC service backed by AuditLogger."""
 
@@ -1888,6 +1966,12 @@ async def serve_json_lines(
         # server-level ``MemoryStore(local-uid)`` singleton, so an API
         # principal could read/write the local-uid's memories.
         memory = MemoryService(db)
+        # C-2-3: SessionService proxies REST /api/sessions list/detail
+        # reads to the durable ``sessions`` table, scoped to
+        # ``ctx.principal_id``.  Previously the Go Gateway served these
+        # from its in-memory ``sessions`` + ``sessionOwners`` maps
+        # (lost on restart, blind to Python-side sessions).
+        sessions = SessionService(db)
         audit_service = AuditService(agent._audit_logger or AuditLogger(db))
         # C-1-5a: TaskService now takes ``db`` (not a TaskManager) and
         # constructs per-principal managers on demand.
@@ -2133,6 +2217,19 @@ async def serve_json_lines(
                     # silently swallowed the call and the durable row
                     # survived in the DB.
                     response = await memory.delete_memory(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "SessionService.List":
+                    # C-2-3: REST ``GET /api/sessions`` proxies here so
+                    # the list is sourced from the durable ``sessions``
+                    # table (not the Go in-memory map, which is lost on
+                    # restart and blind to Python-side sessions).
+                    response = await sessions.list(ctx, **payload)
+                    writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
+                elif method == "SessionService.Get":
+                    # C-2-3: REST ``GET /api/sessions/{id}`` proxies
+                    # here; cross-principal access is hidden as
+                    # ``{"ok": false, "error": "session not found"}``.
+                    response = await sessions.get(ctx, **payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 elif method == "AuditService.Query":
                     response = await audit_service.query(ctx, **payload)

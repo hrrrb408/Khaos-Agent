@@ -288,6 +288,45 @@ func (c PythonClient) ListChannels(ctx context.Context, principalID string) ([]a
 	return channels, err
 }
 
+// ListSessions proxies REST ``GET /api/sessions`` to Python's
+// ``SessionService.List`` (C-2-3).
+//
+// The response is a principal-scoped list of session rows from the
+// durable ``sessions`` table.  Previously the Go handler served this
+// from its in-memory ``sessions`` + ``sessionOwners`` maps, which were
+// lost on restart and blind to sessions created directly against
+// Python (CLI, subagents, webhooks).
+func (c PythonClient) ListSessions(ctx context.Context, principalID string, limit, offset int) ([]api.SessionSummary, error) {
+	response, err := c.callList(ctx, "SessionService.List", map[string]any{
+		"limit":  limit,
+		"offset": offset,
+	}, principalID)
+	if err != nil {
+		return nil, err
+	}
+	raw, err := json.Marshal(response)
+	if err != nil {
+		return nil, err
+	}
+	var sessions []api.SessionSummary
+	err = json.Unmarshal(raw, &sessions)
+	return sessions, err
+}
+
+// GetSession proxies REST ``GET /api/sessions/{id}`` to Python's
+// ``SessionService.Get`` (C-2-3).
+//
+// Cross-principal access is hidden by Python as
+// ``{"ok": false, "error": "session not found"}`` (symmetric to
+// ``TaskService.get``), so the Go handler can map a missing ``ok``
+// flag to HTTP 404 without leaking whether the session exists under
+// another principal.
+func (c PythonClient) GetSession(ctx context.Context, principalID string, sessionID string) (map[string]any, error) {
+	return c.callMap(ctx, "SessionService.Get", map[string]any{
+		"session_id": sessionID,
+	}, principalID)
+}
+
 // SetChannelEnabled changes one registered channel's enabled state.
 //
 // C-2-4 (HIGH 4): Python now gates channel mutations on
