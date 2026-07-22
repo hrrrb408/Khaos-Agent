@@ -120,11 +120,19 @@ type Memory struct {
 }
 
 // MemoryClient is implemented by the Python memory service and by tests.
+//
+// C-2-2 (HIGH 6): every method now carries ``principalID`` so the
+// Python ``MemoryService`` can scope reads/writes to the authenticated
+// caller.  Previously the Gateway called an in-process ``MemoryMap``
+// with no principal — REST-saved memories never reached Python, were
+// not principal-scoped, and were lost on Gateway restart.  The
+// ``MemoryMap`` test double still exists but is no longer wired into
+// the production Gateway binary.
 type MemoryClient interface {
-	Get(ctx context.Context, scope string, key string) (Memory, error)
-	Set(ctx context.Context, memory Memory) (Memory, error)
-	Delete(ctx context.Context, id int64) error
-	Search(ctx context.Context, scope string, query string, topK int) ([]Memory, error)
+	Get(ctx context.Context, principalID string, scope string, key string) (Memory, error)
+	Set(ctx context.Context, principalID string, memory Memory) (Memory, error)
+	Delete(ctx context.Context, principalID string, id int64) error
+	Search(ctx context.Context, principalID string, scope string, query string, topK int) ([]Memory, error)
 }
 
 // AuditEntry is one audit log record returned from the audit query endpoint.
