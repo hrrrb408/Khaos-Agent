@@ -45,6 +45,18 @@ jobs:
           test ! -u /usr/bin/bwrap
       - name: Install test dependencies
         run: python -m pip install -e '.[test]'
+      - name: Build inner seccomp launcher
+        run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
+      - name: Delegate cgroup v2 subtree
+        run: |
+          test -f /sys/fs/cgroup/cgroup.controllers
+          for controller in cpu memory pids io; do
+            if grep -qw "$controller" /sys/fs/cgroup/cgroup.controllers; then
+              echo "+$controller" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null
+            fi
+          done
+          sudo mkdir -p /sys/fs/cgroup/khaos
+          sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/khaos
       - name: Capture pre-test diagnostics
         run: |
           set +e
@@ -72,6 +84,8 @@ jobs:
       - name: Run real bwrap isolation E2E
         env:
           KHAOS_REQUIRE_PLATFORM_SANDBOX: "1"
+          KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos
+          KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
         run: python -m pytest python/tests/coding/test_platform_backends.py -q -k real_bwrap -v
       - name: Capture post-test diagnostics
         if: always()

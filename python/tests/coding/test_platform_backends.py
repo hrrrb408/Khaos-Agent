@@ -10,7 +10,6 @@ import pytest
 from khaos.coding.execution import (
     ExecutionRequest,
     FileSystemAccess,
-    NetworkPolicy,
     PermissionProfile,
     ResourceBudget,
 )
@@ -19,6 +18,7 @@ from khaos.coding.execution.platform import (
     LinuxBubblewrapBackend,
     MacOSSandboxBackend,
     UnsupportedBackend,
+    _create_linux_cgroup,
     _runtime_read_roots,
 )
 
@@ -93,6 +93,26 @@ def test_linux_profile_isolates_proc_ipc_uts_and_parent_lifetime(tmp_path: Path)
         argv[index:index + 3] for index in range(len(argv) - 2)
     )
     assert "--clearenv" in argv
+
+
+def test_linux_cgroup_v2_leaf_has_hard_limits(tmp_path: Path, monkeypatch):
+    from khaos.coding.execution import platform as platform_module
+
+    delegated = tmp_path / "delegated"
+    delegated.mkdir()
+    monkeypatch.setattr(platform_module, "_linux_cgroup_root", lambda: delegated)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    budget = ResourceBudget(pids=17, memory_bytes=32 * 1024 * 1024, cpu_count=0.5)
+
+    group = _create_linux_cgroup(budget, workspace)
+
+    assert group is not None
+    assert (group / "pids.max").read_text() == "17"
+    assert (group / "memory.max").read_text() == str(32 * 1024 * 1024)
+    assert (group / "memory.swap.max").read_text() == "0"
+    assert (group / "cpu.max").read_text() == "50000 100000"
+    assert "rbps=" in (group / "io.max").read_text()
 
 
 def test_macos_profile_uses_positive_read_allowlist(tmp_path: Path):
@@ -235,8 +255,14 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
     (main_repo / "README.txt").write_text("main\n", encoding="utf-8")
 
     command = "\n".join([
-        "import os, socket",
+        "import ctypes, errno, os, socket",
         "from pathlib import Path",
+        "status = Path('/proc/self/status').read_text()",
+        "assert 'NoNewPrivs:\\t1' in status, status",
+        "libc = ctypes.CDLL(None, use_errno=True)",
+        "assert libc.ptrace(0, 0, 0, 0) == -1",
+        "assert ctypes.get_errno() == errno.EPERM",
+        "assert 'exec-' in Path('/proc/self/cgroup').read_text()",
         # 2. Worktree writable
         "Path('inside.txt').write_text('ok')",
         "try: Path('.git').write_text('tampered')",
