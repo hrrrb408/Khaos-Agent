@@ -60,7 +60,7 @@ func main() {
 	allowedOrigins := flag.String("cors-origins", defaultAllowedOrigins, "comma-separated exact browser origins")
 	allowedHosts := flag.String("allowed-hosts", defaultAllowedHosts, "comma-separated HTTP Host names")
 	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService Unix socket path")
-	projectRoot := flag.String("project-root", os.Getenv("KHAOS_PROJECT_ROOT"), "project root directory (used to compute project_id for drift detection; empty disables)")
+	projectRoot := flag.String("project-root", os.Getenv("KHAOS_PROJECT_ROOT"), "project root directory (used to compute project_id for drift detection; REQUIRED in production, rejected if empty)")
 	mockAgent := flag.Bool("mock-agent", false, "use in-process mock agent")
 	enableSubagents := flag.Bool("subagents", false, "enable subagent proxy")
 	flag.Parse()
@@ -79,11 +79,37 @@ func main() {
 	if err := validateListenConfig(*addr, resolvedKey); err != nil {
 		log.Fatal(err)
 	}
-	var agent api.AgentClient = platform.PythonClient{
-		Address: *pythonAddr, Capability: pythonCapability,
-	}
+
+	// C-2-1 (CRITICAL fix): construct the FINAL PythonClient BEFORE
+	// NewHandler so every interface (Chat/Confirm/SwitchMode/Audit/Tasks/
+	// Subagents) shares the same client with project_id + policy_digest
+	// stamped.  Previously NewHandler received a bare PythonClient (empty
+	// ProjectID/PolicyDigest), and the later `agent = pc` only mutated
+	// the local variable — handler.agent kept the bootstrap-less copy, so
+	// /api/chat, ConfirmPermission and SwitchMode silently ran without
+	// drift claims on every successful startup.
+	//
+	// Production mode (non-mock) is now fail-closed: empty --project-root,
+	// project_id computation failure, or policy_digest bootstrap failure
+	// all reject startup via log.Fatal.  Drift detection can no longer be
+	// silently disabled.
+	var agent api.AgentClient
+	var pythonClient platform.PythonClient
 	if *mockAgent {
 		agent = mockAgentClient{}
+	} else {
+		initial := platform.PythonClient{
+			Address:    *pythonAddr,
+			Capability: pythonCapability,
+		}
+		resolved, resolveErr := resolvePythonClient(initial, *projectRoot, initial.BootstrapPolicyDigest)
+		if resolveErr != nil {
+			log.Fatal(resolveErr)
+		}
+		pythonClient = resolved
+		log.Printf("project-id: %s", pythonClient.ProjectID)
+		log.Printf("policy-digest: %s", pythonClient.PolicyDigest)
+		agent = pythonClient
 	}
 
 	handler := api.NewHandler(
@@ -97,50 +123,14 @@ func main() {
 	handler = handler.WithAllowedHosts(allowedHostnames(*addr, splitCSV(*allowedHosts))...)
 	// When talking to a real Python agent, also forward audit queries. The mock
 	// agent path leaves audit unconfigured (GET /api/audit returns []).
+	// C-2-1: all interfaces receive the SAME pythonClient (which is also
+	// `agent`) so Chat/Confirm/SwitchMode and Audit/Tasks/Subagents share
+	// identical project_id + policy_digest claims.
 	if !*mockAgent {
-		client := platform.PythonClient{
-			Address: *pythonAddr, Capability: pythonCapability,
-		}
-		// C-1-3: compute project_id from --project-root so Python's
-		// dispatcher can detect project drift.  Empty project root
-		// disables injection (Python accepts empty claim for backward
-		// compat with older Gateways).
-		if pid, err := computeProjectID(*projectRoot); err != nil {
-			log.Printf("project-id: %v (drift detection disabled)", err)
-		} else if pid != "" {
-			client.ProjectID = pid
-			// Also stamp on the agent client used for Chat/Confirm/SwitchMode.
-			if pc, ok := agent.(platform.PythonClient); ok {
-				pc.ProjectID = pid
-				agent = pc
-			}
-			log.Printf("project-id: %s (drift detection enabled)", pid)
-		}
-		// C-1-4: fetch policy_digest via the Bootstrap.GetPolicyDigest
-		// startup handshake.  Python is the sole authority for
-		// policy_digest — Go never computes it independently.  The
-		// returned digest is stamped on PythonClient.PolicyDigest and
-		// injected into every subsequent RPC payload so Python's
-		// dispatcher can detect policy drift.  Failure is non-fatal:
-		// if the Python server is not yet running or the handshake
-		// errors, drift detection is disabled (Python accepts empty
-		// policy_digest claims for backward compat).
-		bootstrapCtx, bootstrapCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if digest, err := client.BootstrapPolicyDigest(bootstrapCtx); err != nil {
-			log.Printf("policy-digest: %v (drift detection disabled)", err)
-		} else if digest != "" {
-			client.PolicyDigest = digest
-			if pc, ok := agent.(platform.PythonClient); ok {
-				pc.PolicyDigest = digest
-				agent = pc
-			}
-			log.Printf("policy-digest: %s (drift detection enabled)", digest)
-		}
-		bootstrapCancel()
-		handler = handler.WithAudit(client)
-		handler = handler.WithTasks(client)
+		handler = handler.WithAudit(pythonClient)
+		handler = handler.WithTasks(pythonClient)
 		if *enableSubagents {
-			handler = handler.WithSubagents(client)
+			handler = handler.WithSubagents(pythonClient)
 		}
 	}
 	log.Printf("Khaos gateway listening on %s", *addr)
@@ -365,6 +355,49 @@ func allowedHostnames(addr string, configured []string) []string {
 		result = append(result, "localhost", "127.0.0.1", "::1")
 	}
 	return result
+}
+
+// digestBootstrapFunc fetches policy_digest from the Python agent via the
+// Bootstrap.GetPolicyDigest startup handshake.  Extracted as a parameter
+// so resolvePythonClient is unit-testable without a real Python socket.
+type digestBootstrapFunc func(ctx context.Context) (string, error)
+
+// resolvePythonClient constructs the final PythonClient with project_id
+// and policy_digest stamped.  C-2-1 (CRITICAL fix): this MUST be called
+// before NewHandler so every interface (Chat/Confirm/SwitchMode/Audit/
+// Tasks/Subagents) shares the same client.
+//
+// Production mode is fail-closed:
+//   - empty projectRoot rejects startup (no silent drift-detection disable)
+//   - project_id computation failure rejects startup
+//   - digest bootstrap failure rejects startup (Python agent must be running)
+//   - empty digest rejects startup
+//
+// Returns the resolved PythonClient with ProjectID + PolicyDigest stamped.
+// The Address/Capability from ``initial`` are preserved.
+func resolvePythonClient(initial platform.PythonClient, projectRoot string, bootstrapDigest digestBootstrapFunc) (platform.PythonClient, error) {
+	if strings.TrimSpace(projectRoot) == "" {
+		return platform.PythonClient{}, errors.New("gateway: --project-root is required in production (drift detection cannot be disabled)")
+	}
+	pid, err := computeProjectID(projectRoot)
+	if err != nil {
+		return platform.PythonClient{}, fmt.Errorf("gateway: compute project_id: %w", err)
+	}
+	if pid == "" {
+		return platform.PythonClient{}, errors.New("gateway: computed project_id is empty")
+	}
+	initial.ProjectID = pid
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	digest, err := bootstrapDigest(ctx)
+	if err != nil {
+		return platform.PythonClient{}, fmt.Errorf("gateway: policy_digest bootstrap failed: %w (Python agent must be running before the gateway starts)", err)
+	}
+	if digest == "" {
+		return platform.PythonClient{}, errors.New("gateway: policy_digest bootstrap returned empty digest")
+	}
+	initial.PolicyDigest = digest
+	return initial, nil
 }
 
 // computeProjectID mirrors Python's ``compute_project_id(project_root)``:
