@@ -343,13 +343,23 @@ func (h *Handler) changeTask(w http.ResponseWriter, r *http.Request, status stri
 	}
 	id := r.PathValue("id")
 	result, err := action(r.Context(), id)
-	if err != nil || result == TransitionNotFound || result == TransitionInvalid {
+	if err != nil || result == TransitionNotFound || result == TransitionInvalid || result == TransitionLeaseInvalidationFailed {
 		if result == TransitionNotFound {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
 		if result == TransitionInvalid {
 			writeError(w, http.StatusConflict, "invalid task transition")
+			return
+		}
+		// C-2-5 (HIGH 2): lease invalidation failed — the
+		// TaskManager refused to cancel because the workspace lease
+		// could not be released (Batch 2.6 §4 fail-closed).  The task
+		// stays in its pre-cancel state so the caller can retry.
+		// HTTP 503 (not 409) signals a transient infrastructure
+		// failure rather than a client-side state conflict.
+		if result == TransitionLeaseInvalidationFailed {
+			writeError(w, http.StatusServiceUnavailable, "lease invalidation failed; retry the cancel")
 			return
 		}
 		if err == nil {

@@ -76,6 +76,15 @@ func (c PythonClient) taskAction(ctx context.Context, method, principalID, id st
 		return "", err
 	}
 	if ok, _ := response["ok"].(bool); !ok {
+		// C-2-5: Python now returns an explicit ``status`` field for
+		// ``LEASE_INVALIDATION_FAILED`` so the Go side can distinguish
+		// a transient lease-hook failure (→ 503) from a genuine
+		// invalid transition (→ 409).  Without this, both outcomes
+		// collapsed into ``TransitionInvalid`` and the REST caller
+		// could not tell whether to retry.
+		if status, _ := response["status"].(string); status == string(api.TransitionLeaseInvalidationFailed) {
+			return api.TransitionLeaseInvalidationFailed, nil
+		}
 		message := stringValue(response["error"])
 		if message == "task not found" {
 			return api.TransitionNotFound, nil
