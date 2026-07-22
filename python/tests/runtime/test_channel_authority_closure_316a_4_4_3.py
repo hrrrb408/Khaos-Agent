@@ -13,8 +13,8 @@ Verifies that:
 5. Mutation tools fail-closed via ``_require_admin`` when the caller's
    ``principal_id`` is not in ``channel_admins`` (cross-principal
    isolation via the broker).
-6. The admin gate is the :class:`EffectiveSecurityPolicy`'s compiled
-   ``channel_admins`` frozenset (user ∪ project, OR semantics).
+6. The admin gate is a trusted-user-only grant; project declarations are
+   rejected and cannot increase the compiled administrator set.
 
 These are signature/wiring tests — the deeper behavioral tests live in
 ``tests/channels/test_channel_tools.py``.
@@ -267,28 +267,23 @@ def test_effective_policy_channel_admins_defaults_to_empty() -> None:
     assert policy.channel_admins == frozenset()
 
 
-def test_effective_policy_channel_admins_union_user_and_project() -> None:
-    """OR semantics — user ∪ project.  Admin is an authorization grant,
-    so a stricter layer cannot revoke a more permissive layer's grant."""
+def test_effective_policy_rejects_project_channel_admin_grant() -> None:
     project = SandboxPolicy(channel_admins=["api:alice"])
+    user = SandboxPolicy(channel_admins=["api:bob", "api:carol"])
+    with pytest.raises(ValueError, match="trusted-only grant"):
+        compile_effective_policy(
+            project, workspace_root=Path("/tmp"), user_policy=user,
+        )
+
+
+def test_effective_policy_channel_admins_come_from_user_only() -> None:
+    project = SandboxPolicy()
     user = SandboxPolicy(channel_admins=["api:bob", "api:carol"])
     policy = compile_effective_policy(
         project, workspace_root=Path("/tmp"),
         user_policy=user,
     )
-    assert policy.channel_admins == frozenset({"api:alice", "api:bob", "api:carol"})
-
-
-def test_effective_policy_channel_admins_project_only_when_user_unset() -> None:
-    """``user.channel_admins=None`` (key absent) → user contributes
-    nothing; the result is just the project layer's admins."""
-    project = SandboxPolicy(channel_admins=["api:alice"])
-    user = SandboxPolicy()  # channel_admins defaults to None
-    policy = compile_effective_policy(
-        project, workspace_root=Path("/tmp"),
-        user_policy=user,
-    )
-    assert policy.channel_admins == frozenset({"api:alice"})
+    assert policy.channel_admins == frozenset({"api:bob", "api:carol"})
 
 
 def test_effective_policy_channel_admins_in_digest() -> None:
@@ -296,12 +291,14 @@ def test_effective_policy_channel_admins_in_digest() -> None:
     made under one admin set is invalidated if the policy later
     adds/removes admins."""
     p1 = compile_effective_policy(
-        SandboxPolicy(channel_admins=["api:alice"]),
+        SandboxPolicy(),
         workspace_root=Path("/tmp"),
+        user_policy=SandboxPolicy(channel_admins=["api:alice"]),
     )
     p2 = compile_effective_policy(
-        SandboxPolicy(channel_admins=["api:alice", "api:bob"]),
+        SandboxPolicy(),
         workspace_root=Path("/tmp"),
+        user_policy=SandboxPolicy(channel_admins=["api:alice", "api:bob"]),
     )
     assert p1.digest != p2.digest
 

@@ -28,6 +28,7 @@ from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, ScheduledTask, TaskStatus
 from khaos.scheduler.engine import PendingPersistence
+from khaos.time_utils import utc_now_naive
 import khaos.scheduler.engine as _engine_mod
 
 
@@ -90,7 +91,7 @@ async def test_acceptance_1_pause_fail_then_remove_does_not_return_ok(
     try:
         engine = CronEngine(db=db)
         # Future ISO time → not immediately due (tick won't fire).
-        iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "pause-fail-remove", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -181,7 +182,7 @@ async def test_acceptance_2_remove_success_no_resurrection_on_restart(
     db = await _make_db(db_path)
     try:
         engine = CronEngine(db=db)
-        iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "no-resurrect", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -259,7 +260,7 @@ async def test_acceptance_3_new_control_op_supersedes_old_marker(
     db = await _make_db(tmp_path)
     try:
         engine = CronEngine(db=db)
-        iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "supersede", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -371,7 +372,7 @@ async def test_acceptance_4_no_running_null_lease_after_control_fail_and_executo
         )
         await engine.start()
 
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create(
             "no-null-lease", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",
@@ -472,8 +473,8 @@ async def test_acceptance_5_control_finalize_clears_lease_atomically(
         )
 
         # Manually claim the task (set execution_id + lease_until).
-        started_at = datetime.utcnow().isoformat()
-        lease_until = (datetime.utcnow() + timedelta(minutes=10)).isoformat()
+        started_at = utc_now_naive().isoformat()
+        lease_until = (utc_now_naive() + timedelta(minutes=10)).isoformat()
         rowcount = await db.claim_scheduled_task(
             task.id,
             execution_id="test-exec-5",
@@ -560,8 +561,8 @@ async def test_acceptance_6_restart_before_lease_expiry_recovers_as_failed(
         )
 
         # Manually claim with a 10-minute lease (unexpired at restart).
-        started_at = datetime.utcnow().isoformat()
-        lease_until = (datetime.utcnow() + timedelta(minutes=10)).isoformat()
+        started_at = utc_now_naive().isoformat()
+        lease_until = (utc_now_naive() + timedelta(minutes=10)).isoformat()
         rowcount = await db.claim_scheduled_task(
             task.id,
             execution_id="test-exec-6",
@@ -665,7 +666,7 @@ async def test_acceptance_7_recovery_sweeps_all_abnormal_leases(
             "execution_id=?, lease_until=? WHERE id=?",
             (
                 "exec-a",
-                (datetime.utcnow() - timedelta(minutes=5)).isoformat(),
+                (utc_now_naive() - timedelta(minutes=5)).isoformat(),
                 task_a.id,
             ),
         )
@@ -675,7 +676,7 @@ async def test_acceptance_7_recovery_sweeps_all_abnormal_leases(
             "execution_id=?, lease_until=? WHERE id=?",
             (
                 "exec-b",
-                (datetime.utcnow() + timedelta(minutes=10)).isoformat(),
+                (utc_now_naive() + timedelta(minutes=10)).isoformat(),
                 task_b.id,
             ),
         )
@@ -890,7 +891,7 @@ async def test_acceptance_9_load_tasks_failure_enters_degraded_mode(
         )
 
         # M4 batch 3.1.16B-5: create() MUST raise in degraded mode.
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         with pytest.raises(RuntimeError, match="engine_degraded"):
             await engine.create(
                 "degraded-fire", "p", ScheduleConfig(iso_time=iso),
@@ -939,7 +940,7 @@ async def test_acceptance_10_crash_point_injection(tmp_path) -> None:
     db = await _make_db(tmp_path)
     try:
         engine = CronEngine(db=db)
-        iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+        iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
         task = await engine.create(
             "crash-point", "p", ScheduleConfig(iso_time=iso),
             principal_id="alice",

@@ -9,6 +9,8 @@ from datetime import datetime, timedelta
 from enum import Enum
 from typing import Optional
 
+from khaos.time_utils import utc_now_naive
+
 logger = logging.getLogger(__name__)
 
 
@@ -222,7 +224,7 @@ class MemoryStore:
         the list_all() call is principal-scoped, so ``delete_memory_by_id``
         can only receive IDs that belong to this principal.
         """
-        moment = now or datetime.utcnow()
+        moment = now or utc_now_naive()
         before = len(await self.list_all())
         # SQLite stores ISO timestamps; compare in Python to avoid timezone
         # parsing pitfalls inside SQL.
@@ -417,4 +419,3 @@ def _get(obj, attr: str):
     if isinstance(obj, dict):
         return obj.get(attr)
     return getattr(obj, attr, None)
-

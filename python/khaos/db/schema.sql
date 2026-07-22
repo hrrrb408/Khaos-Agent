@@ -153,7 +153,16 @@ CREATE TABLE IF NOT EXISTS permissions (
 CREATE INDEX IF NOT EXISTS idx_permissions_level ON permissions(permission_level, mode);
 -- M4 batch 3.1.16A-2: principal-scoped lookup index.
 CREATE INDEX IF NOT EXISTS idx_permissions_principal
-    ON permissions(principal_id, project_id, mode, permission_level);
+    ON permissions(principal_id, project_id, policy_digest, generation, mode, permission_level);
+
+CREATE TABLE IF NOT EXISTS authorization_contexts (
+    principal_id  TEXT NOT NULL,
+    project_id    TEXT NOT NULL,
+    policy_digest TEXT NOT NULL,
+    epoch         INTEGER NOT NULL DEFAULT 1 CHECK (epoch >= 1),
+    updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    PRIMARY KEY (principal_id, project_id)
+);
 
 CREATE TABLE IF NOT EXISTS tools (
     id               INTEGER PRIMARY KEY AUTOINCREMENT,

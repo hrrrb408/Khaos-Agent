@@ -30,6 +30,8 @@ import logging
 import re
 from dataclasses import dataclass
 
+from khaos.security.host_network import HostNetworkAuthority, HostNetworkDeniedError
+
 logger = logging.getLogger(__name__)
 
 # 命令中的网络相关关键词
@@ -81,6 +83,8 @@ class NetworkGuard:
         network_enabled: bool = False,
         allowed_domains: list[str] | None = None,
         blocked_domains: list[str] | None = None,
+        *,
+        host_authority: HostNetworkAuthority | None = None,
     ):
         self.network_enabled = network_enabled
         # H3: three-state — ``None`` means "no allowlist configured"
@@ -95,6 +99,28 @@ class NetworkGuard:
         else:
             self._allowed = set(allowed_domains)
         self._blocked = set(blocked_domains or [])
+        # Dependency injection is intentionally explicit so integration tests
+        # can use an isolated loopback HTTP server without weakening the
+        # production authority's public-address-only policy.
+        self._host_authority = host_authority or HostNetworkAuthority()
+
+    async def check_resolved_url(self, url: str) -> NetworkCheckResult:
+        """Apply domain policy and reject URLs resolving to special-use IPs."""
+        domain_result = self._check_url(url)
+        if not domain_result.allowed:
+            return domain_result
+        try:
+            await self._host_authority.validate_url(
+                url,
+                allowed_schemes=frozenset({"http", "https", "ws", "wss"}),
+            )
+        except HostNetworkDeniedError as exc:
+            return NetworkCheckResult(
+                allowed=False,
+                reason=str(exc),
+                domain=domain_result.domain,
+            )
+        return domain_result
 
     def check_tool(self, tool_name: str, arguments: dict) -> NetworkCheckResult:
         """检查工具调用是否涉及网络访问。
@@ -295,7 +321,7 @@ class NetworkGuard:
     def _extract_domain(self, text: str) -> str:
         """从命令或 URL 中提取域名。"""
         # 尝试解析为 URL
-        url_match = re.search(r"https?://([^\s/:\"'`]+)", text)
+        url_match = re.search(r"(?:https?|wss?)://([^\s/:\"'`]+)", text)
         if url_match:
             return url_match.group(1)
         # ssh-style: user@host

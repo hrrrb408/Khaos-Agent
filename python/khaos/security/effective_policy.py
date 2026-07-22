@@ -127,14 +127,8 @@ class EffectiveSecurityPolicy:
     audit_log_path: str | None = None
     secrets_scan_before_tool_result: bool = True
     secrets_block_env_dump: bool = True
-    # M4 batch 3.1.16A-4-4-3: principals permitted to mutate (enable /
-    # disable) registered communication channels via the channel tools.
-    # Compiled with OR semantics: ``user.channel_admins ∪
-    # project.channel_admins`` (admin is an authorization grant, not a
-    # restriction, so a stricter layer cannot revoke a more permissive
-    # layer's grant — same shape as ``audit_enabled``).  Defaults to an
-    # empty frozenset so channel mutations are fail-closed until an
-    # admin is explicitly declared in either layer.
+    # Principals permitted to mutate registered communication channels.
+    # This is a host-side grant, so only the trusted user layer contributes.
     channel_admins: frozenset[str] = field(default_factory=frozenset)
     digest: str = ""
 
@@ -298,18 +292,16 @@ def compile_effective_policy(
         # to an arbitrary host path.
         audit_log_path = None
 
-    # M4 batch 3.1.16A-4-4-3: ``channel_admins`` uses OR (union) semantics
-    # — admin is an authorization grant, not a restriction, so a stricter
-    # layer cannot revoke a more permissive layer's grant.  This is the
-    # same shape as ``audit_enabled``: if user OR project declares an
-    # admin, the admin is permitted.  ``None`` on either layer means
-    # "this layer contributes no admins"; an empty list likewise
-    # contributes nothing.  The default effective value is therefore an
-    # empty frozenset — channel mutations are fail-closed until an admin
-    # is explicitly declared in either layer.
-    channel_admins: frozenset[str] = _frozen(project_policy.channel_admins)
-    if user is not None:
-        channel_admins = channel_admins | _frozen(user.channel_admins)
+    # Channel administrator membership is a grant, not a restriction.
+    # Project policy is repository-controlled and therefore must never add
+    # one.  Reject a non-empty declaration explicitly so a malicious or old
+    # project cannot appear to start successfully while its grant is ignored.
+    if project_policy.channel_admins:
+        raise PolicyCompilationError(
+            "project channels.admin_principals is a trusted-only grant; "
+            "move it to ~/.khaos/policy.yaml"
+        )
+    channel_admins = _frozen(user.channel_admins) if user is not None else frozenset()
 
     return EffectiveSecurityPolicy(
         mode=mode,

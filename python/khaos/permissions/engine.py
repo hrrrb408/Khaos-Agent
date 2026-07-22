@@ -33,6 +33,8 @@ class PermissionRule:
     approval: ApprovalMode
     mode: str
     granted_at: float = 0.0
+    policy_digest: str = ""
+    generation: int = 0
 
 
 @dataclass
@@ -94,12 +96,18 @@ class PermissionEngine:
         self._project_id = project_id
         self._policy_digest = policy_digest
         self._runtime_id = runtime_id
+        self._authorization_epoch = 0
 
     async def load_rules(self) -> None:
         """Load persisted rules from SQLite, scoped to this principal."""
+        self._authorization_epoch = await self.db.bind_authorization_context(
+            self._principal_id, self._project_id, self._policy_digest
+        )
         rows = await self.db.list_permission_rules(
             principal_id=self._principal_id,
             project_id=self._project_id,
+            policy_digest=self._policy_digest,
+            generation=self._authorization_epoch,
         )
         self._rules = [
             PermissionRule(
@@ -109,6 +117,8 @@ class PermissionEngine:
                 approval=ApprovalMode(str(row["approval"])),
                 mode=str(row["mode"]),
                 granted_at=float(row["granted_at"] or 0),
+                policy_digest=str(row["policy_digest"]),
+                generation=int(row["generation"]),
             )
             for row in rows
         ]
@@ -122,6 +132,42 @@ class PermissionEngine:
     ) -> PermissionDecision:
         """Check whether a tool call is approved, denied, or needs confirmation."""
         target = self.normalize_target(tool_name, params)
+        if self._authorization_epoch == 0:
+            # Factory startup loads eagerly; direct/library callers remain safe
+            # by binding the authoritative context before their first check.
+            await self.load_rules()
+        context = await self.db.get_authorization_context(
+            self._principal_id, self._project_id
+        )
+        if context is None or str(context["policy_digest"]) != self._policy_digest:
+            self._rules = []
+            return PermissionDecision(
+                approved=ApprovalMode.DENY,
+                reason="Effective policy changed; runtime authorization is stale",
+                target=target,
+            )
+        current_epoch = int(context["epoch"])
+        if current_epoch != self._authorization_epoch:
+            self._authorization_epoch = current_epoch
+            rows = await self.db.list_permission_rules(
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+                policy_digest=self._policy_digest,
+                generation=current_epoch,
+            )
+            self._rules = [
+                PermissionRule(
+                    id=int(row["id"]),
+                    pattern=str(row["pattern"]),
+                    permission_level=str(row["permission_level"]),
+                    approval=ApprovalMode(str(row["approval"])),
+                    mode=str(row["mode"]),
+                    granted_at=float(row["granted_at"] or 0),
+                    policy_digest=str(row["policy_digest"]),
+                    generation=int(row["generation"]),
+                )
+                for row in rows
+            ]
         # H4: policy-level required-approval list runs BEFORE every other
         # shortcut, including the read-only terminal shortcut.  Otherwise a
         # command classified as read-only (cat / grep / ls / rg / head /
@@ -191,16 +237,17 @@ class PermissionEngine:
             project_id=self._project_id,
             policy_digest=self._policy_digest,
         )
-        persisted = PermissionRule(
-            id=rule_id,
-            pattern=rule.pattern,
-            permission_level=rule.permission_level,
-            approval=rule.approval,
-            mode=rule.mode,
-            granted_at=rule.granted_at,
+        context = await self.db.get_authorization_context(
+            self._principal_id, self._project_id
         )
-        self._rules.insert(0, persisted)
-        return persisted
+        if context is None:
+            raise PermissionDeniedError("authorization context disappeared after grant")
+        self._authorization_epoch = int(context["epoch"])
+        await self._reload_current_rules()
+        for persisted in self._rules:
+            if persisted.id == rule_id:
+                return persisted
+        raise PermissionDeniedError("persisted permission rule could not be reloaded")
 
     async def revoke_rule(self, rule_id: int) -> None:
         """Remove a permission rule from storage and cache.
@@ -214,14 +261,63 @@ class PermissionEngine:
         delete was a no-op, masking the cross-principal revoke attempt).
         """
         rowcount = await self.db.delete_permission_rule(
-            rule_id, principal_id=self._principal_id,
+            rule_id,
+            principal_id=self._principal_id,
+            project_id=self._project_id,
+            policy_digest=self._policy_digest,
         )
         if rowcount == 0:
             raise PermissionDeniedError(
                 f"Permission rule {rule_id} not owned by principal "
                 f"{self._principal_id!r} (or does not exist); revoke refused"
             )
-        self._rules = [rule for rule in self._rules if rule.id != rule_id]
+        context = await self.db.get_authorization_context(
+            self._principal_id, self._project_id
+        )
+        self._authorization_epoch = int(context["epoch"]) if context else 0
+        await self._reload_current_rules()
+
+    async def _reload_current_rules(self) -> None:
+        rows = await self.db.list_permission_rules(
+            principal_id=self._principal_id,
+            project_id=self._project_id,
+            policy_digest=self._policy_digest,
+            generation=self._authorization_epoch,
+        )
+        self._rules = [
+            PermissionRule(
+                id=int(row["id"]),
+                pattern=str(row["pattern"]),
+                permission_level=str(row["permission_level"]),
+                approval=ApprovalMode(str(row["approval"])),
+                mode=str(row["mode"]),
+                granted_at=float(row["granted_at"] or 0),
+                policy_digest=str(row["policy_digest"]),
+                generation=int(row["generation"]),
+            )
+            for row in rows
+        ]
+
+    async def authorization_snapshot(self) -> int:
+        """Return the current epoch after verifying this runtime's policy."""
+        if self._authorization_epoch == 0:
+            await self.load_rules()
+        context = await self.db.get_authorization_context(
+            self._principal_id, self._project_id
+        )
+        if context is None or str(context["policy_digest"]) != self._policy_digest:
+            raise PermissionDeniedError(
+                "Effective policy changed; runtime authorization is stale"
+            )
+        return int(context["epoch"])
+
+    async def validate_dispatch_epoch(self, expected_epoch: int) -> None:
+        """Fail closed if authorization changed after permission checking."""
+        current_epoch = await self.authorization_snapshot()
+        if current_epoch != expected_epoch:
+            raise PermissionDeniedError(
+                "Authorization changed before tool dispatch; re-approval required"
+            )
 
     async def audit(
         self,

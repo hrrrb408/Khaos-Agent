@@ -47,7 +47,7 @@ def _build_large_repo(tmp_path: Path):
     conn = sqlite3.connect(":memory:", check_same_thread=False)
     store = IndexStore(conn)
     resolver = ResolutionService(conn)
-    report = asyncio.get_event_loop().run_until_complete(
+    report = asyncio.run(
         RepositoryIndexer(store, resolution_service=resolver).index("large", tmp_path, full_reindex=True)
     )
     query = CodeQueryService(store)

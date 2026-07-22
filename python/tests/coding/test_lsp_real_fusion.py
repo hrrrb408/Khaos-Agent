@@ -45,10 +45,14 @@ pytestmark = pytest.mark.lsp_real
 def _find_python_lsp() -> str | None:
     """Find a trusted, pre-installed Python LSP server binary.
 
-    Checks for pyright, pylsp, or jedi-language-server on PATH.
+    Checks for pyright-langserver, pylsp, or jedi-language-server on PATH.
     Does NOT install anything.
     """
-    for name in ("pyright", "pylsp", "jedi-language-server"):
+    interpreter_bin = Path(sys.executable).parent
+    for name in ("pyright-langserver", "pylsp", "jedi-language-server"):
+        sibling = interpreter_bin / name
+        if sibling.is_file() and os.access(sibling, os.X_OK):
+            return str(sibling)
         path = shutil.which(name)
         if path is not None:
             return path
@@ -56,6 +60,11 @@ def _find_python_lsp() -> str | None:
 
 
 _LSP_BINARY = _find_python_lsp()
+_LSP_ARGV = (
+    (_LSP_BINARY, "--stdio")
+    if _LSP_BINARY and Path(_LSP_BINARY).name == "pyright-langserver"
+    else ((_LSP_BINARY,) if _LSP_BINARY else ())
+)
 
 
 def _has_tree_sitter() -> bool:
@@ -71,7 +80,7 @@ def _has_tree_sitter() -> bool:
 pytest.importorskip("tree_sitter")
 
 
-@pytest.mark.skipif(_LSP_BINARY is None, reason="no trusted Python LSP server found on PATH (pyright/pylsp/jedi-language-server)")
+@pytest.mark.skipif(_LSP_BINARY is None, reason="no trusted Python LSP server found on PATH")
 async def test_real_python_lsp_definition_fusion(tmp_path: Path):
     """Validate real LSP definition fusion against repository resolution.
 
@@ -143,11 +152,11 @@ async def test_real_python_lsp_definition_fusion(tmp_path: Path):
 
     # Start the real LSP client
     lsp_client = LspClient(
-        (_LSP_BINARY,),  # type: ignore[arg-type]
+        _LSP_ARGV,
         execution_service=exec_service,
         task_id="task",
         workspace_id="workspace",
-        trusted_argv=(_LSP_BINARY,),  # type: ignore[arg-type]
+        trusted_argv=_LSP_ARGV,
         timeout=5.0,
     )
 

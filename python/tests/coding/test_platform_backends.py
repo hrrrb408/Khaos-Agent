@@ -119,6 +119,21 @@ def test_user_home_executable_never_exposes_entire_home(tmp_path: Path):
     assert roots == (executable.resolve(),)
 
 
+def test_runtime_roots_include_lexical_virtualenv(tmp_path: Path):
+    base = tmp_path / "base" / "bin" / "python"
+    base.parent.mkdir(parents=True)
+    base.write_text("", encoding="utf-8")
+    virtualenv = tmp_path / "venv"
+    (virtualenv / "bin").mkdir(parents=True)
+    (virtualenv / "pyvenv.cfg").write_text("home = /test\n", encoding="utf-8")
+    executable = virtualenv / "bin" / "python"
+    executable.symlink_to(base)
+
+    roots = _runtime_read_roots((str(executable),), tmp_path / "workspace")
+
+    assert virtualenv.resolve() in roots
+
+
 def test_linux_profile_preserves_cwd_relative_to_workspace(tmp_path: Path):
     workspace = tmp_path / "workspace"
     cwd = workspace / "src" / "pkg"

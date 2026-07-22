@@ -31,6 +31,7 @@ from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler import CronEngine, ScheduleConfig, ScheduledTask, TaskStatus
 from khaos.scheduler.engine import PendingPersistence
+from khaos.time_utils import utc_now_naive
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +99,7 @@ async def test_acceptance_1_lease_revocation_failure_stops_tick(
         await engine.start()
         try:
             # Create Task A with an immediately-due schedule.
-            past_iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+            past_iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
             task_a = await engine.create(
                 "task-a-resistant", "a", ScheduleConfig(iso_time=past_iso),
                 principal_id="alice",
@@ -110,7 +111,7 @@ async def test_acceptance_1_lease_revocation_failure_stops_tick(
             )
 
             # Now expire A's lease and force a sweep.
-            expired_iso = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
+            expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
             conn = await db._require_conn()
             await conn.execute(
                 "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
@@ -194,7 +195,7 @@ async def test_acceptance_2_lease_recovery_db_failure_stops_tick(tmp_path) -> No
         await engine.start()
         try:
             # Create Task A with an expired lease.
-            past_iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+            past_iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
             task_a = await engine.create(
                 "task-a-expired", "a", ScheduleConfig(iso_time=past_iso),
                 principal_id="alice",
@@ -203,7 +204,7 @@ async def test_acceptance_2_lease_recovery_db_failure_stops_tick(tmp_path) -> No
             await asyncio.sleep(0.3)
 
             # Manually set A to running with an expired lease.
-            expired_iso = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
+            expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
             conn = await db._require_conn()
             await conn.execute(
                 "UPDATE scheduled_tasks SET status = 'running', "
@@ -279,7 +280,7 @@ async def test_acceptance_3_degraded_blocks_all_executor_publish(tmp_path) -> No
         await engine.start()
         try:
             # Create a due task.
-            past_iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+            past_iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
             await engine.create(
                 "task-due", "p", ScheduleConfig(iso_time=past_iso),
                 principal_id="alice",
@@ -320,7 +321,7 @@ async def test_acceptance_4_reconcile_holds_per_task_lock(tmp_path) -> None:
         await engine.start()
         try:
             # Create a task and place a marker.
-            future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+            future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
             task = await engine.create(
                 "task-marker", "p", ScheduleConfig(iso_time=future_iso),
                 principal_id="alice",
@@ -383,7 +384,7 @@ async def test_acceptance_5_reconcile_reverifies_operation_id(tmp_path) -> None:
         engine = CronEngine(db=db)
         await engine.start()
         try:
-            future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+            future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
             task = await engine.create(
                 "task-supersede", "p", ScheduleConfig(iso_time=future_iso),
                 principal_id="alice",
@@ -475,7 +476,7 @@ async def test_acceptance_6_old_marker_does_not_overwrite_newer_remove(tmp_path)
         engine = CronEngine(db=db)
         await engine.start()
         try:
-            future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+            future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
             task = await engine.create(
                 "task-overwrite", "p", ScheduleConfig(iso_time=future_iso),
                 principal_id="alice",
@@ -547,7 +548,7 @@ async def test_acceptance_7_reconcile_propagates_false(tmp_path) -> None:
         engine = CronEngine(db=db)
         await engine.start()
         try:
-            future_iso = (datetime.utcnow() + timedelta(hours=1)).isoformat()
+            future_iso = (utc_now_naive() + timedelta(hours=1)).isoformat()
             task = await engine.create(
                 "task-fail", "p", ScheduleConfig(iso_time=future_iso),
                 principal_id="alice",
@@ -587,18 +588,20 @@ async def test_acceptance_7_reconcile_propagates_false(tmp_path) -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_acceptance_8_lockfile_symlink_rejected() -> None:
+async def test_acceptance_8_lockfile_symlink_rejected(
+    tmp_path, monkeypatch,
+) -> None:
     """Criterion 8: a symlink at the lockfile path MUST be rejected.
     The symlink target's content MUST NOT be truncated.
 
     Without the CRITICAL-2 fix, ``os.open`` followed the symlink and
     ``ftruncate(fd, 0)`` truncated the target file's content.
     """
-    import hashlib
     from khaos.grpc_server import _acquire_instance_lock, _instance_lockfile_path
 
+    monkeypatch.setenv("HOME", str(tmp_path))
     # Create a target file with known content.
-    target = Path(tempfile.gettempdir()) / f"khaos_test_target_{os.getpid()}.txt"
+    target = tmp_path / "lockfile-symlink-target.txt"
     target_content = "authorized_keys content\n" * 10
     target.write_text(target_content)
     target.chmod(0o600)
@@ -649,13 +652,16 @@ async def test_acceptance_8_lockfile_symlink_rejected() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_acceptance_9_existing_lockfile_validated() -> None:
+async def test_acceptance_9_existing_lockfile_validated(
+    tmp_path, monkeypatch,
+) -> None:
     """Criterion 9: an existing lockfile with unsafe mode (group/other
     bits set) MUST be rejected.
     """
     from khaos.grpc_server import _acquire_instance_lock, _instance_lockfile_path
 
-    fake_db = str(Path(tempfile.gettempdir()) / "fake_khaos_mode_test.db")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    fake_db = str(tmp_path / "fake_khaos_mode_test.db")
     lockfile_path = _instance_lockfile_path(fake_db)
 
     # Create the lockfile with unsafe mode (0644).
@@ -691,7 +697,9 @@ async def test_acceptance_9_existing_lockfile_validated() -> None:
 # ---------------------------------------------------------------------------
 
 
-async def test_acceptance_10_lock_released_on_init_failure(tmp_path) -> None:
+async def test_acceptance_10_lock_released_on_init_failure(
+    tmp_path, monkeypatch,
+) -> None:
     """Criterion 10: when an init step (UDS probe, migration,
     agent.start) fails AFTER the lock is acquired, the lock MUST be
     released so a retry in the same process can re-acquire it.
@@ -703,6 +711,7 @@ async def test_acceptance_10_lock_released_on_init_failure(tmp_path) -> None:
     """
     from khaos.grpc_server import _acquire_instance_lock
 
+    monkeypatch.setenv("HOME", str(tmp_path))
     db_path = str(tmp_path / "khaos.db")
 
     # Acquire the lock, simulate init failure, verify the lock is

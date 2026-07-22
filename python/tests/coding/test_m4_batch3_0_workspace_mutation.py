@@ -591,7 +591,7 @@ def test_concurrent_apply_creates_one_run_and_no_partial_second_write(tmp_path):
                         outcomes.append(future.result())
                     except Exception as exc:
                         outcomes.append(exc)
-            assert sum(not isinstance(item, Exception) for item in outcomes) >= 1
+            assert sum(not isinstance(item, Exception) for item in outcomes) >= 1, outcomes
         finally:
             await manager.__aexit__(None, None, None)
 

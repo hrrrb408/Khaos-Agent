@@ -24,7 +24,6 @@ from khaos.coding.intelligence.resolution.service import ResolutionService
 from khaos.coding.planning.contracts import (
     ImpactTraversalBudget,
     PlanStatus,
-    TestAssociationResult,
 )
 from khaos.coding.planning.service import DeterministicPlanningService
 from khaos.coding.planning.verification_catalog import VerificationCatalog

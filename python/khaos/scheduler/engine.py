@@ -17,6 +17,7 @@ from typing import Any, Awaitable, Callable, Optional
 
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler.models import ScheduleConfig, ScheduledTask, TaskStatus
+from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -448,10 +449,10 @@ class CronEngine:
                 # (catches in-process hangs from a prior session that
                 # were never cleaned up — idempotent with the above).
                 expired_ids = await self.db.query_expired_lease_task_ids(
-                    now_iso=datetime.utcnow().isoformat(),
+                    now_iso=utc_now_naive().isoformat(),
                 )
                 recovered_expired = await self.db.recover_expired_leases(
-                    now_iso=datetime.utcnow().isoformat(),
+                    now_iso=utc_now_naive().isoformat(),
                 )
                 if recovered_expired > 0:
                     logger.warning(
@@ -2340,7 +2341,7 @@ class CronEngine:
         - interval_seconds: now + interval
         - cron: 简单解析分时日（仅支持基本格式，不支持高级 cron 语法）
         """
-        now = datetime.utcnow()
+        now = utc_now_naive()
         if task.schedule.iso_time:
             try:
                 return datetime.fromisoformat(task.schedule.iso_time)
@@ -2392,7 +2393,7 @@ class CronEngine:
     async def _tick_loop(self) -> None:
         """后台循环，检查到期的任务。"""
         while self._running:
-            now = datetime.utcnow()
+            now = utc_now_naive()
             # M4 batch 3.1.11 (MEDIUM-2): in DEGRADED mode, refuse to
             # fire new executions.  The tick loop still runs so
             # pause / resume / remove work (they don't go through
@@ -2682,7 +2683,7 @@ class CronEngine:
         # the conditional DB write.
         version_at_start = task.lifecycle_version
         # M4 batch 3.1.11 (MEDIUM-1): capture started_at for last_run.
-        started_at_dt = datetime.utcnow()
+        started_at_dt = utc_now_naive()
         # M4 batch 3.1.10 (HIGH-3): durable execution claim.
         execution_id = uuid.uuid4().hex
         lease_until_dt = started_at_dt + timedelta(seconds=self._execution_lease_seconds)

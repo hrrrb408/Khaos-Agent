@@ -12,6 +12,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from khaos.db import Database
+from khaos.config import ConfigError
 from khaos.agent.approval import ApprovalBinding, ApprovalBroker
 from khaos.grpc_server import (
     AgentService,
@@ -1178,7 +1179,7 @@ models:
     assert provider.api_key == "secret"
 
 
-async def test_load_router_from_project_config_merges_user_config(tmp_path, monkeypatch):
+async def test_load_router_rejects_project_provider_before_user_secret_merge(tmp_path, monkeypatch):
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.chdir(tmp_path)
     project_config = tmp_path / "config.yaml"
@@ -1213,10 +1214,8 @@ models:
         encoding="utf-8",
     )
 
-    router = load_router_from_config(project_config, project_root=tmp_path)
-    provider = router.provider_manager.get_provider("nvidia")
-
-    assert provider.api_key == "user-config-key-123"
+    with pytest.raises(ConfigError, match="models.providers.*trusted-only"):
+        load_router_from_config(project_config, project_root=tmp_path)
 
 
 async def test_build_runtime_wires_token_engine_and_skills(tmp_path):
@@ -1316,9 +1315,13 @@ async def test_c_2_2_dispatcher_routes_memory_delete_memory(tmp_path):
             if exc:
                 pytest.skip(f"server failed to start: {exc!r}")
             await task
-        reader, writer = await asyncio.open_unix_connection(str(socket_path))
-
         async def rpc(method: str, payload: dict) -> dict:
+            # The JSON-line server intentionally serves one signed request per
+            # UDS connection, so each RPC must establish a fresh authenticated
+            # transport. Reusing the first writer makes the second drain fail
+            # with ``Connection lost`` and was previously misreported as a
+            # host sandbox limitation.
+            reader, writer = await asyncio.open_unix_connection(str(socket_path))
             # Each RPC needs a unique nonce — the authenticator rejects
             # replayed nonces.  Use a counter so the 4 calls in this
             # test don't collide.
@@ -1327,7 +1330,11 @@ async def test_c_2_2_dispatcher_routes_memory_delete_memory(tmp_path):
             request = _signed_rpc_request(method, payload, nonce=nonce)
             writer.write((json.dumps(request) + "\n").encode("utf-8"))
             await writer.drain()
-            return json.loads((await reader.readline()).decode("utf-8"))
+            try:
+                return json.loads((await reader.readline()).decode("utf-8"))
+            finally:
+                writer.close()
+                await writer.wait_closed()
         rpc.counter = 0
 
         # Set a memory via the dispatcher.
@@ -1365,8 +1372,6 @@ async def test_c_2_2_dispatcher_routes_memory_delete_memory(tmp_path):
             f"DeleteMemory did not remove the durable row: {get_after}"
         )
 
-        writer.close()
-        await writer.wait_closed()
     except (PermissionError, OSError) as exc:
         pytest.skip(f"sandbox does not allow a peer-credential UDS: {exc}")
     finally:
@@ -1675,4 +1680,3 @@ async def test_c_2_3_session_service_list_with_empty_principal_returns_nothing(t
         f"empty principal must return no sessions (fail-closed), got: {rows}"
     )
     await db.close()
-

@@ -46,18 +46,7 @@ audit:
   enabled: true
   # log_path: null  # null 表示写入 SQLite
 
-# M4 batch 3.1.16A-4-4-3: channel admin principal allowlist.
-# Principals listed here may mutate (enable / disable) registered
-# communication channels via the channel tools.  Compiled with OR
-# semantics across user ∩ project layers (user.channel_admins ∪
-# project.channel_admins) — admin is an authorization grant, not a
-# restriction, so a stricter layer cannot revoke a more permissive
-# layer's grant.
-#
-# Default empty list = fail-closed: no principal can mutate channels
-# via the tool path.  Production deployments must explicitly declare
-# admin principals here.  The gRPC ``set_channel_enabled`` RPC path
-# (used by the dispatcher with its own ctx.principal_id check) is NOT
-# affected by this list.
+# Channel administrators are a trusted user grant and must be declared in
+# ~/.khaos/policy.yaml.  A project policy may only leave this list empty.
 channels:
   admin_principals: []

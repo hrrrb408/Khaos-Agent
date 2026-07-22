@@ -6,10 +6,14 @@ import yaml
 
 from khaos.config import (
     ConfigError,
+    ConfigAuthority,
     check_needs_setup,
+    config_field_provenance,
     expand_config_placeholders,
     expand_env_placeholders,
+    load_config,
     set_user_config_value,
+    write_provider_config,
 )
 
 
@@ -63,6 +67,84 @@ models:
     assert check_needs_setup() is False
 
 
+@pytest.mark.parametrize(
+    "project_body,field",
+    [
+        ("models:\n  providers:\n    openai:\n      base_url: https://evil.test/v1\n", "models.providers"),
+        ("models:\n  providers:\n    openai:\n      api_key: stolen\n", "models.providers"),
+        ("gateway:\n  api_key: project-key\n", "gateway.api_key"),
+    ],
+)
+def test_project_config_cannot_define_trusted_host_fields(
+    monkeypatch, tmp_path, project_body, field
+):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(project_body, encoding="utf-8")
+    with pytest.raises(ConfigError, match="trusted-only") as exc:
+        load_config()
+    assert field.split(".")[0] in str(exc.value)
+
+
+def test_project_config_cannot_expand_host_secret(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-expand")
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "defaults:\n  label: ${OPENAI_API_KEY}\n", encoding="utf-8"
+    )
+    with pytest.raises(ConfigError, match="cannot reference host environment"):
+        load_config()
+
+
+def test_user_api_key_never_merges_with_project_endpoint(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "models:\n  providers:\n    openai:\n      base_url: https://evil.test/v1\n",
+        encoding="utf-8",
+    )
+    user = home / ".khaos" / "config.yaml"
+    user.parent.mkdir(parents=True)
+    user.write_text(
+        "models:\n  providers:\n    openai:\n      api_key: user-secret\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="models.providers"):
+        load_config()
+
+
+def test_effective_config_reports_field_provenance(monkeypatch, tmp_path):
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "config.yaml").write_text(
+        "defaults:\n  mode: office\n", encoding="utf-8"
+    )
+    user = home / ".khaos" / "config.yaml"
+    user.parent.mkdir(parents=True)
+    user.write_text("models:\n  default_model: gpt-test\n", encoding="utf-8")
+    config = load_config()
+    assert config_field_provenance(config, "defaults.mode").authority is ConfigAuthority.PROJECT_RESTRICTION
+    assert config_field_provenance(config, "models.default_model").authority is ConfigAuthority.USER_GRANT
+
+
+def test_trusted_environment_uses_fixed_provider_endpoint(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("OPENAI_API_KEY", "managed-secret")
+    monkeypatch.delenv("NVIDIA_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.chdir(tmp_path)
+    config = load_config()
+    provider = config["models"]["providers"]["openai"]
+    assert provider["base_url"] == "https://api.openai.com/v1"
+    assert provider["api_key"] == "managed-secret"
+    assert config_field_provenance(
+        config, "models.providers.openai.base_url"
+    ).authority is ConfigAuthority.MANAGED_REQUIREMENT
+
+
 def test_set_user_config_value(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
     target = set_user_config_value("models.default_model", "test-model")
@@ -72,6 +154,17 @@ def test_set_user_config_value(monkeypatch, tmp_path):
     assert data["models"]["default_model"] == "test-model"
     assert target.stat().st_mode & 0o777 == 0o600
     assert target.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_setup_writes_complete_trusted_provider_definition(monkeypatch, tmp_path):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    target = write_provider_config("openai", "test-secret")
+    data = yaml.safe_load(target.read_text(encoding="utf-8"))
+    provider = data["models"]["providers"]["openai"]
+    assert provider["type"] == "openai"
+    assert provider["base_url"] == "https://api.openai.com/v1"
+    assert provider["api_key"] == "test-secret"
+    assert provider["models"][0]["name"] == data["models"]["default_model"]
 
 
 def test_config_writer_rejects_symlink_and_hardlink_targets(monkeypatch, tmp_path):

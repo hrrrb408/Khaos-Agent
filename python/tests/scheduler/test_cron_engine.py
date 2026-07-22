@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 import pytest
 
 from khaos.scheduler import CronEngine, ScheduleConfig, ScheduledTask, TaskStatus
+from khaos.time_utils import utc_now_naive
 
 
 def _engine() -> CronEngine:
@@ -101,7 +102,7 @@ async def test_remove_unknown_returns_false() -> None:
 def test_next_run_interval() -> None:
     engine = _engine()
     task = ScheduledTask(id="x", name="n", prompt="p", schedule=ScheduleConfig(interval_seconds=120))
-    now = datetime.utcnow()
+    now = utc_now_naive()
     nxt = engine._compute_next_run(task)
     assert nxt >= now
     # interval 120s → within ~120s of now.
@@ -111,7 +112,7 @@ def test_next_run_interval() -> None:
 def test_next_run_cron_simple() -> None:
     engine = _engine()
     task = ScheduledTask(id="x", name="n", prompt="p", schedule=ScheduleConfig(cron="0 9"))
-    now = datetime.utcnow()
+    now = utc_now_naive()
     nxt = engine._compute_next_run(task)
     assert nxt.hour == 9
     assert nxt.minute == 0
@@ -131,7 +132,7 @@ def test_next_run_unknown_format() -> None:
     """No schedule fields set → defaults to +1 hour."""
     engine = _engine()
     task = ScheduledTask(id="x", name="n", prompt="p", schedule=ScheduleConfig())
-    now = datetime.utcnow()
+    now = utc_now_naive()
     nxt = engine._compute_next_run(task)
     assert (nxt - now) >= timedelta(minutes=59)
 
@@ -144,7 +145,7 @@ def test_next_run_unknown_format() -> None:
 async def test_task_lifecycle_pending_running_completed() -> None:
     """A one-shot (iso_time) task transitions PENDING → RUNNING → COMPLETED."""
     engine = _engine()
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("once", "do once", ScheduleConfig(iso_time=iso), principal_id="test")
 
     await engine._execute_task(task)
@@ -172,7 +173,7 @@ async def test_repeat_limit() -> None:
 
 async def test_onetime_task_completed() -> None:
     engine = _engine()
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("once2", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine._execute_task(task)
     assert task.status == TaskStatus.COMPLETED
@@ -181,7 +182,7 @@ async def test_onetime_task_completed() -> None:
 async def test_task_failure() -> None:
     """An executor that raises marks the task FAILED."""
     engine = CronEngine(executor=_raising_executor)
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("boom", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine._execute_task(task)
     assert task.status == TaskStatus.FAILED
@@ -204,7 +205,7 @@ async def test_on_complete_invoked() -> None:
         calls.append((task.name, str(result)))
 
     engine = CronEngine(executor=_recording_executor, on_complete=on_complete)
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("cb", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine._execute_task(task)
 
@@ -253,7 +254,7 @@ async def test_stop_drains_in_flight_execute_tasks() -> None:
         tick_interval=0.01,  # fire quickly so the due task is picked up
     )
     # Due immediately.
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     await engine.create("in-flight", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine.start()
 
@@ -340,7 +341,7 @@ async def test_stop_bounded_against_swallowing_executor() -> None:
         executor=swallowing_executor,
         tick_interval=0.01,
     )
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     await engine.create("swallow", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     await engine.start()
     # Wait for the executor to actually start (proving the task is
@@ -417,7 +418,7 @@ async def test_execute_task_persists_cancelled_state_on_cancellation(tmp_path) -
         # row doesn't store ``next_run``, so a reload leaves it None
         # and the tick loop never picks the task up).
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("cancel-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id  # DB assigns a UUID hex id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -511,7 +512,7 @@ async def test_stop_retries_terminal_persistence_across_calls(tmp_path) -> None:
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("retry-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -624,7 +625,7 @@ async def test_cancelled_task_not_refired_on_restart(tmp_path) -> None:
         )
         await engine.start()
         # Use a one-shot ISO task in the past so it's immediately due.
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create("restart-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -734,7 +735,7 @@ async def test_stop_redrains_retained_persistence_owner(tmp_path) -> None:
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("retained-owner", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -883,7 +884,7 @@ async def test_retained_persistence_owner_exception_is_surfaced(tmp_path) -> Non
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("retained-exc", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -1012,7 +1013,7 @@ async def test_pause_cancels_in_flight_execution(tmp_path) -> None:
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("pause-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -1092,7 +1093,7 @@ async def test_remove_cancels_in_flight_execution(tmp_path) -> None:
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("remove-test", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -1166,7 +1167,7 @@ async def test_remove_prevents_task_refire_on_restart(tmp_path) -> None:
         )
         await engine.start()
         # ISO time in the past so the task is immediately due.
-        iso = (datetime.utcnow() - timedelta(seconds=10)).isoformat()
+        iso = (utc_now_naive() - timedelta(seconds=10)).isoformat()
         task = await engine.create("remove-restart", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
         await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -1277,7 +1278,7 @@ async def test_pause_returns_cancellation_pending_and_epoch_fence_holds(
         engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
         try:
             await engine.start()
-            iso = datetime.utcnow().isoformat()
+            iso = utc_now_naive().isoformat()
             task = await engine.create(
                 "pause-cp", "p", ScheduleConfig(iso_time=iso),
                 principal_id="test",
@@ -1433,7 +1434,7 @@ async def test_remove_returns_cancellation_pending_and_epoch_fence_holds(
         engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
         try:
             await engine.start()
-            iso = datetime.utcnow().isoformat()
+            iso = utc_now_naive().isoformat()
             task = await engine.create(
                 "remove-cp", "p", ScheduleConfig(iso_time=iso),
                 principal_id="test",
@@ -1580,7 +1581,7 @@ async def test_remove_retains_task_when_persist_fails(tmp_path) -> None:
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "remove-retain", "p", ScheduleConfig(iso_time=iso),
             principal_id="test",
@@ -1709,7 +1710,7 @@ async def test_tick_does_not_publish_for_paused_task(tmp_path) -> None:
             tick_interval=0.01,
         )
         # Create a task that's due NOW but DON'T start the engine yet.
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("pause-tick", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
 
@@ -1803,7 +1804,7 @@ async def test_tick_does_not_publish_for_removed_task(tmp_path) -> None:
             tick_interval=0.01,
         )
         # Create a task that's due NOW but DON'T start the engine yet.
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("remove-tick", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
 
@@ -1884,7 +1885,7 @@ async def test_pause_returns_persistence_pending_on_db_failure(
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "pause-pp", "p", ScheduleConfig(iso_time=iso),
             principal_id="test",
@@ -2010,7 +2011,7 @@ async def test_remove_cancellation_pending_tombstone_allows_retry(
         engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
         try:
             await engine.start()
-            iso = datetime.utcnow().isoformat()
+            iso = utc_now_naive().isoformat()
             task = await engine.create(
                 "remove-tomb", "p", ScheduleConfig(iso_time=iso),
                 principal_id="test",
@@ -2177,7 +2178,7 @@ async def test_concurrent_pause_and_resume_are_serialized() -> None:
     engine._executor = stalling_executor
     engine._tick_interval = 0.01
     await engine.start()
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("pause-resume", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
     await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -2267,7 +2268,7 @@ async def test_resume_refuses_cancelled_tombstone(tmp_path) -> None:
         engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
         try:
             await engine.start()
-            iso = datetime.utcnow().isoformat()
+            iso = utc_now_naive().isoformat()
             task = await engine.create(
                 "resume-tomb", "p", ScheduleConfig(iso_time=iso),
                 principal_id="test",
@@ -2352,7 +2353,7 @@ async def test_resume_refuses_running_task() -> None:
     engine._executor = stalling_executor
     engine._tick_interval = 0.01
     await engine.start()
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("resume-running", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
     await asyncio.wait_for(started.wait(), timeout=2.0)
@@ -2399,7 +2400,7 @@ async def test_resume_refuses_terminal_states() -> None:
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     engine = _engine()
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("resume-terminal", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
 
@@ -2441,7 +2442,7 @@ async def test_pause_refuses_cancelled_tombstone() -> None:
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     engine = _engine()
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("pause-cancelled", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
 
@@ -2480,7 +2481,7 @@ async def test_pause_refuses_terminal_states() -> None:
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     engine = _engine()
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("pause-terminal", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
 
@@ -2566,7 +2567,7 @@ async def test_cancelled_tombstone_cannot_be_resurrected_via_pause_resume(
         engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
         try:
             await engine.start()
-            iso = datetime.utcnow().isoformat()
+            iso = utc_now_naive().isoformat()
             task = await engine.create(
                 "resurrect", "p", ScheduleConfig(iso_time=iso),
                 principal_id="test",
@@ -2677,7 +2678,7 @@ async def test_resume_paused_with_live_executor_returns_execution_pending(
         engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
         try:
             await engine.start()
-            iso = datetime.utcnow().isoformat()
+            iso = utc_now_naive().isoformat()
             task = await engine.create(
                 "resume-exec-pending", "p", ScheduleConfig(iso_time=iso),
                 principal_id="test",
@@ -2768,7 +2769,7 @@ async def test_remove_refuses_terminal_states() -> None:
     from khaos.scheduler.models import ScheduleConfig, TaskStatus
 
     engine = _engine()
-    iso = datetime.utcnow().isoformat()
+    iso = utc_now_naive().isoformat()
     task = await engine.create("remove-terminal", "p", ScheduleConfig(iso_time=iso), principal_id="test")
     task_id = task.id
 
@@ -2859,7 +2860,7 @@ async def test_pause_retry_with_live_executor_returns_cancellation_pending(
         engine_module._CANCEL_IN_FLIGHT_TIMEOUT = 0.3
         try:
             await engine.start()
-            iso = datetime.utcnow().isoformat()
+            iso = utc_now_naive().isoformat()
             task = await engine.create(
                 "pause-retry-live", "p", ScheduleConfig(iso_time=iso),
                 principal_id="test",
@@ -2980,7 +2981,7 @@ async def test_pause_retry_with_db_failure_returns_persistence_pending(
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create(
             "pause-retry-persist", "p", ScheduleConfig(iso_time=iso),
             principal_id="test",
@@ -3090,7 +3091,7 @@ async def test_resume_db_failure_keeps_task_paused(tmp_path) -> None:
             tick_interval=0.01,
         )
         await engine.start()
-        iso = datetime.utcnow().isoformat()
+        iso = utc_now_naive().isoformat()
         task = await engine.create("resume-fail", "p", ScheduleConfig(iso_time=iso), principal_id="test")
         task_id = task.id
 
@@ -3262,7 +3263,7 @@ async def test_stale_executor_conditional_update_does_not_overwrite_paused(
         # Force the task to be immediately eligible for tick (the
         # interval schedule sets next_run = now + 60s, which would
         # make the test wait 60s for the first fire).
-        engine._tasks[task_id].next_run = datetime.utcnow()
+        engine._tasks[task_id].next_run = utc_now_naive()
         await asyncio.wait_for(started.wait(), timeout=2.0)
 
         # Capture the lifecycle_version at executor start (for
@@ -3414,7 +3415,7 @@ async def test_recurring_task_consecutive_executions_both_persist(tmp_path) -> N
         task_id = task.id
 
         # Force the first execution.
-        engine._tasks[task_id].next_run = datetime.utcnow()
+        engine._tasks[task_id].next_run = utc_now_naive()
         await asyncio.sleep(0.3)
 
         # Verify the first execution persisted.
@@ -3425,7 +3426,7 @@ async def test_recurring_task_consecutive_executions_both_persist(tmp_path) -> N
         )
 
         # Force the second execution.
-        engine._tasks[task_id].next_run = datetime.utcnow()
+        engine._tasks[task_id].next_run = utc_now_naive()
         await asyncio.sleep(0.3)
 
         # Verify the second execution persisted — this is the key
@@ -3484,7 +3485,7 @@ async def test_executor_persists_after_engine_restart(tmp_path) -> None:
         task_id = task.id
 
         # First execution.
-        engine._tasks[task_id].next_run = datetime.utcnow()
+        engine._tasks[task_id].next_run = utc_now_naive()
         await asyncio.sleep(0.3)
         rows = await db.list_scheduled_tasks()
         row = next(r for r in rows if r["id"] == task_id)
@@ -3527,7 +3528,7 @@ async def test_executor_persists_after_engine_restart(tmp_path) -> None:
 
         # Force a second execution — the conditional UPDATE MUST
         # succeed (rowcount 1), not be discarded as a version mismatch.
-        engine2._tasks[task_id].next_run = datetime.utcnow()
+        engine2._tasks[task_id].next_run = utc_now_naive()
         await asyncio.sleep(0.3)
 
         rows = await db2.list_scheduled_tasks()
@@ -3576,7 +3577,7 @@ async def test_pause_resume_after_execution_keeps_versions_aligned(tmp_path) -> 
         task_id = task.id
 
         # First execution.
-        engine._tasks[task_id].next_run = datetime.utcnow()
+        engine._tasks[task_id].next_run = utc_now_naive()
         await asyncio.sleep(0.3)
 
         # After execution, memory and DB versions MUST both be 0
@@ -3602,7 +3603,7 @@ async def test_pause_resume_after_execution_keeps_versions_aligned(tmp_path) -> 
 
         # Force a second execution — the conditional UPDATE MUST
         # succeed (expected_version=2 matches DB version=2).
-        engine._tasks[task_id].next_run = datetime.utcnow()
+        engine._tasks[task_id].next_run = utc_now_naive()
         await asyncio.sleep(0.3)
 
         rows = await db.list_scheduled_tasks()

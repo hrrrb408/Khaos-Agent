@@ -670,9 +670,10 @@ class BrowserManager:
                     return
                 domain = parsed.hostname or ""
                 if domain:
-                    # Use the guard's domain check (handles blocked /
-                    # allowed / network_enabled priority).
-                    result = guard._check_domain(domain)
+                    # Resolve every browser request before Chromium handles
+                    # it.  This extends the domain policy to A/AAAA targets
+                    # and rejects localhost/private/metadata rebinding.
+                    result = await guard.check_resolved_url(url)
                     if not result.allowed:
                         await route.abort("blockedbyclient")
                         logger.info(
@@ -735,7 +736,7 @@ class BrowserManager:
                 parsed = urlparse(url)
                 domain = parsed.hostname or ""
                 if domain:
-                    result = guard._check_domain(domain)
+                    result = await guard.check_resolved_url(url)
                     if not result.allowed:
                         await ws_route.close(code=1008, reason="blocked by guard")
                         logger.info(

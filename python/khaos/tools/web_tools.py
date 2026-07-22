@@ -4,15 +4,14 @@ Architecture:
 - Pure-stdlib HTML processing (regex-based — no BeautifulSoup/lxml dependency),
   tuned for the Agent use case: fast, zero-dependency, content-first extraction
   that strips ads/navigation/scripts rather than producing pixel-perfect output.
-- HTTP fetching prefers ``httpx`` (async); falls back to ``urllib.request``
-  wrapped in ``asyncio.to_thread`` when httpx is unavailable.
+- HTTP fetching requires ``httpx``/``httpcore`` so DNS can be validated and
+  pinned.  Missing secure transport support fails closed.
 - Public tool functions return ``dict[str, Any]`` (the scheduler JSON-encodes
   them into a ``ToolResult``), matching the contract of every other tool module.
 """
 
 from __future__ import annotations
 
-import asyncio
 import ipaddress
 import logging
 import re
@@ -20,15 +19,25 @@ from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urljoin, urlparse
 
+from khaos.security.host_network import (
+    HostNetworkAuthority,
+    HostNetworkDeniedError,
+    ValidatedTarget,
+)
+
 logger = logging.getLogger(__name__)
 _SECURITY_ENABLED = True
+_HOST_NETWORK_AUTHORITY = HostNetworkAuthority()
+_MAX_REDIRECTS = 5
 
 # httpx is optional at runtime (urllib fallback keeps zero-dependency envs working).
 try:  # pragma: no cover - import success depends on the environment
+    import httpcore
     import httpx
 
     _HAS_HTTPX = True
 except ImportError:  # pragma: no cover
+    httpcore = None  # type: ignore[assignment]
     httpx = None  # type: ignore[assignment]
     _HAS_HTTPX = False
 
@@ -441,23 +450,104 @@ async def _fetch_html(url: str, timeout: int) -> tuple[str, str]:
     httpx 优先；不可用时回退到 urllib（同步，包在 to_thread 里）。
     content-type 非 HTML 时抛出 ValueError。
     """
-    if _HAS_HTTPX:
-        return await _fetch_html_httpx(url, timeout)
-    return await _fetch_html_urllib(url, timeout)
+    if not _HAS_HTTPX:
+        raise ConnectionError(
+            "secure host fetching requires httpx/httpcore; refusing insecure fallback"
+        )
+    return await _fetch_html_httpx(url, timeout)
+
+
+class _PinnedNetworkBackend:
+    """httpcore backend that connects to an authority-approved DNS snapshot."""
+
+    def __init__(self, target: ValidatedTarget) -> None:
+        self._hostname = target.hostname
+        self._addresses = target.addresses
+        self._backend = httpcore.AnyIOBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options=None,
+    ):
+        normalized = host.decode("ascii") if isinstance(host, bytes) else host
+        if normalized.lower().rstrip(".") != self._hostname:
+            raise HostNetworkDeniedError("transport attempted an unvalidated hostname")
+        last_error: Exception | None = None
+        for address in self._addresses:
+            try:
+                return await self._backend.connect_tcp(
+                    address,
+                    port,
+                    timeout=timeout,
+                    local_address=local_address,
+                    socket_options=socket_options,
+                )
+            except Exception as exc:  # network backend errors vary by runtime
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise HostNetworkDeniedError("validated target has no pinned addresses")
+
+    async def connect_unix_socket(self, path: str, timeout=None, socket_options=None):
+        raise HostNetworkDeniedError("Unix sockets are prohibited for host web tools")
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
+def _pinned_transport(target: ValidatedTarget):
+    transport = httpx.AsyncHTTPTransport(trust_env=False, retries=0)
+    # HTTPX does not expose a public resolver hook.  Its supported transport
+    # is backed by httpcore, whose network backend is explicitly pluggable.
+    # Replacing it before the first request pins connect_tcp while preserving
+    # the original hostname for HTTP Host and TLS SNI/certificate validation.
+    transport._pool._network_backend = _PinnedNetworkBackend(target)
+    return transport
+
+
+async def _request_httpx(method: str, url: str, timeout: int):
+    current = url
+    previous_scheme: str | None = None
+    for hop in range(_MAX_REDIRECTS + 1):
+        target = await _HOST_NETWORK_AUTHORITY.validate_url(
+            current, previous_scheme=previous_scheme
+        )
+        try:
+            async with httpx.AsyncClient(
+                transport=_pinned_transport(target),
+                follow_redirects=False,
+                trust_env=False,
+                timeout=httpx.Timeout(timeout),
+                headers={"User-Agent": "KhaosWebFetcher/1.0"},
+            ) as client:
+                response = await client.request(method, current)
+        except httpx.TimeoutException as exc:
+            raise TimeoutError(f"Timeout after {timeout}s") from exc
+        except httpx.HTTPError as exc:
+            raise ConnectionError(str(exc)) from exc
+        if response.status_code not in {301, 302, 303, 307, 308}:
+            return response
+        location = response.headers.get("location")
+        if not location:
+            raise ConnectionError("redirect response omitted Location")
+        if hop >= _MAX_REDIRECTS:
+            raise ConnectionError(f"too many redirects (maximum {_MAX_REDIRECTS})")
+        previous_scheme = target.parsed.scheme.lower()
+        current = urljoin(current, location)
+        if response.status_code == 303 and method != "HEAD":
+            method = "GET"
+    raise ConnectionError("redirect processing failed")
 
 
 async def _fetch_html_httpx(url: str, timeout: int) -> tuple[str, str]:
     try:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=httpx.Timeout(timeout),
-            headers={"User-Agent": "KhaosWebFetcher/1.0"},
-        ) as client:
-            response = await client.get(url)
-    except httpx.TimeoutException as exc:
-        raise TimeoutError(f"Timeout after {timeout}s") from exc
-    except httpx.HTTPError as exc:
-        raise ConnectionError(str(exc)) from exc
+        response = await _request_httpx("GET", url, timeout)
+    except HostNetworkDeniedError:
+        raise
 
     if response.status_code >= 400:
         raise _HTTPError(response.status_code)
@@ -471,34 +561,9 @@ async def _fetch_html_httpx(url: str, timeout: int) -> tuple[str, str]:
 
 
 async def _fetch_html_urllib(url: str, timeout: int) -> tuple[str, str]:
-    import urllib.request
-
-    def _sync() -> tuple[str, str]:
-        req = urllib.request.Request(url, headers={"User-Agent": "KhaosWebFetcher/1.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — Agent tool
-                content_type = resp.headers.get("Content-Type", "").split(";")[0].strip().lower()
-                if content_type and "html" not in content_type:
-                    raise ValueError(f"Content type not HTML: {content_type}")
-                # 处理 gzip/deflate（urllib 不自动解压）。
-                raw = resp.read()
-                charset = "utf-8"
-                # 解析 charset。
-                full_ct = resp.headers.get("Content-Type", "")
-                if "charset=" in full_ct.lower():
-                    charset = full_ct.lower().split("charset=")[-1].split(";")[0].strip() or "utf-8"
-                try:
-                    return raw.decode(charset, errors="replace"), content_type
-                except (LookupError, UnicodeDecodeError):
-                    return raw.decode("utf-8", errors="replace"), content_type
-        except urllib.error.HTTPError as exc:
-            raise _HTTPError(exc.code, str(exc)) from exc
-        except urllib.error.URLError as exc:
-            if "timed out" in str(exc).lower():
-                raise TimeoutError(f"Timeout after {timeout}s") from exc
-            raise ConnectionError(str(exc)) from exc
-
-    return await asyncio.to_thread(_sync)
+    raise ConnectionError(
+        "urllib fallback is disabled because it cannot pin validated DNS safely"
+    )
 
 
 async def _fetch_head(url: str, timeout: int) -> tuple[dict[str, str], str]:
@@ -509,32 +574,18 @@ async def _fetch_head(url: str, timeout: int) -> tuple[dict[str, str], str]:
     body_limit = 100 * 1024
     if _HAS_HTTPX:
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=httpx.Timeout(timeout),
-                headers={"User-Agent": "KhaosWebFetcher/1.0"},
-            ) as client:
-                head_resp = await client.head(url)
-                # 很多服务器对 HEAD 不返回 body，改用 GET 但只读前 100KB。
-                get_resp = await client.get(url)
-                content = get_resp.text[:body_limit]
-                headers = {k: v for k, v in get_resp.headers.items()}
-                return headers, content
-        except httpx.TimeoutException as exc:
-            raise TimeoutError(f"Timeout after {timeout}s") from exc
-        except httpx.HTTPError as exc:
-            raise ConnectionError(str(exc)) from exc
-    # urllib 回退。
-    import urllib.request
-
-    def _sync() -> tuple[dict[str, str], str]:
-        req = urllib.request.Request(url, headers={"User-Agent": "KhaosWebFetcher/1.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 — Agent tool
-            raw = resp.read(body_limit)
-            headers = {k: v for k, v in resp.headers.items()}
-            return headers, raw.decode("utf-8", errors="replace")
-
-    return await asyncio.to_thread(_sync)
+            # Keep HEAD for status/protocol coverage, then use a separately
+            # validated and pinned GET for the body prefix.
+            await _request_httpx("HEAD", url, timeout)
+            get_resp = await _request_httpx("GET", url, timeout)
+            if get_resp.status_code >= 400:
+                raise _HTTPError(get_resp.status_code)
+            return dict(get_resp.headers), get_resp.text[:body_limit]
+        except HostNetworkDeniedError:
+            raise
+    raise ConnectionError(
+        "secure host fetching requires httpx/httpcore; refusing insecure fallback"
+    )
 
 
 # ─── 工具函数 ───

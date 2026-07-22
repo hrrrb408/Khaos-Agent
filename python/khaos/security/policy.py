@@ -93,16 +93,9 @@ class SandboxPolicy:
     audit_enabled: bool = True
     audit_log_path: str | None = None
 
-    # M4 batch 3.1.16A-4-4-3: channel admin principals — the set of
-    # principals allowed to mutate (enable / disable) registered
-    # communication channels via the channel tools.  ``None`` means
-    # "this layer does not configure an admin list" (the effective
-    # policy compiler uses OR semantics across layers — user ∪ project);
-    # an empty list means "this layer explicitly denies all admins"
-    # (still contributes nothing to the union, but is distinct from
-    # "unset" for digest / audit purposes).  Default ``None`` so the
-    # *effective* policy defaults to an empty frozenset — fail-closed
-    # for channel mutations until an admin is explicitly declared.
+    # Host-side channel administrator grant.  The effective compiler accepts
+    # values only from the trusted user layer and rejects non-empty project
+    # declarations.
     channel_admins: list[str] | None = None
 
     @classmethod

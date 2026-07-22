@@ -2687,7 +2687,7 @@ def test_real_docker_worker_crash_e2e(tmp_path):
         await backend.probe()
         command = _docker_command("long_runner.py", timeout=300_000)
         # Launch the container (create + start + attach).
-        container_id, attestation, _, _, _ = await backend.launch_instance(
+        container_id, attestation, attach_proc, _, _ = await backend.launch_instance(
             instance_name=backend.generate_instance_name(),
             image_digest=_profile().image_digest,
             command=command, workspace_root=disposable.root,
@@ -2699,6 +2699,14 @@ def test_real_docker_worker_crash_e2e(tmp_path):
             expected_manifest_digest=disposable.manifest_digest,
         )
         # Confirm container is running.
+        info = await backend.inspect_instance(container_id)
+        assert info is not None
+        # Simulate the worker process dying: its local docker-attach child and
+        # pipes disappear, while Docker keeps the container itself running for
+        # the next boot to reconcile. Leaving the child attached to a loop
+        # that asyncio.run is about to close leaks transports on Python 3.13.
+        attach_proc.kill()
+        await attach_proc.communicate()
         info = await backend.inspect_instance(container_id)
         assert info is not None
         return container_id, attestation
@@ -2805,15 +2813,27 @@ def _start_long_running_container(backend, *, command, workspace_root, labels):
     Returns ``(container_id, instance_name)``.
     """
     instance_name = backend.generate_instance_name()
-    container_id, _attestation, _, _, _ = asyncio.run(
-        backend.launch_instance(
+    async def _launch_detached():
+        # Reconciliation tests need a durable running container, not an
+        # attached output stream. Using launch_instance here discarded its
+        # live ``docker start --attach`` process when asyncio.run closed the
+        # loop, leaking transports and subprocesses under Python 3.13.
+        container_id = await backend.create_instance(
             instance_name=instance_name,
             image_digest=_profile().image_digest,
             command=command, workspace_root=workspace_root,
             labels=labels,
+        )
+        await backend.inspect_and_attest_instance(
+            container_id_or_name=container_id,
+            expected_labels=labels,
+            expected_image_digest=_profile().image_digest,
             expected_manifest_digest=labels["khaos.manifest-digest"],
         )
-    )
+        await backend.start_instance(container_id)
+        return container_id
+
+    container_id = asyncio.run(_launch_detached())
     return container_id, instance_name
 
 
