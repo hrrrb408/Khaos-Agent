@@ -68,6 +68,19 @@ jobs:
           test -w /sys/fs/cgroup/khaos
           test -w /sys/fs/cgroup/khaos/cgroup.procs
           test -w /sys/fs/cgroup/khaos/cgroup.subtree_control
+      - name: Prepare block-backed sandbox workspace
+        run: |
+          # GitHub-hosted runners may place /tmp on an overlay/pseudo device.
+          # cgroup v2 io.max correctly rejects such a device with ENODEV.
+          # Use a real loop-backed ext4 mount so the security job proves the
+          # I/O controller instead of weakening production to skip io.max.
+          sudo truncate -s 2G /var/tmp/khaos-sandbox-workspace.img
+          sudo mkfs.ext4 -F -q /var/tmp/khaos-sandbox-workspace.img
+          sudo mkdir -p /mnt/khaos-sandbox-workspace
+          sudo mount -o loop,noatime /var/tmp/khaos-sandbox-workspace.img /mnt/khaos-sandbox-workspace
+          sudo chown "$(id -u):$(id -g)" /mnt/khaos-sandbox-workspace
+          test -w /mnt/khaos-sandbox-workspace
+          echo "TMPDIR=/mnt/khaos-sandbox-workspace" >> "$GITHUB_ENV"
       - name: Capture pre-test diagnostics
         run: |
           set +e
@@ -110,6 +123,11 @@ jobs:
             echo "=== done ==="
           } > diagnostics/linux-bwrap-post.txt
           exit 0
+      - name: Remove block-backed sandbox workspace
+        if: always()
+        run: |
+          sudo umount /mnt/khaos-sandbox-workspace || true
+          sudo rm -f /var/tmp/khaos-sandbox-workspace.img
       - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
