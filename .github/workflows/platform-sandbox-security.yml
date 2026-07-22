@@ -56,7 +56,18 @@ jobs:
             fi
           done
           sudo mkdir -p /sys/fs/cgroup/khaos
-          sudo chown "$(id -u):$(id -g)" /sys/fs/cgroup/khaos
+          # A cgroup v2 controller must be enabled at every non-leaf level.
+          # Chown the pseudo-files as well as the directory so the unprivileged
+          # test process can create and configure per-execution children.
+          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/khaos
+          for controller in cpu memory pids io; do
+            if grep -qw "$controller" /sys/fs/cgroup/khaos/cgroup.controllers; then
+              echo "+$controller" > /sys/fs/cgroup/khaos/cgroup.subtree_control
+            fi
+          done
+          test -w /sys/fs/cgroup/khaos
+          test -w /sys/fs/cgroup/khaos/cgroup.procs
+          test -w /sys/fs/cgroup/khaos/cgroup.subtree_control
       - name: Capture pre-test diagnostics
         run: |
           set +e
