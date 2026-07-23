@@ -1567,7 +1567,13 @@ class MemoryService:
         self.db = db
 
     def _store(self, ctx: RequestContext) -> MemoryStore:
-        return MemoryStore(self.db, principal_id=ctx.principal_id)
+        # F-02: forward ctx.project_id so memories are isolated by
+        # project on shared state DBs, not just by principal.
+        return MemoryStore(
+            self.db,
+            principal_id=ctx.principal_id,
+            project_id=ctx.project_id,
+        )
 
     async def get_memory(self, ctx: RequestContext, scope: str, key: str) -> dict:
         store = self._store(ctx)
@@ -1604,8 +1610,13 @@ class MemoryService:
         # principal could delete any other principal's memory by id.
         # Now the DELETE is scoped to ``ctx.principal_id`` (or
         # project-shared rows with ``principal_id=''``).
+        # F-02: also scope by ``ctx.project_id`` so a caller from
+        # project B cannot delete project A's memory by id on a
+        # shared state DB.
         await self.db.delete_memory_by_id(
-            memory_id, principal_id=ctx.principal_id,
+            memory_id,
+            principal_id=ctx.principal_id,
+            project_id=ctx.project_id,
         )
         return {"ok": True}
 
