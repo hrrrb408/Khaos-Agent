@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from urllib.parse import urlsplit
 
 from khaos.security.browser_egress_proxy import BrowserEgressProxy
 from khaos.security.host_network import ValidatedTarget
+
+
+def _proxy_auth_header(proxy: BrowserEgressProxy) -> str:
+    """C-07: build the ``Proxy-Authorization`` header for a proxy instance."""
+    credentials = f"{proxy.proxy_username}:{proxy.proxy_password}"
+    encoded = base64.b64encode(credentials.encode("ascii")).decode("ascii")
+    return f"Proxy-Authorization: Basic {encoded}\r\n"
 
 
 class _PinnedGuard:
@@ -43,7 +51,8 @@ async def test_http_proxy_uses_authorized_ip_not_browser_dns():
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
         writer.write(
             f"GET http://browser.attacker.invalid:{port}/ HTTP/1.1\r\n"
-            f"Host: browser.attacker.invalid:{port}\r\n\r\n".encode("ascii")
+            f"Host: browser.attacker.invalid:{port}\r\n"
+            f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
         )
         await writer.drain()
         response = await reader.read()
@@ -72,9 +81,8 @@ async def test_connect_tunnel_is_authorized_and_dns_pinned():
         proxy_port = int(urlsplit(proxy.server_url).port or 0)
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
         writer.write(
-            f"CONNECT websocket.attacker.invalid:{port} HTTP/1.1\r\n\r\n".encode(
-                "ascii"
-            )
+            f"CONNECT websocket.attacker.invalid:{port} HTTP/1.1\r\n"
+            f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
         )
         await writer.drain()
         assert await reader.readuntil(b"\r\n\r\n") == (

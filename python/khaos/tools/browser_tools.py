@@ -268,8 +268,22 @@ class BrowserManager:
                 self._browser_sandbox = BrowserNetworkSandbox()
                 self._browser_sandbox.setup()
             if browser_type == "firefox":
+                # C-09: Firefox does not use the netns wrapper.  Log the
+                # reduced enforcement level so operators know the OS
+                # sandbox is not applied to this browser type.
+                if self._browser_sandbox.is_active:
+                    logger.warning(
+                        "browser sandbox: Firefox launched WITHOUT netns "
+                        "wrapper — only proxy-level enforcement applies"
+                    )
                 browser = await pw.firefox.launch(headless=headless)
             elif browser_type == "webkit":
+                # C-09: WebKit does not use the netns wrapper.
+                if self._browser_sandbox.is_active:
+                    logger.warning(
+                        "browser sandbox: WebKit launched WITHOUT netns "
+                        "wrapper — only proxy-level enforcement applies"
+                    )
                 browser = await pw.webkit.launch(headless=headless)
             else:
                 # F-05: if the netns sandbox is active, wrap the Chromium
@@ -314,7 +328,22 @@ class BrowserManager:
                 browser = await pw.chromium.launch(**launch_kwargs)
             self._browser = browser
             logger.info("Browser launched: %s (headless=%s)", browser_type, headless)
-            return {"ok": True, "browser_type": browser_type, "headless": headless}
+            # C-09: include structured enforcement status in the result
+            # so callers can verify which layers are active and refuse to
+            # proceed when a required layer is missing.
+            status = self._browser_sandbox.enforcement_status
+            return {
+                "ok": True,
+                "browser_type": browser_type,
+                "headless": headless,
+                "enforcement": {
+                    "network_namespace": status.network_namespace,
+                    "proxy_required": status.proxy_required,
+                    "cgroup": status.cgroup,
+                    "route_guard": status.route_guard,
+                    "service_workers_blocked": status.service_workers_blocked,
+                },
+            }
         except Exception as exc:  # noqa: BLE001 — surfaced as error dict
             logger.error("Failed to launch browser: %s", exc)
             return {"ok": False, "error": str(exc)}
@@ -640,16 +669,33 @@ class BrowserManager:
         egress_proxy = BrowserEgressProxy(network_guard, bind_host=proxy_bind_host)
         try:
             await egress_proxy.start()
+            # C-06: install nftables egress pin so the browser veth can
+            # reach ONLY the exact proxy IP:port.  Must be called AFTER
+            # the proxy has started (dynamic port).  When the sandbox is
+            # not active (non-Linux / dev mode), this is a no-op.
+            if (
+                self._browser_sandbox is not None
+                and self._browser_sandbox.is_active
+            ):
+                proxy_port = int(
+                    egress_proxy.server_url.rsplit(":", 1)[1]
+                )
+                self._browser_sandbox.install_egress_pin(proxy_port)
             # F-05: when the netns sandbox is active, the browser reaches
             # the proxy via the veth host IP.  The ``bypass`` list must
             # NOT include ``<-loopback>`` in that case because the proxy
             # is not on loopback — it's on the veth interface.
             bypass = "" if proxy_bind_host != "127.0.0.1" else "<-loopback>"
+            # C-07: pass per-proxy credentials so only the intended
+            # browser context can relay traffic.  Without this, any host
+            # process that can reach the bind address could use the proxy.
             context = await self._browser.new_context(
                 viewport={"width": 1280, "height": 720},
                 user_agent="KhaosBrowser/1.0",
                 proxy={
                     "server": egress_proxy.server_url,
+                    "username": egress_proxy.proxy_username,
+                    "password": egress_proxy.proxy_password,
                     "bypass": bypass,
                 },
                 # Service workers would add another request authority.

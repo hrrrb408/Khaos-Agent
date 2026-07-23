@@ -12,6 +12,7 @@ Covers:
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import sys
 from urllib.parse import urlsplit
@@ -35,6 +36,13 @@ from khaos.security.host_network import ValidatedTarget
 # ---------------------------------------------------------------------------
 # Test helpers (reused from test_browser_egress_proxy.py pattern)
 # ---------------------------------------------------------------------------
+
+
+def _proxy_auth_header(proxy: BrowserEgressProxy) -> str:
+    """C-07: build the ``Proxy-Authorization`` header for a proxy instance."""
+    credentials = f"{proxy.proxy_username}:{proxy.proxy_password}"
+    encoded = base64.b64encode(credentials.encode("ascii")).decode("ascii")
+    return f"Proxy-Authorization: Basic {encoded}\r\n"
 
 
 class _PinnedGuard:
@@ -93,7 +101,8 @@ async def test_f05_upload_byte_limit_aborts_oversized_upload():
         writer.write(
             f"POST http://upload.example.invalid:{port}/ HTTP/1.1\r\n"
             f"Host: upload.example.invalid:{port}\r\n"
-            f"Content-Length: 100000\r\n\r\n".encode("ascii")
+            f"Content-Length: 100000\r\n"
+            f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
         )
         await writer.drain()
         # Send more than 1024 bytes of body
@@ -137,7 +146,8 @@ async def test_f05_download_byte_limit_aborts_oversized_download():
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
         writer.write(
             f"GET http://download.example.invalid:{port}/ HTTP/1.1\r\n"
-            f"Host: download.example.invalid:{port}\r\n\r\n".encode("ascii")
+            f"Host: download.example.invalid:{port}\r\n"
+            f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
         )
         await writer.drain()
         response = await reader.read()
@@ -181,7 +191,8 @@ async def test_f05_connection_quota_rejects_excess():
             r, w = await asyncio.open_connection("127.0.0.1", proxy_port)
             w.write(
                 f"GET http://conn{i}.example.invalid:{port}/ HTTP/1.1\r\n"
-                f"Host: conn{i}.example.invalid:{port}\r\n\r\n".encode("ascii")
+                f"Host: conn{i}.example.invalid:{port}\r\n"
+                f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
             )
             await w.drain()
             conns.append((r, w))
@@ -190,7 +201,8 @@ async def test_f05_connection_quota_rejects_excess():
         r3, w3 = await asyncio.open_connection("127.0.0.1", proxy_port)
         w3.write(
             f"GET http://conn3.example.invalid:{port}/ HTTP/1.1\r\n"
-            f"Host: conn3.example.invalid:{port}\r\n\r\n".encode("ascii")
+            f"Host: conn3.example.invalid:{port}\r\n"
+            f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
         )
         await w3.drain()
         response = await r3.read()
@@ -235,7 +247,8 @@ async def test_f05_idle_timeout_closes_idle_connection():
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
         writer.write(
             f"GET http://idle.example.invalid:{port}/ HTTP/1.1\r\n"
-            f"Host: idle.example.invalid:{port}\r\n\r\n".encode("ascii")
+            f"Host: idle.example.invalid:{port}\r\n"
+            f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
         )
         await writer.drain()
         # The connection should be closed within ~2 seconds (idle timeout + margin)
@@ -282,7 +295,8 @@ async def test_f05_audit_logging_authorize_and_close(caplog):
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
         writer.write(
             f"GET http://audit.example.invalid:{port}/ HTTP/1.1\r\n"
-            f"Host: audit.example.invalid:{port}\r\n\r\n".encode("ascii")
+            f"Host: audit.example.invalid:{port}\r\n"
+            f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
         )
         await writer.drain()
         await reader.read()
@@ -315,7 +329,9 @@ async def test_f05_audit_logging_rejects_unauthorized(caplog):
         reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
         writer.write(
             b"GET http://blocked.example.invalid/ HTTP/1.1\r\n"
-            b"Host: blocked.example.invalid\r\n\r\n"
+            b"Host: blocked.example.invalid\r\n"
+            + _proxy_auth_header(proxy).encode("ascii")
+            + b"\r\n"
         )
         await writer.drain()
         response = await reader.read()
