@@ -651,23 +651,24 @@ async def test_acceptance_15_subagent_service_spawn_uses_ctx_project_id(tmp_path
 # ─────────── coding_tasks RE-STAMPING ON CONFLICT (inverse) ────────────
 
 
-async def test_acceptance_16_coding_tasks_re_stamps_project_id_on_conflict(tmp_path):
-    """A5-1b #16: ``coding_tasks`` DOES re-stamp project_id on conflict.
+async def test_acceptance_16_coding_tasks_update_rejects_foreign_project(tmp_path):
+    """A5-1b #16 (Round-4 Batch 4): ``update_coding_task`` is Owner-bound.
 
-    Unlike ``sessions`` / ``messages`` / ``memories`` / ``audit_log`` /
-    ``session_bookmarks`` (owner-preserving — ``ON CONFLICT`` does NOT
-    touch ``project_id``), ``coding_tasks`` DOES update both
-    ``principal_id`` and ``project_id`` on conflict.  Rationale: a
-    coding task's lifecycle is tied to the runtime that owns it, so a
-    re-attach by the same principal under a different project context
-    (e.g. after a ``project_root`` move) is a legitimate lifecycle
-    event that re-binds ownership.
+    Round-4 review replaced ``upsert_coding_task`` (which re-stamped
+    ``project_id`` on conflict) with ``insert_coding_task`` (Plain
+    INSERT) + ``update_coding_task`` (Owner-bound UPDATE with
+    ``WHERE id=? AND principal_id=? AND project_id=?``).  Ownership is
+    now immutable after creation — a foreign project's UPDATE raises
+    ``OwnerMismatchError`` instead of silently re-stamping.
 
-    This test verifies the inverse policy:
-      1. ``upsert_coding_task`` with ``project_id=A`` → row stamped A.
-      2. ``upsert_coding_task`` (same task id) with ``project_id=B``
-         → row RE-STAMPED to B (not owner-preserving).
+    This test verifies:
+      1. ``insert_coding_task`` with ``project_id=A`` → row stamped A.
+      2. ``update_coding_task`` (same id) with ``project_id=B``
+         → raises ``OwnerMismatchError`` (NOT re-stamped).
+      3. The original row's ``project_id`` is still A.
     """
+    from khaos.db.database import OwnerMismatchError
+
     db = await _make_db(tmp_path / "khaos.db")
     try:
         task_dict = {
@@ -677,43 +678,76 @@ async def test_acceptance_16_coding_tasks_re_stamps_project_id_on_conflict(tmp_p
             "created_at": "2026-07-21T00:00:00Z",
             "updated_at": "2026-07-21T00:00:00Z",
         }
-        # First upsert: stamps PROJECT_ID_A.
-        await db.upsert_coding_task(
+        # INSERT: stamps PROJECT_ID_A.
+        await db.insert_coding_task(
             task_dict, principal_id="u1", project_id=PROJECT_ID_A,
         )
         stamped_a = await _fetch_project_id(db, "coding_tasks", "id='task-rebind-1'")
         assert stamped_a == PROJECT_ID_A
 
-        # Second upsert (same id): RE-STAMPS to PROJECT_ID_B.
-        # The task dict must carry an updated timestamp so the ON
-        # CONFLICT clause's ``updated_at=excluded.updated_at`` is
-        # observable, but the project_id re-stamp happens regardless.
+        # UPDATE with a foreign project_id → OwnerMismatchError.
         task_dict["updated_at"] = "2026-07-21T01:00:00Z"
-        await db.upsert_coding_task(
-            task_dict, principal_id="u1", project_id=PROJECT_ID_B,
-        )
-        stamped_b = await _fetch_project_id(db, "coding_tasks", "id='task-rebind-1'")
-        assert stamped_b == PROJECT_ID_B, (
-            "coding_tasks ON CONFLICT must re-stamp project_id "
-            "(unlike sessions/messages/memories which are owner-preserving)"
+        with pytest.raises(OwnerMismatchError):
+            await db.update_coding_task(
+                task_dict, principal_id="u1", project_id=PROJECT_ID_B,
+            )
+        # The original row is untouched.
+        stamped_still_a = await _fetch_project_id(db, "coding_tasks", "id='task-rebind-1'")
+        assert stamped_still_a == PROJECT_ID_A, (
+            "foreign-project UPDATE must not re-stamp project_id"
         )
     finally:
         await db.close()
 
 
-async def test_acceptance_17_coding_tasks_re_stamps_via_task_manager(tmp_path):
-    """A5-1b #17: TaskManager re-persist re-stamps project_id (lifecycle).
+async def test_acceptance_17_coding_tasks_update_same_owner_succeeds(tmp_path):
+    """A5-1b #17 (Round-4 Batch 4): same-owner UPDATE succeeds.
+
+    When the same (principal_id, project_id) calls ``update_coding_task``,
+    the Owner-Match predicate matches and the row is updated normally.
+    """
+    from khaos.db.database import OwnerMismatchError
+
+    db = await _make_db(tmp_path / "khaos.db")
+    try:
+        task_dict = {
+            "id": "task-update-1",
+            "goal": "build feature",
+            "status": "in_progress",
+            "created_at": "2026-07-21T00:00:00Z",
+            "updated_at": "2026-07-21T00:00:00Z",
+        }
+        await db.insert_coding_task(
+            task_dict, principal_id="u1", project_id=PROJECT_ID_A,
+        )
+        # Same owner UPDATE — succeeds.
+        task_dict["goal"] = "updated goal"
+        task_dict["status"] = "completed"
+        task_dict["updated_at"] = "2026-07-21T01:00:00Z"
+        await db.update_coding_task(
+            task_dict, principal_id="u1", project_id=PROJECT_ID_A,
+        )
+        # Verify the update took effect.
+        rows = await db.list_coding_tasks(principal_id="u1", project_id=PROJECT_ID_A)
+        assert len(rows) == 1
+        assert rows[0]["goal"] == "updated goal"
+        assert rows[0]["status"] == "completed"
+    finally:
+        await db.close()
+
+
+async def test_acceptance_17b_coding_task_manager_rejects_foreign_rebind(tmp_path):
+    """A5-1b #17b (Round-4 Batch 4): TaskManager re-persist by foreign
+    project raises ``OwnerMismatchError``.
 
     Integration-level check: when a task created under manager_a
     (``project_id=A``) is later persisted through manager_b
-    (``project_id=B``), the DB row's ``project_id`` is re-stamped to
-    B.  This mirrors the real-world scenario where a task is resumed
-    under a different project context after a ``project_root`` move.
-
-    The re-stamp happens because ``TaskManager._persist`` always passes
-    ``self._project_id`` to ``upsert_coding_task``, and the DB method's
-    ``ON CONFLICT`` clause updates ``project_id=excluded.project_id``.
+    (``project_id=B``), the UPDATE raises ``OwnerMismatchError``
+    instead of silently re-stamping.  This closes the cross-project
+    takeover bypass.
     """
+    from khaos.db.database import OwnerMismatchError
+
     db = await _make_db(tmp_path / "khaos.db")
     try:
         # manager_a creates the task → row stamped A.
@@ -722,14 +756,13 @@ async def test_acceptance_17_coding_tasks_re_stamps_via_task_manager(tmp_path):
         stamped_a = await _fetch_project_id(db, "coding_tasks", f"id='{task.id}'")
         assert stamped_a == PROJECT_ID_A
 
-        # manager_b re-persists the SAME task object → row re-stamped B.
+        # manager_b tries to re-persist the SAME task → OwnerMismatchError.
         manager_b = TaskManager(db=db, principal_id="u1", project_id=PROJECT_ID_B)
-        # ``_persist`` is the internal write path used by ``create`` /
-        # ``update_status`` / ``transition``.  Calling it directly
-        # simulates a re-attach without going through the task cache.
-        await manager_b._persist(task)
-        stamped_b = await _fetch_project_id(db, "coding_tasks", f"id='{task.id}'")
-        assert stamped_b == PROJECT_ID_B
+        with pytest.raises(OwnerMismatchError):
+            await manager_b._persist(task)
+        # The original row's project_id is still A.
+        stamped_still_a = await _fetch_project_id(db, "coding_tasks", f"id='{task.id}'")
+        assert stamped_still_a == PROJECT_ID_A
     finally:
         await db.close()
 

@@ -3692,23 +3692,22 @@ class Database:
                     (session_id, role, content, created),
                 )
 
-    async def upsert_coding_task(
+    async def insert_coding_task(
         self, task: dict[str, Any], *, principal_id: str = "legacy",
         project_id: str = "",
     ) -> None:
-        """Persist the complete JSON-safe state of one coding task.
+        """INSERT a new coding task row (plain INSERT, no upsert).
 
-        M4 batch 3.1.16A-3: ``principal_id`` is stamped on the row so
-        ``list_coding_tasks`` can filter by it.  Callers should pass the
-        bound principal; the default ``'legacy'`` is fail-closed and
-        only used by pre-A3 callers that haven't been migrated yet.
+        Round-4 review Batch 4 (§八): coding tasks now use a full 128-bit
+        UUID (``uuid.uuid4().hex``) so collision is virtually impossible.
+        If one ever happens, ``sqlite3.IntegrityError`` is raised instead
+        of silently overwriting an old row — mirroring the
+        ``insert_subagent_task`` policy.
 
-        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row for
-        project identity closure.  Unlike ``sessions`` (owner-preserving
-        upsert), coding tasks DO update ``project_id`` on conflict —
-        a coding task's lifecycle is tied to the runtime that owns it,
-        and a task may be re-stamped when resumed under a different
-        project context (mirrors the existing ``principal_id`` policy).
+        ``principal_id`` is stamped on the row so ``list_coding_tasks``
+        can filter by it.  The default ``'legacy'`` is fail-closed and
+        quarantines the task (status→failed) so only an admin can
+        re-claim it.
         """
         persisted_task = dict(task)
         if principal_id == "legacy" and task.get("status") != "failed":
@@ -3723,11 +3722,6 @@ class Database:
                 """
                 INSERT INTO coding_tasks (id, goal, status, state_json, created_at, updated_at, principal_id, project_id)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET goal=excluded.goal,
-                    status=excluded.status, state_json=excluded.state_json,
-                    updated_at=excluded.updated_at,
-                    principal_id=excluded.principal_id,
-                    project_id=excluded.project_id
                 """,
                 (
                     persisted_task["id"], persisted_task["goal"],
@@ -3736,6 +3730,51 @@ class Database:
                     principal_id, project_id,
                 ),
             )
+
+    async def update_coding_task(
+        self, task: dict[str, Any], *, principal_id: str,
+        project_id: str,
+    ) -> None:
+        """UPDATE an existing coding task row with Owner-Match predicate.
+
+        Round-4 review Batch 4 (§八): updates use a standalone
+        ``UPDATE ... WHERE id=? AND principal_id=? AND project_id=?``
+        so a foreign caller cannot mutate another owner's task.
+        If the predicate matches zero rows, ``OwnerMismatchError`` is
+        raised — the caller fails loudly instead of silently touching
+        another owner's row.
+
+        Unlike ``insert_coding_task``, this method does NOT re-stamp
+        ``principal_id`` or ``project_id`` — ownership is immutable
+        after creation.  Only ``goal``, ``status``, ``state_json``,
+        and ``updated_at`` are updated.
+        """
+        persisted_task = dict(task)
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE coding_tasks SET
+                    goal = ?,
+                    status = ?,
+                    state_json = ?,
+                    updated_at = ?
+                WHERE id = ? AND principal_id = ? AND project_id = ?
+                """,
+                (
+                    persisted_task["goal"],
+                    persisted_task["status"],
+                    json.dumps(persisted_task),
+                    persisted_task["updated_at"],
+                    persisted_task["id"],
+                    principal_id,
+                    project_id,
+                ),
+            )
+            if cursor.rowcount == 0:
+                raise OwnerMismatchError(
+                    f"coding task {persisted_task['id']!r} does not exist "
+                    f"or is owned by a different (principal_id, project_id)"
+                )
 
     async def list_coding_tasks(
         self, *, principal_id: str | None = None, project_id: str | None = None

@@ -398,7 +398,7 @@ async def test_legacy_coding_tasks_are_invisible_and_quarantined(tmp_path):
 
     # Simulate a pre-A3 row by inserting directly with principal_id='legacy'.
     # Use the public DB API so the row is formatted correctly.
-    await db.upsert_coding_task(
+    await db.insert_coding_task(
         {
             "id": "legacy-1",
             "goal": "attacker's task",

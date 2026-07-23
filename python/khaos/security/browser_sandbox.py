@@ -228,6 +228,78 @@ class BrowserNetworkSandbox:
             )
             self.teardown()
 
+    @staticmethod
+    def startup_reaper() -> dict[str, int]:
+        """Round-4 review Batch 4 (§13.3): clean up resources from a
+
+        previous boot that crashed without calling ``teardown()``.
+
+        Scans for stale ``khaos-*`` netns, veth pairs, cgroups, and
+        nftables chains left behind by a prior process.  Each cleanup
+        step is best-effort — failures are logged but don't abort the
+        reaper.
+
+        Returns a dict of cleanup counts: ``{"netns": N, "veth": N,
+        "cgroup": N, "nft": N}``.
+        """
+        counts = {"netns": 0, "veth": 0, "cgroup": 0, "nft": 0}
+        if not sys.platform.startswith("linux"):
+            return counts
+
+        # 1. Remove stale khaos-* netns entries.
+        if Path(_NETNS_BASE).is_dir():
+            for entry in Path(_NETNS_BASE).iterdir():
+                if entry.name.startswith(f"khaos-{_VETH_PREFIX}"):
+                    with _suppress_oserrors():
+                        _run_command(
+                            ["ip", "netns", "del", entry.name],
+                            f"reaper: delete stale netns {entry.name}",
+                        )
+                        counts["netns"] += 1
+
+        # 2. Remove stale khaos-br* veth interfaces.
+        try:
+            result = subprocess.run(
+                ["ip", "-o", "link", "show"],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in result.stdout.splitlines():
+                for prefix in (_VETH_PREFIX + "h", _VETH_PREFIX + "n"):
+                    if prefix in line:
+                        parts = line.split(":")
+                        if len(parts) >= 2:
+                            iface = parts[1].strip().split("@")[0].split()[0]
+                            if iface.startswith(prefix):
+                                with _suppress_oserrors():
+                                    _run_command(
+                                        ["ip", "link", "del", iface],
+                                        f"reaper: delete stale veth {iface}",
+                                    )
+                                    counts["veth"] += 1
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+        # 3. Remove stale browser cgroups.
+        cgroup_root = os.environ.get("KHAOS_CGROUP_ROOT", "/sys/fs/cgroup/khaos")
+        cgroup_browser = Path(cgroup_root) / "browser"
+        if cgroup_browser.is_dir():
+            for child in cgroup_browser.iterdir():
+                if child.name.startswith("br-") and child.is_dir():
+                    _remove_cgroup(child)
+                    counts["cgroup"] += 1
+
+        # 4. Remove stale nftables table.
+        with _suppress_oserrors():
+            _run_command(
+                ["nft", "delete", "table", _NFT_TABLE_FAMILY, _NFT_TABLE_NAME],
+                f"reaper: delete stale nft table {_NFT_TABLE_NAME}",
+            )
+            counts["nft"] += 1
+
+        if any(counts.values()):
+            logger.info("browser sandbox startup_reaper: %s", counts)
+        return counts
+
     def _check_prerequisites(self) -> str:
         """Return empty string if all prerequisites are met, else reason."""
         if not sys.platform.startswith("linux"):
@@ -636,8 +708,29 @@ def _browser_cgroup_root() -> Path | None:
 
 
 def _remove_cgroup(group: Path) -> None:
-    """Best-effort cgroup removal."""
+    """Remove a cgroup-v2 leaf using kill → wait → rmdir (Round-4 §13.4)."""
+    import time
+
+    if not group.is_dir():
+        return
+    kill_file = group / "cgroup.kill"
+    if kill_file.exists():
+        try:
+            kill_file.write_text("1", encoding="ascii")
+        except OSError as exc:
+            logger.warning("browser cgroup.kill failed for %s: %s", group, exc)
+    events_file = group / "cgroup.events"
+    if events_file.exists():
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                content = events_file.read_text(encoding="ascii")
+                if "populated 0" in content or "populated=0" in content:
+                    break
+            except OSError:
+                break
+            time.sleep(0.1)
     try:
         group.rmdir()
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.warning("browser cgroup rmdir failed for %s (orphaned): %s", group, exc)

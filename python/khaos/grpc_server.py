@@ -56,6 +56,7 @@ from khaos.channels import (
 )
 from khaos.db import Database
 from khaos.exceptions import ServiceShutdownError
+from khaos.maintenance import MaintenanceService
 from khaos.memory import (
     Memory,
     MemoryBudget,
@@ -1761,23 +1762,38 @@ class TaskService:
     def __init__(self, db, approval_broker: ApprovalBroker | None = None):
         self.db = db
         self.approval_broker = approval_broker
-        # C-1-5a: per-principal TaskManager cache.  Each principal
-        # gets its own manager with its own in-memory cache loaded
-        # from the DB.  The cache is keyed by principal_id and lives
-        # for the process lifetime — a principal that connects, goes
-        # away, and comes back reuses the same manager.
-        self._managers: dict[str, TaskManager] = {}
+        # Round-4 review Batch 4 (§13.2): per-(principal, project)
+        # TaskManager cache with LRU eviction.  Previously the cache was
+        # keyed by ``principal_id`` only and lived for the process
+        # lifetime — a process with many principals would grow without
+        # bound.  Now the key is ``(principal_id, project_id)`` and the
+        # cache is bounded by ``_MAX_MANAGERS`` (default 32).  When the
+        # limit is reached, the least-recently-used entry is evicted.
+        from collections import OrderedDict
+        self._managers: "OrderedDict[tuple[str, str], TaskManager]" = OrderedDict()
+        self._MAX_MANAGERS = 32
 
     async def _manager(self, ctx: RequestContext) -> TaskManager:
-        """Get or create the per-principal TaskManager."""
-        manager = self._managers.get(ctx.principal_id)
+        """Get or create the per-(principal, project) TaskManager."""
+        key = (ctx.principal_id, ctx.project_id)
+        manager = self._managers.get(key)
         if manager is None:
+            # LRU eviction: drop the oldest entry if at capacity.
+            while len(self._managers) >= self._MAX_MANAGERS:
+                evicted_key, _ = self._managers.popitem(last=False)
+                logger.debug(
+                    "TaskService LRU: evicted manager for %s",
+                    evicted_key,
+                )
             manager = TaskManager(
                 db=self.db, principal_id=ctx.principal_id,
                 project_id=ctx.project_id,
             )
             await manager.load()
-            self._managers[ctx.principal_id] = manager
+            self._managers[key] = manager
+        else:
+            # Move to end (most-recently-used).
+            self._managers.move_to_end(key)
         return manager
 
     async def list(self, ctx: RequestContext, active_only: bool = False) -> list[dict]:
@@ -2100,6 +2116,14 @@ async def serve_json_lines(
         await db.recover_inflight_chat_streams(now=time.time())
         agent = AgentService(db, project_root=project_root, config_path=config_path, router=router)
         await agent.start()
+        # Round-4 review Batch 4 (§11.2 + §13.1): start the periodic
+        # maintenance service so ``prune_terminal_chat_streams``,
+        # ``recover_inflight_chat_streams``, and
+        # ``ApprovalBroker.sweep_expired`` run hourly in production.
+        # Previously these GC methods existed but had no production
+        # caller, causing unbounded chat ledger and approval growth.
+        maintenance = MaintenanceService(db, approval_broker=agent.approval_broker)
+        maintenance.start()
         # M4 batch 3.1.16A-4-2: MemoryService now holds ``db`` and
         # constructs a per-request ``MemoryStore`` scoped to
         # ``ctx.principal_id``.  Previously it was bound to a

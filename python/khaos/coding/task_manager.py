@@ -86,7 +86,7 @@ class CodingTask:
     into thinking they can set it.
     """
 
-    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    id: str = field(default_factory=lambda: uuid.uuid4().hex)
     goal: str = ""
     status: TaskStatus = TaskStatus.PENDING
     created_at: datetime = field(default_factory=datetime.now)
@@ -105,6 +105,12 @@ class CodingTask:
     # is fail-closed — a task constructed without a principal is never
     # visible to an authenticated principal's TaskManager.
     principal_id: str = "legacy"
+    # Round-4 review Batch 4: tracks whether this task has been INSERTed
+    # into the DB.  ``_persist`` uses this to choose ``insert_coding_task``
+    # (first write) vs ``update_coding_task`` (subsequent writes).  Tasks
+    # loaded from the DB via ``load()`` start with ``_persisted=True``.
+    # Not included in ``to_dict()`` — it is a runtime-only flag.
+    _persisted: bool = field(default=False, repr=False, compare=False)
 
     def touch(self) -> None:
         """Stamp ``updated_at`` to now."""
@@ -166,10 +172,12 @@ class TaskManager:
     is constructed via ``build_runtime`` the ``project_id`` comes from
     ``RuntimeConfig.project_id`` (set by ``AgentService`` from the
     verified RPC payload), NOT from ``compute_project_id(root)``.
-    Note: ``upsert_coding_task``'s ``ON CONFLICT`` clause DOES re-stamp
-    ``project_id`` (mirroring ``principal_id``), because a task's
-    lifecycle is tied to the runtime that owns it (a re-attach by the
-    same principal in the same project is a normal lifecycle event).
+    Note: Round-4 review Batch 4 replaced ``upsert_coding_task`` with
+    ``insert_coding_task`` (Plain INSERT) + ``update_coding_task``
+    (Owner-bound UPDATE).  Ownership (``principal_id`` +
+    ``project_id``) is now immutable after creation — a re-attach by
+    a different runtime raises ``OwnerMismatchError`` instead of
+    silently re-stamping.
     """
 
     def __init__(
@@ -269,6 +277,10 @@ class TaskManager:
                 # to 'legacy' keeps the invariant.
                 principal_id=data.get("principal_id", self._principal_id),
             )
+            # Round-4 review Batch 4: mark loaded tasks as already
+            # persisted so ``_persist`` uses ``update_coding_task``
+            # (Owner-bound UPDATE) instead of ``insert_coding_task``.
+            task._persisted = True
             if task.status in ACTIVE_STATUSES:
                 task.status = TaskStatus.BLOCKED
                 task.error = "interrupted by process restart"
@@ -515,18 +527,28 @@ class TaskManager:
             # the DB default ('legacy') if a future code path constructs
             # a task with a different principal.
             #
-            # M4 batch 3.1.16A-5-1b: stamp the project identity too.
-            # ``upsert_coding_task``'s ``ON CONFLICT`` clause re-stamps
-            # both ``principal_id`` and ``project_id`` (a task's lifecycle
-            # is tied to the runtime that owns it), so passing the
-            # manager's bound ``project_id`` here keeps the row's project
-            # identity in sync with the runtime that is currently
-            # persisting it (e.g. a re-attach after restart).
-            await self._db.upsert_coding_task(
-                task.to_dict(include_internal=True),
-                principal_id=task.principal_id,
-                project_id=self._project_id,
-            )
+            # Round-4 review Batch 4 (§八): split into Plain INSERT (first
+            # write) and Owner-bound UPDATE (subsequent writes).  The
+            # ``_persisted`` flag tracks which path to take.  This closes
+            # the silent-overwrite bypass: a 128-bit UUID collision on
+            # INSERT raises ``IntegrityError``, and a foreign caller's
+            # UPDATE raises ``OwnerMismatchError`` (predicate matches 0
+            # rows).  Ownership (principal_id + project_id) is immutable
+            # after creation.
+            task_dict = task.to_dict(include_internal=True)
+            if not task._persisted:
+                await self._db.insert_coding_task(
+                    task_dict,
+                    principal_id=task.principal_id,
+                    project_id=self._project_id,
+                )
+                task._persisted = True
+            else:
+                await self._db.update_coding_task(
+                    task_dict,
+                    principal_id=task.principal_id,
+                    project_id=self._project_id,
+                )
         event = {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": task.event_sequence, "type": f"task.{task.status.value}", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
         for queue in self._subscribers.get(task.id, []):
             queue.put_nowait(event)

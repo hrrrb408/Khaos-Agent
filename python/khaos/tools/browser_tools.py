@@ -265,6 +265,10 @@ class BrowserManager:
             # a compromised browser cannot bypass the egress proxy.  On
             # non-Linux, it's a no-op and the proxy-only layer remains.
             if self._browser_sandbox is None:
+                # Round-4 review Batch 4 (§13.3): reap stale netns/veth/
+                # cgroup/nft resources from a previous boot before creating
+                # new ones.  Best-effort — failures are logged.
+                BrowserNetworkSandbox.startup_reaper()
                 self._browser_sandbox = BrowserNetworkSandbox()
                 self._browser_sandbox.setup()
             if browser_type == "firefox":
