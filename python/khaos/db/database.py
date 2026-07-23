@@ -58,6 +58,17 @@ class TransactionContextLeakError(RuntimeError):
     """A transaction ContextVar leaked across task or database boundaries."""
 
 
+class OwnerMismatchError(RuntimeError):
+    """An upsert collided with a row owned by a different principal/project.
+
+    H-05/H-06 (round-4 review): owner-preserving upserts must reject a
+    foreign caller instead of silently mutating the row's non-owner
+    columns.  Raised when ``ON CONFLICT DO UPDATE ... WHERE owner =``
+    matches zero rows because the existing row's owner differs from
+    the caller's.
+    """
+
+
 @dataclass(frozen=True)
 class TransactionOwner:
     """Immutable token proving the current task owns the active transaction.
@@ -1488,25 +1499,35 @@ class Database:
         (unbound) for pre-A-5-1b callers; production callers pass
         ``ctx.project_id`` (RPC) or ``compute_project_id(root)`` (CLI).
 
-        ``ON CONFLICT DO UPDATE`` does NOT touch ``principal_id`` or
-        ``project_id`` — once a session is bound to a (principal,
-        project) pair, a later ``create_session`` call from a different
-        context must NOT silently re-stamp ownership.  Cross-context
-        ``create_session`` for an existing id is a no-op on the owner
-        columns (the row keeps its original owner); callers that need
-        to detect the collision should query first.
+        H-05 (round-4 review): ``ON CONFLICT DO UPDATE`` does NOT touch
+        ``principal_id`` or ``project_id`` AND carries an Owner-Match
+        predicate (``WHERE sessions.principal_id = excluded.principal_id
+        AND sessions.project_id = excluded.project_id``).  A foreign
+        caller colliding with an existing id no longer silently mutates
+        ``mode``/``updated_at`` — the WHERE clause matches zero rows,
+        ``rowcount == 0``, and we raise ``OwnerMismatchError`` so the
+        caller can fail loudly instead of touching another owner's row.
         """
         async with self.transaction() as conn:
-            await conn.execute(
+            cursor = await conn.execute(
                 """
                 INSERT INTO sessions (id, mode, principal_id, project_id)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     mode = excluded.mode,
                     updated_at = datetime('now')
+                WHERE sessions.principal_id = excluded.principal_id
+                  AND sessions.project_id = excluded.project_id
                 """,
                 (session_id, mode, principal_id, project_id),
             )
+            if cursor.rowcount == 0:
+                # Conflict on id but owner did not match — foreign owner
+                # tried to (re)create a session it does not own.
+                raise OwnerMismatchError(
+                    f"session {session_id!r} already exists with a "
+                    f"different (principal_id, project_id) owner"
+                )
 
     async def consume_webhook_event(
         self,
@@ -1654,6 +1675,7 @@ class Database:
         session_id: str,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[Message]:
         """Load persisted messages for a session in chronological order.
 
@@ -1662,28 +1684,31 @@ class Database:
         None`` (default) is the explicit admin opt-in that returns
         every row regardless of owner — used by migration / admin
         tooling, never by an authenticated principal's AgentLoop.
+
+        H-02 (round-4 review): ``project_id`` is an independent owner
+        dimension.  When provided, rows are further scoped to that
+        project — closing the cross-project read path on shared DBs.
+        Production callers pass both ``principal_id`` and ``project_id``;
+        ``None`` on either remains the explicit admin opt-in.
         """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                """
-                SELECT role, content, tool_calls, tool_call_id, token_count
-                FROM messages
-                WHERE session_id = ?
-                ORDER BY created_at, id
-                """,
-                (session_id,),
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT role, content, tool_calls, tool_call_id, token_count
-                FROM messages
-                WHERE session_id = ? AND principal_id = ?
-                ORDER BY created_at, id
-                """,
-                (session_id, principal_id),
-            )
+        clauses: list[str] = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        cursor = await conn.execute(
+            f"""
+            SELECT role, content, tool_calls, tool_call_id, token_count
+            FROM messages
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at, id
+            """,
+            tuple(params),
+        )
         rows = await cursor.fetchall()
         return [
             Message(
@@ -2037,17 +2062,42 @@ class Database:
             )
             return int(cursor.lastrowid)
 
-    async def list_audit_logs(self) -> list[dict[str, Any]]:
-        """Return audit logs in insertion order."""
+    async def list_audit_logs(
+        self,
+        *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return audit logs in insertion order.
+
+        H-02/H-03/H-04 (round-4 review): ``principal_id`` and
+        ``project_id`` are independent owner dimensions.  When either is
+        provided, entries are scoped to that owner — closing the
+        cross-project / cross-principal read path on shared DBs.
+        Production callers pass both; ``None`` on either (default)
+        remains the admin opt-in.
+        """
         conn = await self._require_conn()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         cursor = await conn.execute(
-            """
+            f"""
             SELECT action, target, result, detail, session_id,
                    principal_id, runtime_id, task_id, operation_id,
-                   policy_digest, authority_generation, source_transport
+                   policy_digest, authority_generation, source_transport,
+                   project_id
             FROM audit_log
+            {where}
             ORDER BY created_at, id
-            """
+            """,
+            tuple(params),
         )
         return [dict(row) for row in await cursor.fetchall()]
 
@@ -2060,6 +2110,7 @@ class Database:
         limit: int = 100,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return audit logs matching the given filters, newest first.
 
@@ -2072,6 +2123,12 @@ class Database:
 
         ``created_at`` is stored as ``datetime('now')`` (UTC, 'YYYY-MM-DD HH:MM:SS')
         so lexicographic comparison against ISO-ish strings works.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, entries are
+        further scoped to that project — closing the cross-project read
+        path on shared DBs.  Production callers pass both; ``None`` on
+        either remains the admin opt-in.
         """
         conn = await self._require_conn()
         clauses: list[str] = []
@@ -2091,13 +2148,17 @@ class Database:
         if principal_id is not None:
             clauses.append("principal_id = ?")
             params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(limit)
         cursor = await conn.execute(
             f"""
             SELECT id, action, target, result, detail, session_id, created_at,
                    principal_id, runtime_id, task_id, operation_id,
-                   policy_digest, authority_generation, source_transport
+                   policy_digest, authority_generation, source_transport,
+                   project_id
             FROM audit_log
             {where}
             ORDER BY created_at DESC, id DESC
@@ -2451,34 +2512,44 @@ class Database:
             )
             return cursor.rowcount or 0
 
-    async def list_subagent_tasks(self, principal_id: str | None = None) -> list[dict[str, Any]]:
+    async def list_subagent_tasks(
+        self,
+        principal_id: str | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """List subagent tasks.
 
         B1: when ``principal_id`` is set, only rows owned by that
         principal are returned.  ``None`` preserves the legacy
         "return everything" behaviour.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, rows are further
+        scoped to that project — closing the cross-project read path on
+        shared DBs.  Production callers pass both; ``None`` on either
+        remains the admin opt-in.
         """
         conn = await self._require_conn()
         # C-03: _ensure_subagent_tasks_principal_column removed from
         # runtime — column is added during migration, missing = fail closed.
-        if principal_id is None:
-            cursor = await conn.execute(
-                """
-                SELECT id, parent_session_id, goal, context, tools, status, result, error, principal_id
-                FROM subagent_tasks
-                ORDER BY created_at, id
-                """
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT id, parent_session_id, goal, context, tools, status, result, error, principal_id
-                FROM subagent_tasks
-                WHERE principal_id = ?
-                ORDER BY created_at, id
-                """,
-                (principal_id,),
-            )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cursor = await conn.execute(
+            f"""
+            SELECT id, parent_session_id, goal, context, tools, status, result, error, principal_id, project_id
+            FROM subagent_tasks
+            {where}
+            ORDER BY created_at, id
+            """,
+            tuple(params),
+        )
         return [dict(row) for row in await cursor.fetchall()]
 
     async def _ensure_subagent_tasks_principal_column(self) -> None:
@@ -2538,9 +2609,18 @@ class Database:
         M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row for
         project identity closure (same owner-preserving policy —
         ``ON CONFLICT`` does NOT touch ``project_id``).
+
+        H-06 (round-4 review): the upsert now carries an Owner-Match
+        predicate (``WHERE bookmarks.principal_id = excluded.principal_id
+        AND bookmarks.project_id = excluded.project_id``).  A foreign
+        caller colliding with an existing (session_id, name) no longer
+        silently overwrites ``description``/``mode``/``project_root``/
+        ``summary`` — the WHERE matches zero rows, ``rowcount == 0``,
+        and we raise ``OwnerMismatchError``.  Owner-preserving is now
+        also owner-authorized.
         """
         async with self.transaction() as conn:
-            await conn.execute(
+            cursor = await conn.execute(
                 """
                 INSERT INTO session_bookmarks
                     (session_id, name, description, mode, project_root, summary,
@@ -2551,10 +2631,17 @@ class Database:
                     mode         = excluded.mode,
                     project_root = excluded.project_root,
                     summary      = excluded.summary
+                WHERE session_bookmarks.principal_id = excluded.principal_id
+                  AND session_bookmarks.project_id  = excluded.project_id
                 """,
                 (session_id, name, description, mode, project_root, summary,
                  principal_id, project_id),
             )
+            if cursor.rowcount == 0:
+                raise OwnerMismatchError(
+                    f"bookmark {name!r} on session {session_id!r} already "
+                    f"exists with a different (principal_id, project_id) owner"
+                )
 
     async def load_bookmark(
         self,
@@ -2562,6 +2649,7 @@ class Database:
         name: str,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any] | None:
         """加载指定书签。不存在时返回 None。
 
@@ -2569,28 +2657,31 @@ class Database:
         bookmark owned by that principal is returned — a foreign-
         principal bookmark is treated as ``None`` (existence hidden,
         matching the ``TaskService.get`` pattern).
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, the bookmark is
+        further scoped to that project — closing the cross-project read
+        path on shared DBs.  Production callers pass both; ``None`` on
+        either remains the admin opt-in.
         """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                """
-                SELECT id, session_id, name, description, mode, project_root,
-                       summary, created_at, principal_id
-                FROM session_bookmarks
-                WHERE session_id = ? AND name = ?
-                """,
-                (session_id, name),
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT id, session_id, name, description, mode, project_root,
-                       summary, created_at, principal_id
-                FROM session_bookmarks
-                WHERE session_id = ? AND name = ? AND principal_id = ?
-                """,
-                (session_id, name, principal_id),
-            )
+        clauses: list[str] = ["session_id = ?", "name = ?"]
+        params: list[Any] = [session_id, name]
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        cursor = await conn.execute(
+            f"""
+            SELECT id, session_id, name, description, mode, project_root,
+                   summary, created_at, principal_id, project_id
+            FROM session_bookmarks
+            WHERE {' AND '.join(clauses)}
+            """,
+            tuple(params),
+        )
         row = await cursor.fetchone()
         return dict(row) if row is not None else None
 
@@ -2599,12 +2690,19 @@ class Database:
         session_id: str | None = None,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """列出书签，可按 session 过滤。按创建时间倒序返回。
 
         M4 batch 3.1.16A-4-3: when ``principal_id`` is given, only
         bookmarks owned by that principal are returned.  ``principal_id
         =None`` (default) is the admin opt-in.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, bookmarks are
+        further scoped to that project — closing the cross-project read
+        path on shared DBs.  Production callers pass both; ``None`` on
+        either remains the admin opt-in.
         """
         conn = await self._require_conn()
         clauses: list[str] = []
@@ -2615,11 +2713,14 @@ class Database:
         if principal_id is not None:
             clauses.append("principal_id = ?")
             params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         cursor = await conn.execute(
             f"""
             SELECT id, session_id, name, description, mode, project_root,
-                   summary, created_at, principal_id
+                   summary, created_at, principal_id, project_id
             FROM session_bookmarks
             {where}
             ORDER BY created_at DESC, id DESC
@@ -2634,6 +2735,7 @@ class Database:
         name: str,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         """删除指定书签。不存在的书签静默忽略。
 
@@ -2641,20 +2743,27 @@ class Database:
         DELETE is scoped to that principal — preventing cross-principal
         deletion.  ``principal_id=None`` (default) preserves the legacy
         unscoped behavior for admin callers.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, the DELETE is
+        further scoped to that project — preventing cross-project
+        deletion.  Production callers pass both; ``None`` on either
+        remains the admin opt-in.
         """
         async with self.transaction() as conn:
-            if principal_id is None:
-                await conn.execute(
-                    "DELETE FROM session_bookmarks "
-                    "WHERE session_id = ? AND name = ?",
-                    (session_id, name),
-                )
-            else:
-                await conn.execute(
-                    "DELETE FROM session_bookmarks "
-                    "WHERE session_id = ? AND name = ? AND principal_id = ?",
-                    (session_id, name, principal_id),
-                )
+            clauses: list[str] = ["session_id = ?", "name = ?"]
+            params: list[Any] = [session_id, name]
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            await conn.execute(
+                f"DELETE FROM session_bookmarks "
+                f"WHERE {' AND '.join(clauses)}",
+                tuple(params),
+            )
 
     async def _ensure_sessions_metadata_column(self, column: str) -> None:
         """幂等地为 sessions 表增加一个 TEXT 列（如 summary / changed_files）。
@@ -2945,7 +3054,7 @@ class Database:
             return cursor.rowcount
 
     async def list_scheduled_tasks(
-        self, *, principal_id: str | None = None,
+        self, *, principal_id: str | None = None, project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """List scheduled tasks, optionally filtered by ``principal_id``.
 
@@ -2956,36 +3065,40 @@ class Database:
         M4 batch 3.1.16B-1: the SELECT now includes ``policy_digest``
         and ``project_id`` so ``_task_from_row`` can restore the
         security-context snapshot for B-2 drift detection.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, tasks are further
+        scoped to that project — closing the cross-project read path on
+        shared DBs.  Production callers pass both; ``None`` on either
+        remains the admin opt-in.
         """
         conn = await self._require_conn()
+        clauses: list[str] = []
+        params: list[Any] = []
         if principal_id is not None:
-            cursor = await conn.execute(
-                """
-                SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
-                       created_at, last_run, next_run, run_count, last_result, error,
-                       lifecycle_version, principal_id, execution_id, lease_until,
-                       policy_digest, project_id
-                FROM scheduled_tasks
-                WHERE principal_id = ?
-                ORDER BY created_at
-                """,
-                (principal_id,),
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
-                       created_at, last_run, next_run, run_count, last_result, error,
-                       lifecycle_version, principal_id, execution_id, lease_until,
-                       policy_digest, project_id
-                FROM scheduled_tasks
-                ORDER BY created_at
-                """
-            )
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cursor = await conn.execute(
+            f"""
+            SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
+                   created_at, last_run, next_run, run_count, last_result, error,
+                   lifecycle_version, principal_id, execution_id, lease_until,
+                   policy_digest, project_id
+            FROM scheduled_tasks
+            {where}
+            ORDER BY created_at
+            """,
+            tuple(params),
+        )
         return [dict(row) for row in await cursor.fetchall()]
 
     async def get_scheduled_task(
         self, task_id: str, *, principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Get a scheduled task by id, optionally verifying ``principal_id``.
 
@@ -2993,6 +3106,11 @@ class Database:
         ``None`` if the task belongs to a different principal — so the
         engine can return ``not_found`` (rather than revealing the
         task's existence to an unauthorized caller).
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, returns ``None``
+        if the task belongs to a different project.  Production callers
+        pass both; ``None`` on either remains the admin opt-in.
         """
         conn = await self._require_conn()
         cursor = await conn.execute(
@@ -3003,6 +3121,8 @@ class Database:
             return None
         result = dict(row)
         if principal_id is not None and result.get("principal_id") != principal_id:
+            return None
+        if project_id is not None and result.get("project_id") != project_id:
             return None
         return result
 
@@ -3618,7 +3738,7 @@ class Database:
             )
 
     async def list_coding_tasks(
-        self, *, principal_id: str | None = None
+        self, *, principal_id: str | None = None, project_id: str | None = None
     ) -> list[dict[str, Any]]:
         """Load persisted coding-task state in creation order.
 
@@ -3627,18 +3747,27 @@ class Database:
         (default) is the explicit admin opt-in that returns every row
         regardless of owner — used by migration / admin tooling, never
         by an authenticated principal's TaskManager.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, rows are further
+        scoped to that project — closing the cross-project read path on
+        shared DBs.  Production callers pass both; ``None`` on either
+        remains the admin opt-in.
         """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                "SELECT state_json FROM coding_tasks ORDER BY created_at"
-            )
-        else:
-            cursor = await conn.execute(
-                "SELECT state_json FROM coding_tasks "
-                "WHERE principal_id = ? ORDER BY created_at",
-                (principal_id,),
-            )
+        clauses: list[str] = []
+        params: list[Any] = []
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        cursor = await conn.execute(
+            f"SELECT state_json FROM coding_tasks {where} ORDER BY created_at",
+            tuple(params),
+        )
         return [json.loads(str(row["state_json"])) for row in await cursor.fetchall()]
 
     async def search_sessions(
@@ -3648,6 +3777,7 @@ class Database:
         offset: int = 0,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """FTS5 BM25 search across all session messages.
 
@@ -3659,10 +3789,20 @@ class Database:
         the base ``messages`` table on rowid.  Legacy rows
         (``principal_id='legacy'``) are excluded.  ``principal_id=None``
         (default) is the admin opt-in.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When either ``principal_id`` or
+        ``project_id`` is provided, the query JOINs the base
+        ``messages`` table and applies the supplied owner filters —
+        closing the cross-project read path on shared DBs.  Production
+        callers pass both; ``None`` on either remains the admin opt-in.
         """
         conn = await self._require_conn()
         # snippet: highlight matches with [ ... ]; bm25() rank (lower = better).
-        if principal_id is None:
+        # When either owner filter is provided, JOIN the base messages
+        # table (messages_fts.rowid mirrors messages.id, so the JOIN is
+        # a primary-key lookup — cheap).
+        if principal_id is None and project_id is None:
             cursor = await conn.execute(
                 """
                 SELECT rowid AS id, session_id, role, created_at,
@@ -3676,22 +3816,27 @@ class Database:
                 (query, limit, offset),
             )
         else:
-            # JOIN the base messages table to enforce principal scoping.
-            # messages_fts.rowid mirrors messages.id, so the JOIN is a
-            # primary-key lookup (cheap).
+            clauses: list[str] = ["fts.messages_fts MATCH ?"]
+            params: list[Any] = [query]
+            if principal_id is not None:
+                clauses.append("m.principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("m.project_id = ?")
+                params.append(project_id)
+            params.extend([limit, offset])
             cursor = await conn.execute(
-                """
+                f"""
                 SELECT fts.rowid AS id, fts.session_id, fts.role,
                        fts.created_at, fts.rank,
                        snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
                 FROM messages_fts AS fts
                 JOIN messages AS m ON m.id = fts.rowid
-                WHERE fts.messages_fts MATCH ?
-                  AND m.principal_id = ?
+                WHERE {' AND '.join(clauses)}
                 ORDER BY fts.rank
                 LIMIT ? OFFSET ?
                 """,
-                (query, principal_id, limit, offset),
+                tuple(params),
             )
         return [dict(row) for row in await cursor.fetchall()]
 
@@ -3702,35 +3847,39 @@ class Database:
         offset: int = 0,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Return messages for a session, newest-aware pagination.
 
         M4 batch 3.1.16A-4-3: when ``principal_id`` is given, only
         rows owned by that principal are returned.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, rows are further
+        scoped to that project — closing the cross-project read path on
+        shared DBs.  Production callers pass both; ``None`` on either
+        remains the admin opt-in.
         """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                """
-                SELECT id, session_id, role, content, token_count, created_at
-                FROM messages
-                WHERE session_id = ?
-                ORDER BY created_at, id
-                LIMIT ? OFFSET ?
-                """,
-                (session_id, limit, offset),
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT id, session_id, role, content, token_count, created_at
-                FROM messages
-                WHERE session_id = ? AND principal_id = ?
-                ORDER BY created_at, id
-                LIMIT ? OFFSET ?
-                """,
-                (session_id, principal_id, limit, offset),
-            )
+        clauses: list[str] = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        params.extend([limit, offset])
+        cursor = await conn.execute(
+            f"""
+            SELECT id, session_id, role, content, token_count, created_at
+            FROM messages
+            WHERE {' AND '.join(clauses)}
+            ORDER BY created_at, id
+            LIMIT ? OFFSET ?
+            """,
+            tuple(params),
+        )
         return [dict(row) for row in await cursor.fetchall()]
 
     async def get_message_window(
@@ -3740,31 +3889,39 @@ class Database:
         window: int = 5,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """Return up to ``window`` messages before and after ``message_id``."""
+        """Return up to ``window`` messages before and after ``message_id``.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, rows are further
+        scoped to that project — closing the cross-project read path on
+        shared DBs.  Production callers pass both ``principal_id`` and
+        ``project_id``; ``None`` on either remains the admin opt-in.
+        """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                """
-                SELECT id, session_id, role, content, token_count, created_at
-                FROM messages
-                WHERE session_id = ?
-                ORDER BY ABS(id - ?), id
-                LIMIT ?
-                """,
-                (session_id, message_id, window * 2 + 1),
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT id, session_id, role, content, token_count, created_at
-                FROM messages
-                WHERE session_id = ? AND principal_id = ?
-                ORDER BY ABS(id - ?), id
-                LIMIT ?
-                """,
-                (session_id, principal_id, message_id, window * 2 + 1),
-            )
+        clauses: list[str] = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        # message_id feeds the ABS(id - ?) proximity sort and must come
+        # after the WHERE-clause params.
+        params.append(message_id)
+        params.append(window * 2 + 1)
+        cursor = await conn.execute(
+            f"""
+            SELECT id, session_id, role, content, token_count, created_at
+            FROM messages
+            WHERE {' AND '.join(clauses)}
+            ORDER BY ABS(id - ?), id
+            LIMIT ?
+            """,
+            tuple(params),
+        )
         rows = [dict(row) for row in await cursor.fetchall()]
         # Re-sort chronologically after the ABS-based proximity selection.
         rows.sort(key=lambda r: r["id"])
@@ -3775,19 +3932,29 @@ class Database:
         session_id: str,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> int:
+        """Count messages for a session, optionally scoped by owner.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, rows are further
+        scoped to that project — closing the cross-project read path on
+        shared DBs.  Production callers pass both ``principal_id`` and
+        ``project_id``; ``None`` on either remains the admin opt-in.
+        """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
-                (session_id,),
-            )
-        else:
-            cursor = await conn.execute(
-                "SELECT COUNT(*) AS n FROM messages "
-                "WHERE session_id = ? AND principal_id = ?",
-                (session_id, principal_id),
-            )
+        clauses: list[str] = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        cursor = await conn.execute(
+            f"SELECT COUNT(*) AS n FROM messages WHERE {' AND '.join(clauses)}",
+            tuple(params),
+        )
         row = await cursor.fetchone()
         return int(row["n"]) if row else 0
 
@@ -3797,25 +3964,34 @@ class Database:
         message_id: int,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> tuple[int, int]:
-        """Return (count_before, count_after) relative to ``message_id``."""
+        """Return (count_before, count_after) relative to ``message_id``.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, rows are further
+        scoped to that project — closing the cross-project read path on
+        shared DBs.  Production callers pass both ``principal_id`` and
+        ``project_id``; ``None`` on either remains the admin opt-in.
+        """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                "SELECT "
-                "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
-                "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
-                "FROM messages WHERE session_id = ?",
-                (message_id, message_id, session_id),
-            )
-        else:
-            cursor = await conn.execute(
-                "SELECT "
-                "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
-                "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
-                "FROM messages WHERE session_id = ? AND principal_id = ?",
-                (message_id, message_id, session_id, principal_id),
-            )
+        clauses: list[str] = ["session_id = ?"]
+        params: list[Any] = [session_id]
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        # message_id feeds both CASE expressions, so it must be appended
+        # after the WHERE-clause params and appears twice in the tuple.
+        cursor = await conn.execute(
+            f"SELECT "
+            "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
+            "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
+            f"FROM messages WHERE {' AND '.join(clauses)}",
+            (message_id, message_id, *params),
+        )
         row = await cursor.fetchone()
         if not row:
             return (0, 0)
@@ -3827,6 +4003,7 @@ class Database:
         offset: int = 0,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """List sessions newest-first, with a message-count + last-message preview.
 
@@ -3834,38 +4011,48 @@ class Database:
         sessions owned by that principal are returned.  Legacy rows
         (``principal_id='legacy'``) are excluded.  ``principal_id=None``
         (default) is the admin opt-in.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, sessions are
+        further scoped to that project — closing the cross-project read
+        path on shared DBs.  Production callers pass both; ``None`` on
+        either remains the admin opt-in.
         """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                """
-                SELECT s.id, s.mode, s.created_at,
-                       (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS message_count,
-                       (SELECT content FROM messages m WHERE m.session_id = s.id
-                        ORDER BY m.id DESC LIMIT 1) AS preview
-                FROM sessions s
-                WHERE s.status = 'active'
-                ORDER BY s.updated_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (limit, offset),
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT s.id, s.mode, s.created_at,
-                       (SELECT COUNT(*) FROM messages m
-                        WHERE m.session_id = s.id AND m.principal_id = s.principal_id) AS message_count,
-                       (SELECT content FROM messages m
-                        WHERE m.session_id = s.id AND m.principal_id = s.principal_id
-                        ORDER BY m.id DESC LIMIT 1) AS preview
-                FROM sessions s
-                WHERE s.status = 'active' AND s.principal_id = ?
-                ORDER BY s.updated_at DESC
-                LIMIT ? OFFSET ?
-                """,
-                (principal_id, limit, offset),
-            )
+        where_clauses: list[str] = ["s.status = 'active'"]
+        where_params: list[Any] = []
+        if principal_id is not None:
+            where_clauses.append("s.principal_id = ?")
+            where_params.append(principal_id)
+        if project_id is not None:
+            where_clauses.append("s.project_id = ?")
+            where_params.append(project_id)
+        # When an owner dimension is supplied, scope the message_count /
+        # preview subqueries to the session's own owner value for that
+        # dimension (matching the legacy principal-scoped subquery
+        # behaviour).
+        sub_filters: list[str] = []
+        if principal_id is not None:
+            sub_filters.append("m.principal_id = s.principal_id")
+        if project_id is not None:
+            sub_filters.append("m.project_id = s.project_id")
+        sub_where = (" AND " + " AND ".join(sub_filters)) if sub_filters else ""
+        where_params.extend([limit, offset])
+        cursor = await conn.execute(
+            f"""
+            SELECT s.id, s.mode, s.created_at,
+                   (SELECT COUNT(*) FROM messages m
+                    WHERE m.session_id = s.id{sub_where}) AS message_count,
+                   (SELECT content FROM messages m
+                    WHERE m.session_id = s.id{sub_where}
+                    ORDER BY m.id DESC LIMIT 1) AS preview
+            FROM sessions s
+            WHERE {' AND '.join(where_clauses)}
+            ORDER BY s.updated_at DESC
+            LIMIT ? OFFSET ?
+            """,
+            tuple(where_params),
+        )
         return [dict(row) for row in await cursor.fetchall()]
 
     async def get_session(
@@ -3873,6 +4060,7 @@ class Database:
         session_id: str,
         *,
         principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Return one session row, or ``None`` if missing.
 
@@ -3880,28 +4068,31 @@ class Database:
         that principal is returned (cross-principal access yields
         ``None``, hidden as "not found" by the caller).  This is the
         single-row counterpart to :meth:`list_sessions`.
+
+        H-02/H-03/H-04 (round-4 review): ``project_id`` is an
+        independent owner dimension.  When provided, the row is further
+        scoped to that project — closing the cross-project read path on
+        shared DBs.  Production callers pass both; ``None`` on either
+        remains the admin opt-in.
         """
         conn = await self._require_conn()
-        if principal_id is None:
-            cursor = await conn.execute(
-                """
-                SELECT id, mode, principal_id, project_id, status,
-                       created_at, updated_at
-                FROM sessions
-                WHERE id = ?
-                """,
-                (session_id,),
-            )
-        else:
-            cursor = await conn.execute(
-                """
-                SELECT id, mode, principal_id, project_id, status,
-                       created_at, updated_at
-                FROM sessions
-                WHERE id = ? AND principal_id = ?
-                """,
-                (session_id, principal_id),
-            )
+        clauses: list[str] = ["id = ?"]
+        params: list[Any] = [session_id]
+        if principal_id is not None:
+            clauses.append("principal_id = ?")
+            params.append(principal_id)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
+        cursor = await conn.execute(
+            f"""
+            SELECT id, mode, principal_id, project_id, status,
+                   created_at, updated_at
+            FROM sessions
+            WHERE {' AND '.join(clauses)}
+            """,
+            tuple(params),
+        )
         row = await cursor.fetchone()
         return dict(row) if row is not None else None
 

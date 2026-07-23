@@ -379,6 +379,7 @@ class ToolInvocationBroker:
         # from production).
         if any(capability.name == "history.read" for capability in capabilities):
             handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["project_id"] = context.get("project_id", "")
             handler_params["db"] = context.get("db")
         # M4 batch 3.1.16A-4-4-3 (CRITICAL): the four channel tools
         # declare ``channel.read`` (list / health) or ``channel.manage``

@@ -920,7 +920,7 @@ class CronEngine:
             — the caller raises ``ServiceShutdownError``).
         """
         try:
-            row = await self.db.get_scheduled_task(task_id)
+            row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
         except Exception:  # noqa: BLE001 — DB unreadable
             logger.error(
                 "cron task %s: reconcile could not read DB — "
@@ -975,7 +975,7 @@ class CronEngine:
             # Check commit-then-raise: the CAS may have committed
             # before raising.
             try:
-                row2 = await self.db.get_scheduled_task(task_id)
+                row2 = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
             except Exception:  # noqa: BLE001 — DB unreadable
                 logger.error(
                     "cron task %s: reconcile CAS raised and read-back "
@@ -1007,7 +1007,7 @@ class CronEngine:
             # CAS mismatch — check if prior retry committed or a
             # newer op won.
             try:
-                row2 = await self.db.get_scheduled_task(task_id)
+                row2 = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
             except Exception:  # noqa: BLE001 — treat as failure
                 row2 = None
             if (
@@ -1135,7 +1135,7 @@ class CronEngine:
         attempt it again.
         """
         try:
-            row = await self.db.get_scheduled_task(task_id)
+            row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
         except Exception:  # noqa: BLE001 — DB unreadable
             logger.error(
                 "cron task %s: executor reconcile could not read "
@@ -1587,7 +1587,7 @@ class CronEngine:
                 except Exception:  # noqa: BLE001 — caller retries
                     # Could be commit-then-raise — read back to verify.
                     try:
-                        row = await self.db.get_scheduled_task(task.id)
+                        row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
                     except Exception:  # noqa: BLE001 — DB unreadable
                         logger.error(
                             "cron task %s: could not persist resumed "
@@ -1623,7 +1623,7 @@ class CronEngine:
                     # committed (DB at ``target``) or a newer control
                     # op happened (DB at > ``target``).  Read back.
                     try:
-                        row = await self.db.get_scheduled_task(task.id)
+                        row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
                     except Exception:  # noqa: BLE001 — treat as failure
                         row = None
                     if (
@@ -1959,7 +1959,7 @@ class CronEngine:
             desired = entry["desired_status"]
             op_type = entry["operation_type"]
             try:
-                row = await self.db.get_scheduled_task(task_id)
+                row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
             except Exception:  # noqa: BLE001 — DB unreadable
                 logger.warning(
                     "cron engine start: could not read task %s for "
@@ -2721,7 +2721,7 @@ class CronEngine:
                     task.name, exc_info=True,
                 )
                 try:
-                    row = await self.db.get_scheduled_task(task.id)
+                    row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
                 except Exception:  # noqa: BLE001 — DB unreadable
                     logger.error(
                         "cron task %s: could not read back row after "
@@ -3107,7 +3107,7 @@ class CronEngine:
         # high) and the CAS would permanently mismatch.  Reading the
         # DB gives us the ground truth.
         try:
-            row = await self.db.get_scheduled_task(task.id)
+            row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
         except Exception:  # noqa: BLE001 — DB unreadable
             # Can't read — can't supersede.  Place a marker so
             # ``stop()`` retries.  Use the in-memory version as a
@@ -3208,7 +3208,7 @@ class CronEngine:
             # to verify.  If the DB is already at ``target_version``
             # with the desired status, treat as success.
             try:
-                row2 = await self.db.get_scheduled_task(task.id)
+                row2 = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
             except Exception:  # noqa: BLE001 — DB unreadable
                 raise
             if (
@@ -3237,7 +3237,7 @@ class CronEngine:
             # happened (DB at > ``target``).  Read back to
             # distinguish.
             try:
-                row2 = await self.db.get_scheduled_task(task.id)
+                row2 = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
             except Exception:  # noqa: BLE001 — treat as failure
                 row2 = None
             if (
@@ -3310,7 +3310,7 @@ class CronEngine:
         """
         if not self.db:
             return
-        rows = await self.db.list_scheduled_tasks()
+        rows = await self.db.list_scheduled_tasks(project_id=self._project_id)
         for row in rows:
             task = _task_from_row(row)
             if task is not None:
@@ -3350,7 +3350,7 @@ class CronEngine:
             if exec_task is not None and not exec_task.done():
                 return
             try:
-                row = await self.db.get_scheduled_task(task_id)
+                row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
             except Exception:  # noqa: BLE001 — DB unreadable
                 self._degraded = True
                 logger.error(
@@ -3453,7 +3453,7 @@ class CronEngine:
                 )
                 # Reload the in-memory task to pick up the FAILED state.
                 try:
-                    row = await self.db.get_scheduled_task(task_id)
+                    row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
                 except Exception:  # noqa: BLE001 — DB unreadable
                     self._degraded = True
                     return True

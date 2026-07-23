@@ -167,24 +167,71 @@ async def test_create_session_on_conflict_preserves_original_owner(tmp_path):
     """Once a session is bound to Principal A, Principal B's later
     ``create_session`` for the same id MUST NOT re-stamp ownership.
 
-    The ``ON CONFLICT DO UPDATE`` only refreshes ``mode`` and
-    ``updated_at``; ``principal_id`` is immutable after the first INSERT.
+    H-05 (round-4 review): the upsert now carries an Owner-Match
+    predicate.  A foreign caller colliding with an existing id no
+    longer silently mutates ``mode``/``updated_at`` — it raises
+    ``OwnerMismatchError`` so the caller fails loudly instead of
+    touching another owner's row.  The original owner's row is left
+    completely untouched (mode stays as Alice left it).
     """
+    import pytest
+    from khaos.db.database import OwnerMismatchError
+
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
     await db.create_session("s1", "office", principal_id="api:alice")
-    # Principal B attempts to "re-create" the same session.
-    await db.create_session("s1", "coding", principal_id="api:bob")
+    # Principal B attempts to "re-create" the same session — must fail.
+    with pytest.raises(OwnerMismatchError):
+        await db.create_session("s1", "coding", principal_id="api:bob")
 
     conn = await db._require_conn()
     cursor = await conn.execute(
         "SELECT principal_id, mode FROM sessions WHERE id = 's1'"
     )
     row = await cursor.fetchone()
-    # Owner stays Alice; mode refreshes to Bob's value.
+    # Owner stays Alice; mode stays "office" (Bob's write was rejected).
+    assert row["principal_id"] == "api:alice"
+    assert row["mode"] == "office"
+    await db.close()
+
+
+async def test_create_session_same_owner_can_update_mode(tmp_path):
+    """H-05: the same owner calling ``create_session`` again still
+    refreshes ``mode`` (the Owner-Match predicate matches)."""
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s2", "office", principal_id="api:alice")
+    # Same owner, different mode — succeeds.
+    await db.create_session("s2", "coding", principal_id="api:alice")
+
+    conn = await db._require_conn()
+    cursor = await conn.execute(
+        "SELECT principal_id, mode FROM sessions WHERE id = 's2'"
+    )
+    row = await cursor.fetchone()
     assert row["principal_id"] == "api:alice"
     assert row["mode"] == "coding"
+    await db.close()
+
+
+async def test_create_session_project_mismatch_raises(tmp_path):
+    """H-05: same principal but different project also raises."""
+    import pytest
+    from khaos.db.database import OwnerMismatchError
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session(
+        "s3", "office", principal_id="api:alice", project_id="proj-a"
+    )
+    # Same principal, different project — must fail.
+    with pytest.raises(OwnerMismatchError):
+        await db.create_session(
+            "s3", "coding", principal_id="api:alice", project_id="proj-b"
+        )
     await db.close()
 
 

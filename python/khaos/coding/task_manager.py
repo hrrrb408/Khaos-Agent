@@ -245,7 +245,10 @@ class TaskManager:
         """
         if self._db is None:
             return
-        for data in await self._db.list_coding_tasks(principal_id=self._principal_id):
+        for data in await self._db.list_coding_tasks(
+            principal_id=self._principal_id,
+            project_id=self._project_id,
+        ):
             task = CodingTask(
                 id=data["id"], goal=data.get("goal", ""),
                 status=TaskStatus.parse(data.get("status", "pending")),
