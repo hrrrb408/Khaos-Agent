@@ -13,6 +13,7 @@ pub use executor::{run_parallel, run_one, ToolCall, ToolResult};
 pub use token::{count_tokens, count_tokens_batch};
 
 #[cfg(feature = "pyo3")]
+#[allow(clippy::useless_conversion)]
 mod py {
     use super::{count_tokens, count_tokens_batch, executor::ToolCall};
     use pyo3::prelude::*;

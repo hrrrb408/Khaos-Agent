@@ -1,0 +1,186 @@
+name: Batch 5 Required Jobs
+
+# Round-4 review Batch 5: CI enforcement proof.
+#
+# This workflow provides the 7 required status checks mandated by the
+# fourth-round review (§Batch 5).  Each job maps 1:1 to a required proof:
+#
+#   1. db-transaction-adversarial      — DB transaction adversarial tests
+#   2. shared-db-project-isolation     — Shared DB project isolation tests
+#   3. browser-netns-attack-e2e        — Real Browser netns attack E2E
+#   4. go-race                         — Go race test
+#   5. rust-clippy                     — Rust clippy -D warnings
+#   6. full-python-security            — Full Python security suite
+#   7. migration-fixture-matrix        — Migration fixture matrix
+#
+# All jobs must pass before a PR touching security-sensitive paths can
+# be merged to main.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: batch5-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "feature/**", "codex/**"]
+  workflow_dispatch:
+
+jobs:
+  # ─── 1. DB transaction adversarial tests ──────────────────────────────
+  db-transaction-adversarial:
+    name: DB Transaction Adversarial
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Run DB transaction adversarial tests
+        run: |
+          python -m pytest \
+            python/tests/db/test_transaction_authority_adversarial_c05.py \
+            python/tests/db/test_static_gate_transaction_authority.py \
+            python/tests/db/test_concurrent_transaction_owner.py \
+            python/tests/db/test_transaction_stale_recovery_f01.py \
+            -q -v
+
+  # ─── 2. Shared DB project isolation tests ────────────────────────────
+  shared-db-project-isolation:
+    name: Shared DB Project Isolation
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Run shared DB project isolation tests
+        run: |
+          python -m pytest \
+            python/tests/db/test_memory_project_isolation_f02.py \
+            python/tests/db/test_project_id_schema_closure_316a_5_1a.py \
+            python/tests/db/test_project_id_write_path_closure_316a_5_1b.py \
+            python/tests/db/test_project_identity_closure_h02_h06.py \
+            python/tests/db/test_batch4_id_lifecycle.py \
+            -q -v
+
+  # ─── 3. Real Browser netns attack E2E ────────────────────────────────
+  browser-netns-attack-e2e:
+    name: Browser Netns Attack E2E
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test + browser dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test,browser]'
+      - name: Download Chromium binary
+        run: python -m playwright install --with-deps chromium
+      - name: Run browser kernel egress + netns attack tests
+        env:
+          KHAOS_RUN_BROWSER_E2E: "1"
+        run: |
+          python -m pytest \
+            python/tests/security/test_browser_kernel_egress_c06_c11.py \
+            python/tests/security/test_browser_egress_f05.py \
+            python/tests/security/test_browser_egress_proxy.py \
+            python/tests/security/test_host_network_authority.py \
+            python/tests/tools/test_browser_tools_e2e.py \
+            -q -v -m "browser_real or not browser_real"
+
+  # ─── 4. Go race test ─────────────────────────────────────────────────
+  go-race:
+    name: Go Race Test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: go/go.mod
+      - name: Run Go tests with race detector
+        working-directory: go
+        run: go test -race -count=1 ./...
+
+  # ─── 5. Rust clippy -D warnings ──────────────────────────────────────
+  rust-clippy:
+    name: Rust Clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Run cargo clippy (default features)
+        working-directory: rust/khaos-core
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Run cargo clippy (no default features)
+        working-directory: rust/khaos-core
+        run: cargo clippy --no-default-features --all-targets -- -D warnings
+
+  # ─── 6. Full Python security suite ───────────────────────────────────
+  full-python-security:
+    name: Full Python Security Suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Run full Python security suite
+        run: python -m pytest python/tests/security/ -q -v
+
+  # ─── 7. Migration fixture matrix ─────────────────────────────────────
+  migration-fixture-matrix:
+    name: Migration Fixture Matrix
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Run migration fixture matrix
+        run: |
+          python -m pytest \
+            python/tests/db/test_versioned_migrations.py \
+            python/tests/db/test_migrations_cli_a_5_2.py \
+            python/tests/db/test_legacy_schema_upgrade_f03.py \
+            -q -v

@@ -9,6 +9,7 @@ mod linux {
     use std::path::PathBuf;
 
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
+    #[allow(dead_code)] // only used on aarch64 targets
     const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
     const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
