@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS agent_turn_events (
 );
 
 CREATE TABLE IF NOT EXISTS chat_stream_events (
+    stream_id    TEXT NOT NULL,
     session_id   TEXT NOT NULL,
     principal_id TEXT NOT NULL,
     project_id   TEXT NOT NULL DEFAULT '',
@@ -88,14 +89,18 @@ CREATE TABLE IF NOT EXISTS chat_stream_events (
     data_json    TEXT NOT NULL DEFAULT '{}',
     is_terminal  INTEGER NOT NULL DEFAULT 0 CHECK(is_terminal IN (0, 1)),
     created_at   REAL NOT NULL,
-    PRIMARY KEY(session_id, sequence),
+    PRIMARY KEY(stream_id, sequence),
     FOREIGN KEY(session_id, principal_id, project_id)
         REFERENCES sessions(id, principal_id, project_id)
 );
 
--- Round-5 Batch 5.2: chat stream state machine main table.
+-- Round-5 Batch 5.2 + Round-6 Batch 6.1: chat stream state machine.
+-- One row PER STREAM (stream_id PK), not per session.
 CREATE TABLE IF NOT EXISTS chat_streams (
-    session_id          TEXT PRIMARY KEY,
+    stream_id           TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL,
+    turn_id             TEXT NOT NULL DEFAULT '',
+    attempt_id          TEXT NOT NULL DEFAULT '',
     principal_id        TEXT NOT NULL,
     project_id          TEXT NOT NULL DEFAULT '',
     status              TEXT NOT NULL DEFAULT 'running'

@@ -66,13 +66,17 @@ async def _make_session(db: Database, session_id: str = "s1") -> None:
     )
 
 
-async def _get_chat_stream_row(db: Database, session_id: str) -> dict | None:
+async def _get_chat_stream_row(db: Database, stream_id: str) -> dict | None:
+    """Round-6 Batch 6.1: lookup is now by ``stream_id`` (one row per
+    stream, not per session).  Tests that previously keyed on
+    ``session_id`` pass the same value as ``stream_id`` so the row is
+    found."""
     conn = db._conn
     cursor = await conn.execute(
-        "SELECT session_id, status, boot_id, runtime_id, lease_until, "
-        "last_sequence, terminal_event_type, started_at, terminal_at "
-        "FROM chat_streams WHERE session_id = ?",
-        (session_id,),
+        "SELECT stream_id, session_id, status, boot_id, runtime_id, "
+        "lease_until, last_sequence, terminal_event_type, started_at, "
+        "terminal_at FROM chat_streams WHERE stream_id = ?",
+        (stream_id,),
     )
     row = await cursor.fetchone()
     await cursor.close()
@@ -91,17 +95,17 @@ async def test_c05_a_terminal_shield_rejects_post_terminal_append(tmp_path):
     try:
         await _make_session(db, "s1")
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
         )
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="done", data={}, now=2.0,
         )
         # Post-terminal append must be rejected.
         with pytest.raises(ChatStreamTerminalError):
             await db.append_chat_stream_event(
-                session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+                stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
                 event_type="message", data={"content": "late"}, now=3.0,
             )
     finally:
@@ -122,18 +126,18 @@ async def test_c05_b_terminal_shield_for_all_terminal_types(
         session_id = f"s-{terminal_type}"
         await _make_session(db, session_id)
         await db.append_chat_stream_event(
-            session_id=session_id, principal_id=PRINCIPAL,
+            stream_id=session_id, session_id=session_id, principal_id=PRINCIPAL,
             project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
         )
         await db.append_chat_stream_event(
-            session_id=session_id, principal_id=PRINCIPAL,
+            stream_id=session_id, session_id=session_id, principal_id=PRINCIPAL,
             project_id=PROJECT_ID,
             event_type=terminal_type, data={}, now=2.0,
         )
         with pytest.raises(ChatStreamTerminalError):
             await db.append_chat_stream_event(
-                session_id=session_id, principal_id=PRINCIPAL,
+                stream_id=session_id, session_id=session_id, principal_id=PRINCIPAL,
                 project_id=PROJECT_ID,
                 event_type="message", data={}, now=3.0,
             )
@@ -152,12 +156,12 @@ async def test_c05_c_cas_exactly_one_terminal_per_stream(tmp_path):
     try:
         await _make_session(db, "s1")
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
         )
         # First terminal succeeds.
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="done", data={}, now=2.0,
         )
         row = await _get_chat_stream_row(db, "s1")
@@ -169,7 +173,7 @@ async def test_c05_c_cas_exactly_one_terminal_per_stream(tmp_path):
         # Second terminal is rejected by the shield.
         with pytest.raises(ChatStreamTerminalError):
             await db.append_chat_stream_event(
-                session_id="s1", principal_id=PRINCIPAL,
+                stream_id="s1", session_id="s1", principal_id=PRINCIPAL,
                 project_id=PROJECT_ID,
                 event_type="error", data={}, now=3.0,
             )
@@ -193,7 +197,7 @@ async def test_c05_d_boot_id_recovery_skips_own_streams(tmp_path):
         boot_id = "boot-current"
         now = time.time()
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now,
             boot_id=boot_id, runtime_id="s1",
             lease_until=now + 300,  # lease still valid
@@ -227,7 +231,7 @@ async def test_c05_e_boot_id_recovery_recovers_other_process(tmp_path):
         now = time.time()
         # Stream created by a PREVIOUS process (different boot_id).
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now,
             boot_id="boot-previous", runtime_id="s1",
             lease_until=now + 300,  # lease still "valid" but wrong boot
@@ -265,7 +269,7 @@ async def test_c05_f_boot_id_recovery_recovers_expired_lease(tmp_path):
         now = time.time()
         # Stream created by the current process, but lease has expired.
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now - 600,
             boot_id=boot_id, runtime_id="s1",
             lease_until=now - 300,  # expired 5 minutes ago
@@ -302,14 +306,14 @@ async def test_c05_g_legacy_recovery_recovers_all(tmp_path):
         now = time.time()
         # s1: current boot_id, valid lease.
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now,
             boot_id="boot-current", runtime_id="s1",
             lease_until=now + 300,
         )
         # s2: different boot_id, expired lease.
         await db.append_chat_stream_event(
-            session_id="s2", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s2", session_id="s2", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now - 600,
             boot_id="boot-previous", runtime_id="s2",
             lease_until=now - 300,
@@ -342,7 +346,7 @@ async def test_c05_h_lease_renewed_on_non_terminal_append(tmp_path):
         t0 = 1000.0
         # First append: lease = t0 + 300.
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=t0,
             boot_id=boot_id, runtime_id="s1",
             lease_until=t0 + 300,
@@ -354,7 +358,7 @@ async def test_c05_h_lease_renewed_on_non_terminal_append(tmp_path):
         # Second append at t0 + 200: lease renewed to t0 + 200 + 300.
         t1 = t0 + 200
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="message", data={"content": "working"}, now=t1,
             boot_id=boot_id, runtime_id="s1",
             lease_until=t1 + 300,
@@ -381,7 +385,7 @@ async def test_c05_i_row_lifecycle_lazy_create_and_terminal(tmp_path):
 
         # First append creates the row with status='running'.
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
             boot_id="boot-1", runtime_id="s1",
             lease_until=301.0,
@@ -398,7 +402,7 @@ async def test_c05_i_row_lifecycle_lazy_create_and_terminal(tmp_path):
 
         # Terminal append transitions to terminal.
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="error", data={"reason": "test"}, now=2.0,
             boot_id="boot-1", runtime_id="s1",
         )
@@ -422,11 +426,11 @@ async def test_c05_j_delete_cascades_to_chat_streams(tmp_path):
         await _make_session(db, "s1")
         await _make_session(db, "s2")
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
         )
         await db.append_chat_stream_event(
-            session_id="s2", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s2", session_id="s2", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=2.0,
         )
         assert await _get_chat_stream_row(db, "s1") is not None
@@ -458,20 +462,20 @@ async def test_c05_k_prune_cascades_to_chat_streams(tmp_path):
 
         # aged: terminal 2 hours ago.
         await db.append_chat_stream_event(
-            session_id="aged", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="aged", session_id="aged", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now - 7200,
         )
         await db.append_chat_stream_event(
-            session_id="aged", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="aged", session_id="aged", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="done", data={}, now=now - 7100,
         )
         # fresh: terminal 10 seconds ago.
         await db.append_chat_stream_event(
-            session_id="fresh", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="fresh", session_id="fresh", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now - 20,
         )
         await db.append_chat_stream_event(
-            session_id="fresh", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="fresh", session_id="fresh", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="done", data={}, now=now - 10,
         )
 
@@ -504,7 +508,7 @@ async def test_c05_l_maintenance_run_once_does_not_recover(tmp_path):
         # Create an inflight stream that WOULD be recovered by the old
         # periodic recovery call.
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=time.time() - 600,
             boot_id="boot-old", lease_until=time.time() - 300,
         )
@@ -537,12 +541,12 @@ async def test_c05_m_recovery_skips_already_terminal_streams(tmp_path):
     try:
         await _make_session(db, "s1")
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
             boot_id="boot-old", lease_until=100.0,
         )
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="done", data={}, now=2.0,
         )
 
@@ -572,7 +576,7 @@ async def test_c05_n_recovery_handles_empty_boot_id_streams(tmp_path):
         await _make_session(db, "s1")
         # Stream created WITHOUT boot_id (empty string default).
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
         )
         # Recovery with any boot_id must recover s1 (empty boot_id is

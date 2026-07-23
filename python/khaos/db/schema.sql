@@ -102,7 +102,11 @@ ON agent_turns(session_id, started_at);
 
 -- Gateway-facing chat events are a durable broadcast log.  Every subscriber
 -- reads independently by sequence; Go never owns or consumes the only copy.
+-- Round-6 Batch 6.1: events are keyed by ``stream_id`` (one per chat RPC
+-- attempt), NOT ``session_id``.  A session can have many streams (one
+-- per turn/attempt); the Terminal invariant is per-stream, not per-session.
 CREATE TABLE IF NOT EXISTS chat_stream_events (
+    stream_id    TEXT NOT NULL,
     session_id   TEXT NOT NULL,
     principal_id TEXT NOT NULL,
     project_id   TEXT NOT NULL DEFAULT '',
@@ -111,19 +115,25 @@ CREATE TABLE IF NOT EXISTS chat_stream_events (
     data_json    TEXT NOT NULL DEFAULT '{}',
     is_terminal  INTEGER NOT NULL DEFAULT 0 CHECK(is_terminal IN (0, 1)),
     created_at   REAL NOT NULL,
-    PRIMARY KEY(session_id, sequence),
+    PRIMARY KEY(stream_id, sequence),
     FOREIGN KEY(session_id, principal_id, project_id)
         REFERENCES sessions(id, principal_id, project_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_stream_events_owner
 ON chat_stream_events(principal_id, project_id, session_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_chat_stream_events_stream
+ON chat_stream_events(stream_id, sequence);
 
--- Round-5 Batch 5.2 (C-05/C-06): Chat stream state machine main table.
--- One row per session that has a chat ledger.  Tracks the stream's
--- lifecycle status, owning boot/runtime, and lease — so recovery can
--- distinguish "crash-left by a previous process" from "actively
--- producing in the current process".
+-- Round-5 Batch 5.2 (C-05/C-06) + Round-6 Batch 6.1: Chat stream state
+-- machine main table.  One row PER STREAM (not per session).  A session
+-- can have many streams over its lifetime — each chat RPC creates a new
+-- stream with its own Terminal lifecycle.  This fixes the Round-5 bug
+-- where a session was permanently locked to 'done' after the first turn,
+-- breaking multi-turn conversations.
+--   stream_id: uuid4().hex, unique per chat RPC attempt.
+--   session_id: the conversation container (many streams per session).
+--   turn_id / attempt_id: optional future-use identifiers.
 --   status: 'running' → exactly one CAS transition to
 --           'done'/'error'/'interrupted' (terminal).
 --   boot_id: uuid4().hex of the process that started this stream.
@@ -131,10 +141,13 @@ ON chat_stream_events(principal_id, project_id, session_id, sequence);
 --                means the owning process is likely dead.
 --   terminal_event_type: which event type terminated the stream
 --                        (NULL while running).
--- Legacy streams (pre-round-5) get a row lazily on first append with
+-- Legacy streams (pre-round-6) get a row lazily on first append with
 -- empty boot_id and NULL lease — recovery treats them as recoverable.
 CREATE TABLE IF NOT EXISTS chat_streams (
-    session_id          TEXT PRIMARY KEY,
+    stream_id           TEXT PRIMARY KEY,
+    session_id          TEXT NOT NULL,
+    turn_id             TEXT NOT NULL DEFAULT '',
+    attempt_id          TEXT NOT NULL DEFAULT '',
     principal_id        TEXT NOT NULL,
     project_id          TEXT NOT NULL DEFAULT '',
     status              TEXT NOT NULL DEFAULT 'running'
@@ -150,6 +163,8 @@ CREATE TABLE IF NOT EXISTS chat_streams (
         REFERENCES sessions(id, principal_id, project_id)
 );
 
+CREATE INDEX IF NOT EXISTS idx_chat_streams_session
+ON chat_streams(session_id);
 CREATE INDEX IF NOT EXISTS idx_chat_streams_boot
 ON chat_streams(boot_id, status);
 CREATE INDEX IF NOT EXISTS idx_chat_streams_status_lease

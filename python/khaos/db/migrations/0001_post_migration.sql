@@ -26,11 +26,15 @@ CREATE INDEX IF NOT EXISTS idx_messages_principal
 CREATE INDEX IF NOT EXISTS idx_agent_turns_session
 ON agent_turns(session_id, started_at);
 
--- chat_stream_events
+-- chat_stream_events (round-6 Batch 6.1: stream_id keyed)
 CREATE INDEX IF NOT EXISTS idx_chat_stream_events_owner
 ON chat_stream_events(principal_id, project_id, session_id, sequence);
+CREATE INDEX IF NOT EXISTS idx_chat_stream_events_stream
+ON chat_stream_events(stream_id, sequence);
 
--- chat_streams (round-5 Batch 5.2)
+-- chat_streams (round-5 Batch 5.2 + round-6 Batch 6.1)
+CREATE INDEX IF NOT EXISTS idx_chat_streams_session
+ON chat_streams(session_id);
 CREATE INDEX IF NOT EXISTS idx_chat_streams_boot
 ON chat_streams(boot_id, status);
 CREATE INDEX IF NOT EXISTS idx_chat_streams_status_lease

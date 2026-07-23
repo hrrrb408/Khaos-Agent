@@ -21,11 +21,11 @@ async def test_chat_events_are_durable_ordered_and_replayable(tmp_path):
     db = await _db(tmp_path)
     try:
         first = await db.append_chat_stream_event(
-            session_id="s1", principal_id="alice", project_id="project-a",
+            stream_id="s1", session_id="s1", principal_id="alice", project_id="project-a",
             event_type="message", data={"content": "one"}, now=1.0,
         )
         second = await db.append_chat_stream_event(
-            session_id="s1", principal_id="alice", project_id="project-a",
+            stream_id="s1", session_id="s1", principal_id="alice", project_id="project-a",
             event_type="done", data={"total_tokens": 1}, now=2.0,
         )
         assert (first, second) == (1, 2)
@@ -44,7 +44,7 @@ async def test_chat_event_owner_tuple_is_database_enforced(tmp_path):
     try:
         with pytest.raises(sqlite3.IntegrityError):
             await db.append_chat_stream_event(
-                session_id="s1", principal_id="bob",
+                stream_id="s1", session_id="s1", principal_id="bob",
                 project_id="project-a", event_type="message",
                 data={"content": "forged"}, now=1.0,
             )
@@ -59,7 +59,7 @@ async def test_inflight_chat_is_closed_durably_on_restart(tmp_path):
     db = await _db(tmp_path)
     try:
         await db.append_chat_stream_event(
-            session_id="s1", principal_id="alice", project_id="project-a",
+            stream_id="s1", session_id="s1", principal_id="alice", project_id="project-a",
             event_type="started", data={"session_id": "s1"}, now=1.0,
         )
         assert await db.recover_inflight_chat_streams(now=2.0) == 1
