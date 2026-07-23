@@ -8,9 +8,11 @@ import hashlib
 import os
 import sqlite3
 import time
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 
 try:
     import aiosqlite
@@ -27,6 +29,16 @@ SCHEMA_MIGRATION_VERSION = 1
 SCHEMA_MIGRATION_NAME = "initial_versioned_schema"
 SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
 SCHEMA_MIGRATION_SALT = "legacy-helper-set-2026-07-22-v1"
+
+# F-01: Transaction owner tracking. When non-None, the current asyncio task
+# owns the active BEGIN IMMEDIATE transaction on the shared connection.
+# Nested ``transaction()`` calls from the same task reuse the outer
+# transaction (no re-BEGIN, no intermediate COMMIT). Direct ``commit()``
+# calls from inner methods become no-ops, preventing cross-domain commit
+#串扰 that could break Permission Epoch / Approval / Chat Event atomicity.
+_current_transaction_owner: ContextVar[asyncio.Task | None] = ContextVar(
+    "khaos_db_transaction_owner", default=None
+)
 
 
 class _AsyncCursor:
@@ -98,11 +110,17 @@ class Database:
     def __init__(self, path: str | Path = "khaos.db"):
         self.path = str(path)
         self._conn: aiosqlite.Connection | None = None
+        # F-01: Per-domain locks remain for logical serialization (e.g. two
+        # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
         self._turn_event_lock = asyncio.Lock()
         self._chat_event_lock = asyncio.Lock()
         self._webhook_replay_lock = asyncio.Lock()
         self._authorization_lock = asyncio.Lock()
+        # F-01: Global write transaction lock. Every write transaction must
+        # acquire this lock, preventing cross-domain ``commit()`` 串扰 on the
+        # shared single connection. Read-only queries do not need this lock.
+        self._write_transaction_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Open the SQLite connection if it is not already open."""
@@ -113,6 +131,71 @@ class Database:
                 self._conn = await aiosqlite.connect(self.path)
                 self._conn.row_factory = aiosqlite.Row
             await self._conn.execute("PRAGMA foreign_keys = ON")
+            # F-01: Enable WAL in connect() (not only in run_migrations) so
+            # that connections that skip migration still get concurrent-read
+            # benefits. busy_timeout prevents immediate SQLITE_BUSY returns
+            # when a write transaction is held by another coroutine.
+            await self._conn.execute("PRAGMA journal_mode = WAL")
+            await self._conn.execute("PRAGMA busy_timeout = 5000")
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[Any]:
+        """Acquire the global write lock and run one atomic transaction.
+
+        F-01 (Critical): The shared SQLite connection has a single writer.
+        Without a global transaction owner, a coroutine in domain A
+        (e.g. permission grant) could have its ``BEGIN IMMEDIATE`` …
+        ``COMMIT`` transaction prematurely committed by a bare ``commit()``
+        in domain B (e.g. audit insert), breaking epoch/rule atomicity.
+
+        This context manager:
+        - Acquires ``_write_transaction_lock`` (outermost call only);
+        - Issues ``BEGIN IMMEDIATE`` (outermost call only);
+        - Sets ``_current_transaction_owner`` so nested ``transaction()``
+          calls from the same task reuse the outer transaction;
+        - Commits on clean exit, rolls back on any exception;
+        - Per-domain locks (e.g. ``_authorization_lock``) should be held
+          *outside* this manager to prevent same-domain logical races.
+
+        Nested calls (same task already owns a transaction) yield the raw
+        connection without re-acquiring the lock or re-issuing BEGIN. The
+        outermost call performs the single COMMIT.
+        """
+        if _current_transaction_owner.get() is not None:
+            # Nested call: reuse the outer transaction. Do NOT commit.
+            conn = await self._require_conn()
+            yield conn
+            return
+
+        conn = await self._require_conn()
+        async with self._write_transaction_lock:
+            token = _current_transaction_owner.set(asyncio.current_task())
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                yield conn
+                await conn.commit()
+            except BaseException:
+                await conn.rollback()
+                raise
+            finally:
+                _current_transaction_owner.reset(token)
+
+    async def _commit_if_owner(self) -> None:
+        """Commit only if the current task is NOT inside a transaction.
+
+        F-01: When called from within ``transaction()``, this is a no-op
+        (the outer transaction owner performs the single COMMIT). When
+        called from a bare write method (not wrapped in ``transaction()``),
+        it commits normally. This prevents inner methods from prematurely
+        committing an outer transaction.
+
+        Prefer wrapping write methods in ``transaction()`` directly. This
+        helper exists for the migration helpers and edge cases where
+        wrapping is not practical.
+        """
+        if _current_transaction_owner.get() is None:
+            conn = await self._require_conn()
+            await conn.commit()
 
     async def close(self) -> None:
         """Close the SQLite connection."""
@@ -1056,18 +1139,17 @@ class Database:
         columns (the row keeps its original owner); callers that need
         to detect the collision should query first.
         """
-        conn = await self._require_conn()
-        await conn.execute(
-            """
-            INSERT INTO sessions (id, mode, principal_id, project_id)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                mode = excluded.mode,
-                updated_at = datetime('now')
-            """,
-            (session_id, mode, principal_id, project_id),
-        )
-        await conn.commit()
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO sessions (id, mode, principal_id, project_id)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    mode = excluded.mode,
+                    updated_at = datetime('now')
+                """,
+                (session_id, mode, principal_id, project_id),
+            )
 
     async def consume_webhook_event(
         self,
@@ -1080,31 +1162,30 @@ class Database:
         """Atomically persist one authenticated webhook event exactly once."""
         if not channel_id or not platform or not event_id:
             return False
-        conn = await self._require_conn()
         async with self._webhook_replay_lock:
             if platform == "telegram":
                 return await self._consume_telegram_update(
-                    conn, channel_id, event_id
+                    channel_id, event_id
                 )
             now = time.time()
-            await conn.execute(
-                "DELETE FROM webhook_replay_events "
-                "WHERE expires_at IS NOT NULL AND expires_at < ?",
-                (now,),
-            )
-            cursor = await conn.execute(
-                """
-                INSERT OR IGNORE INTO webhook_replay_events (
-                    channel_id, platform, event_id, issued_at, expires_at, created_at
-                ) VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (channel_id, platform, event_id, issued_at, expires_at, now),
-            )
-            await conn.commit()
-            return cursor.rowcount == 1
+            async with self.transaction() as conn:
+                await conn.execute(
+                    "DELETE FROM webhook_replay_events "
+                    "WHERE expires_at IS NOT NULL AND expires_at < ?",
+                    (now,),
+                )
+                cursor = await conn.execute(
+                    """
+                    INSERT OR IGNORE INTO webhook_replay_events (
+                        channel_id, platform, event_id, issued_at, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (channel_id, platform, event_id, issued_at, expires_at, now),
+                )
+                return cursor.rowcount == 1
 
     async def _consume_telegram_update(
-        self, conn: aiosqlite.Connection, channel_id: str, event_id: str
+        self, channel_id: str, event_id: str
     ) -> bool:
         try:
             update_id = int(event_id)
@@ -1113,8 +1194,7 @@ class Database:
         if update_id < 0:
             return False
         now = time.time()
-        await conn.execute("BEGIN IMMEDIATE")
-        try:
+        async with self.transaction() as conn:
             cursor = await conn.execute(
                 "SELECT high_water, seen_json FROM webhook_replay_watermarks "
                 "WHERE channel_id = ? AND platform = 'telegram'",
@@ -1142,7 +1222,6 @@ class Database:
                     high_water = max(seen)
             cutoff = high_water - TELEGRAM_REPLAY_WINDOW + 1
             if update_id in seen or (high_water >= 0 and update_id < cutoff):
-                await conn.commit()
                 return False
             high_water = max(high_water, update_id)
             cutoff = high_water - TELEGRAM_REPLAY_WINDOW + 1
@@ -1165,11 +1244,7 @@ class Database:
                 "WHERE channel_id = ? AND platform = 'telegram'",
                 (channel_id,),
             )
-            await conn.commit()
             return True
-        except Exception:
-            await conn.rollback()
-            raise
 
     async def insert_message(
         self,
@@ -1191,32 +1266,31 @@ class Database:
         Production callers pass ``AgentLoop.project_id`` (plumbed from
         ``RuntimeConfig.project_id``).
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            INSERT INTO messages (
-                session_id, role, content, tool_calls, tool_call_id,
-                token_count, principal_id, project_id
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO messages (
+                    session_id, role, content, tool_calls, tool_call_id,
+                    token_count, principal_id, project_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    message.role,
+                    message.content,
+                    json.dumps(message.tool_calls),
+                    message.tool_call_id,
+                    message.token_count,
+                    principal_id,
+                    project_id,
+                ),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                session_id,
-                message.role,
-                message.content,
-                json.dumps(message.tool_calls),
-                message.tool_call_id,
-                message.token_count,
-                principal_id,
-                project_id,
-            ),
-        )
-        await conn.execute(
-            "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
-            (session_id,),
-        )
-        await conn.commit()
-        return int(cursor.lastrowid)
+            await conn.execute(
+                "UPDATE sessions SET updated_at = datetime('now') WHERE id = ?",
+                (session_id,),
+            )
+            return int(cursor.lastrowid)
 
     async def list_messages(
         self,
@@ -1267,18 +1341,17 @@ class Database:
 
     async def set_config(self, key: str, value: Any) -> None:
         """Persist a JSON configuration value."""
-        conn = await self._require_conn()
-        await conn.execute(
-            """
-            INSERT INTO user_config (key, value)
-            VALUES (?, ?)
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = datetime('now')
-            """,
-            (key, json.dumps(value)),
-        )
-        await conn.commit()
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO user_config (key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value,
+                    updated_at = datetime('now')
+                """,
+                (key, json.dumps(value)),
+            )
 
     async def get_config(self, key: str, default: Any = None) -> Any:
         """Read a JSON configuration value."""
@@ -1331,18 +1404,17 @@ class Database:
         When ``session_id`` is empty, sets the principal's default
         mode.  When non-empty, sets a session-specific override.
         """
-        conn = await self._require_conn()
-        await conn.execute(
-            """
-            INSERT INTO principal_modes (principal_id, session_id, mode)
-            VALUES (?, ?, ?)
-            ON CONFLICT(principal_id, session_id) DO UPDATE SET
-                mode = excluded.mode,
-                updated_at = datetime('now')
-            """,
-            (principal_id, session_id, mode),
-        )
-        await conn.commit()
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO principal_modes (principal_id, session_id, mode)
+                VALUES (?, ?, ?)
+                ON CONFLICT(principal_id, session_id) DO UPDATE SET
+                    mode = excluded.mode,
+                    updated_at = datetime('now')
+                """,
+                (principal_id, session_id, mode),
+            )
 
     async def insert_permission_rule(
         self,
@@ -1364,58 +1436,50 @@ class Database:
         them get ``principal_id='legacy'`` — the rule is stored but
         never matched by authenticated principals.
         """
-        conn = await self._require_conn()
-        await self._authorization_lock.acquire()
-        try:
-            await conn.execute("BEGIN IMMEDIATE")
-            row = await self._authorization_context_row(
-                conn, principal_id, project_id
-            )
-            if row is None:
-                epoch = 1
-                await conn.execute(
-                    "INSERT INTO authorization_contexts "
-                    "(principal_id, project_id, policy_digest, epoch) "
-                    "VALUES (?, ?, ?, ?)",
-                    (principal_id, project_id, policy_digest, epoch),
+        async with self._authorization_lock:
+            async with self.transaction() as conn:
+                row = await self._authorization_context_row(
+                    conn, principal_id, project_id
                 )
-            else:
-                if str(row["policy_digest"]) != policy_digest:
-                    raise ValueError(
-                        "permission grant policy digest does not match the "
-                        "authoritative authorization context"
+                if row is None:
+                    epoch = 1
+                    await conn.execute(
+                        "INSERT INTO authorization_contexts "
+                        "(principal_id, project_id, policy_digest, epoch) "
+                        "VALUES (?, ?, ?, ?)",
+                        (principal_id, project_id, policy_digest, epoch),
                     )
-                epoch = int(row["epoch"]) + 1
+                else:
+                    if str(row["policy_digest"]) != policy_digest:
+                        raise ValueError(
+                            "permission grant policy digest does not match the "
+                            "authoritative authorization context"
+                        )
+                    epoch = int(row["epoch"]) + 1
+                    await conn.execute(
+                        "UPDATE authorization_contexts SET epoch = ?, "
+                        "updated_at = datetime('now') "
+                        "WHERE principal_id = ? AND project_id = ?",
+                        (epoch, principal_id, project_id),
+                    )
                 await conn.execute(
-                    "UPDATE authorization_contexts SET epoch = ?, "
-                    "updated_at = datetime('now') "
-                    "WHERE principal_id = ? AND project_id = ?",
-                    (epoch, principal_id, project_id),
+                    "UPDATE permissions SET generation = ? "
+                    "WHERE principal_id = ? AND project_id = ? "
+                    "AND policy_digest = ?",
+                    (epoch, principal_id, project_id, policy_digest),
                 )
-            await conn.execute(
-                "UPDATE permissions SET generation = ? "
-                "WHERE principal_id = ? AND project_id = ? "
-                "AND policy_digest = ?",
-                (epoch, principal_id, project_id, policy_digest),
-            )
-            cursor = await conn.execute(
-                """
-                INSERT INTO permissions (
-                    pattern, permission_level, approval, mode,
-                    principal_id, project_id, policy_digest, generation
+                cursor = await conn.execute(
+                    """
+                    INSERT INTO permissions (
+                        pattern, permission_level, approval, mode,
+                        principal_id, project_id, policy_digest, generation
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (pattern, permission_level, approval, mode,
+                     principal_id, project_id, policy_digest, epoch),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (pattern, permission_level, approval, mode,
-                 principal_id, project_id, policy_digest, epoch),
-            )
-            await conn.commit()
-            return int(cursor.lastrowid)
-        except BaseException:
-            await conn.rollback()
-            raise
-        finally:
-            self._authorization_lock.release()
+                return int(cursor.lastrowid)
 
     async def list_permission_rules(
         self,
@@ -1480,87 +1544,70 @@ class Database:
         """
         conn = await self._require_conn()
         if principal_id is None or project_id is None or policy_digest is None:
-            cursor = await conn.execute(
-                "DELETE FROM permissions WHERE id = ?"
-                + (" AND principal_id = ?" if principal_id is not None else ""),
-                (rule_id, principal_id) if principal_id is not None else (rule_id,),
-            )
-            await conn.commit()
-            return cursor.rowcount or 0
-        await self._authorization_lock.acquire()
-        try:
-            await conn.execute("BEGIN IMMEDIATE")
-            row = await self._authorization_context_row(
-                conn, principal_id, project_id
-            )
-            if row is None or str(row["policy_digest"]) != policy_digest:
-                await conn.rollback()
-                return 0
-            cursor = await conn.execute(
-                "DELETE FROM permissions WHERE id = ? AND principal_id = ? "
-                "AND project_id = ? AND policy_digest = ?",
-                (rule_id, principal_id, project_id, policy_digest),
-            )
-            if not (cursor.rowcount or 0):
-                await conn.rollback()
-                return 0
-            epoch = int(row["epoch"]) + 1
-            await conn.execute(
-                "UPDATE authorization_contexts SET epoch = ?, "
-                "updated_at = datetime('now') "
-                "WHERE principal_id = ? AND project_id = ?",
-                (epoch, principal_id, project_id),
-            )
-            await conn.execute(
-                "UPDATE permissions SET generation = ? "
-                "WHERE principal_id = ? AND project_id = ? "
-                "AND policy_digest = ?",
-                (epoch, principal_id, project_id, policy_digest),
-            )
-            await conn.commit()
-            return cursor.rowcount or 0
-        except BaseException:
-            await conn.rollback()
-            raise
-        finally:
-            self._authorization_lock.release()
+            async with self.transaction() as conn:
+                cursor = await conn.execute(
+                    "DELETE FROM permissions WHERE id = ?"
+                    + (" AND principal_id = ?" if principal_id is not None else ""),
+                    (rule_id, principal_id) if principal_id is not None else (rule_id,),
+                )
+                return cursor.rowcount or 0
+        async with self._authorization_lock:
+            async with self.transaction() as conn:
+                row = await self._authorization_context_row(
+                    conn, principal_id, project_id
+                )
+                if row is None or str(row["policy_digest"]) != policy_digest:
+                    return 0
+                cursor = await conn.execute(
+                    "DELETE FROM permissions WHERE id = ? AND principal_id = ? "
+                    "AND project_id = ? AND policy_digest = ?",
+                    (rule_id, principal_id, project_id, policy_digest),
+                )
+                if not (cursor.rowcount or 0):
+                    return 0
+                epoch = int(row["epoch"]) + 1
+                await conn.execute(
+                    "UPDATE authorization_contexts SET epoch = ?, "
+                    "updated_at = datetime('now') "
+                    "WHERE principal_id = ? AND project_id = ?",
+                    (epoch, principal_id, project_id),
+                )
+                await conn.execute(
+                    "UPDATE permissions SET generation = ? "
+                    "WHERE principal_id = ? AND project_id = ? "
+                    "AND policy_digest = ?",
+                    (epoch, principal_id, project_id, policy_digest),
+                )
+                return cursor.rowcount or 0
 
     async def bind_authorization_context(
         self, principal_id: str, project_id: str, policy_digest: str
     ) -> int:
         """Bind the current policy, bumping epoch when the digest changes."""
-        conn = await self._require_conn()
-        await self._authorization_lock.acquire()
-        try:
-            await conn.execute("BEGIN IMMEDIATE")
-            row = await self._authorization_context_row(
-                conn, principal_id, project_id
-            )
-            if row is None:
-                epoch = 1
-                await conn.execute(
-                    "INSERT INTO authorization_contexts "
-                    "(principal_id, project_id, policy_digest, epoch) "
-                    "VALUES (?, ?, ?, ?)",
-                    (principal_id, project_id, policy_digest, epoch),
+        async with self._authorization_lock:
+            async with self.transaction() as conn:
+                row = await self._authorization_context_row(
+                    conn, principal_id, project_id
                 )
-            elif str(row["policy_digest"]) == policy_digest:
-                epoch = int(row["epoch"])
-            else:
-                epoch = int(row["epoch"]) + 1
-                await conn.execute(
-                    "UPDATE authorization_contexts SET policy_digest = ?, "
-                    "epoch = ?, updated_at = datetime('now') "
-                    "WHERE principal_id = ? AND project_id = ?",
-                    (policy_digest, epoch, principal_id, project_id),
-                )
-            await conn.commit()
-            return epoch
-        except BaseException:
-            await conn.rollback()
-            raise
-        finally:
-            self._authorization_lock.release()
+                if row is None:
+                    epoch = 1
+                    await conn.execute(
+                        "INSERT INTO authorization_contexts "
+                        "(principal_id, project_id, policy_digest, epoch) "
+                        "VALUES (?, ?, ?, ?)",
+                        (principal_id, project_id, policy_digest, epoch),
+                    )
+                elif str(row["policy_digest"]) == policy_digest:
+                    epoch = int(row["epoch"])
+                else:
+                    epoch = int(row["epoch"]) + 1
+                    await conn.execute(
+                        "UPDATE authorization_contexts SET policy_digest = ?, "
+                        "epoch = ?, updated_at = datetime('now') "
+                        "WHERE principal_id = ? AND project_id = ?",
+                        (policy_digest, epoch, principal_id, project_id),
+                    )
+                return epoch
 
     async def get_authorization_context(
         self, principal_id: str, project_id: str
@@ -1615,24 +1662,23 @@ class Database:
         pass ``AuditLogger._project_id`` (plumbed from
         ``RuntimeConfig.project_id`` or ``agent._bound_project_id``).
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            INSERT INTO audit_log (
-                action, target, result, detail, session_id,
-                principal_id, runtime_id, task_id, operation_id,
-                policy_digest, authority_generation, source_transport,
-                project_id
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO audit_log (
+                    action, target, result, detail, session_id,
+                    principal_id, runtime_id, task_id, operation_id,
+                    policy_digest, authority_generation, source_transport,
+                    project_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (action, target, result, detail, session_id,
+                 principal_id, runtime_id, task_id, operation_id,
+                 policy_digest, authority_generation, source_transport,
+                 project_id),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (action, target, result, detail, session_id,
-             principal_id, runtime_id, task_id, operation_id,
-             policy_digest, authority_generation, source_transport,
-             project_id),
-        )
-        await conn.commit()
-        return int(cursor.lastrowid)
+            return int(cursor.lastrowid)
 
     async def list_audit_logs(self) -> list[dict[str, Any]]:
         """Return audit logs in insertion order."""
@@ -1732,34 +1778,33 @@ class Database:
         memory is bound to a project, a later upsert from a different
         project cannot re-stamp it).
         """
-        conn = await self._require_conn()
-        await conn.execute(
-            """
-            INSERT INTO memories (
-                scope, key, value, ttl, confidence,
-                principal_id, namespace, session_id, project_id
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO memories (
+                    scope, key, value, ttl, confidence,
+                    principal_id, namespace, session_id, project_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(namespace, principal_id, session_id, scope, key) DO UPDATE SET
+                    value = excluded.value,
+                    ttl = excluded.ttl,
+                    confidence = excluded.confidence,
+                    updated_at = datetime('now')
+                """,
+                (scope, key, value, ttl, confidence,
+                 principal_id, namespace, session_id, project_id),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(namespace, principal_id, session_id, scope, key) DO UPDATE SET
-                value = excluded.value,
-                ttl = excluded.ttl,
-                confidence = excluded.confidence,
-                updated_at = datetime('now')
-            """,
-            (scope, key, value, ttl, confidence,
-             principal_id, namespace, session_id, project_id),
-        )
-        await conn.commit()
-        cursor = await conn.execute(
-            """
-            SELECT id FROM memories
-            WHERE namespace = ? AND principal_id = ? AND session_id = ?
-              AND scope = ? AND key = ?
-            """,
-            (namespace, principal_id, session_id, scope, key),
-        )
-        row = await cursor.fetchone()
-        return int(row["id"])
+            cursor = await conn.execute(
+                """
+                SELECT id FROM memories
+                WHERE namespace = ? AND principal_id = ? AND session_id = ?
+                  AND scope = ? AND key = ?
+                """,
+                (namespace, principal_id, session_id, scope, key),
+            )
+            row = await cursor.fetchone()
+            return int(row["id"])
 
     async def get_memory(
         self,
@@ -1795,16 +1840,15 @@ class Database:
         session_id: str = "",
     ) -> None:
         """Delete one memory by (namespace, principal_id, session_id, scope, key)."""
-        conn = await self._require_conn()
-        await conn.execute(
-            """
-            DELETE FROM memories
-            WHERE namespace = ? AND principal_id = ? AND session_id = ?
-              AND scope = ? AND key = ?
-            """,
-            (namespace, principal_id, session_id, scope, key),
-        )
-        await conn.commit()
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                DELETE FROM memories
+                WHERE namespace = ? AND principal_id = ? AND session_id = ?
+                  AND scope = ? AND key = ?
+                """,
+                (namespace, principal_id, session_id, scope, key),
+            )
 
     async def delete_memory_by_id(
         self, memory_id: int, *, principal_id: str | None = None,
@@ -1816,20 +1860,19 @@ class Database:
         deletion.  ``principal_id=None`` (the default) preserves the
         legacy unscoped behavior for internal/admin callers.
         """
-        conn = await self._require_conn()
-        if principal_id is None:
-            await conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-        else:
-            # Principal-scoped: only delete if the memory belongs to
-            # this principal OR is project-shared (principal_id='').
-            await conn.execute(
-                """
-                DELETE FROM memories
-                WHERE id = ? AND (principal_id = ? OR principal_id = '')
-                """,
-                (memory_id, principal_id),
-            )
-        await conn.commit()
+        async with self.transaction() as conn:
+            if principal_id is None:
+                await conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
+            else:
+                # Principal-scoped: only delete if the memory belongs to
+                # this principal OR is project-shared (principal_id='').
+                await conn.execute(
+                    """
+                    DELETE FROM memories
+                    WHERE id = ? AND (principal_id = ? OR principal_id = '')
+                    """,
+                    (memory_id, principal_id),
+                )
 
     async def list_memories(
         self,
@@ -1920,16 +1963,15 @@ class Database:
 
     async def touch_memory(self, memory_id: int) -> None:
         """Increment memory access frequency."""
-        conn = await self._require_conn()
-        await conn.execute(
-            """
-            UPDATE memories
-            SET access_freq = access_freq + 1, updated_at = datetime('now')
-            WHERE id = ?
-            """,
-            (memory_id,),
-        )
-        await conn.commit()
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                UPDATE memories
+                SET access_freq = access_freq + 1, updated_at = datetime('now')
+                WHERE id = ?
+                """,
+                (memory_id,),
+            )
 
     async def insert_subagent_task(
         self,
@@ -1957,21 +1999,20 @@ class Database:
         counter).  Callers that legitimately need to update an existing
         row use ``update_subagent_task``.
         """
-        conn = await self._require_conn()
-        await self._ensure_subagent_tasks_principal_column()
-        await conn.execute(
-            """
-            INSERT INTO subagent_tasks (
-                id, parent_session_id, goal, context, tools, status,
-                principal_id, project_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                task_id, parent_session_id, goal, context, tools, status,
-                principal_id, project_id,
-            ),
-        )
-        await conn.commit()
+        async with self.transaction() as conn:
+            await self._ensure_subagent_tasks_principal_column()
+            await conn.execute(
+                """
+                INSERT INTO subagent_tasks (
+                    id, parent_session_id, goal, context, tools, status,
+                    principal_id, project_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    task_id, parent_session_id, goal, context, tools, status,
+                    principal_id, project_id,
+                ),
+            )
 
     async def update_subagent_task(
         self,
@@ -1994,18 +2035,17 @@ class Database:
         returned OK — but the DB had no row at all, so the task
         vanished from every later query.
         """
-        conn = await self._require_conn()
-        finished_expr = "datetime('now')" if finished else "finished_at"
-        cursor = await conn.execute(
-            f"""
-            UPDATE subagent_tasks
-            SET status = ?, result = ?, error = ?, finished_at = {finished_expr}
-            WHERE id = ?
-            """,
-            (status, result, error, task_id),
-        )
-        await conn.commit()
-        return cursor.rowcount or 0
+        async with self.transaction() as conn:
+            finished_expr = "datetime('now')" if finished else "finished_at"
+            cursor = await conn.execute(
+                f"""
+                UPDATE subagent_tasks
+                SET status = ?, result = ?, error = ?, finished_at = {finished_expr}
+                WHERE id = ?
+                """,
+                (status, result, error, task_id),
+            )
+            return cursor.rowcount or 0
 
     async def list_subagent_tasks(self, principal_id: str | None = None) -> list[dict[str, Any]]:
         """List subagent tasks.
@@ -2094,23 +2134,22 @@ class Database:
         project identity closure (same owner-preserving policy —
         ``ON CONFLICT`` does NOT touch ``project_id``).
         """
-        conn = await self._require_conn()
-        await conn.execute(
-            """
-            INSERT INTO session_bookmarks
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO session_bookmarks
+                    (session_id, name, description, mode, project_root, summary,
+                     principal_id, project_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, name) DO UPDATE SET
+                    description  = excluded.description,
+                    mode         = excluded.mode,
+                    project_root = excluded.project_root,
+                    summary      = excluded.summary
+                """,
                 (session_id, name, description, mode, project_root, summary,
-                 principal_id, project_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(session_id, name) DO UPDATE SET
-                description  = excluded.description,
-                mode         = excluded.mode,
-                project_root = excluded.project_root,
-                summary      = excluded.summary
-            """,
-            (session_id, name, description, mode, project_root, summary,
-             principal_id, project_id),
-        )
-        await conn.commit()
+                 principal_id, project_id),
+            )
 
     async def load_bookmark(
         self,
@@ -2198,20 +2237,19 @@ class Database:
         deletion.  ``principal_id=None`` (default) preserves the legacy
         unscoped behavior for admin callers.
         """
-        conn = await self._require_conn()
-        if principal_id is None:
-            await conn.execute(
-                "DELETE FROM session_bookmarks "
-                "WHERE session_id = ? AND name = ?",
-                (session_id, name),
-            )
-        else:
-            await conn.execute(
-                "DELETE FROM session_bookmarks "
-                "WHERE session_id = ? AND name = ? AND principal_id = ?",
-                (session_id, name, principal_id),
-            )
-        await conn.commit()
+        async with self.transaction() as conn:
+            if principal_id is None:
+                await conn.execute(
+                    "DELETE FROM session_bookmarks "
+                    "WHERE session_id = ? AND name = ?",
+                    (session_id, name),
+                )
+            else:
+                await conn.execute(
+                    "DELETE FROM session_bookmarks "
+                    "WHERE session_id = ? AND name = ? AND principal_id = ?",
+                    (session_id, name, principal_id),
+                )
 
     async def _ensure_sessions_metadata_column(self, column: str) -> None:
         """幂等地为 sessions 表增加一个 TEXT 列（如 summary / changed_files）。
@@ -2232,15 +2270,14 @@ class Database:
         summary 列不存在则 ALTER TABLE 添加（幂等迁移）。同时合并写入
         metadata JSON 的 summary 字段，保持向后兼容。
         """
-        conn = await self._require_conn()
-        await self._ensure_sessions_metadata_column("summary")
-        await conn.execute(
-            "UPDATE sessions SET summary = ?, updated_at = datetime('now') WHERE id = ?",
-            (summary, session_id),
-        )
-        # 同步到 metadata JSON，便于旧读取路径访问
-        await self._merge_session_metadata(session_id, {"summary": summary})
-        await conn.commit()
+        async with self.transaction() as conn:
+            await self._ensure_sessions_metadata_column("summary")
+            await conn.execute(
+                "UPDATE sessions SET summary = ?, updated_at = datetime('now') WHERE id = ?",
+                (summary, session_id),
+            )
+            # 同步到 metadata JSON，便于旧读取路径访问
+            await self._merge_session_metadata(session_id, {"summary": summary})
 
     async def get_session_summary(self, session_id: str) -> str | None:
         """读取会话摘要。优先读 summary 列，回退到 metadata JSON。"""
@@ -2267,9 +2304,8 @@ class Database:
         与 summary 共存于一个 JSON metadata 字段中，结构：
         ``{"summary": "...", "changed_files": ["path1", "path2"]}``
         """
-        conn = await self._require_conn()
-        await self._merge_session_metadata(session_id, {"changed_files": list(files)})
-        await conn.commit()
+        async with self.transaction() as conn:
+            await self._merge_session_metadata(session_id, {"changed_files": list(files)})
 
     async def get_session_changes(self, session_id: str) -> list[str]:
         """读取会话修改的文件列表。"""
@@ -2352,22 +2388,21 @@ class Database:
 
         if not principal_id:
             raise ValueError("principal_id is required for scheduled task creation")
-        conn = await self._require_conn()
-        task_id = uuid.uuid4().hex[:12]
-        schedule_json = json.dumps(_schedule_to_dict(schedule), ensure_ascii=False)
-        meta_json = json.dumps(meta or {}, ensure_ascii=False)
-        await conn.execute(
-            """
-            INSERT INTO scheduled_tasks
-                (id, name, prompt, status, schedule_config, deliver_to, meta,
-                 principal_id, next_run, project_id, policy_digest)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (task_id, name, prompt, status, schedule_json, deliver_to, meta_json,
-             principal_id, next_run, project_id, policy_digest),
-        )
-        await conn.commit()
-        return task_id
+        async with self.transaction() as conn:
+            task_id = uuid.uuid4().hex[:12]
+            schedule_json = json.dumps(_schedule_to_dict(schedule), ensure_ascii=False)
+            meta_json = json.dumps(meta or {}, ensure_ascii=False)
+            await conn.execute(
+                """
+                INSERT INTO scheduled_tasks
+                    (id, name, prompt, status, schedule_config, deliver_to, meta,
+                     principal_id, next_run, project_id, policy_digest)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (task_id, name, prompt, status, schedule_json, deliver_to, meta_json,
+                 principal_id, next_run, project_id, policy_digest),
+            )
+            return task_id
 
     async def update_scheduled_task_status(
         self, task_id: str, status: str, bump_version: bool = False,
@@ -2379,20 +2414,19 @@ class Database:
         such task).  Used by control operations (pause / resume / remove)
         which always win over stale executor writes.
         """
-        conn = await self._require_conn()
-        if bump_version:
-            cursor = await conn.execute(
-                "UPDATE scheduled_tasks SET status = ?, "
-                "lifecycle_version = lifecycle_version + 1 WHERE id = ?",
-                (status, task_id),
-            )
-        else:
-            cursor = await conn.execute(
-                "UPDATE scheduled_tasks SET status = ? WHERE id = ?",
-                (status, task_id),
-            )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            if bump_version:
+                cursor = await conn.execute(
+                    "UPDATE scheduled_tasks SET status = ?, "
+                    "lifecycle_version = lifecycle_version + 1 WHERE id = ?",
+                    (status, task_id),
+                )
+            else:
+                cursor = await conn.execute(
+                    "UPDATE scheduled_tasks SET status = ? WHERE id = ?",
+                    (status, task_id),
+                )
+            return cursor.rowcount
 
     async def update_scheduled_task(
         self,
@@ -2412,31 +2446,30 @@ class Database:
         ``lifecycle_version``.  Used by control operations which always
         win over stale executor writes.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        for col, val in [
-            ("status", status),
-            ("last_run", last_run),
-            ("next_run", next_run),
-            ("run_count", run_count),
-            ("last_result", last_result),
-            ("error", error),
-        ]:
-            if val is not None:
-                clauses.append(f"{col} = ?")
-                params.append(val)
-        if bump_version:
-            clauses.append("lifecycle_version = lifecycle_version + 1")
-        if not clauses:
-            return 1
-        params.append(task_id)
-        cursor = await conn.execute(
-            f"UPDATE scheduled_tasks SET {', '.join(clauses)} WHERE id = ?",
-            tuple(params),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            clauses: list[str] = []
+            params: list[Any] = []
+            for col, val in [
+                ("status", status),
+                ("last_run", last_run),
+                ("next_run", next_run),
+                ("run_count", run_count),
+                ("last_result", last_result),
+                ("error", error),
+            ]:
+                if val is not None:
+                    clauses.append(f"{col} = ?")
+                    params.append(val)
+            if bump_version:
+                clauses.append("lifecycle_version = lifecycle_version + 1")
+            if not clauses:
+                return 1
+            params.append(task_id)
+            cursor = await conn.execute(
+                f"UPDATE scheduled_tasks SET {', '.join(clauses)} WHERE id = ?",
+                tuple(params),
+            )
+            return cursor.rowcount
 
     async def update_scheduled_task_conditional(
         self,
@@ -2471,38 +2504,37 @@ class Database:
         appeared stuck at its pre-execution ``next_run``, and a process
         restart could re-fire the task immediately.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        for col, val in [
-            ("status", status),
-            ("last_run", last_run),
-            ("next_run", next_run),
-            ("run_count", run_count),
-            ("last_result", last_result),
-            ("error", error),
-        ]:
-            if val is not None:
-                clauses.append(f"{col} = ?")
-                params.append(val)
-        # HIGH (batch 3.1.9): NO version bump here — only the WHERE
-        # clause checks the version.  Control ops bump the version;
-        # executor writes only check it.
-        # HIGH-3 (batch 3.1.8): WHERE clause is ``id = ? AND
-        # lifecycle_version = ?`` — params MUST be in that order
-        # (task_id first, then expected_version).  A previous version
-        # had these reversed, which made every conditional UPDATE
-        # match 0 rows (id column received an int, lifecycle_version
-        # received a string) — silently discarding every executor
-        # terminal write as a "version mismatch".
-        params.extend([task_id, expected_version])
-        cursor = await conn.execute(
-            f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
-            f"WHERE id = ? AND lifecycle_version = ?",
-            tuple(params),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            clauses: list[str] = []
+            params: list[Any] = []
+            for col, val in [
+                ("status", status),
+                ("last_run", last_run),
+                ("next_run", next_run),
+                ("run_count", run_count),
+                ("last_result", last_result),
+                ("error", error),
+            ]:
+                if val is not None:
+                    clauses.append(f"{col} = ?")
+                    params.append(val)
+            # HIGH (batch 3.1.9): NO version bump here — only the WHERE
+            # clause checks the version.  Control ops bump the version;
+            # executor writes only check it.
+            # HIGH-3 (batch 3.1.8): WHERE clause is ``id = ? AND
+            # lifecycle_version = ?`` — params MUST be in that order
+            # (task_id first, then expected_version).  A previous version
+            # had these reversed, which made every conditional UPDATE
+            # match 0 rows (id column received an int, lifecycle_version
+            # received a string) — silently discarding every executor
+            # terminal write as a "version mismatch".
+            params.extend([task_id, expected_version])
+            cursor = await conn.execute(
+                f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
+                f"WHERE id = ? AND lifecycle_version = ?",
+                tuple(params),
+            )
+            return cursor.rowcount
 
     async def list_scheduled_tasks(
         self, *, principal_id: str | None = None,
@@ -2599,18 +2631,17 @@ class Database:
         stable across multiple sequential executions of a recurring
         task.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            UPDATE scheduled_tasks
-            SET status = 'running', execution_id = ?, lease_until = ?,
-                last_run = ?
-            WHERE id = ? AND status = 'pending' AND lifecycle_version = ?
-            """,
-            (execution_id, lease_until, started_at, task_id, expected_version),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status = 'running', execution_id = ?, lease_until = ?,
+                    last_run = ?
+                WHERE id = ? AND status = 'pending' AND lifecycle_version = ?
+                """,
+                (execution_id, lease_until, started_at, task_id, expected_version),
+            )
+            return cursor.rowcount
 
     async def clear_scheduled_task_lease(
         self, task_id: str, *, execution_id: str,
@@ -2625,17 +2656,16 @@ class Database:
 
         Returns rowcount (1 = cleared, 0 = execution_id mismatch).
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            UPDATE scheduled_tasks
-            SET execution_id = NULL, lease_until = NULL
-            WHERE id = ? AND execution_id = ?
-            """,
-            (task_id, execution_id),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET execution_id = NULL, lease_until = NULL
+                WHERE id = ? AND execution_id = ?
+                """,
+                (task_id, execution_id),
+            )
+            return cursor.rowcount
 
     async def recover_expired_leases(self, *, now_iso: str) -> int:
         """Mark tasks with expired leases as FAILED (durable at-least-once disclosure).
@@ -2657,21 +2687,20 @@ class Database:
 
         Returns the number of tasks recovered.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            UPDATE scheduled_tasks
-            SET status = 'failed', error = 'execution lease expired '
-                || '(process crash during execution; at-least-once disclosure)',
-                execution_id = NULL, lease_until = NULL,
-                lifecycle_version = lifecycle_version + 1
-            WHERE status = 'running' AND lease_until IS NOT NULL
-                  AND lease_until < ?
-            """,
-            (now_iso,),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status = 'failed', error = 'execution lease expired '
+                    || '(process crash during execution; at-least-once disclosure)',
+                    execution_id = NULL, lease_until = NULL,
+                    lifecycle_version = lifecycle_version + 1
+                WHERE status = 'running' AND lease_until IS NOT NULL
+                      AND lease_until < ?
+                """,
+                (now_iso,),
+            )
+            return cursor.rowcount
 
     async def recover_all_running_tasks(self) -> int:
         """M4 batch 3.1.12 (HIGH-1): mark ALL running tasks as FAILED.
@@ -2700,21 +2729,20 @@ class Database:
 
         Returns the number of tasks recovered.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            UPDATE scheduled_tasks
-            SET status = 'failed',
-                error = 'process restart detected - task was running '
-                        || 'at startup; single-instance model treats '
-                        || 'this as a crash (at-least-once disclosure)',
-                execution_id = NULL, lease_until = NULL,
-                lifecycle_version = lifecycle_version + 1
-            WHERE status = 'running'
-            """
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status = 'failed',
+                    error = 'process restart detected - task was running '
+                            || 'at startup; single-instance model treats '
+                            || 'this as a crash (at-least-once disclosure)',
+                    execution_id = NULL, lease_until = NULL,
+                    lifecycle_version = lifecycle_version + 1
+                WHERE status = 'running'
+                """
+            )
+            return cursor.rowcount
 
     async def query_running_task_ids(self) -> list[str]:
         """M4 batch 3.1.13 (CRITICAL-2): query task IDs with
@@ -2769,22 +2797,21 @@ class Database:
         periodic sweep AFTER the live executor has been cancelled and
         bounded-awaited.  Returns ``True`` if the row was updated.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            UPDATE scheduled_tasks
-            SET status = 'failed', error = 'execution lease expired '
-                || '(periodic sweep; live executor revoked; '
-                || 'at-least-once disclosure)',
-                execution_id = NULL, lease_until = NULL,
-                lifecycle_version = lifecycle_version + 1
-            WHERE id = ? AND status = 'running'
-                  AND lease_until IS NOT NULL AND lease_until < ?
-            """,
-            (task_id, now_iso),
-        )
-        await conn.commit()
-        return cursor.rowcount == 1
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE scheduled_tasks
+                SET status = 'failed', error = 'execution lease expired '
+                    || '(periodic sweep; live executor revoked; '
+                    || 'at-least-once disclosure)',
+                    execution_id = NULL, lease_until = NULL,
+                    lifecycle_version = lifecycle_version + 1
+                WHERE id = ? AND status = 'running'
+                      AND lease_until IS NOT NULL AND lease_until < ?
+                """,
+                (task_id, now_iso),
+            )
+            return cursor.rowcount == 1
 
     async def finalize_scheduled_task(
         self,
@@ -2821,33 +2848,32 @@ class Database:
                 discarded).  The lease is NOT cleared in this case —
                 the caller must leave it intact for restart recovery.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = [
-            "status = ?",
-            "execution_id = NULL",
-            "lease_until = NULL",
-        ]
-        params: list[Any] = [status]
-        for col, val in [
-            ("last_run", last_run),
-            ("next_run", next_run),
-            ("run_count", run_count),
-            ("last_result", last_result),
-            ("error", error),
-        ]:
-            if val is not None:
-                clauses.append(f"{col} = ?")
-                params.append(val)
-        # NO version bump — executor terminal writes never bump the
-        # version (only control operations do).
-        params.extend([task_id, execution_id, expected_version])
-        cursor = await conn.execute(
-            f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
-            f"WHERE id = ? AND execution_id = ? AND lifecycle_version = ?",
-            tuple(params),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            clauses: list[str] = [
+                "status = ?",
+                "execution_id = NULL",
+                "lease_until = NULL",
+            ]
+            params: list[Any] = [status]
+            for col, val in [
+                ("last_run", last_run),
+                ("next_run", next_run),
+                ("run_count", run_count),
+                ("last_result", last_result),
+                ("error", error),
+            ]:
+                if val is not None:
+                    clauses.append(f"{col} = ?")
+                    params.append(val)
+            # NO version bump — executor terminal writes never bump the
+            # version (only control operations do).
+            params.extend([task_id, execution_id, expected_version])
+            cursor = await conn.execute(
+                f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
+                f"WHERE id = ? AND execution_id = ? AND lifecycle_version = ?",
+                tuple(params),
+            )
+            return cursor.rowcount
 
     async def control_update_scheduled_task(
         self,
@@ -2897,27 +2923,26 @@ class Database:
 
         Returns rowcount (1 = applied, 0 = version mismatch).
         """
-        conn = await self._require_conn()
-        clauses: list[str] = [
-            "status = ?",
-            "lifecycle_version = ?",
-        ]
-        params: list[Any] = [status, target_version]
-        for col, val in [
-            ("next_run", next_run),
-            ("error", error),
-        ]:
-            if val is not None:
-                clauses.append(f"{col} = ?")
-                params.append(val)
-        params.append(task_id)
-        cursor = await conn.execute(
-            f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
-            f"WHERE id = ? AND lifecycle_version = ?",
-            tuple(params + [expected_version]),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            clauses: list[str] = [
+                "status = ?",
+                "lifecycle_version = ?",
+            ]
+            params: list[Any] = [status, target_version]
+            for col, val in [
+                ("next_run", next_run),
+                ("error", error),
+            ]:
+                if val is not None:
+                    clauses.append(f"{col} = ?")
+                    params.append(val)
+            params.append(task_id)
+            cursor = await conn.execute(
+                f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
+                f"WHERE id = ? AND lifecycle_version = ?",
+                tuple(params + [expected_version]),
+            )
+            return cursor.rowcount
 
     async def control_finalize_scheduled_task(
         self,
@@ -2953,29 +2978,28 @@ class Database:
 
         Returns rowcount (1 = applied, 0 = version mismatch).
         """
-        conn = await self._require_conn()
-        clauses: list[str] = [
-            "status = ?",
-            "lifecycle_version = ?",
-            "execution_id = NULL",
-            "lease_until = NULL",
-        ]
-        params: list[Any] = [status, target_version]
-        for col, val in [
-            ("next_run", next_run),
-            ("error", error),
-        ]:
-            if val is not None:
-                clauses.append(f"{col} = ?")
-                params.append(val)
-        params.append(task_id)
-        cursor = await conn.execute(
-            f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
-            f"WHERE id = ? AND lifecycle_version = ?",
-            tuple(params + [expected_version]),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            clauses: list[str] = [
+                "status = ?",
+                "lifecycle_version = ?",
+                "execution_id = NULL",
+                "lease_until = NULL",
+            ]
+            params: list[Any] = [status, target_version]
+            for col, val in [
+                ("next_run", next_run),
+                ("error", error),
+            ]:
+                if val is not None:
+                    clauses.append(f"{col} = ?")
+                    params.append(val)
+            params.append(task_id)
+            cursor = await conn.execute(
+                f"UPDATE scheduled_tasks SET {', '.join(clauses)} "
+                f"WHERE id = ? AND lifecycle_version = ?",
+                tuple(params + [expected_version]),
+            )
+            return cursor.rowcount
 
     # ------------------------------------------------------------------
     # M4 batch 3.1.16B-5: scheduler operation journal (durable intent)
@@ -3015,24 +3039,23 @@ class Database:
 
         Returns the ``seq`` of the inserted row.
         """
-        conn = await self._require_conn()
-        created = utc_now_naive().isoformat()
-        cursor = await conn.execute(
-            """
-            INSERT INTO scheduler_operation_journal
-                (operation_id, task_id, operation_type, desired_status,
-                 expected_version, target_version, principal_id,
-                 policy_digest, project_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                operation_id, task_id, operation_type, desired_status,
-                expected_version, target_version, principal_id,
-                policy_digest, project_id, created,
-            ),
-        )
-        await conn.commit()
-        return int(cursor.lastrowid or 0)
+        async with self.transaction() as conn:
+            created = utc_now_naive().isoformat()
+            cursor = await conn.execute(
+                """
+                INSERT INTO scheduler_operation_journal
+                    (operation_id, task_id, operation_type, desired_status,
+                     expected_version, target_version, principal_id,
+                     policy_digest, project_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id, task_id, operation_type, desired_status,
+                    expected_version, target_version, principal_id,
+                    policy_digest, project_id, created,
+                ),
+            )
+            return int(cursor.lastrowid or 0)
 
     async def mark_scheduler_journal_applied(
         self, operation_id: str,
@@ -3046,15 +3069,14 @@ class Database:
         Returns rowcount (1 = marked, 0 = entry not found — already
         marked or never inserted; both are safe).
         """
-        conn = await self._require_conn()
-        applied = utc_now_naive().isoformat()
-        cursor = await conn.execute(
-            "UPDATE scheduler_operation_journal SET applied_at = ? "
-            "WHERE operation_id = ? AND applied_at IS NULL",
-            (applied, operation_id),
-        )
-        await conn.commit()
-        return cursor.rowcount
+        async with self.transaction() as conn:
+            applied = utc_now_naive().isoformat()
+            cursor = await conn.execute(
+                "UPDATE scheduler_operation_journal SET applied_at = ? "
+                "WHERE operation_id = ? AND applied_at IS NULL",
+                (applied, operation_id),
+            )
+            return cursor.rowcount
 
     async def list_pending_scheduler_journal_entries(
         self,
@@ -3127,21 +3149,20 @@ class Database:
         stamped principal_id on the base ``messages`` row, and the FTS
         row mirrors that rowid.
         """
-        conn = await self._require_conn()
-        created = utc_now_naive().strftime("%Y-%m-%d %H:%M:%S")
-        if rowid is not None:
-            await conn.execute(
-                "INSERT INTO messages_fts (rowid, session_id, role, content, created_at) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (rowid, session_id, role, content, created),
-            )
-        else:
-            await conn.execute(
-                "INSERT INTO messages_fts (session_id, role, content, created_at) "
-                "VALUES (?, ?, ?, ?)",
-                (session_id, role, content, created),
-            )
-        await conn.commit()
+        async with self.transaction() as conn:
+            created = utc_now_naive().strftime("%Y-%m-%d %H:%M:%S")
+            if rowid is not None:
+                await conn.execute(
+                    "INSERT INTO messages_fts (rowid, session_id, role, content, created_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (rowid, session_id, role, content, created),
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO messages_fts (session_id, role, content, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (session_id, role, content, created),
+                )
 
     async def upsert_coding_task(
         self, task: dict[str, Any], *, principal_id: str = "legacy",
@@ -3169,25 +3190,24 @@ class Database:
                 "owner; an admin must re-claim it with a real principal "
                 "before it can run"
             )
-        conn = await self._require_conn()
-        await conn.execute(
-            """
-            INSERT INTO coding_tasks (id, goal, status, state_json, created_at, updated_at, principal_id, project_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET goal=excluded.goal,
-                status=excluded.status, state_json=excluded.state_json,
-                updated_at=excluded.updated_at,
-                principal_id=excluded.principal_id,
-                project_id=excluded.project_id
-            """,
-            (
-                persisted_task["id"], persisted_task["goal"],
-                persisted_task["status"], json.dumps(persisted_task),
-                persisted_task["created_at"], persisted_task["updated_at"],
-                principal_id, project_id,
-            ),
-        )
-        await conn.commit()
+        async with self.transaction() as conn:
+            await conn.execute(
+                """
+                INSERT INTO coding_tasks (id, goal, status, state_json, created_at, updated_at, principal_id, project_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET goal=excluded.goal,
+                    status=excluded.status, state_json=excluded.state_json,
+                    updated_at=excluded.updated_at,
+                    principal_id=excluded.principal_id,
+                    project_id=excluded.project_id
+                """,
+                (
+                    persisted_task["id"], persisted_task["goal"],
+                    persisted_task["status"], json.dumps(persisted_task),
+                    persisted_task["created_at"], persisted_task["updated_at"],
+                    principal_id, project_id,
+                ),
+            )
 
     async def list_coding_tasks(
         self, *, principal_id: str | None = None
@@ -3493,10 +3513,8 @@ class Database:
         created_at: float,
     ) -> None:
         """Persist an immutable destructive-operation approval challenge."""
-        conn = await self._require_conn()
         async with self._operation_approval_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     "SELECT binding_digest FROM operation_approvals WHERE approval_id = ?",
                     (approval_id,),
@@ -3507,7 +3525,6 @@ class Database:
                         raise PermissionError(
                             "operation approval id is already bound to another operation"
                         )
-                    await conn.commit()
                     return
                 await conn.execute(
                     """
@@ -3527,10 +3544,6 @@ class Database:
                     conn, approval_id, "registered", binding_digest,
                     principal_id, session_id, {}, created_at,
                 )
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def start_agent_turn(
         self,
@@ -3558,10 +3571,8 @@ class Database:
         ``principal_id``); per-project visibility is enforced by
         ``list_agent_turn_events`` callers.
         """
-        conn = await self._require_conn()
         async with self._turn_event_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 await conn.execute(
                     "INSERT INTO agent_turns(turn_id,attempt_id,session_id,task_id,"
                     "status,last_sequence,started_at,principal_id,project_id) "
@@ -3572,10 +3583,6 @@ class Database:
                     "INSERT INTO agent_turn_events VALUES(?,1,'turn.started',?,?)",
                     (turn_id, json.dumps(payload, sort_keys=True), now),
                 )
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def append_agent_turn_event(
         self,
@@ -3589,10 +3596,8 @@ class Database:
         error_code: str | None = None,
     ) -> int:
         """Append in sequence; terminal status and event commit together."""
-        conn = await self._require_conn()
         async with self._turn_event_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     "SELECT status,last_sequence FROM agent_turns WHERE turn_id=?",
                     (turn_id,),
@@ -3632,11 +3637,7 @@ class Database:
                             turn_id, expected_sequence,
                         ),
                     )
-                await conn.commit()
                 return sequence
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def append_chat_stream_event(
         self,
@@ -3649,10 +3650,8 @@ class Database:
         now: float,
     ) -> int:
         """Append one Gateway-facing event and return its session sequence."""
-        conn = await self._require_conn()
         async with self._chat_event_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     "SELECT COALESCE(MAX(sequence), 0) FROM chat_stream_events "
                     "WHERE session_id = ?",
@@ -3675,11 +3674,7 @@ class Database:
                         now,
                     ),
                 )
-                await conn.commit()
                 return sequence
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def list_chat_stream_events(
         self,
@@ -3717,10 +3712,8 @@ class Database:
 
     async def recover_inflight_chat_streams(self, *, now: float) -> int:
         """Close crash-left chat ledgers with a durable error terminal."""
-        conn = await self._require_conn()
         async with self._chat_event_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     """
                     SELECT e.session_id,e.principal_id,e.project_id,e.sequence
@@ -3753,18 +3746,12 @@ class Database:
                             now,
                         ),
                     )
-                await conn.commit()
                 return len(rows)
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def recover_inflight_agent_turns(self, *, now: float) -> int:
         """Mark crash-left running turns interrupted without inventing success."""
-        conn = await self._require_conn()
         async with self._turn_event_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     "SELECT turn_id,last_sequence FROM agent_turns "
                     "WHERE status='running' ORDER BY started_at"
@@ -3785,11 +3772,7 @@ class Database:
                         "AND status='running'",
                         (sequence, now, row["turn_id"]),
                     )
-                await conn.commit()
                 return len(rows)
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def list_agent_turn_events(
         self, turn_id: str
@@ -3809,10 +3792,8 @@ class Database:
         session_id: str,
         now: float,
     ) -> bool:
-        conn = await self._require_conn()
         async with self._operation_approval_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     "SELECT * FROM operation_approvals WHERE approval_id = ?",
                     (approval_id,),
@@ -3838,11 +3819,7 @@ class Database:
                         str(row["binding_digest"]), principal_id, session_id,
                         {}, now,
                     )
-                await conn.commit()
                 return success
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def consume_operation_approval(
         self,
@@ -3854,10 +3831,8 @@ class Database:
         now: float,
     ) -> bool:
         """Consume once; a mismatch burns any pending/approved capability."""
-        conn = await self._require_conn()
         async with self._operation_approval_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     "SELECT * FROM operation_approvals WHERE approval_id = ?",
                     (approval_id,),
@@ -3888,19 +3863,13 @@ class Database:
                         binding_digest, principal_id, session_id,
                         {"previous_status": str(row["status"])}, now,
                     )
-                await conn.commit()
                 return success
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def cancel_operation_approval(
         self, approval_id: str, *, now: float
     ) -> None:
-        conn = await self._require_conn()
         async with self._operation_approval_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     "SELECT * FROM operation_approvals WHERE approval_id = ?",
                     (approval_id,),
@@ -3917,10 +3886,6 @@ class Database:
                         str(row["binding_digest"]), str(row["principal_id"]),
                         str(row["session_id"]), {}, now,
                     )
-                await conn.commit()
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def list_operation_approval_events(
         self, approval_id: str
