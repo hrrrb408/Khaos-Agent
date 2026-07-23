@@ -4,7 +4,10 @@ import sqlite3
 import pytest
 
 from khaos.db import Database
-from khaos.db.database import SCHEMA_MIGRATION_VERSION
+from khaos.db.database import (
+    SCHEMA_MIGRATION_NAME,
+    SCHEMA_MIGRATION_VERSION,
+)
 
 
 async def test_migration_records_version_and_checksum(tmp_path):
@@ -20,7 +23,7 @@ async def test_migration_records_version_and_checksum(tmp_path):
         )
     ).fetchone()
     assert row["version"] == SCHEMA_MIGRATION_VERSION
-    assert row["name"] == "initial_versioned_schema"
+    assert row["name"] == SCHEMA_MIGRATION_NAME
     assert len(row["checksum"]) == 64
     assert row["app_version"]
     await db.close()
@@ -125,7 +128,9 @@ async def test_legacy_database_is_backed_up_before_migration(tmp_path):
     await db.run_migrations()
     await db.close()
 
-    backup_path = tmp_path / "state.db.pre-migration-v1.bak"
+    backup_path = (
+        tmp_path / f"state.db.pre-migration-v{SCHEMA_MIGRATION_VERSION}.bak"
+    )
     assert backup_path.is_file()
     backup = sqlite3.connect(backup_path)
     try:

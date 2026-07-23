@@ -26,12 +26,16 @@ from khaos.time_utils import utc_now_naive
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 TELEGRAM_REPLAY_WINDOW = 4096
-SCHEMA_MIGRATION_VERSION = 1
-SCHEMA_MIGRATION_NAME = "initial_versioned_schema"
+# F-02 (third-round review): bumped to v2 so existing v1 databases re-run
+# the legacy upgrade helpers (including the new memories UNIQUE rebuild).
+# The schema.sql change (project_id added to memories UNIQUE) only affects
+# fresh DBs; existing DBs get the rebuild via _ensure_memories_project_id_unique.
+SCHEMA_MIGRATION_VERSION = 2
+SCHEMA_MIGRATION_NAME = "f02_memory_project_unique"
 SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
 
 logger = logging.getLogger(__name__)
-SCHEMA_MIGRATION_SALT = "legacy-helper-set-2026-07-22-v1"
+SCHEMA_MIGRATION_SALT = "f02-memory-project-unique-2026-07-23-v2"
 
 # F-01: Transaction owner tracking. When non-None, the current asyncio task
 # owns the active BEGIN IMMEDIATE transaction on the shared connection.
@@ -414,6 +418,13 @@ class Database:
         await self._ensure_subagent_tasks_principal_column()
         await self._ensure_scheduled_tasks_legacy_quarantine_triggers()
         await self._ensure_session_identity_invariants()
+        # F-02 (third-round review): rebuild memories so project_id is
+        # part of the UNIQUE constraint.  Must run AFTER
+        # _ensure_memories_project_id_column (which adds the column to
+        # legacy DBs) and AFTER _ensure_memories_principal_columns
+        # (which establishes the base schema).  Idempotent: no-op on
+        # fresh v2 DBs where the UNIQUE already includes project_id.
+        await self._ensure_memories_project_id_unique()
 
     async def _ensure_scheduled_tasks_legacy_quarantine_triggers(self) -> None:
         """Quarantine ownerless scheduler writes after versioned migration."""
@@ -1116,6 +1127,141 @@ class Database:
             "project_id, namespace, principal_id, scope",
         )
 
+    async def _ensure_memories_project_id_unique(self) -> None:
+        """F-02 (third-round review): rebuild ``memories`` so ``project_id``
+        is part of the UNIQUE constraint.
+
+        The pre-F-02 UNIQUE was ``(namespace, principal_id, session_id,
+        scope, key)`` — ``project_id`` was a plain column.  When two
+        projects share a state DB (via explicit ``--db``), project B's
+        upsert of the same key could update project A's row while
+        leaving ``project_id=A`` stamped.  F-02 makes the UNIQUE key
+        ``(project_id, namespace, principal_id, session_id, scope, key)``
+        so each project gets its own row.
+
+        SQLite cannot ALTER a UNIQUE constraint, so the table is rebuilt:
+        old data is backed up, the table is dropped and recreated with
+        the new schema, FTS5 + triggers are rebuilt, and the data is
+        re-inserted.  Legacy rows with ``project_id=''`` are preserved
+        as-is — they share the empty project partition.  Run the A-5-2
+        ``khaos migrate project-identity`` backfill before this migration
+        on multi-project shared DBs to avoid collapsing unbound rows.
+
+        The rebuild is idempotent: if the UNIQUE constraint already
+        includes ``project_id`` (fresh DB created with the v2 schema),
+        the method returns immediately.
+        """
+        conn = await self._require_conn()
+        # Idempotency check: inspect the UNIQUE index that SQLite
+        # automatically creates for the UNIQUE constraint.  If it
+        # already covers project_id, the rebuild is a no-op.
+        cursor = await conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='memories'"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return  # Table doesn't exist yet (shouldn't happen post-schema)
+        create_sql = str(row[0])
+        if "UNIQUE(project_id, namespace, principal_id, session_id, scope, key)" in create_sql:
+            return  # Already migrated (fresh v2 schema)
+        # Backup old data.
+        await conn.execute("CREATE TABLE _memories_f02_backup AS SELECT * FROM memories")
+        # Drop old table, FTS, and triggers (triggers drop automatically).
+        await conn.execute("DROP TABLE IF EXISTS memories")
+        await conn.execute("DROP TABLE IF EXISTS memory_fts")
+        # Create new table with project_id in the UNIQUE constraint.
+        await conn.execute(
+            """
+            CREATE TABLE memories (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                scope        TEXT NOT NULL,
+                key          TEXT NOT NULL,
+                value        TEXT NOT NULL,
+                ttl          INTEGER NOT NULL DEFAULT 604800,
+                confidence   INTEGER NOT NULL DEFAULT 2,
+                access_freq  INTEGER NOT NULL DEFAULT 0,
+                created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                principal_id TEXT NOT NULL DEFAULT 'legacy',
+                namespace    TEXT NOT NULL DEFAULT 'private',
+                session_id   TEXT NOT NULL DEFAULT '',
+                project_id   TEXT NOT NULL DEFAULT '',
+                UNIQUE(project_id, namespace, principal_id, session_id, scope, key)
+            )
+            """
+        )
+        # Migrate old data.  If there are duplicate rows that would
+        # violate the new UNIQUE (same project_id + namespace + principal
+        # + session + scope + key), keep the one with the highest id
+        # (most recent write wins — matches the old ON CONFLICT behavior).
+        await conn.execute(
+            """
+            INSERT INTO memories (
+                id, scope, key, value, ttl, confidence, access_freq,
+                created_at, updated_at, principal_id, namespace, session_id,
+                project_id
+            )
+            SELECT id, scope, key, value, ttl, confidence, access_freq,
+                   created_at, updated_at, principal_id, namespace, session_id,
+                   project_id
+            FROM _memories_f02_backup
+            WHERE id IN (
+                SELECT MAX(id) FROM _memories_f02_backup
+                GROUP BY project_id, namespace, principal_id, session_id, scope, key
+            )
+            """
+        )
+        # Recreate FTS5 table.
+        await conn.execute(
+            """
+            CREATE VIRTUAL TABLE memory_fts USING fts5(
+                key,
+                value,
+                content=memories,
+                content_rowid=id,
+                tokenize='unicode61'
+            )
+            """
+        )
+        # Reindex FTS5 from migrated data.
+        await conn.execute(
+            "INSERT INTO memory_fts(rowid, key, value) SELECT id, key, value FROM memories"
+        )
+        # Recreate triggers.
+        await conn.execute(
+            """
+            CREATE TRIGGER memory_ai AFTER INSERT ON memories BEGIN
+                INSERT INTO memory_fts(rowid, key, value) VALUES (new.id, new.key, new.value);
+            END
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TRIGGER memory_ad AFTER DELETE ON memories BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, key, value)
+                VALUES('delete', old.id, old.key, old.value);
+            END
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TRIGGER memory_au AFTER UPDATE ON memories BEGIN
+                INSERT INTO memory_fts(memory_fts, rowid, key, value)
+                VALUES('delete', old.id, old.key, old.value);
+                INSERT INTO memory_fts(rowid, key, value)
+                VALUES (new.id, new.key, new.value);
+            END
+            """
+        )
+        # Recreate the project-scoped index (dropped with the table).
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memories_project "
+            "ON memories(project_id, namespace, principal_id, scope)"
+        )
+        # Cleanup backup.
+        await conn.execute("DROP TABLE _memories_f02_backup")
+
     async def _ensure_audit_log_project_id_column(self) -> None:
         """A-5-1: add ``project_id`` to ``audit_log``."""
         await self._ensure_table_project_id_column(
@@ -1799,20 +1945,21 @@ class Database:
         session_id: str = "",
         project_id: str = "",
     ) -> int:
-        """Insert or update a memory by (namespace, principal_id, session_id, scope, key).
+        """Insert or update a memory by (project_id, namespace, principal_id, session_id, scope, key).
 
         M4 batch 3.1.16A-2: memories are partitioned by
         ``(namespace, principal_id, session_id)``.  Legacy callers that
         omit them get ``principal_id='legacy'`` — the memory is stored
         but never loaded by authenticated principals.
 
-        M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on the row
-        for project identity closure.  It is NOT part of the UNIQUE
-        constraint (principal_id already partitions the namespace); the
-        column is for forensics / future sweep queries.  ``ON CONFLICT``
-        does NOT touch ``project_id`` (owner-preserving update — once a
-        memory is bound to a project, a later upsert from a different
-        project cannot re-stamp it).
+        F-02 (third-round review): ``project_id`` is now part of the
+        UNIQUE constraint.  Two projects sharing a state DB get distinct
+        rows for the same (namespace, principal_id, session_id, scope,
+        key).  The ``ON CONFLICT`` clause includes ``project_id`` so
+        re-upserting from the same project updates the existing row,
+        while a different project creates a new row.  The old
+        "owner-preserving" behavior (where project B could silently
+        update project A's row) is removed.
         """
         async with self.transaction() as conn:
             await conn.execute(
@@ -1822,7 +1969,7 @@ class Database:
                     principal_id, namespace, session_id, project_id
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(namespace, principal_id, session_id, scope, key) DO UPDATE SET
+                ON CONFLICT(project_id, namespace, principal_id, session_id, scope, key) DO UPDATE SET
                     value = excluded.value,
                     ttl = excluded.ttl,
                     confidence = excluded.confidence,
@@ -1834,10 +1981,10 @@ class Database:
             cursor = await conn.execute(
                 """
                 SELECT id FROM memories
-                WHERE namespace = ? AND principal_id = ? AND session_id = ?
-                  AND scope = ? AND key = ?
+                WHERE project_id = ? AND namespace = ? AND principal_id = ?
+                  AND session_id = ? AND scope = ? AND key = ?
                 """,
-                (namespace, principal_id, session_id, scope, key),
+                (project_id, namespace, principal_id, session_id, scope, key),
             )
             row = await cursor.fetchone()
             return int(row["id"])
@@ -1850,18 +1997,24 @@ class Database:
         principal_id: str = "legacy",
         namespace: str = "private",
         session_id: str = "",
+        project_id: str = "",
     ) -> dict[str, Any] | None:
-        """Fetch one memory by (namespace, principal_id, session_id, scope, key)."""
+        """Fetch one memory by (project_id, namespace, principal_id, session_id, scope, key).
+
+        F-02: ``project_id`` is now part of the identity.  Callers that
+        omit it get ``project_id=''`` which matches legacy/unbound rows.
+        """
         conn = await self._require_conn()
         cursor = await conn.execute(
             """
             SELECT id, scope, key, value, ttl, confidence, access_freq,
-                   created_at, updated_at, principal_id, namespace, session_id
+                   created_at, updated_at, principal_id, namespace, session_id,
+                   project_id
             FROM memories
-            WHERE namespace = ? AND principal_id = ? AND session_id = ?
-              AND scope = ? AND key = ?
+            WHERE project_id = ? AND namespace = ? AND principal_id = ?
+              AND session_id = ? AND scope = ? AND key = ?
             """,
-            (namespace, principal_id, session_id, scope, key),
+            (project_id, namespace, principal_id, session_id, scope, key),
         )
         row = await cursor.fetchone()
         return dict(row) if row is not None else None
@@ -1874,20 +2027,29 @@ class Database:
         principal_id: str = "legacy",
         namespace: str = "private",
         session_id: str = "",
+        project_id: str = "",
     ) -> None:
-        """Delete one memory by (namespace, principal_id, session_id, scope, key)."""
+        """Delete one memory by (project_id, namespace, principal_id, session_id, scope, key).
+
+        F-02: ``project_id`` scopes the delete so a caller from project B
+        cannot delete project A's memory of the same key.
+        """
         async with self.transaction() as conn:
             await conn.execute(
                 """
                 DELETE FROM memories
-                WHERE namespace = ? AND principal_id = ? AND session_id = ?
-                  AND scope = ? AND key = ?
+                WHERE project_id = ? AND namespace = ? AND principal_id = ?
+                  AND session_id = ? AND scope = ? AND key = ?
                 """,
-                (namespace, principal_id, session_id, scope, key),
+                (project_id, namespace, principal_id, session_id, scope, key),
             )
 
     async def delete_memory_by_id(
-        self, memory_id: int, *, principal_id: str | None = None,
+        self,
+        memory_id: int,
+        *,
+        principal_id: str | None = None,
+        project_id: str | None = None,
     ) -> None:
         """Delete one memory by id.
 
@@ -1895,20 +2057,28 @@ class Database:
         DELETE is scoped to that principal — preventing cross-principal
         deletion.  ``principal_id=None`` (the default) preserves the
         legacy unscoped behavior for internal/admin callers.
+
+        F-02: when ``project_id`` is provided, the DELETE is additionally
+        scoped to that project.  This prevents a caller from project B
+        deleting project A's memory by id.  ``project_id=None`` preserves
+        the legacy unscoped behavior.
         """
         async with self.transaction() as conn:
-            if principal_id is None:
-                await conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
-            else:
-                # Principal-scoped: only delete if the memory belongs to
-                # this principal OR is project-shared (principal_id='').
-                await conn.execute(
-                    """
-                    DELETE FROM memories
-                    WHERE id = ? AND (principal_id = ? OR principal_id = '')
-                    """,
-                    (memory_id, principal_id),
+            clauses = ["id = ?"]
+            params: list[Any] = [memory_id]
+            if principal_id is not None:
+                clauses.append(
+                    "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
                 )
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            where = " AND ".join(clauses)
+            await conn.execute(
+                f"DELETE FROM memories WHERE {where}",
+                tuple(params),
+            )
 
     async def list_memories(
         self,
@@ -1916,8 +2086,9 @@ class Database:
         *,
         principal_id: str | None = None,
         namespace: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
-        """List memories, optionally filtered by scope/principal/namespace.
+        """List memories, optionally filtered by scope/principal/namespace/project.
 
         M4 batch 3.1.16A-2: when ``principal_id`` is provided, only
         memories belonging to that principal (or project-shared with
@@ -1925,6 +2096,12 @@ class Database:
         ``principal_id='legacy'`` are excluded.  When ``principal_id``
         is ``None`` (default), all memories are returned — this
         preserves the legacy admin/inspection behaviour.
+
+        F-02: when ``project_id`` is provided, only memories in that
+        project are returned.  ``project_id=None`` (default) preserves
+        the legacy unscoped behavior (all projects) for admin callers.
+        Production callers should always pass ``project_id`` so a
+        shared DB cannot leak cross-project memories.
         """
         conn = await self._require_conn()
         clauses: list[str] = []
@@ -1942,11 +2119,15 @@ class Database:
         if namespace is not None:
             clauses.append("namespace = ?")
             params.append(namespace)
+        if project_id is not None:
+            clauses.append("project_id = ?")
+            params.append(project_id)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         cursor = await conn.execute(
             f"""
             SELECT id, scope, key, value, ttl, confidence, access_freq,
-                   created_at, updated_at, principal_id, namespace, session_id
+                   created_at, updated_at, principal_id, namespace, session_id,
+                   project_id
             FROM memories
             {where}
             ORDER BY confidence DESC, updated_at DESC, id DESC
@@ -1962,12 +2143,18 @@ class Database:
         *,
         principal_id: str | None = None,
         namespace: str | None = None,
+        project_id: str | None = None,
     ) -> list[dict[str, Any]]:
         """Search memories through FTS5.
 
         M4 batch 3.1.16A-2: when ``principal_id`` is provided, only
         memories belonging to that principal (or project-shared) are
         returned.  Legacy rows are excluded.
+
+        F-02: when ``project_id`` is provided, only memories in that
+        project are returned.  Production callers should always pass
+        ``project_id`` so a shared DB cannot leak cross-project FTS
+        results.
         """
         conn = await self._require_conn()
         clauses: list[str] = ["memory_fts MATCH ?"]
@@ -1980,13 +2167,16 @@ class Database:
         if namespace is not None:
             clauses.append("m.namespace = ?")
             params.append(namespace)
+        if project_id is not None:
+            clauses.append("m.project_id = ?")
+            params.append(project_id)
         where = " AND ".join(clauses)
         params.append(top_k)
         cursor = await conn.execute(
             f"""
             SELECT m.id, m.scope, m.key, m.value, m.ttl, m.confidence,
                    m.access_freq, m.created_at, m.updated_at,
-                   m.principal_id, m.namespace, m.session_id
+                   m.principal_id, m.namespace, m.session_id, m.project_id
             FROM memory_fts
             JOIN memories AS m ON m.id = memory_fts.rowid
             WHERE {where}

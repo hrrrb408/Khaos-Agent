@@ -282,23 +282,26 @@ async def test_acceptance_6_preexisting_project_id_tables_untouched(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# 7. memories UNIQUE constraint unchanged
+# 7. memories UNIQUE constraint includes project_id (F-02)
 # ---------------------------------------------------------------------------
 
 
-async def test_acceptance_7_memories_unique_constraint_unchanged(tmp_path):
-    """A5-7: ``memories`` UNIQUE constraint is still
-    ``(namespace, principal_id, session_id, scope, key)`` — ``project_id``
-    is NOT part of the UNIQUE key.
+async def test_acceptance_7_memories_unique_constraint_includes_project(tmp_path):
+    """A5-7 (F-02): ``memories`` UNIQUE constraint now INCLUDES ``project_id``.
 
-    We verify by inserting two rows with the same (namespace, principal,
-    session, scope, key) but different project_id — the second INSERT
-    must fail with UNIQUE constraint violation.
+    Two rows with the same (namespace, principal, session, scope, key) but
+    DIFFERENT ``project_id`` must both succeed — each project gets its own
+    row.  Two rows with the SAME ``project_id`` (and same identity tuple)
+    must still fail with UNIQUE constraint violation.
+
+    Pre-F-02 this test asserted the opposite (project_id was NOT in the
+    UNIQUE key); F-02 (third-round review) reversed that so a shared
+    state DB cannot let project B silently overwrite project A's memory.
     """
     db = await _make_db(tmp_path / "khaos.db")
     try:
         conn = await db._require_conn()
-        # First insert succeeds.
+        # First insert for proj-a.
         await conn.execute(
             "INSERT INTO memories (scope, key, value, principal_id, "
             "namespace, session_id, project_id) "
@@ -306,14 +309,33 @@ async def test_acceptance_7_memories_unique_constraint_unchanged(tmp_path):
         )
         await conn.commit()
         # Second insert with same (namespace, principal, session, scope,
-        # key) but different project_id MUST fail (UNIQUE violation).
+        # key) but DIFFERENT project_id MUST succeed (two distinct rows).
+        await conn.execute(
+            "INSERT INTO memories (scope, key, value, principal_id, "
+            "namespace, session_id, project_id) "
+            "VALUES ('global', 'k1', 'v2', 'alice', 'private', '', 'proj-b')"
+        )
+        await conn.commit()
+        # Third insert with the SAME project_id (and same identity tuple)
+        # MUST fail (UNIQUE violation).
         with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
             await conn.execute(
                 "INSERT INTO memories (scope, key, value, principal_id, "
                 "namespace, session_id, project_id) "
-                "VALUES ('global', 'k1', 'v2', 'alice', 'private', '', 'proj-b')"
+                "VALUES ('global', 'k1', 'v3', 'alice', 'private', '', 'proj-a')"
             )
             await conn.commit()
+        # Verify both project-scoped rows are present.
+        cursor = await conn.execute(
+            "SELECT project_id, value FROM memories "
+            "WHERE key = 'k1' ORDER BY project_id"
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 2
+        assert rows[0][0] == "proj-a"
+        assert rows[0][1] == "v1"
+        assert rows[1][0] == "proj-b"
+        assert rows[1][1] == "v2"
     finally:
         await db.close()
 
