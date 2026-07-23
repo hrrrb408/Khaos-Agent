@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import asyncio
 import sqlite3
+import shutil
+import sys
 
 import pytest
 
@@ -24,6 +26,54 @@ os.environ.setdefault("KHAOS_ALLOW_PROJECT_DB", "1")
 # into the dev-mode proxy-only fallback, which is the documented escape
 # hatch.  Production code never sets this variable.
 os.environ.setdefault("KHAOS_BROWSER_DEV_MODE", "1")
+
+# Round-5 Batch 5.5: auto-enable the heavy E2E test suites when the
+# required runtime is present on the developer's machine.  Both flags
+# default off so CI matrices and fresh checkouts stay green without
+# downloading Playwright/Chromium or running a Docker daemon.  A
+# developer who has the runtimes installed gets the full suite by
+# default; CI can still opt out by setting the flag to "0".
+def _auto_enable_e2e_suites() -> None:
+    # Browser E2E: needs Playwright + the Chromium binary.  Detect both
+    # before opting in so a bare ``pip install -e .[test]`` checkout
+    # does not suddenly start collecting slow browser tests.
+    if os.environ.get("KHAOS_RUN_BROWSER_E2E") is None:
+        try:
+            import playwright  # noqa: F401
+            from playwright._impl._driver import compute_driver_executable  # noqa: F401
+            # Chromium binary lives in the OS-specific cache dir.  The
+            # exact folder name is version-pinned (e.g. chromium-1187),
+            # so we just check for any ``chromium-*`` entry.
+            if sys.platform == "darwin":
+                cache_root = os.path.expanduser("~/Library/Caches/ms-playwright")
+            elif sys.platform.startswith("linux"):
+                cache_root = os.path.expanduser("~/.cache/ms-playwright")
+            else:
+                cache_root = ""
+            if cache_root and os.path.isdir(cache_root):
+                if any(name.startswith("chromium-") for name in os.listdir(cache_root)):
+                    os.environ["KHAOS_RUN_BROWSER_E2E"] = "1"
+        except Exception:
+            pass
+
+    # Production sandbox E2E: needs the Docker daemon.  Detect the CLI
+    # and a running daemon before opting in.
+    if os.environ.get("KHAOS_RUN_PRODUCTION_SANDBOX") is None:
+        if shutil.which("docker"):
+            import subprocess
+            try:
+                result = subprocess.run(
+                    ["docker", "info"],
+                    capture_output=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    os.environ["KHAOS_RUN_PRODUCTION_SANDBOX"] = "1"
+            except Exception:
+                pass
+
+
+_auto_enable_e2e_suites()
 
 
 @pytest.fixture(autouse=True)
