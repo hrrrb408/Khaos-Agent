@@ -42,12 +42,14 @@ TELEGRAM_REPLAY_WINDOW = 4096
 # The schema.sql change (project_id added to memories UNIQUE) only affects
 # fresh DBs; existing DBs get the rebuild via _ensure_memories_project_id_unique.
 # v4 (round-5 Batch 5.3 / H-09): project_id added to principal_modes PK.
-SCHEMA_MIGRATION_VERSION = 4
-SCHEMA_MIGRATION_NAME = "round5_batch53_owner_context_closure"
+# v5 (round-6 Batch 6.1): chat_streams/chat_stream_events keyed by stream_id
+# (independent of session_id) — fixes multi-turn conversation breakage.
+SCHEMA_MIGRATION_VERSION = 5
+SCHEMA_MIGRATION_NAME = "round6_batch61_chat_stream_identity"
 SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
 
 logger = logging.getLogger(__name__)
-SCHEMA_MIGRATION_SALT = "round5-batch53-owner-context-closure-2026-07-23-v4"
+SCHEMA_MIGRATION_SALT = "round6-batch61-chat-stream-identity-2026-07-23-v5"
 
 # H-12 (round-5 Batch 5.5): Immutable Migration Registry.
 #
@@ -59,24 +61,25 @@ SCHEMA_MIGRATION_SALT = "round5-batch53-owner-context-closure-2026-07-23-v4"
 # historical migration is detected on every startup, not just the
 # version that was last applied.
 #
-# Historical versions v1–v3 predate the registry.  They were verified at
+# Historical versions v1–v4 predate the registry.  They were verified at
 # apply time (single-version checksum check) but are NOT in the
-# registry — they are accepted as-is.  From v4 onward every version is
+# registry — they are accepted as-is.  From v5 onward every version is
 # registered with a constant checksum computed from the schema content
 # + salt at release time.
 #
-# The v4 checksum is computed once at module load (it matches the value
-# ``run_migrations()`` computes and inserts).  Future versions MUST add
-# their entry here with a pre-computed constant checksum — do NOT
-# recompute at runtime for registry entries, because the whole point is
-# that the checksum is an immutable release-time artifact.
-_V4_CHECKSUM = hashlib.sha256(
+# NOTE (round-6 Batch 6.1): v4 was previously in the registry with a
+# runtime-computed checksum.  Because the schema.sql file changed in
+# Batch 6.1 (chat_streams PK migration), the v4 checksum can no longer
+# be verified — v4 is now pre-registry.  This is the "runtime-computed
+# checksum" weakness that Review §十.1 identified; Batch 6.4 will
+# replace runtime computation with hardcoded release-time constants.
+_V5_CHECKSUM = hashlib.sha256(
     f"{SCHEMA_PATH.read_text(encoding='utf-8')}\n{SCHEMA_MIGRATION_SALT}".encode("utf-8")
 ).hexdigest()
 
 MIGRATION_REGISTRY: dict[int, tuple[str, str]] = {
     # version: (name, checksum)
-    4: (SCHEMA_MIGRATION_NAME, _V4_CHECKSUM),
+    5: (SCHEMA_MIGRATION_NAME, _V5_CHECKSUM),
 }
 
 # Round-4 Batch 1 (C-01): Transaction owner tracking via an immutable
@@ -109,6 +112,21 @@ class ChatStreamTerminalError(RuntimeError):
     defense-in-depth for the invariant that the application layer
     (``AgentService.chat``) already enforces via the ``terminal_appended``
     flag.
+
+    Round-6 Batch 6.1: the Terminal invariant is now per-``stream_id``,
+    not per-``session_id``.  A session can have many streams, each with
+    its own Terminal lifecycle.
+    """
+
+
+class SessionBusyError(RuntimeError):
+    """Round-6 Batch 6.1: concurrent chat on the same session is rejected.
+
+    The application layer (``AgentService.chat``) tracks active sessions
+    and rejects a second concurrent chat RPC on the same ``session_id``
+    with this error.  This makes concurrent behavior explicit (Review §八
+    Strategy B: reject) instead of letting two streams race on the same
+    session's state.
     """
 
 
@@ -793,6 +811,12 @@ class Database:
         # loaded by Project B for the same principal).  Idempotent: a
         # no-op on fresh v4 DBs whose PK already includes project_id.
         await self._ensure_principal_modes_project_id_pk()
+        # Round-6 Batch 6.1: rebuild chat_streams and chat_stream_events
+        # so they are keyed by stream_id (one per chat RPC attempt)
+        # instead of session_id.  This fixes the multi-turn conversation
+        # breakage where a session was permanently locked to 'done'
+        # after the first turn.  Idempotent: no-op on fresh v5 DBs.
+        await self._ensure_chat_streams_stream_id_pk()
 
     async def _ensure_principal_modes_project_id_pk(self) -> None:
         """H-09 (round-5 Batch 5.3): rebuild ``principal_modes`` so
@@ -857,6 +881,159 @@ class Database:
         finally:
             await conn.execute("DROP TABLE _principal_modes_h09_backup")
         await conn.commit()
+
+    async def _ensure_chat_streams_stream_id_pk(self) -> None:
+        """Round-6 Batch 6.1: rebuild ``chat_streams`` and
+        ``chat_stream_events`` so they are keyed by ``stream_id``
+        (one per chat RPC attempt) instead of ``session_id``.
+
+        Pre-6.1 schema used ``session_id`` as the PRIMARY KEY of
+        ``chat_streams`` and as the first column of the
+        ``chat_stream_events`` PK.  This meant a session could only
+        have ONE stream — once it reached ``done``, the Terminal Shield
+        rejected any subsequent ``started`` event, breaking multi-turn
+        conversations.
+
+        6.1 introduces ``stream_id`` (uuid4 per chat RPC) as the
+        primary key.  A session can now have many streams, each with
+        its own Terminal lifecycle.
+
+        Migration strategy (SQLite cannot ALTER PK in-place):
+          1. Check if ``chat_streams`` already has ``stream_id`` as PK
+             (fresh v5 DB) — if so, no-op.
+          2. Create ``_chat_streams_v5`` and ``_chat_stream_events_v5``
+             with the new schema.
+          3. Copy data: legacy rows get ``stream_id = session_id``
+             (each legacy session had at most one stream).
+          4. Drop old tables, rename new tables.
+          5. Recreate indexes.
+
+        Idempotent: safe to run on fresh v5 DBs (detected via PK check).
+        """
+        conn = await self._require_conn()
+        # Idempotency check: inspect chat_streams CREATE SQL.
+        cursor = await conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='chat_streams'"
+        )
+        row = await cursor.fetchone()
+        await cursor.close()
+        if row is None:
+            return  # Table doesn't exist yet (shouldn't happen post-schema)
+        create_sql = str(row[0])
+        if "stream_id TEXT PRIMARY KEY" in create_sql:
+            return  # Already migrated (fresh v5 schema)
+
+        logger.info(
+            "Batch 6.1: migrating chat_streams/chat_stream_events "
+            "from session_id PK to stream_id PK"
+        )
+
+        # Step 1: create new tables with _v5 suffix.
+        await conn.execute(
+            """
+            CREATE TABLE _chat_streams_v5 (
+                stream_id           TEXT PRIMARY KEY,
+                session_id          TEXT NOT NULL,
+                turn_id             TEXT NOT NULL DEFAULT '',
+                attempt_id          TEXT NOT NULL DEFAULT '',
+                principal_id        TEXT NOT NULL,
+                project_id          TEXT NOT NULL DEFAULT '',
+                status              TEXT NOT NULL DEFAULT 'running'
+                    CHECK(status IN ('running','done','error','interrupted')),
+                boot_id             TEXT NOT NULL DEFAULT '',
+                runtime_id          TEXT NOT NULL DEFAULT '',
+                lease_until         REAL,
+                last_sequence       INTEGER NOT NULL DEFAULT 0,
+                terminal_event_type TEXT,
+                started_at          REAL NOT NULL,
+                terminal_at         REAL,
+                FOREIGN KEY(session_id, principal_id, project_id)
+                    REFERENCES sessions(id, principal_id, project_id)
+            )
+            """
+        )
+        await conn.execute(
+            """
+            CREATE TABLE _chat_stream_events_v5 (
+                stream_id    TEXT NOT NULL,
+                session_id   TEXT NOT NULL,
+                principal_id TEXT NOT NULL,
+                project_id   TEXT NOT NULL DEFAULT '',
+                sequence     INTEGER NOT NULL,
+                event_type   TEXT NOT NULL,
+                data_json    TEXT NOT NULL DEFAULT '{}',
+                is_terminal  INTEGER NOT NULL DEFAULT 0 CHECK(is_terminal IN (0, 1)),
+                created_at   REAL NOT NULL,
+                PRIMARY KEY(stream_id, sequence),
+                FOREIGN KEY(session_id, principal_id, project_id)
+                    REFERENCES sessions(id, principal_id, project_id)
+            )
+            """
+        )
+
+        # Step 2: copy data.  Legacy rows: stream_id = session_id
+        # (each legacy session had at most one stream).
+        await conn.execute(
+            """
+            INSERT INTO _chat_streams_v5 (
+                stream_id, session_id, turn_id, attempt_id,
+                principal_id, project_id, status, boot_id,
+                runtime_id, lease_until, last_sequence,
+                terminal_event_type, started_at, terminal_at
+            )
+            SELECT
+                session_id, session_id, '', '',
+                principal_id, project_id, status, boot_id,
+                runtime_id, lease_until, last_sequence,
+                terminal_event_type, started_at, terminal_at
+            FROM chat_streams
+            """
+        )
+        await conn.execute(
+            """
+            INSERT INTO _chat_stream_events_v5 (
+                stream_id, session_id, principal_id, project_id,
+                sequence, event_type, data_json, is_terminal, created_at
+            )
+            SELECT
+                session_id, session_id, principal_id, project_id,
+                sequence, event_type, data_json, is_terminal, created_at
+            FROM chat_stream_events
+            """
+        )
+
+        # Step 3: drop old tables, rename new tables.
+        await conn.execute("DROP TABLE chat_streams")
+        await conn.execute("DROP TABLE chat_stream_events")
+        await conn.execute("ALTER TABLE _chat_streams_v5 RENAME TO chat_streams")
+        await conn.execute(
+            "ALTER TABLE _chat_stream_events_v5 RENAME TO chat_stream_events"
+        )
+
+        # Step 4: recreate indexes (from 0001_post_migration.sql).
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_stream_events_owner "
+            "ON chat_stream_events(principal_id, project_id, session_id, sequence)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_stream_events_stream "
+            "ON chat_stream_events(stream_id, sequence)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_streams_session "
+            "ON chat_streams(session_id)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_streams_boot "
+            "ON chat_streams(boot_id, status)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_streams_status_lease "
+            "ON chat_streams(status, lease_until)"
+        )
+        await conn.commit()
+        logger.info("Batch 6.1: chat_streams migration complete")
 
     async def _ensure_session_identity_invariants(self) -> None:
         """Make SQLite enforce duplicated session identity on every write."""
@@ -4513,6 +4690,7 @@ class Database:
     async def append_chat_stream_event(
         self,
         *,
+        stream_id: str,
         session_id: str,
         principal_id: str,
         project_id: str,
@@ -4522,65 +4700,78 @@ class Database:
         boot_id: str = "",
         runtime_id: str = "",
         lease_until: float | None = None,
+        turn_id: str = "",
+        attempt_id: str = "",
     ) -> int:
-        """Append one Gateway-facing event and return its session sequence.
+        """Append one Gateway-facing event and return its stream sequence.
 
-        Round-5 Batch 5.2 (C-05): enforces the chat stream state machine:
+        Round-5 Batch 5.2 (C-05) + Round-6 Batch 6.1: enforces the chat
+        stream state machine keyed by ``stream_id``:
           - ``chat_streams`` main table row is created lazily on first
-            append (status='running').
+            append (status='running'), keyed by ``stream_id``.
           - Before appending, checks ``chat_streams.status`` — if the
             stream is already terminal, raises ``ChatStreamTerminalError``
             (defense-in-depth for "Terminal 后禁止 Append").
           - On terminal events (done/error/interrupted), performs a CAS
-            ``UPDATE chat_streams SET status=? WHERE status='running'``
-            so exactly one terminal transition is possible.
+            ``UPDATE chat_streams SET status=? WHERE stream_id=? AND
+            status='running'`` so exactly one terminal transition is
+            possible.
           - On non-terminal events, renews ``lease_until`` and updates
             ``last_sequence``.
+          - A session can have many streams (one per chat RPC); the
+            Terminal invariant is per-stream, not per-session.
         """
         async with self._chat_event_lock:
             async with self.transaction() as conn:
                 is_terminal = event_type in {"done", "error", "interrupted"}
 
-                # C-05: lazily create the chat_streams main-table row.
-                # INSERT OR IGNORE is safe: if a row already exists (from
-                # a previous append or a crashed process), it's a no-op.
+                # C-05/6.1: lazily create the chat_streams main-table row,
+                # keyed by stream_id.  INSERT OR IGNORE is safe: if a row
+                # already exists (from a previous append or a crashed
+                # process), it's a no-op.
                 await conn.execute(
                     "INSERT OR IGNORE INTO chat_streams ("
-                    "session_id,principal_id,project_id,status,boot_id,"
+                    "stream_id,session_id,turn_id,attempt_id,"
+                    "principal_id,project_id,status,boot_id,"
                     "runtime_id,lease_until,last_sequence,terminal_event_type,"
-                    "started_at,terminal_at) VALUES(?,?,?,?,?,?,NULL,0,NULL,?,NULL)",
+                    "started_at,terminal_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,NULL,0,NULL,?,NULL)",
                     (
-                        session_id, principal_id, project_id,
+                        stream_id, session_id, turn_id, attempt_id,
+                        principal_id, project_id,
                         "running", boot_id, runtime_id, now,
                     ),
                 )
 
-                # C-05: terminal shield — reject append if already terminal.
+                # C-05/6.1: terminal shield — reject append if already
+                # terminal.  Keyed by stream_id, NOT session_id.
                 cursor = await conn.execute(
-                    "SELECT status FROM chat_streams WHERE session_id = ?",
-                    (session_id,),
+                    "SELECT status FROM chat_streams WHERE stream_id = ?",
+                    (stream_id,),
                 )
                 row = await cursor.fetchone()
                 current_status = str(row["status"]) if row else "running"
                 if current_status != "running":
                     raise ChatStreamTerminalError(
-                        f"chat stream {session_id} is already terminal "
+                        f"chat stream {stream_id} is already terminal "
                         f"(status={current_status}); cannot append "
                         f"'{event_type}'"
                     )
 
                 cursor = await conn.execute(
                     "SELECT COALESCE(MAX(sequence), 0) FROM chat_stream_events "
-                    "WHERE session_id = ?",
-                    (session_id,),
+                    "WHERE stream_id = ?",
+                    (stream_id,),
                 )
                 row = await cursor.fetchone()
                 sequence = int(row[0]) + 1
                 await conn.execute(
                     "INSERT INTO chat_stream_events ("
-                    "session_id,principal_id,project_id,sequence,event_type,"
-                    "data_json,is_terminal,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    "stream_id,session_id,principal_id,project_id,sequence,"
+                    "event_type,data_json,is_terminal,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
                     (
+                        stream_id,
                         session_id,
                         principal_id,
                         project_id,
@@ -4592,55 +4783,76 @@ class Database:
                     ),
                 )
 
-                # Update chat_streams state machine.
+                # Update chat_streams state machine (keyed by stream_id).
                 if is_terminal:
                     # CAS: running → terminal (exactly one terminal).
                     await conn.execute(
                         "UPDATE chat_streams SET status=?, "
                         "terminal_event_type=?, terminal_at=?, "
                         "last_sequence=? "
-                        "WHERE session_id=? AND status='running'",
-                        (event_type, event_type, now, sequence, session_id),
+                        "WHERE stream_id=? AND status='running'",
+                        (event_type, event_type, now, sequence, stream_id),
                     )
                 else:
                     # Renew lease + update last_sequence for running streams.
                     if lease_until is not None:
                         await conn.execute(
                             "UPDATE chat_streams SET last_sequence=?, "
-                            "lease_until=? WHERE session_id=?",
-                            (sequence, lease_until, session_id),
+                            "lease_until=? WHERE stream_id=?",
+                            (sequence, lease_until, stream_id),
                         )
                     else:
                         await conn.execute(
                             "UPDATE chat_streams SET last_sequence=? "
-                            "WHERE session_id=?",
-                            (sequence, session_id),
+                            "WHERE stream_id=?",
+                            (sequence, stream_id),
                         )
                 return sequence
 
     async def list_chat_stream_events(
         self,
         *,
-        session_id: str,
+        stream_id: str = "",
+        session_id: str = "",
         principal_id: str,
         project_id: str,
         after_sequence: int = 0,
         limit: int = 256,
     ) -> list[dict[str, Any]]:
-        """Read an owner's durable chat events after an exclusive cursor."""
+        """Read durable chat events after an exclusive cursor.
+
+        Round-6 Batch 6.1: if ``stream_id`` is provided, returns events
+        for that stream only (ordered by stream-local sequence).  If
+        only ``session_id`` is provided, returns events across ALL
+        streams for that session (ordered by created_at then sequence).
+        """
         conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT sequence,event_type,data_json,is_terminal,created_at "
-            "FROM chat_stream_events WHERE session_id=? AND principal_id=? "
-            "AND project_id=? AND sequence>? ORDER BY sequence LIMIT ?",
-            (
-                session_id,
-                principal_id,
-                project_id,
-                max(0, after_sequence),
-                max(1, min(limit, 1024)),
-            ),
-        )
+        if stream_id:
+            cursor = await conn.execute(
+                "SELECT sequence,event_type,data_json,is_terminal,created_at "
+                "FROM chat_stream_events WHERE stream_id=? AND principal_id=? "
+                "AND project_id=? AND sequence>? ORDER BY sequence LIMIT ?",
+                (
+                    stream_id,
+                    principal_id,
+                    project_id,
+                    max(0, after_sequence),
+                    max(1, min(limit, 1024)),
+                ),
+            )
+        else:
+            cursor = await conn.execute(
+                "SELECT sequence,event_type,data_json,is_terminal,created_at "
+                "FROM chat_stream_events WHERE session_id=? AND principal_id=? "
+                "AND project_id=? AND sequence>? ORDER BY created_at,sequence LIMIT ?",
+                (
+                    session_id,
+                    principal_id,
+                    project_id,
+                    max(0, after_sequence),
+                    max(1, min(limit, 1024)),
+                ),
+            )
         return [
             {
                 "sequence": int(row["sequence"]),
@@ -4679,6 +4891,9 @@ class Database:
         ``chat_streams`` state-machine row so that deleting a session
         does not leave an orphaned state row that would later be
         recovered by ``recover_inflight_chat_streams``.
+
+        Round-6 Batch 6.1: deletes ALL streams for the session (a
+        session can now have many streams).
         """
         async with self._chat_event_lock:
             async with self.transaction() as conn:
@@ -4689,7 +4904,8 @@ class Database:
                 )
                 deleted = cursor.rowcount or 0
                 await cursor.close()
-                # C-05: cascade-delete the state-machine row.
+                # C-05/6.1: cascade-delete ALL state-machine rows for
+                # this session (there may be many streams).
                 await conn.execute(
                     "DELETE FROM chat_streams "
                     "WHERE session_id=? AND principal_id=? AND project_id=?",
@@ -4704,37 +4920,40 @@ class Database:
         now: float,
         limit: int = 1000,
     ) -> int:
-        """F-07: drop chat_stream_events whose session is terminal and
+        """F-07: drop chat_stream_events whose stream is terminal and
         older than ``older_than_seconds``.
 
-        A session is considered "terminal and aged-out" when its
+        A stream is considered "terminal and aged-out" when its
         highest-sequence event is terminal AND that event's
         ``created_at`` is older than ``now - older_than_seconds``.  All
-        events for such sessions (including the terminal one) are
+        events for such streams (including the terminal one) are
         deleted to bound long-term ledger growth.  ``limit`` caps the
-        number of sessions pruned per call so the GC stays
+        number of streams pruned per call so the GC stays
         latency-bounded.
 
         C-02 (round-4 review): now goes through ``transaction()`` (see
         ``delete_chat_stream_events_for_session`` for rationale).
 
         Round-5 Batch 5.2 (C-05): also cascade-deletes the matching
-        ``chat_streams`` state-machine rows for the pruned sessions so
+        ``chat_streams`` state-machine rows for the pruned streams so
         that the state table does not accumulate orphaned terminal rows.
+
+        Round-6 Batch 6.1: prune is now per-stream (stream_id), not
+        per-session.
         """
         async with self._chat_event_lock:
             async with self.transaction() as conn:
-                # C-05: first compute the session_ids that will be pruned
-                # so we can cascade-delete their chat_streams rows too.
+                # C-05/6.1: first compute the stream_ids that will be
+                # pruned so we can cascade-delete their chat_streams rows.
                 cursor = await conn.execute(
                     """
-                    SELECT latest.session_id AS session_id
+                    SELECT latest.stream_id AS stream_id
                     FROM (
-                        SELECT session_id, MAX(sequence) AS sequence
-                        FROM chat_stream_events GROUP BY session_id
+                        SELECT stream_id, MAX(sequence) AS sequence
+                        FROM chat_stream_events GROUP BY stream_id
                     ) latest
                     JOIN chat_stream_events e
-                        ON e.session_id = latest.session_id
+                        ON e.stream_id = latest.stream_id
                         AND e.sequence = latest.sequence
                     WHERE e.is_terminal = 1
                         AND e.created_at < ?
@@ -4746,20 +4965,20 @@ class Database:
                 await cursor.close()
                 if not rows:
                     return 0
-                session_ids = [str(r["session_id"]) for r in rows]
-                placeholders = ",".join("?" * len(session_ids))
+                stream_ids = [str(r["stream_id"]) for r in rows]
+                placeholders = ",".join("?" * len(stream_ids))
                 cursor = await conn.execute(
                     f"DELETE FROM chat_stream_events "
-                    f"WHERE session_id IN ({placeholders})",
-                    session_ids,
+                    f"WHERE stream_id IN ({placeholders})",
+                    stream_ids,
                 )
                 deleted = cursor.rowcount or 0
                 await cursor.close()
-                # C-05: cascade-delete the state-machine rows.
+                # C-05/6.1: cascade-delete the state-machine rows.
                 await conn.execute(
                     f"DELETE FROM chat_streams "
-                    f"WHERE session_id IN ({placeholders})",
-                    session_ids,
+                    f"WHERE stream_id IN ({placeholders})",
+                    stream_ids,
                 )
                 return deleted
 
@@ -4781,6 +5000,10 @@ class Database:
         any new chats are started).  Periodic maintenance must NOT call
         it — that was the C-05 bug where hourly maintenance terminated
         active chats waiting on long tool calls.
+
+        Round-6 Batch 6.1: recovery is now per-stream (stream_id), not
+        per-session.  Each non-terminal stream gets its own error
+        terminal event.
         """
         async with self._chat_event_lock:
             async with self.transaction() as conn:
@@ -4788,13 +5011,13 @@ class Database:
                     # Legacy mode: recover all non-terminal streams.
                     cursor = await conn.execute(
                         """
-                        SELECT e.session_id,e.principal_id,
+                        SELECT e.stream_id,e.session_id,e.principal_id,
                                e.project_id,e.sequence
                         FROM chat_stream_events e
                         JOIN (
-                            SELECT session_id,MAX(sequence) AS sequence
-                            FROM chat_stream_events GROUP BY session_id
-                        ) latest ON latest.session_id=e.session_id
+                            SELECT stream_id,MAX(sequence) AS sequence
+                            FROM chat_stream_events GROUP BY stream_id
+                        ) latest ON latest.stream_id=e.stream_id
                             AND latest.sequence=e.sequence
                         WHERE e.is_terminal=0
                         """
@@ -4803,16 +5026,16 @@ class Database:
                     # C-05: only recover OTHER-boot or expired-lease streams.
                     cursor = await conn.execute(
                         """
-                        SELECT e.session_id,e.principal_id,
+                        SELECT e.stream_id,e.session_id,e.principal_id,
                                e.project_id,e.sequence
                         FROM chat_stream_events e
                         JOIN (
-                            SELECT session_id,MAX(sequence) AS sequence
-                            FROM chat_stream_events GROUP BY session_id
-                        ) latest ON latest.session_id=e.session_id
+                            SELECT stream_id,MAX(sequence) AS sequence
+                            FROM chat_stream_events GROUP BY stream_id
+                        ) latest ON latest.stream_id=e.stream_id
                             AND latest.sequence=e.sequence
                         LEFT JOIN chat_streams cs
-                            ON cs.session_id=e.session_id
+                            ON cs.stream_id=e.stream_id
                         WHERE e.is_terminal=0
                           AND (
                             cs.boot_id IS NULL
@@ -4828,9 +5051,11 @@ class Database:
                 for row in rows:
                     await conn.execute(
                         "INSERT INTO chat_stream_events ("
-                        "session_id,principal_id,project_id,sequence,event_type,"
-                        "data_json,is_terminal,created_at) VALUES(?,?,?,?,?,?,1,?)",
+                        "stream_id,session_id,principal_id,project_id,sequence,"
+                        "event_type,data_json,is_terminal,created_at) "
+                        "VALUES(?,?,?,?,?,?,?,1,?)",
                         (
+                            row["stream_id"],
                             row["session_id"],
                             row["principal_id"],
                             row["project_id"],
@@ -4844,16 +5069,16 @@ class Database:
                             now,
                         ),
                     )
-                    # C-05: CAS the chat_streams row to terminal too.
+                    # C-05/6.1: CAS the chat_streams row to terminal too.
                     await conn.execute(
                         "UPDATE chat_streams SET status='error', "
                         "terminal_event_type='error', terminal_at=?, "
                         "last_sequence=? "
-                        "WHERE session_id=? AND status='running'",
+                        "WHERE stream_id=? AND status='running'",
                         (
                             now,
                             int(row["sequence"]) + 1,
-                            row["session_id"],
+                            row["stream_id"],
                         ),
                     )
                 return len(rows)

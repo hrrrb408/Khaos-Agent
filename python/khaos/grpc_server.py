@@ -55,6 +55,7 @@ from khaos.channels import (
     WebhookReplayGuard,
 )
 from khaos.db import Database
+from khaos.db.database import SessionBusyError
 from khaos.exceptions import ServiceShutdownError
 from khaos.maintenance import MaintenanceService
 from khaos.memory import (
@@ -903,6 +904,11 @@ class AgentService:
         self._accepting_work = True
         self._active_chat_tasks: set[asyncio.Task] = set()
         self._active_runtimes: dict[int, object] = {}
+        # Round-6 Batch 6.1: track active sessions to reject concurrent
+        # chat RPCs on the same session_id (Review §八 Strategy B: reject).
+        # A second chat() on a session that already has an active stream
+        # gets SessionBusyError instead of racing on shared state.
+        self._active_chat_sessions: set[str] = set()
         self._office_shutdown_task: asyncio.Task | None = None
         self.shutdown_failed = False
         # M4 batch 3.1.15 (CRITICAL-1): idempotency flag for shutdown().
@@ -1166,17 +1172,29 @@ class AgentService:
         # already been appended for this chat so every ``started``
         # corresponds to exactly one terminal (done / error / interrupted).
         session_id_for_terminal: str | None = None
+        stream_id_for_terminal: str | None = None
         terminal_appended = False
+        # Round-6 Batch 6.1: each chat RPC creates a new stream_id
+        # (independent of session_id) so a session can have many streams.
+        stream_id = str(uuid.uuid4())
         # Register the reservation BEFORE any await so shutdown's snapshot
         # cannot miss this chat.  Cheap dict mutation under the lock; the
         # expensive build is outside.
         async with self._admission_lock:
             if not self._accepting_work:
                 raise ServiceShutdownError("AgentService is shutting down")
+            session_id = request.session_id or str(uuid.uuid4())
+            # Round-6 Batch 6.1: reject concurrent chat on the same
+            # session (Review §八 Strategy B).  A session can have many
+            # sequential streams, but not concurrent ones.
+            if session_id in self._active_chat_sessions:
+                raise SessionBusyError(
+                    f"session {session_id} already has an active chat stream"
+                )
+            self._active_chat_sessions.add(session_id)
             if owner_task is not None:
                 self._active_chat_tasks.add(owner_task)
         try:
-            session_id = request.session_id or str(uuid.uuid4())
             await self.db.create_session(
                 session_id,
                 request.mode or "office",
@@ -1184,23 +1202,25 @@ class AgentService:
                 project_id=ctx.project_id,
             )
             started_sequence = await self.db.append_chat_stream_event(
+                stream_id=stream_id,
                 session_id=session_id,
                 principal_id=ctx.principal_id,
                 project_id=ctx.project_id,
                 event_type="started",
-                data={"session_id": session_id},
+                data={"session_id": session_id, "stream_id": stream_id},
                 now=time.time(),
                 boot_id=self._boot_id,
-                runtime_id=session_id,
+                runtime_id=stream_id,
                 # C-05: lease renewed on every non-terminal append below.
                 # Initial lease is generous so a slow _build_runtime does
                 # not get recovered by a concurrent process.
                 lease_until=time.time() + _CHAT_STREAM_LEASE_SECONDS,
             )
             session_id_for_terminal = session_id
+            stream_id_for_terminal = stream_id
             yield {
                 "event": "started",
-                "data": {"session_id": session_id},
+                "data": {"session_id": session_id, "stream_id": stream_id},
                 "sequence": started_sequence,
             }
             # Build OUTSIDE the lock — a slow / wedged build no longer
@@ -1233,6 +1253,7 @@ class AgentService:
                 event_name = str(event["event"])
                 is_terminal = event_name in {"done", "error", "interrupted"}
                 sequence = await self.db.append_chat_stream_event(
+                    stream_id=stream_id,
                     session_id=session_id,
                     principal_id=ctx.principal_id,
                     project_id=ctx.project_id,
@@ -1240,7 +1261,7 @@ class AgentService:
                     data=dict(event["data"]),
                     now=time.time(),
                     boot_id=self._boot_id,
-                    runtime_id=session_id,
+                    runtime_id=stream_id,
                     # C-05: renew lease on every non-terminal append so
                     # the periodic recovery (if any other process runs
                     # it) does not reclaim an active chat waiting on a
@@ -1261,7 +1282,7 @@ class AgentService:
             # the model router fails.  Subscribers polling the ledger
             # would otherwise wait the full 30 s idle deadline instead
             # of seeing an explicit failure.
-            if session_id_for_terminal is not None and not terminal_appended:
+            if stream_id_for_terminal is not None and not terminal_appended:
                 event_type = (
                     "interrupted"
                     if isinstance(exc, asyncio.CancelledError)
@@ -1270,7 +1291,8 @@ class AgentService:
                 try:
                     await asyncio.shield(
                         self.db.append_chat_stream_event(
-                            session_id=session_id_for_terminal,
+                            stream_id=stream_id_for_terminal,
+                            session_id=session_id_for_terminal or "",
                             principal_id=ctx.principal_id,
                             project_id=ctx.project_id,
                             event_type=event_type,
@@ -1280,7 +1302,7 @@ class AgentService:
                             },
                             now=time.time(),
                             boot_id=self._boot_id,
-                            runtime_id=session_id_for_terminal,
+                            runtime_id=stream_id_for_terminal,
                             # Terminal append — no lease needed.
                             lease_until=None,
                         )
@@ -1291,9 +1313,9 @@ class AgentService:
                     # Re-raise the original exception; a separate
                     # recovery journal hook could pick this up later.
                     logger.exception(
-                        "F-07: failed to append terminal %s for session=%s",
+                        "F-07: failed to append terminal %s for stream=%s",
                         event_type,
-                        session_id_for_terminal,
+                        stream_id_for_terminal,
                     )
             raise
         finally:
@@ -1308,14 +1330,24 @@ class AgentService:
                     self._active_runtimes.pop(id(runtime), None)
             if owner_task is not None:
                 self._active_chat_tasks.discard(owner_task)
+            # Round-6 Batch 6.1: release the session so the next turn
+            # can start a new stream on the same session.
+            if session_id is not None:
+                self._active_chat_sessions.discard(session_id)
 
     async def chat_events(
         self,
         ctx: RequestContext,
-        session_id: str,
+        session_id: str = "",
         after_sequence: int = 0,
+        stream_id: str = "",
     ) -> AsyncIterator[dict]:
-        """Replay and tail one principal's durable chat event ledger."""
+        """Replay and tail one principal's durable chat event ledger.
+
+        Round-6 Batch 6.1: if ``stream_id`` is provided, tails that
+        specific stream.  Otherwise tails all events for the session
+        (across all streams, ordered by created_at).
+        """
         if not ctx.project_id:
             ctx = RequestContext(
                 principal_id=ctx.principal_id,
@@ -1325,16 +1357,22 @@ class AgentService:
                 source_transport=ctx.source_transport,
                 policy_digest=ctx.policy_digest,
             )
-        session = await self.db.get_session(
-            session_id, principal_id=ctx.principal_id,
-            project_id=ctx.project_id,
-        )
-        if session is None or session.get("project_id") != ctx.project_id:
-            return
+        if stream_id:
+            # Stream-specific tail: no need to verify session ownership
+            # separately — the DB query filters by principal+project.
+            pass
+        else:
+            session = await self.db.get_session(
+                session_id, principal_id=ctx.principal_id,
+                project_id=ctx.project_id,
+            )
+            if session is None or session.get("project_id") != ctx.project_id:
+                return
         cursor = max(0, int(after_sequence))
         idle_deadline = time.monotonic() + 30.0
         while time.monotonic() < idle_deadline:
             events = await self.db.list_chat_stream_events(
+                stream_id=stream_id,
                 session_id=session_id,
                 principal_id=ctx.principal_id,
                 project_id=ctx.project_id,

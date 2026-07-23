@@ -229,15 +229,15 @@ async def test_f07_d_delete_chat_stream_events_for_session(tmp_path):
         await db.create_session("s1", principal_id=PRINCIPAL, project_id=PROJECT_ID)
         await db.create_session("s2", principal_id=PRINCIPAL, project_id=PROJECT_ID)
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
         )
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="done", data={}, now=2.0,
         )
         await db.append_chat_stream_event(
-            session_id="s2", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s2", session_id="s2", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=3.0,
         )
 
@@ -274,25 +274,25 @@ async def test_f07_e_prune_terminal_chat_streams(tmp_path):
         now = time.time()
         # aged: terminal event 2 hours ago.
         await db.append_chat_stream_event(
-            session_id="aged", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="aged", session_id="aged", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now - 7200,
         )
         await db.append_chat_stream_event(
-            session_id="aged", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="aged", session_id="aged", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="done", data={}, now=now - 7100,
         )
         # fresh: terminal event 10 seconds ago.
         await db.append_chat_stream_event(
-            session_id="fresh", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="fresh", session_id="fresh", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now - 20,
         )
         await db.append_chat_stream_event(
-            session_id="fresh", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="fresh", session_id="fresh", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="done", data={}, now=now - 10,
         )
         # inflight: started but no terminal.
         await db.append_chat_stream_event(
-            session_id="inflight", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="inflight", session_id="inflight", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=now - 7200,
         )
 
@@ -328,11 +328,11 @@ async def test_f07_f_interrupted_is_terminal_in_schema(tmp_path):
     try:
         await db.create_session("s1", principal_id=PRINCIPAL, project_id=PROJECT_ID)
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="started", data={}, now=1.0,
         )
         await db.append_chat_stream_event(
-            session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
+            stream_id="s1", session_id="s1", principal_id=PRINCIPAL, project_id=PROJECT_ID,
             event_type="interrupted", data={"reason": "CancelledError"}, now=2.0,
         )
         events = await db.list_chat_stream_events(

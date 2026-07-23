@@ -232,7 +232,7 @@ async def test_chat_gc_serialized_behind_permission_transaction(db: Database):
 
     # Seed a chat event so GC has something to delete.
     await db.append_chat_stream_event(
-        session_id=session,
+        stream_id=session, session_id=session,
         principal_id=principal,
         project_id=project,
         event_type="message",

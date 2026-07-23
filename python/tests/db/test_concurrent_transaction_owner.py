@@ -81,7 +81,7 @@ async def test_concurrent_permission_grant_and_chat_event_append(db: Database):
         await asyncio.sleep(0.05)
         # This must not commit the grant's transaction
         seq = await db.append_chat_stream_event(
-            session_id=session,
+            stream_id=session, session_id=session,
             principal_id=principal,
             project_id=project,
             event_type="message",
@@ -441,7 +441,7 @@ async def test_stress_concurrent_writes_across_domains_no_errors(db: Database):
 
     async def chat_append(i: int):
         await db.append_chat_stream_event(
-            session_id=session,
+            stream_id=session, session_id=session,
             principal_id=principal,
             project_id=project,
             event_type="message",
