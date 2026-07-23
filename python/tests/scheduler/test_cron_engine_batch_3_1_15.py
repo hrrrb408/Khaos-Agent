@@ -491,7 +491,7 @@ async def test_acceptance_5_failed_stop_no_pending_executions(tmp_path) -> None:
         assert engine._lifecycle_state == CronEngineState.QUARANTINED
 
         # Make Task B immediately due in the DB.
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET next_run = ? WHERE id = ?",
             (past_iso, task_b.id),
@@ -799,7 +799,7 @@ async def test_acceptance_9_executor_marker_cas0_running_keeps_marker(
         # scenario — the DB didn't get the terminal write for an
         # unknown reason: execution_id mismatch, version mismatch,
         # etc.).
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET status = 'running' WHERE id = ?",
             (task.id,),
@@ -879,7 +879,7 @@ async def test_acceptance_10_executor_commit_then_raise_clears_marker(
         # Simulate commit-then-raise: the CAS committed (DB is at
         # COMPLETED) but _finalize_task_state returns False (the CAS
         # appeared to fail because the version already advanced).
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET status = 'completed' WHERE id = ?",
             (task.id,),

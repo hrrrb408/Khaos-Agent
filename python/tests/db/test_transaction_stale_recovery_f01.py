@@ -40,7 +40,7 @@ async def test_transaction_recovers_from_stale_uncommitted_write(tmp_path):
     rolled back so the next ``transaction()`` can begin."""
     db = await _db(tmp_path)
     try:
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         # Simulate a bare write that issued an implicit BEGIN but was
         # cancelled before commit() — exactly the cancellation scenario.
         await conn.execute(

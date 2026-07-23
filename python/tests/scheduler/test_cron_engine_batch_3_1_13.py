@@ -144,7 +144,7 @@ async def test_acceptance_1_lease_sweep_revokes_executor_before_failed(tmp_path)
 
         # Expire the lease in the DB.
         expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
             (expired_iso, task_id),
@@ -260,7 +260,7 @@ async def test_acceptance_2_cancellation_resistant_enters_degraded(tmp_path) -> 
 
         # Expire the lease.
         expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
             (expired_iso, task_id),
@@ -968,7 +968,7 @@ async def test_acceptance_10_pause_fail_plus_lease_sweep_combination(
 
         # Expire task B's lease.
         expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
             (expired_iso, task_b.id),

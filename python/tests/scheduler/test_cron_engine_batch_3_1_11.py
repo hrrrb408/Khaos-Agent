@@ -337,7 +337,7 @@ async def test_acceptance_4_terminal_write_failure_restart_recovers_as_failed(
     # Manually expire the lease (simulate time passing).
     db2 = await _make_db(db_path)
     try:
-        conn = await db2._require_conn()
+        conn = await db2._require_writer_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
             ((utc_now_naive() - timedelta(seconds=1)).isoformat(), task.id),
@@ -489,7 +489,7 @@ async def test_acceptance_6_empty_principal_rejected_in_execute(tmp_path) -> Non
         # Corrupt the DB row: set principal_id to empty.
         # ``Database`` doesn't expose a raw ``execute`` — use the
         # underlying connection via ``_require_conn()``.
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "UPDATE scheduled_tasks SET principal_id = '' WHERE id = ?",
             (task.id,),

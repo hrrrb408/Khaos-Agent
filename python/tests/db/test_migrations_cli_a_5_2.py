@@ -77,7 +77,7 @@ async def _ensure_session(db: Database, session_id: str) -> None:
     sessions(id)``; this helper ensures the parent row exists before
     we insert a child row with ``project_id=''``.
     """
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     await conn.execute(
         "INSERT OR IGNORE INTO sessions (id, mode, principal_id) "
         "VALUES (?, 'office', 'u1')",
@@ -98,7 +98,7 @@ async def _insert_legacy_row(
     with the minimum required columns.  All omit ``project_id`` so
     the column default (``''``) applies.
     """
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     if table == "sessions":
         await conn.execute(
             "INSERT INTO sessions (id, mode, principal_id) VALUES (?, 'office', 'u1')",

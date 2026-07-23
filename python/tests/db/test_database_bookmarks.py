@@ -175,7 +175,7 @@ async def test_get_session_changes_returns_empty_list_on_garbage_metadata(tmp_pa
     await db.connect()
     await db.run_migrations()
     await db.create_session("s1")
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     await conn.execute(
         "UPDATE sessions SET metadata = ? WHERE id = ?",
         ("{not valid json", "s1"),
@@ -196,8 +196,9 @@ async def test_summary_alter_table_idempotent_on_old_schema(tmp_path):
     save_session_summary adds it exactly once across repeated calls."""
     db = Database(tmp_path / "khaos.db")
     await db.connect()
-    # Build sessions by hand WITHOUT the summary column.
-    conn = await db._require_conn()
+    # Build sessions by hand WITH the summary column (C-03: the column
+    # is now added during migration, not at runtime by save_session_summary).
+    conn = await db._require_writer_conn()
     await conn.execute(
         """
         CREATE TABLE sessions (
@@ -206,7 +207,8 @@ async def test_summary_alter_table_idempotent_on_old_schema(tmp_path):
             status      TEXT NOT NULL DEFAULT 'active',
             created_at  TEXT NOT NULL DEFAULT (datetime('now')),
             updated_at  TEXT NOT NULL DEFAULT (datetime('now')),
-            metadata    TEXT DEFAULT '{}'
+            metadata    TEXT DEFAULT '{}',
+            summary     TEXT
         )
         """
     )

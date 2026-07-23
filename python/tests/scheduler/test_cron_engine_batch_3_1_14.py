@@ -112,7 +112,7 @@ async def test_acceptance_1_lease_revocation_failure_stops_tick(
 
             # Now expire A's lease and force a sweep.
             expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
-            conn = await db._require_conn()
+            conn = await db._require_writer_conn()
             await conn.execute(
                 "UPDATE scheduled_tasks SET lease_until = ? WHERE id = ?",
                 (expired_iso, task_a.id),
@@ -205,7 +205,7 @@ async def test_acceptance_2_lease_recovery_db_failure_stops_tick(tmp_path) -> No
 
             # Manually set A to running with an expired lease.
             expired_iso = (utc_now_naive() - timedelta(seconds=60)).isoformat()
-            conn = await db._require_conn()
+            conn = await db._require_writer_conn()
             await conn.execute(
                 "UPDATE scheduled_tasks SET status = 'running', "
                 "lease_until = ?, execution_id = ? WHERE id = ?",
