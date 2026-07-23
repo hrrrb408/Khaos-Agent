@@ -65,6 +65,13 @@ class MemoryStore:
     is constructed via ``build_runtime`` the ``project_id`` comes from
     ``RuntimeConfig.project_id`` (set by ``AgentService`` from the
     verified RPC payload), NOT from ``compute_project_id(root)``.
+
+    F-02 (third-round review): ``project_id`` is now part of the
+    memories UNIQUE constraint and is forwarded to every DB read/write
+    call (get, delete, list, search, touch, decay).  This closes the
+    cross-project leak where a shared state DB (via explicit ``--db``)
+    could let project B read, overwrite, or delete project A's memories
+    of the same key.
     """
 
     def __init__(
@@ -72,11 +79,9 @@ class MemoryStore:
     ):
         self.db = db
         self._principal_id = principal_id
-        # M4 batch 3.1.16A-5-1b: project identity stamp.  Default ``''``
-        # ("unbound") matches the schema column default — legacy callers
-        # / tests that omit it produce ``project_id=''`` rows which are
-        # still visible (the UNIQUE key is unchanged) but distinguishable
-        # from rows stamped by a project-bound runtime.
+        # M4 batch 3.1.16A-5-1b / F-02: project identity is bound at
+        # construction and forwarded to every DB call so memories are
+        # isolated by project, not just by principal.
         self._project_id = project_id
 
     def _effective_principal(self, namespace: str) -> str:
@@ -102,6 +107,9 @@ class MemoryStore:
             principal_id=self._effective_principal(namespace),
             namespace=namespace,
             session_id=session_id,
+            # F-02: scope reads by project_id so a shared DB cannot
+            # leak another project's memory of the same key.
+            project_id=self._project_id,
         )
         return self._from_row(row) if row is not None else None
 
@@ -170,11 +178,11 @@ class MemoryStore:
             principal_id=self._effective_principal(namespace),
             namespace=namespace,
             session_id=session_id,
-            # M4 batch 3.1.16A-5-1b: stamp the project identity on every
-            # upsert.  ``upsert_memory``'s ``ON CONFLICT`` clause does NOT
-            # touch ``project_id`` — owner-preserving — so once a memory
-            # is bound to a (principal, project) pair it cannot be
-            # re-stamped by a later upsert from a different context.
+            # F-02: project_id is now part of the UNIQUE constraint.
+            # Re-upserting from the same project updates the existing
+            # row; a different project creates a new row.  The old
+            # "owner-preserving" behavior is removed — each project
+            # owns its own row.
             project_id=self._project_id,
         )
         stored = await self.get(
@@ -223,6 +231,9 @@ class MemoryStore:
         M4 batch 3.1.16A-2: only this principal's memories are decayed —
         the list_all() call is principal-scoped, so ``delete_memory_by_id``
         can only receive IDs that belong to this principal.
+
+        F-02: ``delete_memory_by_id`` is now also scoped by ``project_id``
+        so decay cannot cross project boundaries on a shared DB.
         """
         moment = now or utc_now_naive()
         before = len(await self.list_all())
@@ -236,7 +247,11 @@ class MemoryStore:
             if age > memory.ttl:
                 expired_ids.append(memory.id)
         for memory_id in expired_ids:
-            await self.db.delete_memory_by_id(memory_id)
+            await self.db.delete_memory_by_id(
+                memory_id,
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+            )
         removed = before - len(await self.list_all()) if expired_ids else 0
         if removed:
             logger.info("memory decay removed %d expired entries", removed)
@@ -255,6 +270,9 @@ class MemoryStore:
             principal_id=self._effective_principal(namespace),
             namespace=namespace,
             session_id=session_id,
+            # F-02: scope deletes by project_id so a shared DB cannot
+            # let project B delete project A's memory of the same key.
+            project_id=self._project_id,
         )
 
     async def list_by_scope(self, scope: MemoryScope) -> list[Memory]:
@@ -266,7 +284,9 @@ class MemoryStore:
         return [
             self._from_row(row)
             for row in await self.db.list_memories(
-                scope.value, principal_id=self._principal_id,
+                scope.value,
+                principal_id=self._principal_id,
+                project_id=self._project_id,
             )
         ]
 
@@ -279,7 +299,10 @@ class MemoryStore:
         """
         return [
             self._from_row(row)
-            for row in await self.db.list_memories(principal_id=self._principal_id)
+            for row in await self.db.list_memories(
+                principal_id=self._principal_id,
+                project_id=self._project_id,
+            )
         ]
 
     async def search(self, query: str, top_k: int = 5) -> list[Memory]:
@@ -287,7 +310,9 @@ class MemoryStore:
         memories = [
             self._from_row(row)
             for row in await self.db.search_memories(
-                query, top_k, principal_id=self._principal_id,
+                query, top_k,
+                principal_id=self._principal_id,
+                project_id=self._project_id,
             )
         ]
         for memory in memories:
