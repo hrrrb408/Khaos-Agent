@@ -1109,6 +1109,11 @@ class AgentService:
             )
         owner_task = asyncio.current_task()
         runtime = None
+        # F-07 (third-round review): track whether a terminal event has
+        # already been appended for this chat so every ``started``
+        # corresponds to exactly one terminal (done / error / interrupted).
+        session_id_for_terminal: str | None = None
+        terminal_appended = False
         # Register the reservation BEFORE any await so shutdown's snapshot
         # cannot miss this chat.  Cheap dict mutation under the lock; the
         # expensive build is outside.
@@ -1133,6 +1138,7 @@ class AgentService:
                 data={"session_id": session_id},
                 now=time.time(),
             )
+            session_id_for_terminal = session_id
             yield {
                 "event": "started",
                 "data": {"session_id": session_id},
@@ -1173,7 +1179,47 @@ class AgentService:
                     data=dict(event["data"]),
                     now=time.time(),
                 )
+                if str(event["event"]) in {"done", "error", "interrupted"}:
+                    terminal_appended = True
                 yield {**event, "sequence": sequence}
+        except BaseException as exc:
+            # F-07: shield a terminal ``error``/``interrupted`` append so
+            # the durable ledger always has a terminal event even when
+            # ``_build_runtime`` raises, the chat task is cancelled, or
+            # the model router fails.  Subscribers polling the ledger
+            # would otherwise wait the full 30 s idle deadline instead
+            # of seeing an explicit failure.
+            if session_id_for_terminal is not None and not terminal_appended:
+                event_type = (
+                    "interrupted"
+                    if isinstance(exc, asyncio.CancelledError)
+                    else "error"
+                )
+                try:
+                    await asyncio.shield(
+                        self.db.append_chat_stream_event(
+                            session_id=session_id_for_terminal,
+                            principal_id=ctx.principal_id,
+                            project_id=ctx.project_id,
+                            event_type=event_type,
+                            data={
+                                "reason": type(exc).__name__,
+                                "message": str(exc) or type(exc).__name__,
+                            },
+                            now=time.time(),
+                        )
+                    )
+                    terminal_appended = True
+                except Exception:
+                    # The shield itself failed (DB locked, OOM, etc.).
+                    # Re-raise the original exception; a separate
+                    # recovery journal hook could pick this up later.
+                    logger.exception(
+                        "F-07: failed to append terminal %s for session=%s",
+                        event_type,
+                        session_id_for_terminal,
+                    )
+            raise
         finally:
             # Covers build failure, build cancellation, and normal exit.
             # Without this wrap, a _build_runtime raise would leak the
