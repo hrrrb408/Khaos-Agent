@@ -179,8 +179,7 @@ class KhaosApp(App):
         self.mode_manager = ModeManager(
             self.db, project_root=self.project_root,
             principal_id=f"local-uid:{os.getuid()}",
-            source_transport="tui",
-            foreground_session=True,
+            project_id=self._tui_project_id,
         )
         await self.mode_manager.load()
         if self.mode_override:

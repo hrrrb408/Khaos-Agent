@@ -53,6 +53,7 @@ async def run_once(args: argparse.Namespace) -> int:
     mode_manager = ModeManager(
         db, project_root=Path.cwd(),
         principal_id=f"local-uid:{os.getuid()}",
+        project_id=compute_project_id(Path.cwd()),
     )
     await mode_manager.load()
     if args.mode:
@@ -97,6 +98,7 @@ async def run_repl(args: argparse.Namespace) -> int:
     mode_manager = ModeManager(
         db, project_root=Path.cwd(),
         principal_id=f"local-uid:{os.getuid()}",
+        project_id=compute_project_id(Path.cwd()),
     )
     await mode_manager.load()
     session_id = args.session_id or str(uuid.uuid4())

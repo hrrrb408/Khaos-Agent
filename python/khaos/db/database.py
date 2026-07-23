@@ -41,12 +41,13 @@ TELEGRAM_REPLAY_WINDOW = 4096
 # the legacy upgrade helpers (including the new memories UNIQUE rebuild).
 # The schema.sql change (project_id added to memories UNIQUE) only affects
 # fresh DBs; existing DBs get the rebuild via _ensure_memories_project_id_unique.
-SCHEMA_MIGRATION_VERSION = 3
-SCHEMA_MIGRATION_NAME = "round5_chat_stream_state_machine"
+# v4 (round-5 Batch 5.3 / H-09): project_id added to principal_modes PK.
+SCHEMA_MIGRATION_VERSION = 4
+SCHEMA_MIGRATION_NAME = "round5_batch53_owner_context_closure"
 SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
 
 logger = logging.getLogger(__name__)
-SCHEMA_MIGRATION_SALT = "round5-chat-stream-state-machine-2026-07-23-v3"
+SCHEMA_MIGRATION_SALT = "round5-batch53-owner-context-closure-2026-07-23-v4"
 
 # Round-4 Batch 1 (C-01): Transaction owner tracking via an immutable
 # token that binds the transaction to a specific Database instance,
@@ -651,6 +652,76 @@ class Database:
         # leave memories without identity-guard enforcement.
         await self._ensure_memories_project_id_unique()
         await self._ensure_session_identity_invariants()
+        # H-09 (round-5 Batch 5.3): rebuild principal_modes so project_id
+        # is part of the PRIMARY KEY.  Closes cross-project mode leakage
+        # on shared DBs (Project A's coding mode would otherwise be
+        # loaded by Project B for the same principal).  Idempotent: a
+        # no-op on fresh v4 DBs whose PK already includes project_id.
+        await self._ensure_principal_modes_project_id_pk()
+
+    async def _ensure_principal_modes_project_id_pk(self) -> None:
+        """H-09 (round-5 Batch 5.3): rebuild ``principal_modes`` so
+        ``project_id`` is part of the PRIMARY KEY.
+
+        The pre-H-09 PK was ``(principal_id, session_id)`` —
+        ``project_id`` did not exist.  When two projects share a state DB
+        (via explicit ``--db``), Project B could load Project A's coding
+        mode for the same principal, leaking System Prompt / Tool
+        Availability / Routing decisions across the project boundary.
+
+        H-09 makes the PK ``(project_id, principal_id, session_id)`` so
+        each project gets its own mode rows.  SQLite cannot ALTER a
+        PRIMARY KEY, so the table is rebuilt: old data is backed up, the
+        table is dropped and recreated with the new schema, and the data
+        is re-inserted with ``project_id=''`` (legacy / unbound).  The
+        rebuild is idempotent: if the PK already includes ``project_id``
+        (fresh DB created with the v4 schema), the method returns
+        immediately.
+        """
+        conn = await self._require_conn()
+        # Idempotency check: inspect the table's CREATE SQL.  If the PK
+        # already covers project_id, the rebuild is a no-op.
+        cursor = await conn.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='principal_modes'"
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return  # Table doesn't exist yet (shouldn't happen post-schema)
+        create_sql = str(row[0])
+        if "PRIMARY KEY (project_id, principal_id, session_id)" in create_sql:
+            return  # Already migrated (fresh v4 schema)
+        # Backup old data.
+        await conn.execute(
+            "CREATE TABLE _principal_modes_h09_backup AS "
+            "SELECT * FROM principal_modes"
+        )
+        try:
+            await conn.execute("DROP TABLE principal_modes")
+            await conn.execute(
+                """
+                CREATE TABLE principal_modes (
+                    principal_id TEXT NOT NULL,
+                    project_id   TEXT NOT NULL DEFAULT '',
+                    session_id   TEXT NOT NULL DEFAULT '',
+                    mode         TEXT NOT NULL,
+                    updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
+                    PRIMARY KEY (project_id, principal_id, session_id)
+                )
+                """
+            )
+            # Re-insert legacy rows with project_id='' (unbound).
+            await conn.execute(
+                """
+                INSERT INTO principal_modes
+                    (principal_id, project_id, session_id, mode, updated_at)
+                SELECT principal_id, '', session_id, mode, updated_at
+                FROM _principal_modes_h09_backup
+                """
+            )
+        finally:
+            await conn.execute("DROP TABLE _principal_modes_h09_backup")
+        await conn.commit()
 
     async def _ensure_session_identity_invariants(self) -> None:
         """Make SQLite enforce duplicated session identity on every write."""
@@ -1761,26 +1832,34 @@ class Database:
         principal_id: str,
         session_id: str = "",
         default: str = "office",
+        *,
+        project_id: str = "",
     ) -> str:
         """M4 batch 3.1.16A-2: read principal-scoped mode.
 
         Lookup order:
-        1. (principal_id, session_id) — session-specific override
-        2. (principal_id, '')         — principal default
+        1. (project_id, principal_id, session_id) — session-specific override
+        2. (project_id, principal_id, '')         — principal default
         3. ``default`` (typically 'office')
+
+        H-09 (round-5 Batch 5.3): ``project_id`` is now part of the
+        lookup key — closes cross-project mode leakage on shared DBs.
+        ``project_id=''`` (the default) preserves legacy/test behaviour.
         """
         conn = await self._require_conn()
         if session_id:
             cursor = await conn.execute(
-                "SELECT mode FROM principal_modes WHERE principal_id = ? AND session_id = ?",
-                (principal_id, session_id),
+                "SELECT mode FROM principal_modes "
+                "WHERE project_id = ? AND principal_id = ? AND session_id = ?",
+                (project_id, principal_id, session_id),
             )
             row = await cursor.fetchone()
             if row is not None:
                 return str(row["mode"])
         cursor = await conn.execute(
-            "SELECT mode FROM principal_modes WHERE principal_id = ? AND session_id = ''",
-            (principal_id,),
+            "SELECT mode FROM principal_modes "
+            "WHERE project_id = ? AND principal_id = ? AND session_id = ''",
+            (project_id, principal_id),
         )
         row = await cursor.fetchone()
         if row is not None:
@@ -1792,22 +1871,29 @@ class Database:
         principal_id: str,
         mode: str,
         session_id: str = "",
+        *,
+        project_id: str = "",
     ) -> None:
         """M4 batch 3.1.16A-2: persist principal-scoped mode.
 
         When ``session_id`` is empty, sets the principal's default
         mode.  When non-empty, sets a session-specific override.
+
+        H-09 (round-5 Batch 5.3): ``project_id`` is now part of the
+        PK — each project gets its own mode rows.  ``project_id=''``
+        (the default) preserves legacy/test behaviour.
         """
         async with self.transaction() as conn:
             await conn.execute(
                 """
-                INSERT INTO principal_modes (principal_id, session_id, mode)
-                VALUES (?, ?, ?)
-                ON CONFLICT(principal_id, session_id) DO UPDATE SET
+                INSERT INTO principal_modes
+                    (principal_id, project_id, session_id, mode)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(project_id, principal_id, session_id) DO UPDATE SET
                     mode = excluded.mode,
                     updated_at = datetime('now')
                 """,
-                (principal_id, session_id, mode),
+                (principal_id, project_id, session_id, mode),
             )
 
     async def insert_permission_rule(

@@ -1339,6 +1339,7 @@ class AgentService:
             project_root=self.project_root,
             principal_id=ctx.principal_id,
             session_id=session_id,
+            project_id=ctx.project_id,
         )
         await mode_manager.load()
         mode = ModeManager.parse(target_mode)
