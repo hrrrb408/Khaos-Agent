@@ -310,32 +310,52 @@ async def test_acceptance_8_audit_log_owner_preserving_on_conflict(tmp_path):
 # ─────────────── Owner-preserving ON CONFLICT (memories) ────────────────
 
 
-async def test_acceptance_9_memories_owner_preserving_on_conflict(tmp_path):
-    """A5-1b #9: re-set memory with different project_id does NOT re-stamp.
+async def test_acceptance_9_memories_project_id_isolation_on_conflict(tmp_path):
+    """A5-1b #9 (F-02): re-set memory with different project_id creates a
+    DISTINCT row, not an owner-preserving overwrite.
 
-    ``memories`` UNIQUE key is ``(namespace, principal_id, session_id,
-    scope, key)``; the ON CONFLICT path does NOT update project_id —
-    once a memory is bound to a project, a later upsert from a different
-    project cannot re-stamp ownership.
+    Pre-F-02 the ``memories`` UNIQUE key was
+    ``(namespace, principal_id, session_id, scope, key)``; ``project_id``
+    was a plain column and ``ON CONFLICT`` did NOT touch it.  Two
+    projects sharing a state DB would collide on the same row.
+
+    F-02 (third-round review) makes ``project_id`` part of the UNIQUE
+    key.  Project B's upsert of the same key now creates its own row;
+    project A's row is untouched.  Each project reads its own value.
     """
     db = await _make_db(tmp_path / "khaos.db")
     try:
-        # First write: stamps PROJECT_ID_A.
+        # First write: stamps PROJECT_ID_A, value "v1".
         store_a = MemoryStore(db, principal_id="u1", project_id=PROJECT_ID_A)
         memory_a = Memory(
             id=None, scope=MemoryScope.GLOBAL, key="shared-key", value="v1",
             confidence=MemoryConfidence.MEDIUM,
         )
         await store_a.set(memory_a, namespace="private")
-        # Second write with different project_id: must NOT overwrite.
+        # Second write with different project_id: must create a new row.
         store_b = MemoryStore(db, principal_id="u1", project_id=PROJECT_ID_B)
         memory_b = Memory(
             id=None, scope=MemoryScope.GLOBAL, key="shared-key", value="v2",
             confidence=MemoryConfidence.MEDIUM,
         )
         await store_b.set(memory_b, namespace="private")
-        stamped = await _fetch_project_id(db, "memories", "key='shared-key'")
-        assert stamped == PROJECT_ID_A  # owner-preserving
+        # Each project reads its own value.
+        got_a = await store_a.get(MemoryScope.GLOBAL, "shared-key", namespace="private")
+        got_b = await store_b.get(MemoryScope.GLOBAL, "shared-key", namespace="private")
+        assert got_a is not None and got_a.value == "v1"
+        assert got_b is not None and got_b.value == "v2"
+        # Two distinct rows exist in the DB.
+        conn = await db._require_conn()
+        cursor = await conn.execute(
+            "SELECT project_id, value FROM memories "
+            "WHERE key = 'shared-key' ORDER BY project_id"
+        )
+        rows = await cursor.fetchall()
+        assert len(rows) == 2
+        assert rows[0][0] == PROJECT_ID_A
+        assert rows[0][1] == "v1"
+        assert rows[1][0] == PROJECT_ID_B
+        assert rows[1][1] == "v2"
     finally:
         await db.close()
 

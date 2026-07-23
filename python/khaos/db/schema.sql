@@ -141,7 +141,14 @@ CREATE TABLE IF NOT EXISTS memories (
     session_id   TEXT NOT NULL DEFAULT '',
     -- M4 batch 3.1.16A-5-1: project identity closure (see ``sessions``).
     project_id   TEXT NOT NULL DEFAULT '',
-    UNIQUE(namespace, principal_id, session_id, scope, key)
+    -- F-02 (third-round review): project_id is now part of the UNIQUE
+    -- key so two projects sharing a state DB cannot collide on the same
+    -- (namespace, principal_id, session_id, scope, key) tuple.  Legacy
+    -- rows with project_id='' remain visible (they share the empty
+    -- project partition); A-5-2 backfill should be run before this
+    -- migration on multi-project shared DBs to avoid collapsing
+    -- unbound rows onto a single partition.
+    UNIQUE(project_id, namespace, principal_id, session_id, scope, key)
 );
 -- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 

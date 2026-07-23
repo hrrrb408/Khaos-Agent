@@ -412,6 +412,7 @@ async def test_concurrent_authorization_bind_and_memory_write(db: Database):
     mem = await db.get_memory(
         scope="test", key="key-5",
         principal_id=principal, namespace="private", session_id=session,
+        project_id=project,
     )
     assert mem is not None
     assert mem["value"] == "value-5"
@@ -499,6 +500,7 @@ async def test_stress_concurrent_writes_across_domains_no_errors(db: Database):
     # Verify memories were all persisted
     memories = await db.list_memories(
         scope="stress", principal_id=principal, namespace="private",
+        project_id=project,
     )
     assert len(memories) == 200
 
