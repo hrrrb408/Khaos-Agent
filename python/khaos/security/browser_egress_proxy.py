@@ -19,8 +19,11 @@ resources:
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
+import hmac
 import logging
+import secrets
 import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
@@ -70,12 +73,33 @@ class _ByteLimitExceeded(Exception):
         self.limit = limit
 
 
+class _ProxyAuthError(Exception):
+    """C-07: raised when a client fails proxy authentication.
+
+    The proxy binds to a veth host IP that is reachable from inside the
+    browser network namespace.  Without per-client authentication any
+    process in that namespace (or any host process that can reach the
+    bind address) could use the proxy.  ``_ProxyAuthError`` triggers a
+    ``407 Proxy Authentication Required`` response carrying a
+    ``Proxy-Authenticate`` challenge so only the browser context that
+    received ``proxy_username``/``proxy_password`` can relay traffic.
+    """
+
+
 class BrowserEgressProxy:
     """A loopback-only proxy that authorizes and pins every connection.
 
     F-05: enforces idle timeout, upload/download byte caps, a concurrent
     connection quota, and audit logging on every connection lifecycle
     event.
+
+    C-07 (round-4): generates a random auth token so only the intended
+    browser context can use the proxy.  The token is validated on every
+    request (including CONNECT) via ``Proxy-Authorization: Basic …``.
+
+    C-11 (round-4): policy-violation exceptions (byte-limit, idle-timeout)
+    are now re-raised from ``_relay_bidirectional`` instead of being
+    silently swallowed by ``gather(return_exceptions=True)``.
     """
 
     def __init__(
@@ -97,6 +121,20 @@ class BrowserEgressProxy:
         self._bind_host = bind_host
         self._active_connections = 0
         self._connection_semaphore = asyncio.Semaphore(max_concurrent)
+        # C-07: random auth token — only the browser that receives this
+        # token can use the proxy.  Other host processes that can reach
+        # the bind address are rejected with 407.
+        self._auth_token = secrets.token_urlsafe(32)
+
+    @property
+    def proxy_username(self) -> str:
+        """Username for Playwright's ``proxy.username`` field."""
+        return "khaos"
+
+    @property
+    def proxy_password(self) -> str:
+        """Password for Playwright's ``proxy.password`` field."""
+        return self._auth_token
 
     @property
     def server_url(self) -> str:
@@ -153,6 +191,11 @@ class BrowserEgressProxy:
             )
             if len(header) > _MAX_HEADER_BYTES:
                 raise ValueError("proxy request header exceeds limit")
+            # C-07: validate Proxy-Authorization before dispatching.
+            # Every request — CONNECT or plain HTTP — must carry the
+            # per-proxy auth token so only the intended browser context
+            # can relay traffic through this proxy.
+            self._validate_proxy_auth(header)
             head, _, _ = header.partition(b"\r\n")
             method, target, version = head.decode("latin-1").split(" ", 2)
             stats.method = method.upper()
@@ -166,6 +209,11 @@ class BrowserEgressProxy:
                 )
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             await self._reject(writer, 400, "Bad Request")
+        except _ProxyAuthError as exc:
+            logger.warning(
+                "browser egress rejected: %s (%s)", exc, stats.summary(),
+            )
+            await self._reject_unauthorized(writer)
         except _ByteLimitExceeded as exc:
             logger.warning(
                 "browser egress byte limit exceeded: %s (%s)",
@@ -185,6 +233,54 @@ class BrowserEgressProxy:
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
+
+    def _validate_proxy_auth(self, header: bytes) -> None:
+        """C-07: enforce per-proxy authentication on every request.
+
+        The browser context receives ``proxy_username``/``proxy_password``
+        and sends them as ``Proxy-Authorization: Basic <b64>``.  We parse
+        the header (case-insensitive header name), decode the Basic
+        credentials, and use ``hmac.compare_digest`` so a wrong token is
+        rejected in constant time.  Missing or malformed credentials
+        raise ``_ProxyAuthError`` which maps to a ``407`` response.
+        """
+        expected = f"{self.proxy_username}:{self._auth_token}".encode("ascii")
+        auth_header: str | None = None
+        for line in header.split(b"\r\n")[1:]:
+            if not line:
+                continue
+            name, sep, value = line.partition(b":")
+            if not sep:
+                continue
+            if name.strip().lower() == b"proxy-authorization":
+                auth_header = value.decode("latin-1").strip()
+                break
+        if auth_header is None:
+            raise _ProxyAuthError("missing Proxy-Authorization header")
+        scheme, _, credentials = auth_header.partition(" ")
+        if scheme.lower() != "basic" or not credentials:
+            raise _ProxyAuthError("invalid Proxy-Authorization scheme")
+        try:
+            decoded = base64.b64decode(credentials, validate=True)
+        except ValueError as exc:
+            # binascii.Error is a subclass of ValueError
+            raise _ProxyAuthError("malformed Basic credentials") from exc
+        if not hmac.compare_digest(decoded, expected):
+            raise _ProxyAuthError("invalid proxy credentials")
+
+    @staticmethod
+    async def _reject_unauthorized(writer: asyncio.StreamWriter) -> None:
+        """C-07: send a 407 with a ``Proxy-Authenticate`` challenge."""
+        if writer.is_closing():
+            return
+        writer.write(
+            b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+            b"Proxy-Authenticate: Basic realm=\"khaos-browser-egress\"\r\n"
+            b"Connection: close\r\n"
+            b"Content-Length: 0\r\n\r\n"
+        )
+        with contextlib.suppress(Exception):
+            await writer.drain()
 
     async def _tunnel_connect(
         self,
@@ -364,6 +460,21 @@ async def _relay_bidirectional(
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
     for task in pending:
         task.cancel()
+    # C-11: re-raise the first policy-violation exception instead of
+    # silently swallowing it via ``gather(return_exceptions=True)``.
+    # ``_ByteLimitExceeded`` (upload/download cap) and
+    # ``asyncio.TimeoutError`` (idle timeout) are the policy signals
+    # that ``_handle_client`` maps to 413 / 408 responses; if we swallow
+    # them here the audit log lies about why the connection was closed
+    # and the 413 branch becomes dead code.  We only swallow exceptions
+    # from the *cancelled* pending tasks (CancelledError / connection
+    # reset), which are expected side-effects of tearing down a relay.
+    for task in done:
+        exc = task.exception()
+        if isinstance(exc, (_ByteLimitExceeded, asyncio.TimeoutError)):
+            # Let the pending tasks finish cancelling before propagating.
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise exc
     await asyncio.gather(*done, *pending, return_exceptions=True)
     upstream_writer.close()
     with contextlib.suppress(Exception):

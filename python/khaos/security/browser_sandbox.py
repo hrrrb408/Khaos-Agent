@@ -10,24 +10,40 @@ Architecture::
 
     Host network namespace
     ├── egress proxy  →  bound on 10.200.X.1 (veth host end)
-    └── veth-host-<id>  (10.200.X.1/30)
+    ├── veth-host-<id>  (10.200.X.1/30)
+    └── nftables  →  browser-veth → exact proxy_ip:proxy_port ONLY
 
     Browser network namespace  (khaos-browser-<id>)
     ├── lo  (loopback only, no default route)
     ├── veth-ns-<id>  (10.200.X.2/30)
     └── Chromium  →  --proxy-server=http://10.200.X.1:<port>
+                     (joined to cgroup-v2 leaf for pids/mem/cpu limits)
 
-The browser namespace has NO default route, so even a full Chromium
-compromise cannot reach anything except the proxy.
+C-06 (round-4): nftables rules restrict the browser veth to reach ONLY
+the exact proxy IP:port.  Without this, the host veth IP is on-link and
+reachable on any port — a compromised browser could connect to host
+services bound to ``0.0.0.0``.  Rules are installed atomically after the
+proxy starts (dynamic port) and deleted on teardown.
 
-On non-Linux or when CAP_NET_ADMIN is unavailable, the sandbox is a
-no-op and the proxy-only enforcement layer (BrowserEgressProxy) remains
-the sole egress authority.  A warning is logged so operators know
-OS-level enforcement is inactive.
+C-08 (round-4): the wrapper script writes its own PID to
+``cgroup.procs`` before ``exec nsenter``.  ``nsenter --net`` preserves
+the PID, so Chromium actually joins the cgroup — previously the cgroup
+was empty and resource limits were unenforced.
 
-A cgroup-v2 leaf is also created for the Chromium process to cap pids,
-memory and CPU — reusing the pattern from
-``coding.execution.platform._create_linux_cgroup``.
+C-09 (round-4): ``require_os_sandbox=True`` (production default) fails
+closed if any component is unavailable, instead of silently degrading
+to proxy-only.  ``EnforcementStatus`` exposes which layers are active
+so callers can refuse to launch when parity is required.
+
+C-10 (round-4): the wrapper script is created in a private
+``~/.khaos/run/<token>/`` directory (mode 0700, owner-verified,
+symlink-rejected via ``O_NOFOLLOW | O_EXCL``) instead of shared
+``/tmp``.  The wrapper is part of the TCB and must not be replaceable
+by another user.
+
+On non-Linux or when ``require_os_sandbox=False`` and capabilities are
+missing, the sandbox is a no-op and the proxy-only enforcement layer
+(BrowserEgressProxy) remains the sole egress authority.
 """
 
 from __future__ import annotations
@@ -38,8 +54,7 @@ import secrets
 import shutil
 import subprocess
 import sys
-import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -52,6 +67,12 @@ _VETH_SUBNET_PREFIX = "10.200"
 _VETH_PREFIX = "khaos-br"
 _NETNS_BASE = "/var/run/netns"
 _CGROUP_BROWSER_PREFIX = "browser"
+# C-10: nftables table/chain names for per-sandbox egress pinning.
+_NFT_TABLE_FAMILY = "inet"
+_NFT_TABLE_NAME = "khaos_browser_egress"
+_NFT_CHAIN_PREFIX = "br"
+# C-10: secure run directory root — per-process private subtree.
+_RUN_DIR_ROOT = Path.home() / ".khaos" / "run"
 
 
 @dataclass
@@ -65,28 +86,68 @@ class BrowserSandboxConfig:
     cpu_period: int = 100_000
 
 
+@dataclass
+class EnforcementStatus:
+    """C-09: structured report of which enforcement layers are active.
+
+    Callers (especially production profiles) should check this after
+    ``setup()`` and refuse to launch the browser when a required layer
+    is missing.  ``ok`` is True only when every layer the caller asked
+    for is in effect.
+    """
+
+    network_namespace: bool = False
+    proxy_required: bool = False
+    cgroup: bool = False
+    route_guard: bool = False  # nftables egress pin
+    service_workers_blocked: bool = False
+    failure_reason: str = ""
+
+    @property
+    def ok(self) -> bool:
+        return not self.failure_reason
+
+
 class BrowserNetworkSandbox:
     """Linux: isolates Chromium in a dedicated netns + cgroup.
 
     On non-Linux: no-op.  The caller should check ``is_active`` after
     ``setup()`` to determine whether OS-level enforcement is in effect.
+
+    C-09: when ``require_os_sandbox=True`` (production default), any
+    missing component raises ``BrowserSandboxError`` instead of silently
+    degrading to proxy-only.
     """
 
-    def __init__(self, config: BrowserSandboxConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: BrowserSandboxConfig | None = None,
+        *,
+        require_os_sandbox: bool = False,
+    ) -> None:
         self._config = config or BrowserSandboxConfig()
+        self._require_os_sandbox = require_os_sandbox
         self._netns_name: str | None = None
         self._veth_host: str | None = None
         self._veth_ns: str | None = None
         self._cgroup_path: Path | None = None
         self._wrapper_script: Path | None = None
+        self._run_dir: Path | None = None
+        self._nft_chain: str | None = None
         self._host_ip: str = "127.0.0.1"
         self._ns_ip: str = ""
         self._active = False
+        self._enforcement = EnforcementStatus()
 
     @property
     def is_active(self) -> bool:
         """True if OS-level netns enforcement is in effect."""
         return self._active
+
+    @property
+    def enforcement_status(self) -> EnforcementStatus:
+        """C-09: structured report of active enforcement layers."""
+        return self._enforcement
 
     @property
     def proxy_bind_host(self) -> str:
@@ -106,29 +167,17 @@ class BrowserNetworkSandbox:
     def setup(self) -> None:
         """Create the netns, veth pair, and cgroup.
 
-        On non-Linux or when capabilities are missing, this is a no-op
-        and ``is_active`` remains False.
+        C-09: when ``require_os_sandbox=True`` (production default),
+        any missing prerequisite raises ``BrowserSandboxError`` instead
+        of silently degrading to proxy-only.  When False (development),
+        missing prerequisites are logged as warnings and the sandbox
+        remains inactive.
         """
-        if not sys.platform.startswith("linux"):
-            logger.info(
-                "browser netns sandbox: non-Linux platform (%s), "
-                "using proxy-only enforcement",
-                sys.platform,
-            )
-            return
-
-        if not _has_net_admin():
-            logger.warning(
-                "browser netns sandbox: CAP_NET_ADMIN not available, "
-                "using proxy-only enforcement"
-            )
-            return
-
-        if shutil.which("ip") is None or shutil.which("nsenter") is None:
-            logger.warning(
-                "browser netns sandbox: 'ip' or 'nsenter' not found, "
-                "using proxy-only enforcement"
-            )
+        reason = self._check_prerequisites()
+        if reason:
+            if self._require_os_sandbox:
+                raise BrowserSandboxError(reason)
+            logger.warning("browser netns sandbox: %s, using proxy-only", reason)
             return
 
         suffix = secrets.token_hex(4)
@@ -145,18 +194,121 @@ class BrowserNetworkSandbox:
             self._create_netns()
             self._configure_veth()
             self._create_cgroup()
+            self._create_secure_run_dir()
+            if self._cgroup_path is None and self._require_os_sandbox:
+                raise BrowserSandboxError(
+                    "cgroup-v2 leaf creation failed — resource limits "
+                    "cannot be enforced"
+                )
             self._active = True
+            self._enforcement = EnforcementStatus(
+                network_namespace=True,
+                proxy_required=True,
+                cgroup=self._cgroup_path is not None,
+                route_guard=False,  # set by install_egress_pin()
+                service_workers_blocked=True,
+            )
             logger.info(
                 "browser netns sandbox active: netns=%s host=%s ns=%s",
                 self._netns_name, self._host_ip, self._ns_ip,
             )
+        except BrowserSandboxError:
+            self.teardown()
+            raise
         except OSError as exc:
+            if self._require_os_sandbox:
+                self.teardown()
+                raise BrowserSandboxError(
+                    f"netns setup failed: {exc}"
+                ) from exc
             logger.warning(
                 "browser netns sandbox setup failed, "
                 "falling back to proxy-only: %s",
                 exc,
             )
             self.teardown()
+
+    def _check_prerequisites(self) -> str:
+        """Return empty string if all prerequisites are met, else reason."""
+        if not sys.platform.startswith("linux"):
+            return f"non-Linux platform ({sys.platform})"
+        if not _has_net_admin():
+            return "CAP_NET_ADMIN not available"
+        if shutil.which("ip") is None or shutil.which("nsenter") is None:
+            return "'ip' or 'nsenter' not found"
+        return ""
+
+    def install_egress_pin(self, proxy_port: int) -> None:
+        """C-06: install nftables rules so the browser veth can reach
+        ONLY the exact proxy IP:port.
+
+        Must be called AFTER the egress proxy has started (dynamic port).
+        Rules are scoped to the host-side veth interface name so they
+        do not affect any other host traffic.
+
+        Allows::
+
+            browser-veth → proxy_ip:proxy_port TCP
+
+        Drops::
+
+            browser-veth → any other destination/port
+            browser-veth → forward
+
+        When ``require_os_sandbox=False`` and nftables is unavailable,
+        this logs a warning and returns (proxy-only enforcement).
+        """
+        if not self._active or self._veth_host is None:
+            return
+        if shutil.which("nft") is None:
+            reason = "nftables ('nft') not found — egress pin inactive"
+            if self._require_os_sandbox:
+                raise BrowserSandboxError(reason)
+            logger.warning("browser netns sandbox: %s", reason)
+            return
+
+        chain = f"{_NFT_CHAIN_PREFIX}-{self._veth_host}"
+        # Build a per-sandbox chain.  Using a dedicated chain (rather
+        # than the system ``forward`` hook) avoids interfering with host
+        # firewall rules and makes teardown a single ``delete table``.
+        rules = [
+            f"add table {_NFT_TABLE_FAMILY} {_NFT_TABLE_NAME}",
+            f"add chain {_NFT_TABLE_FAMILY} {_NFT_TABLE_NAME} {chain}"
+            f" '{{ type filter hook forward priority 0; policy drop; }}'",
+            # Allow established connections (return traffic from proxy).
+            f"add rule {_NFT_TABLE_FAMILY} {_NFT_TABLE_NAME} {chain}"
+            f" 'ct state established,related accept'",
+            # Allow browser-veth → exact proxy_ip:proxy_port TCP.
+            f"add rule {_NFT_TABLE_FAMILY} {_NFT_TABLE_NAME} {chain}"
+            f" 'iifname \"{self._veth_host}\" ip daddr {self._host_ip}"
+            f" tcp dport {proxy_port} accept'",
+            # Drop everything else from the browser veth.
+            f"add rule {_NFT_TABLE_FAMILY} {_NFT_TABLE_NAME} {chain}"
+            f" 'iifname \"{self._veth_host}\" drop'",
+        ]
+        try:
+            for rule in rules:
+                _run_command(
+                    ["nft", *rule.split()],
+                    f"install nftables rule: {rule}",
+                )
+            self._nft_chain = chain
+            self._enforcement.route_guard = True
+            logger.info(
+                "browser nftables egress pin installed: "
+                "%s → %s:%d only",
+                self._veth_host, self._host_ip, proxy_port,
+            )
+        except OSError as exc:
+            if self._require_os_sandbox:
+                raise BrowserSandboxError(
+                    f"nftables egress pin failed: {exc}"
+                ) from exc
+            logger.warning(
+                "browser nftables egress pin failed, "
+                "route_guard inactive: %s",
+                exc,
+            )
 
     def _create_netns(self) -> None:
         """Create the network namespace."""
@@ -232,6 +384,32 @@ class BrowserNetworkSandbox:
             logger.warning("browser cgroup creation failed: %s", exc)
             _remove_cgroup(group)
 
+    def _create_secure_run_dir(self) -> None:
+        """C-10: create a private run directory for the wrapper script.
+
+        The directory is created under ``~/.khaos/run/<token>/`` with
+        mode 0700, owner-verified, and symlink-rejected.  The wrapper
+        script is part of the TCB (it launches Chromium) and must not
+        live in shared ``/tmp`` where another user could pre-place a
+        symlink or replace the file before exec.
+        """
+        _RUN_DIR_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
+        # Verify the root is owned by us and not a symlink.
+        root_stat = _RUN_DIR_ROOT.lstat()
+        if not _RUN_DIR_ROOT.is_dir() or root_stat.st_uid != os.getuid():
+            raise BrowserSandboxError(
+                f"run dir root {_RUN_DIR_ROOT} is not a directory owned "
+                f"by the current user"
+            )
+        token = secrets.token_hex(8)
+        run_dir = _RUN_DIR_ROOT / token
+        # os.mkdir raises FileExistsError if the path already exists,
+        # providing the same race-free guarantee as O_EXCL.  We use
+        # mkdir (not os.open+O_CREAT) because O_CREAT creates a regular
+        # file, not a directory.
+        os.mkdir(run_dir, mode=0o700)
+        self._run_dir = run_dir
+
     def create_wrapper_script(
         self, real_executable: str, proxy_port: int,
     ) -> str | None:
@@ -239,36 +417,101 @@ class BrowserNetworkSandbox:
 
         Returns the path to the wrapper script, or None if the sandbox
         is not active (caller uses the real executable directly).
+
+        C-08: the wrapper writes its own PID to ``cgroup.procs`` before
+        ``exec nsenter``.  Since ``nsenter --net`` preserves the PID,
+        Chromium actually joins the cgroup and resource limits apply.
+        If the cgroup write fails the wrapper exits non-zero instead of
+        continuing without limits.
+
+        C-10: the wrapper is created via ``O_NOFOLLOW | O_EXCL`` in the
+        private run directory so it cannot be replaced by a symlink or
+        a pre-placed file.
         """
         if not self._active:
             return None
+        if self._run_dir is None:
+            # Fallback for callers that didn't go through setup() —
+            # fail closed in production.
+            if self._require_os_sandbox:
+                raise BrowserSandboxError(
+                    "secure run directory not created — refusing to "
+                    "write wrapper to shared /tmp"
+                )
+            self._create_secure_run_dir()
 
-        script_dir = Path(tempfile.gettempdir()) / "khaos-browser-wrappers"
-        script_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        script_path = script_dir / f"chromium-{self._netns_name}.sh"
-
-        # The wrapper uses nsenter to enter the netns, then execs the
-        # real Chromium binary with all original arguments.  The proxy
-        # URL is injected via --proxy-server if not already present.
         netns_path = f"{_NETNS_BASE}/{self._netns_name}"
+        cgroup_procs = (
+            str(self._cgroup_path / "cgroup.procs")
+            if self._cgroup_path is not None
+            else ""
+        )
+
+        # C-08: write PID to cgroup.procs before exec.  If the write
+        # fails (permission denied, cgroup deleted), the wrapper must
+        # exit non-zero so the caller knows the browser did not launch
+        # with resource limits enforced.
+        if cgroup_procs:
+            join_cgroup = (
+                f'if ! echo $$ > "{cgroup_procs}" 2>/dev/null; then\n'
+                f'  echo "khaos: failed to join cgroup {cgroup_procs}" >&2\n'
+                f'  exit 1\n'
+                f'fi\n'
+            )
+        else:
+            join_cgroup = ""
+
         script_content = f"""#!/bin/sh
-# F-05: Khaos browser netns wrapper.  AUTO-GENERATED — do not edit.
+# C-08/C-10: Khaos browser netns wrapper.  AUTO-GENERATED - do not edit.
 # Launches Chromium inside the dedicated network namespace so even a
 # compromised browser cannot bypass the egress proxy.
-exec nsenter --net="{netns_path}" "{real_executable}" "$@"
+# This script joins the browser cgroup BEFORE exec so resource limits
+# (pids/memory/cpu) actually apply to Chromium.
+{join_cgroup}exec nsenter --net="{netns_path}" "{real_executable}" "$@"
 """
-        script_path.write_text(script_content, encoding="ascii")
-        script_path.chmod(0o700)
+        # C-10: create with O_NOFOLLOW | O_EXCL so the wrapper cannot
+        # be a symlink or overwrite an existing file.
+        script_path = self._run_dir / f"chromium-{self._netns_name}.sh"
+        fd = os.open(
+            str(script_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            mode=0o700,
+        )
+        try:
+            os.write(fd, script_content.encode("ascii"))
+        finally:
+            os.close(fd)
+        # Verify owner and mode (defence in depth — TOCTOU between
+        # open and exec is mitigated by the private 0700 run dir).
+        stat = script_path.lstat()
+        if stat.st_uid != os.getuid():
+            raise BrowserSandboxError(
+                f"wrapper script {script_path} not owned by current user"
+            )
         self._wrapper_script = script_path
         return str(script_path)
 
     def teardown(self) -> None:
-        """Clean up netns, veth pair, cgroup, and wrapper script."""
-        # Delete wrapper script
+        """Clean up nftables, netns, veth pair, cgroup, wrapper, and run dir."""
+        # Delete nftables table (C-06)
+        if self._nft_chain is not None:
+            with _suppress_oserrors():
+                _run_command(
+                    ["nft", "delete", "table", _NFT_TABLE_FAMILY,
+                     _NFT_TABLE_NAME],
+                    f"delete nftables table {_NFT_TABLE_NAME}",
+                )
+            self._nft_chain = None
+
+        # Delete wrapper script + secure run dir (C-10)
         if self._wrapper_script is not None:
             with _suppress_oserrors():
                 self._wrapper_script.unlink(missing_ok=True)
             self._wrapper_script = None
+        if self._run_dir is not None:
+            with _suppress_oserrors():
+                self._run_dir.rmdir()
+            self._run_dir = None
 
         # Delete cgroup
         if self._cgroup_path is not None:
@@ -295,11 +538,21 @@ exec nsenter --net="{netns_path}" "{real_executable}" "$@"
             self._netns_name = None
 
         self._active = False
+        self._enforcement = EnforcementStatus()
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+class BrowserSandboxError(Exception):
+    """C-09: raised when a required OS-sandbox component is unavailable.
+
+    In production (``require_os_sandbox=True``) this propagates to the
+    caller so the browser launch is refused rather than silently
+    degrading to a weaker enforcement level.
+    """
 
 
 class _suppress_oserrors:
@@ -316,18 +569,32 @@ class _suppress_oserrors:
 
 
 def _has_net_admin() -> bool:
-    """Check if the current process has CAP_NET_ADMIN."""
-    try:
-        import ctypes
-        import ctypes.util
+    """C-09: actually check CAP_NET_ADMIN instead of optimistically returning True.
 
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        # capget for CAP_NET_ADMIN (capability 12)
-        # We use a simpler check: try to create a dummy netns
-        # and immediately delete it.  If it works, we have the
-        # capability.
-        return True  # Optimistic; actual capability is tested during setup
-    except Exception:
+    Uses ``ip netns add/delete`` as a side-effect-free probe because it
+    exercises the exact capability the sandbox needs.  The previous
+    implementation unconditionally returned ``True``, which meant the
+    real capability check was deferred to ``setup()`` failure — too late
+    for a fail-closed decision.
+    """
+    if not sys.platform.startswith("linux"):
+        return False
+    if shutil.which("ip") is None:
+        return False
+    probe = f"khaos-cap-probe-{secrets.token_hex(4)}"
+    try:
+        result = subprocess.run(
+            ["ip", "netns", "add", probe],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return False
+        subprocess.run(
+            ["ip", "netns", "del", probe],
+            capture_output=True, text=True, timeout=5,
+        )
+        return True
+    except (OSError, subprocess.TimeoutExpired):
         return False
 
 
