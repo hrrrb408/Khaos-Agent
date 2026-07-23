@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import asyncio
 import hashlib
+import logging
 import os
 import sqlite3
 import time
@@ -28,6 +29,8 @@ TELEGRAM_REPLAY_WINDOW = 4096
 SCHEMA_MIGRATION_VERSION = 1
 SCHEMA_MIGRATION_NAME = "initial_versioned_schema"
 SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
+
+logger = logging.getLogger(__name__)
 SCHEMA_MIGRATION_SALT = "legacy-helper-set-2026-07-22-v1"
 
 # F-01: Transaction owner tracking. When non-None, the current asyncio task
@@ -170,7 +173,40 @@ class Database:
         conn = await self._require_conn()
         async with self._write_transaction_lock:
             token = _current_transaction_owner.set(asyncio.current_task())
-            await conn.execute("BEGIN IMMEDIATE")
+            # F-01 fail-safe: a previous bare write (not wrapped in
+            # ``transaction()``) may have left the connection inside an
+            # uncommitted implicit transaction — this happens most often
+            # when a coroutine is cancelled mid-write (the cancellation
+            # propagates before the bare ``commit()`` runs, but the
+            # sqlite3 driver has already issued an implicit BEGIN).
+            #
+            # When that happens, ``BEGIN IMMEDIATE`` raises
+            # ``sqlite3.OperationalError: cannot start a transaction
+            # within a transaction``.  The stale transaction was never
+            # committed, so rolling it back is always safe and correct:
+            # no committed data is lost, and the caller's
+            # ``transaction()`` block gets a clean slate.  Without this
+            # recovery, a single cancelled bare write would wedge the
+            # shared connection for every subsequent transaction.
+            try:
+                await conn.execute("BEGIN IMMEDIATE")
+            except Exception as exc:
+                if "cannot start a transaction" not in str(exc).lower():
+                    _current_transaction_owner.reset(token)
+                    raise
+                logger.warning(
+                    "transaction(): connection had a stale uncommitted "
+                    "transaction (likely from a cancelled bare write); "
+                    "rolling back before BEGIN IMMEDIATE: %s",
+                    exc,
+                )
+                try:
+                    await conn.rollback()
+                except Exception:
+                    # If rollback itself fails the connection is wedged;
+                    # let the original BEGIN error surface below.
+                    pass
+                await conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
                 await conn.commit()
