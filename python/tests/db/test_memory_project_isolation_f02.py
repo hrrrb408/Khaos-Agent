@@ -31,7 +31,7 @@ Coverage matrix (all on ONE shared Database):
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from khaos.db import Database
@@ -317,7 +317,7 @@ async def test_f02_9_decay_isolation(tmp_path):
         await store_b.set(_mem("k", "v-b", ttl=1), namespace="private")
 
         # Run decay for project A with a now far in the future.
-        future = datetime.utcnow() + timedelta(hours=1)
+        future = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(hours=1)
         removed_a = await store_a.decay(now=future)
 
         assert removed_a == 1
