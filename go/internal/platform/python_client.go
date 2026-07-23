@@ -29,7 +29,7 @@ var (
 
 // CreateTask creates a persistent coding task.
 //
-// C-1-1: ``principalID`` is the authenticated principal from the
+// C-1-1: “principalID“ is the authenticated principal from the
 // Gateway's auth context.  It is written into the RPC auth envelope
 // so Python's RequestContext.principal_id matches the caller.
 func (c PythonClient) CreateTask(ctx context.Context, principalID string, goal string) (map[string]any, error) {
@@ -127,15 +127,15 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 
 // PythonClient talks to the Python AgentService JSON-line endpoint.
 //
-// C-1-3: ``ProjectID`` is the Gateway-level project identity
-// (``sha256(realpath(project_root))[:32]``).  When non-empty it is
+// C-1-3: “ProjectID“ is the Gateway-level project identity
+// (“sha256(realpath(project_root))[:32]“).  When non-empty it is
 // injected into every RPC payload so Python's dispatcher (A-5-1b)
 // can detect project drift (Gateway booted under project A routing
 // to a Python server booted under project B).  Empty means the
 // Gateway was not configured with a project root — Python accepts
 // the empty claim for backward compatibility.
 //
-// C-1-4: ``PolicyDigest`` is the Gateway-level policy identity
+// C-1-4: “PolicyDigest“ is the Gateway-level policy identity
 // (sha256 of the canonical EffectiveSecurityPolicy).  It is fetched
 // once at startup via the Bootstrap.GetPolicyDigest RPC handshake —
 // Python is the sole authority for policy_digest, Go never computes
@@ -154,36 +154,36 @@ type PythonClient struct {
 
 // writeRequest serializes and signs one JSON-line RPC request.
 //
-// C-1-1: ``principalID`` is the sole source of truth for the
+// C-1-1: “principalID“ is the sole source of truth for the
 // principal identity carried in the RPC auth envelope.  Previously
-// this method extracted ``principal_id`` from the payload (defaulting
-// to ``"gateway"``), which caused ~15 RPC methods to lose the
+// this method extracted “principal_id“ from the payload (defaulting
+// to “"gateway"“), which caused ~15 RPC methods to lose the
 // caller's identity entirely.  Now every caller must pass the
 // authenticated principal explicitly; Python's
-// ``GatewayRPCAuthenticator`` still verifies that, if the payload
-// contains ``principal_id``, it matches the envelope value (so
+// “GatewayRPCAuthenticator“ still verifies that, if the payload
+// contains “principal_id“, it matches the envelope value (so
 // Chat / ConfirmPermission / Spawn / ApproveTask / RejectTask —
-// which embed ``principal_id`` in the payload for the Python service
+// which embed “principal_id“ in the payload for the Python service
 // layer — remain transport-bound).
 //
-// C-1-3: ``c.ProjectID`` (Gateway-level, not per-request) is injected
+// C-1-3: “c.ProjectID“ (Gateway-level, not per-request) is injected
 // into the payload before digest computation.  Python's dispatcher
-// (A-5-1b) compares ``payload["project_id"]`` against
-// ``agent._bound_project_id``; a mismatch is rejected as
-// ``project_drift`` (fail-closed).  An empty ``ProjectID`` is
+// (A-5-1b) compares “payload["project_id"]“ against
+// “agent._bound_project_id“; a mismatch is rejected as
+// “project_drift“ (fail-closed).  An empty “ProjectID“ is
 // accepted by Python (backward compat with older Gateways).  The
-// injection happens before ``canonicalJSON`` so ``payload_digest``
+// injection happens before “canonicalJSON“ so “payload_digest“
 // covers the injected value — Python's digest check passes.
 //
-// C-1-4: ``c.PolicyDigest`` (Gateway-level, not per-request) is
-// injected into the payload alongside ``project_id``, before digest
+// C-1-4: “c.PolicyDigest“ (Gateway-level, not per-request) is
+// injected into the payload alongside “project_id“, before digest
 // computation.  Python's dispatcher compares
-// ``payload["policy_digest"]`` against
-// ``agent._effective_policy.digest``; a mismatch is rejected as
-// ``policy_drift`` (fail-closed).  An empty ``PolicyDigest`` is
+// “payload["policy_digest"]“ against
+// “agent._effective_policy.digest“; a mismatch is rejected as
+// “policy_drift“ (fail-closed).  An empty “PolicyDigest“ is
 // accepted by Python (backward compat with older Gateways or when
 // the bootstrap handshake failed).  The injection happens before
-// ``canonicalJSON`` so ``payload_digest`` covers the injected value.
+// “canonicalJSON“ so “payload_digest“ covers the injected value.
 func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, principalID string) error {
 	if len(c.Capability) < 32 {
 		return fmt.Errorf("Python AgentService capability is missing or too short")
@@ -257,9 +257,9 @@ func canonicalJSON(value any) ([]byte, error) {
 
 // HandleWebhook forwards an inbound webhook to Python without interpreting it.
 //
-// C-1-1: ``principalID`` is ``""`` for signature-authenticated webhook
+// C-1-1: “principalID“ is “""“ for signature-authenticated webhook
 // ingress (no API-key principal in that path); Python's
-// ``AgentService.HandleWebhook`` treats the empty principal as
+// “AgentService.HandleWebhook“ treats the empty principal as
 // unauthenticated platform ingress.
 func (c PythonClient) HandleWebhook(ctx context.Context, principalID string, request api.WebhookRequest) (api.WebhookResponse, error) {
 	response, err := c.callMap(ctx, "AgentService.HandleWebhook", map[string]any{
@@ -288,12 +288,12 @@ func (c PythonClient) ListChannels(ctx context.Context, principalID string) ([]a
 	return channels, err
 }
 
-// ListSessions proxies REST ``GET /api/sessions`` to Python's
-// ``SessionService.List`` (C-2-3).
+// ListSessions proxies REST “GET /api/sessions“ to Python's
+// “SessionService.List“ (C-2-3).
 //
 // The response is a principal-scoped list of session rows from the
-// durable ``sessions`` table.  Previously the Go handler served this
-// from its in-memory ``sessions`` + ``sessionOwners`` maps, which were
+// durable “sessions“ table.  Previously the Go handler served this
+// from its in-memory “sessions“ + “sessionOwners“ maps, which were
 // lost on restart and blind to sessions created directly against
 // Python (CLI, subagents, webhooks).
 func (c PythonClient) ListSessions(ctx context.Context, principalID string, limit, offset int) ([]api.SessionSummary, error) {
@@ -313,12 +313,12 @@ func (c PythonClient) ListSessions(ctx context.Context, principalID string, limi
 	return sessions, err
 }
 
-// GetSession proxies REST ``GET /api/sessions/{id}`` to Python's
-// ``SessionService.Get`` (C-2-3).
+// GetSession proxies REST “GET /api/sessions/{id}“ to Python's
+// “SessionService.Get“ (C-2-3).
 //
 // Cross-principal access is hidden by Python as
-// ``{"ok": false, "error": "session not found"}`` (symmetric to
-// ``TaskService.get``), so the Go handler can map a missing ``ok``
+// “{"ok": false, "error": "session not found"}“ (symmetric to
+// “TaskService.get“), so the Go handler can map a missing “ok“
 // flag to HTTP 404 without leaking whether the session exists under
 // another principal.
 func (c PythonClient) GetSession(ctx context.Context, principalID string, sessionID string) (map[string]any, error) {
@@ -330,8 +330,8 @@ func (c PythonClient) GetSession(ctx context.Context, principalID string, sessio
 // SetChannelEnabled changes one registered channel's enabled state.
 //
 // C-2-4 (HIGH 4): Python now gates channel mutations on
-// ``channel_admins``; a non-admin caller receives
-// ``{"ok": false, "status": "forbidden", ...}``.  We translate that
+// “channel_admins“; a non-admin caller receives
+// “{"ok": false, "status": "forbidden", ...}“.  We translate that
 // into :var:`api.ErrForbidden` so the REST handler can return 403
 // instead of masking the authorization failure as 404.
 func (c PythonClient) SetChannelEnabled(ctx context.Context, principalID string, channelID string, enabled bool) error {
@@ -360,7 +360,7 @@ func (c PythonClient) SetChannelEnabled(ctx context.Context, principalID string,
 //
 // C-2-2 (HIGH 6): the Gateway no longer keeps an in-process MemoryMap;
 // every REST /api/memory call proxies to Python's per-principal
-// MemoryService.  ``principalID`` is the authenticated caller — Python
+// MemoryService.  “principalID“ is the authenticated caller — Python
 // scopes the read to the caller's own memories + project-shared rows.
 func (c PythonClient) Get(ctx context.Context, principalID string, scope string, key string) (api.Memory, error) {
 	response, err := c.callMap(ctx, "MemoryService.GetMemory", map[string]any{
@@ -375,10 +375,10 @@ func (c PythonClient) Get(ctx context.Context, principalID string, scope string,
 // Set creates or updates a memory via the Python MemoryService.
 func (c PythonClient) Set(ctx context.Context, principalID string, memory api.Memory) (api.Memory, error) {
 	response, err := c.callMap(ctx, "MemoryService.SetMemory", map[string]any{
-		"scope":     memory.Scope,
-		"key":       memory.Key,
-		"value":     memory.Value,
-		"ttl":       memory.TTL,
+		"scope":      memory.Scope,
+		"key":        memory.Key,
+		"value":      memory.Value,
+		"ttl":        memory.TTL,
 		"confidence": memory.Confidence,
 	}, principalID)
 	if err != nil {
@@ -415,7 +415,7 @@ func (c PythonClient) Set(ctx context.Context, principalID string, memory api.Me
 // C-2-2: previously the Python dispatcher had no MemoryService.DeleteMemory
 // route, so REST DELETE /api/memory/{id} only mutated the in-process
 // MemoryMap and the durable row survived.  Python now exposes the
-// DeleteMemory route and scopes deletion to ``ctx.principal_id``.
+// DeleteMemory route and scopes deletion to “ctx.principal_id“.
 func (c PythonClient) Delete(ctx context.Context, principalID string, id int64) error {
 	response, err := c.callMap(ctx, "MemoryService.DeleteMemory", map[string]any{
 		"memory_id": id,
@@ -504,6 +504,40 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
 	if err := c.writeRequest(conn, "AgentService.Chat", req, req.PrincipalID); err != nil {
+		stopCancelWatch()
+		conn.Close()
+		return nil, err
+	}
+	ch := make(chan api.ChatEvent)
+	go func() {
+		defer close(ch)
+		defer conn.Close()
+		defer stopCancelWatch()
+		scanner := bufio.NewScanner(conn)
+		for scanner.Scan() {
+			var event api.ChatEvent
+			if json.Unmarshal(scanner.Bytes(), &event) == nil {
+				select {
+				case ch <- event:
+				case <-ctx.Done():
+					return
+				}
+			}
+		}
+	}()
+	return ch, nil
+}
+
+// ChatEvents replays and tails the durable Python-owned chat ledger.
+func (c PythonClient) ChatEvents(ctx context.Context, principalID string, sessionID string, afterSequence uint64) (<-chan api.ChatEvent, error) {
+	conn, err := c.dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	stopCancelWatch := closeOnContextDone(ctx, conn)
+	if err := c.writeRequest(conn, "AgentService.ChatEvents", map[string]any{
+		"session_id": sessionID, "after_sequence": afterSequence,
+	}, principalID); err != nil {
 		stopCancelWatch()
 		conn.Close()
 		return nil, err

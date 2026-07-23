@@ -1,9 +1,21 @@
 import json
 
+import pytest
+
+from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.tools.file_tools import multi_edit
 
 
-async def test_multi_edit_applies_multiple_exact_edits_atomically(tmp_path):
+@pytest.fixture
+async def office_authority():
+    authority = OfficeMutationAuthority()
+    try:
+        yield authority
+    finally:
+        await authority.shutdown()
+
+
+async def test_multi_edit_applies_multiple_exact_edits_atomically(tmp_path, office_authority):
     file_path = tmp_path / "note.txt"
     file_path.write_text("alpha beta\ngamma delta\n", encoding="utf-8")
 
@@ -15,6 +27,7 @@ async def test_multi_edit_applies_multiple_exact_edits_atomically(tmp_path):
                 {"old_text": "alpha", "new_text": "omega"},
             ],
             workspace_root=tmp_path,
+            office_authority=office_authority,
         )
     )
 
@@ -23,7 +36,7 @@ async def test_multi_edit_applies_multiple_exact_edits_atomically(tmp_path):
     assert file_path.read_text(encoding="utf-8") == "omega beta\ngamma epsilon\n"
 
 
-async def test_multi_edit_does_not_write_when_any_edit_is_missing(tmp_path):
+async def test_multi_edit_does_not_write_when_any_edit_is_missing(tmp_path, office_authority):
     file_path = tmp_path / "note.txt"
     original = "alpha beta\ngamma delta\n"
     file_path.write_text(original, encoding="utf-8")
@@ -36,6 +49,7 @@ async def test_multi_edit_does_not_write_when_any_edit_is_missing(tmp_path):
                 {"old_text": "missing", "new_text": "new"},
             ],
             workspace_root=tmp_path,
+            office_authority=office_authority,
         )
     )
 
@@ -51,7 +65,7 @@ async def test_multi_edit_does_not_write_when_any_edit_is_missing(tmp_path):
     assert file_path.read_text(encoding="utf-8") == original
 
 
-async def test_multi_edit_requires_unique_match(tmp_path):
+async def test_multi_edit_requires_unique_match(tmp_path, office_authority):
     file_path = tmp_path / "note.txt"
     original = "alpha alpha\n"
     file_path.write_text(original, encoding="utf-8")
@@ -61,6 +75,7 @@ async def test_multi_edit_requires_unique_match(tmp_path):
             str(file_path),
             [{"old_text": "alpha", "new_text": "omega"}],
             workspace_root=tmp_path,
+            office_authority=office_authority,
         )
     )
 
@@ -70,7 +85,7 @@ async def test_multi_edit_requires_unique_match(tmp_path):
     assert file_path.read_text(encoding="utf-8") == original
 
 
-async def test_multi_edit_replaces_longer_text_first(tmp_path):
+async def test_multi_edit_replaces_longer_text_first(tmp_path, office_authority):
     file_path = tmp_path / "note.txt"
     file_path.write_text("prefix-middle suffix\n", encoding="utf-8")
 
@@ -82,6 +97,7 @@ async def test_multi_edit_replaces_longer_text_first(tmp_path):
                 {"old_text": "prefix-middle", "new_text": "head"},
             ],
             workspace_root=tmp_path,
+            office_authority=office_authority,
         )
     )
 

@@ -30,7 +30,11 @@ import logging
 import re
 from dataclasses import dataclass
 
-from khaos.security.host_network import HostNetworkAuthority, HostNetworkDeniedError
+from khaos.security.host_network import (
+    HostNetworkAuthority,
+    HostNetworkDeniedError,
+    ValidatedTarget,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -106,21 +110,39 @@ class NetworkGuard:
 
     async def check_resolved_url(self, url: str) -> NetworkCheckResult:
         """Apply domain policy and reject URLs resolving to special-use IPs."""
-        domain_result = self._check_url(url)
-        if not domain_result.allowed:
-            return domain_result
         try:
-            await self._host_authority.validate_url(
-                url,
-                allowed_schemes=frozenset({"http", "https", "ws", "wss"}),
-            )
+            await self.authorize_url(url)
         except HostNetworkDeniedError as exc:
             return NetworkCheckResult(
                 allowed=False,
                 reason=str(exc),
-                domain=domain_result.domain,
+                domain=self._extract_domain(url),
             )
-        return domain_result
+        return NetworkCheckResult(
+            allowed=True,
+            reason="network egress authorized",
+            domain=self._extract_domain(url),
+        )
+
+    async def authorize_url(
+        self,
+        url: str,
+        *,
+        previous_scheme: str | None = None,
+    ) -> ValidatedTarget:
+        """Authorize one egress hop and freeze its approved DNS snapshot.
+
+        Redirect transports must call this for every hop so the effective
+        domain policy and DNS/IP policy cannot drift apart.
+        """
+        domain_result = self._check_url(url)
+        if not domain_result.allowed:
+            raise HostNetworkDeniedError(domain_result.reason)
+        return await self._host_authority.validate_url(
+            url,
+            previous_scheme=previous_scheme,
+            allowed_schemes=frozenset({"http", "https", "ws", "wss"}),
+        )
 
     def check_tool(self, tool_name: str, arguments: dict) -> NetworkCheckResult:
         """检查工具调用是否涉及网络访问。

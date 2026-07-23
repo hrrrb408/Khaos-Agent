@@ -151,7 +151,11 @@ async def count_legacy_rows(db: Database, table: str) -> int:
 
 
 async def backfill_table(
-    db: Database, table: str, project_id: str,
+    db: Database,
+    table: str,
+    project_id: str,
+    *,
+    commit: bool = True,
 ) -> int:
     """Backfill ``project_id`` on legacy rows in ``table``.
 
@@ -169,7 +173,8 @@ async def backfill_table(
         f"UPDATE {table} SET project_id = ? WHERE project_id = ''",
         (project_id,),
     )
-    await conn.commit()
+    if commit:
+        await conn.commit()
     rowcount = int(cursor.rowcount or 0)
     await cursor.close()
     return rowcount
@@ -214,17 +219,28 @@ async def run_backfill(
     pid = compute_project_id(resolved_root)
 
     reports: list[BackfillReport] = []
-    for table in target_tables:
-        if dry_run:
+    if dry_run:
+        for table in target_tables:
             count = await count_legacy_rows(db, table)
             reports.append(BackfillReport(table, count, dry_run=True))
-        else:
-            updated = await backfill_table(db, table, pid)
-            reports.append(BackfillReport(table, updated, dry_run=False))
-            logger.info(
-                "backfill: %s — %d rows stamped with project_id=%s",
-                table, updated, pid,
-            )
+    else:
+        conn = await db._require_conn()
+        await conn.execute("PRAGMA defer_foreign_keys = ON")
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            for table in target_tables:
+                updated = await backfill_table(
+                    db, table, pid, commit=False,
+                )
+                reports.append(BackfillReport(table, updated, dry_run=False))
+                logger.info(
+                    "backfill: %s — %d rows stamped with project_id=%s",
+                    table, updated, pid,
+                )
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
 
     return BackfillResult(
         project_id=pid,

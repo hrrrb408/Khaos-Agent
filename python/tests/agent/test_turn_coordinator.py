@@ -10,7 +10,9 @@ async def _database(path):
     db = Database(path)
     await db.connect()
     await db.run_migrations()
-    await db.create_session("session", mode="coding")
+    await db.create_session(
+        "session", mode="coding", principal_id="principal",
+    )
     return db
 
 

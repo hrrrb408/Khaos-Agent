@@ -63,8 +63,20 @@ async def test_agent_service_chat_streams_events(tmp_path):
 
     events = [event async for event in service.chat(_test_ctx(), ChatRequest("s1", "hello", "office"))]
 
-    assert events[0]["event"] == "message"
+    assert events[0]["event"] == "started"
+    assert events[1]["event"] == "message"
     assert events[-1]["event"] == "done"
+    first_replay = [
+        event async for event in service.chat_events(_test_ctx(), "s1")
+    ]
+    second_replay = [
+        event async for event in service.chat_events(_test_ctx(), "s1")
+    ]
+    assert first_replay == second_replay
+    assert [
+        {key: event[key] for key in ("sequence", "event", "data")}
+        for event in first_replay
+    ] == events
     await db.close()
 
 
@@ -351,20 +363,22 @@ async def test_agent_service_permission_waits_for_confirm(tmp_path):
     target = "agent.txt"
 
     stream = service.chat(_test_ctx(), ChatRequest("s1", f"/tool write_file {target} hello", "coding"))
-    first = await stream.__anext__()
-    second = await stream.__anext__()
-    assert first["event"] == "tool_call"
-    assert second["event"] == "permission_request"
+    started = await stream.__anext__()
+    tool_call = await stream.__anext__()
+    permission = await stream.__anext__()
+    assert started["event"] == "started"
+    assert tool_call["event"] == "tool_call"
+    assert permission["event"] == "permission_request"
 
     confirmation = await service.confirm_permission(
         _test_ctx(),
         ConfirmRequest(
             "s1",
-            second["data"]["id"],
+            permission["data"]["id"],
             True,
             False,
             principal_id=f"local-uid:{os.getuid()}",
-            binding_digest=second["data"]["binding_digest"],
+            binding_digest=permission["data"]["binding_digest"],
         )
     )
     assert confirmation == {"ok": True}
@@ -1150,32 +1164,23 @@ def test_parse_json_line_rejects_non_object_payload():
 
 async def test_load_router_from_nvidia_config(tmp_path, monkeypatch):
     monkeypatch.setenv("NVIDIA_API_KEY", "secret")
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
     config = tmp_path / "config.yaml"
     config.write_text(
         """
 models:
-  providers:
-    nvidia:
-      type: openai_compatible
-      base_url: "https://integrate.api.nvidia.com/v1"
-      api_key: "${NVIDIA_API_KEY}"
-      models:
-        - name: "qwen/qwen3-8b"
-          max_context_tokens: 32768
-          supports_tools: true
-          supports_vision: false
-  default_model: "qwen/qwen3-8b"
+  default_model: "qwen/qwen3.5-122b-a10b"
   router:
     type: single
 """,
         encoding="utf-8",
     )
 
-    router = load_router_from_config(config)
+    router = load_router_from_config(config, project_root=tmp_path)
     model = await router.resolve_model("agent_loop")
     provider = router.provider_manager.get_provider("nvidia")
 
-    assert model.model == "qwen/qwen3-8b"
+    assert model.model == "qwen/qwen3.5-122b-a10b"
     assert provider.api_key == "secret"
 
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -73,6 +72,8 @@ class RuntimeConfig:
     # a caller forgets to set it, ``build_runtime`` raises ValueError
     # (fail-closed) instead of silently running as the local OS user.
     principal_id: str = ""
+    source_transport: str = "unknown"
+    foreground_session: bool = False
     # H5: session_id + runtime_id extend the per-session BrowserContext key
     # so two concurrent local sessions under the same UID get independent
     # contexts (cookie / DOM / page isolation).  ``runtime_id`` defaults to
@@ -666,7 +667,13 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
         tool_scheduler=scheduler, confirm_callback=cfg.confirm_callback,
         context_compressor=compressor, memory_manager=memory_manager,
-        error_handler=ErrorHandler(db=cfg.db, router=router, compressor=compressor),
+        error_handler=ErrorHandler(
+            db=cfg.db,
+            router=router,
+            compressor=compressor,
+            principal_id=cfg.principal_id,
+            project_id=project_id,
+        ),
         token_engine=get_token_engine(),
         skill_manager=skill_manager if len(skill_manager.registry) else None,
         verify_fix_factory=verify_factory,
@@ -677,6 +684,8 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         execution_service=execution_service,
         approval_broker=cfg.approval_broker,
         principal_id=cfg.principal_id,
+        source_transport=cfg.source_transport,
+        foreground_session=cfg.foreground_session,
         # H5: carry the runtime_id + session_id into the AgentLoop so the
         # tool_context it builds for the broker includes them — the broker
         # injects them into browser tools so two concurrent sessions get

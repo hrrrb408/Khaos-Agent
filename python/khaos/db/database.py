@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
+import os
 import sqlite3
 import time
 from datetime import datetime
@@ -21,6 +23,10 @@ from khaos.time_utils import utc_now_naive
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 TELEGRAM_REPLAY_WINDOW = 4096
+SCHEMA_MIGRATION_VERSION = 1
+SCHEMA_MIGRATION_NAME = "initial_versioned_schema"
+SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
+SCHEMA_MIGRATION_SALT = "legacy-helper-set-2026-07-22-v1"
 
 
 class _AsyncCursor:
@@ -67,6 +73,25 @@ class _AsyncSqliteFallback:
         self._conn.close()
 
 
+class _MigrationConnection:
+    """Delegate a connection while suppressing legacy helper commits.
+
+    The historical migration helpers call ``commit()`` internally. During a
+    versioned migration they receive this facade, so every helper participates
+    in the outer ``BEGIN IMMEDIATE`` transaction instead of splitting the
+    upgrade into crash-visible partial states.
+    """
+
+    def __init__(self, connection: Any) -> None:
+        self._connection = connection
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._connection, name)
+
+    async def commit(self) -> None:
+        """The versioned migration owner performs the only commit."""
+
+
 class Database:
     """Small async database facade used by the P0-A runtime."""
 
@@ -75,6 +100,7 @@ class Database:
         self._conn: aiosqlite.Connection | None = None
         self._operation_approval_lock = asyncio.Lock()
         self._turn_event_lock = asyncio.Lock()
+        self._chat_event_lock = asyncio.Lock()
         self._webhook_replay_lock = asyncio.Lock()
         self._authorization_lock = asyncio.Lock()
 
@@ -95,10 +121,138 @@ class Database:
             self._conn = None
 
     async def run_migrations(self) -> None:
-        """Apply the full P0-A schema."""
+        """Apply the schema as one locked, checksummed transaction."""
         conn = await self._require_conn()
-        await conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
-        await conn.commit()
+        schema_text = SCHEMA_PATH.read_text(encoding="utf-8")
+        checksum = hashlib.sha256(
+            f"{schema_text}\n{SCHEMA_MIGRATION_SALT}".encode("utf-8")
+        ).hexdigest()
+        await conn.execute("PRAGMA journal_mode = WAL")
+        await conn.execute("PRAGMA foreign_keys = ON")
+        await conn.execute("BEGIN IMMEDIATE")
+        try:
+            existing_tables = await (
+                await conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%' "
+                    "AND name != 'schema_migrations'"
+                )
+            ).fetchall()
+            ledger_table = await (
+                await conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='schema_migrations'"
+                )
+            ).fetchone()
+            if existing_tables and ledger_table is None:
+                await self._backup_before_migration(conn)
+            await conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS schema_migrations (
+                    version INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    checksum TEXT NOT NULL,
+                    applied_at TEXT NOT NULL,
+                    app_version TEXT NOT NULL
+                )
+                """
+            )
+            cursor = await conn.execute(
+                "SELECT version, checksum FROM schema_migrations "
+                "ORDER BY version"
+            )
+            applied = await cursor.fetchall()
+            if applied and int(applied[-1][0]) > SCHEMA_MIGRATION_VERSION:
+                raise RuntimeError(
+                    "database schema is newer than this Khaos build"
+                )
+            for row in applied:
+                if int(row[0]) == SCHEMA_MIGRATION_VERSION:
+                    if str(row[1]) != checksum:
+                        raise RuntimeError(
+                            "database migration checksum mismatch for version 1"
+                        )
+                    await conn.commit()
+                    return
+
+            # ``executescript`` commits implicitly, so execute individual
+            # statements through SQLite's complete-statement parser while the
+            # outer transaction is held. This preserves triggers containing
+            # internal semicolons without allowing an implicit commit.
+            await self._execute_schema_statements(conn, schema_text)
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._run_legacy_schema_upgrades()
+            finally:
+                self._conn = original_conn
+            await conn.execute(
+                """
+                INSERT INTO schema_migrations (
+                    version, name, checksum, applied_at, app_version
+                ) VALUES (?, ?, ?, datetime('now'), ?)
+                """,
+                (
+                    SCHEMA_MIGRATION_VERSION,
+                    SCHEMA_MIGRATION_NAME,
+                    checksum,
+                    SCHEMA_MIGRATION_APP_VERSION,
+                ),
+            )
+            await conn.commit()
+        except BaseException:
+            await conn.rollback()
+            raise
+
+    async def _backup_before_migration(self, conn: Any) -> None:
+        """Create one non-overwriting recovery snapshot for a legacy DB."""
+        if self.path == ":memory:":
+            return
+        backup_path = Path(
+            f"{self.path}.pre-migration-v{SCHEMA_MIGRATION_VERSION}.bak"
+        )
+        try:
+            descriptor = os.open(
+                backup_path,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+        except FileExistsError:
+            return
+        os.close(descriptor)
+        source = sqlite3.connect(self.path)
+        target = sqlite3.connect(backup_path)
+        try:
+            source.backup(target)
+        except Exception:
+            source.close()
+            target.close()
+            backup_path.unlink(missing_ok=True)
+            raise
+        else:
+            source.close()
+            target.close()
+
+    @staticmethod
+    async def _execute_schema_statements(conn: Any, script: str) -> None:
+        """Execute a SQL script without ``executescript``'s implicit commit."""
+        statement = ""
+        for line in script.splitlines(keepends=True):
+            statement += line
+            if not sqlite3.complete_statement(statement):
+                continue
+            sql = statement.strip()
+            statement = ""
+            if not sql or sql.upper().startswith("PRAGMA JOURNAL_MODE"):
+                continue
+            if sql.upper().startswith("PRAGMA FOREIGN_KEYS"):
+                continue
+            await conn.execute(sql)
+        if statement.strip():
+            raise RuntimeError("schema.sql ended with an incomplete statement")
+
+    async def _run_legacy_schema_upgrades(self) -> None:
+        """Run all pre-versioning helpers under the outer migration lock."""
         # HIGH-3 (batch 3.1.8): ensure lifecycle_version column exists on
         # existing databases (CREATE TABLE IF NOT EXISTS won't add it to
         # a pre-existing table).  See _ensure_scheduled_tasks_lifecycle_version.
@@ -138,6 +292,73 @@ class Database:
         await self._ensure_audit_log_project_id_column()
         await self._ensure_coding_tasks_project_id_column()
         await self._ensure_scheduler_journal_project_id_column()
+        await self._ensure_subagent_tasks_principal_column()
+        await self._ensure_scheduled_tasks_legacy_quarantine_triggers()
+        await self._ensure_session_identity_invariants()
+
+    async def _ensure_scheduled_tasks_legacy_quarantine_triggers(self) -> None:
+        """Quarantine ownerless scheduler writes after versioned migration."""
+        conn = await self._require_conn()
+        quarantine = (
+            "quarantined: legacy write - task has no authenticated owner; "
+            "an admin must re-claim it with a real principal before it can run"
+        )
+        for operation, clause in (
+            ("insert", "INSERT"),
+            ("update", "UPDATE OF principal_id, status"),
+        ):
+            await conn.execute(
+                f"""
+                CREATE TRIGGER IF NOT EXISTS
+                    trg_scheduled_tasks_quarantine_legacy_{operation}
+                AFTER {clause} ON scheduled_tasks
+                WHEN NEW.principal_id = 'legacy' AND NEW.status != 'failed'
+                BEGIN
+                    UPDATE scheduled_tasks
+                    SET status = 'failed', error = ?,
+                        execution_id = NULL, lease_until = NULL
+                    WHERE id = NEW.id;
+                END
+                """,
+                (quarantine,),
+            )
+        await conn.commit()
+
+    async def _ensure_session_identity_invariants(self) -> None:
+        """Make SQLite enforce duplicated session identity on every write."""
+        conn = await self._require_conn()
+        await conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_identity "
+            "ON sessions(id, principal_id, project_id)"
+        )
+        children = (
+            ("messages", "session_id", None),
+            ("agent_turns", "session_id", None),
+            ("session_bookmarks", "session_id", None),
+            ("subagent_tasks", "parent_session_id", None),
+            ("audit_log", "session_id", "NEW.session_id IS NOT NULL"),
+            ("memories", "session_id", "NEW.namespace = 'session'"),
+        )
+        for table, session_column, condition in children:
+            guard = f"({condition}) AND " if condition else ""
+            for operation in ("INSERT", "UPDATE"):
+                trigger = f"trg_{table}_session_identity_{operation.lower()}"
+                await conn.execute(
+                    f"""
+                    CREATE TRIGGER IF NOT EXISTS {trigger}
+                    BEFORE {operation} ON {table}
+                    WHEN {guard}NOT EXISTS (
+                        SELECT 1 FROM sessions AS s
+                        WHERE s.id = NEW.{session_column}
+                          AND s.principal_id = NEW.principal_id
+                          AND s.project_id = NEW.project_id
+                    )
+                    BEGIN
+                        SELECT RAISE(ABORT, 'session identity mismatch');
+                    END
+                    """
+                )
+        await conn.commit()
 
     async def _ensure_scheduled_tasks_lifecycle_version(self) -> None:
         """Add ``lifecycle_version`` column to legacy ``scheduled_tasks``.
@@ -1719,6 +1940,7 @@ class Database:
         tools: str,
         status: str = "pending",
         principal_id: str = "",
+        project_id: str = "",
     ) -> None:
         """Insert a subagent task row.
 
@@ -1739,10 +1961,15 @@ class Database:
         await self._ensure_subagent_tasks_principal_column()
         await conn.execute(
             """
-            INSERT INTO subagent_tasks (id, parent_session_id, goal, context, tools, status, principal_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO subagent_tasks (
+                id, parent_session_id, goal, context, tools, status,
+                principal_id, project_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (task_id, parent_session_id, goal, context, tools, status, principal_id),
+            (
+                task_id, parent_session_id, goal, context, tools, status,
+                principal_id, project_id,
+            ),
         )
         await conn.commit()
 
@@ -1820,10 +2047,19 @@ class Database:
         conn = await self._require_conn()
         cursor = await conn.execute("PRAGMA table_info(subagent_tasks)")
         existing = {str(row["name"]) for row in await cursor.fetchall()}
+        changed = False
         if "principal_id" not in existing:
             await conn.execute(
                 "ALTER TABLE subagent_tasks ADD COLUMN principal_id TEXT NOT NULL DEFAULT ''"
             )
+            changed = True
+        if "project_id" not in existing:
+            await conn.execute(
+                "ALTER TABLE subagent_tasks "
+                "ADD COLUMN project_id TEXT NOT NULL DEFAULT ''"
+            )
+            changed = True
+        if changed:
             await conn.commit()
 
     # ------------------------------------------------------------------
@@ -2925,6 +3161,14 @@ class Database:
         and a task may be re-stamped when resumed under a different
         project context (mirrors the existing ``principal_id`` policy).
         """
+        persisted_task = dict(task)
+        if principal_id == "legacy" and task.get("status") != "failed":
+            persisted_task["status"] = "failed"
+            persisted_task["error"] = (
+                "quarantined: legacy write - task has no authenticated "
+                "owner; an admin must re-claim it with a real principal "
+                "before it can run"
+            )
         conn = await self._require_conn()
         await conn.execute(
             """
@@ -2937,8 +3181,9 @@ class Database:
                 project_id=excluded.project_id
             """,
             (
-                task["id"], task["goal"], task["status"],
-                json.dumps(task), task["created_at"], task["updated_at"],
+                persisted_task["id"], persisted_task["goal"],
+                persisted_task["status"], json.dumps(persisted_task),
+                persisted_task["created_at"], persisted_task["updated_at"],
                 principal_id, project_id,
             ),
         )
@@ -3389,6 +3634,127 @@ class Database:
                     )
                 await conn.commit()
                 return sequence
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def append_chat_stream_event(
+        self,
+        *,
+        session_id: str,
+        principal_id: str,
+        project_id: str,
+        event_type: str,
+        data: dict[str, Any],
+        now: float,
+    ) -> int:
+        """Append one Gateway-facing event and return its session sequence."""
+        conn = await self._require_conn()
+        async with self._chat_event_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM chat_stream_events "
+                    "WHERE session_id = ?",
+                    (session_id,),
+                )
+                row = await cursor.fetchone()
+                sequence = int(row[0]) + 1
+                await conn.execute(
+                    "INSERT INTO chat_stream_events ("
+                    "session_id,principal_id,project_id,sequence,event_type,"
+                    "data_json,is_terminal,created_at) VALUES(?,?,?,?,?,?,?,?)",
+                    (
+                        session_id,
+                        principal_id,
+                        project_id,
+                        sequence,
+                        event_type,
+                        json.dumps(data, ensure_ascii=False, sort_keys=True),
+                        int(event_type in {"done", "error"}),
+                        now,
+                    ),
+                )
+                await conn.commit()
+                return sequence
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def list_chat_stream_events(
+        self,
+        *,
+        session_id: str,
+        principal_id: str,
+        project_id: str,
+        after_sequence: int = 0,
+        limit: int = 256,
+    ) -> list[dict[str, Any]]:
+        """Read an owner's durable chat events after an exclusive cursor."""
+        conn = await self._require_conn()
+        cursor = await conn.execute(
+            "SELECT sequence,event_type,data_json,is_terminal,created_at "
+            "FROM chat_stream_events WHERE session_id=? AND principal_id=? "
+            "AND project_id=? AND sequence>? ORDER BY sequence LIMIT ?",
+            (
+                session_id,
+                principal_id,
+                project_id,
+                max(0, after_sequence),
+                max(1, min(limit, 1024)),
+            ),
+        )
+        return [
+            {
+                "sequence": int(row["sequence"]),
+                "event": str(row["event_type"]),
+                "data": json.loads(str(row["data_json"])),
+                "terminal": bool(row["is_terminal"]),
+                "created_at": float(row["created_at"]),
+            }
+            for row in await cursor.fetchall()
+        ]
+
+    async def recover_inflight_chat_streams(self, *, now: float) -> int:
+        """Close crash-left chat ledgers with a durable error terminal."""
+        conn = await self._require_conn()
+        async with self._chat_event_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    """
+                    SELECT e.session_id,e.principal_id,e.project_id,e.sequence
+                    FROM chat_stream_events e
+                    JOIN (
+                        SELECT session_id,MAX(sequence) AS sequence
+                        FROM chat_stream_events GROUP BY session_id
+                    ) latest ON latest.session_id=e.session_id
+                        AND latest.sequence=e.sequence
+                    WHERE e.is_terminal=0
+                    """
+                )
+                rows = await cursor.fetchall()
+                for row in rows:
+                    await conn.execute(
+                        "INSERT INTO chat_stream_events ("
+                        "session_id,principal_id,project_id,sequence,event_type,"
+                        "data_json,is_terminal,created_at) VALUES(?,?,?,?,?,?,1,?)",
+                        (
+                            row["session_id"],
+                            row["principal_id"],
+                            row["project_id"],
+                            int(row["sequence"]) + 1,
+                            "error",
+                            json.dumps({
+                                "code": "PROCESS_RESTART",
+                                "message": "chat interrupted by process restart",
+                                "recoverable": True,
+                            }, sort_keys=True),
+                            now,
+                        ),
+                    )
+                await conn.commit()
+                return len(rows)
             except Exception:
                 await conn.rollback()
                 raise

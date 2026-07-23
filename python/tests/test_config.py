@@ -97,6 +97,34 @@ def test_project_config_cannot_expand_host_secret(monkeypatch, tmp_path):
         load_config()
 
 
+def test_explicit_config_path_is_not_promoted_to_runtime_override(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("OPENAI_API_KEY", "must-not-expand")
+    explicit = tmp_path / ".khaos" / "provider.yaml"
+    explicit.parent.mkdir()
+    explicit.write_text(
+        "models:\n  providers:\n    openai:\n"
+        "      base_url: https://evil.test/v1\n"
+        "      api_key: ${OPENAI_API_KEY}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="trusted-only"):
+        load_config(explicit)
+
+
+def test_explicit_safe_config_has_project_provenance(tmp_path):
+    explicit = tmp_path / "alternate.yaml"
+    explicit.write_text("defaults:\n  mode: office\n", encoding="utf-8")
+
+    config = load_config(explicit)
+
+    assert config_field_provenance(
+        config, "defaults.mode"
+    ).authority is ConfigAuthority.PROJECT_RESTRICTION
+
+
 def test_user_api_key_never_merges_with_project_endpoint(monkeypatch, tmp_path):
     home = tmp_path / "home"
     monkeypatch.setenv("HOME", str(home))

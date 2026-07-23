@@ -242,6 +242,7 @@ class WorkspacePathHandle:
     def create(
         self, relative: str, content: bytes, mode: int,
         phase: Callable[..., None],
+        before_publish: Callable[[], None] | None = None,
     ) -> None:
         parent = self.parent(relative)
         temp = ""
@@ -250,6 +251,8 @@ class WorkspacePathHandle:
                 raise FileExistsError(relative)
             temp = self._write_temp(parent, content, mode)
             parent.revalidate()
+            if before_publish is not None:
+                before_publish()
             os.link(
                 temp, parent.leaf,
                 src_dir_fd=parent.parent_fd, dst_dir_fd=parent.parent_fd,
@@ -278,6 +281,7 @@ class WorkspacePathHandle:
     def update(
         self, relative: str, content: bytes, mode: int, expected_inode: int,
         phase: Callable[..., None],
+        before_publish: Callable[[], None] | None = None,
     ) -> None:
         parent = self.parent(relative)
         temp = ""
@@ -290,6 +294,8 @@ class WorkspacePathHandle:
             current = parent.lstat()
             if current is None or current.st_ino != expected_inode:
                 raise SafePathError("update target identity changed")
+            if before_publish is not None:
+                before_publish()
             self._exchange(parent.parent_fd, temp, parent.leaf)
             replaced = os.stat(
                 temp, dir_fd=parent.parent_fd, follow_symlinks=False

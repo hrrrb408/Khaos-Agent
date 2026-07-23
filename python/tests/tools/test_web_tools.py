@@ -317,6 +317,7 @@ def _mock_httpx_response(*, text="", status_code=200, headers=None):
     resp.text = text
     resp.status_code = status_code
     resp.headers = headers or {"content-type": "text/html; charset=utf-8"}
+    resp.encoding = "utf-8"
     return resp
 
 
@@ -341,11 +342,24 @@ def mock_httpx_client(monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-        async def request(self, method, url):
+        def stream(self, method, url):
             response = self.head_response if method == "HEAD" else self.get_response
-            if isinstance(response, Exception):
-                raise response
-            return response
+
+            class _StreamContext:
+                async def __aenter__(self):
+                    if isinstance(response, Exception):
+                        raise response
+
+                    async def _chunks():
+                        yield response.text.encode(response.encoding)
+
+                    response.aiter_bytes = _chunks
+                    return response
+
+                async def __aexit__(self, *_exc):
+                    return False
+
+            return _StreamContext()
 
     class _FakeAuthority:
         async def validate_url(self, url, **_kwargs):
@@ -536,3 +550,4 @@ def test_runtime_registry_binds_web_tools():
         assert "office" in tool.modes
         assert "coding" in tool.modes
         assert tool.permission_level == "read"
+        assert [cap.name for cap in tool.capabilities] == ["network.access"]

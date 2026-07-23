@@ -225,11 +225,11 @@ async def test_task_manager_persists_and_recovers_interrupted_task(tmp_path) -> 
     db = Database(tmp_path / "tasks.db")
     await db.connect()
     await db.run_migrations()
-    manager = TaskManager(db=db)
+    manager = TaskManager(db=db, principal_id="test-owner")
     task = await manager.create("long work")
     await manager.update_status(task.id, TaskStatus.RUNNING)
     await manager.record_trace(task.id, {"tool_name": "read_file", "arguments": {}, "success": True})
-    restored = TaskManager(db=db)
+    restored = TaskManager(db=db, principal_id="test-owner")
     await restored.load()
     loaded = await restored.get(task.id)
     assert loaded.status == TaskStatus.BLOCKED

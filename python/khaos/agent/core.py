@@ -6,7 +6,6 @@ import asyncio
 import inspect
 import json
 import logging
-import os
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -99,6 +98,8 @@ class AgentLoop:
         execution_service=None,
         approval_broker=None,
         principal_id: str | None = None,
+        source_transport: str = "unknown",
+        foreground_session: bool = False,
         # H5: runtime_id + session_id extend the per-session BrowserContext
         # key so two concurrent local sessions under the same UID get
         # independent BrowserContexts.  Propagated into ``tool_context`` so
@@ -163,14 +164,13 @@ class AgentLoop:
 
             approval_broker = ApprovalBroker(db=db)
         self.approval_broker = approval_broker
-        # C-1-5a: ``principal_id`` defaults to local-uid for backward
-        # compat with ad-hoc test constructions.  Production paths go
-        # through ``RuntimeConfig`` which fail-closed on empty
-        # principal_id (CLI/TUI explicitly pass local-uid; RPC paths
-        # pass ctx.principal_id).  AgentLoop is a lower-level class
-        # that should not enforce this — the RuntimeConfig gate is the
-        # right place for fail-closed.
-        self.principal_id = principal_id or f"local-uid:{os.getuid()}"
+        # Direct, lower-level constructions without authenticated identity
+        # remain in the quarantined legacy partition.  Production paths go
+        # through RuntimeConfig, which requires an explicit principal (CLI /
+        # TUI provide local-uid; RPC provides ctx.principal_id).
+        self.principal_id = principal_id or "legacy"
+        self.source_transport = source_transport
+        self.foreground_session = foreground_session
         # H5: per-runtime + per-session identifiers propagated to the
         # browser tools via the broker so concurrent sessions under the
         # same UID get independent BrowserContexts.
@@ -433,6 +433,8 @@ class AgentLoop:
                         "approval_broker": self.approval_broker,
                         "requester": session_id,
                         "principal_id": self.principal_id,
+                        "source_transport": self.source_transport,
+                        "foreground_session": self.foreground_session,
                         # M4 batch 3.1.16A-5-1b: stamp the bound project
                         # identity into ``tool_context`` so the broker can
                         # inject it into orchestrator tools that spawn

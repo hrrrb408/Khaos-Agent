@@ -16,7 +16,7 @@ import ipaddress
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Protocol
 from urllib.parse import urljoin, urlparse
 
 from khaos.security.host_network import (
@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 _SECURITY_ENABLED = True
 _HOST_NETWORK_AUTHORITY = HostNetworkAuthority()
 _MAX_REDIRECTS = 5
+_MAX_HEADER_BYTES = 64 * 1024
+_MAX_HTML_BYTES = 2 * 1024 * 1024
+_MAX_METADATA_BYTES = 100 * 1024
+_MAX_HTML_LINE_CHARS = 256 * 1024
+_MAX_LINKS = 1000
+_MAX_IMAGES = 500
+_MAX_TABLES = 32
+_MAX_TABLE_CELLS = 4096
+_MAX_CELL_CHARS = 16 * 1024
+_MAX_COMPRESSION_RATIO = 100
 
 # httpx is optional at runtime (urllib fallback keeps zero-dependency envs working).
 try:  # pragma: no cover - import success depends on the environment
@@ -295,7 +305,10 @@ def extract_metadata(html: str, url: str) -> dict[str, Any]:
     # 链接去重并转绝对。
     seen_links: set[str] = set()
     links: list[str] = []
-    for raw in _ALL_HREFS_RE.findall(html):
+    for match in _ALL_HREFS_RE.finditer(html):
+        if len(links) >= _MAX_LINKS:
+            break
+        raw = match.group(1)
         normalized = raw.strip()
         if not normalized or normalized.startswith("#") or normalized.startswith("javascript:"):
             continue
@@ -307,7 +320,10 @@ def extract_metadata(html: str, url: str) -> dict[str, Any]:
     # 图片转绝对（不去重，保留出现顺序）。
     images: list[str] = []
     seen_imgs: set[str] = set()
-    for raw in _ALL_SRCS_RE.findall(html):
+    for match in _ALL_SRCS_RE.finditer(html):
+        if len(images) >= _MAX_IMAGES:
+            break
+        raw = match.group(1)
         normalized = raw.strip()
         if not normalized:
             continue
@@ -367,14 +383,30 @@ def extract_tables(html: str) -> list[dict[str, Any]]:
         return []
 
     tables: list[dict[str, Any]] = []
-    for table_html in _TABLE_RE.findall(html):
+    cell_count = 0
+    for table_match in _TABLE_RE.finditer(html):
+        if len(tables) >= _MAX_TABLES:
+            break
+        table_html = table_match.group(1)
         headers: list[str] = []
         rows: list[list[str]] = []
 
-        for row_html in _TR_RE.findall(table_html):
+        for row_match in _TR_RE.finditer(table_html):
+            row_html = row_match.group(1)
             # 当前行的 <th> / <td>。
-            ths = [_clean_cell(c) for c in _TH_RE.findall(row_html)]
-            tds = [_clean_cell(c) for c in _TD_RE.findall(row_html)]
+            ths = [
+                _clean_cell(match.group(1))[:_MAX_CELL_CHARS]
+                for match in _TH_RE.finditer(row_html)
+            ]
+            tds = [
+                _clean_cell(match.group(1))[:_MAX_CELL_CHARS]
+                for match in _TD_RE.finditer(row_html)
+            ]
+            if cell_count + len(ths) + len(tds) > _MAX_TABLE_CELLS:
+                raise ValueError(
+                    f"table cell count exceeds {_MAX_TABLE_CELLS}"
+                )
+            cell_count += len(ths) + len(tds)
 
             if ths and not headers:
                 # 第一行含 <th> 的视为表头。
@@ -444,7 +476,52 @@ class _HTTPError(Exception):
         self.status_code = status_code
 
 
-async def _fetch_html(url: str, timeout: int) -> tuple[str, str]:
+class _ResponseLimitError(ValueError):
+    """Raised before a host response can exceed its configured hard bound."""
+
+
+class _EgressAuthority(Protocol):
+    async def authorize_url(
+        self,
+        url: str,
+        *,
+        previous_scheme: str | None = None,
+    ) -> ValidatedTarget: ...
+
+
+@dataclass(frozen=True)
+class _BufferedResponse:
+    status_code: int
+    headers: dict[str, str]
+    content: bytes
+    encoding: str = "utf-8"
+
+    @property
+    def text(self) -> str:
+        return self.content.decode(self.encoding, errors="replace")
+
+
+class _DefaultEgressAuthority:
+    """Public-address-only authority used by direct library callers."""
+
+    async def authorize_url(
+        self,
+        url: str,
+        *,
+        previous_scheme: str | None = None,
+    ) -> ValidatedTarget:
+        return await _HOST_NETWORK_AUTHORITY.validate_url(
+            url,
+            previous_scheme=previous_scheme,
+        )
+
+
+async def _fetch_html(
+    url: str,
+    timeout: int,
+    *,
+    network_guard: _EgressAuthority | None = None,
+) -> tuple[str, str]:
     """抓取 URL，返回 (html, content_type)。
 
     httpx 优先；不可用时回退到 urllib（同步，包在 to_thread 里）。
@@ -454,7 +531,7 @@ async def _fetch_html(url: str, timeout: int) -> tuple[str, str]:
         raise ConnectionError(
             "secure host fetching requires httpx/httpcore; refusing insecure fallback"
         )
-    return await _fetch_html_httpx(url, timeout)
+    return await _fetch_html_httpx(url, timeout, network_guard=network_guard)
 
 
 class _PinnedNetworkBackend:
@@ -509,11 +586,54 @@ def _pinned_transport(target: ValidatedTarget):
     return transport
 
 
-async def _request_httpx(method: str, url: str, timeout: int):
+def _header_size(headers: Any) -> int:
+    return sum(len(str(key)) + len(str(value)) + 4 for key, value in headers.items())
+
+
+async def _read_bounded_response(response: Any, body_limit: int) -> bytes:
+    if _header_size(response.headers) > _MAX_HEADER_BYTES:
+        raise _ResponseLimitError(
+            f"response headers exceed {_MAX_HEADER_BYTES} bytes"
+        )
+    content_length = response.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_length = int(content_length)
+        except ValueError as exc:
+            raise _ResponseLimitError("invalid Content-Length header") from exc
+        if declared_length < 0 or declared_length > body_limit:
+            raise _ResponseLimitError(f"response body exceeds {body_limit} bytes")
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > body_limit:
+            raise _ResponseLimitError(f"response body exceeds {body_limit} bytes")
+        body.extend(chunk)
+    if (
+        response.headers.get("content-encoding")
+        and content_length is not None
+        and declared_length > 0
+        and len(body) > declared_length * _MAX_COMPRESSION_RATIO
+    ):
+        raise _ResponseLimitError(
+            f"response compression ratio exceeds {_MAX_COMPRESSION_RATIO}:1"
+        )
+    return bytes(body)
+
+
+async def _request_httpx(
+    method: str,
+    url: str,
+    timeout: int,
+    *,
+    network_guard: _EgressAuthority | None = None,
+    body_limit: int = _MAX_HTML_BYTES,
+) -> _BufferedResponse:
     current = url
     previous_scheme: str | None = None
+    authority = network_guard or _DefaultEgressAuthority()
     for hop in range(_MAX_REDIRECTS + 1):
-        target = await _HOST_NETWORK_AUTHORITY.validate_url(
+        target = await authority.authorize_url(
             current, previous_scheme=previous_scheme
         )
         try:
@@ -524,28 +644,51 @@ async def _request_httpx(method: str, url: str, timeout: int):
                 timeout=httpx.Timeout(timeout),
                 headers={"User-Agent": "KhaosWebFetcher/1.0"},
             ) as client:
-                response = await client.request(method, current)
+                async with client.stream(method, current) as response:
+                    status_code = response.status_code
+                    headers = dict(response.headers)
+                    if status_code not in {301, 302, 303, 307, 308}:
+                        content = (
+                            b""
+                            if method == "HEAD"
+                            else await _read_bounded_response(response, body_limit)
+                        )
+                        return _BufferedResponse(
+                            status_code=status_code,
+                            headers=headers,
+                            content=content,
+                            encoding=getattr(response, "encoding", None) or "utf-8",
+                        )
         except httpx.TimeoutException as exc:
             raise TimeoutError(f"Timeout after {timeout}s") from exc
         except httpx.HTTPError as exc:
             raise ConnectionError(str(exc)) from exc
-        if response.status_code not in {301, 302, 303, 307, 308}:
-            return response
-        location = response.headers.get("location")
+        location = headers.get("location")
         if not location:
             raise ConnectionError("redirect response omitted Location")
         if hop >= _MAX_REDIRECTS:
             raise ConnectionError(f"too many redirects (maximum {_MAX_REDIRECTS})")
         previous_scheme = target.parsed.scheme.lower()
         current = urljoin(current, location)
-        if response.status_code == 303 and method != "HEAD":
+        if status_code == 303 and method != "HEAD":
             method = "GET"
     raise ConnectionError("redirect processing failed")
 
 
-async def _fetch_html_httpx(url: str, timeout: int) -> tuple[str, str]:
+async def _fetch_html_httpx(
+    url: str,
+    timeout: int,
+    *,
+    network_guard: _EgressAuthority | None = None,
+) -> tuple[str, str]:
     try:
-        response = await _request_httpx("GET", url, timeout)
+        response = await _request_httpx(
+            "GET",
+            url,
+            timeout,
+            network_guard=network_guard,
+            body_limit=_MAX_HTML_BYTES,
+        )
     except HostNetworkDeniedError:
         raise
 
@@ -557,7 +700,12 @@ async def _fetch_html_httpx(url: str, timeout: int) -> tuple[str, str]:
         raise ValueError(f"Content type not HTML: {content_type}")
 
     # 编码：优先响应头声明的 charset，否则按 httpx 的 best effort。
-    return response.text, content_type
+    text = response.text
+    if any(len(line) > _MAX_HTML_LINE_CHARS for line in text.splitlines()):
+        raise _ResponseLimitError(
+            f"HTML line exceeds {_MAX_HTML_LINE_CHARS} characters"
+        )
+    return text, content_type
 
 
 async def _fetch_html_urllib(url: str, timeout: int) -> tuple[str, str]:
@@ -566,21 +714,34 @@ async def _fetch_html_urllib(url: str, timeout: int) -> tuple[str, str]:
     )
 
 
-async def _fetch_head(url: str, timeout: int) -> tuple[dict[str, str], str]:
+async def _fetch_head(
+    url: str,
+    timeout: int,
+    *,
+    network_guard: _EgressAuthority | None = None,
+) -> tuple[dict[str, str], str]:
     """轻量抓取：HEAD 拿响应头 + 只读 body 前 100KB。
 
     返回 (headers_dict, body_prefix)。urllib 回退路径用 GET（HEAD 支持不稳定）。
     """
-    body_limit = 100 * 1024
+    body_limit = _MAX_METADATA_BYTES
     if _HAS_HTTPX:
         try:
             # Keep HEAD for status/protocol coverage, then use a separately
             # validated and pinned GET for the body prefix.
-            await _request_httpx("HEAD", url, timeout)
-            get_resp = await _request_httpx("GET", url, timeout)
+            await _request_httpx(
+                "HEAD", url, timeout, network_guard=network_guard, body_limit=0
+            )
+            get_resp = await _request_httpx(
+                "GET",
+                url,
+                timeout,
+                network_guard=network_guard,
+                body_limit=body_limit,
+            )
             if get_resp.status_code >= 400:
                 raise _HTTPError(get_resp.status_code)
-            return dict(get_resp.headers), get_resp.text[:body_limit]
+            return dict(get_resp.headers), get_resp.text
         except HostNetworkDeniedError:
             raise
     raise ConnectionError(
@@ -591,7 +752,15 @@ async def _fetch_head(url: str, timeout: int) -> tuple[dict[str, str], str]:
 # ─── 工具函数 ───
 
 
-async def web_fetch(url: str, timeout: int = 30) -> dict[str, Any]:
+async def web_fetch(
+    url: str,
+    timeout: int = 30,
+    *,
+    network_guard: _EgressAuthority | None = None,
+    network_policy: str = "none",
+    credential_context: Any = None,
+    principal_id: str = "",
+) -> dict[str, Any]:
     """抓取网页并提取正文内容（Markdown）+ 元数据。
 
     返回结构::
@@ -617,7 +786,9 @@ async def web_fetch(url: str, timeout: int = 30) -> dict[str, Any]:
         return {"ok": False, "error": f"Invalid URL: {url}"}
 
     try:
-        html, _content_type = await _fetch_html(url, timeout)
+        html, _content_type = await _fetch_html(
+            url, timeout, network_guard=network_guard
+        )
     except TimeoutError as exc:
         return {"ok": False, "error": str(exc)}
     except _HTTPError as exc:
@@ -647,7 +818,14 @@ async def web_fetch(url: str, timeout: int = 30) -> dict[str, Any]:
     }
 
 
-async def web_extract_tables(url: str) -> dict[str, Any]:
+async def web_extract_tables(
+    url: str,
+    *,
+    network_guard: _EgressAuthority | None = None,
+    network_policy: str = "none",
+    credential_context: Any = None,
+    principal_id: str = "",
+) -> dict[str, Any]:
     """从 URL 提取表格数据。
 
     返回结构::
@@ -663,7 +841,9 @@ async def web_extract_tables(url: str) -> dict[str, Any]:
         return {"ok": False, "error": f"Invalid URL: {url}"}
 
     try:
-        html, _content_type = await _fetch_html(url, timeout=30)
+        html, _content_type = await _fetch_html(
+            url, timeout=30, network_guard=network_guard
+        )
     except TimeoutError as exc:
         return {"ok": False, "error": str(exc)}
     except _HTTPError as exc:
@@ -685,7 +865,14 @@ async def web_extract_tables(url: str) -> dict[str, Any]:
     }
 
 
-async def web_metadata(url: str) -> dict[str, Any]:
+async def web_metadata(
+    url: str,
+    *,
+    network_guard: _EgressAuthority | None = None,
+    network_policy: str = "none",
+    credential_context: Any = None,
+    principal_id: str = "",
+) -> dict[str, Any]:
     """获取网页元数据（不下载完整内容，只用 HEAD + 少量 body）。
 
     返回结构::
@@ -705,7 +892,9 @@ async def web_metadata(url: str) -> dict[str, Any]:
         return {"ok": False, "error": f"Invalid URL: {url}"}
 
     try:
-        headers, body_prefix = await _fetch_head(url, timeout=30)
+        headers, body_prefix = await _fetch_head(
+            url, timeout=30, network_guard=network_guard
+        )
     except TimeoutError as exc:
         return {"ok": False, "error": str(exc)}
     except _HTTPError as exc:

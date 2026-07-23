@@ -11,12 +11,12 @@ the mutation has committed or rolled back before propagating cancellation.
 import asyncio
 import os
 import sys
-from pathlib import Path
+import threading
 
 import pytest
 
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
-from khaos.tools.file_tools import copy_file, move_file
+from khaos.tools.file_tools import copy_file, move_file, write_file
 
 
 pytestmark = pytest.mark.skipif(
@@ -50,6 +50,52 @@ def _patch_slow_copy(monkeypatch, delay: float):
         return original(self, source, destination, **kwargs)
 
     monkeypatch.setattr(boundary.SafeWorkspaceFS, "copy_path", slow_copy)
+
+
+async def test_cancelled_nested_write_cannot_publish_or_leave_parents(
+    tmp_path, office_authority, monkeypatch
+):
+    """A cancellation after temp-file creation aborts before atomic publish."""
+    from khaos.coding.planning import safe_workspace_path
+
+    started = threading.Event()
+    release = threading.Event()
+    original = safe_workspace_path.WorkspacePathHandle._write_temp
+
+    def gated_write_temp(parent, content, mode):
+        temp = original(parent, content, mode)
+        started.set()
+        assert release.wait(timeout=5), "test did not release write worker"
+        return temp
+
+    monkeypatch.setattr(
+        safe_workspace_path.WorkspacePathHandle,
+        "_write_temp",
+        staticmethod(gated_write_temp),
+    )
+
+    task = asyncio.create_task(
+        write_file(
+            "new/nested/file.txt",
+            "secret",
+            workspace_root=tmp_path,
+            office_authority=office_authority,
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 5)
+    task.cancel()
+    # Let the authority observe cancellation and set the cooperative fence
+    # before releasing the worker; otherwise CI event-loop timing can race
+    # this test's intended pre-publish cancellation point.
+    await asyncio.sleep(0)
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await office_authority.wait_for_inflight()
+
+    assert not (tmp_path / "new").exists()
+    assert list(tmp_path.rglob(".khaos-write-*")) == []
 
 
 async def test_cancel_during_recursive_copy_settles_before_return(

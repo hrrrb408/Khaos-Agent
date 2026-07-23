@@ -493,8 +493,8 @@ def test_pyproject_symlink_escape_rejected(tmp_path: Path):
     workspace.mkdir()
     (workspace / "pyproject.toml").symlink_to(external)
     catalog = VerificationCatalog(Path(workspace))
-    # Must have a diagnostic about escape
-    assert any("escapes" in msg for _, msg in catalog.diagnostics), \
+    # O_NOFOLLOW rejects the symlink itself without resolving its target.
+    assert any("cannot safely read" in msg for _, msg in catalog.diagnostics), \
         f"symlink escape not detected: {catalog.diagnostics}"
     # No entries should be generated from the external file
     assert len(catalog.entries) == 0
@@ -509,11 +509,11 @@ def test_package_json_symlink_escape_rejected(tmp_path: Path):
     workspace.mkdir()
     (workspace / "package.json").symlink_to(other_workspace / "package.json")
     catalog = VerificationCatalog(Path(workspace))
-    assert any("escapes" in msg for _, msg in catalog.diagnostics)
+    assert any("cannot safely read" in msg for _, msg in catalog.diagnostics)
 
 
-def test_internal_symlink_allowed(tmp_path: Path):
-    """Internal symlink (pointing inside workspace) must be allowed."""
+def test_internal_config_symlink_rejected(tmp_path: Path):
+    """Even internal config symlinks fail closed to remove path TOCTOU."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     # Create a real config file inside workspace
@@ -522,9 +522,9 @@ def test_internal_symlink_allowed(tmp_path: Path):
     # Create a symlink to it (inside workspace)
     (workspace / "pyproject.toml").symlink_to(real_config)
     catalog = VerificationCatalog(Path(workspace))
-    # Should work — internal symlink is allowed
     pytest_entries = [e for e in catalog.entries if e.verification_type == "unit-test"]
-    assert len(pytest_entries) == 1, f"internal symlink should be allowed: {catalog.diagnostics}"
+    assert pytest_entries == []
+    assert any("cannot safely read" in msg for _, msg in catalog.diagnostics)
 
 
 def test_broken_symlink_rejected(tmp_path: Path):
@@ -547,7 +547,7 @@ def test_symlink_chain_escaped_rejected(tmp_path: Path):
     (workspace / "link1.toml").symlink_to(external)
     (workspace / "pyproject.toml").symlink_to(workspace / "link1.toml")
     catalog = VerificationCatalog(Path(workspace))
-    assert any("escapes" in msg for _, msg in catalog.diagnostics)
+    assert any("cannot safely read" in msg for _, msg in catalog.diagnostics)
 
 
 def test_config_replaced_after_read_is_safe(tmp_path: Path):

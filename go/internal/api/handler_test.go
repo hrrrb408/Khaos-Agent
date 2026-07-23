@@ -27,7 +27,9 @@ type mockAgent struct {
 type blockingAgent struct{ mockAgent }
 
 func (m *blockingAgent) Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
-	return make(chan ChatEvent), nil
+	ch := make(chan ChatEvent, 1)
+	ch <- ChatEvent{Event: "started", Data: map[string]any{"session_id": req.SessionID}}
+	return ch, nil
 }
 
 func (m *mockAgent) Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
@@ -38,6 +40,18 @@ func (m *mockAgent) Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent
 		ch <- ChatEvent{Event: "message", Data: map[string]any{"content": "hello"}}
 		ch <- ChatEvent{Event: "done", Data: map[string]any{"total_tokens": 1}}
 	}()
+	return ch, nil
+}
+
+func (m *mockAgent) ChatEvents(_ context.Context, _ string, _ string, after uint64) (<-chan ChatEvent, error) {
+	ch := make(chan ChatEvent, 2)
+	if after < 1 {
+		ch <- ChatEvent{Sequence: 1, Event: "message", Data: map[string]any{"content": "hello"}}
+	}
+	if after < 2 {
+		ch <- ChatEvent{Sequence: 2, Event: "done", Data: map[string]any{"total_tokens": 1}}
+	}
+	close(ch)
 	return ch, nil
 }
 
@@ -176,6 +190,27 @@ func TestChatAndStream(t *testing.T) {
 	}
 }
 
+func TestChatStreamBroadcastReplayCursor(t *testing.T) {
+	handler, _ := newTestHandler("")
+	first := serve(handler, http.MethodGet, "/api/chat/s1/stream", "", "")
+	second := serve(handler, http.MethodGet, "/api/chat/s1/stream", "", "")
+	if first.Body.String() != second.Body.String() {
+		t.Fatalf("subscribers did not receive identical replay:\n%s\n%s", first.Body.String(), second.Body.String())
+	}
+	if !strings.Contains(first.Body.String(), "id: 1") || !strings.Contains(first.Body.String(), "id: 2") {
+		t.Fatalf("SSE event ids missing: %s", first.Body.String())
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/chat/s1/stream", nil)
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("X-Khaos-Key", testAPIKey)
+	req.Header.Set("Last-Event-ID", "1")
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if strings.Contains(rec.Body.String(), "id: 1") || !strings.Contains(rec.Body.String(), "id: 2") {
+		t.Fatalf("cursor replay mismatch: %s", rec.Body.String())
+	}
+}
+
 func TestAuthRequired(t *testing.T) {
 	handler, _ := newTestHandler("secret")
 	if rec := serveUnauthenticated(handler, http.MethodGet, "/api/health", ""); rec.Code != http.StatusOK {
@@ -230,26 +265,17 @@ func TestProtocolStrictJSONAndRequestLimit(t *testing.T) {
 	}
 }
 
-func TestAuthenticatedSessionOwnershipIsFailClosed(t *testing.T) {
+func TestAuthenticatedSessionAuthorityIsDelegatedToDurableService(t *testing.T) {
 	apiHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), "secret", rate.NewTokenBucket(100, 10))
 	handler := apiHandler.Routes()
 	if rec := serve(handler, http.MethodPost, "/api/chat", `{"session_id":"owned","message":"hello"}`, "secret"); rec.Code != http.StatusOK {
 		t.Fatalf("create=%d", rec.Code)
 	}
-	// C-2-3: simulate a cross-principal collision by re-stamping the
-	// in-memory session's PrincipalID to another principal.  The
-	// deleted ``sessionOwners`` map would have done the same; now the
-	// ownership check reads from ``sessions[id].PrincipalID``.
-	apiHandler.mu.Lock()
-	session := apiHandler.sessions["owned"]
-	session.PrincipalID = "api-key:another"
-	apiHandler.sessions["owned"] = session
-	apiHandler.mu.Unlock()
-	if rec := serve(handler, http.MethodGet, "/api/chat/owned/stream", "", "secret"); rec.Code != http.StatusForbidden {
-		t.Fatalf("cross-principal stream=%d", rec.Code)
+	if rec := serve(handler, http.MethodGet, "/api/chat/owned/stream", "", "secret"); rec.Code != http.StatusOK {
+		t.Fatalf("durable stream=%d", rec.Code)
 	}
-	if rec := serve(handler, http.MethodPost, "/api/chat/owned/confirm", `{"tool_call_id":"c1","binding_digest":"abc","approved":true}`, "secret"); rec.Code != http.StatusForbidden {
-		t.Fatalf("cross-principal confirm=%d", rec.Code)
+	if rec := serve(handler, http.MethodPost, "/api/chat/owned/confirm", `{"tool_call_id":"c1","binding_digest":"abc","approved":true}`, "secret"); rec.Code != http.StatusOK {
+		t.Fatalf("durable confirm=%d", rec.Code)
 	}
 }
 
@@ -398,7 +424,7 @@ func TestWebhookAndChannelEndpoints(t *testing.T) {
 
 // TestC_2_4_ChannelEnableMapsForbiddenTo403 verifies the C-2-4 fix:
 // when the Python service rejects a channel mutation with
-// ``status: "forbidden"``, the Go handler MUST return 403 (not 404
+// “status: "forbidden"“, the Go handler MUST return 403 (not 404
 // as it did pre-C-2-4), and an unauthenticated request MUST return
 // 401 (fail-closed, previously the empty principal was silently
 // forwarded to Python).
@@ -437,11 +463,11 @@ func (m *mockForbiddenChannelAgent) SetChannelEnabled(_ context.Context, _ strin
 
 // TestC_2_5_CancelMapsLeaseInvalidationFailedTo503 verifies the C-2-5
 // fix: when the Python TaskService returns
-// ``{"ok": false, "status": "lease_invalidation_failed"}``, the Go
+// “{"ok": false, "status": "lease_invalidation_failed"}“, the Go
 // handler MUST return HTTP 503 (transient infrastructure failure —
 // retry) rather than the pre-C-2-5 behaviour of HTTP 200 (silently
 // swallowed as success by Python) or HTTP 409 (collapsed into
-// ``TransitionInvalid`` by ``taskAction``).
+// “TransitionInvalid“ by “taskAction“).
 //
 // The 503 signals to the REST caller that the task is still active
 // and the cancel can be retried (Batch 2.6 §4 fail-closed).
@@ -460,7 +486,7 @@ func TestC_2_5_CancelMapsLeaseInvalidationFailedTo503(t *testing.T) {
 
 // mockLeaseInvalidationTaskClient returns
 // TransitionLeaseInvalidationFailed for CancelTask, simulating
-// Python's ``{"ok": false, "status": "lease_invalidation_failed"}``.
+// Python's “{"ok": false, "status": "lease_invalidation_failed"}“.
 type mockLeaseInvalidationTaskClient struct{ mockTaskClient }
 
 func (m *mockLeaseInvalidationTaskClient) CancelTask(_ context.Context, _ string, _ string) (TransitionResult, error) {
@@ -473,10 +499,10 @@ func (m *mockLeaseInvalidationTaskClient) CancelTask(_ context.Context, _ string
 // tests.  It returns a deterministic list for one principal and a
 // not-found response for unknown sessions / cross-principal callers.
 type mockSessionClient struct {
-	listErr      error
-	getResponse  map[string]any
-	getErr       error
-	listCalled   bool
+	listErr       error
+	getResponse   map[string]any
+	getErr        error
+	listCalled    bool
 	listPrincipal string
 }
 
@@ -504,7 +530,7 @@ func (m *mockSessionClient) GetSession(_ context.Context, _ string, _ string) (m
 // TestC_2_3_SessionsEndpointsProxyToPython verifies the C-2-3 fix:
 // GET /api/sessions and GET /api/sessions/{id} now proxy to Python's
 // SessionService (via the SessionClient interface) instead of reading
-// the Go in-memory ``sessions`` + ``sessionOwners`` maps.
+// the Go in-memory “sessions“ + “sessionOwners“ maps.
 //
 // Coverage:
 //   - unauthenticated request → 401 (fail-closed)
@@ -559,7 +585,7 @@ func TestC_2_3_SessionsEndpointsProxyToPython(t *testing.T) {
 	// 5. Detail found → 200 + service response.
 	foundMock := &mockSessionClient{getResponse: map[string]any{
 		"ok": true, "session_id": "s1",
-		"session": map[string]any{"id": "s1", "mode": "office"},
+		"session":  map[string]any{"id": "s1", "mode": "office"},
 		"messages": []any{},
 	}}
 	foundHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).WithSessions(foundMock).Routes()

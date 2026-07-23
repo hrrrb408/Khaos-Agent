@@ -28,6 +28,16 @@ def test_registry_lists_tools_by_mode():
     }
 
 
+def test_every_builtin_tool_has_an_explicit_capability_manifest():
+    registry = create_builtin_registry()
+
+    assert all(tool.capabilities for tool in registry._tools.values())
+    assert registry.get("web_fetch").capabilities[0].name == "network.access"
+    assert registry.get("clipboard_read").capabilities[0].name == "host.clipboard.read"
+    assert registry.get("quick_note").capabilities[0].name == "host.notes.write"
+    assert registry.get("markdown_to_text").capabilities[0].name == "compute.local"
+
+
 def test_registry_get_missing_raises():
     registry = ToolRegistry()
 

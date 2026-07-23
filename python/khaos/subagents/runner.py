@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import logging
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
 from khaos.agent.core import AgentConfig, AgentLoop, Message, SimpleTokenEngine
+from khaos.db.state_root import project_id as compute_project_id
 from khaos.subagents.spawner import SubAgentTask
 
 if TYPE_CHECKING:
@@ -118,6 +118,8 @@ class SubAgentRunner:
         共享 ``office_authority`` 是借用的，``aclose`` 不会关闭它。
         """
         session_id = f"{task.parent_session_id}/{task.id}"
+        project_root = self.project_root or Path.cwd()
+        effective_project_id = task.project_id or compute_project_id(project_root)
         config = AgentConfig(
             max_turns=self.max_turns,
             max_budget_tokens=self.max_budget_tokens,
@@ -133,7 +135,7 @@ class SubAgentRunner:
         await self.db.create_session(
             session_id,
             principal_id=task.principal_id or self.principal_id or "legacy",
-            project_id=task.project_id,
+            project_id=effective_project_id,
         )
 
         from khaos.runtime import (
@@ -179,6 +181,8 @@ class SubAgentRunner:
             # as the main AgentLoop.
             approval_broker=self.approval_broker,
             principal_id=principal_id,
+            source_transport="subagent",
+            foreground_session=False,
             audit_logger=self.audit_logger,
             # M4 batch 3.1.16A-5-1b (CRITICAL): inject the task's
             # project_id so the subagent's AgentLoop._bound_project_id
@@ -186,7 +190,7 @@ class SubAgentRunner:
             # (RPC-verified) instead of being recomputed from
             # project_root.  This guarantees the subagent stamps the
             # SAME project_id on its writes as the parent runtime.
-            project_id=task.project_id,
+            project_id=effective_project_id,
             # B1: inherit the server's project_root / config_path so the
             # subagent loads the SAME ``khaos_policy.yaml`` and compiles the
             # SAME EffectivePolicy as the main AgentLoop.  Without this, a
@@ -194,7 +198,7 @@ class SubAgentRunner:
             # different cwd would have the main runtime under
             # ``/project/A/khaos_policy.yaml`` but the subagent under
             # ``$CWD/khaos_policy.yaml`` — two security authorities.
-            project_root=self.project_root or Path.cwd(),
+            project_root=project_root,
             config_path=self.config_path,
         ))
         try:

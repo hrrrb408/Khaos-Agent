@@ -1,4 +1,5 @@
 from khaos.db import Database
+from khaos.db.state_root import project_id
 from khaos.runtime import RuntimeConfig, build_runtime
 
 
@@ -9,7 +10,11 @@ async def test_office_to_coding_switch_enables_per_turn_components(tmp_path):
     db = Database(tmp_path / "switch.db")
     await db.connect()
     await db.run_migrations()
-    await db.create_session("switch")
+    await db.create_session(
+        "switch",
+        principal_id="local-uid:test",
+        project_id=project_id(tmp_path),
+    )
     runtime = await build_runtime(RuntimeConfig(db=db, project_root=tmp_path, principal_id="local-uid:test"))
     assert runtime.task_manager is not None
     assert runtime.loop.verify_fix_loop is None

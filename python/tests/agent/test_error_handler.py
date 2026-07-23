@@ -1,4 +1,5 @@
 import asyncio
+import os
 
 import pytest
 import httpx
@@ -29,8 +30,9 @@ async def test_handle_uses_exception_type_when_message_is_empty(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    await db.create_session("s1")
-    handler = ErrorHandler(db=db)
+    principal_id = f"local-uid:{os.getuid()}"
+    await db.create_session("s1", principal_id=principal_id)
+    handler = ErrorHandler(db=db, principal_id=principal_id)
 
     event = await handler.handle(AssertionError(), "s1")
 
@@ -43,8 +45,9 @@ async def test_handle_audits_error(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    await db.create_session("s1")
-    handler = ErrorHandler(db=db)
+    principal_id = f"local-uid:{os.getuid()}"
+    await db.create_session("s1", principal_id=principal_id)
+    handler = ErrorHandler(db=db, principal_id=principal_id)
 
     event = await handler.handle(asyncio.TimeoutError("slow"), "s1")
     logs = await db.list_audit_logs()
@@ -114,13 +117,15 @@ async def test_agent_loop_error_handler_integration(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    await db.create_session("s1")
+    principal_id = f"local-uid:{os.getuid()}"
+    await db.create_session("s1", principal_id=principal_id)
     loop = AgentLoop(
         AgentConfig(),
         ModeManager(db, project_root=tmp_path),
         FailingRouter(),
         db,
-        error_handler=ErrorHandler(db=db),
+        error_handler=ErrorHandler(db=db, principal_id=principal_id),
+        principal_id=principal_id,
     )
 
     events = [message async for message in loop.run("hello", "s1")]

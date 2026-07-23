@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -334,18 +335,31 @@ class LinuxBubblewrapBackend:
         """
         if not sys.platform.startswith("linux") or shutil.which("bwrap") is None:
             return BackendAvailability(self.name, False, False, "bwrap unavailable on this platform")
+        launcher = _linux_sandbox_launcher()
+        if launcher is None:
+            return BackendAvailability(
+                self.name, False, False,
+                "khaos-sandbox-launcher unavailable; no_new_privs/seccomp TCB is required",
+            )
         if LinuxBubblewrapBackend._capability_cache is not None:
             return LinuxBubblewrapBackend._capability_cache
+        cgroup: Path | None = None
         try:
             with tempfile.TemporaryDirectory() as tmp, \
                     tempfile.TemporaryDirectory(prefix="khaos-home-") as home:
                 budget = ResourceBudget()
+                cgroup = _create_linux_cgroup(budget, Path(tmp))
                 prefix = self.argv_prefix(
                     Path(tmp), cwd=Path(tmp), synthetic_home=Path(home),
                     resources=budget, command=("/bin/sh",),
                 )
                 completed = subprocess.run(
-                    (*prefix, "--", "/bin/sh", "-c", "echo probe > .probe && cat .probe"),
+                    (
+                        str(launcher), "--join-cgroup",
+                        str(cgroup / "cgroup.procs"), "--", *prefix, "--",
+                        str(launcher), "--", "/bin/sh", "-c",
+                        "echo probe > .probe && cat .probe",
+                    ),
                     capture_output=True,
                     timeout=10,
                 )
@@ -357,6 +371,8 @@ class LinuxBubblewrapBackend:
                 f"bwrap isolation probe could not run: {type(exc).__name__}: {exc}",
             )
             LinuxBubblewrapBackend._capability_cache = availability
+            if cgroup is not None:
+                _remove_linux_cgroup(cgroup)
             return availability
         if completed.returncode == 0 and b"probe" in completed.stdout:
             availability = BackendAvailability(self.name, True, True)
@@ -367,6 +383,8 @@ class LinuxBubblewrapBackend:
                 f"bwrap isolation probe failed (rc={completed.returncode}): {stderr}",
             )
         LinuxBubblewrapBackend._capability_cache = availability
+        if cgroup is not None:
+            _remove_linux_cgroup(cgroup)
         return availability
 
     SANDBOX_WORKDIR = "/workspace"
@@ -422,6 +440,9 @@ class LinuxBubblewrapBackend:
         for literal in _linux_literal_read_files():
             if literal.is_file():
                 prefix.extend(("--ro-bind", str(literal), str(literal)))
+        launcher = _linux_sandbox_launcher()
+        if launcher is not None:
+            prefix.extend(("--ro-bind", str(launcher), str(launcher)))
         safe_environment = _sandbox_environment(
             None, environment or {}, home="/home/khaos", tmpdir="/tmp"
         )
@@ -444,6 +465,12 @@ class LinuxBubblewrapBackend:
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
         with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
+            try:
+                cgroup = _create_linux_cgroup(profile.resources, worktree)
+            except OSError as exc:
+                raise PermissionError(
+                    f"execution refused: delegated cgroup v2 limits unavailable: {exc}"
+                ) from exc
             prefix = self.argv_prefix(
                 worktree,
                 cwd=request.cwd,
@@ -454,20 +481,124 @@ class LinuxBubblewrapBackend:
                 command=request.argv,
                 environment=request.environment,
             )
-            sandboxed = replace(request, argv=(*prefix, "--", *request.argv))
+            launcher = _linux_sandbox_launcher()
+            if launcher is None:
+                raise PermissionError(
+                    "execution refused: no_new_privs/seccomp launcher unavailable"
+                )
+            sandboxed = replace(request, argv=(
+                str(launcher), "--join-cgroup",
+                str(cgroup / "cgroup.procs"), "--", *prefix, "--",
+                str(launcher), "--", *request.argv,
+            ))
             supervisor = self.supervisor or ProcessSupervisor()
             self.supervisor = supervisor
-            return await supervisor.run(
-                sandboxed,
-                cwd=request.cwd.resolve(),
-                sandbox_storage_paths=("/home/khaos", "/tmp"),
-                workspace_root=worktree if writable else None,
-                workspace_baseline=request.workspace_baseline,
-            )
+            try:
+                return await supervisor.run(
+                    sandboxed,
+                    cwd=request.cwd.resolve(),
+                    sandbox_storage_paths=("/home/khaos", "/tmp"),
+                    workspace_root=worktree if writable else None,
+                    workspace_baseline=request.workspace_baseline,
+                )
+            finally:
+                _remove_linux_cgroup(cgroup)
 
     async def terminate(self, execution_id: str) -> None:
         if self.supervisor is not None:
             await self.supervisor.terminate(execution_id)
+
+
+def _linux_sandbox_launcher() -> Path | None:
+    """Resolve the reviewed Rust inner TCB; never fall back to raw exec."""
+    configured = os.environ.get("KHAOS_SANDBOX_LAUNCHER", "").strip()
+    candidates: list[Path] = []
+    if configured:
+        candidates.append(Path(configured).expanduser())
+    repository_root = Path(__file__).resolve().parents[4]
+    candidates.extend((
+        repository_root / "rust" / "khaos-core" / "target" / "release"
+        / "khaos-sandbox-launcher",
+        repository_root / "rust" / "khaos-core" / "target" / "debug"
+        / "khaos-sandbox-launcher",
+    ))
+    located = shutil.which("khaos-sandbox-launcher")
+    if located:
+        candidates.append(Path(located))
+    for candidate in candidates:
+        canonical = candidate.resolve()
+        if canonical.is_file() and os.access(canonical, os.X_OK):
+            return canonical
+    return None
+
+
+def _linux_cgroup_root() -> Path | None:
+    """Return a writable delegated cgroup-v2 subtree, if available."""
+    if not sys.platform.startswith("linux"):
+        return None
+    unified = Path("/sys/fs/cgroup/cgroup.controllers")
+    if not unified.is_file():
+        return None
+    configured = os.environ.get("KHAOS_CGROUP_ROOT", "").strip()
+    root = Path(configured) if configured else Path("/sys/fs/cgroup/khaos")
+    try:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        canonical = root.resolve()
+        if Path("/sys/fs/cgroup") not in (canonical, *canonical.parents):
+            return None
+        if not os.access(canonical, os.W_OK):
+            return None
+        return canonical
+    except OSError:
+        return None
+
+
+def _create_linux_cgroup(
+    budget: ResourceBudget, workspace: Path,
+) -> Path:
+    """Create and fully configure a per-execution cgroup-v2 leaf."""
+    root = _linux_cgroup_root()
+    if root is None:
+        raise OSError("cgroup root is not a writable delegated v2 subtree")
+    group = root / f"exec-{os.getpid()}-{secrets.token_hex(8)}"
+    current_limit = "create leaf"
+    try:
+        group.mkdir(mode=0o700)
+        period = 100_000
+        quota = max(1_000, int(budget.cpu_count * period))
+        io_rate = max(
+            1024 * 1024,
+            min(
+                256 * 1024 * 1024,
+                int(budget.workspace_bytes / max(1.0, budget.timeout_seconds)),
+            ),
+        )
+        device = workspace.resolve().stat().st_dev
+        limits = {
+            "pids.max": str(budget.pids),
+            "memory.max": str(budget.memory_bytes),
+            "memory.swap.max": "0",
+            "cpu.max": f"{quota} {period}",
+            "io.max": (
+                f"{os.major(device)}:{os.minor(device)} "
+                f"rbps={io_rate} wbps={io_rate}"
+            ),
+        }
+        for name, value in limits.items():
+            current_limit = name
+            (group / name).write_text(value, encoding="ascii")
+        return group
+    except OSError as exc:
+        _remove_linux_cgroup(group)
+        raise OSError(f"failed to configure {current_limit}: {exc}") from exc
+
+
+def _remove_linux_cgroup(group: Path) -> None:
+    """Best-effort removal; a live payload keeps the leaf non-empty."""
+    try:
+        group.rmdir()
+    except OSError:
+        pass
 
 
 def _validated_profile(request):

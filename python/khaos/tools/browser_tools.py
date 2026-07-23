@@ -45,6 +45,8 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
+from khaos.security.browser_egress_proxy import BrowserEgressProxy
+
 logger = logging.getLogger(__name__)
 
 # ─── 尝试导入 Playwright ───
@@ -256,7 +258,18 @@ class BrowserManager:
             elif browser_type == "webkit":
                 browser = await pw.webkit.launch(headless=headless)
             else:
-                browser = await pw.chromium.launch(headless=headless)
+                browser = await pw.chromium.launch(
+                    headless=headless,
+                    args=[
+                        "--disable-background-networking",
+                        "--disable-component-update",
+                        "--disable-domain-reliability",
+                        "--disable-features=NetworkServiceSandbox,WebRtcHideLocalIpsWithMdns",
+                        "--disable-quic",
+                        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+                        "--webrtc-ip-handling-policy=disable_non_proxied_udp",
+                    ],
+                )
             self._browser = browser
             logger.info("Browser launched: %s (headless=%s)", browser_type, headless)
             return {"ok": True, "browser_type": browser_type, "headless": headless}
@@ -294,6 +307,9 @@ class BrowserManager:
                     self._context_close_failures.get(key, 0) + 1
                 )
                 raise
+        proxy = entry.get("egress_proxy")
+        if proxy is not None:
+            await proxy.close()
         self._contexts.pop(key, None)
         self._context_close_failures.pop(key, None)
 
@@ -552,19 +568,29 @@ class BrowserManager:
                 return None
         if self._browser is None:
             return None
-        context = await self._browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent="KhaosBrowser/1.0",
-            # B2: block service workers so they cannot intercept requests
-            # and bypass the route guard.  Per Playwright docs, requests
-            # handled by a service worker are NOT seen by
-            # ``context.route()`` — so a page that registers a service
-            # worker could then issue network requests the guard never
-            # observes.  ``service_workers="block"`` makes Playwright
-            # itself refuse service worker registration, closing the
-            # bypass at the browser layer.
-            service_workers="block",
-        )
+        guard_supplied = network_guard is not None
+        if network_guard is None:
+            from khaos.security.network_guard import NetworkGuard
+
+            network_guard = NetworkGuard(
+                network_enabled=False, allowed_domains=[],
+            )
+        egress_proxy = BrowserEgressProxy(network_guard)
+        try:
+            await egress_proxy.start()
+            context = await self._browser.new_context(
+                viewport={"width": 1280, "height": 720},
+                user_agent="KhaosBrowser/1.0",
+                proxy={
+                    "server": egress_proxy.server_url,
+                    "bypass": "<-loopback>",
+                },
+                # Service workers would add another request authority.
+                service_workers="block",
+            )
+        except Exception:
+            await egress_proxy.close()
+            raise
         # B2: install the route interceptor BEFORE creating the page so the
         # very first navigation is gated.  The interceptor runs the
         # NetworkGuard's domain check on every request, redirect and
@@ -575,7 +601,7 @@ class BrowserManager:
         # return None — never continue with an unguarded context.  The
         # caller (``_safe_execute``) translates ``None`` into
         # ``{"ok": False, "error": "Browser security guard installation failed"}``.
-        if network_guard is not None:
+        if guard_supplied:
             try:
                 await self._install_route_guard(context, network_guard)
             except Exception as exc:  # noqa: BLE001 — surfaced as None
@@ -587,6 +613,7 @@ class BrowserManager:
                     await context.close()
                 except Exception:  # noqa: BLE001 — best-effort cleanup
                     pass
+                await egress_proxy.close()
                 # H2: stash the specific failure reason so ``_safe_execute``
                 # can surface it instead of the generic "Browser not
                 # available" message.
@@ -601,6 +628,7 @@ class BrowserManager:
             "page": page,
             "refcount": 1,
             "network_guard": network_guard,
+            "egress_proxy": egress_proxy,
             # H1 (lifecycle): track which runtime_ids have acquired this
             # context so ``ensure_page`` only bumps refcount for NEW
             # runtimes, and ``close_runtime`` can release ALL contexts a
@@ -1412,7 +1440,9 @@ def _make_file_upload_real(
     return _run
 
 
-def _file_upload_real(page: Page) -> Any:  # pragma: no cover - legacy
+def _file_upload_real(
+    page: Page, selector: str = "", file_path: str = "",
+) -> Any:  # pragma: no cover - legacy
     # Retained for backward compatibility with any callers that import
     # the closure directly.  New code uses ``_make_file_upload_real``.
     async def _run() -> dict[str, Any]:

@@ -243,6 +243,9 @@ async def test_browser_manager_concurrent_first_use_creates_one_context(monkeypa
             await asyncio.sleep(0)
             return self.context
 
+        async def close(self):
+            return None
+
     manager = BrowserManager()
     manager._browser = FakeBrowser()
 
@@ -254,6 +257,7 @@ async def test_browser_manager_concurrent_first_use_creates_one_context(monkeypa
     assert first is second
     assert manager._browser.calls == 1
     assert len(manager._contexts) == 1
+    await manager.close()
 
 
 async def test_context_close_failure_retains_owner_for_retry():
@@ -325,7 +329,7 @@ async def test_browser_manager_concurrent_launch_starts_one_browser(monkeypatch)
             self.calls = 0
             self.browser = FakeBrowser()
 
-        async def launch(self, *, headless):
+        async def launch(self, *, headless, **kwargs):
             self.calls += 1
             await asyncio.sleep(0)
             return self.browser

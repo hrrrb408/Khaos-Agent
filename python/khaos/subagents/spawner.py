@@ -304,6 +304,7 @@ class SubAgentSpawner:
                 # B1: persist the principal so list_subagent_tasks(principal_id)
                 # can filter rows on disk, not just in-memory.
                 task.principal_id,
+                task.project_id,
             )
             # Step 3: re-acquire the lock to publish or abort.
             async with self._spawn_lock:
@@ -422,6 +423,7 @@ class SubAgentSpawner:
                 tools_json,
                 task.status,
                 task.principal_id,
+                task.project_id,
             )
             # The INSERT path leaves ``result`` / ``error`` /
             # ``finished_at`` unset; re-issue the UPDATE so the
@@ -1005,6 +1007,7 @@ class SubAgentSpawner:
         except Exception as exc:
             task.status = "failed"
             task.error = str(exc)
+            logger.exception("subagent task %s failed", task.id)
         # H3 (round-5): persist the terminal state (success or exception
         # path).  Use ``_persist_terminal`` so a failed write is tracked
         # for reconcile retry.  Do not propagate — ``_run_task`` is a
