@@ -259,6 +259,9 @@ class BrowserManager:
             if self._playwright is None:
                 self._playwright = await async_playwright().start()
             pw = self._playwright
+            # C-04 (round-5): production defaults to fail-closed.
+            # Only KHAOS_BROWSER_DEV_MODE=1 allows proxy-only fallback.
+            _dev_mode = os.environ.get("KHAOS_BROWSER_DEV_MODE", "") == "1"
             # F-05: set up the OS-level netns sandbox before launching
             # Chromium.  On Linux with CAP_NET_ADMIN, this creates a
             # dedicated network namespace with no default route so even
@@ -269,21 +272,37 @@ class BrowserManager:
                 # cgroup/nft resources from a previous boot before creating
                 # new ones.  Best-effort — failures are logged.
                 BrowserNetworkSandbox.startup_reaper()
-                self._browser_sandbox = BrowserNetworkSandbox()
+                self._browser_sandbox = BrowserNetworkSandbox(
+                    require_os_sandbox=not _dev_mode,
+                )
                 self._browser_sandbox.setup()
             if browser_type == "firefox":
-                # C-09: Firefox does not use the netns wrapper.  Log the
-                # reduced enforcement level so operators know the OS
-                # sandbox is not applied to this browser type.
+                # C-04 (round-5): Firefox does not use the netns wrapper.
+                # In production, refuse to launch Firefox without the OS
+                # sandbox.  In dev mode, log a warning and continue.
                 if self._browser_sandbox.is_active:
+                    from khaos.security.browser_sandbox import BrowserSandboxError
+                    if not _dev_mode:
+                        raise BrowserSandboxError(
+                            "Firefox does not support netns wrapper — "
+                            "refusing to launch in production.  Set "
+                            "KHAOS_BROWSER_DEV_MODE=1 for dev/testing."
+                        )
                     logger.warning(
                         "browser sandbox: Firefox launched WITHOUT netns "
                         "wrapper — only proxy-level enforcement applies"
                     )
                 browser = await pw.firefox.launch(headless=headless)
             elif browser_type == "webkit":
-                # C-09: WebKit does not use the netns wrapper.
+                # C-04 (round-5): WebKit does not use the netns wrapper.
                 if self._browser_sandbox.is_active:
+                    from khaos.security.browser_sandbox import BrowserSandboxError
+                    if not _dev_mode:
+                        raise BrowserSandboxError(
+                            "WebKit does not support netns wrapper — "
+                            "refusing to launch in production.  Set "
+                            "KHAOS_BROWSER_DEV_MODE=1 for dev/testing."
+                        )
                     logger.warning(
                         "browser sandbox: WebKit launched WITHOUT netns "
                         "wrapper — only proxy-level enforcement applies"
@@ -310,25 +329,30 @@ class BrowserManager:
                     ],
                 }
                 if self._browser_sandbox.is_active:
-                    try:
-                        real_path = pw.chromium.executable_path
-                        if real_path:
-                            wrapper = self._browser_sandbox.create_wrapper_script(
-                                real_path, 0,  # port is per-context
-                            )
-                            if wrapper:
-                                launch_kwargs["executable_path"] = wrapper
-                                logger.info(
-                                    "browser netns sandbox: launching "
-                                    "Chromium inside netns %s",
-                                    self._browser_sandbox._netns_name,
-                                )
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "browser netns sandbox: wrapper script "
-                            "creation failed, using direct launch: %s",
-                            exc,
+                    # C-04 (round-5): wrapper creation failure is fatal in
+                    # production.  No more silent fallback to direct launch.
+                    real_path = pw.chromium.executable_path
+                    if real_path:
+                        # create_wrapper_script raises BrowserSandboxError
+                        # in production mode if the run dir is missing.
+                        wrapper = self._browser_sandbox.create_wrapper_script(
+                            real_path, 0,  # port is per-context
                         )
+                        if wrapper:
+                            launch_kwargs["executable_path"] = wrapper
+                            logger.info(
+                                "browser netns sandbox: launching "
+                                "Chromium inside netns %s",
+                                self._browser_sandbox._netns_name,
+                            )
+                        elif not _dev_mode:
+                            # Sandbox is active but wrapper is None —
+                            # this shouldn't happen, but fail closed.
+                            from khaos.security.browser_sandbox import BrowserSandboxError
+                            raise BrowserSandboxError(
+                                "wrapper script creation returned None "
+                                "in production mode — refusing direct launch"
+                            )
                 browser = await pw.chromium.launch(**launch_kwargs)
             self._browser = browser
             logger.info("Browser launched: %s (headless=%s)", browser_type, headless)

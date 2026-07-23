@@ -14,7 +14,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import secrets
 import sys
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
@@ -646,7 +648,8 @@ def test_c06_install_egress_pin_dev_mode_warns_on_missing_nft():
 def test_c06_install_egress_pin_calls_nft_rules(
     mock_which, mock_run
 ):
-    """C-06: when nft is available, install_egress_pin installs rules."""
+    """C-06 (round-5): when nft is available, install_egress_pin installs
+    rules via ``nft -f -`` with an atomic stdin script."""
     mock_which.return_value = "/usr/sbin/nft"
     mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
 
@@ -654,20 +657,26 @@ def test_c06_install_egress_pin_calls_nft_rules(
     sandbox._active = True
     sandbox._veth_host = "khaos-brh-test"
     sandbox._host_ip = "10.200.1.1"
-    sandbox._nft_chain = None
+    sandbox._nft_table = "khaos_browser_test1234"
 
     sandbox.install_egress_pin(9090)
 
-    assert sandbox._nft_chain is not None
     assert sandbox.enforcement_status.route_guard
-    # Verify nft was called multiple times (table, chain, rules)
-    assert mock_run.call_count >= 4
-    # Verify the rules reference the proxy port
-    all_calls = " ".join(
-        " ".join(call.args[0]) for call in mock_run.call_args_list
-    )
-    assert "9090" in all_calls
-    assert "10.200.1.1" in all_calls
+    # C-02 (round-5): nft is called once with -f - (atomic stdin script)
+    assert mock_run.call_count == 1
+    call = mock_run.call_args
+    assert call.args[0] == ["nft", "-f", "-"]
+    # The script is passed via the 'input' kwarg
+    script = call.kwargs.get("input", "")
+    # Verify the script references the proxy port, host IP, and input hook
+    assert "9090" in script
+    assert "10.200.1.1" in script
+    # C-01 (round-5): must use input hook, not just forward
+    assert "hook input" in script
+    assert "hook forward" in script
+    # C-03 (round-5): base chains must use policy accept, not policy drop
+    assert "policy accept" in script
+    assert "policy drop" not in script
 
 
 @patch("khaos.security.browser_sandbox.subprocess.run")
@@ -675,14 +684,14 @@ def test_c06_install_egress_pin_calls_nft_rules(
 def test_c06_teardown_deletes_nft_table(
     mock_which, mock_run
 ):
-    """C-06: teardown deletes the nftables table."""
+    """C-06 (round-5): teardown deletes the per-sandbox nftables table."""
     mock_which.return_value = "/usr/sbin/nft"
     mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
 
     sandbox = BrowserNetworkSandbox()
-    sandbox._nft_chain = "br-test"
+    sandbox._nft_table = "khaos_browser_test1234"
     sandbox.teardown()
-    # Verify nft delete table was called
+    # Verify nft delete table was called with the per-sandbox table name
     delete_calls = [
         call for call in mock_run.call_args_list
         if "delete" in " ".join(call.args[0])
@@ -738,3 +747,139 @@ def test_c09_has_net_admin_returns_false_on_permission_denied(
         result = _has_net_admin()
 
     assert result is False
+
+
+# ---------------------------------------------------------------------------
+# Round-5 Batch 5.1: per-sandbox resource names, registry-based reaper,
+# fail-closed production, nft input hook
+# ---------------------------------------------------------------------------
+
+
+def test_round5_per_sandbox_token_in_resource_names():
+    """H-01: each sandbox instance gets a unique token in resource names."""
+    s1 = BrowserNetworkSandbox()
+    s2 = BrowserNetworkSandbox()
+    # Two instances must have different tokens.
+    assert s1._token != s2._token
+    # After setup names would include the token — verify the token is
+    # 16 hex chars (8 bytes).
+    assert len(s1._token) == 16
+    assert all(c in "0123456789abcdef" for c in s1._token)
+
+
+def test_round5_nft_table_is_per_sandbox():
+    """H-01/H-02: nft table name includes the per-sandbox token."""
+    s1 = BrowserNetworkSandbox()
+    s2 = BrowserNetworkSandbox()
+    # Simulate setup() naming.
+    s1._nft_table = f"khaos_browser_{s1._token}"
+    s2._nft_table = f"khaos_browser_{s2._token}"
+    assert s1._nft_table != s2._nft_table
+    assert s1._token in s1._nft_table
+    assert s2._token in s2._nft_table
+
+
+def test_round5_teardown_only_deletes_own_nft_table():
+    """H-02: teardown deletes only THIS sandbox's nft table, not global."""
+    with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
+         patch("khaos.security.browser_sandbox.shutil.which", return_value="/usr/sbin/nft"):
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        s1 = BrowserNetworkSandbox()
+        expected_table = f"khaos_browser_{s1._token}"
+        s1._nft_table = expected_table
+        s1.teardown()
+        # Verify the delete command used s1's table name.
+        delete_calls = [
+            call for call in mock_run.call_args_list
+            if "delete" in " ".join(call.args[0])
+        ]
+        assert len(delete_calls) >= 1
+        deleted_table = delete_calls[0].args[0][-1]
+        assert deleted_table == expected_table
+        # Must NOT be a global name like "khaos_browser_egress".
+        assert deleted_table != "khaos_browser_egress"
+
+
+def test_round5_nft_script_uses_input_hook_not_forward_only():
+    """C-01: the nft script must include an 'input' hook for browser→host
+    local traffic, not just 'forward'."""
+    with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
+         patch("khaos.security.browser_sandbox.shutil.which", return_value="/usr/sbin/nft"):
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        sandbox = BrowserNetworkSandbox()
+        sandbox._active = True
+        sandbox._veth_host = "khbrh-abc123"
+        sandbox._host_ip = "10.200.1.1"
+        sandbox._nft_table = f"khaos_browser_{sandbox._token}"
+        sandbox.install_egress_pin(9090)
+        script = mock_run.call_args.kwargs.get("input", "")
+        assert "hook input" in script
+        assert "hook forward" in script
+
+
+def test_round5_nft_script_uses_policy_accept_not_drop():
+    """C-03: base chains must use 'policy accept' so unmatched host traffic
+    is unaffected."""
+    with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
+         patch("khaos.security.browser_sandbox.shutil.which", return_value="/usr/sbin/nft"):
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        sandbox = BrowserNetworkSandbox()
+        sandbox._active = True
+        sandbox._veth_host = "khbrh-abc123"
+        sandbox._host_ip = "10.200.1.1"
+        sandbox._nft_table = f"khaos_browser_{sandbox._token}"
+        sandbox.install_egress_pin(9090)
+        script = mock_run.call_args.kwargs.get("input", "")
+        assert "policy accept" in script
+        assert "policy drop" not in script
+
+
+def test_round5_nft_uses_nft_f_minus_not_split():
+    """C-02: nft is called with '-f -' (stdin script), not via .split()."""
+    with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
+         patch("khaos.security.browser_sandbox.shutil.which", return_value="/usr/sbin/nft"):
+        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
+        sandbox = BrowserNetworkSandbox()
+        sandbox._active = True
+        sandbox._veth_host = "khbrh-abc123"
+        sandbox._host_ip = "10.200.1.1"
+        sandbox._nft_table = f"khaos_browser_{sandbox._token}"
+        sandbox.install_egress_pin(9090)
+        # Must be called exactly once with ["nft", "-f", "-"].
+        assert mock_run.call_count == 1
+        assert mock_run.call_args.args[0] == ["nft", "-f", "-"]
+        # The script must be passed as the 'input' kwarg (stdin).
+        assert "input" in mock_run.call_args.kwargs
+
+
+def test_round5_create_wrapper_fails_closed_in_production():
+    """C-04: in production mode, wrapper creation failure raises
+    BrowserSandboxError instead of returning None."""
+    sandbox = BrowserNetworkSandbox(require_os_sandbox=True)
+    sandbox._active = True
+    # _run_dir is None → should raise in production.
+    with pytest.raises(BrowserSandboxError, match="secure run directory"):
+        sandbox.create_wrapper_script("/usr/bin/chromium", 0)
+
+
+def test_round5_create_wrapper_dev_mode_creates_run_dir():
+    """C-04: in dev mode, wrapper creation creates the run dir as fallback."""
+    sandbox = BrowserNetworkSandbox(require_os_sandbox=False)
+    sandbox._active = True
+    sandbox._netns_name = "khaos-br-test"
+    sandbox._token = secrets.token_hex(8)
+    # _run_dir is None → dev mode should create it.
+    # This will create a real directory under ~/.khaos/run/<token>/.
+    try:
+        result = sandbox.create_wrapper_script("/usr/bin/echo", 0)
+        assert result is not None
+        assert os.path.exists(result)
+    finally:
+        if sandbox._run_dir is not None:
+            # Clean up.
+            try:
+                for child in sandbox._run_dir.iterdir():
+                    child.unlink()
+                sandbox._run_dir.rmdir()
+            except OSError:
+                pass

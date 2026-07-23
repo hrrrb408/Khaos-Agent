@@ -16,6 +16,14 @@ os.environ.setdefault("KHAOS_NO_CONFIG", "1")
 # str(tmp_path / "khaos.db"), ...)`` continue to work unchanged.
 # Production code never sets this variable.
 os.environ.setdefault("KHAOS_ALLOW_PROJECT_DB", "1")
+# Round 5 Batch 5.1: production BrowserNetworkSandbox defaults to
+# ``require_os_sandbox=True`` (fail-closed — Firefox/WebKit refuse to
+# launch and Chromium requires the netns wrapper).  CI / local test
+# runners are non-Linux (darwin) and have no netns/cgroup/nft support,
+# so the production path would raise ``BrowserSandboxError``.  Tests opt
+# into the dev-mode proxy-only fallback, which is the documented escape
+# hatch.  Production code never sets this variable.
+os.environ.setdefault("KHAOS_BROWSER_DEV_MODE", "1")
 
 
 @pytest.fixture(autouse=True)
