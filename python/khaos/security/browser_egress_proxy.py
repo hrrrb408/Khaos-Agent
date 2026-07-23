@@ -1,10 +1,28 @@
-"""Mandatory DNS-pinning egress proxy for Playwright browser contexts."""
+"""Mandatory DNS-pinning egress proxy for Playwright browser contexts.
+
+F-05 (third-round review §5.3): the proxy now enforces per-connection
+resource limits so a compromised or runaway page cannot exhaust host
+resources:
+
+  - **idle timeout** — connections with no data transfer for
+    ``_IDLE_TIMEOUT`` seconds are closed;
+  - **upload byte cap** — uploads beyond ``_MAX_UPLOAD_BYTES`` are
+    aborted;
+  - **download byte cap** — downloads beyond ``_MAX_DOWNLOAD_BYTES``
+    are aborted;
+  - **connection quota** — at most ``_MAX_CONCURRENT_CONNECTIONS``
+    concurrent connections per proxy instance (per browser context);
+  - **audit logging** — every authorize / reject / limit event is
+    logged at WARNING (rejects) or INFO (authorized + closed).
+"""
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import logging
+import time
+from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
 from khaos.security.network_guard import NetworkGuard
@@ -13,27 +31,88 @@ logger = logging.getLogger(__name__)
 
 _MAX_HEADER_BYTES = 64 * 1024
 _CONNECT_TIMEOUT = 15.0
+# F-05: per-connection resource limits.
+_IDLE_TIMEOUT = 60.0  # seconds with no data transfer → close
+_MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MiB upload per connection
+_MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200 MiB download per connection
+_MAX_CONCURRENT_CONNECTIONS = 20  # per proxy instance (per browser context)
+
+
+@dataclass
+class _ConnectionStats:
+    """Per-connection accounting for audit logging."""
+
+    method: str = ""
+    host: str = ""
+    port: int = 0
+    uploaded: int = 0
+    downloaded: int = 0
+    started_at: float = field(default_factory=time.monotonic)
+
+    def summary(self) -> str:
+        duration = time.monotonic() - self.started_at
+        return (
+            f"method={self.method} host={self.host}:{self.port} "
+            f"uploaded={self.uploaded} downloaded={self.downloaded} "
+            f"duration={duration:.1f}s"
+        )
+
+
+class _ByteLimitExceeded(Exception):
+    """Raised when a connection exceeds its upload or download byte cap."""
+
+    def __init__(self, direction: str, transferred: int, limit: int) -> None:
+        super().__init__(
+            f"{direction} byte limit exceeded: {transferred} > {limit}"
+        )
+        self.direction = direction
+        self.transferred = transferred
+        self.limit = limit
 
 
 class BrowserEgressProxy:
-    """A loopback-only proxy that authorizes and pins every connection."""
+    """A loopback-only proxy that authorizes and pins every connection.
 
-    def __init__(self, guard: NetworkGuard) -> None:
+    F-05: enforces idle timeout, upload/download byte caps, a concurrent
+    connection quota, and audit logging on every connection lifecycle
+    event.
+    """
+
+    def __init__(
+        self,
+        guard: NetworkGuard,
+        *,
+        max_concurrent: int = _MAX_CONCURRENT_CONNECTIONS,
+        idle_timeout: float = _IDLE_TIMEOUT,
+        max_upload: int = _MAX_UPLOAD_BYTES,
+        max_download: int = _MAX_DOWNLOAD_BYTES,
+        bind_host: str = "127.0.0.1",
+    ) -> None:
         self._guard = guard
         self._server: asyncio.AbstractServer | None = None
+        self._max_concurrent = max_concurrent
+        self._idle_timeout = idle_timeout
+        self._max_upload = max_upload
+        self._max_download = max_download
+        self._bind_host = bind_host
+        self._active_connections = 0
+        self._connection_semaphore = asyncio.Semaphore(max_concurrent)
 
     @property
     def server_url(self) -> str:
         if self._server is None or not self._server.sockets:
             raise RuntimeError("browser egress proxy is not running")
         port = int(self._server.sockets[0].getsockname()[1])
-        return f"http://127.0.0.1:{port}"
+        return f"http://{self._bind_host}:{port}"
 
     async def start(self) -> None:
         if self._server is not None:
             return
         self._server = await asyncio.start_server(
-            self._handle_client, host="127.0.0.1", port=0, limit=_MAX_HEADER_BYTES,
+            self._handle_client,
+            host=self._bind_host,
+            port=0,
+            limit=_MAX_HEADER_BYTES,
         )
 
     async def close(self) -> None:
@@ -46,6 +125,28 @@ class BrowserEgressProxy:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
     ) -> None:
+        # F-05: enforce concurrent connection quota.  If the quota is
+        # exhausted, reject immediately so a compromised page cannot
+        # exhaust file descriptors.
+        try:
+            await asyncio.wait_for(
+                self._connection_semaphore.acquire(), timeout=_CONNECT_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "browser egress rejected: connection quota exhausted "
+                "(%d/%d concurrent)",
+                self._active_connections,
+                self._max_concurrent,
+            )
+            await self._reject(writer, 503, "Too Many Connections")
+            writer.close()
+            with contextlib.suppress(Exception):
+                await writer.wait_closed()
+            return
+
+        self._active_connections += 1
+        stats = _ConnectionStats()
         try:
             header = await asyncio.wait_for(
                 reader.readuntil(b"\r\n\r\n"), timeout=_CONNECT_TIMEOUT,
@@ -54,18 +155,33 @@ class BrowserEgressProxy:
                 raise ValueError("proxy request header exceeds limit")
             head, _, _ = header.partition(b"\r\n")
             method, target, version = head.decode("latin-1").split(" ", 2)
-            if method.upper() == "CONNECT":
-                await self._tunnel_connect(target, reader, writer)
+            stats.method = method.upper()
+            if stats.method == "CONNECT":
+                await self._tunnel_connect(
+                    target, reader, writer, stats,
+                )
             else:
                 await self._forward_http(
-                    method, target, version, header, reader, writer,
+                    method, target, version, header, reader, writer, stats,
                 )
         except (asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             await self._reject(writer, 400, "Bad Request")
+        except _ByteLimitExceeded as exc:
+            logger.warning(
+                "browser egress byte limit exceeded: %s (%s)",
+                exc, stats.summary(),
+            )
+            await self._reject(writer, 413, "Payload Too Large")
         except Exception as exc:  # noqa: BLE001 - deny and audit every failure
-            logger.warning("browser egress denied: %s", exc)
+            logger.warning(
+                "browser egress denied: %s (%s)", exc, stats.summary(),
+            )
             await self._reject(writer, 403, "Forbidden")
+        else:
+            logger.info("browser egress closed: %s", stats.summary())
         finally:
+            self._active_connections -= 1
+            self._connection_semaphore.release()
             writer.close()
             with contextlib.suppress(Exception):
                 await writer.wait_closed()
@@ -75,16 +191,25 @@ class BrowserEgressProxy:
         authority: str,
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
+        stats: _ConnectionStats,
     ) -> None:
         host, port = _split_authority(authority, 443)
         target = await self._guard.authorize_url(f"https://{host}:{port}")
+        stats.host = host
+        stats.port = port
+        logger.info(
+            "browser egress authorized: CONNECT %s:%d", host, port,
+        )
         upstream_reader, upstream_writer = await _open_pinned(
             target.addresses, port,
         )
         client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await client_writer.drain()
         await _relay_bidirectional(
-            client_reader, client_writer, upstream_reader, upstream_writer,
+            client_reader, client_writer,
+            upstream_reader, upstream_writer,
+            stats, self._idle_timeout,
+            self._max_upload, self._max_download,
         )
 
     async def _forward_http(
@@ -95,12 +220,19 @@ class BrowserEgressProxy:
         header: bytes,
         client_reader: asyncio.StreamReader,
         client_writer: asyncio.StreamWriter,
+        stats: _ConnectionStats,
     ) -> None:
         parsed = urlsplit(raw_target)
         if parsed.scheme.lower() not in {"http", "ws"} or not parsed.hostname:
             raise ValueError("proxy requires an absolute HTTP URL")
         target = await self._guard.authorize_url(raw_target)
         port = parsed.port or 80
+        stats.host = parsed.hostname
+        stats.port = port
+        logger.info(
+            "browser egress authorized: %s %s:%d",
+            method.upper(), parsed.hostname, port,
+        )
         upstream_reader, upstream_writer = await _open_pinned(
             target.addresses, port,
         )
@@ -118,7 +250,10 @@ class BrowserEgressProxy:
         upstream_writer.write("\r\n".join(forwarded).encode("latin-1"))
         await upstream_writer.drain()
         await _relay_bidirectional(
-            client_reader, client_writer, upstream_reader, upstream_writer,
+            client_reader, client_writer,
+            upstream_reader, upstream_writer,
+            stats, self._idle_timeout,
+            self._max_upload, self._max_download,
         )
 
     @staticmethod
@@ -157,9 +292,39 @@ async def _open_pinned(
 
 
 async def _copy_stream(
-    reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    *,
+    direction: str,
+    byte_limit: int,
+    stats: _ConnectionStats,
+    idle_timeout: float,
 ) -> None:
-    while data := await reader.read(64 * 1024):
+    """Copy bytes from ``reader`` to ``writer`` with idle + byte limits.
+
+    F-05: raises ``_ByteLimitExceeded`` when ``byte_limit`` is exceeded,
+    and raises ``asyncio.TimeoutError`` when no data arrives for
+    ``idle_timeout`` seconds.
+    """
+    transferred = 0
+    while True:
+        try:
+            data = await asyncio.wait_for(reader.read(64 * 1024), timeout=idle_timeout)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "browser egress idle timeout (%.0fs) on %s (%s)",
+                idle_timeout, direction, stats.summary(),
+            )
+            raise
+        if not data:
+            break
+        transferred += len(data)
+        if transferred > byte_limit:
+            raise _ByteLimitExceeded(direction, transferred, byte_limit)
+        if direction == "upload":
+            stats.uploaded = transferred
+        else:
+            stats.downloaded = transferred
         writer.write(data)
         await writer.drain()
 
@@ -169,15 +334,31 @@ async def _relay_bidirectional(
     client_writer: asyncio.StreamWriter,
     upstream_reader: asyncio.StreamReader,
     upstream_writer: asyncio.StreamWriter,
+    stats: _ConnectionStats,
+    idle_timeout: float,
+    max_upload: int,
+    max_download: int,
 ) -> None:
     async def upload() -> None:
         try:
-            await _copy_stream(client_reader, upstream_writer)
+            await _copy_stream(
+                client_reader, upstream_writer,
+                direction="upload",
+                byte_limit=max_upload,
+                stats=stats,
+                idle_timeout=idle_timeout,
+            )
         finally:
             upstream_writer.close()
 
     async def download() -> None:
-        await _copy_stream(upstream_reader, client_writer)
+        await _copy_stream(
+            upstream_reader, client_writer,
+            direction="download",
+            byte_limit=max_download,
+            stats=stats,
+            idle_timeout=idle_timeout,
+        )
 
     tasks = (asyncio.create_task(upload()), asyncio.create_task(download()))
     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)

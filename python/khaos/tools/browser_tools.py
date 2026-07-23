@@ -46,6 +46,7 @@ from typing import Any, Callable, Optional
 from urllib.parse import urlparse
 
 from khaos.security.browser_egress_proxy import BrowserEgressProxy
+from khaos.security.browser_sandbox import BrowserNetworkSandbox
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +167,11 @@ class BrowserManager:
         self._closing_requested: bool = False
         self._closed: bool = False
         self._close_failed: bool = False
+        # F-05: OS-level browser egress enforcement (Linux netns + cgroup).
+        # Set up once when the browser launches; torn down in close().
+        # On non-Linux or without CAP_NET_ADMIN, this stays inactive and
+        # the proxy-only enforcement layer remains the sole authority.
+        self._browser_sandbox: BrowserNetworkSandbox | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -253,23 +259,59 @@ class BrowserManager:
             if self._playwright is None:
                 self._playwright = await async_playwright().start()
             pw = self._playwright
+            # F-05: set up the OS-level netns sandbox before launching
+            # Chromium.  On Linux with CAP_NET_ADMIN, this creates a
+            # dedicated network namespace with no default route so even
+            # a compromised browser cannot bypass the egress proxy.  On
+            # non-Linux, it's a no-op and the proxy-only layer remains.
+            if self._browser_sandbox is None:
+                self._browser_sandbox = BrowserNetworkSandbox()
+                self._browser_sandbox.setup()
             if browser_type == "firefox":
                 browser = await pw.firefox.launch(headless=headless)
             elif browser_type == "webkit":
                 browser = await pw.webkit.launch(headless=headless)
             else:
-                browser = await pw.chromium.launch(
-                    headless=headless,
-                    args=[
+                # F-05: if the netns sandbox is active, wrap the Chromium
+                # binary so it launches inside the dedicated namespace.
+                launch_kwargs: dict[str, Any] = {
+                    "headless": headless,
+                    "args": [
                         "--disable-background-networking",
                         "--disable-component-update",
                         "--disable-domain-reliability",
-                        "--disable-features=NetworkServiceSandbox,WebRtcHideLocalIpsWithMdns",
+                        # F-05 (third-round review §5.3): do NOT add the
+                        # network service sandbox to the disable list.
+                        # Keeping Chromium's network service sandboxed
+                        # limits the in-process attack surface if a
+                        # renderer compromise occurs.
+                        "--disable-features=WebRtcHideLocalIpsWithMdns",
                         "--disable-quic",
                         "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
                         "--webrtc-ip-handling-policy=disable_non_proxied_udp",
                     ],
-                )
+                }
+                if self._browser_sandbox.is_active:
+                    try:
+                        real_path = pw.chromium.executable_path
+                        if real_path:
+                            wrapper = self._browser_sandbox.create_wrapper_script(
+                                real_path, 0,  # port is per-context
+                            )
+                            if wrapper:
+                                launch_kwargs["executable_path"] = wrapper
+                                logger.info(
+                                    "browser netns sandbox: launching "
+                                    "Chromium inside netns %s",
+                                    self._browser_sandbox._netns_name,
+                                )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "browser netns sandbox: wrapper script "
+                            "creation failed, using direct launch: %s",
+                            exc,
+                        )
+                browser = await pw.chromium.launch(**launch_kwargs)
             self._browser = browser
             logger.info("Browser launched: %s (headless=%s)", browser_type, headless)
             return {"ok": True, "browser_type": browser_type, "headless": headless}
@@ -460,6 +502,18 @@ class BrowserManager:
                 self._browser = None
                 self._playwright = None
                 self._context_close_failures.clear()
+                # F-05: tear down the OS-level netns sandbox (Linux only).
+                # Best-effort: a failure here must not prevent ``_closed``
+                # from being set, since the browser and playwright are
+                # already stopped.
+                if self._browser_sandbox is not None:
+                    try:
+                        self._browser_sandbox.teardown()
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "browser netns sandbox teardown failed: %s", exc,
+                        )
+                    self._browser_sandbox = None
                 # All resources terminated cleanly — only now is the
                 # manager truly closed.  The idempotent short-circuit
                 # above will fire on subsequent calls.
@@ -575,15 +629,28 @@ class BrowserManager:
             network_guard = NetworkGuard(
                 network_enabled=False, allowed_domains=[],
             )
-        egress_proxy = BrowserEgressProxy(network_guard)
+        # F-05: when the OS-level netns sandbox is active, bind the proxy
+        # to the veth host IP so it's reachable from inside the browser
+        # network namespace.  Otherwise, bind to loopback only.
+        proxy_bind_host = (
+            self._browser_sandbox.proxy_bind_host
+            if self._browser_sandbox is not None
+            else "127.0.0.1"
+        )
+        egress_proxy = BrowserEgressProxy(network_guard, bind_host=proxy_bind_host)
         try:
             await egress_proxy.start()
+            # F-05: when the netns sandbox is active, the browser reaches
+            # the proxy via the veth host IP.  The ``bypass`` list must
+            # NOT include ``<-loopback>`` in that case because the proxy
+            # is not on loopback — it's on the veth interface.
+            bypass = "" if proxy_bind_host != "127.0.0.1" else "<-loopback>"
             context = await self._browser.new_context(
                 viewport={"width": 1280, "height": 720},
                 user_agent="KhaosBrowser/1.0",
                 proxy={
                     "server": egress_proxy.server_url,
-                    "bypass": "<-loopback>",
+                    "bypass": bypass,
                 },
                 # Service workers would add another request authority.
                 service_workers="block",
