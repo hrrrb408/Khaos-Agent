@@ -505,6 +505,18 @@ async def _emergency_instance_cleanup(
       - ``subagent_service.shutdown()`` — bounded by SUBAGENT_SHUTDOWN_TIMEOUT.
       - ``agent.shutdown()`` — idempotent via ``_shutdown_completed`` flag.
       - ``db.close()`` — idempotent (sets ``_conn = None``).
+
+    Round-5 Batch 5.4 (Shutdown Quarantine): if ``agent.shutdown()`` or
+    ``subagent_service.shutdown()`` fails (live cron executors, chat
+    owners, or subagent owners may still be running), the DB is NOT
+    closed.  Closing the DB while live owners still hold references
+    would cause them to hit ``_require_*_conn()`` which silently
+    re-opens the database outside the normal service lifecycle —
+    defeating the shutdown ordering invariant.  Instead the DB is
+    quarantined (left open) and the instance lock is retained so no
+    second process can start against it; the OS reaps everything when
+    the process exits.  Only when ALL upstream owners have shut down
+    cleanly is the DB closed.
     """
     ok = True
     # Round-5 Batch 5.2 (C-05): stop the maintenance loop FIRST so it
@@ -539,6 +551,18 @@ async def _emergency_instance_cleanup(
                 exc_info=True,
             )
             ok = False
+    # Round-5 Batch 5.4 (Shutdown Quarantine): only close the DB when
+    # every upstream owner has shut down cleanly.  If any shutdown
+    # failed, live owners may still be accessing the DB — closing it
+    # would either crash them or trigger a silent re-open outside the
+    # service lifecycle.  Quarantine (leave open) + retain lock instead.
+    if not ok:
+        logger.error(
+            "emergency cleanup: upstream shutdown failed; QUARANTINING "
+            "the database (not closing) — live owners may still be "
+            "active; instance lock must be retained",
+        )
+        return False
     if db is not None:
         try:
             await db.close()
@@ -1830,13 +1854,36 @@ class TaskService:
         key = (ctx.principal_id, ctx.project_id)
         manager = self._managers.get(key)
         if manager is None:
-            # LRU eviction: drop the oldest entry if at capacity.
-            while len(self._managers) >= self._MAX_MANAGERS:
-                evicted_key, _ = self._managers.popitem(last=False)
-                logger.debug(
-                    "TaskService LRU: evicted manager for %s",
-                    evicted_key,
-                )
+            # LRU eviction: drop the oldest EVICTABLE entry if at
+            # capacity.  Round-5 Batch 5.4: a manager with active tasks
+            # or live subscribers is NOT evicted (``can_evict`` returns
+            # False) — evicting a live owner would silently drop its
+            # in-memory cache and mark interrupted in-flight work as
+            # ``blocked`` on next ``load()``.  If no evictable entry
+            # exists, the cache is allowed to temporarily grow beyond
+            # ``_MAX_MANAGERS`` rather than evicting a live owner.
+            if len(self._managers) >= self._MAX_MANAGERS:
+                evicted = False
+                # Iterate oldest-first (OrderedDict insertion order).
+                for evict_key in list(self._managers.keys()):
+                    candidate = self._managers[evict_key]
+                    if not candidate.can_evict():
+                        continue
+                    await candidate.aclose()
+                    self._managers.pop(evict_key, None)
+                    logger.debug(
+                        "TaskService LRU: evicted manager for %s",
+                        evict_key,
+                    )
+                    evicted = True
+                    break
+                if not evicted:
+                    logger.warning(
+                        "TaskService LRU: cache at capacity (%d) but no "
+                        "evictable manager (all have live owners); "
+                        "temporarily exceeding limit",
+                        len(self._managers),
+                    )
             manager = TaskManager(
                 db=self.db, principal_id=ctx.principal_id,
                 project_id=ctx.project_id,
