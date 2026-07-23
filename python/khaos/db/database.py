@@ -25,6 +25,16 @@ from khaos.time_utils import utc_now_naive
 
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
+# F-03: split migration files.  ``0001_initial_schema.sql`` contains only
+# CREATE TABLE / CREATE VIRTUAL TABLE; ``0001_post_migration.sql`` contains
+# CREATE INDEX / CREATE TRIGGER.  The split fixes the index-before-column
+# bug: old databases that lack principal_id / project_id columns would
+# fail when CREATE INDEX references those columns.  By executing tables →
+# _ensure_* (column additions) → indexes, the columns always exist before
+# any index or trigger references them.
+_MIGRATIONS_DIR = Path(__file__).with_name("migrations")
+_INITIAL_SCHEMA_PATH = _MIGRATIONS_DIR / "0001_initial_schema.sql"
+_POST_MIGRATION_PATH = _MIGRATIONS_DIR / "0001_post_migration.sql"
 TELEGRAM_REPLAY_WINDOW = 4096
 # F-02 (third-round review): bumped to v2 so existing v1 databases re-run
 # the legacy upgrade helpers (including the new memories UNIQUE rebuild).
@@ -244,8 +254,23 @@ class Database:
             self._conn = None
 
     async def run_migrations(self) -> None:
-        """Apply the schema as one locked, checksummed transaction."""
+        """Apply the schema as one locked, checksummed transaction.
+
+        F-03: the schema is split into two files executed in order:
+          1. ``0001_initial_schema.sql``  — CREATE TABLE (no indexes)
+          2. ``_run_legacy_schema_upgrades()`` — ALTER TABLE ADD COLUMN
+          3. ``0001_post_migration.sql``  — CREATE INDEX / TRIGGER
+
+        This fixes the index-before-column bug: old databases that lack
+        ``principal_id`` / ``project_id`` columns would previously fail
+        when ``CREATE INDEX`` referenced those columns (schema.sql ran
+        indexes before ``_ensure_*`` added the columns).
+        """
         conn = await self._require_conn()
+        # F-03: checksum is still computed from the original schema.sql for
+        # backward compatibility with databases that already have a v2
+        # ledger row.  The split files produce an identical schema; they
+        # just fix the execution order.
         schema_text = SCHEMA_PATH.read_text(encoding="utf-8")
         checksum = hashlib.sha256(
             f"{schema_text}\n{SCHEMA_MIGRATION_SALT}".encode("utf-8")
@@ -293,22 +318,34 @@ class Database:
                 if int(row[0]) == SCHEMA_MIGRATION_VERSION:
                     if str(row[1]) != checksum:
                         raise RuntimeError(
-                            "database migration checksum mismatch for version 1"
+                            f"database migration checksum mismatch "
+                            f"for version {SCHEMA_MIGRATION_VERSION}"
                         )
                     await conn.commit()
                     return
 
-            # ``executescript`` commits implicitly, so execute individual
-            # statements through SQLite's complete-statement parser while the
-            # outer transaction is held. This preserves triggers containing
-            # internal semicolons without allowing an implicit commit.
-            await self._execute_schema_statements(conn, schema_text)
+            # F-03: execute tables FIRST, then legacy column upgrades,
+            # then indexes/triggers.  This ensures all columns exist
+            # before any CREATE INDEX references them.
+            initial_schema_text = _INITIAL_SCHEMA_PATH.read_text(
+                encoding="utf-8"
+            )
+            post_migration_text = _POST_MIGRATION_PATH.read_text(
+                encoding="utf-8"
+            )
+            # Step 1: CREATE TABLE IF NOT EXISTS (safe for old + fresh DBs)
+            await self._execute_schema_statements(conn, initial_schema_text)
+            # Step 2: _ensure_* — add missing columns to old DBs
+            # (no-op for fresh DBs where columns already exist)
             original_conn = self._conn
             self._conn = _MigrationConnection(conn)
             try:
                 await self._run_legacy_schema_upgrades()
             finally:
                 self._conn = original_conn
+            # Step 3: CREATE INDEX / TRIGGER IF NOT EXISTS (safe now —
+            # all columns referenced by indexes exist)
+            await self._execute_schema_statements(conn, post_migration_text)
             await conn.execute(
                 """
                 INSERT INTO schema_migrations (
@@ -416,43 +453,28 @@ class Database:
         await self._ensure_coding_tasks_project_id_column()
         await self._ensure_scheduler_journal_project_id_column()
         await self._ensure_subagent_tasks_principal_column()
-        await self._ensure_scheduled_tasks_legacy_quarantine_triggers()
-        await self._ensure_session_identity_invariants()
+        # F-03 (third-round review): the legacy-quarantine triggers are
+        # now created by ``0001_post_migration.sql`` (step 3) with literal
+        # strings.  SQLite does not allow ``?`` parameter binding inside
+        # ``CREATE TRIGGER`` bodies, so the in-Python helper that used
+        # ``error = ?`` is removed — the SQL file is the single source
+        # of truth for these triggers.
+        #
         # F-02 (third-round review): rebuild memories so project_id is
         # part of the UNIQUE constraint.  Must run AFTER
         # _ensure_memories_project_id_column (which adds the column to
         # legacy DBs) and AFTER _ensure_memories_principal_columns
         # (which establishes the base schema).  Idempotent: no-op on
         # fresh v2 DBs where the UNIQUE already includes project_id.
+        #
+        # F-03 ordering note: this MUST run BEFORE
+        # _ensure_session_identity_invariants because the rebuild DROPs
+        # the memories table (and SQLite automatically drops all triggers
+        # attached to a dropped table).  If the session-identity triggers
+        # were created first, the rebuild would silently destroy them and
+        # leave memories without identity-guard enforcement.
         await self._ensure_memories_project_id_unique()
-
-    async def _ensure_scheduled_tasks_legacy_quarantine_triggers(self) -> None:
-        """Quarantine ownerless scheduler writes after versioned migration."""
-        conn = await self._require_conn()
-        quarantine = (
-            "quarantined: legacy write - task has no authenticated owner; "
-            "an admin must re-claim it with a real principal before it can run"
-        )
-        for operation, clause in (
-            ("insert", "INSERT"),
-            ("update", "UPDATE OF principal_id, status"),
-        ):
-            await conn.execute(
-                f"""
-                CREATE TRIGGER IF NOT EXISTS
-                    trg_scheduled_tasks_quarantine_legacy_{operation}
-                AFTER {clause} ON scheduled_tasks
-                WHEN NEW.principal_id = 'legacy' AND NEW.status != 'failed'
-                BEGIN
-                    UPDATE scheduled_tasks
-                    SET status = 'failed', error = ?,
-                        execution_id = NULL, lease_until = NULL
-                    WHERE id = NEW.id;
-                END
-                """,
-                (quarantine,),
-            )
-        await conn.commit()
+        await self._ensure_session_identity_invariants()
 
     async def _ensure_session_identity_invariants(self) -> None:
         """Make SQLite enforce duplicated session identity on every write."""
