@@ -828,7 +828,11 @@ class AgentLoop:
             )
         ]
         messages.extend(
-            await self.db.list_messages(session_id, principal_id=self.principal_id)
+            await self.db.list_messages(
+                session_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
         )
         messages.extend(self._active_context_facts)
 

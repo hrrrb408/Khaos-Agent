@@ -49,11 +49,16 @@ class SessionSearch:
     call.  ``None`` means admin opt-in (no scoping, legacy behavior) so
     existing callers/tests keep working; a non-None value restricts
     search/browse/scroll/read to that principal's owned rows.
+
+    H-02 (round-4 review): ``project_id`` is an independent owner
+    dimension.  When provided, every underlying DB call is further
+    scoped to that project — closing cross-project reads on shared DBs.
     """
 
-    def __init__(self, db, *, principal_id: str | None = None):
+    def __init__(self, db, *, principal_id: str | None = None, project_id: str | None = None):
         self.db = db
         self.principal_id = principal_id
+        self.project_id = project_id
 
     async def search(
         self,

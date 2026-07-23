@@ -722,6 +722,7 @@ class AuditLogger:
             until=_normalize_time(until),
             limit=limit,
             principal_id=effective_principal,
+            project_id=self._project_id,
         )
         return [AuditEntry.from_row(row) for row in rows]
 

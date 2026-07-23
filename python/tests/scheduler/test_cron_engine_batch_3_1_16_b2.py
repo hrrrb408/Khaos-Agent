@@ -147,7 +147,17 @@ async def test_acceptance_2_policy_digest_drift_returns_reason(tmp_path):
 
 async def test_acceptance_3_project_id_drift_returns_reason(tmp_path):
     """B2-1: ``_check_snapshot_drift`` returns a reason when
-    ``project_id`` differs."""
+    ``project_id`` differs.
+
+    H-02 (round-4 review): ``_load_tasks`` now scopes by ``project_id``
+    (primary defense) — a cross-project task is excluded at read time
+    and never enters ``_tasks``.  This test injects the task directly
+    into ``_tasks`` to exercise the defense-in-depth drift check (the
+    scenario where a task somehow already exists in memory, e.g. loaded
+    before the project scope was applied).
+    """
+    from khaos.scheduler.engine import _task_from_row
+
     db = await _make_db(tmp_path)
     engine = _make_engine(
         db, project_id="proj-engine", policy_digest="sha256:same"
@@ -159,8 +169,15 @@ async def test_acceptance_3_project_id_drift_returns_reason(tmp_path):
         project_id="proj-different",  # DIFFERENT project_id
         policy_digest="sha256:same",  # matching policy_digest
     )
+    # Primary defense: _load_tasks excludes the cross-project task.
     await engine._load_tasks()
-    task = engine._tasks.get(task_id)
+    assert task_id not in engine._tasks, (
+        "cross-project task must be excluded by project-scoped _load_tasks"
+    )
+    # Defense-in-depth: inject the task directly to test drift detection.
+    row = await db.get_scheduled_task(task_id)  # admin fetch, no filter
+    task = _task_from_row(dict(row))
+    engine._tasks[task_id] = task
     assert task is not None
     drift_reason = engine._check_snapshot_drift(task)
     assert drift_reason is not None, "drift must be detected"
@@ -172,7 +189,13 @@ async def test_acceptance_3_project_id_drift_returns_reason(tmp_path):
 
 async def test_acceptance_4_test_mode_skips_enforcement(tmp_path):
     """B2-1: when the engine has no bound digest (test mode), drift
-    detection is DISABLED — every task passes the check."""
+    detection is DISABLED — every task passes the check.
+
+    H-02: task is injected directly (cross-project tasks are excluded
+    by ``_load_tasks`` — see test_acceptance_3 for the primary defense).
+    """
+    from khaos.scheduler.engine import _task_from_row
+
     db = await _make_db(tmp_path)
     # Test engine: empty policy_digest and project_id.
     engine = _make_engine(db, project_id="", policy_digest="")
@@ -184,8 +207,11 @@ async def test_acceptance_4_test_mode_skips_enforcement(tmp_path):
         principal_id="alice",
         project_id="proj-prod", policy_digest="sha256:prod",
     )
-    await engine._load_tasks()
-    task = engine._tasks.get(task_id)
+    # Inject directly (test mode engine has project_id="" so _load_tasks
+    # would scope to the empty project and exclude "proj-prod").
+    row = await db.get_scheduled_task(task_id)
+    task = _task_from_row(dict(row))
+    engine._tasks[task_id] = task
     assert task is not None
     # Test mode → no drift detected, even though snapshots differ.
     assert engine._check_snapshot_drift(task) is None, (
@@ -196,7 +222,13 @@ async def test_acceptance_4_test_mode_skips_enforcement(tmp_path):
 
 async def test_acceptance_5_legacy_task_drift_on_production_engine(tmp_path):
     """B2-1: a legacy task (empty ``policy_digest``) on a production
-    engine (non-empty digest) is detected as drift."""
+    engine (non-empty digest) is detected as drift.
+
+    H-02: task is injected directly (legacy task has project_id="" which
+    differs from the engine's "proj-prod" — _load_tasks excludes it).
+    """
+    from khaos.scheduler.engine import _task_from_row
+
     db = await _make_db(tmp_path)
     engine = _make_engine(
         db, project_id="proj-prod", policy_digest="sha256:prod"
@@ -210,8 +242,10 @@ async def test_acceptance_5_legacy_task_drift_on_production_engine(tmp_path):
         project_id="",  # legacy
         policy_digest="",  # legacy
     )
-    await engine._load_tasks()
-    task = engine._tasks.get(task_id)
+    # Inject directly (legacy project_id="" differs from engine's "proj-prod").
+    row = await db.get_scheduled_task(task_id)
+    task = _task_from_row(dict(row))
+    engine._tasks[task_id] = task
     assert task is not None
     drift_reason = engine._check_snapshot_drift(task)
     assert drift_reason is not None, (

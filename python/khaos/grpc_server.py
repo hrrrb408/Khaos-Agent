@@ -1251,6 +1251,7 @@ class AgentService:
             )
         session = await self.db.get_session(
             session_id, principal_id=ctx.principal_id,
+            project_id=ctx.project_id,
         )
         if session is None or session.get("project_id") != ctx.project_id:
             return
@@ -1666,7 +1667,9 @@ class SessionService:
         # the SQL filter ``s.principal_id = ''`` matches nothing
         # (legacy rows with ``principal_id='legacy'`` are excluded by
         # the A-4-3 filter, and production principals are never empty).
-        rows = await self.db.list_sessions(limit, offset, principal_id=principal_id)
+        rows = await self.db.list_sessions(
+            limit, offset, principal_id=principal_id, project_id=ctx.project_id,
+        )
         return [dict(row) for row in rows]
 
     async def get(
@@ -1684,7 +1687,7 @@ class SessionService:
         """
         principal_id = ctx.principal_id or ""
         session = await self.db.get_session(
-            session_id, principal_id=principal_id,
+            session_id, principal_id=principal_id, project_id=ctx.project_id,
         )
         if session is None:
             return {
@@ -1694,7 +1697,7 @@ class SessionService:
             }
         messages = await self.db.get_session_messages(
             session_id, limit=message_limit, offset=0,
-            principal_id=principal_id,
+            principal_id=principal_id, project_id=ctx.project_id,
         )
         return {
             "ok": True,

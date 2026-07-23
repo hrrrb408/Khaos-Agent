@@ -30,13 +30,17 @@ logger = logging.getLogger(__name__)
 EXPORT_LIMIT = 100_000
 
 
-async def _fetch_rows(db, since: str | None, *, result: str | None = None) -> list[dict[str, Any]]:
-    """Fetch raw audit rows, optionally filtered by since/result."""
+async def _fetch_rows(
+    db, since: str | None, *, result: str | None = None, project_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch raw audit rows, optionally filtered by since/result/project."""
     kwargs: dict[str, Any] = {"limit": EXPORT_LIMIT}
     if since is not None:
         kwargs["since"] = since
     if result is not None:
         kwargs["result"] = result
+    if project_id is not None:
+        kwargs["project_id"] = project_id
     return await db.query_audit_logs(**kwargs)
 
 
@@ -49,12 +53,18 @@ def _row_to_exportable(row: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-async def export_audit_json(db, output_path: str, since: str | None = None) -> int:
+async def export_audit_json(
+    db, output_path: str, since: str | None = None, *, project_id: str | None = None,
+) -> int:
     """导出审计日志为 JSON Lines 文件。
 
     每行一个 JSON 对象。返回导出的记录数。
+
+    H-03 (round-4 review): ``project_id`` scopes the export to one
+    project's audit trail on shared DBs.  ``None`` (default) is the
+    admin opt-in that exports every project.
     """
-    rows = await _fetch_rows(db, since)
+    rows = await _fetch_rows(db, since, project_id=project_id)
     records = [_row_to_exportable(row) for row in rows]
     # Write off-loop: synchronous file I/O inside an async function that just
     # awaited an aiosqlite query can deadlock aiosqlite's worker thread on
@@ -65,24 +75,36 @@ async def export_audit_json(db, output_path: str, since: str | None = None) -> i
     return count
 
 
-async def export_audit_csv(db, output_path: str, since: str | None = None) -> int:
+async def export_audit_csv(
+    db, output_path: str, since: str | None = None, *, project_id: str | None = None,
+) -> int:
     """导出审计日志为 CSV 文件。
 
     ``detail`` 列以 JSON 字符串形式写入。返回导出的记录数。
+
+    H-03 (round-4 review): ``project_id`` scopes the export to one
+    project's audit trail on shared DBs.  ``None`` (default) is the
+    admin opt-in that exports every project.
     """
-    rows = await _fetch_rows(db, since)
+    rows = await _fetch_rows(db, since, project_id=project_id)
     records = [_row_to_exportable(row) for row in rows]
     count = await asyncio.to_thread(_write_csv, output_path, records)
     logger.info("exported %d audit rows to %s (csv)", count, output_path)
     return count
 
 
-async def export_security_events(db, output_path: str) -> int:
+async def export_security_events(
+    db, output_path: str, *, project_id: str | None = None,
+) -> int:
     """仅导出安全相关事件（action 以 ``security:`` 开头）。
 
     Output is JSON Lines. Returns the number of exported records.
+
+    H-03 (round-4 review): ``project_id`` scopes the export to one
+    project's security events on shared DBs.  ``None`` (default) is the
+    admin opt-in that exports every project.
     """
-    rows = await _fetch_rows(db, since=None)
+    rows = await _fetch_rows(db, since=None, project_id=project_id)
     records = [
         _row_to_exportable(row)
         for row in rows

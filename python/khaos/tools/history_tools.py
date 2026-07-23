@@ -61,16 +61,19 @@ def _require_principal(principal_id: str) -> dict[str, Any] | None:
     return None
 
 
-def _build_search(principal_id: str, db: Any) -> SessionSearch | None:
-    """Construct a principal-scoped ``SessionSearch`` for this call.
+def _build_search(principal_id: str, project_id: str, db: Any) -> SessionSearch | None:
+    """Construct a principal+project-scoped ``SessionSearch`` for this call.
 
     Returns ``None`` when ``db`` is missing — callers translate this
     into the "not configured" unavailable response so a misconfigured
     tool context fails gracefully instead of crashing.
+
+    H-02 (round-4 review): ``project_id`` is threaded through so the
+    underlying DB queries filter by both owner dimensions.
     """
     if db is None:
         return None
-    return SessionSearch(db, principal_id=principal_id)
+    return SessionSearch(db, principal_id=principal_id, project_id=project_id or None)
 
 
 async def history_search(
@@ -78,6 +81,7 @@ async def history_search(
     limit: int = 10,
     *,
     principal_id: str = "",
+    project_id: str = "",
     db: Any = None,
     **kwargs: Any,
 ) -> dict:
@@ -90,12 +94,14 @@ async def history_search(
         principal_id: Caller's principal ID (injected by broker via the
             ``history.read`` capability).  Required — the search is
             scoped to this principal's owned sessions/messages.
+        project_id: Caller's project ID (injected by broker).  Scopes
+            results to the caller's project (H-02).
         db: Database instance (injected by broker from ``tool_context``).
     """
     principal_error = _require_principal(principal_id)
     if principal_error is not None:
         return principal_error
-    search = _build_search(principal_id, db)
+    search = _build_search(principal_id, project_id, db)
     if search is None:
         return {"status": "unavailable", "error": "session search not configured", "results": []}
     results = await search.search(query, limit=limit)
@@ -117,6 +123,7 @@ async def history_browse(
     limit: int = 20,
     *,
     principal_id: str = "",
+    project_id: str = "",
     db: Any = None,
     **kwargs: Any,
 ) -> dict:
@@ -125,12 +132,14 @@ async def history_browse(
     Args:
         limit: Maximum sessions to return (default 20).
         principal_id: Caller's principal ID (injected by broker).
+        project_id: Caller's project ID (injected by broker).  Scopes
+            results to the caller's project (H-02).
         db: Database instance (injected by broker from ``tool_context``).
     """
     principal_error = _require_principal(principal_id)
     if principal_error is not None:
         return principal_error
-    search = _build_search(principal_id, db)
+    search = _build_search(principal_id, project_id, db)
     if search is None:
         return {"status": "unavailable", "error": "session search not configured", "sessions": []}
     summaries = await search.browse(limit=limit)
@@ -151,6 +160,7 @@ async def history_read(
     session_id: str,
     *,
     principal_id: str = "",
+    project_id: str = "",
     db: Any = None,
     **kwargs: Any,
 ) -> dict:
@@ -164,12 +174,14 @@ async def history_read(
     Args:
         session_id: Session ID to read.
         principal_id: Caller's principal ID (injected by broker).
+        project_id: Caller's project ID (injected by broker).  Scopes
+            results to the caller's project (H-02).
         db: Database instance (injected by broker from ``tool_context``).
     """
     principal_error = _require_principal(principal_id)
     if principal_error is not None:
         return principal_error
-    search = _build_search(principal_id, db)
+    search = _build_search(principal_id, project_id, db)
     if search is None:
         return {"status": "unavailable", "error": "session search not configured"}
     messages = await search.read_session(session_id)

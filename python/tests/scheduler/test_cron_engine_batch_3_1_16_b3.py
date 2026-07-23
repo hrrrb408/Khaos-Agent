@@ -166,14 +166,23 @@ async def test_acceptance_2_quarantine_writes_audit_entry(tmp_path):
 
 async def test_acceptance_3_audit_entry_captures_snapshots(tmp_path):
     """B3-3: audit log entry captures the task and engine snapshots
-    (so an admin can see what drifted)."""
+    (so an admin can see what drifted).
+
+    H-02 (round-4 review): ``_load_tasks`` now scopes by ``project_id``
+    (primary defense) — a cross-project task is excluded at read time
+    and never reaches ``start()``'s drift check.  This test uses the
+    canonical drift scenario: SAME project, DIFFERENT policy_digest
+    (``khaos_policy.yaml`` edited between runs).  The task is loaded
+    (same project) and the drift check fires on ``policy_digest``.
+    """
     db = await _make_db(tmp_path)
     audit_logger = await _make_audit_logger(db)
     task_id = await db.insert_scheduled_task(
         name="drifted task", prompt="hello", status="pending",
         schedule=ScheduleConfig(cron="0 9"), deliver_to="local", meta={},
         principal_id="alice",
-        project_id="proj-task", policy_digest="sha256:task-digest",
+        project_id="proj-engine",  # MATCHING project_id (canonical drift)
+        policy_digest="sha256:task-digest",  # DIFFERENT policy_digest
     )
     engine = _make_engine(
         db, project_id="proj-engine", policy_digest="sha256:engine-digest",
@@ -192,7 +201,7 @@ async def test_acceptance_3_audit_entry_captures_snapshots(tmp_path):
         assert detail.get("engine_policy_digest") == "sha256:engine-digest", (
             f"audit detail must capture engine_policy_digest, got {detail.get('engine_policy_digest')!r}"
         )
-        assert detail.get("task_project_id") == "proj-task", (
+        assert detail.get("task_project_id") == "proj-engine", (
             f"audit detail must capture task_project_id, got {detail.get('task_project_id')!r}"
         )
         assert detail.get("engine_project_id") == "proj-engine", (
