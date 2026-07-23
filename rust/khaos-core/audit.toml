@@ -1,0 +1,22 @@
+# cargo-audit configuration (round-5 Batch 5.5).
+# See the bottom of this file for justification of each ignored advisory.
+
+[advisories]
+ignore = [
+    "RUSTSEC-2026-0177",
+    "RUSTSEC-2025-0020",
+]
+
+# ---------------------------------------------------------------------------
+# Ignored advisory justifications
+# ---------------------------------------------------------------------------
+#
+# RUSTSEC-2026-0177: pyo3 < 0.29 — Missing Sync bound on
+#   PyCFunction::new_closure closures.
+#   Not exploitable: khaos-core does not use PyCFunction::new_closure.
+#   Follow-up: upgrade pyo3 from 0.22 to >= 0.29 in a dedicated PR.
+#
+# RUSTSEC-2025-0020: pyo3 < 0.24.1 — Risk of buffer overflow in
+#   PyString::from_object.
+#   Not exploitable: khaos-core does not use PyString::from_object.
+#   Follow-up: same as RUSTSEC-2026-0177 — upgrade pyo3 to >= 0.29.

@@ -1,0 +1,106 @@
+name: Supply Chain Audit
+
+# Round-5 Batch 5.5: supply-chain security jobs.
+#
+# Scans all three language layers for known vulnerabilities:
+#   1. pip-audit     — Python dependencies (requirements-lock.txt)
+#   2. cargo audit   — Rust dependencies (Cargo.lock)
+#   3. govulncheck   — Go dependencies (go.mod)
+#
+# All three must pass before a PR touching dependency files can be
+# merged to main.  Branch protection should add these as required
+# status checks.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "python/requirements-lock.txt"
+      - "pyproject.toml"
+      - "rust/khaos-core/Cargo.lock"
+      - "rust/khaos-core/Cargo.toml"
+      - "go/go.mod"
+      - "go/go.sum"
+      - ".github/workflows/supply-chain-audit.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Run weekly on Monday 09:00 UTC to catch newly-disclosed CVEs.
+    - cron: "0 9 * * 1"
+
+jobs:
+  # ─── 1. Python: pip-audit ──────────────────────────────────────────
+  pip-audit:
+    name: pip-audit (Python)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install pip-audit
+        run: python -m pip install pip-audit
+      - name: Audit Python dependencies
+        run: |
+          pip-audit \
+            --requirement python/requirements-lock.txt \
+            --strict \
+            --desc
+
+  # ─── 2. Rust: cargo audit ──────────────────────────────────────────
+  cargo-audit:
+    name: cargo audit (Rust)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit Rust dependencies
+        working-directory: rust/khaos-core
+        # --ignore flags suppress advisories that are not exploitable
+        # in this codebase but cannot be immediately fixed (pyo3 0.22
+        # needs a major upgrade to >= 0.29).  See rust/khaos-core/audit.toml
+        # for justification.  --deny warnings fails on everything else
+        # (unmaintained crates, new CVEs, etc.).
+        run: |
+          cargo audit --deny warnings \
+            --ignore RUSTSEC-2026-0177 \
+            --ignore RUSTSEC-2025-0020
+
+  # ─── 3. Go: govulncheck ────────────────────────────────────────────
+  govulncheck:
+    name: govulncheck (Go)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      # NOTE: govulncheck@latest requires a newer Go than the build
+      # toolchain (go.mod says go 1.22; batch5 CI uses 1.24.x).  The
+      # supply-chain audit is independent of the build, so we use the
+      # latest Go here to run the latest govulncheck.
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.25.x"
+          cache-dependency-path: go/go.mod
+      - name: Install govulncheck
+        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+      - name: Audit Go dependencies
+        working-directory: go
+        run: govulncheck ./...

@@ -1,0 +1,67 @@
+# Python dependency lockfile (round-5 Batch 5.5).
+#
+# Pinned versions for reproducible installs.  Generated from
+# ``pyproject.toml`` dependencies + test/tui/browser extras.
+# CI supply-chain jobs (pip-audit) scan this file for known CVEs.
+#
+# Update strategy: bump versions deliberately, re-run pip-audit, and
+# commit the updated lockfile.  Do NOT auto-bump in CI.
+
+# --- Core runtime dependencies ---
+aiosqlite==0.22.1
+httpx==0.28.1
+cryptography==49.0.0
+PyYAML==6.0.3
+google-re2==1.1.20251105
+
+# --- Transitive (core) ---
+anyio==4.14.2
+certifi==2026.7.22
+cffi==2.1.0
+greenlet==3.5.4
+h11==0.16.0
+httpcore==1.0.9
+idna==3.18
+pycparser==3.0
+
+# --- Test dependencies ---
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pluggy==1.6.0
+iniconfig==2.3.0
+packaging==26.2
+
+# --- TUI dependencies ---
+textual==8.2.8
+rich==15.0.0
+Pillow==12.3.0
+pyee==13.0.1
+markdown-it-py==4.2.0
+mdurl==0.1.2
+mdit-py-plugins==0.6.1
+linkify-it-py==2.1.0
+uc-micro-py==2.0.0
+Pygments==2.20.0
+platformdirs==4.11.0
+
+# --- Browser E2E ---
+playwright==1.61.0
+nodeenv==1.10.0
+
+# --- Tree-sitter (optional) ---
+tree-sitter==0.26.0
+tree-sitter-python==0.25.0
+tree-sitter-javascript==0.25.0
+tree-sitter-typescript==0.23.2
+tree-sitter-go==0.25.0
+tree-sitter-rust==0.24.2
+
+# --- LSP (optional) ---
+pyright==1.1.411
+
+# --- Build tooling ---
+setuptools==83.0.0
+wheel==0.47.0
+maturin==1.14.1
+typing_extensions==4.16.0
+ruff==0.15.22

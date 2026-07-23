@@ -177,3 +177,96 @@ def test_other_db_modules_have_no_transaction_control():
             "Non-Authority db/*.py files must not contain "
             "BEGIN/COMMIT/ROLLBACK:\n" + details
         )
+
+
+# ---------------------------------------------------------------------------
+# H-07 (round-5 Batch 5.5): production write methods must use transaction()
+# ---------------------------------------------------------------------------
+
+class BareWriterCallFinder(ast.NodeVisitor):
+    """H-07: find calls to ``_commit_if_owner()`` and bare
+    ``_require_writer_conn()`` (outside the migration runner) in
+    ``database.py``.
+
+    The long-term goal (H-07) is:
+      - ``_commit_if_owner()`` is NEVER called from production code.
+      - ``_require_writer_conn()`` is only called from migration
+        helpers and ``_commit_if_owner`` itself — production write
+        methods go through ``transaction()``.
+
+    This test tracks progress toward that goal.  Currently
+    ``_commit_if_owner`` has zero callers (dead code — kept for
+    migration helpers), and ``_require_writer_conn`` is called from
+    ``run_migrations`` and ``_commit_if_owner`` (both allowed).
+    """
+
+    def __init__(self) -> None:
+        self.commit_owner_calls: list[tuple[str, int]] = []
+        self.bare_writer_calls: list[tuple[str, int]] = []
+        self._func_stack: list[str] = []
+
+    def _visit_function(self, node):
+        self._func_stack.append(node.name)
+        self.generic_visit(node)
+        self._func_stack.pop()
+
+    visit_FunctionDef = _visit_function
+    visit_AsyncFunctionDef = _visit_function
+
+    def visit_Call(self, node: ast.Call) -> None:
+        func = node.func
+        if isinstance(func, ast.Attribute):
+            if func.attr == "_commit_if_owner":
+                enclosing = self._func_stack[-1] if self._func_stack else "<module>"
+                self.commit_owner_calls.append((enclosing, node.lineno))
+            elif func.attr == "_require_writer_conn":
+                enclosing = self._func_stack[-1] if self._func_stack else "<module>"
+                # Allowed in migration runner and _commit_if_owner.
+                if enclosing not in ("run_migrations", "_commit_if_owner"):
+                    self.bare_writer_calls.append((enclosing, node.lineno))
+        elif isinstance(func, ast.Name):
+            if func.id == "_commit_if_owner":
+                enclosing = self._func_stack[-1] if self._func_stack else "<module>"
+                self.commit_owner_calls.append((enclosing, node.lineno))
+        self.generic_visit(node)
+
+
+def test_h07_no_commit_if_owner_calls_in_production():
+    """H-07: ``_commit_if_owner()`` must not be called from any
+    production write method.  It exists only as a helper for migration
+    helpers that cannot wrap in ``transaction()``.  Currently it has
+    ZERO callers — this test ensures it stays that way."""
+    source = DATABASE_PY.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(DATABASE_PY))
+    finder = BareWriterCallFinder()
+    finder.visit(tree)
+    if finder.commit_owner_calls:
+        details = "\n".join(
+            f"  line {lineno}: in {func!r}"
+            for func, lineno in finder.commit_owner_calls
+        )
+        pytest.fail(
+            "_commit_if_owner() is called from production code — "
+            "all writes must go through transaction():\n" + details
+        )
+
+
+def test_h07_bare_writer_conn_only_in_migration_runner():
+    """H-07: ``_require_writer_conn()`` (the bare writer accessor,
+    not the locked variant) must only be called from
+    ``run_migrations()`` and ``_commit_if_owner()`` — never from
+    production write methods that should use ``transaction()``."""
+    source = DATABASE_PY.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(DATABASE_PY))
+    finder = BareWriterCallFinder()
+    finder.visit(tree)
+    if finder.bare_writer_calls:
+        details = "\n".join(
+            f"  line {lineno}: in {func!r}"
+            for func, lineno in finder.bare_writer_calls
+        )
+        pytest.fail(
+            "_require_writer_conn() called outside migration runner — "
+            "use transaction() or _require_writer_conn_locked() instead:\n"
+            + details
+        )
