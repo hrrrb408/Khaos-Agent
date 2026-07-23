@@ -84,6 +84,8 @@ class _ToolApprovalRecord:
     decision: ApprovalDecision | None = None
     used: bool = False
     dispatched: bool = False
+    # Round-4 review Batch 4 (§13.1): timestamp for TTL-based eviction.
+    created_at: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -178,6 +180,43 @@ class ApprovalBroker:
     def _has_runtime_receipt_writer(self) -> bool:
         """Test-only introspection: does a writer exist?"""
         return self.__runtime_receipt_writer is not None  # type: ignore[attr-defined]
+
+    async def sweep_expired(self, *, ttl_seconds: float = 3600.0) -> dict[str, int]:
+        """Round-4 review Batch 4 (§13.1): evict consumed and expired records.
+
+        The broker previously kept every ``_tool_approvals`` /
+        ``_operation_approvals`` / ``_plan_approvals`` record forever —
+        consumed records were marked ``used``/``dispatched`` but never
+        deleted, causing unbounded growth in long-running processes.
+
+        This method evicts:
+          - Tool approvals where ``used=True`` (consumed).
+          - Tool approvals older than ``ttl_seconds``.
+          - Plan approvals past their ``expires_at``.
+
+        Returns a summary dict ``{"tool": N, "plan": N}``.
+        """
+        now = time.time()
+        counts = {"tool": 0, "plan": 0}
+        async with self._lock:
+            # Tool approvals: evict consumed or expired.
+            stale_tool = [
+                key for key, rec in self._tool_approvals.items()
+                if rec.used or (now - rec.created_at) > ttl_seconds
+            ]
+            for key in stale_tool:
+                self._tool_approvals.pop(key, None)
+                self._pending.pop(key, None)
+                counts["tool"] += 1
+            # Plan approvals: evict expired.
+            stale_plan = [
+                key for key, rec in self._plan_approvals.items()
+                if rec.expires_at <= now
+            ]
+            for key in stale_plan:
+                self._plan_approvals.pop(key, None)
+                counts["plan"] += 1
+        return counts
 
     async def register_tool_approval(
         self, binding: ApprovalBinding

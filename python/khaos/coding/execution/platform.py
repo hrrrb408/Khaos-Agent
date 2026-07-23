@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import os
 import shutil
 import secrets
@@ -13,6 +14,8 @@ from pathlib import Path
 
 from khaos.coding.execution.models import ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -594,11 +597,62 @@ def _create_linux_cgroup(
 
 
 def _remove_linux_cgroup(group: Path) -> None:
-    """Best-effort removal; a live payload keeps the leaf non-empty."""
+    """Remove a cgroup-v2 leaf using the proper kill → wait → rmdir flow.
+
+    Round-4 review Batch 4 (§13.4): previously this method only called
+    ``group.rmdir()`` and silently ignored failures — a live payload
+    kept the leaf non-empty, causing the cgroup to leak.  The proper
+    cgroup v2 teardown flow is:
+
+    1. Write ``1`` to ``cgroup.kill`` — synchronously kills all
+       processes in the cgroup (including descendants).
+    2. Wait for ``cgroup.events`` to report ``populated=0`` — the
+       kernel has reaped all processes.
+    3. Remove descendant cgroups (if any) bottom-up.
+    4. ``rmdir`` the leaf.
+
+    If any step fails, the cgroup is left in place and a warning is
+    logged — the caller (finally block) continues, and a startup
+    reaper can clean up the orphan later.
+    """
+    import time
+
+    if not group.is_dir():
+        return
+    # Step 1: kill all processes in the cgroup.
+    kill_file = group / "cgroup.kill"
+    if kill_file.exists():
+        try:
+            kill_file.write_text("1", encoding="ascii")
+        except OSError as exc:
+            logger.warning("cgroup.kill failed for %s: %s", group, exc)
+    # Step 2: wait for populated=0 (max 5 seconds).
+    events_file = group / "cgroup.events"
+    if events_file.exists():
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                content = events_file.read_text(encoding="ascii")
+                if "populated 0" in content or "populated=0" in content:
+                    break
+            except OSError:
+                break
+            time.sleep(0.1)
+    # Step 3: remove descendant cgroups bottom-up (if any).
     try:
-        group.rmdir()
+        for child in sorted(group.rglob("*"), reverse=True):
+            if child.is_dir():
+                try:
+                    child.rmdir()
+                except OSError:
+                    pass
     except OSError:
         pass
+    # Step 4: rmdir the leaf.
+    try:
+        group.rmdir()
+    except OSError as exc:
+        logger.warning("cgroup rmdir failed for %s (orphaned): %s", group, exc)
 
 
 def _validated_profile(request):

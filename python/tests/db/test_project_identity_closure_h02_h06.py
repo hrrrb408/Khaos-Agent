@@ -369,7 +369,7 @@ async def test_h04_get_scheduled_task_filters_by_project(tmp_path):
 async def test_h04_list_coding_tasks_filters_by_project(tmp_path):
     db = await _make_db(tmp_path)
     for proj, cid in [(_PROJ_A, "ct-a"), (_PROJ_B, "ct-b")]:
-        await db.upsert_coding_task(
+        await db.insert_coding_task(
             {"id": cid, "goal": f"g-{proj}", "status": "pending",
              "created_at": "2026-01-01T00:00:00", "updated_at": "2026-01-01T00:00:00"},
             principal_id=_PRINCIPAL, project_id=proj,
