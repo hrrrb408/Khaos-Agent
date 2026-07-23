@@ -7,11 +7,18 @@ Tasks:
   - ``prune_terminal_chat_streams``: delete chat ledger events for
     sessions that have been terminal for longer than the retention
     window (default: 24 hours).
-  - ``recover_inflight_chat_streams``: close crash-left chat ledgers
-    with a durable error terminal.
+  - ``ApprovalBroker.sweep_expired``: evict consumed and expired
+    approval records.
+
+Round-5 Batch 5.2 (C-05): ``recover_inflight_chat_streams`` has been
+REMOVED from the periodic loop.  Recovery now runs ONLY once at process
+startup (see ``grpc_server._recover_inflight_at_startup``) using a
+``boot_id`` to avoid recovering streams owned by the current process.
+Calling recovery periodically was the C-05 bug: hourly maintenance
+terminated active chats that were waiting on long tool calls because
+their lease had expired between heartbeat renewals.
 
 Future tasks (deferred to a later batch):
-  - prune expired approvals
   - prune idle task managers
   - cleanup stale cgroups/netns/wrappers
 """
@@ -48,10 +55,15 @@ class MaintenanceService:
         sessions that have been terminal for longer than the retention
         window (default: 24 hours).  Previously these GC methods existed
         but had no production caller.
-      - ``recover_inflight_chat_streams``: close crash-left chat ledgers.
       - ``ApprovalBroker.sweep_expired``: evict consumed and expired
         approval records.  Previously the broker kept every record
         forever, causing unbounded memory growth.
+
+    Round-5 Batch 5.2 (C-05): ``recover_inflight_chat_streams`` was
+    REMOVED from the periodic loop.  Recovery is now a startup-only
+    operation owned by ``grpc_server`` (which passes the current
+    ``boot_id`` to avoid recovering the current process's own active
+    streams).  See the module docstring for the rationale.
 
     The service is best-effort: if a GC cycle raises, the error is
     logged and the next cycle proceeds normally.  It never crashes the
@@ -123,16 +135,15 @@ class MaintenanceService:
         except Exception as exc:  # noqa: BLE001
             logger.error("maintenance: prune_terminal_chat_streams failed: %s", exc)
 
-        # 2. Recover crash-left inflight chat streams.
-        try:
-            recovered = await self._db.recover_inflight_chat_streams(now=now)
-            if recovered > 0:
-                counts["inflight_recovered"] = recovered
-                logger.info("maintenance: recovered %d inflight chat streams", recovered)
-        except Exception as exc:  # noqa: BLE001
-            logger.error("maintenance: recover_inflight_chat_streams failed: %s", exc)
-
-        # 3. Sweep expired approval broker records (§13.1).
+        # 2. Sweep expired approval broker records (§13.1).
+        #
+        # C-05 (round-5 Batch 5.2): ``recover_inflight_chat_streams`` was
+        # REMOVED from the periodic loop.  Recovery is now a startup-only
+        # operation owned by ``grpc_server`` (which passes the current
+        # ``boot_id``).  Calling recovery periodically was the C-05 bug:
+        # hourly maintenance terminated active chats that were waiting on
+        # long tool calls because their lease had expired between
+        # heartbeat renewals.
         if self._approval_broker is not None:
             try:
                 swept = await self._approval_broker.sweep_expired(

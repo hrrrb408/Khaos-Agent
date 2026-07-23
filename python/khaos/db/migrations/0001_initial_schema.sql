@@ -93,6 +93,24 @@ CREATE TABLE IF NOT EXISTS chat_stream_events (
         REFERENCES sessions(id, principal_id, project_id)
 );
 
+-- Round-5 Batch 5.2: chat stream state machine main table.
+CREATE TABLE IF NOT EXISTS chat_streams (
+    session_id          TEXT PRIMARY KEY,
+    principal_id        TEXT NOT NULL,
+    project_id          TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'running'
+        CHECK(status IN ('running','done','error','interrupted')),
+    boot_id             TEXT NOT NULL DEFAULT '',
+    runtime_id          TEXT NOT NULL DEFAULT '',
+    lease_until         REAL,
+    last_sequence       INTEGER NOT NULL DEFAULT 0,
+    terminal_event_type TEXT,
+    started_at          REAL NOT NULL,
+    terminal_at         REAL,
+    FOREIGN KEY(session_id, principal_id, project_id)
+        REFERENCES sessions(id, principal_id, project_id)
+);
+
 CREATE TABLE IF NOT EXISTS memories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     scope       TEXT NOT NULL,

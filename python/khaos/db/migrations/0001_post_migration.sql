@@ -30,6 +30,12 @@ ON agent_turns(session_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_chat_stream_events_owner
 ON chat_stream_events(principal_id, project_id, session_id, sequence);
 
+-- chat_streams (round-5 Batch 5.2)
+CREATE INDEX IF NOT EXISTS idx_chat_streams_boot
+ON chat_streams(boot_id, status);
+CREATE INDEX IF NOT EXISTS idx_chat_streams_status_lease
+ON chat_streams(status, lease_until);
+
 -- memories FTS5 sync triggers
 CREATE TRIGGER IF NOT EXISTS memory_ai AFTER INSERT ON memories BEGIN
     INSERT INTO memory_fts(rowid, key, value) VALUES (new.id, new.key, new.value);

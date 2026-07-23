@@ -119,6 +119,42 @@ CREATE TABLE IF NOT EXISTS chat_stream_events (
 CREATE INDEX IF NOT EXISTS idx_chat_stream_events_owner
 ON chat_stream_events(principal_id, project_id, session_id, sequence);
 
+-- Round-5 Batch 5.2 (C-05/C-06): Chat stream state machine main table.
+-- One row per session that has a chat ledger.  Tracks the stream's
+-- lifecycle status, owning boot/runtime, and lease — so recovery can
+-- distinguish "crash-left by a previous process" from "actively
+-- producing in the current process".
+--   status: 'running' → exactly one CAS transition to
+--           'done'/'error'/'interrupted' (terminal).
+--   boot_id: uuid4().hex of the process that started this stream.
+--   lease_until: renewed on every non-terminal append; expired lease
+--                means the owning process is likely dead.
+--   terminal_event_type: which event type terminated the stream
+--                        (NULL while running).
+-- Legacy streams (pre-round-5) get a row lazily on first append with
+-- empty boot_id and NULL lease — recovery treats them as recoverable.
+CREATE TABLE IF NOT EXISTS chat_streams (
+    session_id          TEXT PRIMARY KEY,
+    principal_id        TEXT NOT NULL,
+    project_id          TEXT NOT NULL DEFAULT '',
+    status              TEXT NOT NULL DEFAULT 'running'
+        CHECK(status IN ('running','done','error','interrupted')),
+    boot_id             TEXT NOT NULL DEFAULT '',
+    runtime_id          TEXT NOT NULL DEFAULT '',
+    lease_until         REAL,
+    last_sequence       INTEGER NOT NULL DEFAULT 0,
+    terminal_event_type TEXT,
+    started_at          REAL NOT NULL,
+    terminal_at         REAL,
+    FOREIGN KEY(session_id, principal_id, project_id)
+        REFERENCES sessions(id, principal_id, project_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_chat_streams_boot
+ON chat_streams(boot_id, status);
+CREATE INDEX IF NOT EXISTS idx_chat_streams_status_lease
+ON chat_streams(status, lease_until);
+
 CREATE TABLE IF NOT EXISTS memories (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     scope       TEXT NOT NULL,

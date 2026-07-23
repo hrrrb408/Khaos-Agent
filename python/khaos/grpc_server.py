@@ -92,6 +92,15 @@ RPC_AUTH_WINDOW_SECONDS = 30
 SERVER_HANDLER_DRAIN_TIMEOUT = 5.0   # connection handler tasks
 CHAT_DRAIN_TIMEOUT = 10.0            # active AgentService chat tasks
 SUBAGENT_SHUTDOWN_TIMEOUT = 30.0     # detached SubAgent background tasks
+# Round-5 Batch 5.2 (C-05): lease duration for chat_streams rows.
+# Each non-terminal ``append_chat_stream_event`` renews the lease to
+# ``now + _CHAT_STREAM_LEASE_SECONDS``.  A stream whose lease has
+# expired is eligible for recovery by a DIFFERENT process (e.g. after a
+# crash).  5 minutes is generous enough that a chat waiting on a long
+# tool call (e.g. a 60 s docker build) does not get falsely recovered,
+# but short enough that a crashed process's streams are reclaimed
+# quickly on the next startup.
+_CHAT_STREAM_LEASE_SECONDS = 300.0
 
 
 def _instance_lockfile_path(db_path: str) -> Path:
@@ -478,6 +487,7 @@ async def _emergency_instance_cleanup(
     agent: AgentService | None,
     db: Database | None,
     subagent_service: SubAgentService | None,
+    maintenance: "MaintenanceService | None" = None,
 ) -> bool:
     """M4 batch 3.1.15 (CRITICAL-1 + HIGH-1): attempt to clean up
     partially-initialized or partially-torn-down resources.
@@ -491,11 +501,24 @@ async def _emergency_instance_cleanup(
     must RETAIN the instance lock.
 
     Each cleanup is best-effort and idempotent:
+      - ``maintenance.stop()`` — cancels the periodic GC loop.
       - ``subagent_service.shutdown()`` — bounded by SUBAGENT_SHUTDOWN_TIMEOUT.
       - ``agent.shutdown()`` — idempotent via ``_shutdown_completed`` flag.
       - ``db.close()`` — idempotent (sets ``_conn = None``).
     """
     ok = True
+    # Round-5 Batch 5.2 (C-05): stop the maintenance loop FIRST so it
+    # does not race with agent.shutdown() / db.close() — e.g. a prune
+    # cycle touching chat_streams while the DB is being closed.
+    if maintenance is not None:
+        try:
+            await maintenance.stop()
+        except Exception:  # noqa: BLE001 — best-effort cleanup
+            logger.error(
+                "emergency cleanup: maintenance.stop() failed",
+                exc_info=True,
+            )
+            ok = False
     if subagent_service is not None:
         try:
             await subagent_service.shutdown(timeout=SUBAGENT_SHUTDOWN_TIMEOUT)
@@ -727,11 +750,16 @@ class ConfirmRequest:
 class AgentService:
     """Agent RPC service backed by AgentLoop."""
 
-    def __init__(self, db: Database, project_root: Path | None = None, config_path: Path | None = None, router=None):
+    def __init__(self, db: Database, project_root: Path | None = None, config_path: Path | None = None, router=None, *, boot_id: str = ""):
         self.db = db
         self.project_root = project_root or Path.cwd()
         self.config_path = config_path or self.project_root / "config.yaml"
         self._router = router
+        # Round-5 Batch 5.2 (C-05): per-process boot_id used to tag
+        # chat_streams rows so recovery never recovers the current
+        # process's own active streams.  Passed through to
+        # ``append_chat_stream_event`` via the chat flow.
+        self._boot_id = boot_id
         self.pending_confirmations: dict[str, dict] = {}
         self.approval_broker = ApprovalBroker(db=db)
         # Shared coding-task tracker so the TUI / TaskService can observe
@@ -1138,6 +1166,12 @@ class AgentService:
                 event_type="started",
                 data={"session_id": session_id},
                 now=time.time(),
+                boot_id=self._boot_id,
+                runtime_id=session_id,
+                # C-05: lease renewed on every non-terminal append below.
+                # Initial lease is generous so a slow _build_runtime does
+                # not get recovered by a concurrent process.
+                lease_until=time.time() + _CHAT_STREAM_LEASE_SECONDS,
             )
             session_id_for_terminal = session_id
             yield {
@@ -1172,13 +1206,26 @@ class AgentService:
                 self._active_runtimes[id(runtime)] = runtime
             async for message in runtime.loop.run(request.message, session_id):
                 event = _message_to_event(message)
+                event_name = str(event["event"])
+                is_terminal = event_name in {"done", "error", "interrupted"}
                 sequence = await self.db.append_chat_stream_event(
                     session_id=session_id,
                     principal_id=ctx.principal_id,
                     project_id=ctx.project_id,
-                    event_type=str(event["event"]),
+                    event_type=event_name,
                     data=dict(event["data"]),
                     now=time.time(),
+                    boot_id=self._boot_id,
+                    runtime_id=session_id,
+                    # C-05: renew lease on every non-terminal append so
+                    # the periodic recovery (if any other process runs
+                    # it) does not reclaim an active chat waiting on a
+                    # long tool call.  Terminal appends do not need a
+                    # lease.
+                    lease_until=(
+                        None if is_terminal
+                        else time.time() + _CHAT_STREAM_LEASE_SECONDS
+                    ),
                 )
                 if str(event["event"]) in {"done", "error", "interrupted"}:
                     terminal_appended = True
@@ -1208,6 +1255,10 @@ class AgentService:
                                 "message": str(exc) or type(exc).__name__,
                             },
                             now=time.time(),
+                            boot_id=self._boot_id,
+                            runtime_id=session_id_for_terminal,
+                            # Terminal append — no lease needed.
+                            lease_until=None,
                         )
                     )
                     terminal_appended = True
@@ -2093,6 +2144,10 @@ async def serve_json_lines(
     agent: AgentService | None = None
     db: Database | None = None
     subagent_service: SubAgentService | None = None
+    # Round-5 Batch 5.2 (C-05): track maintenance so both the inner
+    # shutdown path and the outer emergency-cleanup path can stop the
+    # periodic GC loop before tearing down shared authorities / DB.
+    maintenance: MaintenanceService | None = None
     inner_cleanup_completed = False
     try:
         if uds_path.exists() or uds_path.is_symlink():
@@ -2113,15 +2168,39 @@ async def serve_json_lines(
         db = Database(db_path)
         await db.connect()
         await db.run_migrations()
-        await db.recover_inflight_chat_streams(now=time.time())
-        agent = AgentService(db, project_root=project_root, config_path=config_path, router=router)
+        # Round-5 Batch 5.2 (C-05): chat stream recovery is now a
+        # STARTUP-ONLY operation that passes a per-process ``boot_id``.
+        # Previously ``recover_inflight_chat_streams`` was called both at
+        # startup AND hourly by ``MaintenanceService``; the hourly call
+        # terminated active chats that were waiting on long tool calls
+        # because their lease had expired between heartbeat renewals.
+        # The ``boot_id`` ensures the current process never recovers its
+        # OWN active streams — only streams left by a PREVIOUS crashed
+        # process or streams whose lease has genuinely expired.
+        boot_id = uuid.uuid4().hex
+        recovered = await db.recover_inflight_chat_streams(
+            now=time.time(), boot_id=boot_id,
+        )
+        if recovered > 0:
+            logger.info(
+                "serve_json_lines: recovered %d crash-left chat stream(s) "
+                "at startup (boot_id=%s)", recovered, boot_id,
+            )
+        agent = AgentService(
+            db, project_root=project_root, config_path=config_path, router=router,
+            boot_id=boot_id,
+        )
         await agent.start()
         # Round-4 review Batch 4 (§11.2 + §13.1): start the periodic
-        # maintenance service so ``prune_terminal_chat_streams``,
-        # ``recover_inflight_chat_streams``, and
+        # maintenance service so ``prune_terminal_chat_streams`` and
         # ``ApprovalBroker.sweep_expired`` run hourly in production.
         # Previously these GC methods existed but had no production
         # caller, causing unbounded chat ledger and approval growth.
+        #
+        # Round-5 Batch 5.2 (C-05): ``recover_inflight_chat_streams``
+        # was REMOVED from the periodic loop — recovery is now
+        # startup-only (see the call above).  Calling recovery
+        # periodically was the C-05 bug.
         maintenance = MaintenanceService(db, approval_broker=agent.approval_broker)
         maintenance.start()
         # M4 batch 3.1.16A-4-2: MemoryService now holds ``db`` and
@@ -2530,6 +2609,11 @@ async def serve_json_lines(
                     )
             if "server" in locals():
                 await server.wait_closed()
+            # Round-5 Batch 5.2 (C-05): stop the periodic maintenance
+            # loop BEFORE tearing down shared authorities / DB, so a GC
+            # cycle does not race with agent.shutdown() / db.close().
+            if maintenance is not None:
+                await maintenance.stop()
             # H1: detached SubAgent background tasks must be torn down BEFORE
             # the shared Office / Browser / Audit / DB authorities.  SubAgent
             # runs borrow all four; without this gate the server could close
@@ -2572,7 +2656,7 @@ async def serve_json_lines(
                 # cleanup (HIGH-1: init failed after agent.start(); or
                 # CRITICAL-1: inner finally raised during teardown).
                 cleanup_ok = await _emergency_instance_cleanup(
-                    agent, db, subagent_service,
+                    agent, db, subagent_service, maintenance,
                 )
                 if cleanup_ok:
                     try:
