@@ -1,0 +1,37 @@
+# cargo-audit configuration (round-5 Batch 5.5).
+#
+# The supply-chain CI job (`.github/workflows/supply-chain-audit.yml`)
+# runs `cargo audit --deny warnings` on every PR touching dependency
+# files and weekly to catch newly-disclosed CVEs.
+#
+# Vulnerabilities that are NOT exploitable in this codebase but cannot
+# be immediately fixed (e.g. a major-version dependency upgrade that
+# requires coordinated work) are listed here with justification.
+# Review this file on every dependency upgrade — remove entries once
+# the underlying dependency is upgraded past the vulnerable version.
+
+[advisories]
+ignore = [
+    # RUSTSEC-2026-0177: pyo3 < 0.29 — Missing Sync bound on
+    # PyCFunction::new_closure closures.
+    #
+    # Not exploitable: khaos-core does not use PyCFunction::new_closure.
+    # The PyO3 surface is limited to #[pyfunction] macros, PyDict, and
+    # exception constructors (see rust/khaos-core/src/lib.rs).
+    #
+    # Follow-up: upgrade pyo3 from 0.22 to >= 0.29 in a dedicated PR —
+    # the 7-major-version jump requires verifying the #[pyfunction]
+    # signature attributes and the PyModule registration macro still
+    # compile, plus re-running the PyO3 binding tests.
+    "RUSTSEC-2026-0177",
+
+    # RUSTSEC-2025-0020: pyo3 < 0.24.1 — Risk of buffer overflow in
+    # PyString::from_object.
+    #
+    # Not exploitable: khaos-core does not use PyString::from_object.
+    # All string returns go through the standard PyO3 conversion trait
+    # (String -> PyObject), not the vulnerable from_object constructor.
+    #
+    # Follow-up: same as RUSTSEC-2026-0177 — upgrade pyo3 to >= 0.29.
+    "RUSTSEC-2025-0020",
+]
