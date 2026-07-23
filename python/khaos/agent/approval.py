@@ -193,11 +193,23 @@ class ApprovalBroker:
           - Tool approvals where ``used=True`` (consumed).
           - Tool approvals older than ``ttl_seconds``.
           - Plan approvals past their ``expires_at``.
+          - Operation approvals where ``used=True`` or past ``expiry``
+            (H-10, round-5 Batch 5.4 — previously ``_operation_approvals``
+            was never swept, causing unbounded growth).
 
-        Returns a summary dict ``{"tool": N, "plan": N}``.
+        Round-5 Batch 5.4 (Future expiry resolution): before removing a
+        tool approval's entry from ``_pending``, any unresolved Future
+        is resolved with a denied ``ApprovalDecision`` so the task
+        blocked in :meth:`wait` wakes immediately instead of hanging
+        forever (a Future removed from ``_pending`` without being
+        resolved is never awaited again — ``asyncio.shield`` would
+        block indefinitely when no ``timeout`` was passed).
+
+        Returns a summary dict ``{"tool": N, "plan": N, "operation": N}``.
         """
         now = time.time()
-        counts = {"tool": 0, "plan": 0}
+        counts = {"tool": 0, "plan": 0, "operation": 0}
+        denied = ApprovalDecision(approved=False, remember=False)
         async with self._lock:
             # Tool approvals: evict consumed or expired.
             stale_tool = [
@@ -206,7 +218,12 @@ class ApprovalBroker:
             ]
             for key in stale_tool:
                 self._tool_approvals.pop(key, None)
-                self._pending.pop(key, None)
+                # H-05/Future-expiry: wake any waiter before dropping the
+                # Future so it does not block on a shielded, never-resolved
+                # Future when ``wait()`` was called without a timeout.
+                future = self._pending.pop(key, None)
+                if future is not None and not future.done():
+                    future.set_result(denied)
                 counts["tool"] += 1
             # Plan approvals: evict expired.
             stale_plan = [
@@ -216,6 +233,18 @@ class ApprovalBroker:
             for key in stale_plan:
                 self._plan_approvals.pop(key, None)
                 counts["plan"] += 1
+            # H-10 (round-5 Batch 5.4): operation approvals — evict
+            # consumed (``used=True``) or past ``expiry``.  These were
+            # previously never swept, so a long-running process
+            # accumulated every destructive-operation approval record
+            # forever.
+            stale_op = [
+                key for key, rec in self._operation_approvals.items()
+                if rec.get("used") or now >= float(rec.get("expiry", 0))
+            ]
+            for key in stale_op:
+                self._operation_approvals.pop(key, None)
+                counts["operation"] += 1
         return counts
 
     async def register_tool_approval(

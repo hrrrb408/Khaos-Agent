@@ -570,3 +570,55 @@ class TaskManager:
     def _active_count(self) -> int:
         """Count in-flight tasks (callers hold ``self._lock``)."""
         return sum(1 for task in self._tasks.values() if task.status in ACTIVE_STATUSES)
+
+    def can_evict(self) -> bool:
+        """Round-5 Batch 5.4: return ``True`` only if this manager is safe
+        to evict from the ``TaskService`` LRU cache.
+
+        A manager is **not** evictable while:
+          - It has any task in an ``ACTIVE_STATUSES`` state (a live owner
+            may be mid-execution and would lose its in-memory tracking).
+          - It has live subscribers (an RPC streaming consumer is
+            awaiting state updates — evicting would orphan the queue).
+
+        Evicting a manager with active work would silently drop the
+        in-memory cache; the next access would ``load()`` from the DB
+        and mark interrupted in-flight tasks as ``blocked``, which is
+        a correctness regression for the live owner.  ``TaskService``
+        therefore skips non-evictable entries and allows the cache to
+        temporarily exceed ``_MAX_MANAGERS`` rather than evicting a
+        live owner.
+        """
+        if any(task.status in ACTIVE_STATUSES for task in self._tasks.values()):
+            return False
+        if any(subs for subs in self._subscribers.values()):
+            return False
+        return True
+
+    async def aclose(self) -> None:
+        """Round-5 Batch 5.4: best-effort cleanup when evicted from the
+        ``TaskService`` LRU cache.
+
+        Closes all subscriber queues by feeding them a terminal
+        ``task.evicted`` event so streaming consumers unblock
+        immediately instead of waiting for a queue that will never
+        receive another update.  Subscribers are expected to treat any
+        unknown/terminal event as a stream-end signal.
+        """
+        async with self._lock:
+            for task_id, queues in list(self._subscribers.items()):
+                for queue in queues:
+                    try:
+                        queue.put_nowait(
+                            {
+                                "event_id": uuid.uuid4().hex,
+                                "task_id": task_id,
+                                "sequence": 0,
+                                "type": "task.evicted",
+                                "timestamp": datetime.now().isoformat(),
+                                "payload": {"reason": "manager_evicted"},
+                            }
+                        )
+                    except asyncio.QueueFull:
+                        pass
+                self._subscribers[task_id] = []

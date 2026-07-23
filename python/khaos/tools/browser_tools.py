@@ -271,11 +271,17 @@ class BrowserManager:
                 # Round-4 review Batch 4 (§13.3): reap stale netns/veth/
                 # cgroup/nft resources from a previous boot before creating
                 # new ones.  Best-effort — failures are logged.
-                BrowserNetworkSandbox.startup_reaper()
+                # Round-5 Batch 5.4: run in a thread — startup_reaper()
+                # invokes subprocess.run (ip/nft/cgroup file I/O) which
+                # would block the event loop.
+                await asyncio.to_thread(BrowserNetworkSandbox.startup_reaper)
                 self._browser_sandbox = BrowserNetworkSandbox(
                     require_os_sandbox=not _dev_mode,
                 )
-                self._browser_sandbox.setup()
+                # Round-5 Batch 5.4: setup() invokes subprocess.run
+                # (ip netns add, ip link add, nft -f -, cgroup mkdir)
+                # which blocks the event loop — run off-loop.
+                await asyncio.to_thread(self._browser_sandbox.setup)
             if browser_type == "firefox":
                 # C-04 (round-5): Firefox does not use the netns wrapper.
                 # In production, refuse to launch Firefox without the OS
@@ -565,7 +571,11 @@ class BrowserManager:
                 # already stopped.
                 if self._browser_sandbox is not None:
                     try:
-                        self._browser_sandbox.teardown()
+                        # Round-5 Batch 5.4: teardown() invokes
+                        # subprocess.run (nft delete, ip link del, ip
+                        # netns del) and cgroup file I/O which blocks
+                        # the event loop — run off-loop.
+                        await asyncio.to_thread(self._browser_sandbox.teardown)
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "browser netns sandbox teardown failed: %s", exc,
@@ -708,7 +718,12 @@ class BrowserManager:
                 proxy_port = int(
                     egress_proxy.server_url.rsplit(":", 1)[1]
                 )
-                self._browser_sandbox.install_egress_pin(proxy_port)
+                # Round-5 Batch 5.4: install_egress_pin() invokes
+                # subprocess.run (nft -f -) which blocks the event
+                # loop — run off-loop.
+                await asyncio.to_thread(
+                    self._browser_sandbox.install_egress_pin, proxy_port
+                )
             # F-05: when the netns sandbox is active, the browser reaches
             # the proxy via the veth host IP.  The ``bypass`` list must
             # NOT include ``<-loopback>`` in that case because the proxy

@@ -202,32 +202,78 @@ class Database:
         # acquire this lock, preventing cross-domain ``commit()`` 串扰 on the
         # shared single connection. Read-only queries do not need this lock.
         self._write_transaction_lock = asyncio.Lock()
+        # H-05 (round-5 Batch 5.4): dedicated connection-lifecycle lock.
+        # ``connect`` / ``close`` / generation bump ALL acquire this lock
+        # so two concurrent ``connect()`` calls cannot both see
+        # ``_conn is None`` and leak one set of connections.  ``transaction()``
+        # also acquires it (via ``_require_writer_conn_locked``) inside the
+        # write lock so the writer reference cannot be torn down by a
+        # concurrent ``close()`` between acquiring the ref and acquiring the
+        # write lock (H-06).
+        self._connection_lifecycle_lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        """Open writer and reader SQLite connections if not already open."""
-        if self._conn is None:
-            if aiosqlite is None:
-                self._conn = _AsyncSqliteFallback(self.path)
-                self._reader_conn = _AsyncSqliteFallback(self.path)
-            else:
-                self._conn = await aiosqlite.connect(self.path)
-                self._conn.row_factory = aiosqlite.Row
-                self._reader_conn = await aiosqlite.connect(self.path)
-                self._reader_conn.row_factory = aiosqlite.Row
-            # Writer PRAGMAs
-            await self._conn.execute("PRAGMA foreign_keys = ON")
-            # F-01: Enable WAL in connect() (not only in run_migrations) so
-            # that connections that skip migration still get concurrent-read
-            # benefits. busy_timeout prevents immediate SQLITE_BUSY returns
-            # when a write transaction is held by another coroutine.
-            await self._conn.execute("PRAGMA journal_mode = WAL")
-            await self._conn.execute("PRAGMA busy_timeout = 5000")
-            # C-04: Reader PRAGMAs — query_only prevents accidental writes
-            # through the reader connection, enforcing the split at the
-            # SQLite level (not just by convention).
-            await self._reader_conn.execute("PRAGMA foreign_keys = ON")
-            await self._reader_conn.execute("PRAGMA query_only = ON")
-            await self._reader_conn.execute("PRAGMA busy_timeout = 5000")
+        """Open writer and reader SQLite connections if not already open.
+
+        H-05 (round-5 Batch 5.4): the whole open-and-configure sequence is
+        now guarded by ``_connection_lifecycle_lock`` and uses atomic
+        publish — both connections are opened into LOCAL variables, fully
+        configured, and only THEN published to ``self._conn`` /
+        ``self._reader_conn``.  If reader open fails after writer open
+        succeeded, the writer is closed before raising, so
+        ``self._conn`` is never non-None while ``self._reader_conn`` is
+        None (the partial-initialization bug).  Two concurrent
+        ``connect()`` calls no longer race: the second sees
+        ``self._conn is not None`` after the first releases the lock.
+        """
+        async with self._connection_lifecycle_lock:
+            if self._conn is not None:
+                return  # another task opened it while we waited
+            writer: Any = None
+            reader: Any = None
+            try:
+                if aiosqlite is None:
+                    writer = _AsyncSqliteFallback(self.path)
+                    reader = _AsyncSqliteFallback(self.path)
+                else:
+                    writer = await aiosqlite.connect(self.path)
+                    writer.row_factory = aiosqlite.Row
+                    reader = await aiosqlite.connect(self.path)
+                    reader.row_factory = aiosqlite.Row
+                # Writer PRAGMAs
+                await writer.execute("PRAGMA foreign_keys = ON")
+                # F-01: Enable WAL in connect() (not only in run_migrations)
+                # so that connections that skip migration still get
+                # concurrent-read benefits.  busy_timeout prevents immediate
+                # SQLITE_BUSY returns when a write transaction is held by
+                # another coroutine.
+                await writer.execute("PRAGMA journal_mode = WAL")
+                await writer.execute("PRAGMA busy_timeout = 5000")
+                # C-04: Reader PRAGMAs — query_only prevents accidental
+                # writes through the reader connection, enforcing the split
+                # at the SQLite level (not just by convention).
+                await reader.execute("PRAGMA foreign_keys = ON")
+                await reader.execute("PRAGMA query_only = ON")
+                await reader.execute("PRAGMA busy_timeout = 5000")
+                # Atomic publish: only visible to other tasks after BOTH
+                # connections are fully open and configured.
+                self._conn = writer
+                self._reader_conn = reader
+                writer = None
+                reader = None
+            finally:
+                # If anything raised after one connection opened, close it
+                # so it does not leak (partial initialization).
+                if reader is not None:
+                    try:
+                        await reader.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                if writer is not None:
+                    try:
+                        await writer.close()
+                    except Exception:  # noqa: BLE001
+                        pass
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[Any]:
@@ -299,8 +345,17 @@ class Database:
             yield conn
             return
 
-        conn = await self._require_writer_conn()
+        # H-06 (round-5 Batch 5.4): acquire the writer connection INSIDE
+        # the write lock.  Previously ``_require_writer_conn()`` was called
+        # BEFORE the lock, so a concurrent ``close()`` could tear down the
+        # connection between acquiring the ref and acquiring the lock —
+        # leaving this task with a stale, closed connection but a
+        # fresh-generation TransactionOwner token.  Now the connection
+        # reference and the generation capture happen atomically under the
+        # same lock, and ``close()`` (which also acquires this lock) cannot
+        # interleave.
         async with self._write_transaction_lock:
+            conn = await self._require_writer_conn_locked()
             new_owner = TransactionOwner(
                 database_id=id(self),
                 connection_generation=self._connection_generation,
@@ -383,20 +438,36 @@ class Database:
         transaction is in-flight on another task.  ``close()`` must NOT
         be called from within a ``transaction()`` block in the same
         task (that would deadlock — and is a programming error).
+
+        H-05 (round-5 Batch 5.4): now ALSO acquires
+        ``_connection_lifecycle_lock`` so the generation bump and
+        connection teardown are atomic with respect to a concurrent
+        ``connect()``.  Lock ORDER is ``_write_transaction_lock`` →
+        ``_connection_lifecycle_lock`` — the SAME order used by
+        ``transaction()`` (which acquires the lifecycle lock via
+        ``_require_writer_conn_locked`` → ``connect()`` while holding
+        the write lock).  Reversing the order would be a classic
+        lock-ordering inversion: ``transaction()`` holds WRITE waiting
+        for LIFECYCLE while ``close()`` holds LIFECYCLE waiting for
+        WRITE → deadlock.
         """
         if _current_transaction_owner.get() is not None:
             raise TransactionContextLeakError(
                 "close() called from within an active transaction; "
                 "commit or roll back before closing the database"
             )
+        # WRITE first (wait for in-flight transactions), then LIFECYCLE
+        # (block concurrent connect).  Both must be held while we bump
+        # the generation and tear down the connections.
         async with self._write_transaction_lock:
-            self._connection_generation += 1
-            if self._conn is not None:
-                await self._conn.close()
-                self._conn = None
-            if self._reader_conn is not None:
-                await self._reader_conn.close()
-                self._reader_conn = None
+            async with self._connection_lifecycle_lock:
+                self._connection_generation += 1
+                if self._conn is not None:
+                    await self._conn.close()
+                    self._conn = None
+                if self._reader_conn is not None:
+                    await self._reader_conn.close()
+                    self._reader_conn = None
 
     async def _require_writer_conn(self):
         """Return the writer connection, opening if necessary.
@@ -406,6 +477,24 @@ class Database:
         ``transaction()`` (legacy bare writes) also use this — they
         should be migrated to ``transaction()`` but until then they
         still need the writer.
+        """
+        if self._conn is None:
+            await self.connect()
+        assert self._conn is not None
+        return self._conn
+
+    async def _require_writer_conn_locked(self):
+        """Return the writer connection, opening if necessary.
+
+        H-06 (round-5 Batch 5.4): caller MUST already hold
+        ``_write_transaction_lock``.  This variant acquires only the
+        connection-lifecycle lock (NOT the write lock) so the open and
+        the generation read happen atomically with respect to
+        ``close()``.  Using ``connect()`` directly here would
+        double-acquire the lifecycle lock is fine (``connect()``
+        re-enters it), but the key point is that the returned ``conn``
+        reference is captured while the write lock is held, so
+        ``close()`` cannot tear it down before BEGIN.
         """
         if self._conn is None:
             await self.connect()
