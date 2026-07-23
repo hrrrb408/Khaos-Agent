@@ -38,6 +38,97 @@ from khaos.security.host_network import (
 
 logger = logging.getLogger(__name__)
 
+
+# F-04 (third-round review): domain canonical form.  Pre-F-04 the
+# NetworkGuard stored allow/block lists verbatim and compared domains
+# case-sensitively, so a policy of ``blocked_domains: [example.com]``
+# could be bypassed by ``https://EXAMPLE.COM/`` or
+# ``https://example.com./``.  ``canonicalize_domain`` produces one
+# authoritative representation applied BOTH at policy-compile time AND
+# at every request/command parse time, so the blocklist can no longer
+# be evaded by host representation tricks.
+#
+# Steps (per the review):
+#   1. trim whitespace
+#   2. strip one trailing dot (root label)
+#   3. IDNA encode (Unicode → ASCII punycode)
+#   4. lowercase
+#   5. validate total length (<=253) and per-label length (<=63)
+#   6. reject empty labels (``invalid..example``)
+#   7. reject wildcard misuse (``*.example.com`` is not a valid host)
+#
+# Returns the canonical ASCII lowercase domain, or ``""`` when the input
+# is empty.  Raises ``ValueError`` on malformed input so the policy
+# compiler can fail closed.
+_MAX_DOMAIN_LEN = 253
+_MAX_LABEL_LEN = 63
+
+
+def canonicalize_domain(domain: str) -> str:
+    """Return the canonical ASCII lowercase form of ``domain``.
+
+    Raises ``ValueError`` if the domain is malformed (empty labels,
+    over-length, wildcard misuse, or un-encodable Unicode).
+    """
+    if domain is None:
+        return ""
+    cleaned = domain.strip()
+    if not cleaned:
+        return ""
+    # Strip ONE trailing dot (the DNS root label).  Multiple trailing
+    # dots are malformed.
+    if cleaned.endswith("."):
+        if cleaned.endswith(".."):
+            raise ValueError(f"domain has multiple trailing dots: {domain!r}")
+        cleaned = cleaned[:-1]
+    if not cleaned:
+        raise ValueError(f"domain is empty after stripping dot: {domain!r}")
+    # Reject wildcards — the blocklist/allowlist matches hostnames, not
+    # glob patterns.  ``*.example.com`` would silently never match a
+    # real hostname and lull the operator into a false sense of security.
+    if "*" in cleaned:
+        raise ValueError(f"wildcard domains are not allowed: {domain!r}")
+    # Validate labels BEFORE IDNA encoding.  We do this ourselves
+    # (rather than relying on the idna codec's "label empty or too
+    # long" error) so the error message is precise: ``invalid..example``
+    # reports "empty label" instead of a generic "not IDNA-encodable".
+    # Note: per-label length is checked on the Unicode form here; a
+    # Unicode label may expand to a longer punycode form, so we also
+    # re-check per-label length after IDNA below.
+    raw_labels = cleaned.split(".")
+    for label in raw_labels:
+        if not label:
+            raise ValueError(f"domain has empty label: {domain!r}")
+        if len(label) > _MAX_LABEL_LEN:
+            raise ValueError(
+                f"domain label exceeds {_MAX_LABEL_LEN} chars: {label!r}"
+            )
+    # IDNA encode Unicode → ASCII punycode.  ``idna`` codecs raise
+    # ``UnicodeError`` on invalid input (e.g. disallowed characters);
+    # we re-raise as ``ValueError`` so callers get a single exception
+    # type.  With empty/overlength labels already filtered above, the
+    # codec's "label empty or too long" path is unreachable.
+    try:
+        encoded = cleaned.encode("idna").decode("ascii")
+    except UnicodeError as exc:
+        raise ValueError(f"domain is not IDNA-encodable: {domain!r}") from exc
+    # Lowercase AFTER IDNA so punycode prefix (``xn--``) is also lowercased.
+    encoded = encoded.lower()
+    # Validate total length.
+    if len(encoded) > _MAX_DOMAIN_LEN:
+        raise ValueError(
+            f"domain exceeds {_MAX_DOMAIN_LEN} chars: {domain!r} "
+            f"({len(encoded)} chars)"
+        )
+    # Re-validate per-label length on the punycode form — a short
+    # Unicode label may expand past 63 chars once encoded.
+    for label in encoded.split("."):
+        if len(label) > _MAX_LABEL_LEN:
+            raise ValueError(
+                f"domain label exceeds {_MAX_LABEL_LEN} chars: {label!r}"
+            )
+    return encoded
+
 # 命令中的网络相关关键词
 NETWORK_COMMAND_KEYWORDS = frozenset(
     {
@@ -98,11 +189,20 @@ class NetworkGuard:
         # which collapsed None and [] into the same empty set, then treated
         # both as "no allowlist" — so an explicit ``allowed_domains: []``
         # (deny all) silently became "unrestricted".
+        #
+        # F-04: every entry is canonicalized (lowercase + IDNA + trailing
+        # dot strip) at compile time so the blocklist cannot be bypassed
+        # by host representation tricks.  A malformed entry raises
+        # ``ValueError`` so the policy compiler fails closed.
         if allowed_domains is None:
             self._allowed: set[str] | None = None
         else:
-            self._allowed = set(allowed_domains)
-        self._blocked = set(blocked_domains or [])
+            self._allowed = {
+                canonicalize_domain(d) for d in allowed_domains if d and d.strip()
+            }
+        self._blocked = {
+            canonicalize_domain(d) for d in (blocked_domains or []) if d and d.strip()
+        }
         # Dependency injection is intentionally explicit so integration tests
         # can use an isolated loopback HTTP server without weakening the
         # production authority's public-address-only policy.
@@ -288,16 +388,35 @@ class NetworkGuard:
           * non-empty — only allowlisted domains pass (deny-by-default).
         * When network is disabled, all domains are blocked (the allowlist
           can only TIGHTEN an enabled network, not RELAX a disabled one).
+
+        F-04: the input domain is canonicalized (lowercase + IDNA +
+        trailing dot strip) BEFORE comparison so the blocklist cannot be
+        bypassed by ``EXAMPLE.COM`` / ``example.com.`` / Unicode forms.
+        A malformed domain (empty labels, over-length, un-encodable) is
+        rejected fail-closed — we never let an uncanonicalizable host
+        slip through the policy.
         """
         if not domain:
             return NetworkCheckResult(allowed=True, reason="empty domain")
+        # F-04: canonicalize the request-time domain.  If it can't be
+        # canonicalized, fail closed.
+        try:
+            canonical = canonicalize_domain(domain)
+        except ValueError as exc:
+            return NetworkCheckResult(
+                allowed=False,
+                reason=f"domain {domain!r} rejected: {exc}",
+                domain=domain,
+            )
+        if not canonical:
+            return NetworkCheckResult(allowed=True, reason="empty domain")
         # Blocklist always wins.
         for blocked in self._blocked:
-            if domain == blocked or domain.endswith(f".{blocked}"):
+            if canonical == blocked or canonical.endswith(f".{blocked}"):
                 return NetworkCheckResult(
                     allowed=False,
-                    reason=f"domain {domain} is blocked by policy",
-                    domain=domain,
+                    reason=f"domain {canonical} is blocked by policy",
+                    domain=canonical,
                 )
         # H3: three-state allowlist.
         if self._allowed is not None:
@@ -306,33 +425,33 @@ class NetworkGuard:
                 # Explicit deny-all.
                 return NetworkCheckResult(
                     allowed=False,
-                    reason=f"domain {domain} blocked by empty allowlist (deny all)",
-                    domain=domain,
+                    reason=f"domain {canonical} blocked by empty allowlist (deny all)",
+                    domain=canonical,
                 )
             for allowed in self._allowed:
-                if domain == allowed or domain.endswith(f".{allowed}"):
+                if canonical == allowed or canonical.endswith(f".{allowed}"):
                     return NetworkCheckResult(
                         allowed=True,
-                        reason=f"domain {domain} in allowlist",
-                        domain=domain,
+                        reason=f"domain {canonical} in allowlist",
+                        domain=canonical,
                     )
             return NetworkCheckResult(
                 allowed=False,
-                reason=f"domain {domain} not in allowlist",
-                domain=domain,
+                reason=f"domain {canonical} not in allowlist",
+                domain=canonical,
             )
         # No allowlist configured (None) — allow when network is enabled,
         # block when disabled.
         if self.network_enabled:
             return NetworkCheckResult(
                 allowed=True,
-                reason=f"domain {domain} allowed (network enabled, no allowlist)",
-                domain=domain,
+                reason=f"domain {canonical} allowed (network enabled, no allowlist)",
+                domain=canonical,
             )
         return NetworkCheckResult(
             allowed=False,
-            reason=f"network access blocked to {domain}",
-            domain=domain,
+            reason=f"network access blocked to {canonical}",
+            domain=canonical,
         )
 
     # Backward-compatible alias — older callers may use _is_domain_allowed.
@@ -341,8 +460,31 @@ class NetworkGuard:
         return self._check_domain(domain).allowed
 
     def _extract_domain(self, text: str) -> str:
-        """从命令或 URL 中提取域名。"""
-        # 尝试解析为 URL
+        """从命令或 URL 中提取域名。
+
+        F-04: prefer the standard URL parser (``urllib.parse``) over a
+        regex so the host authority is not fooled by URL quirks.  The
+        regex is kept as a fallback for ssh-style ``user@host`` and for
+        commands that embed a URL without scheme (e.g. ``git clone
+        github.com:user/repo``).
+        """
+        from urllib.parse import urlsplit
+
+        # Try the standard URL parser first — it correctly handles
+        # brackets (``[::1]``), ports (``host:8080``), userinfo
+        # (``user:pw@host``), and edge cases the regex misses.
+        try:
+            parts = urlsplit(text)
+            if parts.hostname:
+                # parts.hostname is already lowercased and stripped of
+                # brackets/ports by the parser; return as-is and let
+                # ``canonicalize_domain`` do the IDNA + trailing-dot work.
+                return parts.hostname
+        except ValueError:
+            # Malformed URL — fall through to the regex path.
+            pass
+        # Regex fallback for http(s)/ws(s) URLs that the parser rejected
+        # (e.g. embedded in a longer command string).
         url_match = re.search(r"(?:https?|wss?)://([^\s/:\"'`]+)", text)
         if url_match:
             return url_match.group(1)
