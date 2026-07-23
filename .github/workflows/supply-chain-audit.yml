@@ -83,9 +83,13 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+      # NOTE: govulncheck@latest requires a newer Go than the build
+      # toolchain (go.mod says go 1.22; batch5 CI uses 1.24.x).  The
+      # supply-chain audit is independent of the build, so we use the
+      # latest Go here to run the latest govulncheck.
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.24.x"
+          go-version: "1.25.x"
           cache-dependency-path: go/go.mod
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
