@@ -92,6 +92,18 @@ class ModeManager:
     key, so every principal on the same database shared one mode.  The
     global key is no longer read or written; ``user_config`` is retained
     for genuinely global settings (API keys etc.).
+
+    H-09 (round-5 Batch 5.3): mode is now ALSO project-scoped.  The
+    lookup order becomes:
+
+      1. ``(project_id, principal_id, session_id)`` — session override
+      2. ``(project_id, principal_id, '')``         — principal default
+      3. system default (office)
+
+    This closes cross-project mode leakage on shared DBs: Project A's
+    coding mode (which gates System Prompt, Tool Availability, Routing)
+    is no longer loaded by Project B for the same principal.
+    ``project_id=''`` (the default) preserves legacy/test behaviour.
     """
 
     def __init__(
@@ -101,11 +113,13 @@ class ModeManager:
         *,
         principal_id: str = "legacy",
         session_id: str = "",
+        project_id: str = "",
     ):
         self.db = db
         self.project_root = project_root or Path.cwd()
         self._principal_id = principal_id
         self._session_id = session_id
+        self._project_id = project_id
         self._current_mode = Mode.OFFICE
         self._intent_buffer = ""
 
@@ -122,13 +136,14 @@ class ModeManager:
     async def load(self) -> Mode:
         """Load current mode from the principal_modes table.
 
-        Lookup order: ``(principal_id, session_id)`` →
-        ``(principal_id, '')`` → system default (office).
+        Lookup order: ``(project_id, principal_id, session_id)`` →
+        ``(project_id, principal_id, '')`` → system default (office).
         """
         value = await self.db.get_principal_mode(
             self._principal_id,
             session_id=self._session_id,
             default=Mode.OFFICE.value,
+            project_id=self._project_id,
         )
         self._current_mode = Mode(value)
         return self._current_mode
@@ -136,10 +151,11 @@ class ModeManager:
     async def switch(self, target_mode: Mode, intent_context: str = "") -> Mode:
         """Switch mode and persist the principal's current preference.
 
-        Writes to ``(principal_id, session_id)``.  When ``session_id``
-        is empty (the default), the write targets the principal's
-        default row — every session without its own override sees it.
-        When ``session_id`` is set, only that session is affected.
+        Writes to ``(project_id, principal_id, session_id)``.  When
+        ``session_id`` is empty (the default), the write targets the
+        principal's default row for that project — every session
+        without its own override sees it.  When ``session_id`` is set,
+        only that session is affected.
         """
         self._intent_buffer = intent_context
         self._current_mode = target_mode
@@ -147,6 +163,7 @@ class ModeManager:
             self._principal_id,
             target_mode.value,
             session_id=self._session_id,
+            project_id=self._project_id,
         )
         return self._current_mode
 

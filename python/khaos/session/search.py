@@ -68,7 +68,9 @@ class SessionSearch:
     ) -> list[SearchResult]:
         """FTS5 搜索。支持 AND/OR/NOT/引号短语/前缀通配。"""
         rows = await self.db.search_sessions(
-            query, limit, offset, principal_id=self.principal_id
+            query, limit, offset,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
         )
         return [
             SearchResult(
@@ -89,7 +91,9 @@ class SessionSearch:
     ) -> list[SessionSummary]:
         """按时间倒序浏览最近的会话。"""
         sessions = await self.db.list_sessions(
-            limit, offset, principal_id=self.principal_id
+            limit, offset,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
         )
         summaries: list[SessionSummary] = []
         for session in sessions:
@@ -98,7 +102,9 @@ class SessionSearch:
             title = ""
             try:
                 first = await self.db.get_session_messages(
-                    sid, 1, 0, principal_id=self.principal_id
+                    sid, 1, 0,
+                    principal_id=self.principal_id,
+                    project_id=self.project_id,
                 )
                 if first:
                     title = str(first[0].get("content", ""))[:100]
@@ -127,6 +133,7 @@ class SessionSearch:
             around_message_id,
             window,
             principal_id=self.principal_id,
+            project_id=self.project_id,
         )
         # Efficient before/after counts relative to the window's edges.
         if messages:
@@ -134,6 +141,7 @@ class SessionSearch:
                 session_id,
                 around_message_id,
                 principal_id=self.principal_id,
+                project_id=self.project_id,
             )
             has_before = before > 0
             has_after = after > 0
@@ -149,11 +157,15 @@ class SessionSearch:
     async def read_session(self, session_id: str) -> list[dict]:
         """读取完整会话（分页加载）。"""
         return await self.db.get_session_messages(
-            session_id, 50, 0, principal_id=self.principal_id
+            session_id, 50, 0,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
         )
 
     async def _count_session_messages(self, session_id: str) -> int:
         count = await self.db.count_session_messages(
-            session_id, principal_id=self.principal_id
+            session_id,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
         )
         return int(count) if count else 0

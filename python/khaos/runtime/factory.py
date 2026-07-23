@@ -462,6 +462,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     mode_manager = cfg.mode_manager or ModeManager(
         cfg.db, project_root=root,
         principal_id=cfg.principal_id, session_id=cfg.session_id,
+        project_id=cfg.project_id,
     )
     if cfg.mode_manager is None:
         await mode_manager.load()

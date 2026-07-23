@@ -298,10 +298,11 @@ CREATE TABLE IF NOT EXISTS user_config (
 --   3. system default (office)
 CREATE TABLE IF NOT EXISTS principal_modes (
     principal_id TEXT NOT NULL,
+    project_id   TEXT NOT NULL DEFAULT '',
     session_id   TEXT NOT NULL DEFAULT '',
     mode         TEXT NOT NULL,
     updated_at   TEXT NOT NULL DEFAULT (datetime('now')),
-    PRIMARY KEY (principal_id, session_id)
+    PRIMARY KEY (project_id, principal_id, session_id)
 );
 
 CREATE TABLE IF NOT EXISTS subagent_tasks (
