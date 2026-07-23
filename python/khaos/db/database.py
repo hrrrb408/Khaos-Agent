@@ -3896,7 +3896,7 @@ class Database:
                         sequence,
                         event_type,
                         json.dumps(data, ensure_ascii=False, sort_keys=True),
-                        int(event_type in {"done", "error"}),
+                        int(event_type in {"done", "error", "interrupted"}),
                         now,
                     ),
                 )
@@ -3935,6 +3935,87 @@ class Database:
             }
             for row in await cursor.fetchall()
         ]
+
+    async def delete_chat_stream_events_for_session(
+        self,
+        *,
+        session_id: str,
+        principal_id: str,
+        project_id: str,
+    ) -> int:
+        """F-07: cascade-delete all chat_stream_events for one session.
+
+        The ``chat_stream_events`` FK to ``sessions`` does not carry
+        ``ON DELETE CASCADE`` (the schema predates the durable ledger),
+        so session deletion must explicitly remove the events to keep
+        long-lived services from accumulating unbounded ledger rows.
+        Returns the number of deleted rows.
+        """
+        conn = await self._require_conn()
+        async with self._chat_event_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    "DELETE FROM chat_stream_events "
+                    "WHERE session_id=? AND principal_id=? AND project_id=?",
+                    (session_id, principal_id, project_id),
+                )
+                deleted = cursor.rowcount or 0
+                await cursor.close()
+                await conn.commit()
+                return deleted
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def prune_terminal_chat_streams(
+        self,
+        *,
+        older_than_seconds: float,
+        now: float,
+        limit: int = 1000,
+    ) -> int:
+        """F-07: drop chat_stream_events whose session is terminal and
+        older than ``older_than_seconds``.
+
+        A session is considered "terminal and aged-out" when its
+        highest-sequence event is terminal AND that event's
+        ``created_at`` is older than ``now - older_than_seconds``.  All
+        events for such sessions (including the terminal one) are
+        deleted to bound long-term ledger growth.  ``limit`` caps the
+        number of sessions pruned per call so the GC stays
+        latency-bounded.
+        """
+        conn = await self._require_conn()
+        async with self._chat_event_lock:
+            await conn.execute("BEGIN IMMEDIATE")
+            try:
+                cursor = await conn.execute(
+                    """
+                    DELETE FROM chat_stream_events
+                    WHERE session_id IN (
+                        SELECT latest.session_id
+                        FROM (
+                            SELECT session_id, MAX(sequence) AS sequence
+                            FROM chat_stream_events GROUP BY session_id
+                        ) latest
+                        JOIN chat_stream_events e
+                            ON e.session_id = latest.session_id
+                            AND e.sequence = latest.sequence
+                        WHERE e.is_terminal = 1
+                            AND e.created_at < ?
+                        LIMIT ?
+                    )
+                    """,
+                    (now - older_than_seconds, max(1, min(limit, 10_000))),
+                )
+                deleted = cursor.rowcount or 0
+                await cursor.close()
+                await conn.commit()
+                return deleted
+            except Exception:
+                await conn.rollback()
+                raise
 
     async def recover_inflight_chat_streams(self, *, now: float) -> int:
         """Close crash-left chat ledgers with a durable error terminal."""

@@ -27,6 +27,14 @@ var (
 	_ api.MemoryClient   = PythonClient{} // C-2-2 (HIGH 6): Gateway now proxies Python MemoryService.
 )
 
+// F-06 (third-round review): bufio.Scanner defaults to a 64 KiB max
+// token, but Khaos tool budget allows 100 000+ chars per turn.  A
+// single large tool output, diff, or Base64 blob can exceed 64 KiB and
+// cause the scanner to silently close the channel with "token too long".
+// 8 MiB comfortably fits the largest legitimate frame while still
+// bounding memory.
+const maxStreamFrameSize = 8 * 1024 * 1024
+
 // CreateTask creates a persistent coding task.
 //
 // C-1-1: “principalID“ is the authenticated principal from the
@@ -110,15 +118,39 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 		defer close(ch)
 		defer conn.Close()
 		defer stopCancelWatch()
+		// F-06: raise the 64 KiB default so large tool outputs don't
+		// silently truncate the stream.
 		scanner := bufio.NewScanner(conn)
+		scanner.Buffer(make([]byte, 64*1024), maxStreamFrameSize)
 		for scanner.Scan() {
 			var event map[string]any
-			if json.Unmarshal(scanner.Bytes(), &event) == nil {
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				// F-06: malformed JSON terminates the stream with an
+				// error event instead of being silently dropped.
 				select {
-				case ch <- event:
+				case ch <- map[string]any{
+					"event": "stream_error",
+					"data":  map[string]any{"message": "json decode: " + err.Error()},
+				}:
 				case <-ctx.Done():
-					return
 				}
+				return
+			}
+			select {
+			case ch <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+		// F-06: propagate scanner errors (e.g. "token too long") as a
+		// terminal error event instead of silently closing the channel.
+		if err := scanner.Err(); err != nil && ctx.Err() == nil {
+			select {
+			case ch <- map[string]any{
+				"event": "stream_error",
+				"data":  map[string]any{"message": "scanner: " + err.Error()},
+			}:
+			case <-ctx.Done():
 			}
 		}
 	}()
@@ -513,15 +545,39 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 		defer close(ch)
 		defer conn.Close()
 		defer stopCancelWatch()
+		// F-06: raise the 64 KiB default so large tool outputs don't
+		// silently truncate the stream.
 		scanner := bufio.NewScanner(conn)
+		scanner.Buffer(make([]byte, 64*1024), maxStreamFrameSize)
 		for scanner.Scan() {
 			var event api.ChatEvent
-			if json.Unmarshal(scanner.Bytes(), &event) == nil {
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				// F-06: malformed JSON terminates the stream with an
+				// error event instead of being silently dropped.
 				select {
-				case ch <- event:
+				case ch <- api.ChatEvent{
+					Event: "stream_error",
+					Data:  map[string]any{"message": "json decode: " + err.Error()},
+				}:
 				case <-ctx.Done():
-					return
 				}
+				return
+			}
+			select {
+			case ch <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+		// F-06: propagate scanner errors (e.g. "token too long") as a
+		// terminal error event instead of silently closing the channel.
+		if err := scanner.Err(); err != nil && ctx.Err() == nil {
+			select {
+			case ch <- api.ChatEvent{
+				Event: "stream_error",
+				Data:  map[string]any{"message": "scanner: " + err.Error()},
+			}:
+			case <-ctx.Done():
 			}
 		}
 	}()
@@ -547,15 +603,39 @@ func (c PythonClient) ChatEvents(ctx context.Context, principalID string, sessio
 		defer close(ch)
 		defer conn.Close()
 		defer stopCancelWatch()
+		// F-06: raise the 64 KiB default so large tool outputs don't
+		// silently truncate the stream.
 		scanner := bufio.NewScanner(conn)
+		scanner.Buffer(make([]byte, 64*1024), maxStreamFrameSize)
 		for scanner.Scan() {
 			var event api.ChatEvent
-			if json.Unmarshal(scanner.Bytes(), &event) == nil {
+			if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+				// F-06: malformed JSON terminates the stream with an
+				// error event instead of being silently dropped.
 				select {
-				case ch <- event:
+				case ch <- api.ChatEvent{
+					Event: "stream_error",
+					Data:  map[string]any{"message": "json decode: " + err.Error()},
+				}:
 				case <-ctx.Done():
-					return
 				}
+				return
+			}
+			select {
+			case ch <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+		// F-06: propagate scanner errors (e.g. "token too long") as a
+		// terminal error event instead of silently closing the channel.
+		if err := scanner.Err(); err != nil && ctx.Err() == nil {
+			select {
+			case ch <- api.ChatEvent{
+				Event: "stream_error",
+				Data:  map[string]any{"message": "scanner: " + err.Error()},
+			}:
+			case <-ctx.Done():
 			}
 		}
 	}()
