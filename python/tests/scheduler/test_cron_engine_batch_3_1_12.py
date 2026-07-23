@@ -659,7 +659,7 @@ async def test_acceptance_7_recovery_sweeps_all_abnormal_leases(
         )
 
         # Set abnormal states via raw SQL.
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         # Task A: running + expired lease.
         await conn.execute(
             "UPDATE scheduled_tasks SET status='running', "
@@ -748,7 +748,7 @@ async def test_acceptance_8_legacy_cron_quarantined(tmp_path) -> None:
     try:
         # Insert a legacy task via raw SQL (bypasses engine.create's
         # principal_id validation).
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "INSERT INTO scheduled_tasks (id, name, prompt, status, "
             "schedule_config, principal_id) VALUES (?, ?, ?, ?, ?, ?)",

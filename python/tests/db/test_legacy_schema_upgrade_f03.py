@@ -472,7 +472,7 @@ async def test_f03_legacy_quarantine_trigger_fires_on_legacy_write(tmp_path):
     db = Database(path)
     await db.connect()
     await db.run_migrations()
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
 
     # Insert a new scheduled task with principal_id='legacy' and a
     # non-failed status.  The trigger should quarantine it.

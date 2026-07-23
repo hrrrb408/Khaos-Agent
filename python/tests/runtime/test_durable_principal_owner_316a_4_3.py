@@ -132,7 +132,7 @@ async def test_legacy_rows_default_to_legacy_principal(tmp_path):
     await db.connect()
     await db.run_migrations()
     # Insert via raw SQL to bypass the principal_id parameter entirely.
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     await conn.execute("INSERT INTO sessions(id, mode) VALUES('s1', 'office')")
     await conn.commit()
     cursor = await conn.execute(

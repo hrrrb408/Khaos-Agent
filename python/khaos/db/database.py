@@ -11,6 +11,7 @@ import sqlite3
 import time
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -47,13 +48,42 @@ SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
 logger = logging.getLogger(__name__)
 SCHEMA_MIGRATION_SALT = "f02-memory-project-unique-2026-07-23-v2"
 
-# F-01: Transaction owner tracking. When non-None, the current asyncio task
-# owns the active BEGIN IMMEDIATE transaction on the shared connection.
-# Nested ``transaction()`` calls from the same task reuse the outer
-# transaction (no re-BEGIN, no intermediate COMMIT). Direct ``commit()``
-# calls from inner methods become no-ops, preventing cross-domain commit
-#串扰 that could break Permission Epoch / Approval / Chat Event atomicity.
-_current_transaction_owner: ContextVar[asyncio.Task | None] = ContextVar(
+# Round-4 Batch 1 (C-01): Transaction owner tracking via an immutable
+# token that binds the transaction to a specific Database instance,
+# connection generation, and asyncio Task.  This closes the ContextVar
+# leak where ``create_task()`` inherits the parent's non-None owner and
+# incorrectly believes it is inside a nested transaction, skipping
+# BEGIN/COMMIT and leaving bare writes on the shared connection.
+class TransactionContextLeakError(RuntimeError):
+    """A transaction ContextVar leaked across task or database boundaries."""
+
+
+@dataclass(frozen=True)
+class TransactionOwner:
+    """Immutable token proving the current task owns the active transaction.
+
+    C-01 (round-4 review): the old ContextVar only stored ``asyncio.Task |
+    None`` and checked ``is not None``.  A child ``create_task()`` inherits
+    the parent's context, so it saw a non-None owner and skipped
+    BEGIN/COMMIT — but it was NOT the real owner.  This token binds the
+    transaction to:
+
+    - ``database_id``: ``id(self)`` — prevents cross-Database pollution
+      when one task opens transactions on db_a and db_b.
+    - ``connection_generation``: bumped on ``close()`` — prevents a
+      stale owner from writing to a reopened connection.
+    - ``task``: ``asyncio.current_task()`` — only the task that issued
+      BEGIN may nest; any other task (even a child that inherited the
+      context) must acquire its own transaction.
+    """
+
+    database_id: int
+    connection_generation: int
+    task: asyncio.Task  # type: ignore[type-arg]
+    depth: int
+
+
+_current_transaction_owner: ContextVar[TransactionOwner | None] = ContextVar(
     "khaos_db_transaction_owner", default=None
 )
 
@@ -126,7 +156,17 @@ class Database:
 
     def __init__(self, path: str | Path = "khaos.db"):
         self.path = str(path)
-        self._conn: aiosqlite.Connection | None = None
+        # C-04 (round-4 review): split writer and reader connections so
+        # reads do not see the writer's uncommitted state on the shared
+        # SQLite connection.  In WAL mode the reader connection can read
+        # concurrently with the writer (different snapshot).  Inside an
+        # active ``transaction()``, ``_require_conn()`` routes to the
+        # writer so intra-transaction reads see uncommitted writes.
+        self._conn: aiosqlite.Connection | None = None  # writer
+        self._reader_conn: aiosqlite.Connection | None = None
+        # C-01: bumped on close() so a stale TransactionOwner token
+        # (from a pre-close task) cannot match after reopen.
+        self._connection_generation = 0
         # F-01: Per-domain locks remain for logical serialization (e.g. two
         # concurrent permission grants must not race on epoch computation).
         self._operation_approval_lock = asyncio.Lock()
@@ -140,13 +180,17 @@ class Database:
         self._write_transaction_lock = asyncio.Lock()
 
     async def connect(self) -> None:
-        """Open the SQLite connection if it is not already open."""
+        """Open writer and reader SQLite connections if not already open."""
         if self._conn is None:
             if aiosqlite is None:
                 self._conn = _AsyncSqliteFallback(self.path)
+                self._reader_conn = _AsyncSqliteFallback(self.path)
             else:
                 self._conn = await aiosqlite.connect(self.path)
                 self._conn.row_factory = aiosqlite.Row
+                self._reader_conn = await aiosqlite.connect(self.path)
+                self._reader_conn.row_factory = aiosqlite.Row
+            # Writer PRAGMAs
             await self._conn.execute("PRAGMA foreign_keys = ON")
             # F-01: Enable WAL in connect() (not only in run_migrations) so
             # that connections that skip migration still get concurrent-read
@@ -154,10 +198,31 @@ class Database:
             # when a write transaction is held by another coroutine.
             await self._conn.execute("PRAGMA journal_mode = WAL")
             await self._conn.execute("PRAGMA busy_timeout = 5000")
+            # C-04: Reader PRAGMAs — query_only prevents accidental writes
+            # through the reader connection, enforcing the split at the
+            # SQLite level (not just by convention).
+            await self._reader_conn.execute("PRAGMA foreign_keys = ON")
+            await self._reader_conn.execute("PRAGMA query_only = ON")
+            await self._reader_conn.execute("PRAGMA busy_timeout = 5000")
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[Any]:
         """Acquire the global write lock and run one atomic transaction.
+
+        Round-4 Batch 1 (C-01): the owner token now binds the transaction
+        to ``id(self)`` + ``connection_generation`` + ``asyncio.Task``.
+        A child ``create_task()`` that inherits the parent's non-None
+        ContextVar no longer falsely believes it is nested — the task
+        identity check fails and ``TransactionContextLeakError`` is
+        raised instead of silently skipping BEGIN/COMMIT.
+
+        C-04: ``transaction()`` always operates on the writer connection
+        (``self._conn``).  Read-only methods that call
+        ``_require_conn()`` are routed to the reader connection when
+        outside a transaction, so they never see uncommitted writer
+        state.  Inside a transaction, ``_require_conn()`` routes back
+        to the writer so intra-transaction reads see uncommitted
+        writes.
 
         F-01 (Critical): The shared SQLite connection has a single writer.
         Without a global transaction owner, a coroutine in domain A
@@ -175,18 +240,50 @@ class Database:
           *outside* this manager to prevent same-domain logical races.
 
         Nested calls (same task already owns a transaction) yield the raw
-        connection without re-acquiring the lock or re-issuing BEGIN. The
-        outermost call performs the single COMMIT.
+        writer connection without re-acquiring the lock or re-issuing
+        BEGIN. The outermost call performs the single COMMIT.
         """
-        if _current_transaction_owner.get() is not None:
-            # Nested call: reuse the outer transaction. Do NOT commit.
-            conn = await self._require_conn()
+        owner = _current_transaction_owner.get()
+        if owner is not None:
+            # C-01: verify the owner is THIS database and THIS task.
+            # A mismatch means the ContextVar leaked across a task or
+            # database boundary (e.g. via ``create_task()`` context
+            # copy, or one task opening transactions on two Database
+            # instances).  Raising is safer than waiting on the writer
+            # lock — the parent may be ``await``-ing the child, so
+            # waiting could deadlock.
+            if (
+                owner.database_id != id(self)
+                or owner.connection_generation != self._connection_generation
+                or owner.task is not asyncio.current_task()
+            ):
+                raise TransactionContextLeakError(
+                    "Transaction ContextVar leaked across boundary: "
+                    f"owner(db={owner.database_id}, "
+                    f"gen={owner.connection_generation}, "
+                    f"task={owner.task!r}) != "
+                    f"current(db={id(self)}, "
+                    f"gen={self._connection_generation}, "
+                    f"task={asyncio.current_task()!r})"
+                )
+            # Nested call from the same task on the same database:
+            # reuse the outer transaction. Do NOT commit.
+            conn = self._conn
+            assert conn is not None, (
+                "writer connection must exist when transaction owner is set"
+            )
             yield conn
             return
 
-        conn = await self._require_conn()
+        conn = await self._require_writer_conn()
         async with self._write_transaction_lock:
-            token = _current_transaction_owner.set(asyncio.current_task())
+            new_owner = TransactionOwner(
+                database_id=id(self),
+                connection_generation=self._connection_generation,
+                task=asyncio.current_task(),  # type: ignore[arg-type]
+                depth=0,
+            )
+            token = _current_transaction_owner.set(new_owner)
             # F-01 fail-safe: a previous bare write (not wrapped in
             # ``transaction()``) may have left the connection inside an
             # uncommitted implicit transaction — this happens most often
@@ -239,19 +336,68 @@ class Database:
         it commits normally. This prevents inner methods from prematurely
         committing an outer transaction.
 
+        C-04: commits on the writer connection (``self._conn``), never
+        the reader.
+
         Prefer wrapping write methods in ``transaction()`` directly. This
         helper exists for the migration helpers and edge cases where
         wrapping is not practical.
         """
         if _current_transaction_owner.get() is None:
-            conn = await self._require_conn()
+            conn = await self._require_writer_conn()
             await conn.commit()
 
     async def close(self) -> None:
-        """Close the SQLite connection."""
-        if self._conn is not None:
-            await self._conn.close()
-            self._conn = None
+        """Close both writer and reader SQLite connections.
+
+        C-01: bumps ``_connection_generation`` so any stale
+        ``TransactionOwner`` token (from a pre-close task that is still
+        running) will fail the generation check on next access.
+
+        Batch 1 (§十九): acquires ``_write_transaction_lock`` so
+        ``close()`` cannot tear down connections while a write
+        transaction is in-flight on another task.  ``close()`` must NOT
+        be called from within a ``transaction()`` block in the same
+        task (that would deadlock — and is a programming error).
+        """
+        if _current_transaction_owner.get() is not None:
+            raise TransactionContextLeakError(
+                "close() called from within an active transaction; "
+                "commit or roll back before closing the database"
+            )
+        async with self._write_transaction_lock:
+            self._connection_generation += 1
+            if self._conn is not None:
+                await self._conn.close()
+                self._conn = None
+            if self._reader_conn is not None:
+                await self._reader_conn.close()
+                self._reader_conn = None
+
+    async def _require_writer_conn(self):
+        """Return the writer connection, opening if necessary.
+
+        C-04: ``transaction()`` and ``run_migrations()`` use this
+        directly.  Write methods that are not wrapped in
+        ``transaction()`` (legacy bare writes) also use this — they
+        should be migrated to ``transaction()`` but until then they
+        still need the writer.
+        """
+        if self._conn is None:
+            await self.connect()
+        assert self._conn is not None
+        return self._conn
+
+    async def _require_reader_conn(self):
+        """Return the reader connection, opening if necessary.
+
+        C-04: the reader connection has ``PRAGMA query_only = ON`` so
+        any accidental write through it fails at the SQLite level.
+        """
+        if self._reader_conn is None:
+            await self.connect()
+        assert self._reader_conn is not None
+        return self._reader_conn
 
     async def run_migrations(self) -> None:
         """Apply the schema as one locked, checksummed transaction.
@@ -266,7 +412,7 @@ class Database:
         when ``CREATE INDEX`` referenced those columns (schema.sql ran
         indexes before ``_ensure_*`` added the columns).
         """
-        conn = await self._require_conn()
+        conn = await self._require_writer_conn()
         # F-03: checksum is still computed from the original schema.sql for
         # backward compatibility with databases that already have a v2
         # ledger row.  The split files produce an identical schema; they
@@ -453,6 +599,13 @@ class Database:
         await self._ensure_coding_tasks_project_id_column()
         await self._ensure_scheduler_journal_project_id_column()
         await self._ensure_subagent_tasks_principal_column()
+        # C-03 (round-4 review): ensure the sessions.summary column exists
+        # during migration.  Previously ``save_session_summary`` called
+        # ``_ensure_sessions_metadata_column("summary")`` at runtime inside
+        # a transaction, which prematurely committed the outer transaction.
+        # Now the column is added during migration only; if it's missing
+        # at runtime, the SQL UPDATE fails closed (OperationalError).
+        await self._ensure_sessions_metadata_column("summary")
         # F-03 (third-round review): the legacy-quarantine triggers are
         # now created by ``0001_post_migration.sql`` (step 3) with literal
         # strings.  SQLite does not allow ``?`` parameter binding inside
@@ -2248,7 +2401,10 @@ class Database:
         row use ``update_subagent_task``.
         """
         async with self.transaction() as conn:
-            await self._ensure_subagent_tasks_principal_column()
+            # C-03 (round-4 review): _ensure_subagent_tasks_principal_column
+            # is now only called during migration. If the column is missing
+            # at runtime, the INSERT will fail with OperationalError (fail
+            # closed) — the DB needs migration, not runtime ALTER.
             await conn.execute(
                 """
                 INSERT INTO subagent_tasks (
@@ -2303,7 +2459,8 @@ class Database:
         "return everything" behaviour.
         """
         conn = await self._require_conn()
-        await self._ensure_subagent_tasks_principal_column()
+        # C-03: _ensure_subagent_tasks_principal_column removed from
+        # runtime — column is added during migration, missing = fail closed.
         if principal_id is None:
             cursor = await conn.execute(
                 """
@@ -2515,11 +2672,14 @@ class Database:
     async def save_session_summary(self, session_id: str, summary: str) -> None:
         """保存会话摘要到 sessions 表的 summary 列。
 
-        summary 列不存在则 ALTER TABLE 添加（幂等迁移）。同时合并写入
-        metadata JSON 的 summary 字段，保持向后兼容。
+        C-03 (round-4 review): the ``summary`` column is now added during
+        migration (``_run_legacy_schema_upgrades``), not at runtime.  If
+        the column is missing, the UPDATE fails with OperationalError
+        (fail closed) — the DB needs migration, not runtime ALTER.
+
+        同时合并写入 metadata JSON 的 summary 字段，保持向后兼容。
         """
         async with self.transaction() as conn:
-            await self._ensure_sessions_metadata_column("summary")
             await conn.execute(
                 "UPDATE sessions SET summary = ?, updated_at = datetime('now') WHERE id = ?",
                 (summary, session_id),
@@ -3972,11 +4132,17 @@ class Database:
         so session deletion must explicitly remove the events to keep
         long-lived services from accumulating unbounded ledger rows.
         Returns the number of deleted rows.
+
+        C-02 (round-4 review): now goes through ``transaction()`` so the
+        global ``_write_transaction_lock`` is acquired and the
+        ``TransactionOwner`` token is set.  Previously this method
+        hand-wrote ``BEGIN IMMEDIATE`` / ``commit()`` / ``rollback()``
+        and only held ``_chat_event_lock``, which bypassed the
+        Transaction Authority and could interleave with a concurrent
+        permission grant or audit insert on the same shared connection.
         """
-        conn = await self._require_conn()
         async with self._chat_event_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     "DELETE FROM chat_stream_events "
                     "WHERE session_id=? AND principal_id=? AND project_id=?",
@@ -3984,11 +4150,7 @@ class Database:
                 )
                 deleted = cursor.rowcount or 0
                 await cursor.close()
-                await conn.commit()
                 return deleted
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def prune_terminal_chat_streams(
         self,
@@ -4007,11 +4169,12 @@ class Database:
         deleted to bound long-term ledger growth.  ``limit`` caps the
         number of sessions pruned per call so the GC stays
         latency-bounded.
+
+        C-02 (round-4 review): now goes through ``transaction()`` (see
+        ``delete_chat_stream_events_for_session`` for rationale).
         """
-        conn = await self._require_conn()
         async with self._chat_event_lock:
-            await conn.execute("BEGIN IMMEDIATE")
-            try:
+            async with self.transaction() as conn:
                 cursor = await conn.execute(
                     """
                     DELETE FROM chat_stream_events
@@ -4033,11 +4196,7 @@ class Database:
                 )
                 deleted = cursor.rowcount or 0
                 await cursor.close()
-                await conn.commit()
                 return deleted
-            except Exception:
-                await conn.rollback()
-                raise
 
     async def recover_inflight_chat_streams(self, *, now: float) -> int:
         """Close crash-left chat ledgers with a durable error terminal."""
@@ -4251,10 +4410,43 @@ class Database:
         )
 
     async def _require_conn(self):
-        if self._conn is None:
-            await self.connect()
-        assert self._conn is not None
-        return self._conn
+        """Return the appropriate connection for the current context.
+
+        C-04 (round-4 review): routes to the writer connection when the
+        current task owns an active transaction (so intra-transaction
+        reads see uncommitted writes), and to the reader connection
+        otherwise (so reads never see another task's uncommitted writer
+        state on the shared SQLite connection).
+
+        C-01: the owner check uses the full TransactionOwner token
+        (database_id + connection_generation + task), not just
+        ``is not None``.  A leaked ContextVar from a different task or
+        database is treated as "no owner" and routed to the reader —
+        the leaked task's writes would fail closed on the reader's
+        ``query_only`` PRAGMA.
+
+        Migration context: when ``self._conn`` is a
+        ``_MigrationConnection`` (i.e. ``run_migrations()`` is in
+        progress), always return it — the migration helpers need the
+        writer connection (wrapped by ``_MigrationConnection`` to
+        suppress intermediate commits), not the reader.
+        """
+        # During migration, self._conn is _MigrationConnection — use it
+        # directly so _ensure_* helpers ALTER TABLE on the writer, not
+        # the query_only reader.
+        if isinstance(self._conn, _MigrationConnection):
+            return self._conn
+        owner = _current_transaction_owner.get()
+        if (
+            owner is not None
+            and owner.database_id == id(self)
+            and owner.connection_generation == self._connection_generation
+            and owner.task is asyncio.current_task()
+        ):
+            # Inside a transaction owned by this task: use writer so
+            # reads see uncommitted writes within the same transaction.
+            return self._conn  # type: ignore[return-value]
+        return await self._require_reader_conn()
 
 
 def _schedule_to_dict(schedule) -> dict[str, Any]:

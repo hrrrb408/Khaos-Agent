@@ -300,7 +300,7 @@ async def test_acceptance_7_memories_unique_constraint_includes_project(tmp_path
     """
     db = await _make_db(tmp_path / "khaos.db")
     try:
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         # First insert for proj-a.
         await conn.execute(
             "INSERT INTO memories (scope, key, value, principal_id, "
@@ -353,7 +353,7 @@ async def test_acceptance_8_scheduler_journal_has_project_id(tmp_path):
     """
     db = await _make_db(tmp_path / "khaos.db")
     try:
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         cols = await _table_columns(conn, "scheduler_operation_journal")
         assert "project_id" in cols, (
             "scheduler_operation_journal is missing project_id column"

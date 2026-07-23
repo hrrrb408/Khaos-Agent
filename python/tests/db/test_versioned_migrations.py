@@ -33,7 +33,7 @@ async def test_migration_rejects_unknown_future_version(tmp_path):
     db = Database(tmp_path / "state.db")
     await db.connect()
     await db.run_migrations()
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     await conn.execute(
         "INSERT INTO schema_migrations VALUES "
         "(999, 'future', 'future', datetime('now'), '999')"
@@ -49,7 +49,7 @@ async def test_migration_rejects_checksum_drift(tmp_path):
     db = Database(tmp_path / "state.db")
     await db.connect()
     await db.run_migrations()
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     await conn.execute(
         "UPDATE schema_migrations SET checksum='tampered' WHERE version=?",
         (SCHEMA_MIGRATION_VERSION,),
@@ -68,7 +68,7 @@ async def test_migration_failure_rolls_back_entire_schema(
     await db.connect()
 
     async def fail_mid_migration():
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute("CREATE TABLE must_rollback(value TEXT)")
         raise RuntimeError("injected migration crash")
 

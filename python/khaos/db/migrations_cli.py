@@ -168,7 +168,7 @@ async def backfill_table(
             "project_id must be non-empty for backfill "
             "(use compute_project_id(project_root))"
         )
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     cursor = await conn.execute(
         f"UPDATE {table} SET project_id = ? WHERE project_id = ''",
         (project_id,),
@@ -224,7 +224,7 @@ async def run_backfill(
             count = await count_legacy_rows(db, table)
             reports.append(BackfillReport(table, count, dry_run=True))
     else:
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute("PRAGMA defer_foreign_keys = ON")
         await conn.execute("BEGIN IMMEDIATE")
         try:

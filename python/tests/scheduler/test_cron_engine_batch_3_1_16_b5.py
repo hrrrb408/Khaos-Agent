@@ -317,7 +317,7 @@ async def test_acceptance_6_journal_marked_applied_on_idempotent(tmp_path):
         # Manually insert a SECOND journal entry with applied_at=NULL,
         # simulating a crash AFTER the CAS committed but BEFORE the
         # journal was marked applied.
-        conn = await db._require_conn()
+        conn = await db._require_writer_conn()
         await conn.execute(
             "INSERT INTO scheduler_operation_journal "
             "(operation_id, task_id, operation_type, desired_status, "
@@ -622,7 +622,7 @@ async def test_acceptance_15_replay_marks_stale_for_terminal_task(tmp_path):
     # Set the error column via direct UPDATE (insert_scheduled_task
     # doesn't accept an ``error`` kwarg — it's only set by the engine
     # during execution / quarantine).
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     await conn.execute(
         "UPDATE scheduled_tasks SET error = ? WHERE id = ?",
         ("natural failure", task_id),
@@ -695,7 +695,7 @@ async def test_acceptance_17_replay_does_not_resurrect_failed_with_resume(tmp_pa
     )
     # Set the error column via direct UPDATE (insert_scheduled_task
     # doesn't accept an ``error`` kwarg).
-    conn = await db._require_conn()
+    conn = await db._require_writer_conn()
     await conn.execute(
         "UPDATE scheduled_tasks SET error = ? WHERE id = ?",
         ("natural failure", task_id),
