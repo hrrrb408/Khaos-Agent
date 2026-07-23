@@ -415,6 +415,30 @@ class BrowserManager:
         proxy = entry.get("egress_proxy")
         if proxy is not None:
             await proxy.close()
+        # Round-6 Batch 6.2 (§六): remove this context's egress port
+        # from the per-sandbox nftables port set and atomically
+        # re-apply the table.  This ensures the kernel policy no longer
+        # allows traffic to a proxy that has just been shut down, while
+        # PRESERVING other contexts' ports (the previous ``flush table``
+        # design silently dropped them).
+        egress_port = entry.get("egress_port")
+        if (
+            egress_port is not None
+            and self._browser_sandbox is not None
+            and self._browser_sandbox.is_active
+        ):
+            try:
+                # Round-5 Batch 5.4: remove_egress_port() invokes
+                # subprocess.run (nft -c -f - + nft -f -) which blocks
+                # the event loop — run off-loop.
+                await asyncio.to_thread(
+                    self._browser_sandbox.remove_egress_port, egress_port
+                )
+            except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+                logger.warning(
+                    "remove_egress_port(%s) failed during context close: %s",
+                    egress_port, exc,
+                )
         self._contexts.pop(key, None)
         self._context_close_failures.pop(key, None)
 
@@ -711,6 +735,11 @@ class BrowserManager:
             # reach ONLY the exact proxy IP:port.  Must be called AFTER
             # the proxy has started (dynamic port).  When the sandbox is
             # not active (non-Linux / dev mode), this is a no-op.
+            # Round-6 Batch 6.2 (§六): ``install_egress_pin`` now ADDS
+            # the port to a per-sandbox ``_egress_ports`` set (instead
+            # of ``flush``-ing the whole table).  The matching
+            # ``remove_egress_port`` is called by ``_close_one_context``.
+            proxy_port: int | None = None
             if (
                 self._browser_sandbox is not None
                 and self._browser_sandbox.is_active
@@ -785,6 +814,12 @@ class BrowserManager:
             "refcount": 1,
             "network_guard": network_guard,
             "egress_proxy": egress_proxy,
+            # Round-6 Batch 6.2 (§六): record the kernel-allowed egress
+            # port so ``_close_one_context`` can call
+            # ``remove_egress_port`` and atomically rebuild the nft
+            # table WITHOUT this port.  ``None`` when the OS sandbox is
+            # not active (non-Linux / dev mode).
+            "egress_port": proxy_port,
             # H1 (lifecycle): track which runtime_ids have acquired this
             # context so ``ensure_page`` only bumps refcount for NEW
             # runtimes, and ``close_runtime`` can release ALL contexts a
