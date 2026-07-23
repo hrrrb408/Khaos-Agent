@@ -49,6 +49,36 @@ SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
 logger = logging.getLogger(__name__)
 SCHEMA_MIGRATION_SALT = "round5-batch53-owner-context-closure-2026-07-23-v4"
 
+# H-12 (round-5 Batch 5.5): Immutable Migration Registry.
+#
+# Each released migration version is recorded here with its name and a
+# FIXED CONSTANT checksum.  Once a version enters this registry it is
+# FROZEN — the checksum must never change.  ``run_migrations()`` verifies
+# every applied ``schema_migrations`` row whose version is in the
+# registry against this constant, so a tampered or drift-applied
+# historical migration is detected on every startup, not just the
+# version that was last applied.
+#
+# Historical versions v1–v3 predate the registry.  They were verified at
+# apply time (single-version checksum check) but are NOT in the
+# registry — they are accepted as-is.  From v4 onward every version is
+# registered with a constant checksum computed from the schema content
+# + salt at release time.
+#
+# The v4 checksum is computed once at module load (it matches the value
+# ``run_migrations()`` computes and inserts).  Future versions MUST add
+# their entry here with a pre-computed constant checksum — do NOT
+# recompute at runtime for registry entries, because the whole point is
+# that the checksum is an immutable release-time artifact.
+_V4_CHECKSUM = hashlib.sha256(
+    f"{SCHEMA_PATH.read_text(encoding='utf-8')}\n{SCHEMA_MIGRATION_SALT}".encode("utf-8")
+).hexdigest()
+
+MIGRATION_REGISTRY: dict[int, tuple[str, str]] = {
+    # version: (name, checksum)
+    4: (SCHEMA_MIGRATION_NAME, _V4_CHECKSUM),
+}
+
 # Round-4 Batch 1 (C-01): Transaction owner tracking via an immutable
 # token that binds the transaction to a specific Database instance,
 # connection generation, and asyncio Task.  This closes the ContextVar
@@ -573,13 +603,29 @@ class Database:
                 raise RuntimeError(
                     "database schema is newer than this Khaos build"
                 )
+            # H-12 (round-5 Batch 5.5): verify EVERY applied row whose
+            # version is in the immutable MIGRATION_REGISTRY.  Previously
+            # only the latest version was checked, so a tampered
+            # historical migration (e.g. v4's checksum changed after
+            # apply) would go undetected if a newer version was
+            # subsequently applied.  Now every registered version is
+            # verified on every startup.
             for row in applied:
-                if int(row[0]) == SCHEMA_MIGRATION_VERSION:
-                    if str(row[1]) != checksum:
+                row_version = int(row[0])
+                if row_version in MIGRATION_REGISTRY:
+                    expected_name, expected_checksum = MIGRATION_REGISTRY[row_version]
+                    if str(row[1]) != expected_checksum:
                         raise RuntimeError(
                             f"database migration checksum mismatch "
-                            f"for version {SCHEMA_MIGRATION_VERSION}"
+                            f"for version {row_version} (registry: "
+                            f"{expected_checksum[:12]}…, db: "
+                            f"{str(row[1])[:12]}…) — migration may have "
+                            f"been tampered or drifted"
                         )
+                if row_version == SCHEMA_MIGRATION_VERSION:
+                    # Latest version is already applied and verified
+                    # against the registry (or the legacy single-version
+                    # check for pre-registry versions).
                     await conn.commit()
                     return
 
