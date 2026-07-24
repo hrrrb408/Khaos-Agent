@@ -119,6 +119,17 @@ class ChatStreamTerminalError(RuntimeError):
     """
 
 
+class ChatStreamOwnerMismatchError(RuntimeError):
+    """Batch 7.2 (round-7 §十五): attempt to append to a stream owned by a
+    different (session, principal, project).
+
+    ``append_chat_stream_event`` reads back the ``chat_streams`` row after
+    the lazy ``INSERT OR IGNORE`` and verifies the caller's owner matches.
+    A caller that knows (or guesses) a foreign ``stream_id`` is refused —
+    the UUID is hard to guess but that does not replace an Authority check.
+    """
+
+
 class SessionBusyError(RuntimeError):
     """Round-6 Batch 6.1: concurrent chat on the same session is rejected.
 
@@ -773,6 +784,15 @@ class Database:
             # Step 3: CREATE INDEX / TRIGGER IF NOT EXISTS (safe now —
             # all columns referenced by indexes exist)
             await self._execute_schema_statements(conn, post_migration_text)
+            # Batch 7.2 (round-7 §十四): apply v7 deltas AFTER the v6
+            # aggregate so v6's frozen manifest is untouched.  v7 adds
+            # the session-global ``event_id`` replay cursor.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v7_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1186,6 +1206,105 @@ class Database:
         )
         await conn.commit()
         logger.info("Batch 6.1: chat_streams migration complete")
+
+    async def _apply_v7_upgrades(self) -> None:
+        """Batch 7.2 (round-7 §十四): apply v7 schema deltas.
+
+        Called by ``run_migrations`` AFTER the v6 aggregate (initial schema
+        + legacy upgrades + post-migration), so v6's frozen manifest is
+        untouched.  v7 adds the session-global ``event_id`` column to
+        ``chat_stream_events`` — a true monotonic replay cursor that does
+        not collide across streams (the stream-local ``sequence`` did).
+        """
+        await self._ensure_chat_event_id_column()
+
+    async def _ensure_chat_event_id_column(self) -> None:
+        """Batch 7.2 (round-7 §十四): add ``event_id INTEGER PRIMARY KEY
+        AUTOINCREMENT`` to ``chat_stream_events``.
+
+        SQLite ``ALTER TABLE ... ADD COLUMN`` cannot add a PRIMARY KEY
+        AUTOINCREMENT to an existing table, so on old DBs (pre-v7, where
+        the PK was the composite ``(stream_id, sequence)``) we rebuild the
+        table.  On fresh v7 DBs the column already exists (the
+        ``schema.sql`` reference defines it).  Idempotent: a no-op when
+        the column is already present.
+
+        The ``event_id`` is a session-global monotonic cursor: each
+        appended event gets the next autoincrement value regardless of
+        which stream it belongs to, so session-wide replay (``event_id >
+        ?``) never misses events from streams whose stream-local
+        ``sequence`` is <= the cursor.
+        """
+        conn = await self._require_conn()
+        cols = await (await conn.execute(
+            "PRAGMA table_info(chat_stream_events)"
+        )).fetchall()
+        col_names = {str(c["name"]) for c in cols}
+        if "event_id" in col_names:
+            return  # already migrated (fresh v7 DB or already applied)
+        # Rebuild with event_id as INTEGER PRIMARY KEY AUTOINCREMENT.
+        # Preserve all existing data; event_id becomes the rowid alias.
+        logger.info("Batch 7.2: adding event_id to chat_stream_events")
+        await conn.execute(
+            "CREATE TABLE _chat_stream_events_v7 AS "
+            "SELECT * FROM chat_stream_events"
+        )
+        try:
+            await conn.execute("DROP TABLE chat_stream_events")
+            await conn.execute(
+                """
+                CREATE TABLE chat_stream_events (
+                    event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+                    stream_id    TEXT NOT NULL,
+                    session_id   TEXT NOT NULL,
+                    principal_id TEXT NOT NULL,
+                    project_id   TEXT NOT NULL DEFAULT '',
+                    sequence     INTEGER NOT NULL,
+                    event_type   TEXT NOT NULL,
+                    data_json    TEXT NOT NULL DEFAULT '{}',
+                    is_terminal  INTEGER NOT NULL DEFAULT 0
+                        CHECK(is_terminal IN (0, 1)),
+                    created_at   REAL NOT NULL,
+                    UNIQUE(stream_id, sequence),
+                    FOREIGN KEY(session_id, principal_id, project_id)
+                        REFERENCES sessions(id, principal_id, project_id)
+                )
+                """
+            )
+            await conn.execute(
+                "INSERT INTO chat_stream_events "
+                "(stream_id, session_id, principal_id, project_id, "
+                "sequence, event_type, data_json, is_terminal, created_at) "
+                "SELECT stream_id, session_id, principal_id, project_id, "
+                "sequence, event_type, data_json, is_terminal, created_at "
+                "FROM _chat_stream_events_v7 ORDER BY created_at, sequence"
+            )
+            await conn.execute("DROP TABLE _chat_stream_events_v7")
+            # Rebuild indexes (the old PK indexes were dropped with the table).
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_stream_events_owner "
+                "ON chat_stream_events(principal_id, project_id, "
+                "session_id, event_id)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_stream_events_stream "
+                "ON chat_stream_events(stream_id, event_id)"
+            )
+            await conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_chat_stream_events_session "
+                "ON chat_stream_events(session_id, principal_id, "
+                "project_id, event_id)"
+            )
+        except BaseException:
+            # Restore the backup if the rebuild failed mid-way.
+            await conn.execute("DROP TABLE IF EXISTS chat_stream_events")
+            await conn.execute(
+                "ALTER TABLE _chat_stream_events_v7 RENAME TO "
+                "chat_stream_events"
+            )
+            raise
+        await conn.commit()
+        logger.info("Batch 7.2: chat_stream_events event_id migration complete")
 
     async def _ensure_session_identity_invariants(self) -> None:
         """Make SQLite enforce duplicated session identity on every write."""
@@ -4925,14 +5044,34 @@ class Database:
                     ),
                 )
 
-                # C-05/6.1: terminal shield — reject append if already
-                # terminal.  Keyed by stream_id, NOT session_id.
+                # Batch 7.2 (round-7 §十五): OWNER VERIFICATION.  Read back
+                # the stream row and confirm the caller's
+                # (session_id, principal_id, project_id) match the row's
+                # owner.  Without this, a caller that knows (or guesses) a
+                # foreign stream_id could insert events under its own
+                # owner partition while mutating the victim's state-machine
+                # row (INSERT OR IGNORE is a silent no-op on an existing
+                # foreign row, then the SELECT below read the VICTIM's row).
                 cursor = await conn.execute(
-                    "SELECT status FROM chat_streams WHERE stream_id = ?",
+                    "SELECT status, session_id, principal_id, project_id "
+                    "FROM chat_streams WHERE stream_id = ?",
                     (stream_id,),
                 )
                 row = await cursor.fetchone()
                 current_status = str(row["status"]) if row else "running"
+                if row is not None:
+                    if (
+                        str(row["session_id"]) != session_id
+                        or str(row["principal_id"]) != principal_id
+                        or str(row["project_id"]) != project_id
+                    ):
+                        raise ChatStreamOwnerMismatchError(
+                            f"chat stream {stream_id} is owned by a "
+                            f"different (session/principal/project); "
+                            f"append refused"
+                        )
+                # C-05/6.1: terminal shield — reject append if already
+                # terminal.  Keyed by stream_id, NOT session_id.
                 if current_status != "running":
                     raise ChatStreamTerminalError(
                         f"chat stream {stream_id} is already terminal "
@@ -4966,28 +5105,37 @@ class Database:
                 )
 
                 # Update chat_streams state machine (keyed by stream_id).
+                # Batch 7.2 (round-7 §十五): every UPDATE carries the full
+                # owner predicate so a foreign caller cannot drive another
+                # principal's stream to terminal or renew its lease.
                 if is_terminal:
                     # CAS: running → terminal (exactly one terminal).
                     await conn.execute(
                         "UPDATE chat_streams SET status=?, "
                         "terminal_event_type=?, terminal_at=?, "
                         "last_sequence=? "
-                        "WHERE stream_id=? AND status='running'",
-                        (event_type, event_type, now, sequence, stream_id),
+                        "WHERE stream_id=? AND session_id=? AND "
+                        "principal_id=? AND project_id=? AND status='running'",
+                        (event_type, event_type, now, sequence,
+                         stream_id, session_id, principal_id, project_id),
                     )
                 else:
                     # Renew lease + update last_sequence for running streams.
                     if lease_until is not None:
                         await conn.execute(
                             "UPDATE chat_streams SET last_sequence=?, "
-                            "lease_until=? WHERE stream_id=?",
-                            (sequence, lease_until, stream_id),
+                            "lease_until=? WHERE stream_id=? AND session_id=? "
+                            "AND principal_id=? AND project_id=?",
+                            (sequence, lease_until, stream_id,
+                             session_id, principal_id, project_id),
                         )
                     else:
                         await conn.execute(
                             "UPDATE chat_streams SET last_sequence=? "
-                            "WHERE stream_id=?",
-                            (sequence, stream_id),
+                            "WHERE stream_id=? AND session_id=? "
+                            "AND principal_id=? AND project_id=?",
+                            (sequence, stream_id,
+                             session_id, principal_id, project_id),
                         )
                 return sequence
 
@@ -5003,41 +5151,47 @@ class Database:
     ) -> list[dict[str, Any]]:
         """Read durable chat events after an exclusive cursor.
 
-        Round-6 Batch 6.1: if ``stream_id`` is provided, returns events
-        for that stream only (ordered by stream-local sequence).  If
-        only ``session_id`` is provided, returns events across ALL
-        streams for that session (ordered by created_at then sequence).
+        Batch 7.2 (round-7 §十四): the cursor is now the session-global
+        ``event_id`` (passed via ``after_sequence`` for wire-compat), NOT
+        the stream-local ``sequence``.  This fixes the cross-stream
+        missed-events bug: a cursor of ``event_id=3`` no longer filters
+        out other streams whose stream-local ``sequence`` is <= 3.
+
+        If ``stream_id`` is provided, returns events for that stream
+        only.  If only ``session_id`` is provided, returns events across
+        ALL streams for that session.  Both paths order by ``event_id``
+        (the session-global monotonic cursor) so pagination is stable
+        with no gaps and no duplicates on reconnect.
+
+        Each returned event dict now includes ``event_id`` (the cursor)
+        and ``stream_id`` (so the client can attribute events to
+        streams) alongside the existing ``sequence``/``event``/``data``/
+        ``terminal``/``created_at`` fields.
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
+            after = max(0, after_sequence)
+            lim = max(1, min(limit, 1024))
             if stream_id:
                 cursor = await conn.execute(
-                    "SELECT sequence,event_type,data_json,is_terminal,created_at "
+                    "SELECT event_id,stream_id,sequence,event_type,data_json,"
+                    "is_terminal,created_at "
                     "FROM chat_stream_events WHERE stream_id=? AND principal_id=? "
-                    "AND project_id=? AND sequence>? ORDER BY sequence LIMIT ?",
-                    (
-                        stream_id,
-                        principal_id,
-                        project_id,
-                        max(0, after_sequence),
-                        max(1, min(limit, 1024)),
-                    ),
+                    "AND project_id=? AND event_id>? ORDER BY event_id LIMIT ?",
+                    (stream_id, principal_id, project_id, after, lim),
                 )
             else:
                 cursor = await conn.execute(
-                    "SELECT sequence,event_type,data_json,is_terminal,created_at "
+                    "SELECT event_id,stream_id,sequence,event_type,data_json,"
+                    "is_terminal,created_at "
                     "FROM chat_stream_events WHERE session_id=? AND principal_id=? "
-                    "AND project_id=? AND sequence>? ORDER BY created_at,sequence LIMIT ?",
-                    (
-                        session_id,
-                        principal_id,
-                        project_id,
-                        max(0, after_sequence),
-                        max(1, min(limit, 1024)),
-                    ),
+                    "AND project_id=? AND event_id>? ORDER BY event_id LIMIT ?",
+                    (session_id, principal_id, project_id, after, lim),
                 )
             return [
                 {
+                    "event_id": int(row["event_id"]),
+                    "stream_id": str(row["stream_id"]),
                     "sequence": int(row["sequence"]),
                     "event": str(row["event_type"]),
                     "data": json.loads(str(row["data_json"])),
