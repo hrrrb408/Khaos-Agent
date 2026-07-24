@@ -553,7 +553,8 @@ async def test_f03_legacy_schema_migration_is_idempotent_on_restart(tmp_path):
         f"restart changed row counts: {counts_before} -> {counts_after}"
     )
 
-    # ledger must still have exactly one row
+    # Batch 6.4: the ledger now carries the full registered chain (one row
+    # per version), not a single row.  Restart must leave it unchanged.
     db3 = Database(path)
     await db3.connect()
     conn3 = await db3._require_conn()
@@ -562,7 +563,9 @@ async def test_f03_legacy_schema_migration_is_idempotent_on_restart(tmp_path):
             "SELECT COUNT(*) AS n, MAX(version) AS v FROM schema_migrations"
         )
     ).fetchone()
-    assert ledger["n"] == 1
+    from khaos.db.migrations._registry import REGISTRY_BY_VERSION
+
+    assert ledger["n"] == len(REGISTRY_BY_VERSION)
     assert ledger["v"] == SCHEMA_MIGRATION_VERSION
     await db3.close()
 
