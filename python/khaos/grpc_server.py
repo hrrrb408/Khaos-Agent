@@ -1381,9 +1381,16 @@ class AgentService:
     ) -> AsyncIterator[dict]:
         """Replay and tail one principal's durable chat event ledger.
 
-        Round-6 Batch 6.1: if ``stream_id`` is provided, tails that
-        specific stream.  Otherwise tails all events for the session
-        (across all streams, ordered by created_at).
+        Batch 7.2 (round-7 §十四): the cursor is now the session-global
+        ``event_id`` (passed via ``after_sequence`` for wire-compat), NOT
+        the stream-local ``sequence``.  This fixes the cross-stream
+        missed-events bug on reconnect.
+
+        If ``stream_id`` is provided, tails that specific stream (a
+        terminal event ENDS the stream-specific tail).  Otherwise tails
+        ALL streams for the session — and a terminal event on ONE stream
+        does NOT end the session-wide subscription (a session can produce
+        future streams).
         """
         if not ctx.project_id:
             ctx = RequestContext(
@@ -1405,6 +1412,7 @@ class AgentService:
             )
             if session is None or session.get("project_id") != ctx.project_id:
                 return
+        # Batch 7.2 §十四: cursor is the session-global event_id.
         cursor = max(0, int(after_sequence))
         idle_deadline = time.monotonic() + 30.0
         while time.monotonic() < idle_deadline:
@@ -1420,9 +1428,13 @@ class AgentService:
                 continue
             idle_deadline = time.monotonic() + 30.0
             for event in events:
-                cursor = int(event["sequence"])
+                cursor = int(event["event_id"])
                 yield event
-            if events[-1]["terminal"]:
+            # §十四: a terminal event only ends a STREAM-SPECIFIC tail.
+            # In session-wide mode (no stream_id), a terminal on one
+            # stream must NOT end the subscription — the session may
+            # produce future streams.
+            if stream_id and events[-1]["terminal"]:
                 return
 
     async def switch_mode(self, ctx: RequestContext, session_id: str, target_mode: str) -> dict:
@@ -2571,10 +2583,13 @@ async def serve_json_lines(
                             ).encode("utf-8")
                         )
                 elif method == "AgentService.ChatEvents":
+                    # Batch 7.2 §十四: forward stream_id so a caller can
+                    # request a stream-specific tail (previously dropped).
                     async for event in agent.chat_events(
                         ctx,
                         str(payload.get("session_id", "")),
                         int(payload.get("after_sequence", 0)),
+                        str(payload.get("stream_id", "")),
                     ):
                         writer.write(
                             (json.dumps(event, ensure_ascii=False) + "\n").encode(
