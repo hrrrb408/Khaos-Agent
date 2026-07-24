@@ -33,54 +33,47 @@ SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 # fail when CREATE INDEX references those columns.  By executing tables →
 # _ensure_* (column additions) → indexes, the columns always exist before
 # any index or trigger references them.
+#
+# Batch 6.4 (round-6): these two SQL files are now FROZEN v1 artifacts of
+# the immutable migration chain (see ``migrations/_registry.py``).  They
+# are no longer hand-edited — any schema change must add a new versioned
+# MigrationSpec.  ``schema.sql`` is retained only for tools that read the
+# aggregate schema; it is NOT executed and is NOT the checksum source.
 _MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 _INITIAL_SCHEMA_PATH = _MIGRATIONS_DIR / "0001_initial_schema.sql"
 _POST_MIGRATION_PATH = _MIGRATIONS_DIR / "0001_post_migration.sql"
 TELEGRAM_REPLAY_WINDOW = 4096
-# F-02 (third-round review): bumped to v2 so existing v1 databases re-run
-# the legacy upgrade helpers (including the new memories UNIQUE rebuild).
-# The schema.sql change (project_id added to memories UNIQUE) only affects
-# fresh DBs; existing DBs get the rebuild via _ensure_memories_project_id_unique.
-# v4 (round-5 Batch 5.3 / H-09): project_id added to principal_modes PK.
-# v5 (round-6 Batch 6.1): chat_streams/chat_stream_events keyed by stream_id
-# (independent of session_id) — fixes multi-turn conversation breakage.
-SCHEMA_MIGRATION_VERSION = 5
-SCHEMA_MIGRATION_NAME = "round6_batch61_chat_stream_identity"
+
+# Batch 6.4 (round-6): the immutable migration chain lives entirely in
+# ``migrations/_registry.py``.  The version/name are derived from the
+# chain's last entry so this module and the registry can never disagree.
+# Migration history:
+#   v1 = initial schema (historical, accepted as-is)
+#   v2 = F-02/F-03 memories project_unique + split files (historical)
+#   v3 = principal_modes project_pk intermediate (historical)
+#   v4 = H-09 principal_modes project_id PK (historical)
+#   v5 = Batch 6.1 chat_streams keyed by stream_id (first manifest-checksummed)
+#   v6 = Batch 6.4 immutable migration chain + historical ledger backfill
+from khaos.db.migrations._registry import (  # noqa: E402
+    CURRENT_NAME as _CHAIN_CURRENT_NAME,
+    CURRENT_VERSION as _CHAIN_CURRENT_VERSION,
+    MIGRATIONS,
+    MIGRATION_REGISTRY,  # re-exported for backwards-compatible imports
+    REGISTRY_BY_VERSION,
+    is_historical,
+    verify_source_integrity as _verify_migrator_source_integrity,
+)
+
+SCHEMA_MIGRATION_VERSION = _CHAIN_CURRENT_VERSION
+SCHEMA_MIGRATION_NAME = _CHAIN_CURRENT_NAME
 SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
 
 logger = logging.getLogger(__name__)
-SCHEMA_MIGRATION_SALT = "round6-batch61-chat-stream-identity-2026-07-23-v5"
 
-# H-12 (round-5 Batch 5.5): Immutable Migration Registry.
-#
-# Each released migration version is recorded here with its name and a
-# FIXED CONSTANT checksum.  Once a version enters this registry it is
-# FROZEN — the checksum must never change.  ``run_migrations()`` verifies
-# every applied ``schema_migrations`` row whose version is in the
-# registry against this constant, so a tampered or drift-applied
-# historical migration is detected on every startup, not just the
-# version that was last applied.
-#
-# Historical versions v1–v4 predate the registry.  They were verified at
-# apply time (single-version checksum check) but are NOT in the
-# registry — they are accepted as-is.  From v5 onward every version is
-# registered with a constant checksum computed from the schema content
-# + salt at release time.
-#
-# NOTE (round-6 Batch 6.1): v4 was previously in the registry with a
-# runtime-computed checksum.  Because the schema.sql file changed in
-# Batch 6.1 (chat_streams PK migration), the v4 checksum can no longer
-# be verified — v4 is now pre-registry.  This is the "runtime-computed
-# checksum" weakness that Review §十.1 identified; Batch 6.4 will
-# replace runtime computation with hardcoded release-time constants.
-_V5_CHECKSUM = hashlib.sha256(
-    f"{SCHEMA_PATH.read_text(encoding='utf-8')}\n{SCHEMA_MIGRATION_SALT}".encode("utf-8")
-).hexdigest()
-
-MIGRATION_REGISTRY: dict[int, tuple[str, str]] = {
-    # version: (name, checksum)
-    5: (SCHEMA_MIGRATION_NAME, _V5_CHECKSUM),
-}
+# Retained for backwards compatibility with tests/tools that import it, but
+# it is no longer used as the checksum source (the manifest in _registry.py
+# is).  Kept as a non-empty sentinel so legacy assertions on its shape hold.
+SCHEMA_MIGRATION_SALT = "khaos-migration-chain-immutable-2026-07-24"
 
 # Round-4 Batch 1 (C-01): Transaction owner tracking via an immutable
 # token that binds the transaction to a specific Database instance,
@@ -572,16 +565,22 @@ class Database:
         ``principal_id`` / ``project_id`` columns would previously fail
         when ``CREATE INDEX`` referenced those columns (schema.sql ran
         indexes before ``_ensure_*`` added the columns).
+
+        Batch 6.4 (round-6): the checksum + verification now come from the
+        immutable migration chain in ``migrations/_registry.py``.  Before
+        touching the DB we run ``verify_source_integrity()`` — a fail-closed
+        self-check that re-hashes the registered SQL files + migrator source
+        and aborts if any have drifted from their release-time constant.
         """
+        # Batch 6.4 §10.1/§10.2: fail-closed BEFORE any DB access if a
+        # registered migration file or migrator method has drifted.
+        _verify_migrator_source_integrity()
         conn = await self._require_writer_conn()
-        # F-03: checksum is still computed from the original schema.sql for
-        # backward compatibility with databases that already have a v2
-        # ledger row.  The split files produce an identical schema; they
-        # just fix the execution order.
-        schema_text = SCHEMA_PATH.read_text(encoding="utf-8")
-        checksum = hashlib.sha256(
-            f"{schema_text}\n{SCHEMA_MIGRATION_SALT}".encode("utf-8")
-        ).hexdigest()
+        # Batch 6.4: checksum is the immutable manifest hash from the
+        # registry, NOT a runtime computation over schema.sql (review §10.1).
+        # For the current version it is a release-time literal constant.
+        current_spec = REGISTRY_BY_VERSION[SCHEMA_MIGRATION_VERSION]
+        checksum = current_spec.sha256
         await conn.execute("PRAGMA journal_mode = WAL")
         await conn.execute("PRAGMA foreign_keys = ON")
         await conn.execute("BEGIN IMMEDIATE")
@@ -613,7 +612,9 @@ class Database:
                 """
             )
             cursor = await conn.execute(
-                "SELECT version, checksum FROM schema_migrations "
+                # Batch 6.4 §10.5: also fetch ``name`` so it can be verified
+                # (previously written but never checked).
+                "SELECT version, name, checksum FROM schema_migrations "
                 "ORDER BY version"
             )
             applied = await cursor.fetchall()
@@ -621,31 +622,47 @@ class Database:
                 raise RuntimeError(
                     "database schema is newer than this Khaos build"
                 )
-            # H-12 (round-5 Batch 5.5): verify EVERY applied row whose
-            # version is in the immutable MIGRATION_REGISTRY.  Previously
-            # only the latest version was checked, so a tampered
-            # historical migration (e.g. v4's checksum changed after
-            # apply) would go undetected if a newer version was
-            # subsequently applied.  Now every registered version is
-            # verified on every startup.
+            # Batch 6.4 §10.4/§10.5: verify EVERY applied row whose version is
+            # in the immutable registry.  For each registered row we check
+            # BOTH the name (review §10.5) and the checksum (review §10.2),
+            # unless the version is ``HISTORICAL_ACCEPTED`` (v1–v5: their
+            # original checksums were runtime-computed and cannot be
+            # reproduced, so they are verified by name only — the documented
+            # "accepted as-is" carve-out).  This supersedes the round-5 H-12
+            # check which only compared checksums.
+            applied_versions = set()
             for row in applied:
                 row_version = int(row[0])
-                if row_version in MIGRATION_REGISTRY:
-                    expected_name, expected_checksum = MIGRATION_REGISTRY[row_version]
-                    if str(row[1]) != expected_checksum:
+                applied_versions.add(row_version)
+                if row_version in REGISTRY_BY_VERSION:
+                    spec = REGISTRY_BY_VERSION[row_version]
+                    expected_name, expected_checksum = spec.name, spec.sha256
+                    # §10.5: name is ALWAYS verified.
+                    if str(row[1]) != expected_name:
                         raise RuntimeError(
-                            f"database migration checksum mismatch "
-                            f"for version {row_version} (registry: "
-                            f"{expected_checksum[:12]}…, db: "
-                            f"{str(row[1])[:12]}…) — migration may have "
-                            f"been tampered or drifted"
+                            f"database migration name mismatch for "
+                            f"version {row_version} (registry: "
+                            f"{expected_name!r}, db: {str(row[1])!r}) — "
+                            f"migration row may have been tampered"
                         )
-                if row_version == SCHEMA_MIGRATION_VERSION:
-                    # Latest version is already applied and verified
-                    # against the registry (or the legacy single-version
-                    # check for pre-registry versions).
-                    await conn.commit()
-                    return
+                    # §10.1/§10.2: checksum verified unless historical.
+                    if not is_historical(spec):
+                        if str(row[2]) != expected_checksum:
+                            raise RuntimeError(
+                                f"database migration checksum mismatch "
+                                f"for version {row_version} (registry: "
+                                f"{expected_checksum[:12]}…, db: "
+                                f"{str(row[2])[:12]}…) — migration may "
+                                f"have been tampered or drifted"
+                            )
+            if SCHEMA_MIGRATION_VERSION in applied_versions:
+                # Latest version is already applied and verified against the
+                # registry.  (Batch 6.4: we still backfill any missing
+                # historical rows below for ledger completeness — but only if
+                # they are absent, so this path is a true no-op once full.)
+                await self._backfill_historical_ledger_rows(conn, applied_versions)
+                await conn.commit()
+                return
 
             # F-03: execute tables FIRST, then legacy column upgrades,
             # then indexes/triggers.  This ensures all columns exist
@@ -669,9 +686,14 @@ class Database:
             # Step 3: CREATE INDEX / TRIGGER IF NOT EXISTS (safe now —
             # all columns referenced by indexes exist)
             await self._execute_schema_statements(conn, post_migration_text)
+            # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
+            # so the chain is complete from this point on.  Idempotent —
+            # uses INSERT OR IGNORE keyed on the version PK.
+            await self._backfill_historical_ledger_rows(conn, applied_versions)
+            # Record the current version with its immutable manifest checksum.
             await conn.execute(
                 """
-                INSERT INTO schema_migrations (
+                INSERT OR IGNORE INTO schema_migrations (
                     version, name, checksum, applied_at, app_version
                 ) VALUES (?, ?, ?, datetime('now'), ?)
                 """,
@@ -686,6 +708,40 @@ class Database:
         except BaseException:
             await conn.rollback()
             raise
+
+    async def _backfill_historical_ledger_rows(
+        self, conn: Any, applied_versions: set[int]
+    ) -> None:
+        """Insert missing historical (v1–v5) ledger rows.
+
+        Batch 6.4 §10.4: the registry now covers v1–v6.  Databases that
+        pre-date v6 (or fresh DBs) only have whichever single row the
+        legacy runner wrote.  This helper idempotently inserts every
+        historical version's row with its registered name and the
+        ``HISTORICAL_ACCEPTED`` sentinel checksum, so the ledger tells the
+        complete, verifiable story.  ``applied_versions`` lets us skip rows
+        that already exist (e.g. a live v5 DB already has its v5 row).
+        """
+        for spec in MIGRATIONS:
+            if spec.version in applied_versions:
+                continue
+            if spec.version >= SCHEMA_MIGRATION_VERSION:
+                # The current version's row is written by the caller (with
+                # the real manifest checksum + applied_at), not here.
+                continue
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO schema_migrations (
+                    version, name, checksum, applied_at, app_version
+                ) VALUES (?, ?, ?, datetime('now'), ?)
+                """,
+                (
+                    spec.version,
+                    spec.name,
+                    spec.sha256,  # HISTORICAL_ACCEPTED for v1–v5
+                    SCHEMA_MIGRATION_APP_VERSION,
+                ),
+            )
 
     async def _backup_before_migration(self, conn: Any) -> None:
         """Create one non-overwriting recovery snapshot for a legacy DB."""
