@@ -697,28 +697,40 @@ class Database:
                 raise RuntimeError(
                     "database schema is newer than this Khaos build"
                 )
-            # Batch 6.4 §10.4/§10.5: verify EVERY applied row whose version is
-            # in the immutable registry.  For each registered row we check
-            # BOTH the name (review §10.5) and the checksum (review §10.2),
-            # unless the version is ``HISTORICAL_ACCEPTED`` (v1–v5: their
-            # original checksums were runtime-computed and cannot be
-            # reproduced, so they are verified by name only — the documented
-            # "accepted as-is" carve-out).  This supersedes the round-5 H-12
-            # check which only compared checksums.
+            # Batch 6.4 §10.4/§10.5 + Batch 7.1 §五/§十六: verify EVERY applied
+            # row whose version is in the immutable registry.  For each
+            # registered row we check BOTH the name and the checksum, unless
+            # the version is ``HISTORICAL_ACCEPTED`` (v1–v5: their original
+            # checksums were runtime-computed and cannot be reproduced, so
+            # they are verified by name only — the documented "accepted
+            # as-is" carve-out).
+            #
+            # Batch 7.1 name handling: the canonical name (spec.name) is
+            # always accepted, AND for historical versions we also accept
+            # every name in ``accepted_historical_names`` — the real
+            # release commits wrote names that differed from the ones Batch
+            # 6.4 guessed, so an upgrade would have ``RuntimeError``'d on
+            # every live v1–v4 DB.  v6+ has an empty alias set (canonical
+            # name only).
             applied_versions = set()
             for row in applied:
                 row_version = int(row[0])
                 applied_versions.add(row_version)
                 if row_version in REGISTRY_BY_VERSION:
                     spec = REGISTRY_BY_VERSION[row_version]
-                    expected_name, expected_checksum = spec.name, spec.sha256
-                    # §10.5: name is ALWAYS verified.
-                    if str(row[1]) != expected_name:
+                    expected_checksum = spec.sha256
+                    row_name = str(row[1])
+                    # §10.5 + §五/§十六: name verified against canonical +
+                    # historical alias set.
+                    acceptable_names = {spec.name, *spec.accepted_historical_names}
+                    if row_name not in acceptable_names:
                         raise RuntimeError(
                             f"database migration name mismatch for "
-                            f"version {row_version} (registry: "
-                            f"{expected_name!r}, db: {str(row[1])!r}) — "
-                            f"migration row may have been tampered"
+                            f"version {row_version} (accepted: "
+                            f"{sorted(acceptable_names)}, db: "
+                            f"{row_name!r}) — migration row may have "
+                            f"been tampered or is from an unrecognized "
+                            f"release"
                         )
                     # §10.1/§10.2: checksum verified unless historical.
                     if not is_historical(spec):
@@ -792,10 +804,19 @@ class Database:
         Batch 6.4 §10.4: the registry now covers v1–v6.  Databases that
         pre-date v6 (or fresh DBs) only have whichever single row the
         legacy runner wrote.  This helper idempotently inserts every
-        historical version's row with its registered name and the
-        ``HISTORICAL_ACCEPTED`` sentinel checksum, so the ledger tells the
-        complete, verifiable story.  ``applied_versions`` lets us skip rows
+        historical version's row with its canonical name and the
+        ``HISTORICAL_ACCEPTED`` sentinel checksum, so the ledger tells
+        the complete, verifiable story.  ``applied_versions`` lets us skip rows
         that already exist (e.g. a live v5 DB already has its v5 row).
+
+        Batch 7.1 (round-7 §十九): these rows are SYNTHETIC — they were
+        never individually applied by a real release runner; they are
+        backfilled for ledger completeness.  We mark them honestly by
+        writing ``synthetic-backfill`` in the ``app_version`` column (no
+        schema change needed — the column already exists) so a future
+        audit can distinguish a real applied row from a synthetic one.
+        Real release DBs carry their own ``app_version`` from the release
+        that created them.
         """
         for spec in MIGRATIONS:
             if spec.version in applied_versions:
@@ -814,7 +835,7 @@ class Database:
                     spec.version,
                     spec.name,
                     spec.sha256,  # HISTORICAL_ACCEPTED for v1–v5
-                    SCHEMA_MIGRATION_APP_VERSION,
+                    "synthetic-backfill",  # §十九: mark honestly
                 ),
             )
 
