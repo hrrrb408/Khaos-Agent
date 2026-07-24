@@ -640,6 +640,10 @@ def test_c06_install_egress_pin_dev_mode_warns_on_missing_nft():
     sandbox._host_ip = "10.200.1.1"
     # Must not raise
     sandbox.install_egress_pin(8080)
+    # Round-6 Batch 6.2: route_guard stays False because the nft apply
+    # failed (nft binary not found).  Previously install_egress_pin
+    # itself set route_guard=True unconditionally on success; now the
+    # flag is set only after a successful _apply_nft_script.
     assert not sandbox.enforcement_status.route_guard
 
 
@@ -648,8 +652,16 @@ def test_c06_install_egress_pin_dev_mode_warns_on_missing_nft():
 def test_c06_install_egress_pin_calls_nft_rules(
     mock_which, mock_run
 ):
-    """C-06 (round-5): when nft is available, install_egress_pin installs
-    rules via ``nft -f -`` with an atomic stdin script."""
+    """C-06 (round-5/round-6): when nft is available, install_egress_pin
+    installs rules via ``nft -f -`` with an atomic stdin script.
+
+    Round-6 Batch 6.2: ``_apply_nft_script`` now calls nft TWICE —
+    first ``nft -c -f -`` (syntax check) then ``nft -f -`` (apply).
+    Both calls receive the same script via stdin.  The script uses the
+    ``table inet <name> { … }`` block syntax (create-or-replace) so
+    the table is created if missing (fixes C-02 round-6: ``flush
+    table`` on a fresh table used to fail).
+    """
     mock_which.return_value = "/usr/sbin/nft"
     mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
 
@@ -662,13 +674,15 @@ def test_c06_install_egress_pin_calls_nft_rules(
     sandbox.install_egress_pin(9090)
 
     assert sandbox.enforcement_status.route_guard
-    # C-02 (round-5): nft is called once with -f - (atomic stdin script)
-    assert mock_run.call_count == 1
-    call = mock_run.call_args
-    assert call.args[0] == ["nft", "-f", "-"]
-    # The script is passed via the 'input' kwarg
-    script = call.kwargs.get("input", "")
-    # Verify the script references the proxy port, host IP, and input hook
+    # Round-6 Batch 6.2: nft is called twice — once with -c (check),
+    # once without (apply).  Both use -f - (stdin script).
+    assert mock_run.call_count == 2
+    check_call, apply_call = mock_run.call_args_list
+    assert check_call.args[0] == ["nft", "-c", "-f", "-"]
+    assert apply_call.args[0] == ["nft", "-f", "-"]
+    # The apply call's script must reference the proxy port, host IP,
+    # and both hooks.
+    script = apply_call.kwargs.get("input", "")
     assert "9090" in script
     assert "10.200.1.1" in script
     # C-01 (round-5): must use input hook, not just forward
@@ -677,6 +691,12 @@ def test_c06_install_egress_pin_calls_nft_rules(
     # C-03 (round-5): base chains must use policy accept, not policy drop
     assert "policy accept" in script
     assert "policy drop" not in script
+    # Round-6 Batch 6.2 (C-02): the script uses the ``table inet <name>
+    # { … }`` block syntax so the table is CREATED if missing.
+    assert f"table inet khaos_browser_test1234 {{" in script
+    # The check call's script must match the apply call's script.
+    check_script = check_call.kwargs.get("input", "")
+    assert check_script == script
 
 
 @patch("khaos.security.browser_sandbox.subprocess.run")
@@ -835,7 +855,12 @@ def test_round5_nft_script_uses_policy_accept_not_drop():
 
 
 def test_round5_nft_uses_nft_f_minus_not_split():
-    """C-02: nft is called with '-f -' (stdin script), not via .split()."""
+    """C-02: nft is called with '-f -' (stdin script), not via .split().
+
+    Round-6 Batch 6.2: ``_apply_nft_script`` now calls nft TWICE —
+    first ``nft -c -f -`` (syntax check) then ``nft -f -`` (apply).
+    Both calls must use ``-f -`` (stdin), never ``.split()``.
+    """
     with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
          patch("khaos.security.browser_sandbox.shutil.which", return_value="/usr/sbin/nft"):
         mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
@@ -845,11 +870,15 @@ def test_round5_nft_uses_nft_f_minus_not_split():
         sandbox._host_ip = "10.200.1.1"
         sandbox._nft_table = f"khaos_browser_{sandbox._token}"
         sandbox.install_egress_pin(9090)
-        # Must be called exactly once with ["nft", "-f", "-"].
-        assert mock_run.call_count == 1
-        assert mock_run.call_args.args[0] == ["nft", "-f", "-"]
-        # The script must be passed as the 'input' kwarg (stdin).
-        assert "input" in mock_run.call_args.kwargs
+        # Round-6 Batch 6.2: nft is called twice — check + apply.  Both
+        # must use -f - (stdin script), never .split().
+        assert mock_run.call_count == 2
+        for call in mock_run.call_args_list:
+            argv = call.args[0]
+            assert "-f" in argv
+            assert "-" in argv
+            # The script must be passed as the 'input' kwarg (stdin).
+            assert "input" in call.kwargs
 
 
 def test_round5_create_wrapper_fails_closed_in_production():

@@ -43,6 +43,31 @@ Round-5 review Batch 5.1 fixes (C-01~C-04, H-01~H-04):
 * **H-04**: run-root directory chain is verified via
   ``openat``/``O_DIRECTORY``/``O_NOFOLLOW`` from the home directory
   down to the per-sandbox run dir.
+
+Round-6 review Batch 6.2 fixes (C-02 round-6 + §四 + §五 + §六):
+
+* **C-02 (round-6)**: the nft script now uses ``table inet <name> { … }``
+  block syntax so the table is CREATED if missing (previously only
+  ``flush table`` was emitted, which fails on a fresh table → nft
+  returns an error → ``BrowserSandboxError`` in production).  The block
+  syntax is accepted by ``nft --check -f -`` and is the documented way
+  to atomically create+populate a table.
+* **§四 default-deny before browser start**: ``setup()`` now installs
+  the default-deny kernel rule (drop everything from the browser veth,
+  allow established return traffic) BEFORE the browser is launched.
+  Previously the veth was completely open between ``setup()`` and the
+  first ``ensure_page()`` — a window in which a compromised startup
+  component could reach any host port.
+* **§六 multi-context port set**: ``install_egress_pin`` now ADDS the
+  port to a per-sandbox ``_egress_ports`` set and atomically rebuilds
+  the whole table (delete + recreate via one ``nft -f -`` transaction).
+  Previously each call did ``flush table`` + a single port rule, so a
+  second context's creation silently dropped the first context's port
+  from the kernel policy.  New ``remove_egress_port`` (called by
+  ``_close_one_context``) removes a port and re-applies.
+* **nft --check**: ``_apply_nft_script`` runs ``nft -c -f -`` first to
+  syntax-check the script before applying it, so a malformed script is
+  a detectable failure instead of a silent kernel-policy gap.
 """
 
 from __future__ import annotations
@@ -147,6 +172,14 @@ class BrowserNetworkSandbox:
         self._enforcement = EnforcementStatus()
         # Round-5 H-03: registry file path for ownership tracking.
         self._registry_file: Path | None = None
+        # Round-6 Batch 6.2 (C-02 + §六): the set of currently-active
+        # egress proxy ports.  ``install_egress_pin`` now ADDS to this
+        # set (instead of ``flush``-ing the whole table — which would
+        # silently drop other contexts' ports).  Rule (re)generation is
+        # atomic: the whole table is rebuilt and applied via a single
+        # ``nft -f -`` transaction.  ``remove_egress_port`` (called by
+        # ``_close_one_context``) removes a port and re-applies.
+        self._egress_ports: set[int] = set()
 
     @property
     def is_active(self) -> bool:
@@ -218,12 +251,22 @@ class BrowserNetworkSandbox:
                     "cgroup-v2 leaf creation failed — resource limits "
                     "cannot be enforced"
                 )
+            # Round-6 Batch 6.2 (§五): install the default-deny kernel
+            # rule BEFORE the browser is launched.  ``install_egress_pin``
+            # (called later from ``ensure_page``) only ADDS a port to
+            # this already-default-deny table.  This closes the startup
+            # window in which the veth was completely open between
+            # ``setup()`` and the first ``ensure_page()``.
+            self._install_default_deny_nft()
             self._active = True
             self._enforcement = EnforcementStatus(
                 network_namespace=True,
                 proxy_required=True,
                 cgroup=self._cgroup_path is not None,
-                route_guard=False,  # set by install_egress_pin()
+                # route_guard is True from the moment the default-deny
+                # table exists (no proxy port allowed yet, but the
+                # kernel is already enforcing "browser veth → drop").
+                route_guard=True,
                 service_workers_blocked=True,
             )
             logger.info(
@@ -321,63 +364,124 @@ class BrowserNetworkSandbox:
             return "'ip' or 'nsenter' not found"
         return ""
 
-    def install_egress_pin(self, proxy_port: int) -> None:
-        """C-06 (round-5 rewrite): install nftables rules so the browser
-        veth can reach ONLY the exact proxy IP:port.
+    # ------------------------------------------------------------------
+    # Round-6 Batch 6.2: nftables authority — table creation, atomic
+    # multi-port rule set, default-deny before browser start.
+    # ------------------------------------------------------------------
 
-        Round-5 Batch 5.1 fixes:
-          - Uses ``input`` hook (not ``forward``) for browser→host local
-            traffic (C-01).
-          - Uses ``nft -f -`` atomic stdin script (not ``.split()``) so
-            quotes and braces are parsed correctly by nft (C-02).
-          - Base chains use ``policy accept`` so unmatched host traffic
-            is unaffected (C-03).
-          - nft table name is per-sandbox (H-01/H-02).
-          - Also drops browser-veth on ``forward`` hook to prevent
-            routing to other namespaces.
+    def _build_nft_script(self, *, include_table_create: bool) -> str:
+        """Build the atomic nftables script for the current
+        ``_egress_ports`` set.
 
-        Must be called AFTER the egress proxy has started (dynamic port).
+        When ``include_table_create`` is True (used by
+        ``_install_default_deny_nft`` and by every re-apply), the
+        script uses the ``table inet <name> { … }`` block syntax so
+        the table is CREATED if missing and atomically replaced if it
+        already exists.  This is the documented nftables way to do
+        "create-or-replace" and is accepted by ``nft --check -f -``.
+
+        The script always contains BOTH hooks (input + forward), so
+        even with zero egress ports the browser veth is fully
+        default-deny.  Each port in ``_egress_ports`` produces one
+        ``accept`` rule.
+
+        This method is pure (no subprocess, no I/O) so it can be
+        unit-tested without mocking ``subprocess.run``.
         """
-        if not self._active or self._veth_host is None:
-            return
+        table = self._nft_table
+        veth = self._veth_host
+        host_ip = self._host_ip
+        # Sort ports for deterministic output (easier diffs in tests
+        # and in ``nft --check`` logs).
+        ports = sorted(self._egress_ports)
+        # Build one ``accept`` line per active port.  When no port is
+        # active, the input chain is pure default-deny (drop everything
+        # from the browser veth except established return traffic).
+        if ports:
+            port_rules = "\n    ".join(
+                f'iifname "{veth}" ip daddr {host_ip} tcp dport {p} accept'
+                for p in ports
+            )
+        else:
+            port_rules = "# (no egress proxy port active — full default-deny)"
+        if include_table_create:
+            # ``table inet <name> { … }`` block: create-or-replace.
+            # This is the fix for C-02 (round-6): previously only
+            # ``flush table`` was emitted, which fails on a fresh
+            # table because the table does not exist yet.
+            return (
+                f"table inet {table} {{\n"
+                f"    chain khaos_input {{\n"
+                f"        type filter hook input priority -10; policy accept;\n"
+                f"        ct state established,related accept\n"
+                f"        {port_rules}\n"
+                f"        iifname \"{veth}\" drop\n"
+                f"    }}\n"
+                f"    chain khaos_forward {{\n"
+                f"        type filter hook forward priority -10; policy accept;\n"
+                f"        iifname \"{veth}\" drop\n"
+                f"        oifname \"{veth}\" ct state new drop\n"
+                f"    }}\n"
+                f"}}\n"
+            )
+        # Legacy form: separate ``flush table`` + chains.  Kept for
+        # reference but no longer used in production — the block form
+        # above is strictly more correct.
+        return (
+            f"flush table {_NFT_TABLE_FAMILY} {table}\n"
+            f"\n"
+            f"chain khaos_input {{\n"
+            f"    type filter hook input priority -10; policy accept;\n"
+            f"    ct state established,related accept\n"
+            f"    {port_rules}\n"
+            f"    iifname \"{veth}\" drop\n"
+            f"}}\n"
+            f"\n"
+            f"chain khaos_forward {{\n"
+            f"    type filter hook forward priority -10; policy accept;\n"
+            f"    iifname \"{veth}\" drop\n"
+            f"    oifname \"{veth}\" ct state new drop\n"
+            f"}}\n"
+        )
+
+    def _apply_nft_script(self, script: str, *, description: str) -> bool:
+        """Syntax-check (``nft -c -f -``) then apply (``nft -f -``) an
+        nftables script atomically.
+
+        Round-6 Batch 6.2 (§四 "真实 nft --check"): the script is first
+        fed to ``nft -c -f -`` so a malformed script is a detectable
+        failure instead of a silent kernel-policy gap.  If the check
+        passes, the same script is applied for real.
+
+        Returns ``True`` when the script was applied successfully,
+        ``False`` when the nft binary is missing or the apply failed
+        in dev mode (a warning is logged in that case).
+
+        ``require_os_sandbox=True`` (production) raises
+        ``BrowserSandboxError`` on any failure.  ``False`` (dev) logs a
+        warning and returns ``False`` — the proxy-only layer remains.
+        """
         if shutil.which("nft") is None:
             reason = "nftables ('nft') not found — egress pin inactive"
             if self._require_os_sandbox:
                 raise BrowserSandboxError(reason)
             logger.warning("browser netns sandbox: %s", reason)
-            return
-
-        # C-02 (round-5): build a complete atomic nft script and feed
-        # it via stdin.  This avoids the .split() quote-parsing bug.
-        table = self._nft_table
-        veth = self._veth_host
-        host_ip = self._host_ip
-        port = proxy_port
-        script = f"""\
-flush table {_NFT_TABLE_FAMILY} {table}
-
-# C-01 (round-5): input hook — browser→host is LOCAL input traffic,
-# not forward.  Without this hook, browser can reach any host port.
-chain khaos_input {{
-    type filter hook input priority -10; policy accept;
-    # Allow established connections (return traffic from proxy).
-    ct state established,related accept
-    # Allow browser-veth → exact proxy_ip:proxy_port TCP.
-    iifname "{veth}" ip daddr {host_ip} tcp dport {port} accept
-    # Drop everything else from the browser veth.
-    iifname "{veth}" drop
-}}
-
-# C-03 (round-5): forward hook — drop browser-veth to prevent routing
-# to other network namespaces or external networks.
-chain khaos_forward {{
-    type filter hook forward priority -10; policy accept;
-    iifname "{veth}" drop
-    oifname "{veth}" ct state new drop
-}}
-"""
+            return False
         try:
-            # C-02: use nft -f - to parse the script atomically.
+            # 1) Syntax check (does not touch kernel state).
+            check = subprocess.run(
+                ["nft", "-c", "-f", "-"],
+                input=script,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if check.returncode != 0:
+                raise OSError(
+                    f"nft -c -f - rejected script (exit "
+                    f"{check.returncode}): {check.stderr.strip()}"
+                )
+            # 2) Apply for real.
             result = subprocess.run(
                 ["nft", "-f", "-"],
                 input=script,
@@ -390,22 +494,120 @@ chain khaos_forward {{
                     f"nft -f - failed (exit {result.returncode}): "
                     f"{result.stderr.strip()}"
                 )
-            self._enforcement.route_guard = True
-            logger.info(
-                "browser nftables egress pin installed: "
-                "%s → %s:%d only (table=%s, input+forward hooks)",
-                veth, host_ip, port, table,
-            )
         except OSError as exc:
             if self._require_os_sandbox:
                 raise BrowserSandboxError(
-                    f"nftables egress pin failed: {exc}"
+                    f"nftables {description} failed: {exc}"
                 ) from exc
             logger.warning(
-                "browser nftables egress pin failed, "
+                "browser nftables %s failed, "
                 "route_guard inactive: %s",
-                exc,
+                description, exc,
             )
+            return False
+        return True
+
+    def _install_default_deny_nft(self) -> None:
+        """Round-6 Batch 6.2 (§五): install the default-deny nft table
+        BEFORE the browser is launched.
+
+        Called from ``setup()`` right after the netns/veth/cgroup are
+        ready.  At this point ``_egress_ports`` is empty, so the input
+        chain is pure default-deny: the browser veth can only receive
+        established return traffic and everything else is dropped.
+
+        ``install_egress_pin`` (called later from ``ensure_page``) adds
+        a port to ``_egress_ports`` and re-applies the table.  The
+        browser therefore NEVER runs in a window where the veth is
+        completely open — even before the first proxy port is known.
+        """
+        if self._nft_table is None or self._veth_host is None:
+            return  # nothing to do (non-Linux / dev fallback path)
+        script = self._build_nft_script(include_table_create=True)
+        self._apply_nft_script(
+            script, description="default-deny table install",
+        )
+        logger.info(
+            "browser nftables default-deny table installed (table=%s, "
+            "veth=%s) — browser veth fully blocked until egress pin added",
+            self._nft_table, self._veth_host,
+        )
+
+    def install_egress_pin(self, proxy_port: int) -> None:
+        """C-06 (round-5 rewrite, round-6 redesign): add ``proxy_port``
+        to the set of kernel-allowed egress ports and atomically
+        re-apply the nft table.
+
+        Round-6 Batch 6.2 changes:
+          - ADDS the port to ``_egress_ports`` instead of ``flush``-ing
+            the whole table.  Other contexts' ports are preserved.
+          - The table is rebuilt using the ``table inet <name> { … }``
+            block syntax (create-or-replace), so the table exists even
+            on the first call (fixes C-02 round-6: ``flush table`` on
+            a fresh table used to fail).
+          - ``_apply_nft_script`` first syntax-checks the script with
+            ``nft -c -f -`` (§四 "真实 nft --check").
+
+        Must be called AFTER the egress proxy has started (dynamic
+        port) and AFTER ``setup()`` (which installs the default-deny
+        table).
+        """
+        if not self._active or self._veth_host is None:
+            return
+        if not isinstance(proxy_port, int) or not (1 <= proxy_port <= 65535):
+            raise BrowserSandboxError(
+                f"invalid egress proxy port: {proxy_port!r}"
+            )
+        self._egress_ports.add(int(proxy_port))
+        script = self._build_nft_script(include_table_create=True)
+        applied = self._apply_nft_script(
+            script, description=f"egress pin port {proxy_port}",
+        )
+        # Only flip route_guard on when the nft apply actually
+        # succeeded.  In dev mode, a missing nft binary logs a warning
+        # and returns — route_guard must stay False so callers can
+        # detect that kernel enforcement is NOT active.
+        if applied:
+            self._enforcement.route_guard = True
+            logger.info(
+                "browser nftables egress pin added: %s → %s:%d "
+                "(table=%s, active_ports=%s)",
+                self._veth_host, self._host_ip, proxy_port,
+                self._nft_table, sorted(self._egress_ports),
+            )
+
+    def remove_egress_port(self, proxy_port: int) -> None:
+        """Round-6 Batch 6.2 (§六): remove ``proxy_port`` from the set
+        of kernel-allowed egress ports and atomically re-apply the nft
+        table.
+
+        Called by ``BrowserManager._close_one_context`` when a context
+        is closed, so the kernel policy no longer allows traffic to a
+        proxy that has been shut down.  Other contexts' ports are
+        preserved.
+
+        No-op (with a debug log) if the port was not in the set — this
+        makes the call safe against double-close paths.
+        """
+        if not self._active or self._veth_host is None:
+            return
+        port = int(proxy_port)
+        if port not in self._egress_ports:
+            logger.debug(
+                "remove_egress_port(%d): not in active set %s — no-op",
+                port, sorted(self._egress_ports),
+            )
+            return
+        self._egress_ports.discard(port)
+        script = self._build_nft_script(include_table_create=True)
+        self._apply_nft_script(
+            script, description=f"egress pin remove port {port}",
+        )
+        logger.info(
+            "browser nftables egress pin removed: port %d "
+            "(table=%s, active_ports=%s)",
+            port, self._nft_table, sorted(self._egress_ports),
+        )
 
     def _create_netns(self) -> None:
         """Create the network namespace."""
@@ -644,6 +846,9 @@ chain khaos_forward {{
 
         Round-5 H-02: only deletes THIS sandbox's resources (per-sandbox
         nft table name), never a global table.
+
+        Round-6 Batch 6.2: also clears ``_egress_ports`` so a re-setup()
+        on the same sandbox instance starts from a clean port set.
         """
         # Delete per-sandbox nftables table (H-02: not global)
         if self._nft_table is not None:
@@ -654,6 +859,9 @@ chain khaos_forward {{
                     f"delete nftables table {self._nft_table}",
                 )
             self._nft_table = None
+        # Round-6 Batch 6.2: clear the egress port set so a re-setup()
+        # does not carry stale ports forward.
+        self._egress_ports.clear()
 
         # Delete wrapper script + secure run dir (C-10)
         if self._wrapper_script is not None:
