@@ -43,6 +43,13 @@ _MIGRATIONS_DIR = Path(__file__).with_name("migrations")
 _INITIAL_SCHEMA_PATH = _MIGRATIONS_DIR / "0001_initial_schema.sql"
 _POST_MIGRATION_PATH = _MIGRATIONS_DIR / "0001_post_migration.sql"
 TELEGRAM_REPLAY_WINDOW = 4096
+# Batch 6.5 (round-6 §十八): how long ``close()`` waits for in-flight reads
+# to drain before closing the reader connection.  Bounded so a stuck read
+# cannot block shutdown indefinitely — the generation bump already prevents
+# NEW reads, and a read still in flight after this window is a leak (logged,
+# then the connection is closed anyway; the stuck coroutine raises on its
+# next await).
+_READER_DRAIN_TIMEOUT = 10.0
 
 # Batch 6.4 (round-6): the immutable migration chain lives entirely in
 # ``migrations/_registry.py``.  The version/name are derived from the
@@ -252,6 +259,18 @@ class Database:
         # concurrent ``close()`` between acquiring the ref and acquiring the
         # write lock (H-06).
         self._connection_lifecycle_lock = asyncio.Lock()
+        # Batch 6.5 (round-6 §十八): Reader Operation Lease.  Plain reads
+        # (``_require_conn()`` → ``execute`` → ``fetchall``) hold no lock,
+        # so ``close()`` could tear down the reader mid-fetch.  Each read
+        # method wraps its body in ``async with self._read_lease():`` which
+        # bumps ``_active_readers`` (clearing ``_readers_idle``); ``close()``
+        # drains to zero before closing the reader connection.  Writer-path
+        # reads (inside ``transaction()``) are already protected by the
+        # write+ lifecycle locks and do NOT take a lease.
+        self._active_readers = 0
+        self._readers_idle = asyncio.Event()
+        self._readers_idle.set()
+        self._reader_drain_lock = asyncio.Lock()
 
     async def connect(self) -> None:
         """Open writer and reader SQLite connections if not already open.
@@ -506,9 +525,65 @@ class Database:
                 if self._conn is not None:
                     await self._conn.close()
                     self._conn = None
+                # Batch 6.5 (round-6 §十八): drain in-flight reads BEFORE
+                # closing the reader.  ``_read_lease`` holders bump
+                # ``_active_readers``; we wait for them to finish (bounded
+                # by ``_READER_DRAIN_TIMEOUT``) so a read that already
+                # captured the reader ref does not hit a torn-down
+                # connection mid-fetch.  New reads are rejected because the
+                # generation bump above makes ``_require_conn`` re-open
+                # (which fails / waits on the lifecycle lock we hold).
+                await self._wait_readers_drained()
                 if self._reader_conn is not None:
                     await self._reader_conn.close()
                     self._reader_conn = None
+
+    @asynccontextmanager
+    async def _read_lease(self):
+        """Batch 6.5 (round-6 §十八): hold a reader-operation lease.
+
+        Wraps the body of a read method so ``close()`` waits for all
+        in-flight reads to finish before tearing down the reader
+        connection.  Enter bumps ``_active_readers`` (clearing
+        ``_readers_idle``); exit decrements and sets ``_readers_idle``
+        when the count returns to zero.
+
+        Only the READER path needs this — writer-path reads (inside
+        ``transaction()``) are already serialized by the write +
+        lifecycle locks, and ``close()`` itself acquires the write lock
+        first, so it cannot race an in-flight transaction.
+        """
+        self._active_readers += 1
+        self._readers_idle.clear()
+        try:
+            yield
+        finally:
+            self._active_readers -= 1
+            if self._active_readers <= 0:
+                self._active_readers = 0
+                self._readers_idle.set()
+
+    async def _wait_readers_drained(self) -> None:
+        """Block until all in-flight reads finish, or the drain timeout
+        expires.  Called by ``close()`` under the lifecycle lock."""
+        if self._active_readers == 0:
+            return
+        logger.debug(
+            "close: waiting for %d in-flight reader(s) to drain",
+            self._active_readers,
+        )
+        try:
+            await asyncio.wait_for(
+                self._readers_idle.wait(), timeout=_READER_DRAIN_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "close: %d reader(s) still in flight after %.1fs drain "
+                "timeout; closing reader connection anyway (stuck reads "
+                "will raise on their next await)",
+                self._active_readers,
+                _READER_DRAIN_TIMEOUT,
+            )
 
     async def _require_writer_conn(self):
         """Return the writer connection, opening if necessary.
@@ -2142,35 +2217,36 @@ class Database:
         Production callers pass both ``principal_id`` and ``project_id``;
         ``None`` on either remains the explicit admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = ["session_id = ?"]
-        params: list[Any] = [session_id]
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        cursor = await conn.execute(
-            f"""
-            SELECT role, content, tool_calls, tool_call_id, token_count
-            FROM messages
-            WHERE {' AND '.join(clauses)}
-            ORDER BY created_at, id
-            """,
-            tuple(params),
-        )
-        rows = await cursor.fetchall()
-        return [
-            Message(
-                role=str(row["role"]),
-                content=str(row["content"]),
-                tool_calls=json.loads(str(row["tool_calls"] or "[]")),
-                tool_call_id=row["tool_call_id"],
-                token_count=int(row["token_count"]),
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = ["session_id = ?"]
+            params: list[Any] = [session_id]
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            cursor = await conn.execute(
+                f"""
+                SELECT role, content, tool_calls, tool_call_id, token_count
+                FROM messages
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at, id
+                """,
+                tuple(params),
             )
-            for row in rows
-        ]
+            rows = await cursor.fetchall()
+            return [
+                Message(
+                    role=str(row["role"]),
+                    content=str(row["content"]),
+                    tool_calls=json.loads(str(row["tool_calls"] or "[]")),
+                    tool_call_id=row["tool_call_id"],
+                    token_count=int(row["token_count"]),
+                )
+                for row in rows
+            ]
 
     async def set_config(self, key: str, value: Any) -> None:
         """Persist a JSON configuration value."""
@@ -2188,12 +2264,13 @@ class Database:
 
     async def get_config(self, key: str, default: Any = None) -> Any:
         """Read a JSON configuration value."""
-        conn = await self._require_conn()
-        cursor = await conn.execute("SELECT value FROM user_config WHERE key = ?", (key,))
-        row = await cursor.fetchone()
-        if row is None:
-            return default
-        return json.loads(str(row["value"]))
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute("SELECT value FROM user_config WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+            if row is None:
+                return default
+            return json.loads(str(row["value"]))
 
     async def get_principal_mode(
         self,
@@ -2214,25 +2291,26 @@ class Database:
         lookup key — closes cross-project mode leakage on shared DBs.
         ``project_id=''`` (the default) preserves legacy/test behaviour.
         """
-        conn = await self._require_conn()
-        if session_id:
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            if session_id:
+                cursor = await conn.execute(
+                    "SELECT mode FROM principal_modes "
+                    "WHERE project_id = ? AND principal_id = ? AND session_id = ?",
+                    (project_id, principal_id, session_id),
+                )
+                row = await cursor.fetchone()
+                if row is not None:
+                    return str(row["mode"])
             cursor = await conn.execute(
                 "SELECT mode FROM principal_modes "
-                "WHERE project_id = ? AND principal_id = ? AND session_id = ?",
-                (project_id, principal_id, session_id),
+                "WHERE project_id = ? AND principal_id = ? AND session_id = ''",
+                (project_id, principal_id),
             )
             row = await cursor.fetchone()
             if row is not None:
                 return str(row["mode"])
-        cursor = await conn.execute(
-            "SELECT mode FROM principal_modes "
-            "WHERE project_id = ? AND principal_id = ? AND session_id = ''",
-            (project_id, principal_id),
-        )
-        row = await cursor.fetchone()
-        if row is not None:
-            return str(row["mode"])
-        return default
+            return default
 
     async def set_principal_mode(
         self,
@@ -2345,34 +2423,35 @@ class Database:
         ``principal_id`` is ``None`` (default), all rules are returned
         — this preserves the legacy admin/inspection behaviour.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        if policy_digest is not None:
-            clauses.append("policy_digest = ?")
-            params.append(policy_digest)
-        if generation is not None:
-            clauses.append("generation = ?")
-            params.append(generation)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        cursor = await conn.execute(
-            f"""
-            SELECT id, pattern, permission_level, approval, mode,
-                   strftime('%s', granted_at) AS granted_at,
-                   principal_id, project_id, policy_digest, generation
-            FROM permissions
-            {where}
-            ORDER BY granted_at DESC, id DESC
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = []
+            params: list[Any] = []
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            if policy_digest is not None:
+                clauses.append("policy_digest = ?")
+                params.append(policy_digest)
+            if generation is not None:
+                clauses.append("generation = ?")
+                params.append(generation)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor = await conn.execute(
+                f"""
+                SELECT id, pattern, permission_level, approval, mode,
+                       strftime('%s', granted_at) AS granted_at,
+                       principal_id, project_id, policy_digest, generation
+                FROM permissions
+                {where}
+                ORDER BY granted_at DESC, id DESC
+                """,
+                tuple(params),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def delete_permission_rule(
         self,
@@ -2390,43 +2469,44 @@ class Database:
         Returns the number of rows deleted (0 if the rule doesn't
         exist or belongs to a different principal).
         """
-        conn = await self._require_conn()
-        if principal_id is None or project_id is None or policy_digest is None:
-            async with self.transaction() as conn:
-                cursor = await conn.execute(
-                    "DELETE FROM permissions WHERE id = ?"
-                    + (" AND principal_id = ?" if principal_id is not None else ""),
-                    (rule_id, principal_id) if principal_id is not None else (rule_id,),
-                )
-                return cursor.rowcount or 0
-        async with self._authorization_lock:
-            async with self.transaction() as conn:
-                row = await self._authorization_context_row(
-                    conn, principal_id, project_id
-                )
-                if row is None or str(row["policy_digest"]) != policy_digest:
-                    return 0
-                cursor = await conn.execute(
-                    "DELETE FROM permissions WHERE id = ? AND principal_id = ? "
-                    "AND project_id = ? AND policy_digest = ?",
-                    (rule_id, principal_id, project_id, policy_digest),
-                )
-                if not (cursor.rowcount or 0):
-                    return 0
-                epoch = int(row["epoch"]) + 1
-                await conn.execute(
-                    "UPDATE authorization_contexts SET epoch = ?, "
-                    "updated_at = datetime('now') "
-                    "WHERE principal_id = ? AND project_id = ?",
-                    (epoch, principal_id, project_id),
-                )
-                await conn.execute(
-                    "UPDATE permissions SET generation = ? "
-                    "WHERE principal_id = ? AND project_id = ? "
-                    "AND policy_digest = ?",
-                    (epoch, principal_id, project_id, policy_digest),
-                )
-                return cursor.rowcount or 0
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            if principal_id is None or project_id is None or policy_digest is None:
+                async with self.transaction() as conn:
+                    cursor = await conn.execute(
+                        "DELETE FROM permissions WHERE id = ?"
+                        + (" AND principal_id = ?" if principal_id is not None else ""),
+                        (rule_id, principal_id) if principal_id is not None else (rule_id,),
+                    )
+                    return cursor.rowcount or 0
+            async with self._authorization_lock:
+                async with self.transaction() as conn:
+                    row = await self._authorization_context_row(
+                        conn, principal_id, project_id
+                    )
+                    if row is None or str(row["policy_digest"]) != policy_digest:
+                        return 0
+                    cursor = await conn.execute(
+                        "DELETE FROM permissions WHERE id = ? AND principal_id = ? "
+                        "AND project_id = ? AND policy_digest = ?",
+                        (rule_id, principal_id, project_id, policy_digest),
+                    )
+                    if not (cursor.rowcount or 0):
+                        return 0
+                    epoch = int(row["epoch"]) + 1
+                    await conn.execute(
+                        "UPDATE authorization_contexts SET epoch = ?, "
+                        "updated_at = datetime('now') "
+                        "WHERE principal_id = ? AND project_id = ?",
+                        (epoch, principal_id, project_id),
+                    )
+                    await conn.execute(
+                        "UPDATE permissions SET generation = ? "
+                        "WHERE principal_id = ? AND project_id = ? "
+                        "AND policy_digest = ?",
+                        (epoch, principal_id, project_id, policy_digest),
+                    )
+                    return cursor.rowcount or 0
 
     async def bind_authorization_context(
         self, principal_id: str, project_id: str, policy_digest: str
@@ -2460,12 +2540,13 @@ class Database:
     async def get_authorization_context(
         self, principal_id: str, project_id: str
     ) -> dict[str, Any] | None:
-        conn = await self._require_conn()
-        async with self._authorization_lock:
-            row = await self._authorization_context_row(
-                conn, principal_id, project_id
-            )
-        return dict(row) if row is not None else None
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            async with self._authorization_lock:
+                row = await self._authorization_context_row(
+                    conn, principal_id, project_id
+                )
+            return dict(row) if row is not None else None
 
     async def _authorization_context_row(
         self, conn, principal_id: str, project_id: str
@@ -2543,29 +2624,30 @@ class Database:
         Production callers pass both; ``None`` on either (default)
         remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        cursor = await conn.execute(
-            f"""
-            SELECT action, target, result, detail, session_id,
-                   principal_id, runtime_id, task_id, operation_id,
-                   policy_digest, authority_generation, source_transport,
-                   project_id
-            FROM audit_log
-            {where}
-            ORDER BY created_at, id
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = []
+            params: list[Any] = []
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor = await conn.execute(
+                f"""
+                SELECT action, target, result, detail, session_id,
+                       principal_id, runtime_id, task_id, operation_id,
+                       policy_digest, authority_generation, source_transport,
+                       project_id
+                FROM audit_log
+                {where}
+                ORDER BY created_at, id
+                """,
+                tuple(params),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def query_audit_logs(
         self,
@@ -2596,43 +2678,44 @@ class Database:
         path on shared DBs.  Production callers pass both; ``None`` on
         either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if action is not None:
-            clauses.append("action = ?")
-            params.append(action)
-        if result is not None:
-            clauses.append("result = ?")
-            params.append(result)
-        if since is not None:
-            clauses.append("created_at >= ?")
-            params.append(since)
-        if until is not None:
-            clauses.append("created_at <= ?")
-            params.append(until)
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        params.append(limit)
-        cursor = await conn.execute(
-            f"""
-            SELECT id, action, target, result, detail, session_id, created_at,
-                   principal_id, runtime_id, task_id, operation_id,
-                   policy_digest, authority_generation, source_transport,
-                   project_id
-            FROM audit_log
-            {where}
-            ORDER BY created_at DESC, id DESC
-            LIMIT ?
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = []
+            params: list[Any] = []
+            if action is not None:
+                clauses.append("action = ?")
+                params.append(action)
+            if result is not None:
+                clauses.append("result = ?")
+                params.append(result)
+            if since is not None:
+                clauses.append("created_at >= ?")
+                params.append(since)
+            if until is not None:
+                clauses.append("created_at <= ?")
+                params.append(until)
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            params.append(limit)
+            cursor = await conn.execute(
+                f"""
+                SELECT id, action, target, result, detail, session_id, created_at,
+                       principal_id, runtime_id, task_id, operation_id,
+                       policy_digest, authority_generation, source_transport,
+                       project_id
+                FROM audit_log
+                {where}
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def upsert_memory(
         self,
@@ -2706,20 +2789,21 @@ class Database:
         F-02: ``project_id`` is now part of the identity.  Callers that
         omit it get ``project_id=''`` which matches legacy/unbound rows.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT id, scope, key, value, ttl, confidence, access_freq,
-                   created_at, updated_at, principal_id, namespace, session_id,
-                   project_id
-            FROM memories
-            WHERE project_id = ? AND namespace = ? AND principal_id = ?
-              AND session_id = ? AND scope = ? AND key = ?
-            """,
-            (project_id, namespace, principal_id, session_id, scope, key),
-        )
-        row = await cursor.fetchone()
-        return dict(row) if row is not None else None
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                """
+                SELECT id, scope, key, value, ttl, confidence, access_freq,
+                       created_at, updated_at, principal_id, namespace, session_id,
+                       project_id
+                FROM memories
+                WHERE project_id = ? AND namespace = ? AND principal_id = ?
+                  AND session_id = ? AND scope = ? AND key = ?
+                """,
+                (project_id, namespace, principal_id, session_id, scope, key),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else None
 
     async def delete_memory(
         self,
@@ -2805,38 +2889,39 @@ class Database:
         Production callers should always pass ``project_id`` so a
         shared DB cannot leak cross-project memories.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if scope is not None:
-            clauses.append("scope = ?")
-            params.append(scope)
-        if principal_id is not None:
-            # Include the principal's private memories AND project-shared
-            # memories (namespace='shared', principal_id='').
-            clauses.append(
-                "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = []
+            params: list[Any] = []
+            if scope is not None:
+                clauses.append("scope = ?")
+                params.append(scope)
+            if principal_id is not None:
+                # Include the principal's private memories AND project-shared
+                # memories (namespace='shared', principal_id='').
+                clauses.append(
+                    "(principal_id = ? OR (namespace = 'shared' AND principal_id = ''))"
+                )
+                params.append(principal_id)
+            if namespace is not None:
+                clauses.append("namespace = ?")
+                params.append(namespace)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor = await conn.execute(
+                f"""
+                SELECT id, scope, key, value, ttl, confidence, access_freq,
+                       created_at, updated_at, principal_id, namespace, session_id,
+                       project_id
+                FROM memories
+                {where}
+                ORDER BY confidence DESC, updated_at DESC, id DESC
+                """,
+                tuple(params),
             )
-            params.append(principal_id)
-        if namespace is not None:
-            clauses.append("namespace = ?")
-            params.append(namespace)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        cursor = await conn.execute(
-            f"""
-            SELECT id, scope, key, value, ttl, confidence, access_freq,
-                   created_at, updated_at, principal_id, namespace, session_id,
-                   project_id
-            FROM memories
-            {where}
-            ORDER BY confidence DESC, updated_at DESC, id DESC
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def search_memories(
         self,
@@ -2858,36 +2943,37 @@ class Database:
         ``project_id`` so a shared DB cannot leak cross-project FTS
         results.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = ["memory_fts MATCH ?"]
-        params: list[Any] = [query]
-        if principal_id is not None:
-            clauses.append(
-                "(m.principal_id = ? OR (m.namespace = 'shared' AND m.principal_id = ''))"
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = ["memory_fts MATCH ?"]
+            params: list[Any] = [query]
+            if principal_id is not None:
+                clauses.append(
+                    "(m.principal_id = ? OR (m.namespace = 'shared' AND m.principal_id = ''))"
+                )
+                params.append(principal_id)
+            if namespace is not None:
+                clauses.append("m.namespace = ?")
+                params.append(namespace)
+            if project_id is not None:
+                clauses.append("m.project_id = ?")
+                params.append(project_id)
+            where = " AND ".join(clauses)
+            params.append(top_k)
+            cursor = await conn.execute(
+                f"""
+                SELECT m.id, m.scope, m.key, m.value, m.ttl, m.confidence,
+                       m.access_freq, m.created_at, m.updated_at,
+                       m.principal_id, m.namespace, m.session_id, m.project_id
+                FROM memory_fts
+                JOIN memories AS m ON m.id = memory_fts.rowid
+                WHERE {where}
+                ORDER BY bm25(memory_fts)
+                LIMIT ?
+                """,
+                tuple(params),
             )
-            params.append(principal_id)
-        if namespace is not None:
-            clauses.append("m.namespace = ?")
-            params.append(namespace)
-        if project_id is not None:
-            clauses.append("m.project_id = ?")
-            params.append(project_id)
-        where = " AND ".join(clauses)
-        params.append(top_k)
-        cursor = await conn.execute(
-            f"""
-            SELECT m.id, m.scope, m.key, m.value, m.ttl, m.confidence,
-                   m.access_freq, m.created_at, m.updated_at,
-                   m.principal_id, m.namespace, m.session_id, m.project_id
-            FROM memory_fts
-            JOIN memories AS m ON m.id = memory_fts.rowid
-            WHERE {where}
-            ORDER BY bm25(memory_fts)
-            LIMIT ?
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def touch_memory(self, memory_id: int) -> None:
         """Increment memory access frequency."""
@@ -2995,28 +3081,29 @@ class Database:
         shared DBs.  Production callers pass both; ``None`` on either
         remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        # C-03: _ensure_subagent_tasks_principal_column removed from
-        # runtime — column is added during migration, missing = fail closed.
-        clauses: list[str] = []
-        params: list[Any] = []
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        cursor = await conn.execute(
-            f"""
-            SELECT id, parent_session_id, goal, context, tools, status, result, error, principal_id, project_id
-            FROM subagent_tasks
-            {where}
-            ORDER BY created_at, id
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            # C-03: _ensure_subagent_tasks_principal_column removed from
+            # runtime — column is added during migration, missing = fail closed.
+            clauses: list[str] = []
+            params: list[Any] = []
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor = await conn.execute(
+                f"""
+                SELECT id, parent_session_id, goal, context, tools, status, result, error, principal_id, project_id
+                FROM subagent_tasks
+                {where}
+                ORDER BY created_at, id
+                """,
+                tuple(params),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def _ensure_subagent_tasks_principal_column(self) -> None:
         """B1: idempotently add the ``principal_id`` column to existing
@@ -3130,26 +3217,27 @@ class Database:
         path on shared DBs.  Production callers pass both; ``None`` on
         either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = ["session_id = ?", "name = ?"]
-        params: list[Any] = [session_id, name]
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        cursor = await conn.execute(
-            f"""
-            SELECT id, session_id, name, description, mode, project_root,
-                   summary, created_at, principal_id, project_id
-            FROM session_bookmarks
-            WHERE {' AND '.join(clauses)}
-            """,
-            tuple(params),
-        )
-        row = await cursor.fetchone()
-        return dict(row) if row is not None else None
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = ["session_id = ?", "name = ?"]
+            params: list[Any] = [session_id, name]
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            cursor = await conn.execute(
+                f"""
+                SELECT id, session_id, name, description, mode, project_root,
+                       summary, created_at, principal_id, project_id
+                FROM session_bookmarks
+                WHERE {' AND '.join(clauses)}
+                """,
+                tuple(params),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else None
 
     async def list_bookmarks(
         self,
@@ -3170,30 +3258,31 @@ class Database:
         path on shared DBs.  Production callers pass both; ``None`` on
         either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if session_id is not None:
-            clauses.append("session_id = ?")
-            params.append(session_id)
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        cursor = await conn.execute(
-            f"""
-            SELECT id, session_id, name, description, mode, project_root,
-                   summary, created_at, principal_id, project_id
-            FROM session_bookmarks
-            {where}
-            ORDER BY created_at DESC, id DESC
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = []
+            params: list[Any] = []
+            if session_id is not None:
+                clauses.append("session_id = ?")
+                params.append(session_id)
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor = await conn.execute(
+                f"""
+                SELECT id, session_id, name, description, mode, project_root,
+                       summary, created_at, principal_id, project_id
+                FROM session_bookmarks
+                {where}
+                ORDER BY created_at DESC, id DESC
+                """,
+                tuple(params),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def delete_bookmark(
         self,
@@ -3264,22 +3353,23 @@ class Database:
 
     async def get_session_summary(self, session_id: str) -> str | None:
         """读取会话摘要。优先读 summary 列，回退到 metadata JSON。"""
-        conn = await self._require_conn()
-        # summary 列可能不存在（旧库未迁移），用 try 探测。
-        try:
-            cursor = await conn.execute(
-                "SELECT summary FROM sessions WHERE id = ?",
-                (session_id,),
-            )
-            row = await cursor.fetchone()
-            if row is not None and row["summary"] is not None:
-                return str(row["summary"])
-        except sqlite3.OperationalError:
-            # 列尚未添加 — 回退到 metadata
-            pass
-        meta = await self._read_session_metadata(session_id)
-        value = meta.get("summary")
-        return str(value) if value is not None else None
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            # summary 列可能不存在（旧库未迁移），用 try 探测。
+            try:
+                cursor = await conn.execute(
+                    "SELECT summary FROM sessions WHERE id = ?",
+                    (session_id,),
+                )
+                row = await cursor.fetchone()
+                if row is not None and row["summary"] is not None:
+                    return str(row["summary"])
+            except sqlite3.OperationalError:
+                # 列尚未添加 — 回退到 metadata
+                pass
+            meta = await self._read_session_metadata(session_id)
+            value = meta.get("summary")
+            return str(value) if value is not None else None
 
     async def save_session_changes(self, session_id: str, files: list[str]) -> None:
         """保存会话期间修改的文件列表到 sessions metadata。
@@ -3300,38 +3390,40 @@ class Database:
 
     async def _read_session_metadata(self, session_id: str) -> dict[str, Any]:
         """读取 sessions.metadata 的 JSON 字典，缺失/损坏时返回空字典。"""
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT metadata FROM sessions WHERE id = ?",
-            (session_id,),
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            return {}
-        raw = row["metadata"]
-        if not raw:
-            return {}
-        try:
-            data = json.loads(str(raw))
-        except (TypeError, ValueError):
-            return {}
-        return data if isinstance(data, dict) else {}
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                "SELECT metadata FROM sessions WHERE id = ?",
+                (session_id,),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return {}
+            raw = row["metadata"]
+            if not raw:
+                return {}
+            try:
+                data = json.loads(str(raw))
+            except (TypeError, ValueError):
+                return {}
+            return data if isinstance(data, dict) else {}
 
     async def _merge_session_metadata(
         self, session_id: str, updates: dict[str, Any]
     ) -> None:
         """合并写入 sessions.metadata JSON（浅合并）。"""
-        conn = await self._require_conn()
-        current = await self._read_session_metadata(session_id)
-        current.update(updates)
-        await conn.execute(
-            "UPDATE sessions SET metadata = ?, updated_at = datetime('now') WHERE id = ?",
-            (json.dumps(current, ensure_ascii=False), session_id),
-        )
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            current = await self._read_session_metadata(session_id)
+            current.update(updates)
+            await conn.execute(
+                "UPDATE sessions SET metadata = ?, updated_at = datetime('now') WHERE id = ?",
+                (json.dumps(current, ensure_ascii=False), session_id),
+            )
 
-    # ------------------------------------------------------------------
-    # Hermes batch 1: scheduled (cron) tasks
-    # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Hermes batch 1: scheduled (cron) tasks
+        # ------------------------------------------------------------------
 
     async def insert_scheduled_task(
         self,
@@ -3538,29 +3630,30 @@ class Database:
         shared DBs.  Production callers pass both; ``None`` on either
         remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        cursor = await conn.execute(
-            f"""
-            SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
-                   created_at, last_run, next_run, run_count, last_result, error,
-                   lifecycle_version, principal_id, execution_id, lease_until,
-                   policy_digest, project_id
-            FROM scheduled_tasks
-            {where}
-            ORDER BY created_at
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = []
+            params: list[Any] = []
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor = await conn.execute(
+                f"""
+                SELECT id, name, prompt, status, schedule_config, deliver_to, meta,
+                       created_at, last_run, next_run, run_count, last_result, error,
+                       lifecycle_version, principal_id, execution_id, lease_until,
+                       policy_digest, project_id
+                FROM scheduled_tasks
+                {where}
+                ORDER BY created_at
+                """,
+                tuple(params),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_scheduled_task(
         self, task_id: str, *, principal_id: str | None = None,
@@ -3578,19 +3671,20 @@ class Database:
         if the task belongs to a different project.  Production callers
         pass both; ``None`` on either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
-        )
-        row = await cursor.fetchone()
-        if row is None:
-            return None
-        result = dict(row)
-        if principal_id is not None and result.get("principal_id") != principal_id:
-            return None
-        if project_id is not None and result.get("project_id") != project_id:
-            return None
-        return result
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                "SELECT * FROM scheduled_tasks WHERE id = ?", (task_id,)
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            result = dict(row)
+            if principal_id is not None and result.get("principal_id") != principal_id:
+                return None
+            if project_id is not None and result.get("project_id") != project_id:
+                return None
+            return result
 
     async def claim_scheduled_task(
         self,
@@ -3754,12 +3848,13 @@ class Database:
         recovered, then call ``recover_all_running_tasks`` to
         bulk-UPDATE them, then per-task reload each one.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT id FROM scheduled_tasks WHERE status = 'running'"
-        )
-        rows = await cursor.fetchall()
-        return [str(row[0]) for row in rows]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                "SELECT id FROM scheduled_tasks WHERE status = 'running'"
+            )
+            rows = await cursor.fetchall()
+            return [str(row[0]) for row in rows]
 
     async def query_expired_lease_task_ids(self, *, now_iso: str) -> list[str]:
         """M4 batch 3.1.13 (CRITICAL-1): query task IDs with expired
@@ -3771,15 +3866,16 @@ class Database:
         then called ``_load_tasks()`` — the live executor was never
         cancelled, producing side effects after the DB said FAILED.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT id FROM scheduled_tasks "
-            "WHERE status = 'running' AND lease_until IS NOT NULL "
-            "AND lease_until < ?",
-            (now_iso,),
-        )
-        rows = await cursor.fetchall()
-        return [str(row[0]) for row in rows]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                "SELECT id FROM scheduled_tasks "
+                "WHERE status = 'running' AND lease_until IS NOT NULL "
+                "AND lease_until < ?",
+                (now_iso,),
+            )
+            rows = await cursor.fetchall()
+            return [str(row[0]) for row in rows]
 
     async def recover_one_expired_lease(
         self, task_id: str, *, now_iso: str,
@@ -4088,37 +4184,38 @@ class Database:
         ``expected_version``, ``target_version``, ``principal_id``,
         ``policy_digest``, ``created_at``.
         """
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            """
-            SELECT seq, operation_id, task_id, operation_type,
-                   desired_status, expected_version, target_version,
-                   principal_id, policy_digest, created_at
-            FROM scheduler_operation_journal
-            WHERE applied_at IS NULL
-            ORDER BY seq ASC
-            """
-        )
-        rows = await cursor.fetchall()
-        return [
-            {
-                "seq": int(row[0]),
-                "operation_id": str(row[1]),
-                "task_id": str(row[2]),
-                "operation_type": str(row[3]),
-                "desired_status": str(row[4]),
-                "expected_version": int(row[5]),
-                "target_version": int(row[6]),
-                "principal_id": str(row[7]),
-                "policy_digest": str(row[8]),
-                "created_at": str(row[9]),
-            }
-            for row in rows
-        ]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                """
+                SELECT seq, operation_id, task_id, operation_type,
+                       desired_status, expected_version, target_version,
+                       principal_id, policy_digest, created_at
+                FROM scheduler_operation_journal
+                WHERE applied_at IS NULL
+                ORDER BY seq ASC
+                """
+            )
+            rows = await cursor.fetchall()
+            return [
+                {
+                    "seq": int(row[0]),
+                    "operation_id": str(row[1]),
+                    "task_id": str(row[2]),
+                    "operation_type": str(row[3]),
+                    "desired_status": str(row[4]),
+                    "expected_version": int(row[5]),
+                    "target_version": int(row[6]),
+                    "principal_id": str(row[7]),
+                    "policy_digest": str(row[8]),
+                    "created_at": str(row[9]),
+                }
+                for row in rows
+            ]
 
-    # ------------------------------------------------------------------
-    # Hermes batch 2: session history FTS5 search
-    # ------------------------------------------------------------------
+        # ------------------------------------------------------------------
+        # Hermes batch 2: session history FTS5 search
+        # ------------------------------------------------------------------
 
     async def insert_message_fts(
         self,
@@ -4259,21 +4356,22 @@ class Database:
         shared DBs.  Production callers pass both; ``None`` on either
         remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = []
-        params: list[Any] = []
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        cursor = await conn.execute(
-            f"SELECT state_json FROM coding_tasks {where} ORDER BY created_at",
-            tuple(params),
-        )
-        return [json.loads(str(row["state_json"])) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = []
+            params: list[Any] = []
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            cursor = await conn.execute(
+                f"SELECT state_json FROM coding_tasks {where} ORDER BY created_at",
+                tuple(params),
+            )
+            return [json.loads(str(row["state_json"])) for row in await cursor.fetchall()]
 
     async def search_sessions(
         self,
@@ -4302,48 +4400,49 @@ class Database:
         closing the cross-project read path on shared DBs.  Production
         callers pass both; ``None`` on either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        # snippet: highlight matches with [ ... ]; bm25() rank (lower = better).
-        # When either owner filter is provided, JOIN the base messages
-        # table (messages_fts.rowid mirrors messages.id, so the JOIN is
-        # a primary-key lookup — cheap).
-        if principal_id is None and project_id is None:
-            cursor = await conn.execute(
-                """
-                SELECT rowid AS id, session_id, role, created_at,
-                       rank,
-                       snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
-                FROM messages_fts
-                WHERE messages_fts MATCH ?
-                ORDER BY rank
-                LIMIT ? OFFSET ?
-                """,
-                (query, limit, offset),
-            )
-        else:
-            clauses: list[str] = ["fts.messages_fts MATCH ?"]
-            params: list[Any] = [query]
-            if principal_id is not None:
-                clauses.append("m.principal_id = ?")
-                params.append(principal_id)
-            if project_id is not None:
-                clauses.append("m.project_id = ?")
-                params.append(project_id)
-            params.extend([limit, offset])
-            cursor = await conn.execute(
-                f"""
-                SELECT fts.rowid AS id, fts.session_id, fts.role,
-                       fts.created_at, fts.rank,
-                       snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
-                FROM messages_fts AS fts
-                JOIN messages AS m ON m.id = fts.rowid
-                WHERE {' AND '.join(clauses)}
-                ORDER BY fts.rank
-                LIMIT ? OFFSET ?
-                """,
-                tuple(params),
-            )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            # snippet: highlight matches with [ ... ]; bm25() rank (lower = better).
+            # When either owner filter is provided, JOIN the base messages
+            # table (messages_fts.rowid mirrors messages.id, so the JOIN is
+            # a primary-key lookup — cheap).
+            if principal_id is None and project_id is None:
+                cursor = await conn.execute(
+                    """
+                    SELECT rowid AS id, session_id, role, created_at,
+                           rank,
+                           snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
+                    FROM messages_fts
+                    WHERE messages_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ? OFFSET ?
+                    """,
+                    (query, limit, offset),
+                )
+            else:
+                clauses: list[str] = ["fts.messages_fts MATCH ?"]
+                params: list[Any] = [query]
+                if principal_id is not None:
+                    clauses.append("m.principal_id = ?")
+                    params.append(principal_id)
+                if project_id is not None:
+                    clauses.append("m.project_id = ?")
+                    params.append(project_id)
+                params.extend([limit, offset])
+                cursor = await conn.execute(
+                    f"""
+                    SELECT fts.rowid AS id, fts.session_id, fts.role,
+                           fts.created_at, fts.rank,
+                           snippet(messages_fts, 2, '[', ']]', '...', 12) AS snippet
+                    FROM messages_fts AS fts
+                    JOIN messages AS m ON m.id = fts.rowid
+                    WHERE {' AND '.join(clauses)}
+                    ORDER BY fts.rank
+                    LIMIT ? OFFSET ?
+                    """,
+                    tuple(params),
+                )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_session_messages(
         self,
@@ -4365,27 +4464,28 @@ class Database:
         shared DBs.  Production callers pass both; ``None`` on either
         remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = ["session_id = ?"]
-        params: list[Any] = [session_id]
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        params.extend([limit, offset])
-        cursor = await conn.execute(
-            f"""
-            SELECT id, session_id, role, content, token_count, created_at
-            FROM messages
-            WHERE {' AND '.join(clauses)}
-            ORDER BY created_at, id
-            LIMIT ? OFFSET ?
-            """,
-            tuple(params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = ["session_id = ?"]
+            params: list[Any] = [session_id]
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            params.extend([limit, offset])
+            cursor = await conn.execute(
+                f"""
+                SELECT id, session_id, role, content, token_count, created_at
+                FROM messages
+                WHERE {' AND '.join(clauses)}
+                ORDER BY created_at, id
+                LIMIT ? OFFSET ?
+                """,
+                tuple(params),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_message_window(
         self,
@@ -4404,33 +4504,34 @@ class Database:
         shared DBs.  Production callers pass both ``principal_id`` and
         ``project_id``; ``None`` on either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = ["session_id = ?"]
-        params: list[Any] = [session_id]
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        # message_id feeds the ABS(id - ?) proximity sort and must come
-        # after the WHERE-clause params.
-        params.append(message_id)
-        params.append(window * 2 + 1)
-        cursor = await conn.execute(
-            f"""
-            SELECT id, session_id, role, content, token_count, created_at
-            FROM messages
-            WHERE {' AND '.join(clauses)}
-            ORDER BY ABS(id - ?), id
-            LIMIT ?
-            """,
-            tuple(params),
-        )
-        rows = [dict(row) for row in await cursor.fetchall()]
-        # Re-sort chronologically after the ABS-based proximity selection.
-        rows.sort(key=lambda r: r["id"])
-        return rows
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = ["session_id = ?"]
+            params: list[Any] = [session_id]
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            # message_id feeds the ABS(id - ?) proximity sort and must come
+            # after the WHERE-clause params.
+            params.append(message_id)
+            params.append(window * 2 + 1)
+            cursor = await conn.execute(
+                f"""
+                SELECT id, session_id, role, content, token_count, created_at
+                FROM messages
+                WHERE {' AND '.join(clauses)}
+                ORDER BY ABS(id - ?), id
+                LIMIT ?
+                """,
+                tuple(params),
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+            # Re-sort chronologically after the ABS-based proximity selection.
+            rows.sort(key=lambda r: r["id"])
+            return rows
 
     async def count_session_messages(
         self,
@@ -4447,21 +4548,22 @@ class Database:
         shared DBs.  Production callers pass both ``principal_id`` and
         ``project_id``; ``None`` on either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = ["session_id = ?"]
-        params: list[Any] = [session_id]
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        cursor = await conn.execute(
-            f"SELECT COUNT(*) AS n FROM messages WHERE {' AND '.join(clauses)}",
-            tuple(params),
-        )
-        row = await cursor.fetchone()
-        return int(row["n"]) if row else 0
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = ["session_id = ?"]
+            params: list[Any] = [session_id]
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            cursor = await conn.execute(
+                f"SELECT COUNT(*) AS n FROM messages WHERE {' AND '.join(clauses)}",
+                tuple(params),
+            )
+            row = await cursor.fetchone()
+            return int(row["n"]) if row else 0
 
     async def count_messages_before_after(
         self,
@@ -4479,28 +4581,29 @@ class Database:
         shared DBs.  Production callers pass both ``principal_id`` and
         ``project_id``; ``None`` on either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = ["session_id = ?"]
-        params: list[Any] = [session_id]
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        # message_id feeds both CASE expressions, so it must be appended
-        # after the WHERE-clause params and appears twice in the tuple.
-        cursor = await conn.execute(
-            f"SELECT "
-            "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
-            "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
-            f"FROM messages WHERE {' AND '.join(clauses)}",
-            (message_id, message_id, *params),
-        )
-        row = await cursor.fetchone()
-        if not row:
-            return (0, 0)
-        return (int(row["before_n"] or 0), int(row["after_n"] or 0))
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = ["session_id = ?"]
+            params: list[Any] = [session_id]
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            # message_id feeds both CASE expressions, so it must be appended
+            # after the WHERE-clause params and appears twice in the tuple.
+            cursor = await conn.execute(
+                f"SELECT "
+                "SUM(CASE WHEN id < ? THEN 1 ELSE 0 END) AS before_n, "
+                "SUM(CASE WHEN id > ? THEN 1 ELSE 0 END) AS after_n "
+                f"FROM messages WHERE {' AND '.join(clauses)}",
+                (message_id, message_id, *params),
+            )
+            row = await cursor.fetchone()
+            if not row:
+                return (0, 0)
+            return (int(row["before_n"] or 0), int(row["after_n"] or 0))
 
     async def list_sessions(
         self,
@@ -4523,42 +4626,43 @@ class Database:
         path on shared DBs.  Production callers pass both; ``None`` on
         either remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        where_clauses: list[str] = ["s.status = 'active'"]
-        where_params: list[Any] = []
-        if principal_id is not None:
-            where_clauses.append("s.principal_id = ?")
-            where_params.append(principal_id)
-        if project_id is not None:
-            where_clauses.append("s.project_id = ?")
-            where_params.append(project_id)
-        # When an owner dimension is supplied, scope the message_count /
-        # preview subqueries to the session's own owner value for that
-        # dimension (matching the legacy principal-scoped subquery
-        # behaviour).
-        sub_filters: list[str] = []
-        if principal_id is not None:
-            sub_filters.append("m.principal_id = s.principal_id")
-        if project_id is not None:
-            sub_filters.append("m.project_id = s.project_id")
-        sub_where = (" AND " + " AND ".join(sub_filters)) if sub_filters else ""
-        where_params.extend([limit, offset])
-        cursor = await conn.execute(
-            f"""
-            SELECT s.id, s.mode, s.created_at,
-                   (SELECT COUNT(*) FROM messages m
-                    WHERE m.session_id = s.id{sub_where}) AS message_count,
-                   (SELECT content FROM messages m
-                    WHERE m.session_id = s.id{sub_where}
-                    ORDER BY m.id DESC LIMIT 1) AS preview
-            FROM sessions s
-            WHERE {' AND '.join(where_clauses)}
-            ORDER BY s.updated_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            tuple(where_params),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            where_clauses: list[str] = ["s.status = 'active'"]
+            where_params: list[Any] = []
+            if principal_id is not None:
+                where_clauses.append("s.principal_id = ?")
+                where_params.append(principal_id)
+            if project_id is not None:
+                where_clauses.append("s.project_id = ?")
+                where_params.append(project_id)
+            # When an owner dimension is supplied, scope the message_count /
+            # preview subqueries to the session's own owner value for that
+            # dimension (matching the legacy principal-scoped subquery
+            # behaviour).
+            sub_filters: list[str] = []
+            if principal_id is not None:
+                sub_filters.append("m.principal_id = s.principal_id")
+            if project_id is not None:
+                sub_filters.append("m.project_id = s.project_id")
+            sub_where = (" AND " + " AND ".join(sub_filters)) if sub_filters else ""
+            where_params.extend([limit, offset])
+            cursor = await conn.execute(
+                f"""
+                SELECT s.id, s.mode, s.created_at,
+                       (SELECT COUNT(*) FROM messages m
+                        WHERE m.session_id = s.id{sub_where}) AS message_count,
+                       (SELECT content FROM messages m
+                        WHERE m.session_id = s.id{sub_where}
+                        ORDER BY m.id DESC LIMIT 1) AS preview
+                FROM sessions s
+                WHERE {' AND '.join(where_clauses)}
+                ORDER BY s.updated_at DESC
+                LIMIT ? OFFSET ?
+                """,
+                tuple(where_params),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def get_session(
         self,
@@ -4580,26 +4684,27 @@ class Database:
         shared DBs.  Production callers pass both; ``None`` on either
         remains the admin opt-in.
         """
-        conn = await self._require_conn()
-        clauses: list[str] = ["id = ?"]
-        params: list[Any] = [session_id]
-        if principal_id is not None:
-            clauses.append("principal_id = ?")
-            params.append(principal_id)
-        if project_id is not None:
-            clauses.append("project_id = ?")
-            params.append(project_id)
-        cursor = await conn.execute(
-            f"""
-            SELECT id, mode, principal_id, project_id, status,
-                   created_at, updated_at
-            FROM sessions
-            WHERE {' AND '.join(clauses)}
-            """,
-            tuple(params),
-        )
-        row = await cursor.fetchone()
-        return dict(row) if row is not None else None
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            clauses: list[str] = ["id = ?"]
+            params: list[Any] = [session_id]
+            if principal_id is not None:
+                clauses.append("principal_id = ?")
+                params.append(principal_id)
+            if project_id is not None:
+                clauses.append("project_id = ?")
+                params.append(project_id)
+            cursor = await conn.execute(
+                f"""
+                SELECT id, mode, principal_id, project_id, status,
+                       created_at, updated_at
+                FROM sessions
+                WHERE {' AND '.join(clauses)}
+                """,
+                tuple(params),
+            )
+            row = await cursor.fetchone()
+            return dict(row) if row is not None else None
 
     async def register_operation_approval(
         self,
@@ -4882,43 +4987,44 @@ class Database:
         only ``session_id`` is provided, returns events across ALL
         streams for that session (ordered by created_at then sequence).
         """
-        conn = await self._require_conn()
-        if stream_id:
-            cursor = await conn.execute(
-                "SELECT sequence,event_type,data_json,is_terminal,created_at "
-                "FROM chat_stream_events WHERE stream_id=? AND principal_id=? "
-                "AND project_id=? AND sequence>? ORDER BY sequence LIMIT ?",
-                (
-                    stream_id,
-                    principal_id,
-                    project_id,
-                    max(0, after_sequence),
-                    max(1, min(limit, 1024)),
-                ),
-            )
-        else:
-            cursor = await conn.execute(
-                "SELECT sequence,event_type,data_json,is_terminal,created_at "
-                "FROM chat_stream_events WHERE session_id=? AND principal_id=? "
-                "AND project_id=? AND sequence>? ORDER BY created_at,sequence LIMIT ?",
-                (
-                    session_id,
-                    principal_id,
-                    project_id,
-                    max(0, after_sequence),
-                    max(1, min(limit, 1024)),
-                ),
-            )
-        return [
-            {
-                "sequence": int(row["sequence"]),
-                "event": str(row["event_type"]),
-                "data": json.loads(str(row["data_json"])),
-                "terminal": bool(row["is_terminal"]),
-                "created_at": float(row["created_at"]),
-            }
-            for row in await cursor.fetchall()
-        ]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            if stream_id:
+                cursor = await conn.execute(
+                    "SELECT sequence,event_type,data_json,is_terminal,created_at "
+                    "FROM chat_stream_events WHERE stream_id=? AND principal_id=? "
+                    "AND project_id=? AND sequence>? ORDER BY sequence LIMIT ?",
+                    (
+                        stream_id,
+                        principal_id,
+                        project_id,
+                        max(0, after_sequence),
+                        max(1, min(limit, 1024)),
+                    ),
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT sequence,event_type,data_json,is_terminal,created_at "
+                    "FROM chat_stream_events WHERE session_id=? AND principal_id=? "
+                    "AND project_id=? AND sequence>? ORDER BY created_at,sequence LIMIT ?",
+                    (
+                        session_id,
+                        principal_id,
+                        project_id,
+                        max(0, after_sequence),
+                        max(1, min(limit, 1024)),
+                    ),
+                )
+            return [
+                {
+                    "sequence": int(row["sequence"]),
+                    "event": str(row["event_type"]),
+                    "data": json.loads(str(row["data_json"])),
+                    "terminal": bool(row["is_terminal"]),
+                    "created_at": float(row["created_at"]),
+                }
+                for row in await cursor.fetchall()
+            ]
 
     async def delete_chat_stream_events_for_session(
         self,
@@ -5168,12 +5274,13 @@ class Database:
     async def list_agent_turn_events(
         self, turn_id: str
     ) -> list[dict[str, Any]]:
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT * FROM agent_turn_events WHERE turn_id=? ORDER BY sequence",
-            (turn_id,),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                "SELECT * FROM agent_turn_events WHERE turn_id=? ORDER BY sequence",
+                (turn_id,),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def approve_operation_approval(
         self,
@@ -5281,12 +5388,13 @@ class Database:
     async def list_operation_approval_events(
         self, approval_id: str
     ) -> list[dict[str, Any]]:
-        conn = await self._require_conn()
-        cursor = await conn.execute(
-            "SELECT * FROM operation_approval_events WHERE approval_id=? ORDER BY id",
-            (approval_id,),
-        )
-        return [dict(row) for row in await cursor.fetchall()]
+        async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                "SELECT * FROM operation_approval_events WHERE approval_id=? ORDER BY id",
+                (approval_id,),
+            )
+            return [dict(row) for row in await cursor.fetchall()]
 
     async def _insert_operation_event(
         self,
@@ -5311,6 +5419,70 @@ class Database:
                 session_id, json.dumps(detail, sort_keys=True), created_at,
             ),
         )
+
+    async def prune_approval_ledger(
+        self, *, retention_seconds: int
+    ) -> dict[str, int]:
+        """Batch 6.5 (round-6 §25.3): DB-level retention for the durable
+        approval ledger.
+
+        ``ApprovalBroker.sweep_expired`` clears the in-memory dicts only;
+        the underlying ``operation_approvals`` / ``operation_approval_events``
+        rows accumulated without bound.  This method deletes rows that are
+        either terminal (``consumed`` / ``cancelled``) OR past their
+        ``expires_at`` by more than ``retention_seconds`` — a grace window
+        so recently-resolved approvals remain auditable.  The matching
+        ``operation_approval_events`` rows are pruned via cascading
+        deletion on the approval id.
+
+        Returns ``{"operation_approvals": N, "operation_approval_events": N}``
+        with the per-table deleted counts.
+
+        This is a WRITE and runs under ``transaction()`` so the prune is
+        atomic.  The Maintenance loop calls it hourly.
+        """
+        if retention_seconds < 0:
+            retention_seconds = 0
+        cutoff = time.time() - retention_seconds
+        deleted_op = 0
+        deleted_ev = 0
+        async with self.transaction() as conn:
+            # Collect the approval_ids we are about to remove so we can
+            # prune their events in the same transaction (the events table
+            # has no FK cascade — it is append-only audit).
+            cursor = await conn.execute(
+                """
+                SELECT approval_id FROM operation_approvals
+                WHERE status IN ('consumed', 'cancelled')
+                   OR (expires_at IS NOT NULL AND expires_at < ?)
+                """,
+                (cutoff,),
+            )
+            stale_ids = [str(row["approval_id"]) for row in await cursor.fetchall()]
+            if stale_ids:
+                # Prune events for the stale approvals first.
+                placeholders = ",".join("?" for _ in stale_ids)
+                ev_cur = await conn.execute(
+                    f"DELETE FROM operation_approval_events "
+                    f"WHERE approval_id IN ({placeholders})",
+                    stale_ids,
+                )
+                deleted_ev = ev_cur.rowcount or 0
+                op_cur = await conn.execute(
+                    f"DELETE FROM operation_approvals "
+                    f"WHERE approval_id IN ({placeholders})",
+                    stale_ids,
+                )
+                deleted_op = op_cur.rowcount or 0
+        logger.debug(
+            "prune_approval_ledger: removed %d operation_approvals + %d "
+            "events (retention_seconds=%d, cutoff=%d)",
+            deleted_op, deleted_ev, retention_seconds, int(cutoff),
+        )
+        return {
+            "operation_approvals": deleted_op,
+            "operation_approval_events": deleted_ev,
+        }
 
     async def _require_conn(self):
         """Return the appropriate connection for the current context.

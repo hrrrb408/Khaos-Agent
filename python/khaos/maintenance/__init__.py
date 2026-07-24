@@ -43,6 +43,12 @@ _DEFAULT_RETENTION_SECONDS = 24 * 3600
 _DEFAULT_INTERVAL_SECONDS = 3600
 # Default TTL for approval broker records.
 _DEFAULT_APPROVAL_TTL_SECONDS = 3600.0
+# Batch 6.5 (round-6 §25.3): retention for the DURABLE approval ledger
+# (operation_approvals / operation_approval_events rows).  The in-memory
+# ``ApprovalBroker.sweep_expired`` clears the dicts; the DB rows need their
+# own pruning or they grow without bound.  7 days keeps recently-resolved
+# approvals auditable while bounding storage.
+_DEFAULT_APPROVAL_LEDGER_RETENTION_SECONDS = 7 * 24 * 3600
 
 
 class MaintenanceService:
@@ -78,12 +84,14 @@ class MaintenanceService:
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
         retention_seconds: float = _DEFAULT_RETENTION_SECONDS,
         approval_ttl_seconds: float = _DEFAULT_APPROVAL_TTL_SECONDS,
+        approval_ledger_retention_seconds: float = _DEFAULT_APPROVAL_LEDGER_RETENTION_SECONDS,
     ) -> None:
         self._db = db
         self._approval_broker = approval_broker
         self._interval = max(60.0, interval_seconds)
         self._retention = retention_seconds
         self._approval_ttl = approval_ttl_seconds
+        self._approval_ledger_retention = approval_ledger_retention_seconds
         self._task: asyncio.Task[None] | None = None
         self._running = False
 
@@ -155,6 +163,25 @@ class MaintenanceService:
                     logger.info("maintenance: swept %d expired approvals", total)
             except Exception as exc:  # noqa: BLE001
                 logger.error("maintenance: approval sweep failed: %s", exc)
+
+        # 3. Batch 6.5 (round-6 §25.3): prune the DURABLE approval ledger.
+        #    ``sweep_expired`` only clears the in-memory dicts; the DB rows
+        #    in ``operation_approvals`` / ``operation_approval_events`` grow
+        #    without bound otherwise.  Runs in its own try so a failure
+        #    does not skip subsequent cycles.
+        try:
+            pruned = await self._db.prune_approval_ledger(
+                retention_seconds=int(self._approval_ledger_retention),
+            )
+            total_pruned = sum(pruned.values())
+            if total_pruned > 0:
+                counts["approval_ledger_pruned"] = total_pruned
+                logger.info(
+                    "maintenance: pruned %d durable approval rows (%s)",
+                    total_pruned, pruned,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("maintenance: prune_approval_ledger failed: %s", exc)
 
         return counts
 
