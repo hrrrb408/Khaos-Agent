@@ -518,6 +518,17 @@ async def _emergency_instance_cleanup(
     second process can start against it; the OS reaps everything when
     the process exits.  Only when ALL upstream owners have shut down
     cleanly is the DB closed.
+
+    Batch 6.5 (round-6 §十六): FAIL-STOP dependency chain.  The shutdown
+    topology is maintenance → subagent → agent → db, where each lower
+    layer borrows the layer above's shared authorities.  If an upstream
+    layer fails to shut down, its live owners may still be using those
+    borrowed authorities — closing them would leave the live owner
+    half-quarantined (alive but with Office/Browser/Audit already gone).
+    Therefore a failure at ANY layer now stops the whole chain: it does
+    NOT fall through to close downstream borrowed authorities.  Each
+    step returns ``False`` (quarantine + retain lock) on failure rather
+    than logging and continuing.
     """
     ok = True
     # Round-5 Batch 5.2 (C-05): stop the maintenance loop FIRST so it
@@ -532,16 +543,42 @@ async def _emergency_instance_cleanup(
                 exc_info=True,
             )
             ok = False
+    # Batch 6.5 (round-6 §十六): FAIL-STOP dependency chain.  The shutdown
+    # topology is maintenance → subagent → agent → db, where each lower
+    # layer BORROWS the layer above's shared authorities (Subagent borrows
+    # Agent's OfficeMutationAuthority / BrowserManager / AuditLogger /
+    # ApprovalBroker / DB; Agent borrows the DB).  If an upstream layer
+    # fails to shut down, its live owners may still be using those borrowed
+    # authorities — closing them would leave the live owner half-quarantined
+    # (alive but its authorities gone).  Therefore a failure at any layer
+    # MUST NOT proceed to close the downstream borrowed authorities.  Each
+    # step checks ``ok`` and returns early (quarantine + retain lock) on
+    # failure, instead of the old "log + continue" fall-through.
+    if not ok:
+        logger.error(
+            "emergency cleanup: maintenance.stop() failed; NOT shutting "
+            "down subagent/agent/db — borrowed authorities retained to "
+            "avoid half-quarantine; instance lock must be retained",
+        )
+        return False
     if subagent_service is not None:
         try:
             await subagent_service.shutdown(timeout=SUBAGENT_SHUTDOWN_TIMEOUT)
         except Exception:  # noqa: BLE001 — best-effort cleanup
             logger.error(
                 "emergency cleanup: subagent_service.shutdown() failed; "
-                "live subagent owners may remain",
+                "live subagent owners may remain — NOT shutting down "
+                "agent/db (Subagent borrows Agent's Office/Browser/Audit)",
                 exc_info=True,
             )
             ok = False
+    if not ok:
+        logger.error(
+            "emergency cleanup: subagent shutdown failed; QUARANTINING "
+            "agent + database (not closing borrowed authorities) — live "
+            "subagent owners may still be active; instance lock retained",
+        )
+        return False
     if agent is not None:
         try:
             await agent.shutdown()
@@ -559,9 +596,9 @@ async def _emergency_instance_cleanup(
     # service lifecycle.  Quarantine (leave open) + retain lock instead.
     if not ok:
         logger.error(
-            "emergency cleanup: upstream shutdown failed; QUARANTINING "
-            "the database (not closing) — live owners may still be "
-            "active; instance lock must be retained",
+            "emergency cleanup: agent shutdown failed; QUARANTINING "
+            "the database (not closing) — live cron/chat owners may "
+            "still be active; instance lock must be retained",
         )
         return False
     if db is not None:
@@ -1886,52 +1923,73 @@ class TaskService:
         from collections import OrderedDict
         self._managers: "OrderedDict[tuple[str, str], TaskManager]" = OrderedDict()
         self._MAX_MANAGERS = 32
+        # Batch 6.5 (round-6 §十七): service-level cache lock.  Without
+        # it, two concurrent ``_manager()`` calls for the same key both
+        # observe a cache miss, both build+load a TaskManager, and one
+        # overwrites the cache — the loser (with any registered
+        # subscribers) is silently dropped, producing two managers for
+        # one ``(principal, project)``.  The lock serializes the whole
+        # miss → build → load → insert → LRU-evict sequence.
+        self._manager_cache_lock = asyncio.Lock()
 
     async def _manager(self, ctx: RequestContext) -> TaskManager:
-        """Get or create the per-(principal, project) TaskManager."""
+        """Get or create the per-(principal, project) TaskManager.
+
+        Batch 6.5 (round-6 §十七): the entire lookup + build + LRU-evict
+        sequence is serialized under ``_manager_cache_lock`` so two
+        concurrent callers for the same key cannot race-build two
+        managers (split-brain).  Eviction uses the atomic
+        ``begin_eviction()`` CAS instead of the unlocked
+        ``can_evict()`` + ``aclose()`` two-step, closing the window in
+        which a task could go active between the check and the drain.
+        """
         key = (ctx.principal_id, ctx.project_id)
-        manager = self._managers.get(key)
-        if manager is None:
-            # LRU eviction: drop the oldest EVICTABLE entry if at
-            # capacity.  Round-5 Batch 5.4: a manager with active tasks
-            # or live subscribers is NOT evicted (``can_evict`` returns
-            # False) — evicting a live owner would silently drop its
-            # in-memory cache and mark interrupted in-flight work as
-            # ``blocked`` on next ``load()``.  If no evictable entry
-            # exists, the cache is allowed to temporarily grow beyond
-            # ``_MAX_MANAGERS`` rather than evicting a live owner.
-            if len(self._managers) >= self._MAX_MANAGERS:
-                evicted = False
-                # Iterate oldest-first (OrderedDict insertion order).
-                for evict_key in list(self._managers.keys()):
-                    candidate = self._managers[evict_key]
-                    if not candidate.can_evict():
-                        continue
-                    await candidate.aclose()
-                    self._managers.pop(evict_key, None)
-                    logger.debug(
-                        "TaskService LRU: evicted manager for %s",
-                        evict_key,
-                    )
-                    evicted = True
-                    break
-                if not evicted:
-                    logger.warning(
-                        "TaskService LRU: cache at capacity (%d) but no "
-                        "evictable manager (all have live owners); "
-                        "temporarily exceeding limit",
-                        len(self._managers),
-                    )
-            manager = TaskManager(
-                db=self.db, principal_id=ctx.principal_id,
-                project_id=ctx.project_id,
-            )
-            await manager.load()
-            self._managers[key] = manager
-        else:
-            # Move to end (most-recently-used).
-            self._managers.move_to_end(key)
-        return manager
+        async with self._manager_cache_lock:
+            manager = self._managers.get(key)
+            if manager is None:
+                # LRU eviction: drop the oldest EVICTABLE entry if at
+                # capacity.  Round-5 Batch 5.4: a manager with active
+                # tasks or live subscribers is NOT evicted.  Batch 6.5:
+                # ``can_evict()`` is a cheap unlocked pre-filter, but
+                # the authoritative decision is the ``begin_eviction()``
+                # CAS (which re-checks under the manager lock and flips
+                # ``_closing`` so no new work can arrive in the gap).
+                if len(self._managers) >= self._MAX_MANAGERS:
+                    evicted = False
+                    # Iterate oldest-first (OrderedDict insertion order).
+                    for evict_key in list(self._managers.keys()):
+                        candidate = self._managers[evict_key]
+                        if not candidate.can_evict():
+                            continue
+                        if not await candidate.begin_eviction():
+                            # Lost the CAS (went active / gained a
+                            # subscriber / already evicting) — try next.
+                            continue
+                        await candidate.aclose()
+                        self._managers.pop(evict_key, None)
+                        logger.debug(
+                            "TaskService LRU: evicted manager for %s",
+                            evict_key,
+                        )
+                        evicted = True
+                        break
+                    if not evicted:
+                        logger.warning(
+                            "TaskService LRU: cache at capacity (%d) but "
+                            "no evictable manager (all have live owners); "
+                            "temporarily exceeding limit",
+                            len(self._managers),
+                        )
+                manager = TaskManager(
+                    db=self.db, principal_id=ctx.principal_id,
+                    project_id=ctx.project_id,
+                )
+                await manager.load()
+                self._managers[key] = manager
+            else:
+                # Move to end (most-recently-used).
+                self._managers.move_to_end(key)
+            return manager
 
     async def list(self, ctx: RequestContext, active_only: bool = False) -> list[dict]:
         """List tasks — active ones by default, all when ``active_only`` is set.
