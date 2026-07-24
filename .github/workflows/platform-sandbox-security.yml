@@ -231,9 +231,14 @@ jobs:
           KHAOS_BROWSER_DEV_MODE: ""
           KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser
+        # ``sudo`` does not inherit the setup-python PATH/PYTHONPATH, so
+        # we capture the full interpreter path + PYTHONPATH and pass them
+        # through explicitly (mirrors the linux-bwrap-security job).
         run: |
-          sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT \
-            python -m pytest \
+          python_bin="$(command -v python)"
+          py_path="$PYTHONPATH"
+          sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,PYTHONPATH \
+            "$python_bin" -m pytest \
             python/tests/security/test_browser_kernel_isolation_round6.py \
             -m kernel_real -v
       - name: Capture post-test kernel diagnostics
