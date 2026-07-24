@@ -36,6 +36,18 @@ Historical versions (v1–v5) carry the ``HISTORICAL_ACCEPTED`` sentinel
 checksum because their original bytes pre-date the manifest and cannot be
 reconstructed; ``run_migrations`` verifies their NAME only (review §10.5).
 
+Batch 7.1 (round-7 §五/§十六/§十九):
+  - Each historical version's canonical ``name`` is the one the REAL
+    release commit wrote (confirmed via git history).  An
+    ``accepted_historical_names`` alias set also accepts the wrong names
+    Batch 6.4 used for synthetic backfill, so those DBs still upgrade.
+  - The v1–v5 ledger rows on a fresh DB are SYNTHETIC backfill (written
+    by ``_backfill_historical_ledger_rows`` for completeness) — they were
+    never individually applied by a real release runner.  They are marked
+    ``app_version='synthetic-backfill'`` so an audit can tell them apart
+    from rows a real release actually wrote.  A live v4/v5 DB keeps its
+    own real ``app_version``.
+
 ``schema.sql`` (in the parent ``db/`` dir) is retained only for tooling
 that reads the aggregate schema; it is NOT executed at runtime and is NOT
 the checksum source.
