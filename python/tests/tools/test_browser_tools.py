@@ -55,7 +55,7 @@ def force_mock_fallback(monkeypatch):
 
 async def test_browser_navigate_updates_mock_url():
     result = await browser_navigate("https://example.com")
-    assert result == {"ok": True, "url": "https://example.com"}
+    assert result == {"ok": True, "url": "https://example.com", "mock": True}
     # Subsequent snapshot reflects the navigate.
     snapshot = await browser_snapshot()
     assert snapshot["url"] == "https://example.com"
@@ -63,7 +63,7 @@ async def test_browser_navigate_updates_mock_url():
 
 async def test_browser_click_records_click():
     result = await browser_click("#submit")
-    assert result == {"ok": True, "selector": "#submit"}
+    assert result == {"ok": True, "selector": "#submit", "mock": True}
     snapshot = await browser_snapshot()
     assert snapshot["clicks"] == ["#submit"]
 
@@ -77,7 +77,7 @@ async def test_browser_click_records_multiple_in_order():
 
 async def test_browser_type_records_typed_text():
     result = await browser_type("#q", "khaos")
-    assert result == {"ok": True, "selector": "#q", "text": "khaos"}
+    assert result == {"ok": True, "selector": "#q", "text": "khaos", "mock": True}
     snapshot = await browser_snapshot()
     assert snapshot["typed"] == {"#q": "khaos"}
 
@@ -130,7 +130,7 @@ async def test_browser_screenshot_unavailable_in_mock_mode():
 
 async def test_browser_scroll_returns_confirmation():
     result = await browser_scroll(direction="down", amount=5)
-    assert result == {"ok": True, "direction": "down", "amount": 5}
+    assert result == {"ok": True, "direction": "down", "amount": 5, "mock": True}
 
 
 async def test_browser_scroll_defaults():
@@ -162,6 +162,7 @@ async def test_browser_file_upload_records_in_mock(tmp_path):
             "ok": True,
             "selector": "input[type=file]",
             "file": str(f),
+            "mock": True,
         }
     else:
         assert result["ok"] is False

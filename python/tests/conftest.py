@@ -26,6 +26,11 @@ os.environ.setdefault("KHAOS_ALLOW_PROJECT_DB", "1")
 # into the dev-mode proxy-only fallback, which is the documented escape
 # hatch.  Production code never sets this variable.
 os.environ.setdefault("KHAOS_BROWSER_DEV_MODE", "1")
+# Batch 7.4 (round-7 §十二): browser tools fail-closed when Playwright is
+# missing (production never silently mocks).  Tests opt into the mock
+# fallback so a bare ``pip install -e .[test]`` checkout without
+# Playwright can still exercise the browser-tool logic paths.
+os.environ.setdefault("KHAOS_BROWSER_MOCK_MODE", "1")
 
 # Round-5 Batch 5.5: auto-enable the heavy E2E test suites when the
 # required runtime is present on the developer's machine.  Both flags
