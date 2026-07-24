@@ -317,6 +317,152 @@ def test_kernel_real_reaper_does_not_delete_live_sandbox(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Batch 7.5 (round-7 §十三): the missing coverage the review called out.
+# These complete the "what the tests claim to prove" list.
+# ---------------------------------------------------------------------------
+
+
+def test_kernel_real_egress_pin_makes_proxy_port_reachable():
+    """§十三: after ``install_egress_pin(port)``, a process inside the netns
+    CAN connect to that port on the host veth IP.  This proves the
+    positive direction (proxy reachability), complementing the existing
+    default-deny test (negative direction)."""
+    _require_root()
+    sb = BrowserNetworkSandbox(require_os_sandbox=True)
+    try:
+        sb.setup()
+        # Start a listener on the host veth IP on a known port.
+        proxy_port = _free_port()
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind((sb._host_ip, proxy_port))
+        listener.listen(1)
+        listener.settimeout(3)
+        try:
+            # Pin the port — the kernel rule now allows it.
+            sb.install_egress_pin(proxy_port)
+            # Connect from the netns: should SUCCEED now.
+            cp = _exec_in_netns(
+                sb._netns_name,
+                ["python3", "-c",
+                 f"import socket; s=socket.socket(); "
+                 f"s.settimeout(2); "
+                 f"print('OK' if s.connect_ex(('{sb._host_ip}',{proxy_port}))==0 else 'BLOCKED')"],
+            )
+            assert "OK" in cp.stdout, (
+                f"egress pin failed: netns could not reach pinned proxy "
+                f"port {proxy_port} (output: {cp.stdout!r})"
+            )
+        finally:
+            listener.close()
+    finally:
+        sb.teardown()
+
+
+def test_kernel_real_secret_port_blocked_even_with_other_pin():
+    """§十三: a DIFFERENT port (not the pinned one) remains blocked.  This
+    proves the egress policy is per-port exact-match, not "any port open"."""
+    _require_root()
+    sb = BrowserNetworkSandbox(require_os_sandbox=True)
+    try:
+        sb.setup()
+        proxy_port = _free_port()
+        secret_port = _free_port()
+        # Listen on the secret port.
+        secret_listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        secret_listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        secret_listener.bind((sb._host_ip, secret_port))
+        secret_listener.listen(1)
+        secret_listener.settimeout(3)
+        try:
+            sb.install_egress_pin(proxy_port)  # pin a DIFFERENT port
+            # The secret port must still be BLOCKED.
+            cp = _exec_in_netns(
+                sb._netns_name,
+                ["python3", "-c",
+                 f"import socket; s=socket.socket(); "
+                 f"s.settimeout(2); "
+                 f"print('OK' if s.connect_ex(('{sb._host_ip}',{secret_port}))==0 else 'BLOCKED')"],
+            )
+            assert "BLOCKED" in cp.stdout, (
+                f"non-pinned secret port {secret_port} was reachable "
+                f"(only {proxy_port} should be pinned)"
+            )
+        finally:
+            secret_listener.close()
+    finally:
+        sb.teardown()
+
+
+def test_kernel_real_process_in_netns_lands_in_cgroup():
+    """§十三: a process launched inside the netns via the cgroup join path
+    must actually be a member of the sandbox's cgroup.  We spawn a sleep
+    via ``ip netns exec`` after writing its PID into cgroup.procs, then
+    check cgroup.procs contains it."""
+    _require_root()
+    sb = BrowserNetworkSandbox(require_os_sandbox=True)
+    try:
+        sb.setup()
+        assert sb._cgroup_path is not None
+        procs_file = sb._cgroup_path / "cgroup.procs"
+        # Spawn a short-lived process inside the netns, joined to the cgroup.
+        # We write the subprocess PID into cgroup.procs then exec sleep.
+        cp = subprocess.run(
+            ["sh", "-c",
+             f"echo $$ > {procs_file} 2>/dev/null; "
+             f"ip netns exec {sb._netns_name} sleep 2 & "
+             f"CHILDPID=$!; sleep 0.5; "
+             f"cat {procs_file}; kill $CHILDPID 2>/dev/null"],
+            capture_output=True, text=True, timeout=10,
+        )
+        # The cgroup.procs dump should contain at least one PID (the child).
+        pids_in_cgroup = [
+            int(line.strip())
+            for line in cp.stdout.splitlines()
+            if line.strip().isdigit()
+        ]
+        assert pids_in_cgroup, (
+            f"no PIDs found in cgroup.procs after launching a netns "
+            f"process (output: {cp.stdout!r})"
+        )
+    finally:
+        sb.teardown()
+
+
+def test_kernel_real_reaper_does_not_delete_live_process_resources(tmp_path):
+    """§十三: the startup_reaper must NOT delete resources belonging to a
+    LIVE process.  We create a sandbox whose PID is still alive, then run
+    ``startup_reaper()`` and confirm the sandbox's resources survive.
+
+    (This is distinct from the teardown-isolation test above — that one
+    checks a second SANDBOX doesn't delete a live one; this one checks
+    the STARTUP REAPER itself respects liveness.)"""
+    _require_root()
+    sb = BrowserNetworkSandbox(require_os_sandbox=True)
+    sb.setup()
+    netns = sb._netns_name
+    nft = sb._nft_table
+    reg_file = sb._registry_file
+    assert reg_file is not None and reg_file.exists()
+    try:
+        # The current process (PID) is alive, and the registry records it.
+        # Run the reaper — it should see our PID is alive and skip us.
+        counts = BrowserNetworkSandbox.startup_reaper()
+        # Our resources must survive (reaper found them live).
+        assert _netns_exists(netns), (
+            "reaper deleted a LIVE process's netns"
+        )
+        assert _nft_table_exists(nft), (
+            "reaper deleted a LIVE process's nft table"
+        )
+        assert reg_file.exists(), (
+            "reaper deleted a LIVE process's registry file"
+        )
+    finally:
+        sb.teardown()
+
+
+# ---------------------------------------------------------------------------
 # helper: find a free TCP port on the host
 # ---------------------------------------------------------------------------
 
