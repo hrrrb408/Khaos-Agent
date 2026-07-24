@@ -101,6 +101,88 @@ _RUN_DIR_ROOT = Path.home() / ".khaos" / "run"
 _RESOURCE_REGISTRY = Path.home() / ".khaos" / "run" / "browser_registry"
 
 
+# ---------------------------------------------------------------------------
+# Batch 7.3 (round-7 §六/§七/§八): resource-name derivation + validation,
+# creation-stage state machine, structured teardown result.
+#
+# §六 fix: the registry NO LONGER stores resource names (netns/veth/cgroup/
+# nft).  They are DERIVED from the per-sandbox token by the trusted code
+# below, and the reaper re-derives them instead of trusting registry
+# strings.  Each derived name is validated against a strict regex so a
+# crafted/foreign name can never reach a privileged ``ip``/``nft`` command.
+# ---------------------------------------------------------------------------
+
+import re as _re
+
+# Strict format validators for every derived resource name.  A name that
+# does not match is REFUSED before any privileged operation — this closes
+# the Confused Deputy (review §六): a forged registry entry cannot name an
+# arbitrary netns/veth/nft-table/cgroup for the privileged reaper to delete.
+_NETNS_RE = _re.compile(r"^khaos-br-[0-9a-f]{6}$")
+_VETH_RE = _re.compile(r"^khbr[h]-[0-9a-f]{6}$")
+_NFT_TABLE_RE = _re.compile(r"^khaos_browser_[0-9a-f]{16}$")
+
+
+def _derive_netns_name(token: str) -> str:
+    """Derive the netns name from the sandbox token (trusted derivation)."""
+    return f"khaos-br-{token[:6]}"
+
+
+def _derive_veth_host(token: str) -> str:
+    """Derive the host veth name from the sandbox token."""
+    return f"khbrh-{token[:6]}"
+
+
+def _derive_nft_table(token: str) -> str:
+    """Derive the nft table name from the sandbox token."""
+    return f"{_NFT_TABLE_PREFIX}_{token}"
+
+
+def _derive_cgroup_name(token: str) -> str:
+    """Derive the cgroup leaf name from the sandbox token."""
+    return f"{_CGROUP_BROWSER_PREFIX}-{token[:8]}"
+
+
+def _is_valid_derived_name(
+    *, netns: str = "", veth: str = "", nft_table: str = ""
+) -> bool:
+    """Return True iff every provided name matches its strict derived format.
+
+    Used by the reaper to refuse forged registry entries (§六)."""
+    if netns and not _NETNS_RE.match(netns):
+        return False
+    if veth and not _VETH_RE.match(veth):
+        return False
+    if nft_table and not _NFT_TABLE_RE.match(nft_table):
+        return False
+    return True
+
+
+# Creation-stage state machine (§七).  The registry records the current
+# stage so a crash at any point leaves a trace the reaper can act on.
+_CREATION_STAGES = (
+    "INTENT", "NETNS", "VETH", "CGROUP", "RUNDIR",
+    "NFT_ACTIVE", "BROWSER_ACTIVE",
+)
+_RELEASE_STAGES = ("RELEASING", "RELEASED", "QUARANTINED")
+
+
+@dataclass
+class CleanupResult:
+    """§八: structured teardown result.  Every kernel resource is tracked;
+    if any deletion fails, ``fully_closed`` is False and the registry is
+    retained so the next startup reaper can retry."""
+
+    nft_removed: bool = False
+    veth_removed: bool = False
+    netns_removed: bool = False
+    cgroup_removed: bool = False
+    wrapper_removed: bool = False
+    run_dir_removed: bool = False
+    registry_retained: bool = False
+    fully_closed: bool = False
+
+
 @dataclass
 class BrowserSandboxConfig:
     """Resource limits for the browser cgroup."""
@@ -172,6 +254,9 @@ class BrowserNetworkSandbox:
         self._enforcement = EnforcementStatus()
         # Round-5 H-03: registry file path for ownership tracking.
         self._registry_file: Path | None = None
+        # Batch 7.3 §七: creation-stage state machine.  Persisted in the
+        # registry so the reaper can act on a crash at any point.
+        self._creation_stage: str = ""
         # Round-6 Batch 6.2 (C-02 + §六): the set of currently-active
         # egress proxy ports.  ``install_egress_pin`` now ADDS to this
         # set (instead of ``flush``-ing the whole table — which would
@@ -222,50 +307,55 @@ class BrowserNetworkSandbox:
             logger.warning("browser netns sandbox: %s, using proxy-only", reason)
             return
 
-        # Round-5 H-01: all resource names include the per-sandbox token.
-        self._netns_name = f"khaos-{_VETH_PREFIX}-{self._token}"
-        self._veth_host = f"{_VETH_PREFIX}h-{self._token}"
-        self._veth_ns = f"{_VETH_PREFIX}n-{self._token}"
-        # Truncate token for interface name length limits (15 chars).
-        # veth names: "khaos-brh-" (10) + 6 hex chars = 16 → too long.
-        # Use a shorter prefix for veth to stay under 15 chars.
-        short_token = self._token[:6]
-        self._veth_host = f"khbrh-{short_token}"
-        self._veth_ns = f"khbrn-{short_token}"
-        self._netns_name = f"khaos-br-{short_token}"
-        self._nft_table = f"{_NFT_TABLE_PREFIX}_{self._token}"
+        # Batch 7.3 (round-7 §六): resource names are DERIVED from the token
+        # via trusted helpers (never read back from the registry).  The old
+        # dead-code that built names two different ways is removed.
+        self._netns_name = _derive_netns_name(self._token)
+        self._veth_host = _derive_veth_host(self._token)
+        self._veth_ns = f"khbrn-{self._token[:6]}"
+        self._nft_table = _derive_nft_table(self._token)
 
         # Randomize the second octet to avoid collisions.
         subnet = f"{_VETH_SUBNET_PREFIX}.{secrets.randbelow(250) + 1}"
         self._host_ip = f"{subnet}.1"
         self._ns_ip = f"{subnet}.2"
 
+        # Batch 7.3 §七: write INTENT FIRST (before any kernel resource is
+        # created) so a crash at any later point leaves a registry trace
+        # the reaper can act on.  Production refuses to start if the
+        # registry cannot be written (§六 — was best-effort debug).
+        self._creation_stage = "INTENT"
         try:
+            self._write_registry_entry()  # writes INTENT
             self._create_netns()
+            self._creation_stage = "NETNS"
+            self._update_registry_stage("NETNS")
             self._configure_veth()
+            self._creation_stage = "VETH"
+            self._update_registry_stage("VETH")
             self._create_cgroup()
+            self._creation_stage = "CGROUP"
+            self._update_registry_stage("CGROUP")
             self._create_secure_run_dir()
-            self._write_registry_entry()
+            self._creation_stage = "RUNDIR"
+            self._update_registry_stage("RUNDIR")
             if self._cgroup_path is None and self._require_os_sandbox:
                 raise BrowserSandboxError(
                     "cgroup-v2 leaf creation failed — resource limits "
                     "cannot be enforced"
                 )
             # Round-6 Batch 6.2 (§五): install the default-deny kernel
-            # rule BEFORE the browser is launched.  ``install_egress_pin``
-            # (called later from ``ensure_page``) only ADDS a port to
-            # this already-default-deny table.  This closes the startup
-            # window in which the veth was completely open between
-            # ``setup()`` and the first ``ensure_page()``.
+            # rule BEFORE the browser is launched.
             self._install_default_deny_nft()
+            self._creation_stage = "NFT_ACTIVE"
+            self._update_registry_stage("NFT_ACTIVE")
             self._active = True
+            self._creation_stage = "BROWSER_ACTIVE"
+            self._update_registry_stage("BROWSER_ACTIVE")
             self._enforcement = EnforcementStatus(
                 network_namespace=True,
                 proxy_required=True,
                 cgroup=self._cgroup_path is not None,
-                # route_guard is True from the moment the default-deny
-                # table exists (no proxy port allowed yet, but the
-                # kernel is already enforcing "browser veth → drop").
                 route_guard=True,
                 service_workers_blocked=True,
             )
@@ -291,14 +381,17 @@ class BrowserNetworkSandbox:
 
     @staticmethod
     def startup_reaper() -> dict[str, int]:
-        """Round-5 review Batch 5.1 (H-03): clean up resources from a
-        previous process that crashed without calling ``teardown()``.
+        """Round-5 review Batch 5.1 (H-03) + Batch 7.3 (round-7 §六):
+        clean up resources from a previous process that crashed without
+        calling ``teardown()``.
 
-        Unlike the round-4 reaper which blindly deleted ALL ``khaos-*``
-        resources, this version reads the resource registry
-        (``~/.khaos/run/browser_registry/``) and only deletes resources
-        whose owning process is confirmed dead (PID no longer exists or
-        process start-time has changed).
+        §六 fix: the reaper NO LONGER trusts registry-supplied resource
+        names.  It DERIVES every name (netns/veth/nft/cgroup) from the
+        registry's ``token`` via the trusted helpers, and VALIDATES each
+        against a strict regex before passing it to a privileged command.
+        A forged registry entry cannot name an arbitrary resource.  The
+        cgroup path is rebuilt from the trusted root + token and checked
+        with ``realpath().is_relative_to(trusted_root)``.
 
         Returns a dict of cleanup counts: ``{"netns": N, "veth": N,
         "cgroup": N, "nft": N}``.
@@ -309,12 +402,33 @@ class BrowserNetworkSandbox:
 
         # H-03: Read the registry and find orphaned resources.
         orphans = _find_orphaned_resources()
+        trusted_cgroup_root = _browser_cgroup_root()
         for entry in orphans:
             token = entry.get("token", "")
-            if not token:
+            # §六: token must be a 16-hex string (the format our token
+            # generator produces); a forged/short token is refused.
+            if not token or not _re.match(r"^[0-9a-f]{16}$", token):
+                logger.warning(
+                    "reaper: registry entry has invalid token %r — skipping "
+                    "(possible forgery)", token[:32],
+                )
+                continue
+            # DERIVE every resource name from the token (trusted).
+            netns_name = _derive_netns_name(token)
+            veth_host = _derive_veth_host(token)
+            nft_table = _derive_nft_table(token)
+            # VALIDATE the derived names against strict regex (defense
+            # in depth — the derivation is already correct, but this
+            # guards against a future derivation change).
+            if not _is_valid_derived_name(
+                netns=netns_name, veth=veth_host, nft_table=nft_table,
+            ):
+                logger.error(
+                    "reaper: derived names for token %s failed validation — "
+                    "skipping (derivation bug?)", token,
+                )
                 continue
             # Delete netns
-            netns_name = entry.get("netns_name", f"khaos-br-{token[:6]}")
             with _suppress_oserrors():
                 _run_command(
                     ["ip", "netns", "del", netns_name],
@@ -322,22 +436,31 @@ class BrowserNetworkSandbox:
                 )
                 counts["netns"] += 1
             # Delete veth (host end)
-            veth_host = entry.get("veth_host", f"khbrh-{token[:6]}")
             with _suppress_oserrors():
                 _run_command(
                     ["ip", "link", "del", veth_host],
                     f"reaper: delete orphaned veth {veth_host}",
                 )
                 counts["veth"] += 1
-            # Delete cgroup
-            cgroup_path = entry.get("cgroup_path")
-            if cgroup_path:
-                cg = Path(cgroup_path)
-                if cg.is_dir():
-                    _remove_cgroup(cg)
-                    counts["cgroup"] += 1
+            # Delete cgroup — §六: rebuild path from trusted root + token,
+            # NOT from the registry.  realpath-is-relative-to guard.
+            if trusted_cgroup_root is not None:
+                cg = trusted_cgroup_root / _derive_cgroup_name(token)
+                try:
+                    if cg.is_dir():
+                        real = cg.resolve(strict=False)
+                        if real.is_relative_to(trusted_cgroup_root):
+                            _remove_cgroup(cg)
+                            counts["cgroup"] += 1
+                        else:
+                            logger.warning(
+                                "reaper: cgroup %s realpath %s escapes "
+                                "trusted root %s — skipping",
+                                cg, real, trusted_cgroup_root,
+                            )
+                except OSError as exc:
+                    logger.warning("reaper: cgroup cleanup failed: %s", exc)
             # Delete nft table
-            nft_table = entry.get("nft_table", f"{_NFT_TABLE_PREFIX}_{token}")
             with _suppress_oserrors():
                 _run_command(
                     ["nft", "delete", "table", _NFT_TABLE_FAMILY, nft_table],
@@ -558,23 +681,42 @@ class BrowserNetworkSandbox:
             raise BrowserSandboxError(
                 f"invalid egress proxy port: {proxy_port!r}"
             )
-        self._egress_ports.add(int(proxy_port))
-        script = self._build_nft_script(include_table_create=True)
-        applied = self._apply_nft_script(
-            script, description=f"egress pin port {proxy_port}",
-        )
+        # Batch 7.3 (round-7 §九): transactional — APPLY the nft script
+        # FIRST (with the candidate set = current + new port), and only
+        # commit the port to ``_egress_ports`` on success.  Previously
+        # the port was added before the apply, so a failed apply left a
+        # stale port that the next rebuild would silently re-open (even
+        # after the proxy was closed → a host process rebinding the port
+        # became reachable from the browser netns).
+        port = int(proxy_port)
+        candidate = self._egress_ports | {port}
+        saved = set(self._egress_ports)
+        self._egress_ports = candidate
+        try:
+            script = self._build_nft_script(include_table_create=True)
+            applied = self._apply_nft_script(
+                script, description=f"egress pin port {port}",
+            )
+        except BaseException:
+            # Rollback: restore the pre-install set on any failure.
+            self._egress_ports = saved
+            raise
+        if not applied:
+            # Dev-mode soft-failure: rollback so the in-memory set stays
+            # consistent with the (unchanged) kernel policy.
+            self._egress_ports = saved
+            return
         # Only flip route_guard on when the nft apply actually
         # succeeded.  In dev mode, a missing nft binary logs a warning
         # and returns — route_guard must stay False so callers can
         # detect that kernel enforcement is NOT active.
-        if applied:
-            self._enforcement.route_guard = True
-            logger.info(
-                "browser nftables egress pin added: %s → %s:%d "
-                "(table=%s, active_ports=%s)",
-                self._veth_host, self._host_ip, proxy_port,
-                self._nft_table, sorted(self._egress_ports),
-            )
+        self._enforcement.route_guard = True
+        logger.info(
+            "browser nftables egress pin added: %s → %s:%d "
+            "(table=%s, active_ports=%s)",
+            self._veth_host, self._host_ip, port,
+            self._nft_table, sorted(self._egress_ports),
+        )
 
     def remove_egress_port(self, proxy_port: int) -> None:
         """Round-6 Batch 6.2 (§六): remove ``proxy_port`` from the set
@@ -598,11 +740,26 @@ class BrowserNetworkSandbox:
                 port, sorted(self._egress_ports),
             )
             return
+        # Batch 7.3 (round-7 §九): transactional — APPLY the nft script
+        # FIRST with the candidate set (current - port), and only commit
+        # the removal on success.  If the apply fails, KEEP the port in
+        # the set (stale-open is safer than stale-closed: the proxy is
+        # still running, so the kernel allowing it is correct; a rollback
+        # to stale-closed would leave the kernel denying a live proxy).
+        saved = set(self._egress_ports)
         self._egress_ports.discard(port)
-        script = self._build_nft_script(include_table_create=True)
-        self._apply_nft_script(
-            script, description=f"egress pin remove port {port}",
-        )
+        try:
+            script = self._build_nft_script(include_table_create=True)
+            applied = self._apply_nft_script(
+                script, description=f"egress pin remove port {port}",
+            )
+        except BaseException:
+            # Rollback: restore the port on failure (stale-open).
+            self._egress_ports = saved
+            raise
+        if not applied:
+            self._egress_ports = saved  # keep port (stale-open)
+            return
         logger.info(
             "browser nftables egress pin removed: port %d "
             "(table=%s, active_ports=%s)",
@@ -721,24 +878,36 @@ class BrowserNetworkSandbox:
             os.close(fd)
 
     def _write_registry_entry(self) -> None:
-        """H-03 (round-5): write a registry file so the reaper can
-        verify process liveness before deleting this sandbox's resources.
+        """H-03 (round-5) + Batch 7.3 (round-7 §六/§七): write a registry
+        file so the reaper can verify process liveness before deleting this
+        sandbox's resources.
+
+        §六 fix: the registry NO LONGER stores resource names
+        (netns/veth/cgroup/nft).  They are DERIVED from the token by
+        trusted code; the reaper re-derives them.  This closes the
+        Confused Deputy — a forged registry entry cannot name an
+        arbitrary resource for the privileged reaper to delete.  Only
+        ``{token, pid, process_start_time, creation_stage}`` are stored.
+
+        §六/§七 fix: in production (``require_os_sandbox=True``) a registry
+        write failure now RAISES ``BrowserSandboxError`` (was best-effort
+        debug) — a sandbox whose resources cannot be tracked must not
+        start, or a crash would leave un-reapable orphans.
         """
+        import json
         try:
             _RESOURCE_REGISTRY.mkdir(mode=0o700, parents=True, exist_ok=True)
-        except OSError:
-            return  # best-effort
-        import json
+        except OSError as exc:
+            if self._require_os_sandbox:
+                raise BrowserSandboxError(
+                    f"registry directory creation failed: {exc}"
+                ) from exc
+            return  # dev mode: best-effort
         entry = {
             "token": self._token,
             "pid": os.getpid(),
             "process_start_time": _get_process_start_time(os.getpid()),
-            "created_at": time.time(),
-            "netns_name": self._netns_name,
-            "veth_host": self._veth_host,
-            "veth_ns": self._veth_ns,
-            "cgroup_path": str(self._cgroup_path) if self._cgroup_path else None,
-            "nft_table": self._nft_table,
+            "creation_stage": self._creation_stage or "INTENT",
         }
         reg_file = _RESOURCE_REGISTRY / f"{self._token}.json"
         try:
@@ -753,7 +922,47 @@ class BrowserNetworkSandbox:
                 os.close(fd)
             self._registry_file = reg_file
         except OSError as exc:
+            if self._require_os_sandbox:
+                raise BrowserSandboxError(
+                    f"registry entry write failed: {exc}"
+                ) from exc
             logger.debug("registry write failed (best-effort): %s", exc)
+
+    def _update_registry_stage(self, stage: str) -> None:
+        """§七: atomically update the registry's ``creation_stage`` after
+        each resource is created, so a crash leaves a precise trace.  The
+        update is written via a temp-file + atomic rename for durability."""
+        import json
+        if self._registry_file is None:
+            return
+        entry = {
+            "token": self._token,
+            "pid": os.getpid(),
+            "process_start_time": _get_process_start_time(os.getpid()),
+            "creation_stage": stage,
+        }
+        tmp = self._registry_file.with_suffix(".tmp")
+        try:
+            fd = os.open(
+                str(tmp),
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW,
+                mode=0o600,
+            )
+            try:
+                os.write(fd, json.dumps(entry).encode("utf-8"))
+            finally:
+                os.close(fd)
+            os.replace(tmp, self._registry_file)
+        except OSError as exc:
+            # A stage-update failure is not fatal (the INTENT record
+            # already exists), but log it so a persistent failure is
+            # visible.  The reaper falls back to deriving names from
+            # the token regardless of the recorded stage.
+            logger.debug("registry stage update to %s failed: %s", stage, exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def create_wrapper_script(
         self, real_executable: str, proxy_port: int,
@@ -840,24 +1049,48 @@ class BrowserNetworkSandbox:
         self._wrapper_script = script_path
         return str(script_path)
 
-    def teardown(self) -> None:
+    def teardown(self) -> CleanupResult:
         """Clean up nftables, netns, veth pair, cgroup, wrapper, run dir,
         and registry entry.
 
         Round-5 H-02: only deletes THIS sandbox's resources (per-sandbox
         nft table name), never a global table.
 
-        Round-6 Batch 6.2: also clears ``_egress_ports`` so a re-setup()
-        on the same sandbox instance starts from a clean port set.
+        Batch 7.3 (round-7 §八): returns a structured ``CleanupResult``.
+        Every kernel-resource deletion is tracked; if ANY fails, the
+        registry file is RETAINED (``registry_retained=True``) and
+        ``fully_closed=False`` so the next startup reaper can retry.
+        Previously teardown swallowed all failures (``_suppress_oserrors``
+        + unconditional field-clearing + registry delete) and returned
+        None, leaking un-trackable kernel orphans.  ``subprocess.
+        TimeoutExpired`` is now caught too (it is not an ``OSError``,
+        so the old guard let it abort teardown mid-way).
         """
+        result = CleanupResult()
+        # Track which kernel resources were present BEFORE deletion so an
+        # inactive sandbox (nothing present) is vacuously clean.
+        had_nft = self._nft_table is not None
+        had_veth = self._veth_host is not None
+        had_netns = self._netns_name is not None
+        had_cgroup = self._cgroup_path is not None
+
+        # Helper: run a deletion, return True on success.  Catches BOTH
+        # OSError and subprocess.TimeoutExpired (§八 latent bug).
+        def _try(fn) -> bool:
+            try:
+                fn()
+                return True
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                logger.warning("teardown: deletion failed (retained): %s", exc)
+                return False
+
         # Delete per-sandbox nftables table (H-02: not global)
         if self._nft_table is not None:
-            with _suppress_oserrors():
-                _run_command(
-                    ["nft", "delete", "table", _NFT_TABLE_FAMILY,
-                     self._nft_table],
-                    f"delete nftables table {self._nft_table}",
-                )
+            tbl = self._nft_table
+            result.nft_removed = _try(lambda: _run_command(
+                ["nft", "delete", "table", _NFT_TABLE_FAMILY, tbl],
+                f"delete nftables table {tbl}",
+            ))
             self._nft_table = None
         # Round-6 Batch 6.2: clear the egress port set so a re-setup()
         # does not carry stale ports forward.
@@ -865,46 +1098,76 @@ class BrowserNetworkSandbox:
 
         # Delete wrapper script + secure run dir (C-10)
         if self._wrapper_script is not None:
-            with _suppress_oserrors():
-                self._wrapper_script.unlink(missing_ok=True)
+            w = self._wrapper_script
+            result.wrapper_removed = _try(lambda: w.unlink(missing_ok=True))
             self._wrapper_script = None
         if self._run_dir is not None:
-            with _suppress_oserrors():
-                self._run_dir.rmdir()
+            rd = self._run_dir
+            result.run_dir_removed = _try(lambda: rd.rmdir())
             self._run_dir = None
 
-        # Delete cgroup
+        # Delete cgroup — _remove_cgroup logs warnings on failure but
+        # does not raise; verify the dir is actually gone afterwards.
         if self._cgroup_path is not None:
-            _remove_cgroup(self._cgroup_path)
+            cg = self._cgroup_path
+            _remove_cgroup(cg)
+            result.cgroup_removed = not cg.exists()
             self._cgroup_path = None
 
         # Delete veth pair (deleting the host end removes both ends)
         if self._veth_host is not None:
-            with _suppress_oserrors():
-                _run_command(
-                    ["ip", "link", "del", self._veth_host],
-                    f"delete veth {self._veth_host}",
-                )
+            vh = self._veth_host
+            result.veth_removed = _try(lambda: _run_command(
+                ["ip", "link", "del", vh],
+                f"delete veth {vh}",
+            ))
             self._veth_host = None
             self._veth_ns = None
 
         # Delete netns
         if self._netns_name is not None:
-            with _suppress_oserrors():
-                _run_command(
-                    ["ip", "netns", "del", self._netns_name],
-                    f"delete netns {self._netns_name}",
-                )
+            nn = self._netns_name
+            result.netns_removed = _try(lambda: _run_command(
+                ["ip", "netns", "del", nn],
+                f"delete netns {nn}",
+            ))
             self._netns_name = None
 
-        # Delete registry file (H-03)
-        if self._registry_file is not None:
-            with _suppress_oserrors():
-                self._registry_file.unlink(missing_ok=True)
-            self._registry_file = None
+        # §八: clean iff every PRESENT resource was confirmed removed.
+        # A resource that was never set (inactive sandbox) is vacuously
+        # clean.  If any present resource failed, RETAIN the registry.
+        kernel_clean = (
+            (result.nft_removed or not had_nft)
+            and (result.veth_removed or not had_veth)
+            and (result.netns_removed or not had_netns)
+            and (result.cgroup_removed or not had_cgroup)
+        )
+        if kernel_clean:
+            if self._registry_file is not None:
+                rf = self._registry_file
+                result.registry_retained = not _try(
+                    lambda: rf.unlink(missing_ok=True)
+                )
+            else:
+                result.registry_retained = False
+            result.fully_closed = not result.registry_retained
+        else:
+            # Keep the registry file; mark stage as RELEASING so the
+            # reaper knows a partial cleanup happened.
+            result.registry_retained = True
+            result.fully_closed = False
+            self._update_registry_stage("RELEASING")
+            logger.error(
+                "teardown: kernel resources remain (nft=%s veth=%s "
+                "netns=%s cgroup=%s) — registry RETAINED for reaper",
+                result.nft_removed, result.veth_removed,
+                result.netns_removed, result.cgroup_removed,
+            )
 
         self._active = False
+        self._creation_stage = "RELEASED" if result.fully_closed else "QUARANTINED"
         self._enforcement = EnforcementStatus()
+        return result
 
 
 # ---------------------------------------------------------------------------
