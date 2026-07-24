@@ -22,8 +22,6 @@ depend on.
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,10 +31,13 @@ from khaos.db import Database
 from khaos.db.database import (
     MIGRATION_REGISTRY,
     SCHEMA_MIGRATION_NAME,
-    SCHEMA_MIGRATION_SALT,
     SCHEMA_MIGRATION_VERSION,
-    SCHEMA_PATH,
 )
+from khaos.db.migrations._registry import REGISTRY_BY_VERSION
+
+# Batch 6.4: the ledger now carries one row per registered version.  Tests
+# that previously asserted a single-row ledger assert this count instead.
+_EXPECTED_LEDGER_ROWS = len(REGISTRY_BY_VERSION)
 
 
 # ---------------------------------------------------------------------------
@@ -62,34 +63,52 @@ def test_h12_registry_covers_current_schema_version():
 
 
 def test_h12_registry_checksum_matches_runtime_computation():
-    """The frozen registry checksum for the current version MUST equal
-    what ``run_migrations()`` computes at runtime from ``schema.sql`` +
-    the salt.  If this fails, either the registry or the schema file
-    drifted — both are release-time artifacts and must agree."""
-    expected = hashlib.sha256(
-        f"{SCHEMA_PATH.read_text(encoding='utf-8')}\n{SCHEMA_MIGRATION_SALT}".encode(
-            "utf-8"
-        )
-    ).hexdigest()
-    _, registry_checksum = MIGRATION_REGISTRY[SCHEMA_MIGRATION_VERSION]
-    assert registry_checksum == expected, (
-        "MIGRATION_REGISTRY checksum for the current version does not "
-        "match the runtime computation from schema.sql + salt.  The "
-        "registry is FROZEN — if schema.sql legitimately changed, "
-        "you must bump SCHEMA_MIGRATION_VERSION and add a NEW entry, "
-        "not edit the existing checksum."
+    """Batch 6.4 superseded the round-5 runtime-computation model.
+
+    The registry checksum for the current version is now a HARDCODED
+    release-time literal constant (review §10.1), and it must equal what
+    ``compute_manifest_checksum`` re-derives from the *actual executed
+    bytes* (the SQL files + migrator source — review §10.2), NOT a runtime
+    hash of ``schema.sql`` (which was never executed).  This test asserts
+    the new contract: the stored constant agrees with the manifest
+    re-computation.  If it fails, either the registry constant drifted or
+    a registered file was edited without bumping the version.
+    """
+    from khaos.db.migrations._registry import (
+        REGISTRY_BY_VERSION,
+        compute_manifest_checksum,
+        is_historical,
+    )
+
+    spec = REGISTRY_BY_VERSION[SCHEMA_MIGRATION_VERSION]
+    # Historical versions have no reproducible manifest; skip them.
+    assert not is_historical(spec), (
+        "the CURRENT version must carry a real manifest checksum, not "
+        "the historical sentinel"
+    )
+    assert spec.sha256 == compute_manifest_checksum(spec), (
+        "the hardcoded registry checksum for the current version does not "
+        "match the manifest re-computation.  The registry is FROZEN — if a "
+        "registered file legitimately changed, bump SCHEMA_MIGRATION_VERSION "
+        "and add a NEW entry, do not edit the existing checksum."
     )
 
 
 def test_h12_registry_entries_are_immutable_constants():
-    """Every registry entry must be a 64-char lowercase hex SHA-256
-    digest paired with a non-empty name.  This is a structural
-    invariant — the registry is a release-time artifact and must not
-    contain placeholders or empty values."""
+    """Every registry entry must be either a 64-char lowercase hex SHA-256
+    digest (a real manifest checksum) or the documented historical sentinel
+    (for pre-manifest versions verified by name only).  Paired with a
+    non-empty name.  This is a structural invariant — the registry is a
+    release-time artifact and must not contain placeholders or empty values."""
+    from khaos.db.migrations._registry import HISTORICAL_ACCEPTED
+
     assert MIGRATION_REGISTRY, "MIGRATION_REGISTRY must not be empty"
     for version, (name, checksum) in MIGRATION_REGISTRY.items():
         assert isinstance(version, int) and version > 0
         assert isinstance(name, str) and name
+        if checksum == HISTORICAL_ACCEPTED:
+            # Documented carve-out: pre-manifest version, verified by name.
+            continue
         assert isinstance(checksum, str) and len(checksum) == 64
         assert all(c in "0123456789abcdef" for c in checksum)
 
@@ -100,72 +119,58 @@ def test_h12_registry_entries_are_immutable_constants():
 
 
 async def test_h12_detects_tampered_historical_registry_entry(
-    tmp_path, monkeypatch
+    tmp_path
 ):
-    """H-12 core guarantee: a tampered historical migration is detected
-    even when a newer version is the latest applied row.
+    """Batch 6.4 core guarantee: a tampered historical migration NAME is
+    detected even when a newer version is the latest applied row.
 
-    Pre-H-12, only ``applied[-1]`` was checked, so tampering an older
-    version went undetected once a newer version was applied.  This
-    test simulates that scenario by inserting a fake older version
-    (v3 < v4) into ``schema_migrations`` with a wrong checksum, then
-    temporarily registering v3 in ``MIGRATION_REGISTRY`` with the
-    correct checksum.  The mismatch must be detected.
+    v1–v5 are registered as ``HISTORICAL_ACCEPTED`` — their checksums
+    cannot be reproduced, so they are verified by NAME ONLY (review §10.5).
+    This test tampers a historical version's NAME and confirms the verify
+    loop catches it even though v6 is the latest applied row.  (The
+    pre-H-12 bug only checked ``applied[-1]``, so this would have slipped
+    through.)
     """
     db = Database(tmp_path / "h12_hist.db")
     await db.connect()
     await db.run_migrations()
 
-    # Insert a fake historical row v3 (v3 < v4 so the "newer than
-    # build" guard does not trip).  v4 remains the latest applied row.
     conn = await db._require_writer_conn()
-    tampered_checksum = "a" * 64  # wrong
+    # Tamper v3's name (v3 < v6 so the "newer than build" guard does not
+    # trip).  v6 remains the latest applied row.
     await conn.execute(
-        "INSERT INTO schema_migrations "
-        "(version, name, checksum, applied_at, app_version) "
-        "VALUES (3, 'fake_v3', ?, datetime('now'), '0.0.3')",
-        (tampered_checksum,),
+        "UPDATE schema_migrations SET name = 'TAMPERED' WHERE version = 3"
     )
     await conn.commit()
 
-    # Temporarily register v3 with a DIFFERENT (correct) checksum.
-    # The H-12 verify loop must now catch the mismatch on v3 even
-    # though v4 is the latest row.
-    from khaos.db import database as db_module
-
-    correct_checksum = "b" * 64
-    monkeypatch.setitem(
-        db_module.MIGRATION_REGISTRY,
-        3,
-        ("fake_v3", correct_checksum),
-    )
-
-    with pytest.raises(RuntimeError, match="checksum mismatch"):
+    # The verify loop must catch the NAME mismatch on v3 even though v6
+    # is the latest row.
+    with pytest.raises(RuntimeError, match="name mismatch"):
         await db.run_migrations()
     await db.close()
 
 
 async def test_h12_skips_unregistered_historical_versions(tmp_path):
-    """Sanity check: a historical version NOT in the registry is
-    skipped (not verified).  This is the forward-compat path — old
-    databases may have pre-registry versions that we cannot verify
-    after the fact."""
+    """Sanity check: a version NOT in the registry is skipped (not
+    verified).  This is the forward-compat path — a database may carry an
+    extra version unknown to this build."""
     db = Database(tmp_path / "h12_skip.db")
     await db.connect()
     await db.run_migrations()
 
     conn = await db._require_writer_conn()
-    # Insert a fake v2 (not in registry) with an obviously wrong
-    # checksum.  run_migrations() must NOT raise on this row.
+    # Insert a fake version 0 (not in registry, and below the current
+    # version so the "newer than build" guard does not trip) with an
+    # obviously wrong checksum.  run_migrations() must NOT raise on it.
     await conn.execute(
         "INSERT INTO schema_migrations "
         "(version, name, checksum, applied_at, app_version) "
-        "VALUES (2, 'pre_registry', 'definitely_not_a_sha256', "
+        "VALUES (0, 'pre_registry', 'definitely_not_a_sha256', "
         "datetime('now'), '0.0.1')",
     )
     await conn.commit()
 
-    # Should not raise — v2 is not in the registry, so it is skipped.
+    # Should not raise — version 0 is not in the registry, so it is skipped.
     await db.run_migrations()
     await db.close()
 
@@ -232,7 +237,7 @@ async def test_crash_injection_during_legacy_upgrades_recovers(tmp_path):
     await db2.connect()
     await db2.run_migrations()  # must NOT raise
 
-    # Verify the schema is complete and the ledger has exactly one row.
+    # Verify the schema is complete and the ledger has the full chain.
     conn = await db2._require_conn()
     ledger_rows = await (
         await conn.execute(
@@ -240,9 +245,10 @@ async def test_crash_injection_during_legacy_upgrades_recovers(tmp_path):
             "ORDER BY version"
         )
     ).fetchall()
-    assert len(ledger_rows) == 1
-    assert ledger_rows[0]["version"] == SCHEMA_MIGRATION_VERSION
-    assert ledger_rows[0]["name"] == SCHEMA_MIGRATION_NAME
+    # Batch 6.4: one row per registered version after recovery.
+    assert len(ledger_rows) == _EXPECTED_LEDGER_ROWS
+    assert ledger_rows[-1]["version"] == SCHEMA_MIGRATION_VERSION
+    assert ledger_rows[-1]["name"] == SCHEMA_MIGRATION_NAME
 
     # Spot-check that key tables exist (migration completed).
     table_names = {
@@ -312,7 +318,7 @@ async def test_crash_injection_during_initial_schema_recovers(tmp_path):
     ledger = await (
         await conn.execute("SELECT COUNT(*) AS n FROM schema_migrations")
     ).fetchone()
-    assert ledger["n"] == 1
+    assert ledger["n"] == _EXPECTED_LEDGER_ROWS
     await db2.close()
 
 
@@ -347,7 +353,7 @@ async def test_crash_injection_then_idempotent_rerun(tmp_path):
     ledger = await (
         await conn.execute("SELECT COUNT(*) AS n FROM schema_migrations")
     ).fetchone()
-    assert ledger["n"] == 1
+    assert ledger["n"] == _EXPECTED_LEDGER_ROWS
     await db2.close()
 
 
@@ -389,7 +395,7 @@ async def test_crash_injection_concurrent_recovery_safe(tmp_path):
     ledger = await (
         await conn.execute("SELECT COUNT(*) AS n FROM schema_migrations")
     ).fetchone()
-    assert ledger["n"] == 1
+    assert ledger["n"] == _EXPECTED_LEDGER_ROWS
     await db_a.close()
     await db_b.close()
 

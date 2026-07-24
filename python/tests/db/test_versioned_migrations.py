@@ -16,12 +16,17 @@ async def test_migration_records_version_and_checksum(tmp_path):
     await db.run_migrations()
 
     conn = await db._require_conn()
+    # Batch 6.4: the ledger now carries one row per registered version
+    # (v1–v6), so we look up the CURRENT version's row explicitly rather
+    # than assuming a single-row ledger.
     row = await (
         await conn.execute(
             "SELECT version, name, checksum, app_version "
-            "FROM schema_migrations"
+            "FROM schema_migrations WHERE version = ?",
+            (SCHEMA_MIGRATION_VERSION,),
         )
     ).fetchone()
+    assert row is not None
     assert row["version"] == SCHEMA_MIGRATION_VERSION
     assert row["name"] == SCHEMA_MIGRATION_NAME
     assert len(row["checksum"]) == 64
@@ -109,7 +114,13 @@ async def test_concurrent_migration_startup_has_one_ledger_row(tmp_path):
             "FROM schema_migrations"
         )
     ).fetchone()
-    assert row["n"] == 1
+    # Batch 6.4: the ledger now carries the full registered chain (one row
+    # per version).  Concurrent startup must still converge on exactly that
+    # set — no duplicate rows, no partial application — and the highest
+    # version is the current build version.
+    from khaos.db.migrations._registry import REGISTRY_BY_VERSION
+
+    assert row["n"] == len(REGISTRY_BY_VERSION)
     assert row["version"] == SCHEMA_MIGRATION_VERSION
     await first.close()
     await second.close()
