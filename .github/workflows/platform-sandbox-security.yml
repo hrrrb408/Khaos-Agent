@@ -163,6 +163,102 @@ jobs:
           name: linux-bwrap-diagnostics
           path: diagnostics/
 
+  # ─── Batch 6.6 (round-6 §6.6): real-kernel browser isolation E2E ────
+  # This job proves the REAL production browser sandbox path (no
+  # KHAOS_BROWSER_DEV_MODE) on a privileged Linux runner: real nft parser,
+  # real netns/veth/cgroup creation, real egress isolation, real teardown.
+  # It closes review §21 ("CI 不能证明真实 nft").  Tests run as root
+  # because BrowserNetworkSandbox needs CAP_NET_ADMIN for ip netns / nft.
+  browser-kernel-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install nftables + iproute2 + nsenter
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables iproute2 util-linux
+          nft --version
+          ip -V
+          which nsenter
+      - name: Enable unprivileged user namespaces (if restricted by AppArmor)
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Delegate cgroup v2 subtree for browser cgroup leaves
+        run: |
+          test -f /sys/fs/cgroup/cgroup.controllers
+          for controller in cpu memory pids io; do
+            if grep -qw "$controller" /sys/fs/cgroup/cgroup.controllers; then
+              echo "+$controller" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null
+            fi
+          done
+          sudo mkdir -p /sys/fs/cgroup/khaos-browser
+          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/khaos-browser
+          for controller in cpu memory pids io; do
+            if grep -qw "$controller" /sys/fs/cgroup/khaos-browser/cgroup.controllers; then
+              echo "+$controller" > /sys/fs/cgroup/khaos-browser/cgroup.subtree_control
+            fi
+          done
+          test -w /sys/fs/cgroup/khaos-browser
+      - name: Install test dependencies
+        run: python -m pip install -e '.[test]'
+      - name: Capture pre-test kernel diagnostics
+        run: |
+          set +e
+          mkdir -p diagnostics
+          {
+            echo "=== uname ==="; uname -a
+            echo "=== nft version ==="; nft --version
+            echo "=== existing netns ==="; ip netns list
+            echo "=== existing nft tables ==="; nft list tables
+            echo "=== uid ==="; id
+            echo "=== cap_net_admin probe ==="
+            # ip netns add/delete is the canonical CAP_NET_ADMIN probe.
+            ip netns add khaos-cap-probe 2>&1; echo "add exit: $?"
+            ip netns del khaos-cap-probe 2>&1; echo "del exit: $?"
+          } > diagnostics/browser-kernel-pre.txt
+          exit 0
+      - name: Run real-kernel browser isolation tests (as root)
+        env:
+          # CRITICAL: unset dev-mode so the REAL production path runs.
+          KHAOS_BROWSER_DEV_MODE: ""
+          KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
+          KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser
+        # ``sudo`` does not inherit the setup-python PATH/PYTHONPATH, so
+        # we capture the full interpreter path + PYTHONPATH and pass them
+        # through explicitly (mirrors the linux-bwrap-security job).
+        run: |
+          python_bin="$(command -v python)"
+          py_path="$PYTHONPATH"
+          sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,PYTHONPATH \
+            "$python_bin" -m pytest \
+            python/tests/security/test_browser_kernel_isolation_round6.py \
+            -m kernel_real -v
+      - name: Capture post-test kernel diagnostics
+        if: always()
+        run: |
+          set +e
+          {
+            echo "=== residual netns ==="; ip netns list
+            echo "=== residual nft tables ==="; nft list tables
+            echo "=== residual cgroup khaos-browser ==="; ls -la /sys/fs/cgroup/khaos-browser 2>&1
+            echo "=== done ==="
+          } > diagnostics/browser-kernel-post.txt
+          exit 0
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: browser-kernel-diagnostics
+          path: diagnostics/
+
   macos-sandbox-security:
     runs-on: macos-latest
     timeout-minutes: 20
