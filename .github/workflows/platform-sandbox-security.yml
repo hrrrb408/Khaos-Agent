@@ -259,6 +259,74 @@ jobs:
           name: browser-kernel-diagnostics
           path: diagnostics/
 
+  # ─── Batch 7.5 (round-7 §十三): full-stack browser kernel CI ───────
+  # The ONE job that proves the FULL production stack together: real
+  # Chromium + real BrowserManager + production require_os_sandbox + real
+  # nft + real authenticated proxy + real cgroup PID enforcement.  This
+  # closes review §十三 ("声明强于实际测试"): the kernel job tests nft/
+  # netns without Chromium, and the browser job tests Chromium in dev
+  # mode — neither proves the combination.  This job does.
+  fullstack-browser-kernel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install nftables + iproute2 + nsenter
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables iproute2 util-linux
+          nft --version
+          ip -V
+      - name: Enable unprivileged user namespaces (if restricted)
+        run: |
+          if sysctl kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+      - name: Delegate cgroup v2 subtree
+        run: |
+          for controller in cpu memory pids io; do
+            if grep -qw "$controller" /sys/fs/cgroup/cgroup.controllers; then
+              echo "+$controller" | sudo tee /sys/fs/cgroup/cgroup.subtree_control >/dev/null
+            fi
+          done
+          sudo mkdir -p /sys/fs/cgroup/khaos-browser
+          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/khaos-browser
+          for controller in cpu memory pids io; do
+            if grep -qw "$controller" /sys/fs/cgroup/khaos-browser/cgroup.controllers; then
+              echo "+$controller" > /sys/fs/cgroup/khaos-browser/cgroup.subtree_control
+            fi
+          done
+          test -w /sys/fs/cgroup/khaos-browser
+      - name: Build inner browser launcher (Rust)
+        run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
+      - name: Install test + browser dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e '.[test,browser]'
+      - name: Download Chromium binary
+        run: python -m playwright install --with-deps chromium
+      - name: Run full-stack browser kernel tests (as root)
+        env:
+          # CRITICAL: unset dev-mode + mock-mode so the REAL production
+          # path runs (real sandbox, no mock fallback).
+          KHAOS_BROWSER_DEV_MODE: ""
+          KHAOS_BROWSER_MOCK_MODE: ""
+          KHAOS_RUN_BROWSER_E2E: "1"
+          KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
+          KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser
+          KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
+        run: |
+          python_bin="$(command -v python)"
+          sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_BROWSER_MOCK_MODE,KHAOS_RUN_BROWSER_E2E,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,KHAOS_SANDBOX_LAUNCHER,PYTHONPATH,HOME \
+            "$python_bin" -m pytest \
+            python/tests/security/test_browser_kernel_isolation_round6.py \
+            -m kernel_real -v
+
   macos-sandbox-security:
     runs-on: macos-latest
     timeout-minutes: 20

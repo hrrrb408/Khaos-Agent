@@ -38,6 +38,7 @@ PR checks UI), grouped by workflow.
 |---|---|
 | `linux-bwrap-security` | real bubblewrap + cgroup v2 + ext4 io isolation |
 | `browser-kernel-isolation` | **real** nft parser + netns/veth/cgroup creation + egress isolation + teardown (Batch 6.6) |
+| `fullstack-browser-kernel` | **real** Chromium + BrowserManager + production sandbox + nft + proxy + cgroup PID, full-stack E2E (Batch 7.5) |
 | `macos-sandbox-security` | real `sandbox-exec` on macOS |
 | `windows-fail-closed-security` | Windows refuses execution (no backend) |
 
