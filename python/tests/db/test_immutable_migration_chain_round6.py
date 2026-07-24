@@ -153,8 +153,11 @@ def test_s102_checksum_covers_executed_sql_files_not_schema_sql():
 def test_s102_tampering_executed_sql_file_changes_checksum(tmp_path):
     """§10.2: editing a registered SQL file that IS executed must change
     the manifest checksum.  We copy the migration dir, append a byte to
-    ``0001_initial_schema.sql``, and confirm the checksum differs."""
-    v6 = REGISTRY_BY_VERSION[SCHEMA_MIGRATION_VERSION]
+    ``0001_initial_schema.sql``, and confirm the checksum differs.
+
+    Batch 7.2: v6 is the last version whose manifest covers the SQL files
+    (v7 is a migrator-only delta), so we test against v6."""
+    v6 = REGISTRY_BY_VERSION[6]
     original = compute_manifest_checksum(v6)
 
     initial_sql = Path(_registry._THIS_DIR) / "0001_initial_schema.sql"
@@ -221,9 +224,10 @@ def test_s102_verify_source_integrity_detects_drift_and_passes_clean():
 
 def test_s103_frozen_initial_schema_is_in_manifest():
     """§10.3: ``0001_initial_schema.sql`` (the file that was silently
-    edited in Batch 6.1) is now part of the v6 manifest.  Any future edit
-    is therefore detected by ``verify_source_integrity``."""
-    v6 = REGISTRY_BY_VERSION[SCHEMA_MIGRATION_VERSION]
+    edited in Batch 6.1) is part of the v6 manifest (the last version
+    whose manifest covers the SQL files).  Any future edit is therefore
+    detected by ``verify_source_integrity``."""
+    v6 = REGISTRY_BY_VERSION[6]
     assert "0001_initial_schema.sql" in v6.sql_files
     assert "0001_post_migration.sql" in v6.sql_files
 
@@ -286,13 +290,20 @@ def test_s104_versions_are_contiguous_and_monotonic():
 
 def test_s104_historical_versions_carry_sentinel():
     """§10.4: v1–v5 carry the ``HISTORICAL_ACCEPTED`` sentinel (their
-    original bytes pre-date the manifest and cannot be reconstructed)."""
+    original bytes pre-date the manifest and cannot be reconstructed).
+    Batch 7.2: v6+ carry real manifest checksums, so the historical
+    carve-out is versions 1–5 only (not "everything below current")."""
     for spec in MIGRATIONS:
-        if spec.version < SCHEMA_MIGRATION_VERSION:
+        if spec.version <= 5:
             assert is_historical(spec), (
                 f"§10.4: v{spec.version} ({spec.name}) should be marked "
-                f"historical — only the current version carries a real "
-                f"manifest checksum"
+                f"historical — its bytes pre-date the manifest"
+            )
+        else:
+            # v6+ carry a real manifest checksum.
+            assert not is_historical(spec), (
+                f"§10.4: v{spec.version} ({spec.name}) must NOT be "
+                f"historical — it has a real manifest checksum"
             )
 
 

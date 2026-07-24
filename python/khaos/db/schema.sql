@@ -106,6 +106,7 @@ ON agent_turns(session_id, started_at);
 -- attempt), NOT ``session_id``.  A session can have many streams (one
 -- per turn/attempt); the Terminal invariant is per-stream, not per-session.
 CREATE TABLE IF NOT EXISTS chat_stream_events (
+    event_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     stream_id    TEXT NOT NULL,
     session_id   TEXT NOT NULL,
     principal_id TEXT NOT NULL,
@@ -115,15 +116,17 @@ CREATE TABLE IF NOT EXISTS chat_stream_events (
     data_json    TEXT NOT NULL DEFAULT '{}',
     is_terminal  INTEGER NOT NULL DEFAULT 0 CHECK(is_terminal IN (0, 1)),
     created_at   REAL NOT NULL,
-    PRIMARY KEY(stream_id, sequence),
+    UNIQUE(stream_id, sequence),
     FOREIGN KEY(session_id, principal_id, project_id)
         REFERENCES sessions(id, principal_id, project_id)
 );
 
 CREATE INDEX IF NOT EXISTS idx_chat_stream_events_owner
-ON chat_stream_events(principal_id, project_id, session_id, sequence);
+ON chat_stream_events(principal_id, project_id, session_id, event_id);
 CREATE INDEX IF NOT EXISTS idx_chat_stream_events_stream
-ON chat_stream_events(stream_id, sequence);
+ON chat_stream_events(stream_id, event_id);
+CREATE INDEX IF NOT EXISTS idx_chat_stream_events_session
+ON chat_stream_events(session_id, principal_id, project_id, event_id);
 
 -- Round-5 Batch 5.2 (C-05/C-06) + Round-6 Batch 6.1: Chat stream state
 -- machine main table.  One row PER STREAM (not per session).  A session

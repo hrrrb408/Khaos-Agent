@@ -302,9 +302,21 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         # migrator method that ``run_migrations`` invokes.  Editing any of
         # them is detected by ``verify_source_integrity``.  Computed once
         # at release time and recorded here as a LITERAL.
-        sha256="8d8e4642044b568c2c67a83dc0ad404dc2ef7cc35f5bda2b0d102c620d1f6072",
+        sha256="89ea4c434b13f30f0cd1e1be6f1c4189b3edd6909132d78e11397737850dd0e7",
         sql_files=("0001_initial_schema.sql", "0001_post_migration.sql"),
         migrator_symbols=_IMMUTABLE_MIGRATOR_SYMBOLS,
+    ),
+    MigrationSpec(
+        version=7,
+        name="round7_batch72_chat_replay_protocol",
+        # Batch 7.2 (round-7 §十四): add the session-global ``event_id``
+        # column to ``chat_stream_events`` so session-wide replay has a
+        # true monotonic cursor (the stream-local ``sequence`` collided
+        # across streams and missed events on reconnect).  v7's manifest
+        # covers ONLY the v7 delta migrators — the v6 aggregate stays
+        # frozen.  Computed at release time and recorded as a LITERAL.
+        sha256="28992f0190d75b671b6bc37090b51e92eb0c8b541b92ab8a23064095cf7f7954",
+        migrator_symbols=("_apply_v7_upgrades", "_ensure_chat_event_id_column"),
     ),
 )
 
