@@ -78,13 +78,22 @@ class MigrationSpec:
 
     Attributes:
         version: integer schema version (1-based, monotonic).
-        name: human-readable identifier recorded in ``schema_migrations.name``.
+        name: the CANONICAL human-readable identifier.  For v6+ this is
+            the ONLY accepted name.  New ledger rows are written with it.
         sha256: **hardcoded** release-time hex digest over the manifest
             bytes (or ``HISTORICAL_ACCEPTED`` for pre-manifest versions).
         sql_files: SQL files whose bytes are part of this version's manifest.
         migrator_symbols: names of methods on ``Database`` (in ``database.py``)
             whose AST source is part of this version's manifest.  Empty for
             SQL-only or ledger-backfill migrations.
+        accepted_historical_names: names a live DB row may carry for this
+            version BESIDES ``name``.  Batch 7.1 (round-7 §五/§十六): the
+            real release commits wrote names that differed from the
+            canonical ones originally guessed in Batch 6.4, so an upgrade
+            would ``RuntimeError`` on name mismatch.  This alias set lets
+            verification accept both the real release name and the
+            Batch-6.4 synthetic-backfill name.  Empty for v6+ (canonical
+            name is the only accepted one).
     """
 
     version: int
@@ -92,6 +101,7 @@ class MigrationSpec:
     sha256: str
     sql_files: tuple[str, ...] = ()
     migrator_symbols: tuple[str, ...] = field(default_factory=tuple)
+    accepted_historical_names: tuple[str, ...] = field(default_factory=tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +203,16 @@ def is_historical(spec: MigrationSpec) -> bool:
 # plus the runner, the post/initial schema executor, the backup helper, and
 # the commit-suppressing connection facade.  Editing any of these methods
 # is a schema change and must bump the version.
+#
+# Batch 7.1 (round-7 §十七): also include ``run_migrations`` and
+# ``_backfill_historical_ledger_rows`` — they control execution order,
+# checksum comparison, ledger backfill, commit/rollback, name verification,
+# and current-version recording.  Without them the v6 manifest hash would
+# NOT change when the runner's key behavior changes.
 _IMMUTABLE_MIGRATOR_SYMBOLS: tuple[str, ...] = (
+    "run_migrations",
+    "_backfill_historical_ledger_rows",
+    "_MigrationConnection",
     "_MigrationConnection",
     "_run_legacy_schema_upgrades",
     "_backup_before_migration",
@@ -231,23 +250,38 @@ _IMMUTABLE_MIGRATOR_SYMBOLS: tuple[str, ...] = (
 MIGRATIONS: tuple[MigrationSpec, ...] = (
     MigrationSpec(
         version=1,
-        name="initial_schema_v1",
+        name="initial_versioned_schema",
         sha256=HISTORICAL_ACCEPTED,
+        # Batch 7.1: the real release name (commit f4432c4) is the
+        # canonical one.  ``initial_schema_v1`` was the wrong name Batch
+        # 6.4 used for synthetic backfill; accept it so those DBs upgrade.
+        accepted_historical_names=("initial_schema_v1",),
     ),
     MigrationSpec(
         version=2,
-        name="memories_project_unique_f03",
+        name="f02_memory_project_unique",
         sha256=HISTORICAL_ACCEPTED,
+        # Real release name (commit 4458da4).  Batch 6.4 guessed
+        # ``memories_project_unique_f03`` for synthetic backfill.
+        accepted_historical_names=("memories_project_unique_f03",),
     ),
     MigrationSpec(
         version=3,
-        name="principal_modes_project_pk_intermediate",
+        name="round5_chat_stream_state_machine",
         sha256=HISTORICAL_ACCEPTED,
+        # Real release name (commit d87347d).  Batch 6.4 guessed
+        # ``principal_modes_project_pk_intermediate`` for synthetic backfill.
+        accepted_historical_names=("principal_modes_project_pk_intermediate",),
     ),
     MigrationSpec(
         version=4,
-        name="principal_modes_project_id_pk_h09",
+        name="round5_batch53_owner_context_closure",
         sha256=HISTORICAL_ACCEPTED,
+        # Real release name (commit 39a3a97) — THIS was the Critical bug
+        # from round-7 §五/§十六: Batch 6.4 wrote
+        # ``principal_modes_project_id_pk_h09``, which would make every
+        # live v4 DB fail name verification on upgrade.
+        accepted_historical_names=("principal_modes_project_id_pk_h09",),
     ),
     MigrationSpec(
         version=5,
@@ -256,7 +290,8 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         # ``sha256(schema.sql + salt)`` checksum (review §10.1).  Live v5
         # DBs therefore store a checksum we cannot reproduce from the
         # current source, so v5 is verified by NAME ONLY.  v6 is the first
-        # version with a real manifest checksum.
+        # version with a real manifest checksum.  The name was correct in
+        # Batch 6.4, so no alias is needed.
         sha256=HISTORICAL_ACCEPTED,
     ),
     MigrationSpec(
@@ -267,7 +302,7 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         # migrator method that ``run_migrations`` invokes.  Editing any of
         # them is detected by ``verify_source_integrity``.  Computed once
         # at release time and recorded here as a LITERAL.
-        sha256="7bd6cb4e51936c81d3c29ab9b8902f04203374d80d588732e97157b265de8038",
+        sha256="8d8e4642044b568c2c67a83dc0ad404dc2ef7cc35f5bda2b0d102c620d1f6072",
         sql_files=("0001_initial_schema.sql", "0001_post_migration.sql"),
         migrator_symbols=_IMMUTABLE_MIGRATOR_SYMBOLS,
     ),
