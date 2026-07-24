@@ -193,6 +193,12 @@ class TaskManager:
         self._lock = asyncio.Lock()
         self._db = db
         self._subscribers: dict[str, list[asyncio.Queue[dict[str, Any]]]] = {}
+        # Batch 6.5 (round-6 §十七): eviction-in-progress flag.  Once
+        # ``begin_eviction()`` atomically sets this under ``self._lock``,
+        # new ``create()`` / ``subscribe()`` calls are rejected so the
+        # eviction cannot race a task going active or a subscriber
+        # registering in the gap between ``can_evict()`` and ``aclose()``.
+        self._closing = False
         # Batch 2.5 §4: optional lease invalidation hook. When set
         # (by ApprovalRuntime / WorkspaceExecutionLeaseCoordinator),
         # cancel() calls it BEFORE transitioning the task to CANCELLED
@@ -297,6 +303,14 @@ class TaskManager:
         never create a task that another principal could see or cancel.
         """
         async with self._lock:
+            if self._closing:
+                # Batch 6.5 §十七: the manager is mid-eviction — refuse
+                # new work so the eviction's ``begin_eviction`` CAS stays
+                # valid (no active task can appear after the check).
+                raise RuntimeError(
+                    "TaskManager is closing (evicted from LRU cache); "
+                    "retry against a fresh manager"
+                )
             if self._active_count() >= self._max_active:
                 raise RuntimeError(
                     f"max active tasks reached ({self._max_active}); "
@@ -554,18 +568,44 @@ class TaskManager:
             queue.put_nowait(event)
 
     async def subscribe(self, task_id: str):
-        """Yield an initial snapshot and subsequent state-change events."""
+        """Yield an initial snapshot and subsequent state-change events.
+
+        Batch 6.5 (round-6 §十七): the loop now treats a ``task.evicted``
+        event as a terminal sentinel and breaks cleanly, so the consumer
+        unblocks when the manager is evicted from the LRU cache instead
+        of awaiting a queue that will never receive another event.  The
+        ``finally`` removes the queue idempotently ( swallowing
+        ``ValueError``/``KeyError``) so it cannot race ``aclose()``
+        replacing the subscriber list with ``[]``.
+        """
         task = await self.get(task_id)
         if task is None:
             raise KeyError(task_id)
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-        self._subscribers.setdefault(task_id, []).append(queue)
+        async with self._lock:
+            if self._closing:
+                raise RuntimeError(
+                    "TaskManager is closing (evicted from LRU cache); "
+                    "subscription refused"
+                )
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            self._subscribers.setdefault(task_id, []).append(queue)
         try:
             yield {"event_id": uuid.uuid4().hex, "task_id": task.id, "sequence": task.event_sequence, "type": "task.snapshot", "timestamp": task.updated_at.isoformat(), "payload": task.to_dict()}
             while True:
-                yield await queue.get()
+                event = await queue.get()
+                yield event
+                # Batch 6.5 §十七: terminal sentinel — stop after the
+                # consumer sees the eviction event.
+                if event.get("type") == "task.evicted":
+                    break
         finally:
-            self._subscribers[task_id].remove(queue)
+            # Idempotent remove: ``aclose()`` may have replaced this
+            # task's subscriber list with ``[]`` already, in which case a
+            # bare ``.remove(queue)`` raises ``ValueError``.
+            try:
+                self._subscribers[task_id].remove(queue)
+            except (ValueError, KeyError):
+                pass
 
     def _active_count(self) -> int:
         """Count in-flight tasks (callers hold ``self._lock``)."""
@@ -588,12 +628,45 @@ class TaskManager:
         therefore skips non-evictable entries and allows the cache to
         temporarily exceed ``_MAX_MANAGERS`` rather than evicting a
         live owner.
+
+        Batch 6.5 (round-6 §十七): this is a NON-LOCKED fast-path
+        pre-filter only.  ``TaskService`` uses it to skip obviously-live
+        candidates cheaply, but the authoritative eviction decision is
+        the atomic ``begin_eviction()`` CAS, which re-checks the same
+        conditions under ``self._lock`` and flips ``_closing`` so no
+        task can go active or subscriber register in the gap.
         """
+        if self._closing:
+            return False
         if any(task.status in ACTIVE_STATUSES for task in self._tasks.values()):
             return False
         if any(subs for subs in self._subscribers.values()):
             return False
         return True
+
+    async def begin_eviction(self) -> bool:
+        """Batch 6.5 (round-6 §十七): atomically check evictability and
+        mark the manager closing.
+
+        Returns ``True`` and sets ``self._closing = True`` under
+        ``self._lock`` iff the manager has no active tasks and no live
+        subscribers.  Once ``_closing`` is set, ``create()`` and
+        ``subscribe()`` refuse new work, closing the TOCTOU window that
+        existed between the unlocked ``can_evict()`` poll and the
+        ``aclose()`` drain.  ``TaskService`` must call this BEFORE
+        ``aclose()``/``pop`` and only proceed when it returns ``True``.
+        """
+        async with self._lock:
+            if self._closing:
+                # Already mid-eviction (e.g. two concurrent evictors);
+                # treat as "not mine to evict".
+                return False
+            if any(task.status in ACTIVE_STATUSES for task in self._tasks.values()):
+                return False
+            if any(subs for subs in self._subscribers.values()):
+                return False
+            self._closing = True
+            return True
 
     async def aclose(self) -> None:
         """Round-5 Batch 5.4: best-effort cleanup when evicted from the
@@ -604,6 +677,13 @@ class TaskManager:
         immediately instead of waiting for a queue that will never
         receive another update.  Subscribers are expected to treat any
         unknown/terminal event as a stream-end signal.
+
+        Batch 6.5 (round-6 §十七): ``TaskService`` must call
+        ``begin_eviction()`` first and only ``aclose()`` when it returns
+        ``True``; ``aclose()`` itself does NOT re-check evictability
+        (the CAS already guaranteed no new work can arrive).  It is safe
+        to call without ``begin_eviction`` only for final process
+        teardown where no concurrency remains.
         """
         async with self._lock:
             for task_id, queues in list(self._subscribers.items()):
