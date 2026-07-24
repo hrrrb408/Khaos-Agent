@@ -1049,7 +1049,27 @@ class BrowserManager:
         ``dict``。两条路径都返回 ``dict[str, Any]``。
         """
         if not _HAS_PLAYWRIGHT:
-            return mock()  # mock 路径返回 dict
+            # Batch 7.4 (round-7 §十二): production MUST NOT silently mock.
+            # A deployment that forgot to install Playwright would otherwise
+            # report successful browser operations (navigate/click/type all
+            # return ok:True), and the Agent would believe real side effects
+            # happened.  Only an EXPLICIT opt-in (KHAOS_BROWSER_MOCK_MODE=1,
+            # set by tests/dev) uses the mock path; otherwise fail-closed.
+            if os.environ.get("KHAOS_BROWSER_MOCK_MODE", "") != "1":
+                return {
+                    "ok": False,
+                    "error": (
+                        "Playwright is not installed; browser tools are "
+                        "unavailable. Set KHAOS_BROWSER_MOCK_MODE=1 for "
+                        "the dev/test mock fallback."
+                    ),
+                    "playwright_missing": True,
+                }
+            result = mock()  # mock 路径返回 dict
+            # §十二: stamp every mock result so it is distinguishable from
+            # a real browser operation in audit logs / caller checks.
+            result["mock"] = True
+            return result
         page = await self.ensure_page(
             principal_id,
             session_id=session_id,
