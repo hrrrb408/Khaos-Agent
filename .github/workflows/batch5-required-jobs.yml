@@ -108,6 +108,7 @@ jobs:
             python/tests/security/test_browser_egress_f05.py \
             python/tests/security/test_browser_egress_proxy.py \
             python/tests/security/test_host_network_authority.py \
+            python/tests/security/test_browser_nft_authority_round6.py \
             python/tests/tools/test_browser_tools_e2e.py \
             -q -v -m "browser_real or not browser_real"
 
@@ -183,4 +184,9 @@ jobs:
             python/tests/db/test_versioned_migrations.py \
             python/tests/db/test_migrations_cli_a_5_2.py \
             python/tests/db/test_legacy_schema_upgrade_f03.py \
+            python/tests/db/test_immutable_migration_chain_round6.py \
+            python/tests/db/test_immutable_migration_supply_chain_round5.py \
+            python/tests/db/test_lifecycle_concurrency_round6.py \
+            python/tests/db/test_chat_stream_state_machine_round5.py \
+            python/tests/db/test_owner_context_closure_round5.py \
             -q -v
