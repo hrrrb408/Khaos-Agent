@@ -132,8 +132,123 @@ mod linux {
         Err(io::Error::last_os_error())
     }
 
+    /// Batch 7.4 (round-7 §十一): close every inherited file descriptor
+    /// greater than ``stderr`` before exec'ing the browser, so a
+    /// compromised renderer cannot reach privileged fds held by the
+    /// launcher (e.g. the netns fd, the cgroup file, library fds).
+    /// Uses ``close_range`` when available (Linux 5.9+); falls back to
+    /// iterating ``/proc/self/fd``.
+    fn sanitize_fds() -> io::Result<()> {
+        // Try close_range(3, ~0u, CLOSE_RANGE_UNSHARE).  We do NOT unshare
+        // the fd table (the flag is 0) so the launcher's own fds used
+        // during setup are already closed by this point.
+        const CLOSE_RANGE_FD_MASK: u32 = 0;
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_close_range,
+                3u32,
+                u32::MAX,
+                CLOSE_RANGE_FD_MASK,
+            )
+        };
+        if ret == 0 {
+            return Ok(());
+        }
+        // Fallback: iterate /proc/self/fd.  close_range may be absent on
+        // older kernels (ENOSYS) — the errno is checked by the fallback.
+        let entries = std::fs::read_dir("/proc/self/fd")
+            .map_err(|e| io::Error::new(e.kind(), format!("read /proc/self/fd: {e}")))?;
+        for entry in entries.flatten() {
+            if let Ok(name) = entry.file_name().into_string() {
+                if let Ok(fd) = name.parse::<i32>() {
+                    if fd > 2 {
+                        unsafe { libc::close(fd) };
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Batch 7.4 (round-7 §十一): join a named network namespace by
+    /// opening ``/var/run/netns/<name>`` and calling ``setns(fd,
+    /// CLONE_NEWNET)``.  Must run BEFORE seccomp installs (the filter
+    /// denies ``setns`` so a later-compromised browser cannot escape).
+    fn join_netns(name: &str) -> io::Result<()> {
+        let path = format!("/var/run/netns/{}", name);
+        let c_path = CString::new(path.as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "netns path contained NUL")
+        })?;
+        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
+        unsafe { libc::close(fd) };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn run() -> io::Result<()> {
         let mut args: Vec<_> = env::args_os().skip(1).collect();
+
+        // Batch 7.4 (round-7 §十一): browser launcher mode.
+        //   --browser --netns <name> --cgroup <procs> -- <chromium> <args>
+        // Order: validate → join cgroup → join netns → sanitize fds →
+        // no_new_privs → install seccomp (denies setns, so the browser
+        // cannot later escape) → execve.  This replaces the shell
+        // wrapper that did ``echo $$ > cgroup.procs; nsenter --net=…``.
+        if args.first().is_some_and(|arg| arg == "--browser") {
+            args.remove(0);
+            let mut netns: Option<String> = None;
+            let mut cgroup: Option<PathBuf> = None;
+            loop {
+                match args.first().map(|s| s.to_string_lossy().into_owned()).as_deref() {
+                    Some("--netns") => {
+                        args.remove(0);
+                        netns = Some(
+                            args.remove(0)
+                                .to_str()
+                                .ok_or_else(|| io::Error::new(
+                                    io::ErrorKind::InvalidInput, "--netns value not UTF-8",
+                                ))?
+                                .to_string(),
+                        );
+                    }
+                    Some("--cgroup") => {
+                        args.remove(0);
+                        cgroup = Some(PathBuf::from(args.remove(0)));
+                    }
+                    Some("--") => {
+                        args.remove(0);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+            // Join cgroup first (write our PID into cgroup.procs).
+            if let Some(procs) = cgroup {
+                std::fs::write(&procs, b"0").map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("browser join cgroup {}: {error}", procs.display()),
+                    )
+                })?;
+            }
+            // Join the netns BEFORE seccomp (setns is denied after install).
+            if let Some(name) = netns {
+                join_netns(&name)?;
+            }
+            // Sanitize inherited fds (close everything > stderr).
+            sanitize_fds()?;
+            // seccomp: no_new_privs + deny-list.  setns is in the deny
+            // list, so Chromium cannot change namespaces after this point.
+            install_seccomp()?;
+            return exec(&args);
+        }
+
         if args.first().is_some_and(|arg| arg == "--join-cgroup") {
             if args.len() < 4 || args[2] != "--" {
                 return Err(io::Error::new(

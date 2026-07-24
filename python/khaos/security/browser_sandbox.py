@@ -209,6 +209,13 @@ class EnforcementStatus:
     cgroup: bool = False
     route_guard: bool = False  # nftables egress pin
     service_workers_blocked: bool = False
+    # Batch 7.4 (round-7 §十): True ONLY when each (principal, project,
+    # runtime) authority domain owns a DISTINCT browser process + netns +
+    # cgroup.  The current design is process-shared (one Chromium, one
+    # netns, one cgroup for the whole process), so this is False — see
+    # ``docs/browser-threat-model.md``.  A caller that requires
+    # per-principal OS isolation must check this and refuse to share.
+    process_isolation: bool = False
     failure_reason: str = ""
 
     @property
@@ -964,6 +971,51 @@ class BrowserNetworkSandbox:
             except OSError:
                 pass
 
+    def build_launcher_argv(
+        self, real_executable: str, extra_args: list[str] | None = None,
+    ) -> list[str] | None:
+        """Batch 7.4 (round-7 §十一): build the Rust launcher argv for
+        browser launching, replacing the shell wrapper.
+
+        Returns ``[launcher, "--browser", "--netns", <name>, "--cgroup",
+        <procs>, "--", <chromium>, ...]`` when the launcher binary is
+        available (``KHAOS_SANDBOX_LAUNCHER`` env or on PATH), or None
+        when it is not (caller falls back to the shell wrapper).
+
+        The launcher does: validate argv → join cgroup → setns(netns) →
+        close inherited FDs → no_new_privs → install seccomp (denies
+        setns/unshare afterward) → execve(chromium).  This removes the
+        shell from the TCB and adds FD sanitization + browser seccomp.
+        """
+        if not self._active or self._netns_name is None:
+            return None
+        launcher = self._locate_browser_launcher()
+        if launcher is None:
+            return None
+        argv: list[str] = [
+            launcher, "--browser",
+            "--netns", self._netns_name,
+        ]
+        if self._cgroup_path is not None:
+            procs = self._cgroup_path / "cgroup.procs"
+            argv += ["--cgroup", str(procs)]
+        argv.append("--")
+        argv.append(real_executable)
+        if extra_args:
+            argv.extend(extra_args)
+        return argv
+
+    @staticmethod
+    def _locate_browser_launcher() -> str | None:
+        """Locate the khaos-sandbox-launcher binary (env override first)."""
+        configured = os.environ.get("KHAOS_SANDBOX_LAUNCHER", "").strip()
+        if configured:
+            return configured
+        found = shutil.which("khaos-sandbox-launcher")
+        if found:
+            return found
+        return None
+
     def create_wrapper_script(
         self, real_executable: str, proxy_port: int,
     ) -> str | None:
@@ -971,6 +1023,12 @@ class BrowserNetworkSandbox:
 
         Returns the path to the wrapper script, or None if the sandbox
         is not active (caller uses the real executable directly).
+
+        Batch 7.4 (round-7 §十一): prefer the Rust launcher
+        (``build_launcher_argv``) when available — it removes the shell
+        from the TCB and adds FD sanitization + seccomp.  This shell
+        wrapper remains as the FALLBACK when the launcher binary is
+        absent (e.g. non-Linux or unbuilt).
 
         C-08: the wrapper writes its own PID to ``cgroup.procs`` before
         ``exec nsenter``.  Since ``nsenter --net`` preserves the PID,
@@ -1005,26 +1063,48 @@ class BrowserNetworkSandbox:
             else ""
         )
 
-        # C-08: write PID to cgroup.procs before exec.  If the write
-        # fails (permission denied, cgroup deleted), the wrapper must
-        # exit non-zero so the caller knows the browser did not launch
-        # with resource limits enforced.
-        if cgroup_procs:
-            join_cgroup = (
-                f'if ! echo $$ > "{cgroup_procs}" 2>/dev/null; then\n'
-                f'  echo "khaos: failed to join cgroup {cgroup_procs}" >&2\n'
-                f'  exit 1\n'
-                f'fi\n'
+        # Batch 7.4 (round-7 §十一): prefer the Rust launcher when
+        # available — it does cgroup join + netns join + FD sanitization
+        # + seccomp in one trusted binary (no shell quoting, no nsenter
+        # dependency).  The shim below just forwards Playwright's argv to
+        # the launcher because Playwright's ``executable_path`` takes a
+        # single binary path, not an argv list.  When the launcher is
+        # absent we fall back to the legacy nsenter shell form.
+        launcher = self._locate_browser_launcher()
+        if launcher is not None:
+            # Shim: exec the launcher with --browser + netns + cgroup,
+            # then "$@" (Playwright's Chromium flags) become the
+            # launcher's command after "--".  The launcher inserts
+            # ``real_executable`` as the command — but Playwright calls
+            # the shim with the Chromium flags as $@, so we pass the
+            # real executable explicitly and let "$@" append flags.
+            cgroup_arg = (
+                f' --cgroup "{cgroup_procs}"' if cgroup_procs else ""
+            )
+            script_content = (
+                f'#!/bin/sh\n'
+                f'# Batch 7.4: forwards to the Rust browser launcher.\n'
+                f'# AUTO-GENERATED - do not edit.\n'
+                f'exec "{launcher}" --browser --netns "{self._netns_name}"'
+                f'{cgroup_arg} -- "{real_executable}" "$@"\n'
             )
         else:
-            join_cgroup = ""
-
-        script_content = f"""#!/bin/sh
-# C-08/C-10: Khaos browser netns wrapper.  AUTO-GENERATED - do not edit.
-# Launches Chromium inside the dedicated network namespace so even a
-# compromised browser cannot bypass the egress proxy.
-# This script joins the browser cgroup BEFORE exec so resource limits
-# (pids/memory/cpu) actually apply to Chromium.
+            # Legacy fallback: direct nsenter shell wrapper (no FD
+            # sanitization / seccomp — used when the launcher binary is
+            # not built/installed, e.g. non-Linux dev).
+            if cgroup_procs:
+                join_cgroup = (
+                    f'if ! echo $$ > "{cgroup_procs}" 2>/dev/null; then\n'
+                    f'  echo "khaos: failed to join cgroup {cgroup_procs}" >&2\n'
+                    f'  exit 1\n'
+                    f'fi\n'
+                )
+            else:
+                join_cgroup = ""
+            script_content = f"""#!/bin/sh
+# C-08/C-10: Khaos browser netns wrapper (legacy fallback).  AUTO-GENERATED.
+# Prefer the Rust launcher (build khaos-sandbox-launcher) for FD
+# sanitization + browser seccomp.
 {join_cgroup}exec nsenter --net="{netns_path}" "{real_executable}" "$@"
 """
         # C-10: create with O_NOFOLLOW | O_EXCL so the wrapper cannot
