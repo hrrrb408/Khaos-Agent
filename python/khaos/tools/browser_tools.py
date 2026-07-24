@@ -520,13 +520,61 @@ class BrowserManager:
         return {"ok": True, "runtime_id": runtime_id}
 
     async def _force_close_browser_locked(self) -> None:
-        """Force the browser generation closed after repeated Context failure."""
+        """Force the browser generation closed after repeated Context failure.
+
+        Batch 6.5 (round-6 §十五): previously this only did
+        ``browser.close()`` + ``playwright.stop()`` + ``_contexts.clear()``
+        — it never closed each context's ``egress_proxy`` (leaking the
+        listening socket + the kernel nft egress-pin port) and never tore
+        down the ``BrowserSandbox`` (leaking netns / veth / cgroup / nft
+        table).  Once ``_contexts.clear()`` ran the proxy references were
+        lost, so a later ``close()`` could not enumerate them either.  Now
+        this mirrors the normal ``close()`` path: best-effort per-context
+        proxy+port cleanup FIRST, then browser/playwright, then sandbox
+        teardown.  Any failure is logged but does not abort the rest of
+        the teardown (we are already in a degraded state).
+        """
+        # Step 1: close every context's egress proxy + remove its nft
+        # egress-pin port.  ``_close_all_contexts`` already encapsulates
+        # this (force=True ignores refcounts and does proxy.close() +
+        # remove_egress_port per entry).  Best-effort: a single context's
+        # failure must not skip the rest or the sandbox teardown.
+        try:
+            await self._close_all_contexts()
+        except Exception as exc:  # noqa: BLE001 — degraded-path cleanup
+            logger.error(
+                "force-close: _close_all_contexts raised %s; continuing "
+                "to browser/playwright/sandbox teardown (some proxies "
+                "or nft ports may leak)", exc,
+            )
+        # Step 2: stop the browser + playwright runtime.
         if self._browser is not None:
-            await self._browser.close()
+            try:
+                await self._browser.close()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("force-close: browser.close() failed: %s", exc)
         if self._playwright is not None:
-            await self._playwright.stop()
+            try:
+                await self._playwright.stop()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("force-close: playwright.stop() failed: %s", exc)
         self._browser = None
         self._playwright = None
+        # Step 3: tear down the OS-level netns sandbox (Linux).  This
+        # deletes the per-sandbox nft table, veth pair, netns, cgroup, and
+        # registry file.  On failure we retain ``_browser_sandbox`` so the
+        # startup Reaper can retry on next launch instead of silently
+        # leaking the resources.
+        if self._browser_sandbox is not None:
+            try:
+                await asyncio.to_thread(self._browser_sandbox.teardown)
+                self._browser_sandbox = None
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "force-close: sandbox teardown failed: %s — RETAINING "
+                    "sandbox reference for startup Reaper; netns/veth/"
+                    "cgroup/nft may leak until next launch", exc,
+                )
         self._contexts.clear()
         self._context_close_failures.clear()
 
