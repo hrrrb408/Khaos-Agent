@@ -81,8 +81,12 @@ def _nft_check(script: str) -> bool:
 
 
 def _nft_table_exists(table: str) -> bool:
+    # The production sandbox creates ``table inet <name>`` (the
+    # ``_NFT_TABLE_FAMILY`` constant is "inet").  ``nft list table <name>``
+    # without a family defaults to the ``ip`` family and reports "not
+    # found" for an inet table, so we MUST pass the family explicitly.
     proc = subprocess.run(
-        ["nft", "list", "table", table],
+        ["nft", "list", "table", "inet", table],
         capture_output=True,
         text=True,
         timeout=10,
