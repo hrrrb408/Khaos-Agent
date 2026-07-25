@@ -48,6 +48,10 @@ mod linux {
     }
 
     fn denied_syscalls() -> &'static [libc::c_long] {
+        // Batch 7.6 (round-7 §二十五): io_uring syscalls added to match
+        // the Codex restricted-execution model.  io_uring expands the
+        // async kernel-I/O attack surface; denying it keeps the sandbox
+        // to the classic synchronous syscall set.
         &[
             libc::SYS_bpf,
             libc::SYS_ptrace,
@@ -71,6 +75,9 @@ mod linux {
             libc::SYS_keyctl,
             libc::SYS_add_key,
             libc::SYS_request_key,
+            libc::SYS_io_uring_setup,
+            libc::SYS_io_uring_enter,
+            libc::SYS_io_uring_register,
         ]
     }
 
