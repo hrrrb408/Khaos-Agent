@@ -188,5 +188,8 @@ jobs:
             python/tests/db/test_immutable_migration_supply_chain_round5.py \
             python/tests/db/test_lifecycle_concurrency_round6.py \
             python/tests/db/test_chat_stream_state_machine_round5.py \
+            python/tests/db/test_chat_stream_identity_round6.py \
+            python/tests/db/test_chat_replay_protocol_round7.py \
             python/tests/db/test_owner_context_closure_round5.py \
+            python/tests/db/test_migration_upgrade_compat_round7.py \
             -q -v

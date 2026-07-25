@@ -92,6 +92,14 @@ class TransactionContextLeakError(RuntimeError):
     """A transaction ContextVar leaked across task or database boundaries."""
 
 
+class DatabaseClosingError(RuntimeError):
+    """Batch 7.6 (round-7 §二十): a read was attempted while the database
+    is closing.  ``close()`` sets the admission fence (``_closing=True``)
+    before draining in-flight reads, so a NEW read that arrives during
+    the drain is rejected rather than entering and then being torn down
+    mid-fetch.  Callers should retry on a re-opened database."""
+
+
 class OwnerMismatchError(RuntimeError):
     """An upsert collided with a row owned by a different principal/project.
 
@@ -282,6 +290,12 @@ class Database:
         self._readers_idle = asyncio.Event()
         self._readers_idle.set()
         self._reader_drain_lock = asyncio.Lock()
+        # Batch 7.6 (round-7 §二十): admission-fence state.  ``close()``
+        # sets this BEFORE draining so new ``_read_lease()`` entrants are
+        # rejected (the generation bump alone does not gate the reader
+        # path because ``_require_reader_conn`` re-opens under the
+        # lifecycle lock we hold — which would re-open mid-close).
+        self._closing = False
 
     async def connect(self) -> None:
         """Open writer and reader SQLite connections if not already open.
@@ -306,6 +320,20 @@ class Database:
                 if aiosqlite is None:
                     writer = _AsyncSqliteFallback(self.path)
                     reader = _AsyncSqliteFallback(self.path)
+                elif self.path == ":memory:":
+                    # Batch 7.6 (round-7 §二十一): two bare
+                    # ``aiosqlite.connect(":memory:")`` calls create TWO
+                    # independent in-memory databases — the writer's
+                    # migration creates tables the reader never sees.
+                    # Use a shared-cache URI so both connections back the
+                    # SAME in-memory database.
+                    import uuid as _uuid
+                    if not hasattr(self, "_memory_uri") or not self._memory_uri:
+                        self._memory_uri = f"file:khaos-{_uuid.uuid4().hex}?mode=memory&cache=shared"
+                    writer = await aiosqlite.connect(self._memory_uri, uri=True)
+                    writer.row_factory = aiosqlite.Row
+                    reader = await aiosqlite.connect(self._memory_uri, uri=True)
+                    reader.row_factory = aiosqlite.Row
                 else:
                     writer = await aiosqlite.connect(self.path)
                     writer.row_factory = aiosqlite.Row
@@ -532,6 +560,9 @@ class Database:
         # the generation and tear down the connections.
         async with self._write_transaction_lock:
             async with self._connection_lifecycle_lock:
+                # Batch 7.6 §二十: set the admission fence FIRST so new
+                # ``_read_lease()`` entrants are rejected while we drain.
+                self._closing = True
                 self._connection_generation += 1
                 if self._conn is not None:
                     await self._conn.close()
@@ -541,17 +572,23 @@ class Database:
                 # ``_active_readers``; we wait for them to finish (bounded
                 # by ``_READER_DRAIN_TIMEOUT``) so a read that already
                 # captured the reader ref does not hit a torn-down
-                # connection mid-fetch.  New reads are rejected because the
-                # generation bump above makes ``_require_conn`` re-open
-                # (which fails / waits on the lifecycle lock we hold).
+                # connection mid-fetch.  Batch 7.6 §二十: NEW reads are
+                # now rejected by the ``_closing`` fence above (the
+                # generation bump alone was insufficient because
+                # ``_require_reader_conn`` re-opens under the lifecycle
+                # lock we hold).
                 await self._wait_readers_drained()
                 if self._reader_conn is not None:
                     await self._reader_conn.close()
                     self._reader_conn = None
+                # Reset the fence so a subsequent ``connect()`` can admit
+                # reads again (re-open path).
+                self._closing = False
 
     @asynccontextmanager
     async def _read_lease(self):
-        """Batch 6.5 (round-6 §十八): hold a reader-operation lease.
+        """Batch 6.5 (round-6 §十八) + Batch 7.6 (round-7 §二十): hold a
+        reader-operation lease.
 
         Wraps the body of a read method so ``close()`` waits for all
         in-flight reads to finish before tearing down the reader
@@ -559,11 +596,16 @@ class Database:
         ``_readers_idle``); exit decrements and sets ``_readers_idle``
         when the count returns to zero.
 
-        Only the READER path needs this — writer-path reads (inside
-        ``transaction()``) are already serialized by the write +
-        lifecycle locks, and ``close()`` itself acquires the write lock
-        first, so it cannot race an in-flight transaction.
+        Batch 7.6 §二十 admission fence: if ``close()`` has already set
+        ``_closing``, a NEW read is rejected with ``DatabaseClosingError``
+        instead of entering and then being torn down.  This closes the
+        gap where a read could enter between the drain-event returning
+        and ``reader.close()`` executing.
         """
+        if self._closing:
+            raise DatabaseClosingError(
+                "database is closing; new read operations are rejected"
+            )
         self._active_readers += 1
         self._readers_idle.clear()
         try:
