@@ -44,7 +44,10 @@ jobs:
           sudo chmod 0755 /usr/bin/bwrap
           test ! -u /usr/bin/bwrap
       - name: Install test dependencies
-        run: python -m pip install -e '.[test]'
+        run: |
+          python -m pip install uv==0.11.9
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Build inner seccomp launcher
         run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
       - name: Delegate cgroup v2 subtree
@@ -208,7 +211,10 @@ jobs:
           done
           test -w /sys/fs/cgroup/khaos-browser
       - name: Install test dependencies
-        run: python -m pip install -e '.[test]'
+        run: |
+          python -m pip install uv==0.11.9
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Capture pre-test kernel diagnostics
         run: |
           set +e
@@ -239,8 +245,8 @@ jobs:
           py_path="$PYTHONPATH"
           sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,PYTHONPATH \
             "$python_bin" -m pytest \
-            python/tests/security/test_browser_kernel_isolation_round6.py \
-            -m kernel_real -v
+            python/tests/security/test_browser_fullstack_kernel_round8.py \
+            -m "kernel_real and browser_real" -v
       - name: Capture post-test kernel diagnostics
         if: always()
         run: |
@@ -276,10 +282,10 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
-      - name: Install nftables + iproute2 + nsenter
+      - name: Install nftables + iproute2 + bubblewrap
         run: |
           sudo apt-get update
-          sudo apt-get install -y nftables iproute2 util-linux
+          sudo apt-get install -y nftables iproute2 util-linux bubblewrap
           nft --version
           ip -V
       - name: Enable unprivileged user namespaces (if restricted)
@@ -306,8 +312,9 @@ jobs:
         run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
       - name: Install test + browser dependencies
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e '.[test,browser]'
+          python -m pip install uv==0.11.9
+          uv sync --frozen --extra test --extra browser
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Download Chromium binary
         run: python -m playwright install --with-deps chromium
       - name: Run full-stack browser kernel tests (as root)
@@ -324,7 +331,7 @@ jobs:
           python_bin="$(command -v python)"
           sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_BROWSER_MOCK_MODE,KHAOS_RUN_BROWSER_E2E,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,KHAOS_SANDBOX_LAUNCHER,PYTHONPATH,HOME \
             "$python_bin" -m pytest \
-            python/tests/security/test_browser_kernel_isolation_round6.py \
+            python/tests/security/test_browser_fullstack_kernel_round8.py \
             -m kernel_real -v
 
   macos-sandbox-security:
@@ -338,7 +345,10 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install test dependencies
-        run: python -m pip install -e '.[test]'
+        run: |
+          python -m pip install uv==0.11.9
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Capture pre-test diagnostics
         run: |
           set +e
@@ -383,7 +393,10 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install test dependencies
-        run: python -m pip install -e ".[test]"
+        run: |
+          python -m pip install uv==0.11.9
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Prove Windows has no Host fallback
         run: python -m pytest python/tests/coding/test_windows_fail_closed.py python/tests/coding/test_backend_selector.py -q -m windows_fail_closed -v
       - name: Capture Windows diagnostics

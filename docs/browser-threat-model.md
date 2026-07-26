@@ -1,78 +1,54 @@
-# Browser Threat Model (Batch 7.4, round-7 §十)
+# Browser Threat Model (Round 8 closure)
 
-## Current isolation boundary
+## Enforced authority boundary
 
-Khaos's browser subsystem is **process-shared**: a single `BrowserManager`
-(process-wide singleton) owns ONE Chromium process, ONE network namespace,
-ONE cgroup, and ONE nftables table.  Multiple callers are isolated only at
-the Playwright `BrowserContext` layer:
+A `BrowserManager` generation owns one Chromium process tree, network
+namespace, cgroup, nftables table and registry record. That generation is
+leased to exactly one authenticated principal. Sessions and runtimes for that
+principal may use separate `BrowserContext` objects, but a second principal is
+rejected fail-closed for the lifetime of the process generation.
 
-| Layer | Scope | Isolation guarantee |
-|-------|-------|---------------------|
-| Chromium process tree | **process-wide (shared)** | none across principals |
-| Network namespace | **process-wide (shared)** | none across principals |
-| cgroup (pids/memory/cpu) | **process-wide (shared)** | budget shared across principals |
-| nftables table | **process-wide (shared)** | port set shared (per-context pins coexist) |
-| `BrowserContext` (cookies/DOM/localStorage) | per-`(principal, session, runtime)` | API-layer isolation only |
-| Egress proxy port | per-context | per-context port, pinned into the shared table |
+This single-principal lease is intentional. A `BrowserContext` is an API state
+boundary, not a containment boundary for a compromised Chromium process. A
+multi-user service must therefore allocate a distinct `BrowserManager` process
+generation per principal/project authority domain; it may not share this
+singleton between principals.
 
-The `EnforcementStatus.process_isolation` flag is `False` to make this
-explicit — callers that require per-principal OS-level isolation must
-check it and refuse to share.
+| Layer | Scope | Enforced guarantee |
+|---|---|---|
+| Chromium process tree | one principal per generation | a second principal is denied |
+| Linux mount namespace (`bwrap`) | process generation | `/home`, `/root` and host temp are hidden; synthetic HOME/tmp only |
+| Network namespace + nftables | process generation | default deny; only authenticated proxy ports are pinned |
+| cgroup v2 | process generation | pids, memory, CPU and I/O budget |
+| `BrowserContext` | per session/runtime key | cookie, DOM and storage separation within one principal |
+| Egress proxy | per context | credentialed relay plus DNS/IP revalidation |
 
-## What the current model defends against
+## Launch and teardown transaction
 
-- **Accidental cross-principal state leakage at the API layer** — cookies,
-  DOM, localStorage, page state are scoped per `BrowserContext`.
-- **Network egress to non-allowlisted hosts** — the nft default-deny +
-  per-context egress pin + authenticated proxy enforce that the browser
-  netns can only reach the pinned proxy port.
-- **Resource exhaustion from a single context** — the shared cgroup bounds
-  the whole browser tree (pids/memory/cpu).
+Production launch is permitted only after netns, cgroup, nftables, trusted
+Rust launcher, FD sanitization and filesystem sandbox enforcement have all
+been established. Sandbox setup failure poisons the generation; retry cannot
+fall through to direct Chromium. The Rust launcher preserves only Playwright's
+FD 3/4 pipes, closes unrelated descriptors, joins cgroup/netns, enters the
+mount sandbox, installs `no_new_privs` and seccomp, then execs Chromium.
 
-## What the current model does NOT defend against
+Context teardown removes its nft port while the authenticated proxy still owns
+the socket, closes the proxy, and finally closes the context. Generation
+teardown removes wrappers, kills and removes the cgroup, then removes nft/netns
+resources. Partial cleanup remains registered and makes shutdown fail until a
+retry succeeds; it is never reported as closed.
 
-> **A full Chromium-process compromise is NOT contained per-principal.**
+Registry entries contain owner PID/start-time, boot ID, lifecycle stage and an
+HMAC. Resource names are derived from the same per-install secret. The Browser
+mount namespace cannot access that secret. Corrupt or unauthenticated entries
+are quarantined rather than trusted by the reaper.
 
-If an attacker achieves arbitrary code execution inside the Chromium
-process (e.g. a browser exploit that escapes the renderer sandbox), they
-share the OS-level authority of that single process with every other
-principal's context.  Specifically:
+## Claims and deployment rule
 
-- Memory of other principals' `BrowserContext` data is reachable.
-- The netns/cgroup/nft authority is process-wide, not per-principal.
-- The egress proxy credentials of other contexts are reachable.
+Safe claim: Khaos enforces a single-principal Chromium generation with
+kernel-default-deny egress, filesystem hiding, cgroup limits, descriptor
+sanitization and retryable fail-closed teardown on supported Linux hosts.
 
-For a **single-user local product** this is acceptable — there is only one
-principal.  For a **multi-principal deployment** (e.g. a shared Khaos
-instance serving several authenticated users) this is a known gap.
-
-## Codex-aligned end state (future work)
-
-Review §十 recommends, for multi-principal deployments, keying the
-browser authority domain by `(project_id, principal_id, runtime_id)` so
-each domain owns a DISTINCT:
-
-```
-Browser Process
-Network Namespace
-cgroup
-Proxy
-Registry
-Kernel Policy (nft table)
-```
-
-This is a substantial refactor (per-domain browser launch, lifecycle, and
-resource management) and is tracked as future work.  Until then, the
-`process_isolation = False` flag and this document are the explicit,
-audited statement of the boundary.
-
-## Safe to claim
-
-> Khaos isolates browser contexts at the API layer (cookies/DOM/storage)
-> and enforces kernel-level network egress default-deny per process.
-
-## Not yet safe to claim
-
-> Khaos isolates browser authority per principal at the OS level (a
-> compromise of one principal's browser context cannot reach another's).
+Not a safe claim: one `BrowserManager` can safely serve several principals.
+Multi-user deployments must instantiate independent generations; if they do
+not, the built-in principal lease rejects the second principal.

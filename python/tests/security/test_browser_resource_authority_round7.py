@@ -30,6 +30,14 @@ from khaos.security.browser_sandbox import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _deterministic_registry_key(monkeypatch):
+    monkeypatch.setattr(
+        "khaos.security.browser_sandbox._registry_key",
+        lambda *, create=False: b"k" * 32,
+    )
+
+
 # ===========================================================================
 # §六 — Name derivation + validation (the Confused Deputy defense)
 # ===========================================================================
@@ -37,16 +45,16 @@ from khaos.security.browser_sandbox import (
 
 class TestNameDerivation:
     def test_derive_netns_name(self):
-        assert _derive_netns_name("a1b2c3d4e5f6a1b2") == "khaos-br-a1b2c3"
+        assert _derive_netns_name("a1b2c3d4e5f6a1b2") == "khaos-br-bee0ab458daa"
 
     def test_derive_veth_host(self):
-        assert _derive_veth_host("a1b2c3d4e5f6a1b2") == "khbrh-a1b2c3"
+        assert _derive_veth_host("a1b2c3d4e5f6a1b2") == "khbee0ab458daa"
 
     def test_derive_nft_table(self):
-        assert _derive_nft_table("a1b2c3d4e5f6a1b2") == "khaos_browser_a1b2c3d4e5f6a1b2"
+        assert _derive_nft_table("a1b2c3d4e5f6a1b2") == "khaos_browser_bee0ab458daab81c30afdc32f6274f76"
 
     def test_derive_cgroup_name(self):
-        assert _derive_cgroup_name("a1b2c3d4e5f6a1b2") == "browser-a1b2c3d4"
+        assert _derive_cgroup_name("a1b2c3d4e5f6a1b2") == "browser-bee0ab458daab81c30afdc32"
 
 
 class TestNameValidation:
@@ -54,9 +62,9 @@ class TestNameValidation:
 
     def test_valid_derived_names_pass(self):
         assert _is_valid_derived_name(
-            netns="khaos-br-a1b2c3",
-            veth="khbrh-a1b2c3",
-            nft_table="khaos_browser_a1b2c3d4e5f6a1b2",
+            netns="khaos-br-bee0ab458daa",
+            veth="khbee0ab458daa",
+            nft_table="khaos_browser_bee0ab458daab81c30afdc32f6274f76",
         )
 
     def test_forged_netns_rejected(self):
@@ -100,7 +108,8 @@ class TestRegistryFormat:
         entry = json.loads(sb._registry_file.read_text())
         # Allowed fields only.
         assert set(entry.keys()) == {
-            "token", "pid", "process_start_time", "creation_stage",
+            "token", "pid", "process_start_time", "boot_id",
+            "creation_stage", "mac",
         }
         # Forbidden resource-name fields.
         for forbidden in (

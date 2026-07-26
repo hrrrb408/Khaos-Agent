@@ -74,6 +74,9 @@ from __future__ import annotations
 
 import logging
 import os
+import hashlib
+import hmac
+import json
 import secrets
 import shutil
 import subprocess
@@ -118,29 +121,83 @@ import re as _re
 # does not match is REFUSED before any privileged operation — this closes
 # the Confused Deputy (review §六): a forged registry entry cannot name an
 # arbitrary netns/veth/nft-table/cgroup for the privileged reaper to delete.
-_NETNS_RE = _re.compile(r"^khaos-br-[0-9a-f]{6}$")
-_VETH_RE = _re.compile(r"^khbr[h]-[0-9a-f]{6}$")
-_NFT_TABLE_RE = _re.compile(r"^khaos_browser_[0-9a-f]{16}$")
+_NETNS_RE = _re.compile(r"^khaos-br-[0-9a-f]{12}$")
+_VETH_RE = _re.compile(r"^kh[0-9a-f]{12}$")
+_NFT_TABLE_RE = _re.compile(r"^khaos_browser_[0-9a-f]{32}$")
+
+
+def _registry_key(*, create: bool = False) -> bytes:
+    """Read or securely create the process-external registry MAC key."""
+    key_file = _RESOURCE_REGISTRY.parent / "browser-registry.key"
+    if create:
+        key_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            fd = os.open(
+                key_file,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+        except FileExistsError:
+            pass
+        else:
+            try:
+                os.write(fd, secrets.token_bytes(32))
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    fd = os.open(key_file, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+            raise BrowserSandboxError("browser registry key ownership/mode invalid")
+        key = os.read(fd, 33)
+    finally:
+        os.close(fd)
+    if len(key) != 32:
+        raise BrowserSandboxError("browser registry key must be exactly 32 bytes")
+    return key
+
+
+def _resource_digest(token: str) -> str:
+    return hmac.new(_registry_key(create=True), token.encode("ascii"), hashlib.sha256).hexdigest()
 
 
 def _derive_netns_name(token: str) -> str:
     """Derive the netns name from the sandbox token (trusted derivation)."""
-    return f"khaos-br-{token[:6]}"
+    return f"khaos-br-{_resource_digest(token)[:12]}"
 
 
 def _derive_veth_host(token: str) -> str:
     """Derive the host veth name from the sandbox token."""
-    return f"khbrh-{token[:6]}"
+    return f"kh{_resource_digest(token)[:12]}"
 
 
 def _derive_nft_table(token: str) -> str:
     """Derive the nft table name from the sandbox token."""
-    return f"{_NFT_TABLE_PREFIX}_{token}"
+    return f"{_NFT_TABLE_PREFIX}_{_resource_digest(token)[:32]}"
 
 
 def _derive_cgroup_name(token: str) -> str:
     """Derive the cgroup leaf name from the sandbox token."""
-    return f"{_CGROUP_BROWSER_PREFIX}-{token[:8]}"
+    return f"{_CGROUP_BROWSER_PREFIX}-{_resource_digest(token)[:24]}"
+
+
+def _boot_id() -> str:
+    try:
+        return Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    except OSError:
+        return "non-linux"
+
+
+def _sign_registry_entry(entry: dict[str, object]) -> str:
+    payload = json.dumps(entry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hmac.new(_registry_key(create=True), payload, hashlib.sha256).hexdigest()
+
+
+def _verify_registry_entry(entry: dict[str, object]) -> bool:
+    supplied = str(entry.pop("mac", ""))
+    expected = _sign_registry_entry(entry)
+    return bool(supplied) and hmac.compare_digest(supplied, expected)
 
 
 def _is_valid_derived_name(
@@ -182,6 +239,19 @@ class CleanupResult:
     registry_retained: bool = False
     fully_closed: bool = False
 
+    def to_dict(self) -> dict[str, bool]:
+        """Return a stable JSON-safe cleanup report for lifecycle owners."""
+        return {
+            "nft_removed": self.nft_removed,
+            "veth_removed": self.veth_removed,
+            "netns_removed": self.netns_removed,
+            "cgroup_removed": self.cgroup_removed,
+            "wrapper_removed": self.wrapper_removed,
+            "run_dir_removed": self.run_dir_removed,
+            "registry_retained": self.registry_retained,
+            "fully_closed": self.fully_closed,
+        }
+
 
 @dataclass
 class BrowserSandboxConfig:
@@ -216,11 +286,33 @@ class EnforcementStatus:
     # ``docs/browser-threat-model.md``.  A caller that requires
     # per-principal OS isolation must check this and refuse to share.
     process_isolation: bool = False
+    trusted_launcher: bool = False
+    fd_sanitized: bool = False
+    filesystem_sandbox: bool = False
     failure_reason: str = ""
 
     @property
+    def kernel_ok(self) -> bool:
+        """True once the pre-launch kernel and proxy layers exist."""
+        return (
+            not self.failure_reason
+            and self.network_namespace
+            and self.proxy_required
+            and self.cgroup
+            and self.route_guard
+            and self.service_workers_blocked
+        )
+
+    @property
     def ok(self) -> bool:
-        return not self.failure_reason
+        """True only for the complete production Chromium launch contract."""
+        return (
+            self.kernel_ok
+            and self.process_isolation
+            and self.trusted_launcher
+            and self.fd_sanitized
+            and self.filesystem_sandbox
+        )
 
 
 class BrowserNetworkSandbox:
@@ -319,8 +411,13 @@ class BrowserNetworkSandbox:
         # dead-code that built names two different ways is removed.
         self._netns_name = _derive_netns_name(self._token)
         self._veth_host = _derive_veth_host(self._token)
-        self._veth_ns = f"khbrn-{self._token[:6]}"
+        self._veth_ns = f"kn{_resource_digest(self._token)[:12]}"
         self._nft_table = _derive_nft_table(self._token)
+
+        # Keyed names make collisions cryptographically unlikely, but
+        # privileged creation still performs an explicit global absence
+        # check. Never adopt or overwrite a pre-existing kernel object.
+        self._assert_resource_names_available()
 
         # Randomize the second octet to avoid collisions.
         subnet = f"{_VETH_SUBNET_PREFIX}.{secrets.randbelow(250) + 1}"
@@ -365,6 +462,7 @@ class BrowserNetworkSandbox:
                 cgroup=self._cgroup_path is not None,
                 route_guard=True,
                 service_workers_blocked=True,
+                process_isolation=True,
             )
             logger.info(
                 "browser netns sandbox active: netns=%s host=%s ns=%s token=%s",
@@ -385,6 +483,40 @@ class BrowserNetworkSandbox:
                 exc,
             )
             self.teardown()
+
+    def _assert_resource_names_available(self) -> None:
+        """Reject any pre-existing derived kernel/registry resource."""
+        assert self._netns_name is not None
+        assert self._veth_host is not None
+        assert self._nft_table is not None
+        probes = (
+            (["ip", "netns", "list"], self._netns_name, True),
+            (["ip", "link", "show", "dev", self._veth_host], "", False),
+            (["nft", "list", "table", _NFT_TABLE_FAMILY, self._nft_table], "", False),
+        )
+        for argv, exact_name, list_probe in probes:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, timeout=5,
+            )
+            collision = (
+                any(line.split()[0] == exact_name for line in result.stdout.splitlines())
+                if list_probe
+                else result.returncode == 0
+            )
+            if collision:
+                raise BrowserSandboxError(
+                    f"derived browser resource already exists: {exact_name or argv[-1]}"
+                )
+        cgroup_root = _browser_cgroup_root()
+        if cgroup_root is not None:
+            cgroup = cgroup_root / _derive_cgroup_name(self._token)
+            if cgroup.exists():
+                raise BrowserSandboxError(
+                    f"derived browser cgroup already exists: {cgroup.name}"
+                )
+        registry = _RESOURCE_REGISTRY / f"{self._token}.json"
+        if registry.exists():
+            raise BrowserSandboxError("browser registry token collision")
 
     @staticmethod
     def startup_reaper() -> dict[str, int]:
@@ -831,7 +963,7 @@ class BrowserNetworkSandbox:
                 "skipping resource limits"
             )
             return
-        group = root / f"{_CGROUP_BROWSER_PREFIX}-{self._token[:8]}"
+        group = root / _derive_cgroup_name(self._token)
         try:
             group.mkdir(mode=0o700)
             limits = {
@@ -901,7 +1033,6 @@ class BrowserNetworkSandbox:
         debug) — a sandbox whose resources cannot be tracked must not
         start, or a crash would leave un-reapable orphans.
         """
-        import json
         try:
             _RESOURCE_REGISTRY.mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError as exc:
@@ -914,8 +1045,10 @@ class BrowserNetworkSandbox:
             "token": self._token,
             "pid": os.getpid(),
             "process_start_time": _get_process_start_time(os.getpid()),
+            "boot_id": _boot_id(),
             "creation_stage": self._creation_stage or "INTENT",
         }
+        entry["mac"] = _sign_registry_entry(entry)
         reg_file = _RESOURCE_REGISTRY / f"{self._token}.json"
         try:
             fd = os.open(
@@ -939,15 +1072,16 @@ class BrowserNetworkSandbox:
         """§七: atomically update the registry's ``creation_stage`` after
         each resource is created, so a crash leaves a precise trace.  The
         update is written via a temp-file + atomic rename for durability."""
-        import json
         if self._registry_file is None:
             return
         entry = {
             "token": self._token,
             "pid": os.getpid(),
             "process_start_time": _get_process_start_time(os.getpid()),
+            "boot_id": _boot_id(),
             "creation_stage": stage,
         }
+        entry["mac"] = _sign_registry_entry(entry)
         tmp = self._registry_file.with_suffix(".tmp")
         try:
             fd = os.open(
@@ -1015,6 +1149,29 @@ class BrowserNetworkSandbox:
         if found:
             return found
         return None
+
+    def launcher_environment(self, real_executable: str) -> dict[str, str]:
+        """Return the direct Rust-launcher contract for Playwright.
+
+        Playwright can only configure one executable path.  Passing the Rust
+        binary directly and supplying immutable launch metadata through the
+        child environment removes the forwarding shell from production TCB.
+        """
+        launcher = self._locate_browser_launcher()
+        if launcher is None:
+            raise BrowserSandboxError("trusted Rust browser launcher required")
+        if not self._active or not self._netns_name:
+            raise BrowserSandboxError("browser sandbox is not active")
+        env = {
+            "KHAOS_BROWSER_LAUNCH": "1",
+            "KHAOS_BROWSER_REAL_EXECUTABLE": real_executable,
+            "KHAOS_BROWSER_NETNS": self._netns_name,
+        }
+        if self._cgroup_path is not None:
+            env["KHAOS_BROWSER_CGROUP_PROCS"] = str(
+                self._cgroup_path / "cgroup.procs"
+            )
+        return env
 
     def create_wrapper_script(
         self, real_executable: str, proxy_port: int,
@@ -1089,6 +1246,10 @@ class BrowserNetworkSandbox:
                 f'{cgroup_arg} -- "{real_executable}" "$@"\n'
             )
         else:
+            if self._require_os_sandbox:
+                raise BrowserSandboxError(
+                    "trusted Rust browser launcher is required in production"
+                )
             # Legacy fallback: direct nsenter shell wrapper (no FD
             # sanitization / seccomp — used when the launcher binary is
             # not built/installed, e.g. non-Linux dev).
@@ -1164,35 +1325,43 @@ class BrowserNetworkSandbox:
                 logger.warning("teardown: deletion failed (retained): %s", exc)
                 return False
 
-        # Delete per-sandbox nftables table (H-02: not global)
-        if self._nft_table is not None:
+        # Delete wrapper script + secure run dir (C-10)
+        if self._wrapper_script is not None:
+            w = self._wrapper_script
+            result.wrapper_removed = _try(lambda: w.unlink(missing_ok=True))
+            if result.wrapper_removed:
+                self._wrapper_script = None
+        if self._run_dir is not None:
+            rd = self._run_dir
+            result.run_dir_removed = _try(lambda: rd.rmdir())
+            if result.run_dir_removed:
+                self._run_dir = None
+
+        # Kill the browser process tree before removing the firewall.  The
+        # nft default-deny boundary remains active until cgroup populated=0
+        # and the leaf is gone, so a failed browser.close() cannot create an
+        # unfiltered network window during force teardown.
+        if self._cgroup_path is not None:
+            cg = self._cgroup_path
+            _remove_cgroup(cg)
+            result.cgroup_removed = not cg.exists()
+            if result.cgroup_removed:
+                self._cgroup_path = None
+
+        # Delete per-sandbox nftables table only after the browser cgroup is
+        # dead.  If cgroup removal failed, retain the firewall and report a
+        # quarantined partial cleanup.
+        if self._nft_table is not None and (
+            result.cgroup_removed or not had_cgroup
+        ):
             tbl = self._nft_table
             result.nft_removed = _try(lambda: _run_command(
                 ["nft", "delete", "table", _NFT_TABLE_FAMILY, tbl],
                 f"delete nftables table {tbl}",
             ))
-            self._nft_table = None
-        # Round-6 Batch 6.2: clear the egress port set so a re-setup()
-        # does not carry stale ports forward.
-        self._egress_ports.clear()
-
-        # Delete wrapper script + secure run dir (C-10)
-        if self._wrapper_script is not None:
-            w = self._wrapper_script
-            result.wrapper_removed = _try(lambda: w.unlink(missing_ok=True))
-            self._wrapper_script = None
-        if self._run_dir is not None:
-            rd = self._run_dir
-            result.run_dir_removed = _try(lambda: rd.rmdir())
-            self._run_dir = None
-
-        # Delete cgroup — _remove_cgroup logs warnings on failure but
-        # does not raise; verify the dir is actually gone afterwards.
-        if self._cgroup_path is not None:
-            cg = self._cgroup_path
-            _remove_cgroup(cg)
-            result.cgroup_removed = not cg.exists()
-            self._cgroup_path = None
+            if result.nft_removed:
+                self._nft_table = None
+                self._egress_ports.clear()
 
         # Delete veth pair (deleting the host end removes both ends)
         if self._veth_host is not None:
@@ -1201,8 +1370,9 @@ class BrowserNetworkSandbox:
                 ["ip", "link", "del", vh],
                 f"delete veth {vh}",
             ))
-            self._veth_host = None
-            self._veth_ns = None
+            if result.veth_removed:
+                self._veth_host = None
+                self._veth_ns = None
 
         # Delete netns
         if self._netns_name is not None:
@@ -1211,7 +1381,8 @@ class BrowserNetworkSandbox:
                 ["ip", "netns", "del", nn],
                 f"delete netns {nn}",
             ))
-            self._netns_name = None
+            if result.netns_removed:
+                self._netns_name = None
 
         # §八: clean iff every PRESENT resource was confirmed removed.
         # A resource that was never set (inactive sandbox) is vacuously
@@ -1429,7 +1600,6 @@ def _find_orphaned_resources() -> list[dict]:
       - The recorded PID no longer exists, OR
       - The PID's start time has changed (PID reused by another process).
     """
-    import json
     orphans: list[dict] = []
     if not _RESOURCE_REGISTRY.is_dir():
         return orphans
@@ -1439,8 +1609,15 @@ def _find_orphaned_resources() -> list[dict]:
         try:
             data = json.loads(entry_path.read_text())
         except (OSError, ValueError):
-            # Corrupted registry file — treat as orphan.
-            orphans.append({"registry_file": str(entry_path)})
+            logger.error("reaper: unreadable registry entry %s quarantined", entry_path)
+            continue
+        if not isinstance(data, dict) or not _verify_registry_entry(data):
+            logger.error("reaper: unauthenticated registry entry %s quarantined", entry_path)
+            continue
+        if data.get("boot_id") != _boot_id():
+            # A prior boot cannot have a live owner PID in this boot.
+            data["registry_file"] = str(entry_path)
+            orphans.append(data)
             continue
         pid = data.get("pid", 0)
         start_time = data.get("process_start_time", 0.0)

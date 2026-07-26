@@ -338,9 +338,14 @@ def test_6_2_e_setup_installs_default_deny_before_browser():
         type(s), "_write_registry_entry", fake_write_registry_entry,
     ), patch.object(
         type(s), "_install_default_deny_nft", fake_install_default_deny,
-    ), patch.object(
-        type(s), "teardown", lambda self: None,
-    ):
+        ), patch.object(
+            type(s), "teardown", lambda self: None,
+        ), patch(
+            "khaos.security.browser_sandbox._resource_digest",
+            return_value="0" * 64,
+        ), patch.object(
+            type(s), "_assert_resource_names_available", lambda self: None,
+        ):
         s.setup()
     # The default-deny table is installed AFTER the netns/veth/cgroup
     # are ready, but BEFORE the sandbox is marked active (which is the
@@ -374,9 +379,14 @@ def test_6_2_e_setup_marks_route_guard_true_with_zero_ports():
         type(s), "_write_registry_entry", lambda self: None,
     ), patch.object(
         type(s), "_install_default_deny_nft", lambda self: None,
-    ), patch.object(
-        type(s), "teardown", lambda self: None,
-    ):
+        ), patch.object(
+            type(s), "teardown", lambda self: None,
+        ), patch(
+            "khaos.security.browser_sandbox._resource_digest",
+            return_value="0" * 64,
+        ), patch.object(
+            type(s), "_assert_resource_names_available", lambda self: None,
+        ):
         s.setup()
     assert s.is_active
     assert s.enforcement_status.route_guard is True

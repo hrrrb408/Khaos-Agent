@@ -145,33 +145,55 @@ mod linux {
     /// launcher (e.g. the netns fd, the cgroup file, library fds).
     /// Uses ``close_range`` when available (Linux 5.9+); falls back to
     /// iterating ``/proc/self/fd``.
-    fn sanitize_fds() -> io::Result<()> {
+    fn sanitize_fds_except(preserved: &[i32]) -> io::Result<()> {
+        // Browser pipe transport is deliberately inherited on fd 3/4.
+        // close_range cannot express holes, so close the ranges around the
+        // small, validated preserve set.
+        let mut keep: Vec<u32> = preserved
+            .iter()
+            .copied()
+            .filter(|fd| *fd > 2)
+            .map(|fd| fd as u32)
+            .collect();
+        keep.sort_unstable();
+        keep.dedup();
         // Try close_range(3, ~0u, CLOSE_RANGE_UNSHARE).  We do NOT unshare
         // the fd table (the flag is 0) so the launcher's own fds used
         // during setup are already closed by this point.
         const CLOSE_RANGE_FD_MASK: u32 = 0;
-        let ret = unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                3u32,
-                u32::MAX,
-                CLOSE_RANGE_FD_MASK,
-            )
-        };
-        if ret == 0 {
+        let mut start = 3u32;
+        let mut close_range_supported = true;
+        for end in keep.iter().copied().chain(std::iter::once(u32::MAX)) {
+            if start < end {
+                let ret = unsafe {
+                    libc::syscall(libc::SYS_close_range, start, end - 1, CLOSE_RANGE_FD_MASK)
+                };
+                if ret != 0 {
+                    close_range_supported = false;
+                    break;
+                }
+            }
+            if end == u32::MAX {
+                break;
+            }
+            start = end.saturating_add(1);
+        }
+        if close_range_supported {
             return Ok(());
         }
         // Fallback: iterate /proc/self/fd.  close_range may be absent on
         // older kernels (ENOSYS) — the errno is checked by the fallback.
         let entries = std::fs::read_dir("/proc/self/fd")
             .map_err(|e| io::Error::new(e.kind(), format!("read /proc/self/fd: {e}")))?;
-        for entry in entries.flatten() {
-            if let Ok(name) = entry.file_name().into_string() {
-                if let Ok(fd) = name.parse::<i32>() {
-                    if fd > 2 {
-                        unsafe { libc::close(fd) };
-                    }
-                }
+        // Collect before closing: the iterator itself owns a directory fd.
+        let fds: Vec<i32> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|name| name.parse::<i32>().ok())
+            .collect();
+        for fd in fds {
+            if fd > 2 && !preserved.contains(&fd) {
+                unsafe { libc::close(fd) };
             }
         }
         Ok(())
@@ -183,9 +205,8 @@ mod linux {
     /// denies ``setns`` so a later-compromised browser cannot escape).
     fn join_netns(name: &str) -> io::Result<()> {
         let path = format!("/var/run/netns/{}", name);
-        let c_path = CString::new(path.as_bytes()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "netns path contained NUL")
-        })?;
+        let c_path = CString::new(path.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "netns path contained NUL"))?;
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -201,6 +222,115 @@ mod linux {
     pub fn run() -> io::Result<()> {
         let mut args: Vec<_> = env::args_os().skip(1).collect();
 
+        // Round 8: Playwright executes this binary directly.  The immutable
+        // launch metadata is child-only environment supplied by
+        // BrowserManager; Chromium flags remain in argv exactly as Playwright
+        // produced them.  No forwarding shell participates in production.
+        if env::var_os("KHAOS_BROWSER_LAUNCH").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            let real = env::var_os("KHAOS_BROWSER_REAL_EXECUTABLE").ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing browser executable")
+            })?;
+            let netns = env::var("KHAOS_BROWSER_NETNS").map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing browser netns")
+            })?;
+            if let Some(procs) = env::var_os("KHAOS_BROWSER_CGROUP_PROCS") {
+                std::fs::write(PathBuf::from(procs), b"0")?;
+            }
+            join_netns(&netns)?;
+
+            let launcher = env::current_exe()?;
+            let real_path = PathBuf::from(&real);
+            let real_parent = real_path.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "browser executable has no parent",
+                )
+            })?;
+            let real_name = real_path.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "browser executable has no filename",
+                )
+            })?;
+            let inner_real = PathBuf::from("/run/khaos-browser/runtime").join(real_name);
+
+            let mut bwrap_args: Vec<std::ffi::OsString> = vec![
+                "bwrap".into(),
+                "--die-with-parent".into(),
+                "--new-session".into(),
+                "--unshare-user-try".into(),
+                "--unshare-pid".into(),
+                "--unshare-ipc".into(),
+                "--unshare-uts".into(),
+                "--ro-bind".into(),
+                "/".into(),
+                "/".into(),
+                "--dev".into(),
+                "/dev".into(),
+                "--proc".into(),
+                "/proc".into(),
+                "--tmpfs".into(),
+                "/tmp".into(),
+                "--tmpfs".into(),
+                "/home".into(),
+                "--tmpfs".into(),
+                "/root".into(),
+                "--dir".into(),
+                "/run/khaos-browser".into(),
+                "--dir".into(),
+                "/run/khaos-browser/runtime".into(),
+                "--ro-bind".into(),
+                real_parent.as_os_str().into(),
+                "/run/khaos-browser/runtime".into(),
+                "--ro-bind".into(),
+                launcher.as_os_str().into(),
+                "/run/khaos-browser/launcher".into(),
+                "--dir".into(),
+                "/tmp/khaos-home".into(),
+                "--setenv".into(),
+                "HOME".into(),
+                "/tmp/khaos-home".into(),
+                "--preserve-fds".into(),
+                "2".into(),
+                "--".into(),
+                "/run/khaos-browser/launcher".into(),
+                "--browser-inner".into(),
+                "--".into(),
+                inner_real.into_os_string(),
+            ];
+            bwrap_args.append(&mut args);
+            return exec(&bwrap_args);
+        }
+
+        if args.first().is_some_and(|arg| arg == "--browser-inner") {
+            args.remove(0);
+            if args.first().is_some_and(|arg| arg == "--") {
+                args.remove(0);
+            }
+            let remote_debugging_pipe = args
+                .iter()
+                .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
+            let preserved = if remote_debugging_pipe {
+                vec![3, 4]
+            } else {
+                Vec::new()
+            };
+            for fd in &preserved {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(*fd, &mut stat) } != 0
+                    || (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Playwright control fd {fd} is not a pipe"),
+                    ));
+                }
+            }
+            sanitize_fds_except(&preserved)?;
+            install_seccomp()?;
+            return exec(&args);
+        }
+
         // Batch 7.4 (round-7 §十一): browser launcher mode.
         //   --browser --netns <name> --cgroup <procs> -- <chromium> <args>
         // Order: validate → join cgroup → join netns → sanitize fds →
@@ -212,15 +342,22 @@ mod linux {
             let mut netns: Option<String> = None;
             let mut cgroup: Option<PathBuf> = None;
             loop {
-                match args.first().map(|s| s.to_string_lossy().into_owned()).as_deref() {
+                match args
+                    .first()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .as_deref()
+                {
                     Some("--netns") => {
                         args.remove(0);
                         netns = Some(
                             args.remove(0)
                                 .to_str()
-                                .ok_or_else(|| io::Error::new(
-                                    io::ErrorKind::InvalidInput, "--netns value not UTF-8",
-                                ))?
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "--netns value not UTF-8",
+                                    )
+                                })?
                                 .to_string(),
                         );
                     }
@@ -248,8 +385,33 @@ mod linux {
             if let Some(name) = netns {
                 join_netns(&name)?;
             }
-            // Sanitize inherited fds (close everything > stderr).
-            sanitize_fds()?;
+            let remote_debugging_pipe = args
+                .iter()
+                .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
+            let preserved = if remote_debugging_pipe {
+                for fd in [3, 4] {
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                    if flags < 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Playwright control pipe fd {fd} is not open"),
+                        ));
+                    }
+                    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                    if unsafe { libc::fstat(fd, &mut stat) } != 0
+                        || (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO
+                    {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Playwright control fd {fd} is not a pipe"),
+                        ));
+                    }
+                }
+                vec![3, 4]
+            } else {
+                Vec::new()
+            };
+            sanitize_fds_except(&preserved)?;
             // seccomp: no_new_privs + deny-list.  setns is in the deny
             // list, so Chromium cannot change namespaces after this point.
             install_seccomp()?;

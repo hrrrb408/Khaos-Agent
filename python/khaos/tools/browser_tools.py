@@ -47,6 +47,7 @@ from urllib.parse import urlparse
 
 from khaos.security.browser_egress_proxy import BrowserEgressProxy
 from khaos.security.browser_sandbox import BrowserNetworkSandbox
+from khaos.security.browser_sandbox import BrowserSandboxError
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +173,17 @@ class BrowserManager:
         # On non-Linux or without CAP_NET_ADMIN, this stays inactive and
         # the proxy-only enforcement layer remains the sole authority.
         self._browser_sandbox: BrowserNetworkSandbox | None = None
+        # A failed production setup poisons this manager generation.  A
+        # retry must never bypass setup and launch Chromium directly.
+        self._sandbox_generation_failed: bool = False
+        self._quarantined_sandboxes: list[BrowserNetworkSandbox] = []
+        # Round 8: a Chromium process generation is leased to exactly one
+        # authenticated principal. BrowserContext isolation is useful for
+        # sessions, but it is not a process-security boundary: a compromised
+        # renderer/browser process could inspect sibling contexts. Until the
+        # service owns a per-principal process pool, reject a second principal
+        # rather than silently weakening isolation.
+        self._process_principal: str | None = None
 
     @property
     def is_ready(self) -> bool:
@@ -229,6 +241,14 @@ class BrowserManager:
                 "ok": False,
                 "error": "browser manager is permanently closed",
             }
+        if self._sandbox_generation_failed:
+            return {
+                "ok": False,
+                "error": (
+                    "browser sandbox generation is quarantined after a "
+                    "failed setup; close this manager before retrying"
+                ),
+            }
         if not _HAS_PLAYWRIGHT:
             return {
                 "ok": False,
@@ -275,13 +295,39 @@ class BrowserManager:
                 # invokes subprocess.run (ip/nft/cgroup file I/O) which
                 # would block the event loop.
                 await asyncio.to_thread(BrowserNetworkSandbox.startup_reaper)
-                self._browser_sandbox = BrowserNetworkSandbox(
+                candidate = BrowserNetworkSandbox(
                     require_os_sandbox=not _dev_mode,
                 )
                 # Round-5 Batch 5.4: setup() invokes subprocess.run
                 # (ip netns add, ip link add, nft -f -, cgroup mkdir)
                 # which blocks the event loop — run off-loop.
-                await asyncio.to_thread(self._browser_sandbox.setup)
+                try:
+                    await asyncio.to_thread(candidate.setup)
+                    if not _dev_mode and (
+                        not candidate.is_active
+                        or not candidate.enforcement_status.kernel_ok
+                    ):
+                        raise BrowserSandboxError(
+                            "browser sandbox setup did not establish all "
+                            "required enforcement layers"
+                        )
+                except BaseException:
+                    self._sandbox_generation_failed = True
+                    self._quarantined_sandboxes.append(candidate)
+                    raise
+                # Atomic publish: only a fully verified candidate becomes
+                # the active authority.
+                self._browser_sandbox = candidate
+            sandbox = self._browser_sandbox
+            if not _dev_mode and (
+                sandbox is None
+                or not sandbox.is_active
+                or not sandbox.enforcement_status.kernel_ok
+            ):
+                raise BrowserSandboxError(
+                    "production Chromium launch requires an active, "
+                    "verified OS sandbox"
+                )
             if browser_type == "firefox":
                 # C-04 (round-5): Firefox does not use the netns wrapper.
                 # In production, refuse to launch Firefox without the OS
@@ -341,24 +387,32 @@ class BrowserManager:
                     if real_path:
                         # create_wrapper_script raises BrowserSandboxError
                         # in production mode if the run dir is missing.
-                        wrapper = self._browser_sandbox.create_wrapper_script(
-                            real_path, 0,  # port is per-context
-                        )
-                        if wrapper:
-                            launch_kwargs["executable_path"] = wrapper
+                        launcher = self._browser_sandbox._locate_browser_launcher()
+                        if launcher is None and not _dev_mode:
+                            raise BrowserSandboxError(
+                                "trusted Rust browser launcher required"
+                            )
+                        if launcher is not None:
+                            launch_kwargs["executable_path"] = launcher
+                            launch_kwargs["env"] = {
+                                **os.environ,
+                                **self._browser_sandbox.launcher_environment(real_path),
+                            }
+                            self._browser_sandbox.enforcement_status.trusted_launcher = True
+                            self._browser_sandbox.enforcement_status.fd_sanitized = True
+                            self._browser_sandbox.enforcement_status.filesystem_sandbox = True
                             logger.info(
-                                "browser netns sandbox: launching "
-                                "Chromium inside netns %s",
+                                "browser sandbox: launching Chromium through "
+                                "the direct Rust launcher in netns %s",
                                 self._browser_sandbox._netns_name,
                             )
-                        elif not _dev_mode:
-                            # Sandbox is active but wrapper is None —
-                            # this shouldn't happen, but fail closed.
-                            from khaos.security.browser_sandbox import BrowserSandboxError
-                            raise BrowserSandboxError(
-                                "wrapper script creation returned None "
-                                "in production mode — refusing direct launch"
-                            )
+                    if (
+                        not _dev_mode
+                        and not self._browser_sandbox.enforcement_status.ok
+                    ):
+                        raise BrowserSandboxError(
+                            "production Chromium launch contract is incomplete"
+                        )
                 browser = await pw.chromium.launch(**launch_kwargs)
             self._browser = browser
             logger.info("Browser launched: %s (headless=%s)", browser_type, headless)
@@ -376,6 +430,9 @@ class BrowserManager:
                     "cgroup": status.cgroup,
                     "route_guard": status.route_guard,
                     "service_workers_blocked": status.service_workers_blocked,
+                    "trusted_launcher": status.trusted_launcher,
+                    "fd_sanitized": status.fd_sanitized,
+                    "filesystem_sandbox": status.filesystem_sandbox,
                 },
             }
         except Exception as exc:  # noqa: BLE001 — surfaced as error dict
@@ -401,20 +458,7 @@ class BrowserManager:
             if entry["refcount"] > 0:
                 # Still in use by another runtime — do NOT close.
                 return
-        ctx = entry.get("context")
-        if ctx is not None:
-            try:
-                await ctx.close()
-            except Exception:
-                if not force:
-                    entry["refcount"] = max(1, int(entry.get("refcount", 0)))
-                self._context_close_failures[key] = (
-                    self._context_close_failures.get(key, 0) + 1
-                )
-                raise
         proxy = entry.get("egress_proxy")
-        if proxy is not None:
-            await proxy.close()
         # Round-6 Batch 6.2 (§六): remove this context's egress port
         # from the per-sandbox nftables port set and atomically
         # re-apply the table.  This ensures the kernel policy no longer
@@ -427,18 +471,24 @@ class BrowserManager:
             and self._browser_sandbox is not None
             and self._browser_sandbox.is_active
         ):
+            # Revoke kernel authority while the proxy still owns the port.
+            # Failure retains the entire context entry and listening socket.
+            await asyncio.to_thread(
+                self._browser_sandbox.remove_egress_port, egress_port
+            )
+        if proxy is not None:
+            await proxy.close()
+        ctx = entry.get("context")
+        if ctx is not None:
             try:
-                # Round-5 Batch 5.4: remove_egress_port() invokes
-                # subprocess.run (nft -c -f - + nft -f -) which blocks
-                # the event loop — run off-loop.
-                await asyncio.to_thread(
-                    self._browser_sandbox.remove_egress_port, egress_port
+                await ctx.close()
+            except Exception:
+                if not force:
+                    entry["refcount"] = max(1, int(entry.get("refcount", 0)))
+                self._context_close_failures[key] = (
+                    self._context_close_failures.get(key, 0) + 1
                 )
-            except Exception as exc:  # noqa: BLE001 — best-effort cleanup
-                logger.warning(
-                    "remove_egress_port(%s) failed during context close: %s",
-                    egress_port, exc,
-                )
+                raise
         self._contexts.pop(key, None)
         self._context_close_failures.pop(key, None)
 
@@ -510,7 +560,12 @@ class BrowserManager:
                 except Exception:
                     failures = self._context_close_failures.get(key, 0)
                     if failures >= 3 and self._browser is not None:
-                        await self._force_close_browser_locked()
+                        force_result = await self._force_close_browser_locked()
+                        if not force_result.get("ok"):
+                            return {
+                                **force_result,
+                                "runtime_id": runtime_id,
+                            }
                         return {
                             "ok": True,
                             "runtime_id": runtime_id,
@@ -519,7 +574,7 @@ class BrowserManager:
                     raise
         return {"ok": True, "runtime_id": runtime_id}
 
-    async def _force_close_browser_locked(self) -> None:
+    async def _force_close_browser_locked(self) -> dict[str, Any]:
         """Force the browser generation closed after repeated Context failure.
 
         Batch 6.5 (round-6 §十五): previously this only did
@@ -567,7 +622,15 @@ class BrowserManager:
         # leaking the resources.
         if self._browser_sandbox is not None:
             try:
-                await asyncio.to_thread(self._browser_sandbox.teardown)
+                cleanup = await asyncio.to_thread(
+                    self._browser_sandbox.teardown
+                )
+                if not cleanup.fully_closed:
+                    return {
+                        "ok": False,
+                        "error": "browser kernel resources remain",
+                        "cleanup": cleanup.to_dict(),
+                    }
                 self._browser_sandbox = None
             except Exception as exc:  # noqa: BLE001
                 logger.error(
@@ -577,6 +640,7 @@ class BrowserManager:
                 )
         self._contexts.clear()
         self._context_close_failures.clear()
+        return {"ok": True}
 
     @staticmethod
     def _context_key(
@@ -647,12 +711,31 @@ class BrowserManager:
                         # subprocess.run (nft delete, ip link del, ip
                         # netns del) and cgroup file I/O which blocks
                         # the event loop — run off-loop.
-                        await asyncio.to_thread(self._browser_sandbox.teardown)
+                        cleanup = await asyncio.to_thread(
+                            self._browser_sandbox.teardown
+                        )
+                        if not cleanup.fully_closed:
+                            self._close_failed = True
+                            return {
+                                "ok": False,
+                                "error": "browser kernel resources remain",
+                                "cleanup": cleanup.to_dict(),
+                            }
                     except Exception as exc:  # noqa: BLE001
                         logger.warning(
                             "browser netns sandbox teardown failed: %s", exc,
                         )
                     self._browser_sandbox = None
+                for candidate in list(self._quarantined_sandboxes):
+                    cleanup = await asyncio.to_thread(candidate.teardown)
+                    if not cleanup.fully_closed:
+                        self._close_failed = True
+                        return {
+                            "ok": False,
+                            "error": "quarantined browser resources remain",
+                            "cleanup": cleanup.to_dict(),
+                        }
+                    self._quarantined_sandboxes.remove(candidate)
                 # All resources terminated cleanly — only now is the
                 # manager truly closed.  The idempotent short-circuit
                 # above will fire on subsequent calls.
@@ -715,10 +798,12 @@ class BrowserManager:
         # ``_ensure_page_locked``) so a concurrent ``close()`` cannot slip
         # a ``_closed=True`` between the check and lock acquisition.
         self._last_ensure_error = ""
+        effective_principal = principal_id or "default"
         key = self._context_key(principal_id, session_id, runtime_id)
         async with self._lifecycle_lock:
             return await self._ensure_page_locked(
                 key,
+                principal_id=effective_principal,
                 runtime_id=runtime_id,
                 network_guard=network_guard,
             )
@@ -727,6 +812,7 @@ class BrowserManager:
         self,
         key: str,
         *,
+        principal_id: str,
         runtime_id: str,
         network_guard: Any,
     ) -> Optional[Page]:
@@ -740,6 +826,15 @@ class BrowserManager:
         """
         if self._closing_requested:
             self._last_ensure_error = "browser manager is permanently closed"
+            return None
+        if (
+            self._process_principal is not None
+            and self._process_principal != principal_id
+        ):
+            self._last_ensure_error = (
+                "browser process is leased to a different principal; "
+                "cross-principal process sharing is forbidden"
+            )
             return None
         entry = self._contexts.get(key)
         if entry is not None and entry.get("page") is not None:
@@ -874,6 +969,7 @@ class BrowserManager:
             # runtime owns (across principals / sessions).
             "_runtime_owners": {runtime_id} if runtime_id else set(),
         }
+        self._process_principal = principal_id
         logger.info("Browser context created for session: %s", key)
         return page
 
