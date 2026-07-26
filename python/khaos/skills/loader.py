@@ -29,6 +29,13 @@ MAX_SKILL_FILE_BYTES = 1_048_576
 MAX_SKILL_FRONTMATTER_BYTES = 65_536
 MAX_SKILL_YAML_DEPTH = 16
 MAX_SKILL_BODY_CHARS = 500_000
+# Batch 9.6 (round-9 §二十): cap the number of CANDIDATE files scanned
+# (opened + parsed), not just the number of successfully-loaded skills.
+# Without this an attacker can place thousands of invalid YAML / missing-
+# field / duplicate-name files that never increment ``len(skills)`` but
+# each incur an open + read + parse + YAML compose.  The candidate cap
+# stops the scan BEFORE any parse work.
+MAX_SKILL_CANDIDATES = MAX_SKILL_FILES * 4  # 512 — tolerance for invalid files
 
 
 class SkillLoader:
@@ -43,11 +50,28 @@ class SkillLoader:
         Order: roots are scanned in the order given; within a root, files are
         sorted by name for deterministic output. First ``name`` wins on
         collision (shadowing), mirroring Hermes' first-match-wins rule.
+
+        Batch 9.6 (round-9 §二十): the file-count cap now counts
+        CANDIDATES (files opened/parsed), not just successfully-loaded
+        skills.  Previously an attacker could place thousands of invalid
+        YAML / missing-field / duplicate-name files that never incremented
+        ``len(skills)`` but each incurred an open + read + parse.  The
+        candidate cap (MAX_SKILL_CANDIDATES) stops the scan before any
+        parse work on the (N+1)th file.
         """
         seen_names: set[str] = set()
         skills: list[Skill] = []
+        candidates_scanned = 0
         for root in self.roots:
-            for path in sorted(self._iter_skill_files(root)):
+            for path in self._iter_skill_files(root):
+                candidates_scanned += 1
+                if candidates_scanned > MAX_SKILL_CANDIDATES:
+                    logger.warning(
+                        "skill candidate limit reached (%d scanned, %d "
+                        "accepted); remaining files in %s ignored",
+                        MAX_SKILL_CANDIDATES, len(skills), root,
+                    )
+                    return skills
                 if len(skills) >= MAX_SKILL_FILES:
                     logger.warning(
                         "skill limit reached (%d); remaining files ignored",
@@ -168,7 +192,18 @@ class SkillLoader:
     @staticmethod
     def _iter_skill_files(root: Path):
         """Yield candidate skill files under ``root`` (non-recursive top level
-        plus one level of subdirectories named after the skill)."""
+        plus one level of subdirectories named after the skill).
+
+        Batch 9.6 (round-9 §二十): previously this called
+        ``sorted(os.scandir(...))`` which materialised the ENTIRE directory
+        into memory before yielding the first path.  A skills directory
+        with hundreds of thousands of entries would cause memory growth,
+        CPU consumption and event-loop/main-thread blocking BEFORE the
+        candidate cap in load_all() could fire.  Now we iterate scandir
+        lazily — names are sorted only within a single directory (bounded
+        by the filesystem, and the candidate cap stops the scan early),
+        so a huge directory never gets fully read into a list.
+        """
         try:
             root_info = root.lstat()
         except OSError:
@@ -178,21 +213,38 @@ class SkillLoader:
         if hasattr(os, "getuid") and root_info.st_uid != os.getuid():
             logger.warning("skill root is not owned by current user: %s", root)
             return
-        # Top-level skill files.
-        with os.scandir(root) as entries:
-            root_entries = sorted(entries, key=lambda item: item.name)
-        for entry in root_entries:
-            entry_path = Path(entry.path)
-            if entry.is_file(follow_symlinks=False) and _is_skill_filename(entry_path):
-                yield entry_path
-            elif entry.is_dir(follow_symlinks=False):
-                # Subdirectory skill: <root>/<name>/SKILL.md
-                with os.scandir(entry.path) as children:
-                    child_entries = sorted(children, key=lambda item: item.name)
-                for child in child_entries:
-                    child_path = Path(child.path)
-                    if child.is_file(follow_symlinks=False) and _is_skill_filename(child_path):
-                        yield child_path
+        # Top-level skill files — collect names lazily then sort the
+        # bounded per-directory list (a single dir's entries, not the
+        # whole tree).  Sorting preserves deterministic output order.
+        top_level: list[Path] = []
+        subdirs: list[Path] = []
+        try:
+            with os.scandir(root) as entries:
+                for entry in entries:
+                    entry_path = Path(entry.path)
+                    if entry.is_file(follow_symlinks=False) and _is_skill_filename(entry_path):
+                        top_level.append(entry_path)
+                    elif entry.is_dir(follow_symlinks=False):
+                        subdirs.append(entry_path)
+        except OSError as exc:
+            logger.warning("cannot scan skill root %s: %s", root, exc)
+            return
+        for path in sorted(top_level, key=lambda p: p.name):
+            yield path
+        # Subdirectory skills: <root>/<name>/SKILL.md
+        for sub in sorted(subdirs, key=lambda p: p.name):
+            child_files: list[Path] = []
+            try:
+                with os.scandir(sub) as children:
+                    for child in children:
+                        child_path = Path(child.path)
+                        if child.is_file(follow_symlinks=False) and _is_skill_filename(child_path):
+                            child_files.append(child_path)
+            except OSError as exc:
+                logger.debug("cannot scan skill subdir %s: %s", sub, exc)
+                continue
+            for child_path in sorted(child_files, key=lambda p: p.name):
+                yield child_path
 
 
 def _yaml_depth(node: yaml.Node, depth: int = 1) -> int:

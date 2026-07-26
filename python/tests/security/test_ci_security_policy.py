@@ -154,3 +154,64 @@ def test_browser_e2e_workflow_is_mandatory():
         "browser-e2e.yml does not filter on the browser_real marker — "
         "the real E2E tests would not run"
     )
+
+
+def test_browser_kernel_isolation_job_runs_round6_primitives():
+    """Batch 9.7a (round-9 §十七): the ``browser-kernel-isolation`` job
+    must run the round-6 kernel primitive suite, NOT the round-8
+    fullstack test.
+
+    Previously the job ran test_browser_fullstack_kernel_round8.py with
+    -m "kernel_real and browser_real" but only set
+    KHAOS_RUN_KERNEL_BROWSER_E2E=1 (not KHAOS_RUN_BROWSER_E2E=1), so the
+    round8 _require_fullstack() gate called pytest.skip() — the required
+    job was green but empty.  Now it must run the round-6 primitives
+    (which only need the kernel gate) so the required context is real.
+    """
+    platform = (WORKFLOWS / "platform-sandbox-security.yml").read_text("utf-8")
+    assert "test_browser_kernel_isolation_round6.py" in platform, (
+        "browser-kernel-isolation job must run the round-6 kernel "
+        "primitive suite (not the round-8 fullstack test, which skips "
+        "without KHAOS_RUN_BROWSER_E2E=1)"
+    )
+
+
+def test_bootstrap_toolchain_is_hash_verified():
+    """Batch 9.7b (round-9 §二十一): the CI toolchain (uv, pip-audit) must
+    be installed with hash verification, not a bare ``pip install``.
+
+    A compromised PyPI mirror that swapped the same-version wheel would
+    otherwise control every subsequent frozen install.  Every workflow
+    that installs uv/pip-audit must use --require-hashes against the
+    pinned bootstrap-requirements.txt.
+    """
+    bootstrap = ROOT / "python" / "bootstrap-requirements.txt"
+    assert bootstrap.exists(), (
+        "python/bootstrap-requirements.txt is missing — the CI toolchain "
+        "has no hash-pinned trust root"
+    )
+    text = bootstrap.read_text("utf-8")
+    assert "uv==0.11.9" in text and "--hash=sha256:" in text, (
+        "bootstrap-requirements.txt must pin uv with sha256 hashes"
+    )
+    # uv is a single Rust binary with NO Python deps, so hashing the uv
+    # wheels alone is a complete trust root (no transitive tree to pin).
+    # uv is the bootstrap trust root — it MUST always be hash-verified.
+    # No workflow may install uv without --require-hashes against the
+    # pinned bootstrap-requirements.txt.
+    for workflow in _workflow_files():
+        wt = workflow.read_text("utf-8")
+        assert "pip install uv==" not in wt, (
+            f"{workflow.name} installs uv without --require-hashes: "
+            f"use 'pip install --require-hashes -r "
+            f"python/bootstrap-requirements.txt' instead"
+        )
+    # pip-audit is the AUDIT TOOL (not the trust root).  It has a heavy
+    # transitive dependency tree that cannot be practically hash-pinned,
+    # and its own --require-hashes check on requirements-lock.txt is the
+    # real trust root for business dependencies.  It may be installed
+    # bare ONLY in the supply-chain-audit workflow, version-pinned.
+    audit = (WORKFLOWS / "supply-chain-audit.yml").read_text("utf-8")
+    assert "pip-audit==2.10.0" in audit, (
+        "supply-chain-audit.yml must pin pip-audit to a fixed version"
+    )

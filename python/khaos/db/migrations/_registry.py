@@ -215,7 +215,6 @@ def is_historical(spec: MigrationSpec) -> bool:
 # released v6 checksum and broke real upgrades in round 8.
 _IMMUTABLE_MIGRATOR_SYMBOLS: tuple[str, ...] = (
     "_MigrationConnection",
-    "_MigrationConnection",
     "_run_legacy_schema_upgrades",
     "_backup_before_migration",
     "_execute_schema_statements",
@@ -304,13 +303,24 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         # migrator method that ``run_migrations`` invokes.  Editing any of
         # them is detected by ``verify_source_integrity``.  Computed once
         # at release time and recorded here as a LITERAL.
-        sha256="cefd37b7bb3176619521d1bac798eec4081f5b2f4ad878f5e6b51c63bdc9b728",
+        #
+        # Batch 9.7c (round-9 §二十三.2): the migrator-symbol list had a
+        # duplicate ``_MigrationConnection`` entry (cosmetic —
+        # _extract_symbol_source dedupes via a dict — but it polluted the
+        # manifest header and implied the tuple was hand-maintained without
+        # a uniqueness guard).  Removing the duplicate restores the
+        # checksum to the originally-released ``7bd6cb4e…`` value.  The
+        # post-duplicate ``cefd37b7…`` value is retained in
+        # accepted_released_checksums so databases created during that
+        # window remain upgradeable.
+        sha256="7bd6cb4e51936c81d3c29ab9b8902f04203374d80d588732e97157b265de8038",
         # main@19a2b538 wrote this checksum before the generic migration
         # runner was (incorrectly) added to the v6 manifest.  Real databases
         # must retain that provenance and remain upgradeable.
         accepted_released_checksums=(
-            "7bd6cb4e51936c81d3c29ab9b8902f04203374d80d588732e97157b265de8038",
             "89ea4c434b13f30f0cd1e1be6f1c4189b3edd6909132d78e11397737850dd0e7",
+            # Post-duplicate (round-8) value; retained for upgrade compat.
+            "cefd37b7bb3176619521d1bac798eec4081f5b2f4ad878f5e6b51c63bdc9b728",
         ),
         sql_files=("0001_initial_schema.sql", "0001_post_migration.sql"),
         migrator_symbols=_IMMUTABLE_MIGRATOR_SYMBOLS,

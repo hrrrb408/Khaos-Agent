@@ -80,6 +80,7 @@ import os
 import re as _re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -102,6 +103,110 @@ _NFT_TABLE_PREFIX = "khaos_browser"
 _RUN_DIR_ROOT = Path.home() / ".khaos" / "run"
 # Round-5 H-03: registry directory for resource ownership records.
 _RESOURCE_REGISTRY = Path.home() / ".khaos" / "run" / "browser_registry"
+
+# Batch 9.1 (round-9 §九): the ONLY parent-process environment variables
+# forwarded to Chromium.  Everything else (provider API keys, cloud creds,
+# proxy secrets, DB connection strings) is dropped so a compromised
+# Chromium cannot read parent secrets from its own environment.  The Rust
+# launcher additionally runs bubblewrap with ``--clearenv`` and re-sets a
+# minimal PATH/LANG/HOME inside the namespace.
+_BROWSER_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "PLAYWRIGHT_BROWSERS_PATH",
+)
+
+
+def _validate_tcb_binary(path: str, *, label: str) -> None:
+    """Validate that ``path`` is a trusted TCB binary.
+
+    Batch 9.3 (round-9 §十二): the browser launcher, bubblewrap and Chromium
+    runtime are part of the trusted computing base.  Their path must resolve
+    to a regular file (no symlink at the final component, via ``O_NOFOLLOW``)
+    owned by the current UID with no group/other write bit.  This closes:
+
+    * PATH hijack — a pre-sandbox attacker plants a malicious ``bwrap`` or
+      launcher earlier in PATH;
+    * binary replacement — a group-writable binary is swapped out between
+      validation and exec;
+    * symlink confusion — ``/usr/local/bin/bwrap`` is a symlink to an
+      attacker-controlled location.
+
+    Raises ``BrowserSandboxError`` on any violation.  The file is opened
+    with ``O_NOFOLLOW`` so a trailing-symlink swap is rejected at the kernel
+    level (the FD refers to the verified inode).
+    """
+    resolved = Path(path).expanduser()
+    if not resolved.is_absolute():
+        raise BrowserSandboxError(
+            f"{label} path must be absolute, got {path!r}"
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(str(resolved), flags)
+    except OSError as exc:
+        raise BrowserSandboxError(
+            f"{label} {path}: secure open failed: {exc}"
+        ) from exc
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise BrowserSandboxError(
+                f"{label} {path}: not a regular file"
+            )
+        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+            raise BrowserSandboxError(
+                f"{label} {path}: owner {info.st_uid} != current uid "
+                f"{os.getuid()}"
+            )
+        if info.st_mode & 0o022:
+            raise BrowserSandboxError(
+                f"{label} {path}: group/other writable (mode "
+                f"{oct(info.st_mode & 0o777)})"
+            )
+    finally:
+        os.close(fd)
+
+
+def _fsync_dir(path: str | Path) -> None:
+    """fsync the parent directory so a rename/create is durable on crash.
+
+    Batch 9.5 (round-9 §十五): the registry entry, stage-update rename and
+    MAC key file are all written via ``write → close → replace``.  Without
+    an explicit ``fsync`` of the parent directory, a host power loss or
+    filesystem crash can leave the directory entry (the rename) un-flushed
+    even though the file data hit the page cache.  This makes the
+    registry's crash-recovery claim hold under host-level failures, not
+    just process crashes.
+
+    Silently skipped on platforms without ``O_DIRECTORY`` (non-POSIX).
+    """
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    else:
+        return  # pragma: no cover — non-POSIX platform
+    try:
+        dir_fd = os.open(str(path), flags)
+    except OSError as exc:
+        logger.debug("fsync_dir %s failed to open: %s", path, exc)
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        # fsync on a directory fd is not supported on all filesystems
+        # (e.g. tmpfs in some kernels).  Log and continue — the file fsync
+        # is the critical durability step.
+        logger.debug("fsync_dir %s fsync failed: %s", path, exc)
+    finally:
+        os.close(dir_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -143,6 +248,9 @@ def _registry_key(*, create: bool = False) -> bytes:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            # Batch 9.5: fsync the parent dir so the new key file's
+            # directory entry survives a host power loss.
+            _fsync_dir(key_file.parent)
     fd = os.open(key_file, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
@@ -1061,8 +1169,15 @@ class BrowserNetworkSandbox:
             )
             try:
                 os.write(fd, json.dumps(entry).encode("utf-8"))
+                # Batch 9.5 (round-9 §十五): fsync the file data before
+                # closing so a host power loss does not lose the INTENT
+                # record that lets the reaper recover residual resources.
+                os.fsync(fd)
             finally:
                 os.close(fd)
+            # fsync the parent directory so the new file's directory
+            # entry is durable.
+            _fsync_dir(_RESOURCE_REGISTRY)
             self._registry_file = reg_file
         except OSError as exc:
             if self._require_os_sandbox:
@@ -1094,9 +1209,14 @@ class BrowserNetworkSandbox:
             )
             try:
                 os.write(fd, json.dumps(entry).encode("utf-8"))
+                # Batch 9.5: fsync the temp file so the renamed-over
+                # content is durable.
+                os.fsync(fd)
             finally:
                 os.close(fd)
             os.replace(tmp, self._registry_file)
+            # fsync the parent directory so the rename is durable.
+            _fsync_dir(self._registry_file.parent)
         except OSError as exc:
             # A stage-update failure is not fatal (the INTENT record
             # already exists), but log it so a persistent failure is
@@ -1126,7 +1246,7 @@ class BrowserNetworkSandbox:
         """
         if not self._active or self._netns_name is None:
             return None
-        launcher = self._locate_browser_launcher()
+        launcher = self._locate_and_validate_browser_launcher()
         if launcher is None:
             return None
         argv: list[str] = [
@@ -1144,7 +1264,13 @@ class BrowserNetworkSandbox:
 
     @staticmethod
     def _locate_browser_launcher() -> str | None:
-        """Locate the khaos-sandbox-launcher binary (env override first)."""
+        """Locate the khaos-sandbox-launcher binary (env override first).
+
+        No validation is performed here — callers that need the trusted
+        production path should use ``_locate_and_validate_browser_launcher``
+        instead (it rejects symlinks, non-owner files, and group/other-
+        writable binaries).
+        """
         configured = os.environ.get("KHAOS_SANDBOX_LAUNCHER", "").strip()
         if configured:
             return configured
@@ -1153,23 +1279,74 @@ class BrowserNetworkSandbox:
             return found
         return None
 
+    def _locate_and_validate_browser_launcher(self) -> str | None:
+        """Locate AND validate the launcher binary for production use.
+
+        Batch 9.3 (round-9 §十二): in production (``require_os_sandbox``)
+        the launcher, bubblewrap and Chromium binaries are part of the TCB.
+        Their path must be resolved to an absolute regular file owned by
+        the current UID (root in production) with no group/other write bit
+        and no symlink at the final component.  This closes PATH-hijack
+        and binary-replacement attacks where a pre-sandbox attacker plants
+        a malicious ``bwrap`` or launcher earlier in PATH.
+
+        In dev mode the validation is skipped (the binary may be missing or
+        owned by the developer on a non-root checkout).
+        """
+        path = self._locate_browser_launcher()
+        if path is None:
+            return None
+        if not self._require_os_sandbox:
+            return path
+        _validate_tcb_binary(path, label="browser launcher")
+        return path
+
     def launcher_environment(self, real_executable: str) -> dict[str, str]:
         """Return the direct Rust-launcher contract for Playwright.
 
         Playwright can only configure one executable path.  Passing the Rust
         binary directly and supplying immutable launch metadata through the
         child environment removes the forwarding shell from production TCB.
+
+        Batch 9.1 (round-9 §九): this dict is the COMPLETE Chromium
+        environment — it NO LONGER inherits ``os.environ``.  Only an
+        explicit allowlist of benign runtime variables (PATH, locale, TLS
+        roots, Playwright browser path) is forwarded, plus the four
+        ``KHAOS_BROWSER_*`` authority-metadata vars that the Rust launcher
+        strips at the namespace boundary.  Provider API keys, cloud
+        credentials, proxy secrets and any other parent-process env are
+        therefore NOT visible to a compromised Chromium.
         """
-        launcher = self._locate_browser_launcher()
+        launcher = self._locate_and_validate_browser_launcher()
         if launcher is None:
             raise BrowserSandboxError("trusted Rust browser launcher required")
         if not self._active or not self._netns_name:
             raise BrowserSandboxError("browser sandbox is not active")
-        env = {
-            "KHAOS_BROWSER_LAUNCH": "1",
-            "KHAOS_BROWSER_REAL_EXECUTABLE": real_executable,
-            "KHAOS_BROWSER_NETNS": self._netns_name,
-        }
+        # Batch 9.3: validate the Chromium (real_executable) and bubblewrap
+        # binaries in production so a planted/writable binary cannot enter
+        # the TCB.  Dev mode skips validation (developer-owned checkouts).
+        if self._require_os_sandbox:
+            _validate_tcb_binary(real_executable, label="chromium runtime")
+        # Start from the explicit allowlist only — never ``os.environ``.
+        env: dict[str, str] = {}
+        for name in _BROWSER_ENV_ALLOWLIST:
+            value = os.environ.get(name)
+            if value:
+                env[name] = value
+        # Authority metadata consumed by the Rust launcher; stripped inside
+        # the bubblewrap namespace so Chromium never sees them.
+        env["KHAOS_BROWSER_LAUNCH"] = "1"
+        env["KHAOS_BROWSER_REAL_EXECUTABLE"] = real_executable
+        env["KHAOS_BROWSER_NETNS"] = self._netns_name
+        # Batch 9.2: resolved host home so the Rust launcher can mask the
+        # REAL home directory (which may live outside /home or /root).
+        env["KHAOS_BROWSER_HOST_HOME"] = str(Path.home().resolve())
+        # Batch 9.3: validated absolute bubblewrap path (TCB binary trust).
+        bwrap_path = shutil.which("bwrap")
+        if bwrap_path:
+            if self._require_os_sandbox:
+                _validate_tcb_binary(bwrap_path, label="bubblewrap runtime")
+            env["KHAOS_BROWSER_BWRAP_PATH"] = bwrap_path
         if self._cgroup_path is not None:
             env["KHAOS_BROWSER_CGROUP_PROCS"] = str(
                 self._cgroup_path / "cgroup.procs"

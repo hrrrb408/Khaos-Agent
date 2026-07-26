@@ -1,0 +1,48 @@
+# Bootstrap toolchain pinned with hashes (Batch 9.7b, round-9 review §二十一).
+#
+# CI jobs previously installed uv via ``python -m pip install uv==0.11.9``
+# with no hash verification.  A compromised PyPI mirror or download link
+# could replace the same-version wheel and control every subsequent
+# frozen install.  This file is the trust root for the uv binary: install
+# with
+#
+#     python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+#
+# pip refuses any wheel whose sha256 is not listed below, so a swapped
+# wheel fails to install.  uv is a single Rust binary (PyOxidizer) with
+# NO Python runtime dependencies (Requires-Dist is empty), so hashing
+# the uv wheels alone is sufficient — there is no transitive dependency
+# tree that also needs pinning.
+#
+# Note: pip-audit is NOT in this file.  It has a heavy dependency tree
+# (CacheControl, cyclonedx-python-lib, etc.) that would all need hash
+# pinning and frequent updates.  pip-audit is installed separately in the
+# supply-chain-audit workflow, where it is the AUDIT TOOL rather than the
+# trust root — the trust root for business dependencies is pip-audit's
+# own --require-hashes verification of the frozen requirements-lock.txt.
+#
+# Update procedure: when bumping uv, fetch the new hashes from
+#   https://pypi.org/pypi/uv/<version>/json
+# and replace the lines below IN FULL.
+uv==0.11.9 \
+    --hash=sha256:053659e258b33c88e416e508d4cf63685505c1151f3cf46e47dd47212439379c \
+    --hash=sha256:12caca9460223611cfaa65d3508c3fd4c4c4bfec091e0baaef86a774748eff61 \
+    --hash=sha256:29a7337a1699d4a152bdaa1ff2607e9d1451675c45bc8862d9671013b1d5392b \
+    --hash=sha256:2aabf5f28271e00f011ca9bc3972b044200ad9dfa07a8802db5221746d393faf \
+    --hash=sha256:43edb4b3eb43a9780f9232110dfbcc0bed9367ce5b24d37a315817d3faf3c913 \
+    --hash=sha256:5837b514d3e9686e1db8280b1913ca0155810e6547eb37f80f2b9d6c66728087 \
+    --hash=sha256:64eb69a88fe1c6c21b2bebf69a7cfd25b1fd02346f0c1213cef49a61375761cf \
+    --hash=sha256:76fece22e397eae133397a5dd322418d007253ff6a01e070cb4ab660a21b4f84 \
+    --hash=sha256:7d7ccee2c1d51e7905680a989b63d30430f6deb06d2abda476da9f867f494325 \
+    --hash=sha256:8aa8a3b14883dc2fd618c79cf1506077dd8fe08335a846f8679a8e70dd16eb30 \
+    --hash=sha256:8ba2f50cfe6a1b22b9caaab4e500fdcb90002be26e5cb371f8aee08f24a13426 \
+    --hash=sha256:9b3bf17f6e33fd74078437e01dbfbd3c08623ff4b9f16f34be2c5b5f2682ce16 \
+    --hash=sha256:9fb549e1de544596e840e076a7f09a40e50303ba5d70d4ead12f866638d9a1b0 \
+    --hash=sha256:a712094efd1304d6b3657b1b6211ba1bfd11563a7a44b3ec3965bcb48b0f182b \
+    --hash=sha256:c765ab07cffa2cd9e79a5afa62aa134010d73f3d0cd9b5e72e48cf723fd41e4a \
+    --hash=sha256:cd7ed9438b46749ca5e5e82ad3b958264c861472249dcbac23e6145ad68dd1e1 \
+    --hash=sha256:cdc6970be26c02f4f4e4d126f8938f118f1068d6e20533af8b360e4aaa07eca7 \
+    --hash=sha256:d6fcd327a577bedde6c33007277b429e8e6cb0d7a665933c12e60a4e5ee5dccc \
+    --hash=sha256:f07298b7f21942423e827318e719a66aa4530888e94ba01f180f0f4613fd0d95
+    # uv is a Rust binary distributed as per-platform wheels; all platform
+    # hashes are listed so every CI runner architecture resolves.
