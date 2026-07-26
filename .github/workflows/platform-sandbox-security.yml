@@ -354,7 +354,7 @@ jobs:
               echo "$$" > /sys/fs/cgroup/khaos-browser/runner/cgroup.procs
               exec "$1" -m pytest \
                 python/tests/security/test_browser_fullstack_kernel_round8.py \
-                -m kernel_real -v
+                -m kernel_real -v --log-cli-level=INFO
             ' bash "$python_bin"
 
   macos-sandbox-security:
