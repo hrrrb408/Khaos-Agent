@@ -358,6 +358,8 @@ mod linux {
                 "--tmpfs".into(),
                 "/tmp".into(),
                 "--tmpfs".into(),
+                "/run".into(),
+                "--tmpfs".into(),
                 "/home".into(),
                 "--tmpfs".into(),
                 "/root".into(),
