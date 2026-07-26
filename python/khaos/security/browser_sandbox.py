@@ -175,6 +175,40 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
         os.close(fd)
 
 
+def _fsync_dir(path: str | Path) -> None:
+    """fsync the parent directory so a rename/create is durable on crash.
+
+    Batch 9.5 (round-9 §十五): the registry entry, stage-update rename and
+    MAC key file are all written via ``write → close → replace``.  Without
+    an explicit ``fsync`` of the parent directory, a host power loss or
+    filesystem crash can leave the directory entry (the rename) un-flushed
+    even though the file data hit the page cache.  This makes the
+    registry's crash-recovery claim hold under host-level failures, not
+    just process crashes.
+
+    Silently skipped on platforms without ``O_DIRECTORY`` (non-POSIX).
+    """
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    else:
+        return  # pragma: no cover — non-POSIX platform
+    try:
+        dir_fd = os.open(str(path), flags)
+    except OSError as exc:
+        logger.debug("fsync_dir %s failed to open: %s", path, exc)
+        return
+    try:
+        os.fsync(dir_fd)
+    except OSError as exc:
+        # fsync on a directory fd is not supported on all filesystems
+        # (e.g. tmpfs in some kernels).  Log and continue — the file fsync
+        # is the critical durability step.
+        logger.debug("fsync_dir %s fsync failed: %s", path, exc)
+    finally:
+        os.close(dir_fd)
+
+
 # ---------------------------------------------------------------------------
 # Batch 7.3 (round-7 §六/§七/§八): resource-name derivation + validation,
 # creation-stage state machine, structured teardown result.
@@ -214,6 +248,9 @@ def _registry_key(*, create: bool = False) -> bytes:
                 os.fsync(fd)
             finally:
                 os.close(fd)
+            # Batch 9.5: fsync the parent dir so the new key file's
+            # directory entry survives a host power loss.
+            _fsync_dir(key_file.parent)
     fd = os.open(key_file, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         info = os.fstat(fd)
@@ -1132,8 +1169,15 @@ class BrowserNetworkSandbox:
             )
             try:
                 os.write(fd, json.dumps(entry).encode("utf-8"))
+                # Batch 9.5 (round-9 §十五): fsync the file data before
+                # closing so a host power loss does not lose the INTENT
+                # record that lets the reaper recover residual resources.
+                os.fsync(fd)
             finally:
                 os.close(fd)
+            # fsync the parent directory so the new file's directory
+            # entry is durable.
+            _fsync_dir(_RESOURCE_REGISTRY)
             self._registry_file = reg_file
         except OSError as exc:
             if self._require_os_sandbox:
@@ -1165,9 +1209,14 @@ class BrowserNetworkSandbox:
             )
             try:
                 os.write(fd, json.dumps(entry).encode("utf-8"))
+                # Batch 9.5: fsync the temp file so the renamed-over
+                # content is durable.
+                os.fsync(fd)
             finally:
                 os.close(fd)
             os.replace(tmp, self._registry_file)
+            # fsync the parent directory so the rename is durable.
+            _fsync_dir(self._registry_file.parent)
         except OSError as exc:
             # A stage-update failure is not fatal (the INTENT record
             # already exists), but log it so a persistent failure is
