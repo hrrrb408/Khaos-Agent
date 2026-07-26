@@ -440,7 +440,6 @@ mod linux {
             // (which a pre-sandbox attacker could hijack).
             let bwrap_exe = env::var_os("KHAOS_BROWSER_BWRAP_PATH")
                 .filter(|s| !s.is_empty())
-                .map(std::ffi::OsString::from)
                 .unwrap_or_else(|| "bwrap".into());
 
             // Batch 9.2: sensitive host paths that must NEVER be readable
