@@ -25,13 +25,39 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pytest
 
+from khaos.security.host_network import ValidatedTarget
+from khaos.security.network_guard import NetworkCheckResult
 from khaos.tools.browser_tools import BrowserManager
 
 
 pytestmark = [pytest.mark.browser_real, pytest.mark.kernel_real]
+
+
+class _PinnedLocalGuard:
+    """Minimal network guard that authorizes the sandbox host IP only."""
+
+    def __init__(self, address: str) -> None:
+        self.address = address
+
+    async def authorize_url(self, url: str, **_: object) -> ValidatedTarget:
+        parsed = urlparse(url)
+        return ValidatedTarget(
+            url=url,
+            parsed=parsed,
+            hostname=parsed.hostname or "khaos.test",
+            addresses=(self.address,),
+        )
+
+    async def check_resolved_url(self, url: str) -> NetworkCheckResult:
+        return NetworkCheckResult(
+            allowed=True,
+            reason="round9 controlled local fixture",
+            domain=urlparse(url).hostname or "",
+        )
 
 
 def _require_fullstack() -> None:
@@ -67,49 +93,6 @@ def _read_in_netns(netns: str, path: str) -> tuple[int, bytes]:
         check=False,
     )
     return result.returncode, result.stdout
-
-
-def _read_in_chromium_mountns(cgroup_procs: Path, host_path: str) -> tuple[int, bytes]:
-    """Read ``host_path`` as seen from Chromium's OWN mount namespace.
-
-    Batch 9.2 (round-9 §十/§十一): ``ip netns exec`` only switches the
-    NETWORK namespace — a helper run that way still sees the HOST mount
-    table, so it would always find the home sentinel and falsely report
-    a secrecy violation.  The bubblewrap ``--tmpfs`` mask only applies
-    inside Chromium's MOUNT namespace.
-
-    To observe the mount-namespace view, we read through
-    ``/proc/<chromium-pid>/root/<path>``: the kernel resolves this magic
-    symlink against the target process's own rootfs, so it reflects what
-    Chromium actually sees (the masked tmpfs).  No netns switch needed —
-    we read from the host using the Chromium PID's mount-namespace view.
-
-    Returns (returncode, stdout).  returncode 0 + non-empty output means
-    the path was readable from inside Chromium's namespace (a VIOLATION).
-    """
-    pids = [int(v) for v in cgroup_procs.read_text().split()]
-    assert pids, "Chromium process tree did not join browser cgroup"
-    script = (
-        "import sys\n"
-        "try:\n"
-        "    with open(sys.argv[1], 'rb') as f:\n"
-        "        sys.stdout.buffer.write(f.read())\n"
-        "    raise SystemExit(0)\n"
-        "except OSError:\n"
-        "    raise SystemExit(1)\n"
-    )
-    for pid in pids:
-        proc_root_path = f"/proc/{pid}/root{host_path}"
-        result = subprocess.run(
-            ["python3", "-c", script, proc_root_path],
-            capture_output=True,
-            timeout=5,
-            check=False,
-        )
-        if result.returncode == 0:
-            return result.returncode, result.stdout
-    # None of the Chromium PIDs could read it — secrecy holds.
-    return 1, b""
 
 
 def _read_chromium_environ(netns: str, cgroup_procs: Path) -> bytes:
@@ -169,11 +152,20 @@ async def test_chromium_environ_excludes_parent_secrets() -> None:
 
 @pytest.mark.asyncio
 async def test_resolved_home_not_readable_from_browser() -> None:
-    """High (§十): the resolved real home must not be readable.
+    """High (§十): the resolved real home must not be readable from
+    inside Chromium's OWN mount namespace.
 
-    Places a sentinel file in the real home and verifies it cannot be read
-    from inside the browser netns (the bubblewrap namespace masks it with
-    a tmpfs).
+    Batch 9.2 verification note: this MUST be observed from inside the
+    Chromium process itself (via its Playwright page), NOT from an
+    external ``ip netns exec`` helper or ``/proc/<pid>/root`` read.
+    Those only switch the NETWORK namespace or resolve the magic symlink
+    against the reader's credentials — they see the HOST mount table,
+    not the bubblewrap tmpfs.  The mask is only meaningful from inside
+    Chromium's MOUNT namespace, which only Chromium itself inhabits.
+
+    We evaluate a fetch('file://...') inside the page; Chromium resolves
+    the path against its own rootfs (the bubblewrap view).  If the mask
+    holds, the fetch fails (no such file).
     """
     _require_fullstack()
     home = Path.home().resolve()
@@ -186,17 +178,32 @@ async def test_resolved_home_not_readable_from_browser() -> None:
             assert launch["ok"], launch
             sandbox = manager._browser_sandbox
             assert sandbox is not None and sandbox.is_active
-
-            # Read through /proc/<chromium-pid>/root/ to observe the
-            # bubblewrap mount-namespace view (ip netns exec only
-            # switches the network namespace, not the mount table).
-            rc, out = _read_in_chromium_mountns(
-                sandbox._cgroup_path / "cgroup.procs", str(sentinel)
+            page = await manager.ensure_page(
+                "round9-fs-principal",
+                session_id="round9-fs",
+                runtime_id="round9-fs",
+                network_guard=_PinnedLocalGuard(sandbox._host_ip),
             )
-            assert rc != 0, (
-                f"HIGH: resolved home {sentinel} was readable from "
-                f"Chromium's mount namespace (got {out!r}) — Batch 9.2 "
-                f"regression"
+            assert page is not None
+
+            # Read the file FROM INSIDE Chromium.  Navigate to the file://
+            # URL; Chromium resolves file paths against its own mount
+            # namespace (the bubblewrap tmpfs view).  If the mask holds,
+            # navigation fails (file not found).
+            await page.goto("about:blank")
+            file_url = sentinel.as_uri()
+            leaked = None
+            try:
+                response = await page.goto(file_url, wait_until="domcontentloaded")
+                if response is not None and response.ok:
+                    leaked = await page.text_content("body")
+            except Exception:
+                leaked = None
+            assert leaked is None, (
+                f"HIGH: resolved home {sentinel} was readable from inside "
+                f"Chromium's mount namespace (got {leaked!r}) — Batch 9.2 "
+                f"regression: the bwrap --tmpfs mask on the home path is "
+                f"not effective"
             )
         finally:
             await manager.close()
@@ -209,17 +216,14 @@ async def test_sensitive_host_paths_not_readable_from_browser(tmp_path) -> None:
     """High (§十一): existing sensitive host paths must be masked.
 
     Creates a sentinel under each sensitive path that EXISTS on the host
-    (the Rust launcher only masks paths that exist — a non-existent path
-    holds no secret).  Verifies none of the created sentinels is readable
-    from the browser netns.  Falls back to the tmp_path (under /tmp or
-    /home, both always masked) if none of the fixed paths exist, so the
-    test always proves at least one masking.
+    and verifies none is readable from inside Chromium's OWN mount
+    namespace (via the page, not an external helper — see
+    test_resolved_home_not_readable_from_browser for why).  Falls back
+    to tmp_path (under /tmp, always masked) so the test always proves
+    at least one masking.
     """
     _require_fullstack()
     candidates = ["/workspace", "/srv", "/data", "/mnt", "/var/lib"]
-    # Create sentinels under paths that EXIST and are writable.  Only
-    # existing paths are masked by the Rust launcher (a non-existent path
-    # has no secret to protect and bwrap --tmpfs would fail on it).
     sentinels: list[Path] = []
     for base in candidates:
         base_path = Path(base)
@@ -233,9 +237,7 @@ async def test_sensitive_host_paths_not_readable_from_browser(tmp_path) -> None:
             sentinels.append(sentinel)
         except OSError:
             continue
-    # Guarantee at least one sentinel exists: tmp_path is under /tmp or
-    # /home (both always masked), so it proves the masking invariant even
-    # when none of the fixed sensitive paths exist on the runner.
+    # Guarantee at least one sentinel under /tmp (always masked).
     fallback = tmp_path / "khaos-round9-fallback-secret"
     fallback.write_text("fallback-host-secret", encoding="utf-8")
     sentinels.append(fallback)
@@ -246,21 +248,34 @@ async def test_sensitive_host_paths_not_readable_from_browser(tmp_path) -> None:
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
         assert sandbox is not None and sandbox.is_active
+        page = await manager.ensure_page(
+            "round9-fs2-principal",
+            session_id="round9-fs2",
+            runtime_id="round9-fs2",
+            network_guard=_PinnedLocalGuard(sandbox._host_ip),
+        )
+        assert page is not None
+        await page.goto("about:blank")
 
         for sentinel in sentinels:
-            rc, out = _read_in_chromium_mountns(
-                sandbox._cgroup_path / "cgroup.procs", str(sentinel)
-            )
-            assert rc != 0, (
+            file_url = sentinel.as_uri()
+            leaked = None
+            try:
+                response = await page.goto(file_url, wait_until="domcontentloaded")
+                if response is not None and response.ok:
+                    leaked = await page.text_content("body")
+            except Exception:
+                leaked = None
+            assert leaked is None, (
                 f"HIGH: sensitive host path {sentinel} was readable from "
-                f"Chromium's mount namespace (got {out!r}) — Batch 9.2 "
-                f"regression"
+                f"inside Chromium's mount namespace (got {leaked!r}) — "
+                f"Batch 9.2 regression: the bwrap --tmpfs mask is not "
+                f"effective"
             )
     finally:
         await manager.close()
         for sentinel in sentinels:
             sentinel.unlink(missing_ok=True)
-            # Clean up the probe dir if we created it (not tmp_path).
             if sentinel.parent.name == "khaos-round9-probe":
                 try:
                     sentinel.parent.rmdir()
