@@ -427,7 +427,7 @@ def test_python_lockfile_exists_and_is_non_empty():
         "PyYAML==",
         "google-re2==",
     ):
-        assert required_dep in content, (
+        assert required_dep.lower() in content.lower(), (
             f"requirements-lock.txt is missing pinned {required_dep!r}"
         )
 

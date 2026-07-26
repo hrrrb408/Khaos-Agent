@@ -1378,6 +1378,7 @@ class AgentService:
         session_id: str = "",
         after_sequence: int = 0,
         stream_id: str = "",
+        after_event_id: int | None = None,
     ) -> AsyncIterator[dict]:
         """Replay and tail one principal's durable chat event ledger.
 
@@ -1413,7 +1414,14 @@ class AgentService:
             if session is None or session.get("project_id") != ctx.project_id:
                 return
         # Batch 7.2 §十四: cursor is the session-global event_id.
-        cursor = max(0, int(after_sequence))
+        if after_event_id is not None and after_sequence:
+            raise ValueError(
+                "ambiguous replay cursor: use after_event_id only"
+            )
+        cursor = max(
+            0,
+            int(after_event_id if after_event_id is not None else after_sequence),
+        )
         idle_deadline = time.monotonic() + 30.0
         while time.monotonic() < idle_deadline:
             events = await self.db.list_chat_stream_events(
@@ -1421,7 +1429,7 @@ class AgentService:
                 session_id=session_id,
                 principal_id=ctx.principal_id,
                 project_id=ctx.project_id,
-                after_sequence=cursor,
+                after_event_id=cursor,
             )
             if not events:
                 await asyncio.sleep(0.05)
@@ -2585,11 +2593,20 @@ async def serve_json_lines(
                 elif method == "AgentService.ChatEvents":
                     # Batch 7.2 §十四: forward stream_id so a caller can
                     # request a stream-specific tail (previously dropped).
+                    legacy_cursor_present = "after_sequence" in payload
+                    event_cursor_present = "after_event_id" in payload
+                    if legacy_cursor_present and event_cursor_present:
+                        raise ValueError("ambiguous replay cursor fields")
                     async for event in agent.chat_events(
                         ctx,
                         str(payload.get("session_id", "")),
                         int(payload.get("after_sequence", 0)),
                         str(payload.get("stream_id", "")),
+                        (
+                            int(payload["after_event_id"])
+                            if event_cursor_present
+                            else None
+                        ),
                     ):
                         writer.write(
                             (json.dumps(event, ensure_ascii=False) + "\n").encode(

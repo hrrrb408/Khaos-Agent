@@ -27,6 +27,7 @@ type ChatRequest struct {
 
 // ChatEvent is the gateway-neutral event shape streamed as SSE.
 type ChatEvent struct {
+	EventID  uint64         `json:"event_id,omitempty"`
 	Sequence uint64         `json:"sequence,omitempty"`
 	Event    string         `json:"event"`
 	Data     map[string]any `json:"data"`
@@ -47,7 +48,7 @@ type AgentClient interface {
 
 // ChatEventClient reads the Python-owned durable broadcast ledger.
 type ChatEventClient interface {
-	ChatEvents(ctx context.Context, principalID string, sessionID string, afterSequence uint64) (<-chan ChatEvent, error)
+	ChatEvents(ctx context.Context, principalID string, sessionID string, afterEventID uint64) (<-chan ChatEvent, error)
 }
 
 // WebhookRequest preserves an external platform's original webhook data.
