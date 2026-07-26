@@ -661,7 +661,10 @@ class BrowserNetworkSandbox:
         # from the browser veth except established return traffic).
         if ports:
             port_rules = "\n    ".join(
-                f'iifname "{veth}" ip daddr {host_ip} tcp dport {p} accept'
+                (
+                    f'iifname "{veth}" ip daddr {host_ip} tcp dport {p} counter\n'
+                    f'    iifname "{veth}" ip daddr {host_ip} tcp dport {p} accept'
+                )
                 for p in ports
             )
         else:

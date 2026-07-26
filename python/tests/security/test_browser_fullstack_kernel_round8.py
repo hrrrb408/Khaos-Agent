@@ -73,7 +73,8 @@ async def _http_handler(
 
 
 async def _probe_authenticated_proxy(
-    *, netns: str, proxy: object, target_url: str,
+    *, netns: str, nft_table: str, host_interface: str,
+    proxy: object, target_url: str,
 ) -> bytes:
     """Exercise the exact netns -> nft pin -> authenticated proxy path."""
     proxy_url = urlparse(proxy.server_url)  # type: ignore[attr-defined]
@@ -105,7 +106,29 @@ async def _probe_authenticated_proxy(
         stderr=asyncio.subprocess.PIPE,
     )
     stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=8)
-    assert process.returncode == 0, stderr.decode("utf-8", "replace")
+    if process.returncode != 0:
+        commands = (
+            ["nft", "list", "table", "inet", nft_table],
+            ["ip", "addr", "show", "dev", host_interface],
+            ["ip", "netns", "exec", netns, "ip", "addr"],
+            ["ip", "netns", "exec", netns, "ip", "route"],
+        )
+        diagnostics: list[str] = []
+        for command in commands:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+            )
+            diagnostics.append(
+                f"$ {' '.join(command)}\n{result.stdout}{result.stderr}"
+            )
+        pytest.fail(
+            stderr.decode("utf-8", "replace") + "\n" + "\n".join(diagnostics)
+        )
     return stdout
 
 
@@ -121,7 +144,12 @@ async def test_browser_manager_real_chromium_kernel_stack() -> None:
         sandbox = manager._browser_sandbox
         assert sandbox is not None and sandbox.is_active
         assert sandbox.enforcement_status.ok
-        assert sandbox._netns_name and sandbox._cgroup_path and sandbox._nft_table
+        assert (
+            sandbox._netns_name
+            and sandbox._cgroup_path
+            and sandbox._nft_table
+            and sandbox._veth_host
+        )
 
         server = await asyncio.start_server(_http_handler, sandbox._host_ip, 0)
         port = int(server.sockets[0].getsockname()[1])
@@ -138,6 +166,8 @@ async def test_browser_manager_real_chromium_kernel_stack() -> None:
         ]
         proxy_response = await _probe_authenticated_proxy(
             netns=sandbox._netns_name,
+            nft_table=sandbox._nft_table,
+            host_interface=sandbox._veth_host,
             proxy=context_entry["egress_proxy"],
             target_url=target_url,
         )
