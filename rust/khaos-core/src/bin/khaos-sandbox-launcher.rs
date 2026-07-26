@@ -244,12 +244,20 @@ mod linux {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("open cgroup.procs: {error}; {}", cgroup_context()),
+            ));
         }
         let pid = b"0\n";
         let written = unsafe { libc::write(fd, pid.as_ptr().cast(), pid.len()) };
         let write_error = if written < 0 {
-            Some(io::Error::last_os_error())
+            let error = io::Error::last_os_error();
+            Some(io::Error::new(
+                error.kind(),
+                format!("write cgroup.procs: {error}; {}", cgroup_context()),
+            ))
         } else if written as usize != pid.len() {
             Some(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -266,6 +274,28 @@ mod linux {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    fn cgroup_context() -> String {
+        let membership = std::fs::read_to_string("/proc/self/cgroup")
+            .unwrap_or_else(|error| format!("unavailable:{error}"))
+            .trim()
+            .replace('\n', ",");
+        let mount = std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|content| {
+                content
+                    .lines()
+                    .find(|line| line.contains(" - cgroup2 "))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unavailable".to_string());
+        format!(
+            "euid={} cgroup={} mount={}",
+            unsafe { libc::geteuid() },
+            membership,
+            mount
+        )
     }
 
     fn validate_control_channel(fd: i32, needs_read: bool) -> io::Result<()> {
