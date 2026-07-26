@@ -307,11 +307,17 @@ mod linux {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing browser netns")
             })?;
             if let Some(procs) = env::var_os("KHAOS_BROWSER_CGROUP_PROCS") {
-                std::fs::write(PathBuf::from(procs), b"0")?;
+                std::fs::write(PathBuf::from(procs), b"0").map_err(|error| {
+                    io::Error::new(error.kind(), format!("join browser cgroup: {error}"))
+                })?;
             }
-            join_netns(&netns)?;
+            join_netns(&netns).map_err(|error| {
+                io::Error::new(error.kind(), format!("join browser netns: {error}"))
+            })?;
 
-            let launcher_path = env::current_exe()?;
+            let launcher_path = env::current_exe().map_err(|error| {
+                io::Error::new(error.kind(), format!("resolve launcher image: {error}"))
+            })?;
             let launcher_c_path = CString::new(launcher_path.as_os_str().as_encoded_bytes())
                 .map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidInput, "launcher path contained NUL")
@@ -322,7 +328,11 @@ mod linux {
             // private parent directory by pathname.
             let launcher_fd = unsafe { libc::open(launcher_c_path.as_ptr(), libc::O_RDONLY) };
             if launcher_fd < 0 {
-                return Err(io::Error::last_os_error());
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("open launcher image: {error}"),
+                ));
             }
 
             let real_path = PathBuf::from(&real);
@@ -393,9 +403,16 @@ mod linux {
                 .iter()
                 .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe")
             {
-                bridge_playwright_pipes_to_stdio()?;
+                bridge_playwright_pipes_to_stdio().map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("bridge Playwright control channels: {error}"),
+                    )
+                })?;
             }
-            return exec(&bwrap_args);
+            return exec(&bwrap_args).map_err(|error| {
+                io::Error::new(error.kind(), format!("exec bubblewrap: {error}"))
+            });
         }
 
         if args.first().is_some_and(|arg| arg == "--browser-inner") {
