@@ -6,7 +6,7 @@ mod linux {
     use std::ffi::CString;
     use std::io;
     use std::os::unix::ffi::OsStrExt;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
     #[allow(dead_code)] // only used on aarch64 targets
