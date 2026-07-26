@@ -429,8 +429,33 @@ mod linux {
             })?;
             let inner_real = PathBuf::from("/run/khaos-browser/runtime").join(real_name);
 
+            // Batch 9.2 (round-9 §十): resolve the REAL host home so we can
+            // mask it even when it lives outside /home or /root (e.g.
+            // /var/lib/khaos, /srv/khaos).  Python passes the resolved path.
+            let host_home = env::var("KHAOS_BROWSER_HOST_HOME")
+                .ok()
+                .filter(|s| !s.is_empty());
+            // Batch 9.3 (round-9 §十二): use the validated absolute bubblewrap
+            // path supplied by Python instead of relying on PATH lookup
+            // (which a pre-sandbox attacker could hijack).
+            let bwrap_exe = env::var_os("KHAOS_BROWSER_BWRAP_PATH")
+                .filter(|s| !s.is_empty())
+                .map(std::ffi::OsString::from)
+                .unwrap_or_else(|| "bwrap".into());
+
+            // Batch 9.2: sensitive host paths that must NEVER be readable
+            // from inside the browser namespace, regardless of the ro-bind
+            // of /.  tmpfs overwrites the ro-bind at these mount points.
+            let sensitive_host_paths: [&str; 5] = [
+                "/workspace",
+                "/srv",
+                "/data",
+                "/mnt",
+                "/var/lib",
+            ];
+
             let mut bwrap_args: Vec<std::ffi::OsString> = vec![
-                "bwrap".into(),
+                bwrap_exe,
                 "--die-with-parent".into(),
                 "--new-session".into(),
                 "--unshare-user-try".into(),
@@ -452,6 +477,26 @@ mod linux {
                 "/home".into(),
                 "--tmpfs".into(),
                 "/root".into(),
+            ];
+            // Mask the resolved real home if it is not already covered by
+            // the /home or /root tmpfs above.
+            if let Some(home) = host_home.as_deref() {
+                let home_str = home.trim_end_matches('/');
+                let already_masked = home_str == "/home"
+                    || home_str == "/root"
+                    || home_str.starts_with("/home/")
+                    || home_str.starts_with("/root/");
+                if !already_masked && !home_str.is_empty() {
+                    bwrap_args.push("--tmpfs".into());
+                    bwrap_args.push(home_str.into());
+                }
+            }
+            // Mask the fixed sensitive host paths.
+            for path in sensitive_host_paths {
+                bwrap_args.push("--tmpfs".into());
+                bwrap_args.push(path.into());
+            }
+            bwrap_args.extend([
                 "--dir".into(),
                 "/run/khaos-browser".into(),
                 "--dir".into(),
@@ -466,9 +511,20 @@ mod linux {
                 "/run/khaos-browser/launcher".into(),
                 "--dir".into(),
                 "/tmp/khaos-home".into(),
+                // Batch 9.1 (round-9 §九): --clearenv wipes ALL inherited
+                // environment, then we re-set only the minimal benign vars
+                // Chromium actually needs.  Provider keys / cloud creds /
+                // proxy secrets from the parent are therefore absent.
+                "--clearenv".into(),
                 "--setenv".into(),
                 "HOME".into(),
                 "/tmp/khaos-home".into(),
+                "--setenv".into(),
+                "PATH".into(),
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
+                "--setenv".into(),
+                "LANG".into(),
+                "C.UTF-8".into(),
                 "--chdir".into(),
                 "/tmp/khaos-home".into(),
                 // The inner image must not re-enter the privileged outer
@@ -483,12 +539,16 @@ mod linux {
                 "KHAOS_BROWSER_NETNS".into(),
                 "--unsetenv".into(),
                 "KHAOS_BROWSER_CGROUP_PROCS".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_HOST_HOME".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_BWRAP_PATH".into(),
                 "--".into(),
                 "/run/khaos-browser/launcher".into(),
                 "--browser-inner".into(),
                 "--".into(),
                 inner_real.into_os_string(),
-            ];
+            ]);
             bwrap_args.append(&mut args);
             if bwrap_args
                 .iter()

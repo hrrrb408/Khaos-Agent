@@ -394,10 +394,15 @@ class BrowserManager:
                             )
                         if launcher is not None:
                             launch_kwargs["executable_path"] = launcher
-                            launch_kwargs["env"] = {
-                                **os.environ,
-                                **self._browser_sandbox.launcher_environment(real_path),
-                            }
+                            # Batch 9.1 (round-9 §九): launcher_environment()
+                            # returns the COMPLETE Chromium env — an explicit
+                            # allowlist plus the four KHAOS_BROWSER_* authority
+                            # vars.  We NO LONGER merge os.environ, so provider
+                            # API keys / cloud creds / proxy secrets in the
+                            # parent process are invisible to Chromium.
+                            launch_kwargs["env"] = (
+                                self._browser_sandbox.launcher_environment(real_path)
+                            )
                             self._browser_sandbox.enforcement_status.trusted_launcher = True
                             self._browser_sandbox.enforcement_status.fd_sanitized = True
                             self._browser_sandbox.enforcement_status.filesystem_sandbox = True

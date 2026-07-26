@@ -103,6 +103,23 @@ _RUN_DIR_ROOT = Path.home() / ".khaos" / "run"
 # Round-5 H-03: registry directory for resource ownership records.
 _RESOURCE_REGISTRY = Path.home() / ".khaos" / "run" / "browser_registry"
 
+# Batch 9.1 (round-9 §九): the ONLY parent-process environment variables
+# forwarded to Chromium.  Everything else (provider API keys, cloud creds,
+# proxy secrets, DB connection strings) is dropped so a compromised
+# Chromium cannot read parent secrets from its own environment.  The Rust
+# launcher additionally runs bubblewrap with ``--clearenv`` and re-sets a
+# minimal PATH/LANG/HOME inside the namespace.
+_BROWSER_ENV_ALLOWLIST: tuple[str, ...] = (
+    "PATH",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "PLAYWRIGHT_BROWSERS_PATH",
+)
+
 
 # ---------------------------------------------------------------------------
 # Batch 7.3 (round-7 §六/§七/§八): resource-name derivation + validation,
@@ -1159,17 +1176,39 @@ class BrowserNetworkSandbox:
         Playwright can only configure one executable path.  Passing the Rust
         binary directly and supplying immutable launch metadata through the
         child environment removes the forwarding shell from production TCB.
+
+        Batch 9.1 (round-9 §九): this dict is the COMPLETE Chromium
+        environment — it NO LONGER inherits ``os.environ``.  Only an
+        explicit allowlist of benign runtime variables (PATH, locale, TLS
+        roots, Playwright browser path) is forwarded, plus the four
+        ``KHAOS_BROWSER_*`` authority-metadata vars that the Rust launcher
+        strips at the namespace boundary.  Provider API keys, cloud
+        credentials, proxy secrets and any other parent-process env are
+        therefore NOT visible to a compromised Chromium.
         """
         launcher = self._locate_browser_launcher()
         if launcher is None:
             raise BrowserSandboxError("trusted Rust browser launcher required")
         if not self._active or not self._netns_name:
             raise BrowserSandboxError("browser sandbox is not active")
-        env = {
-            "KHAOS_BROWSER_LAUNCH": "1",
-            "KHAOS_BROWSER_REAL_EXECUTABLE": real_executable,
-            "KHAOS_BROWSER_NETNS": self._netns_name,
-        }
+        # Start from the explicit allowlist only — never ``os.environ``.
+        env: dict[str, str] = {}
+        for name in _BROWSER_ENV_ALLOWLIST:
+            value = os.environ.get(name)
+            if value:
+                env[name] = value
+        # Authority metadata consumed by the Rust launcher; stripped inside
+        # the bubblewrap namespace so Chromium never sees them.
+        env["KHAOS_BROWSER_LAUNCH"] = "1"
+        env["KHAOS_BROWSER_REAL_EXECUTABLE"] = real_executable
+        env["KHAOS_BROWSER_NETNS"] = self._netns_name
+        # Batch 9.2: resolved host home so the Rust launcher can mask the
+        # REAL home directory (which may live outside /home or /root).
+        env["KHAOS_BROWSER_HOST_HOME"] = str(Path.home().resolve())
+        # Batch 9.3: resolved bubblewrap absolute path (TCB binary trust).
+        bwrap_path = shutil.which("bwrap")
+        if bwrap_path:
+            env["KHAOS_BROWSER_BWRAP_PATH"] = bwrap_path
         if self._cgroup_path is not None:
             env["KHAOS_BROWSER_CGROUP_PROCS"] = str(
                 self._cgroup_path / "cgroup.procs"
