@@ -631,6 +631,10 @@ class BrowserManager:
                     self._browser_sandbox.teardown
                 )
                 if not cleanup.fully_closed:
+                    # Partial cleanup: kernel resources remain.  Retain
+                    # the sandbox reference and the context authority map
+                    # so the startup Reaper can recover on next launch.
+                    self._close_failed = True
                     return {
                         "ok": False,
                         "error": "browser kernel resources remain",
@@ -638,11 +642,22 @@ class BrowserManager:
                     }
                 self._browser_sandbox = None
             except Exception as exc:  # noqa: BLE001
+                # Batch 9.4 (round-9 §十三): teardown RAISED.  Kernel
+                # resource state is unknown — do NOT clear contexts and
+                # do NOT return ok:True.  Return a fail-closed result;
+                # _browser_sandbox is retained for the startup Reaper.
                 logger.error(
-                    "force-close: sandbox teardown failed: %s — RETAINING "
+                    "force-close: sandbox teardown raised: %s — RETAINING "
                     "sandbox reference for startup Reaper; netns/veth/"
                     "cgroup/nft may leak until next launch", exc,
                 )
+                self._close_failed = True
+                return {
+                    "ok": False,
+                    "error": "browser sandbox teardown raised",
+                    "quarantined": True,
+                    "detail": str(exc),
+                }
         self._contexts.clear()
         self._context_close_failures.clear()
         return {"ok": True}
@@ -727,9 +742,27 @@ class BrowserManager:
                                 "cleanup": cleanup.to_dict(),
                             }
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning(
-                            "browser netns sandbox teardown failed: %s", exc,
+                        # Batch 9.4 (round-9 §十三): teardown RAISED.
+                        # The kernel resource state is unknown — we must
+                        # NOT drop the sandbox reference, NOT clear
+                        # contexts, and NOT set _closed.  Return a
+                        # fail-closed result so the caller can observe
+                        # and retry; the startup Reaper can still recover
+                        # the residual netns/veth/cgroup/nft on next launch
+                        # because _browser_sandbox is retained.
+                        logger.error(
+                            "browser netns sandbox teardown raised: %s — "
+                            "RETAINING sandbox reference for startup Reaper; "
+                            "netns/veth/cgroup/nft may leak until next launch",
+                            exc,
                         )
+                        self._close_failed = True
+                        return {
+                            "ok": False,
+                            "error": "browser sandbox teardown raised",
+                            "quarantined": True,
+                            "detail": str(exc),
+                        }
                     self._browser_sandbox = None
                 for candidate in list(self._quarantined_sandboxes):
                     cleanup = await asyncio.to_thread(candidate.teardown)
