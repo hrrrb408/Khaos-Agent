@@ -128,6 +128,60 @@ async def test_timeout_is_terminal_and_registry_is_cleaned(tmp_path: Path):
 
 @pytest.mark.asyncio
 @POSIX_ONLY
+async def test_signal_death_before_timeout_is_classified_as_timeout(tmp_path: Path):
+    """Race fix: a process that dies from a signal (SIGTERM) and exits on
+    its own with returncode 143 BEFORE our wait_for raises TimeoutError must
+    be classified as "timed-out", not "failed".
+
+    This reproduces the Docker daemon race: the daemon forwards SIGTERM to
+    the container, the CLI exits 143 before the supervisor's own timeout
+    fires, and without the fix the status becomes "failed" + returncode 143
+    instead of "timed-out" + returncode -1.
+    """
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    # The process sends itself SIGTERM after starting; the timeout is 2s,
+    # so the process exits on its own (returncode 143, shell convention)
+    # well before wait_for raises TimeoutError.
+    request = ExecutionRequest(
+        (
+            sys.executable, "-c",
+            "import os, signal, time; "
+            "os.kill(os.getpid(), signal.SIGTERM); time.sleep(5)",
+        ),
+        tmp_path,
+        budget=ResourceBudget(timeout_seconds=2),
+        correlation_id="signal-race",
+    )
+
+    result = await supervisor.run(request)
+
+    assert result.status == "timed-out", (
+        f"signal-death before timeout should be timed-out, got "
+        f"{result.status} (rc={result.return_code})"
+    )
+    assert result.return_code is not None and result.return_code != 0
+
+
+@pytest.mark.asyncio
+@POSIX_ONLY
+async def test_normal_failure_stays_failed_not_timeout(tmp_path: Path):
+    """Regression guard: a process that exits non-zero normally (not via
+    signal) must stay "failed", not be reclassified as "timed-out"."""
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    request = ExecutionRequest(
+        (sys.executable, "-c", "import sys; sys.exit(1)"),
+        tmp_path,
+        budget=ResourceBudget(timeout_seconds=5),
+        correlation_id="normal-fail",
+    )
+
+    result = await supervisor.run(request)
+    assert result.status == "failed"
+    assert result.return_code == 1
+
+
+@pytest.mark.asyncio
+@POSIX_ONLY
 async def test_supervisor_enforces_file_size_limit(tmp_path: Path):
     supervisor = ProcessSupervisor()
     request = ExecutionRequest(

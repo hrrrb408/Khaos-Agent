@@ -164,6 +164,28 @@ class ProcessSupervisor:
                 diagnostics["resource_violation"] = resource_violation
             elif active.termination_requested and status != "timed-out":
                 status = "cancelled"
+            elif (
+                status == "failed"
+                and not active.termination_requested
+                and self._is_signal_death(process.returncode)
+                and request.permission_profile.resources.timeout_seconds is not None
+            ):
+                # Race fix: the process died from a signal (SIGTERM/SIGKILL)
+                # and exited on its own (returncode 128+signum, shell
+                # convention) BEFORE our wait_for raised TimeoutError.  This
+                # happens in containerized backends (Docker daemon forwards
+                # SIGTERM to the container and the CLI exits 143 before our
+                # timer fires).  We were not the ones who requested
+                # termination (termination_requested is False), a timeout was
+                # configured, and the death is signal-induced — classify it
+                # as a timeout so the tool layer surfaces -1 (the documented
+                # convention) instead of a raw 143.
+                status = "timed-out"
+                diagnostics["timeout_seconds"] = (
+                    request.permission_profile.resources.timeout_seconds
+                )
+                diagnostics["process_group_terminated"] = True
+                diagnostics["race_signal_returncode"] = process.returncode
             stdout, stdout_total = await stdout_task
             stderr, stderr_total = await stderr_task
         finally:
@@ -264,6 +286,18 @@ class ProcessSupervisor:
         async with self._registry_lock:
             if self._active.get(execution_id) is active:
                 self._active.pop(execution_id, None)
+
+    @staticmethod
+    def _is_signal_death(returncode: int | None) -> bool:
+        """True when ``returncode`` indicates the process was killed by a signal.
+
+        Covers both conventions:
+        * Python ``subprocess``: negative returncode (``-signal``);
+        * shell: ``128 + signal`` (e.g. 143 = SIGTERM, 137 = SIGKILL).
+        """
+        if returncode is None:
+            return False
+        return returncode < 0 or returncode >= 128
 
     async def _terminate_active(self, active: _ActiveProcess) -> None:
         async with active.termination_lock:
