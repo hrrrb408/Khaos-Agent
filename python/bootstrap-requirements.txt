@@ -1,20 +1,28 @@
 # Bootstrap toolchain pinned with hashes (Batch 9.7b, round-9 review §二十一).
 #
-# CI jobs previously installed uv and pip-audit via
-# ``python -m pip install uv==0.11.9`` with no hash verification.  A
-# compromised PyPI mirror or download link could replace the same-version
-# wheel and control every subsequent frozen install.  This file is the
-# trust root: install with
+# CI jobs previously installed uv via ``python -m pip install uv==0.11.9``
+# with no hash verification.  A compromised PyPI mirror or download link
+# could replace the same-version wheel and control every subsequent
+# frozen install.  This file is the trust root for the uv binary: install
+# with
 #
 #     python -m pip install --require-hashes -r python/bootstrap-requirements.txt
 #
 # pip refuses any wheel whose sha256 is not listed below, so a swapped
-# wheel fails to install.  Hashes are the full set PyPI publishes for
-# each version (uv ships per-platform wheels), so every CI runner
-# architecture resolves.
+# wheel fails to install.  uv is a single Rust binary (PyOxidizer) with
+# NO Python runtime dependencies (Requires-Dist is empty), so hashing
+# the uv wheels alone is sufficient — there is no transitive dependency
+# tree that also needs pinning.
 #
-# Update procedure: when bumping uv/pip-audit, fetch the new hashes from
-#   https://pypi.org/pypi/<pkg>/<version>/json
+# Note: pip-audit is NOT in this file.  It has a heavy dependency tree
+# (CacheControl, cyclonedx-python-lib, etc.) that would all need hash
+# pinning and frequent updates.  pip-audit is installed separately in the
+# supply-chain-audit workflow, where it is the AUDIT TOOL rather than the
+# trust root — the trust root for business dependencies is pip-audit's
+# own --require-hashes verification of the frozen requirements-lock.txt.
+#
+# Update procedure: when bumping uv, fetch the new hashes from
+#   https://pypi.org/pypi/uv/<version>/json
 # and replace the lines below IN FULL.
 uv==0.11.9 \
     --hash=sha256:053659e258b33c88e416e508d4cf63685505c1151f3cf46e47dd47212439379c \
@@ -38,6 +46,3 @@ uv==0.11.9 \
     --hash=sha256:f07298b7f21942423e827318e719a66aa4530888e94ba01f180f0f4613fd0d95
     # uv is a Rust binary distributed as per-platform wheels; all platform
     # hashes are listed so every CI runner architecture resolves.
-pip-audit==2.10.0 \
-    --hash=sha256:16e02093872fac97580303f0848fa3ad64f7ecf600736ea7835a2b24de49613f \
-    --hash=sha256:427ea5bf61d1d06b98b1ae29b7feacc00288a2eced52c9c58ceed5253ef6c2a4

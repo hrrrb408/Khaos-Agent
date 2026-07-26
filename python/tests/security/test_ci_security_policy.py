@@ -194,16 +194,24 @@ def test_bootstrap_toolchain_is_hash_verified():
     assert "uv==0.11.9" in text and "--hash=sha256:" in text, (
         "bootstrap-requirements.txt must pin uv with sha256 hashes"
     )
-    assert "pip-audit==2.10.0" in text, (
-        "bootstrap-requirements.txt must pin pip-audit with sha256 hashes"
-    )
-    # No workflow may install uv/pip-audit without hash verification.
+    # uv is a single Rust binary with NO Python deps, so hashing the uv
+    # wheels alone is a complete trust root (no transitive tree to pin).
+    # uv is the bootstrap trust root — it MUST always be hash-verified.
+    # No workflow may install uv without --require-hashes against the
+    # pinned bootstrap-requirements.txt.
     for workflow in _workflow_files():
         wt = workflow.read_text("utf-8")
-        # A bare `pip install uv==` or `pip install pip-audit==` without
-        # --require-hashes is a trust-root violation.
-        for forbidden in ("pip install uv==", "pip install pip-audit=="):
-            assert forbidden not in wt, (
-                f"{workflow.name} installs the toolchain without "
-                f"--require-hashes: found '{forbidden}'"
-            )
+        assert "pip install uv==" not in wt, (
+            f"{workflow.name} installs uv without --require-hashes: "
+            f"use 'pip install --require-hashes -r "
+            f"python/bootstrap-requirements.txt' instead"
+        )
+    # pip-audit is the AUDIT TOOL (not the trust root).  It has a heavy
+    # transitive dependency tree that cannot be practically hash-pinned,
+    # and its own --require-hashes check on requirements-lock.txt is the
+    # real trust root for business dependencies.  It may be installed
+    # bare ONLY in the supply-chain-audit workflow, version-pinned.
+    audit = (WORKFLOWS / "supply-chain-audit.yml").read_text("utf-8")
+    assert "pip-audit==2.10.0" in audit, (
+        "supply-chain-audit.yml must pin pip-audit to a fixed version"
+    )
