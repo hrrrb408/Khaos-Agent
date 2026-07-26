@@ -219,6 +219,61 @@ mod linux {
         Ok(())
     }
 
+    fn validate_pipe(fd: i32, label: &str) -> io::Result<()> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0
+            || (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{label} fd {fd} is not a pipe"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bubblewrap deliberately closes non-stdio descriptors and released
+    /// Ubuntu versions do not expose a portable arbitrary-FD preservation
+    /// option. Bridge Playwright's read/write pipes across the bwrap exec via
+    /// stdin/stdout, which bwrap preserves by contract. The inner launcher
+    /// restores the canonical Chromium FD 3/4 layout before installing
+    /// seccomp and execing the browser.
+    fn bridge_playwright_pipes_to_stdio() -> io::Result<()> {
+        validate_pipe(3, "Playwright control")?;
+        validate_pipe(4, "Playwright control")?;
+        if unsafe { libc::dup2(3, libc::STDIN_FILENO) } < 0
+            || unsafe { libc::dup2(4, libc::STDOUT_FILENO) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn restore_playwright_pipes_from_stdio() -> io::Result<()> {
+        if unsafe { libc::dup2(libc::STDIN_FILENO, 3) } < 0
+            || unsafe { libc::dup2(libc::STDOUT_FILENO, 4) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        validate_pipe(3, "Playwright control")?;
+        validate_pipe(4, "Playwright control")?;
+
+        let dev_null = CString::new("/dev/null").expect("static path has no NUL");
+        let null_fd = unsafe { libc::open(dev_null.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if null_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let redirect_result = if unsafe { libc::dup2(null_fd, libc::STDIN_FILENO) } < 0
+            || unsafe { libc::dup2(null_fd, libc::STDOUT_FILENO) } < 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        unsafe { libc::close(null_fd) };
+        redirect_result
+    }
+
     pub fn run() -> io::Result<()> {
         let mut args: Vec<_> = env::args_os().skip(1).collect();
 
@@ -290,8 +345,6 @@ mod linux {
                 "--setenv".into(),
                 "HOME".into(),
                 "/tmp/khaos-home".into(),
-                "--preserve-fds".into(),
-                "2".into(),
                 "--".into(),
                 "/run/khaos-browser/launcher".into(),
                 "--browser-inner".into(),
@@ -299,6 +352,12 @@ mod linux {
                 inner_real.into_os_string(),
             ];
             bwrap_args.append(&mut args);
+            if bwrap_args
+                .iter()
+                .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe")
+            {
+                bridge_playwright_pipes_to_stdio()?;
+            }
             return exec(&bwrap_args);
         }
 
@@ -311,20 +370,13 @@ mod linux {
                 .iter()
                 .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
             let preserved = if remote_debugging_pipe {
+                restore_playwright_pipes_from_stdio()?;
                 vec![3, 4]
             } else {
                 Vec::new()
             };
             for fd in &preserved {
-                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(*fd, &mut stat) } != 0
-                    || (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO
-                {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Playwright control fd {fd} is not a pipe"),
-                    ));
-                }
+                validate_pipe(*fd, "Playwright control")?;
             }
             sanitize_fds_except(&preserved)?;
             install_seccomp()?;
