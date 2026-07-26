@@ -159,17 +159,26 @@ async def test_resolved_home_not_readable_from_browser() -> None:
 
 @pytest.mark.asyncio
 async def test_sensitive_host_paths_not_readable_from_browser(tmp_path) -> None:
-    """High (§十一): /workspace, /srv, /data, /mnt, /var/lib must be masked.
+    """High (§十一): existing sensitive host paths must be masked.
 
-    Creates a sentinel under each sensitive path (when the path exists and
-    is writable) and verifies none is readable from the browser netns.
+    Creates a sentinel under each sensitive path that EXISTS on the host
+    (the Rust launcher only masks paths that exist — a non-existent path
+    holds no secret).  Verifies none of the created sentinels is readable
+    from the browser netns.  Falls back to the tmp_path (under /tmp or
+    /home, both always masked) if none of the fixed paths exist, so the
+    test always proves at least one masking.
     """
     _require_fullstack()
     candidates = ["/workspace", "/srv", "/data", "/mnt", "/var/lib"]
-    # Create sentinels where possible; skip paths we cannot write to.
+    # Create sentinels under paths that EXIST and are writable.  Only
+    # existing paths are masked by the Rust launcher (a non-existent path
+    # has no secret to protect and bwrap --tmpfs would fail on it).
     sentinels: list[Path] = []
     for base in candidates:
-        sentinel_dir = Path(base) / "khaos-round9-probe"
+        base_path = Path(base)
+        if not base_path.exists():
+            continue
+        sentinel_dir = base_path / "khaos-round9-probe"
         try:
             sentinel_dir.mkdir(parents=True, exist_ok=True)
             sentinel = sentinel_dir / "secret.txt"
@@ -177,7 +186,12 @@ async def test_sensitive_host_paths_not_readable_from_browser(tmp_path) -> None:
             sentinels.append(sentinel)
         except OSError:
             continue
-    assert sentinels, "could not create any sentinel under sensitive paths"
+    # Guarantee at least one sentinel exists: tmp_path is under /tmp or
+    # /home (both always masked), so it proves the masking invariant even
+    # when none of the fixed sensitive paths exist on the runner.
+    fallback = tmp_path / "khaos-round9-fallback-secret"
+    fallback.write_text("fallback-host-secret", encoding="utf-8")
+    sentinels.append(fallback)
 
     manager = BrowserManager()
     try:
@@ -196,4 +210,9 @@ async def test_sensitive_host_paths_not_readable_from_browser(tmp_path) -> None:
         await manager.close()
         for sentinel in sentinels:
             sentinel.unlink(missing_ok=True)
-            sentinel.parent.rmdir() if sentinel.parent.exists() else None
+            # Clean up the probe dir if we created it (not tmp_path).
+            if sentinel.parent.name == "khaos-round9-probe":
+                try:
+                    sentinel.parent.rmdir()
+                except OSError:
+                    pass

@@ -478,22 +478,30 @@ mod linux {
                 "/root".into(),
             ];
             // Mask the resolved real home if it is not already covered by
-            // the /home or /root tmpfs above.
+            // the /home or /root tmpfs above.  Only mask paths that EXIST
+            // on the host: bwrap's --tmpfs requires the mount point to
+            // already exist (the ro-bind of / does not create missing dirs),
+            // and a non-existent path holds no secret to hide anyway.
             if let Some(home) = host_home.as_deref() {
                 let home_str = home.trim_end_matches('/');
                 let already_masked = home_str == "/home"
                     || home_str == "/root"
                     || home_str.starts_with("/home/")
                     || home_str.starts_with("/root/");
-                if !already_masked && !home_str.is_empty() {
+                if !already_masked && !home_str.is_empty() && Path::new(home_str).exists() {
                     bwrap_args.push("--tmpfs".into());
                     bwrap_args.push(home_str.into());
                 }
             }
-            // Mask the fixed sensitive host paths.
+            // Mask the fixed sensitive host paths — only those that EXIST
+            // on the host (see rationale above).  A non-existent path has
+            // no secret to protect, and --tmpfs on a missing mount point
+            // fails with "Can't mkdir: Read-only file system".
             for path in sensitive_host_paths {
-                bwrap_args.push("--tmpfs".into());
-                bwrap_args.push(path.into());
+                if Path::new(path).exists() {
+                    bwrap_args.push("--tmpfs".into());
+                    bwrap_args.push(path.into());
+                }
             }
             bwrap_args.extend([
                 "--dir".into(),
