@@ -471,6 +471,18 @@ mod linux {
                 "/tmp/khaos-home".into(),
                 "--chdir".into(),
                 "/tmp/khaos-home".into(),
+                // The inner image must not re-enter the privileged outer
+                // launch branch.  Strip all one-shot authority metadata at
+                // the namespace boundary; only the explicit --browser-inner
+                // argv contract continues into the read-only sandbox.
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_LAUNCH".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_REAL_EXECUTABLE".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_NETNS".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_CGROUP_PROCS".into(),
                 "--".into(),
                 "/run/khaos-browser/launcher".into(),
                 "--browser-inner".into(),
