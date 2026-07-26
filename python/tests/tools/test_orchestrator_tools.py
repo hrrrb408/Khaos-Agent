@@ -573,8 +573,9 @@ async def test_build_subagent_service_wires_init_orchestrator(tmp_path):
     # _build_subagent_service imports init_orchestrator lazily from
     # khaos.tools.orchestrator_tools, so patch it on the source module.
     orch_module.init_orchestrator = spy_init
+    service = None
     try:
-        await grpc_module._build_subagent_service(
+        service = await grpc_module._build_subagent_service(
             db,
             project_root=tmp_path,
             config_path=tmp_path / "config.yaml",
@@ -595,6 +596,8 @@ async def test_build_subagent_service_wires_init_orchestrator(tmp_path):
         assert orch_module._spawner is spawner_arg
         assert orch_module._runner is runner_arg
     finally:
+        if service is not None:
+            await service.shutdown(timeout=1.0)
         orch_module.init_orchestrator = real_init
         orch_module._spawner = None
         orch_module._runner = None
@@ -622,8 +625,9 @@ async def test_build_subagent_service_orchestrator_tools_not_initialized_after(
     (tmp_path / "config.yaml").write_text(
         "providers: {}\nmodels: {}\n", encoding="utf-8",
     )
+    service = None
     try:
-        await grpc_module._build_subagent_service(
+        service = await grpc_module._build_subagent_service(
             db,
             project_root=tmp_path,
             config_path=tmp_path / "config.yaml",
@@ -636,6 +640,8 @@ async def test_build_subagent_service_orchestrator_tools_not_initialized_after(
             f"orchestrator tools still not initialized in production: {result}"
         )
     finally:
+        if service is not None:
+            await service.shutdown(timeout=1.0)
         orch_module._spawner = None
         orch_module._runner = None
         await db.close()

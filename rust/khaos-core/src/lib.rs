@@ -9,7 +9,7 @@
 pub mod executor;
 pub mod token;
 
-pub use executor::{run_parallel, run_one, ToolCall, ToolResult};
+pub use executor::{run_one, run_parallel, ToolCall, ToolResult};
 pub use token::{count_tokens, count_tokens_batch};
 
 #[cfg(feature = "pyo3")]
