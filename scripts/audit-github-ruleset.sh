@@ -26,9 +26,9 @@ jq -s -e --slurpfile expected "$expected_file" '
     any(.rules[]?; .type == "deletion") and
     any(.rules[]?; .type == "non_fast_forward") and
     any(.rules[]?; .type == "pull_request" and
-      (.parameters.required_approving_review_count // 0) >= 1 and
-      .parameters.dismiss_stale_reviews_on_push == true and
-      .parameters.require_last_push_approval == true and
+      (.parameters.required_approving_review_count // 0) == 0 and
+      .parameters.dismiss_stale_reviews_on_push == false and
+      .parameters.require_last_push_approval == false and
       .parameters.required_review_thread_resolution == true) and
     any(.rules[]?; .type == "required_status_checks" and
       .parameters.do_not_enforce_on_create == false and
@@ -37,4 +37,4 @@ jq -s -e --slurpfile expected "$expected_file" '
   )
 ' "$out_dir/ruleset-details.jsonl" >/dev/null
 
-printf '%s\n' "active ruleset enforces reviews, up-to-date checks, and force-push/deletion protection"
+printf '%s\n' "active single-maintainer ruleset enforces up-to-date checks, resolved review threads, and force-push/deletion protection"
