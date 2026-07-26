@@ -219,14 +219,32 @@ mod linux {
         Ok(())
     }
 
-    fn validate_pipe(fd: i32, label: &str) -> io::Result<()> {
+    fn validate_control_channel(fd: i32, needs_read: bool) -> io::Result<()> {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-        if unsafe { libc::fstat(fd, &mut stat) } != 0
-            || (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO
-        {
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file_type = stat.st_mode & libc::S_IFMT;
+        if file_type != libc::S_IFIFO && file_type != libc::S_IFSOCK {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{label} fd {fd} is not a pipe"),
+                format!("Playwright control fd {fd} is not a pipe/socket channel"),
+            ));
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let access = flags & libc::O_ACCMODE;
+        let wrong_direction = if needs_read {
+            access == libc::O_WRONLY
+        } else {
+            access == libc::O_RDONLY
+        };
+        if wrong_direction {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Playwright control fd {fd} has invalid access direction"),
             ));
         }
         Ok(())
@@ -239,8 +257,8 @@ mod linux {
     /// restores the canonical Chromium FD 3/4 layout before installing
     /// seccomp and execing the browser.
     fn bridge_playwright_pipes_to_stdio() -> io::Result<()> {
-        validate_pipe(3, "Playwright control")?;
-        validate_pipe(4, "Playwright control")?;
+        validate_control_channel(3, true)?;
+        validate_control_channel(4, false)?;
         if unsafe { libc::dup2(3, libc::STDIN_FILENO) } < 0
             || unsafe { libc::dup2(4, libc::STDOUT_FILENO) } < 0
         {
@@ -255,8 +273,8 @@ mod linux {
         {
             return Err(io::Error::last_os_error());
         }
-        validate_pipe(3, "Playwright control")?;
-        validate_pipe(4, "Playwright control")?;
+        validate_control_channel(3, true)?;
+        validate_control_channel(4, false)?;
 
         let dev_null = CString::new("/dev/null").expect("static path has no NUL");
         let null_fd = unsafe { libc::open(dev_null.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
@@ -376,7 +394,7 @@ mod linux {
                 Vec::new()
             };
             for fd in &preserved {
-                validate_pipe(*fd, "Playwright control")?;
+                validate_control_channel(*fd, *fd == 3)?;
             }
             sanitize_fds_except(&preserved)?;
             install_seccomp()?;
@@ -442,22 +460,7 @@ mod linux {
                 .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
             let preserved = if remote_debugging_pipe {
                 for fd in [3, 4] {
-                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-                    if flags < 0 {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("Playwright control pipe fd {fd} is not open"),
-                        ));
-                    }
-                    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
-                    if unsafe { libc::fstat(fd, &mut stat) } != 0
-                        || (stat.st_mode & libc::S_IFMT) != libc::S_IFIFO
-                    {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            format!("Playwright control fd {fd} is not a pipe"),
-                        ));
-                    }
+                    validate_control_channel(fd, fd == 3)?;
                 }
                 vec![3, 4]
             } else {
