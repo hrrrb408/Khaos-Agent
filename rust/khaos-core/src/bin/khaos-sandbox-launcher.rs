@@ -219,6 +219,55 @@ mod linux {
         Ok(())
     }
 
+    /// Move this process into an existing cgroup-v2 leaf without applying
+    /// ordinary-file creation or truncation flags to the cgroupfs control
+    /// file.  `std::fs::write` uses `File::create`, whose O_CREAT/O_TRUNC
+    /// semantics are inappropriate for kernel pseudo-files and can be
+    /// rejected with EROFS even when the delegated control file is writable.
+    fn join_cgroup(procs: &std::ffi::OsStr) -> io::Result<()> {
+        let path = PathBuf::from(procs);
+        if path.file_name() != Some(std::ffi::OsStr::new("cgroup.procs"))
+            || !path.starts_with("/sys/fs/cgroup")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cgroup target must be an absolute cgroup.procs path",
+            ));
+        }
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cgroup path contained NUL")
+        })?;
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let pid = b"0\n";
+        let written = unsafe { libc::write(fd, pid.as_ptr().cast(), pid.len()) };
+        let write_error = if written < 0 {
+            Some(io::Error::last_os_error())
+        } else if written as usize != pid.len() {
+            Some(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short write to cgroup.procs",
+            ))
+        } else {
+            None
+        };
+        let close_result = unsafe { libc::close(fd) };
+        if let Some(error) = write_error {
+            return Err(error);
+        }
+        if close_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn validate_control_channel(fd: i32, needs_read: bool) -> io::Result<()> {
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
         if unsafe { libc::fstat(fd, &mut stat) } != 0 {
@@ -307,7 +356,7 @@ mod linux {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing browser netns")
             })?;
             if let Some(procs) = env::var_os("KHAOS_BROWSER_CGROUP_PROCS") {
-                std::fs::write(PathBuf::from(procs), b"0").map_err(|error| {
+                join_cgroup(&procs).map_err(|error| {
                     io::Error::new(error.kind(), format!("join browser cgroup: {error}"))
                 })?;
             }
