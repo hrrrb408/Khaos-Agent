@@ -8,6 +8,7 @@ and the route guard.  It is skipped unless the privileged CI gate opts in.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import socket
 import subprocess
@@ -71,6 +72,43 @@ async def _http_handler(
     await writer.wait_closed()
 
 
+async def _probe_authenticated_proxy(
+    *, netns: str, proxy: object, target_url: str,
+) -> bytes:
+    """Exercise the exact netns -> nft pin -> authenticated proxy path."""
+    proxy_url = urlparse(proxy.server_url)  # type: ignore[attr-defined]
+    credentials = (
+        f"{proxy.proxy_username}:{proxy.proxy_password}"  # type: ignore[attr-defined]
+    ).encode("ascii")
+    authorization = base64.b64encode(credentials).decode("ascii")
+    script = (
+        "import socket,sys; "
+        "s=socket.create_connection((sys.argv[1],int(sys.argv[2])),3); "
+        "request=(f'GET {sys.argv[3]} HTTP/1.1\\r\\nHost: khaos.test\\r\\n' "
+        "+ f'Proxy-Authorization: Basic {sys.argv[4]}\\r\\n' "
+        "+ 'Connection: close\\r\\n\\r\\n').encode('ascii'); "
+        "s.sendall(request); chunks=[]; "
+        "s.settimeout(3); "
+        "\nwhile True:\n"
+        " try:\n  data=s.recv(65536)\n"
+        " except socket.timeout:\n  break\n"
+        " if not data:\n  break\n"
+        " chunks.append(data)\n"
+        "\nsys.stdout.buffer.write(b''.join(chunks))"
+    )
+    process = await asyncio.create_subprocess_exec(
+        "ip", "netns", "exec", netns,
+        "python3", "-c", script,
+        proxy_url.hostname or "", str(proxy_url.port or 0),
+        target_url, authorization,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=8)
+    assert process.returncode == 0, stderr.decode("utf-8", "replace")
+    return stdout
+
+
 @pytest.mark.asyncio
 async def test_browser_manager_real_chromium_kernel_stack() -> None:
     _require_fullstack()
@@ -94,7 +132,19 @@ async def test_browser_manager_real_chromium_kernel_stack() -> None:
             network_guard=_PinnedLocalGuard(sandbox._host_ip),
         )
         assert page is not None, manager._last_ensure_error
-        response = await page.goto(f"http://khaos.test:{port}/proof")
+        target_url = f"http://khaos.test:{port}/proof"
+        context_entry = manager._contexts[
+            "round8-principal:round8-session:round8-runtime"
+        ]
+        proxy_response = await _probe_authenticated_proxy(
+            netns=sandbox._netns_name,
+            proxy=context_entry["egress_proxy"],
+            target_url=target_url,
+        )
+        assert b"200 OK" in proxy_response
+        assert b"khaos-fullstack-ok" in proxy_response
+
+        response = await page.goto(target_url)
         assert response is not None and response.ok
         assert await page.text_content("body") == "khaos-fullstack-ok"
 
