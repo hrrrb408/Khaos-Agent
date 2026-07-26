@@ -94,6 +94,10 @@ class MigrationSpec:
             verification accept both the real release name and the
             Batch-6.4 synthetic-backfill name.  Empty for v6+ (canonical
             name is the only accepted one).
+        accepted_released_checksums: immutable checksum values written by
+            earlier public releases for this same version.  This is a closed
+            compatibility set, not a wildcard: the canonical ``sha256`` is
+            still used for new rows and source-integrity verification.
     """
 
     version: int
@@ -102,6 +106,7 @@ class MigrationSpec:
     sql_files: tuple[str, ...] = ()
     migrator_symbols: tuple[str, ...] = field(default_factory=tuple)
     accepted_historical_names: tuple[str, ...] = field(default_factory=tuple)
+    accepted_released_checksums: tuple[str, ...] = field(default_factory=tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -204,14 +209,11 @@ def is_historical(spec: MigrationSpec) -> bool:
 # the commit-suppressing connection facade.  Editing any of these methods
 # is a schema change and must bump the version.
 #
-# Batch 7.1 (round-7 §十七): also include ``run_migrations`` and
-# ``_backfill_historical_ledger_rows`` — they control execution order,
-# checksum comparison, ledger backfill, commit/rollback, name verification,
-# and current-version recording.  Without them the v6 manifest hash would
-# NOT change when the runner's key behavior changes.
+# The generic runner and ledger verifier are deliberately NOT members of a
+# historical version manifest.  They dispatch every version and therefore
+# must evolve when v7/v8 are added; binding them to v6 is what changed the
+# released v6 checksum and broke real upgrades in round 8.
 _IMMUTABLE_MIGRATOR_SYMBOLS: tuple[str, ...] = (
-    "run_migrations",
-    "_backfill_historical_ledger_rows",
     "_MigrationConnection",
     "_MigrationConnection",
     "_run_legacy_schema_upgrades",
@@ -302,7 +304,14 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         # migrator method that ``run_migrations`` invokes.  Editing any of
         # them is detected by ``verify_source_integrity``.  Computed once
         # at release time and recorded here as a LITERAL.
-        sha256="89ea4c434b13f30f0cd1e1be6f1c4189b3edd6909132d78e11397737850dd0e7",
+        sha256="cefd37b7bb3176619521d1bac798eec4081f5b2f4ad878f5e6b51c63bdc9b728",
+        # main@19a2b538 wrote this checksum before the generic migration
+        # runner was (incorrectly) added to the v6 manifest.  Real databases
+        # must retain that provenance and remain upgradeable.
+        accepted_released_checksums=(
+            "7bd6cb4e51936c81d3c29ab9b8902f04203374d80d588732e97157b265de8038",
+            "89ea4c434b13f30f0cd1e1be6f1c4189b3edd6909132d78e11397737850dd0e7",
+        ),
         sql_files=("0001_initial_schema.sql", "0001_post_migration.sql"),
         migrator_symbols=_IMMUTABLE_MIGRATOR_SYMBOLS,
     ),
@@ -315,8 +324,11 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         # across streams and missed events on reconnect).  v7's manifest
         # covers ONLY the v7 delta migrators — the v6 aggregate stays
         # frozen.  Computed at release time and recorded as a LITERAL.
-        sha256="28992f0190d75b671b6bc37090b51e92eb0c8b541b92ab8a23064095cf7f7954",
+        sha256="541e4dcaf2acdabc4378d68b41d60b9dde36c79395b0fc135c421cc635cad906",
         migrator_symbols=("_apply_v7_upgrades", "_ensure_chat_event_id_column"),
+        accepted_released_checksums=(
+            "28992f0190d75b671b6bc37090b51e92eb0c8b541b92ab8a23064095cf7f7954",
+        ),
     ),
 )
 

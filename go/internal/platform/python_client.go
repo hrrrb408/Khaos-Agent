@@ -585,14 +585,14 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 }
 
 // ChatEvents replays and tails the durable Python-owned chat ledger.
-func (c PythonClient) ChatEvents(ctx context.Context, principalID string, sessionID string, afterSequence uint64) (<-chan api.ChatEvent, error) {
+func (c PythonClient) ChatEvents(ctx context.Context, principalID string, sessionID string, afterEventID uint64) (<-chan api.ChatEvent, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {
 		return nil, err
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
 	if err := c.writeRequest(conn, "AgentService.ChatEvents", map[string]any{
-		"session_id": sessionID, "after_sequence": afterSequence,
+		"session_id": sessionID, "after_event_id": afterEventID,
 	}, principalID); err != nil {
 		stopCancelWatch()
 		conn.Close()

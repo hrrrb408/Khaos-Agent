@@ -296,6 +296,7 @@ class Database:
         # path because ``_require_reader_conn`` re-opens under the
         # lifecycle lock we hold — which would re-open mid-close).
         self._closing = False
+        self._close_state = "OPEN"
 
     async def connect(self) -> None:
         """Open writer and reader SQLite connections if not already open.
@@ -312,6 +313,11 @@ class Database:
         ``self._conn is not None`` after the first releases the lock.
         """
         async with self._connection_lifecycle_lock:
+            if self._close_state == "QUARANTINED":
+                raise DatabaseClosingError(
+                    "database close failed and is quarantined; retry close "
+                    "before reconnecting"
+                )
             if self._conn is not None:
                 return  # another task opened it while we waited
             writer: Any = None
@@ -563,10 +569,12 @@ class Database:
                 # Batch 7.6 §二十: set the admission fence FIRST so new
                 # ``_read_lease()`` entrants are rejected while we drain.
                 self._closing = True
+                self._close_state = "CLOSING"
                 self._connection_generation += 1
-                if self._conn is not None:
-                    await self._conn.close()
-                    self._conn = None
+                try:
+                    if self._conn is not None:
+                        await self._conn.close()
+                        self._conn = None
                 # Batch 6.5 (round-6 §十八): drain in-flight reads BEFORE
                 # closing the reader.  ``_read_lease`` holders bump
                 # ``_active_readers``; we wait for them to finish (bounded
@@ -577,13 +585,17 @@ class Database:
                 # generation bump alone was insufficient because
                 # ``_require_reader_conn`` re-opens under the lifecycle
                 # lock we hold).
-                await self._wait_readers_drained()
-                if self._reader_conn is not None:
-                    await self._reader_conn.close()
-                    self._reader_conn = None
-                # Reset the fence so a subsequent ``connect()`` can admit
-                # reads again (re-open path).
-                self._closing = False
+                    await self._wait_readers_drained()
+                    if self._reader_conn is not None:
+                        await self._reader_conn.close()
+                        self._reader_conn = None
+                except BaseException:
+                    self._close_state = "QUARANTINED"
+                    raise
+                else:
+                    self._close_state = "CLOSED"
+                    # A cleanly closed Database may be explicitly reopened.
+                    self._closing = False
 
     @asynccontextmanager
     async def _read_lease(self):
@@ -787,11 +799,15 @@ class Database:
                         )
                     # §10.1/§10.2: checksum verified unless historical.
                     if not is_historical(spec):
-                        if str(row[2]) != expected_checksum:
+                        acceptable_checksums = {
+                            expected_checksum,
+                            *spec.accepted_released_checksums,
+                        }
+                        if str(row[2]) not in acceptable_checksums:
                             raise RuntimeError(
                                 f"database migration checksum mismatch "
                                 f"for version {row_version} (registry: "
-                                f"{expected_checksum[:12]}…, db: "
+                                f"{sorted(value[:12] + '…' for value in acceptable_checksums)}, db: "
                                 f"{str(row[2])[:12]}…) — migration may "
                                 f"have been tampered or drifted"
                             )
@@ -1319,7 +1335,8 @@ class Database:
                 "sequence, event_type, data_json, is_terminal, created_at) "
                 "SELECT stream_id, session_id, principal_id, project_id, "
                 "sequence, event_type, data_json, is_terminal, created_at "
-                "FROM _chat_stream_events_v7 ORDER BY created_at, sequence"
+                "FROM _chat_stream_events_v7 "
+                "ORDER BY created_at, stream_id, sequence"
             )
             await conn.execute("DROP TABLE _chat_stream_events_v7")
             # Rebuild indexes (the old PK indexes were dropped with the table).
@@ -5189,6 +5206,7 @@ class Database:
         principal_id: str,
         project_id: str,
         after_sequence: int = 0,
+        after_event_id: int | None = None,
         limit: int = 256,
     ) -> list[dict[str, Any]]:
         """Read durable chat events after an exclusive cursor.
@@ -5212,7 +5230,14 @@ class Database:
         """
         async with self._read_lease():  # Batch 6.5 §十八 reader operation lease
             conn = await self._require_conn()
-            after = max(0, after_sequence)
+            if after_event_id is not None and after_sequence:
+                raise ValueError(
+                    "ambiguous replay cursor: use after_event_id only"
+                )
+            after = max(
+                0,
+                int(after_event_id if after_event_id is not None else after_sequence),
+            )
             lim = max(1, min(limit, 1024))
             if stream_id:
                 cursor = await conn.execute(

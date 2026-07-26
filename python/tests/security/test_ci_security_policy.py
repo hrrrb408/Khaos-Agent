@@ -142,7 +142,7 @@ def test_browser_e2e_workflow_is_mandatory():
     )
     # Installs the ``browser`` extra — proves Playwright is shipped
     # rather than the install being skipped.
-    assert "browser]" in text, (
+    assert "browser]" in text or "--extra browser" in text, (
         "browser-e2e.yml does not install the browser extra — "
         "Playwright would not be available"
     )

@@ -62,6 +62,8 @@ func main() {
 	defaultAPIKeyFile := os.Getenv("KHAOS_API_KEY_FILE")
 	defaultAllowedOrigins := os.Getenv("KHAOS_CORS_ORIGINS")
 	defaultAllowedHosts := os.Getenv("KHAOS_ALLOWED_HOSTS")
+	defaultTLSCert := os.Getenv("KHAOS_TLS_CERT")
+	defaultTLSKey := os.Getenv("KHAOS_TLS_KEY")
 	defaultPythonAgent := os.Getenv("KHAOS_PYTHON_AGENT")
 	if defaultPythonAgent == "" {
 		defaultPythonAgent = fmt.Sprintf("/tmp/khaos-%d/agent.sock", os.Getuid())
@@ -71,6 +73,8 @@ func main() {
 	apiKeyFile := flag.String("api-key-file", defaultAPIKeyFile, "path to the mode-0600 local gateway token")
 	allowedOrigins := flag.String("cors-origins", defaultAllowedOrigins, "comma-separated exact browser origins")
 	allowedHosts := flag.String("allowed-hosts", defaultAllowedHosts, "comma-separated HTTP Host names")
+	tlsCert := flag.String("tls-cert", defaultTLSCert, "TLS certificate PEM (required for non-loopback listen)")
+	tlsKey := flag.String("tls-key", defaultTLSKey, "TLS private key PEM (required for non-loopback listen)")
 	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService Unix socket path")
 	projectRoot := flag.String("project-root", os.Getenv("KHAOS_PROJECT_ROOT"), "project root directory (used to compute project_id for drift detection; REQUIRED in production, rejected if empty)")
 	mockAgent := flag.Bool("mock-agent", false, "use in-process mock agent")
@@ -89,6 +93,9 @@ func main() {
 		log.Fatal(err)
 	}
 	if err := validateListenConfig(*addr, resolvedKey); err != nil {
+		log.Fatal(err)
+	}
+	if err := validateTLSConfig(*addr, *tlsCert, *tlsKey); err != nil {
 		log.Fatal(err)
 	}
 
@@ -177,6 +184,9 @@ func main() {
 		IdleTimeout:       60 * time.Second,
 		MaxHeaderBytes:    1 << 20,
 	}
+	if strings.TrimSpace(*tlsCert) != "" {
+		log.Fatal(server.ListenAndServeTLS(*tlsCert, *tlsKey))
+	}
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -250,6 +260,24 @@ func validateListenConfig(addr, apiKey string) error {
 	}
 	if len(apiKey) < 32 {
 		return errors.New("refusing gateway listen with an authentication token shorter than 32 characters")
+	}
+	return nil
+}
+
+func validateTLSConfig(addr, certPath, keyPath string) error {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return err
+	}
+	certPath = strings.TrimSpace(certPath)
+	keyPath = strings.TrimSpace(keyPath)
+	if (certPath == "") != (keyPath == "") {
+		return errors.New("TLS certificate and key must be configured together")
+	}
+	ip := net.ParseIP(host)
+	loopback := strings.EqualFold(host, "localhost") || (ip != nil && ip.IsLoopback())
+	if !loopback && certPath == "" {
+		return errors.New("refusing non-loopback gateway listen without TLS")
 	}
 	return nil
 }

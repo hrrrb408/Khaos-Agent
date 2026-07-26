@@ -115,6 +115,7 @@ export function useSessions(initialMode: ChatMode) {
   const syncGatewaySessions = useCallback(async (gatewayUrl: string, apiKey: string) => {
     try {
       const response = await fetch(`${gatewayUrl}/api/sessions`, {
+        credentials: "include",
         headers: apiKey ? { "X-Khaos-Key": apiKey } : {},
       });
       if (!response.ok) return;

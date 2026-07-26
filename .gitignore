@@ -12,6 +12,7 @@ khaos.db
 
 # Node
 node_modules/
+*.tsbuildinfo
 web/.next/
 
 # Go

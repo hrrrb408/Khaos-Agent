@@ -145,33 +145,55 @@ mod linux {
     /// launcher (e.g. the netns fd, the cgroup file, library fds).
     /// Uses ``close_range`` when available (Linux 5.9+); falls back to
     /// iterating ``/proc/self/fd``.
-    fn sanitize_fds() -> io::Result<()> {
+    fn sanitize_fds_except(preserved: &[i32]) -> io::Result<()> {
+        // Browser pipe transport is deliberately inherited on fd 3/4.
+        // close_range cannot express holes, so close the ranges around the
+        // small, validated preserve set.
+        let mut keep: Vec<u32> = preserved
+            .iter()
+            .copied()
+            .filter(|fd| *fd > 2)
+            .map(|fd| fd as u32)
+            .collect();
+        keep.sort_unstable();
+        keep.dedup();
         // Try close_range(3, ~0u, CLOSE_RANGE_UNSHARE).  We do NOT unshare
         // the fd table (the flag is 0) so the launcher's own fds used
         // during setup are already closed by this point.
         const CLOSE_RANGE_FD_MASK: u32 = 0;
-        let ret = unsafe {
-            libc::syscall(
-                libc::SYS_close_range,
-                3u32,
-                u32::MAX,
-                CLOSE_RANGE_FD_MASK,
-            )
-        };
-        if ret == 0 {
+        let mut start = 3u32;
+        let mut close_range_supported = true;
+        for end in keep.iter().copied().chain(std::iter::once(u32::MAX)) {
+            if start < end {
+                let ret = unsafe {
+                    libc::syscall(libc::SYS_close_range, start, end - 1, CLOSE_RANGE_FD_MASK)
+                };
+                if ret != 0 {
+                    close_range_supported = false;
+                    break;
+                }
+            }
+            if end == u32::MAX {
+                break;
+            }
+            start = end.saturating_add(1);
+        }
+        if close_range_supported {
             return Ok(());
         }
         // Fallback: iterate /proc/self/fd.  close_range may be absent on
         // older kernels (ENOSYS) — the errno is checked by the fallback.
         let entries = std::fs::read_dir("/proc/self/fd")
             .map_err(|e| io::Error::new(e.kind(), format!("read /proc/self/fd: {e}")))?;
-        for entry in entries.flatten() {
-            if let Ok(name) = entry.file_name().into_string() {
-                if let Ok(fd) = name.parse::<i32>() {
-                    if fd > 2 {
-                        unsafe { libc::close(fd) };
-                    }
-                }
+        // Collect before closing: the iterator itself owns a directory fd.
+        let fds: Vec<i32> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|name| name.parse::<i32>().ok())
+            .collect();
+        for fd in fds {
+            if fd > 2 && !preserved.contains(&fd) {
+                unsafe { libc::close(fd) };
             }
         }
         Ok(())
@@ -183,9 +205,8 @@ mod linux {
     /// denies ``setns`` so a later-compromised browser cannot escape).
     fn join_netns(name: &str) -> io::Result<()> {
         let path = format!("/var/run/netns/{}", name);
-        let c_path = CString::new(path.as_bytes()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidInput, "netns path contained NUL")
-        })?;
+        let c_path = CString::new(path.as_bytes())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "netns path contained NUL"))?;
         let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
         if fd < 0 {
             return Err(io::Error::last_os_error());
@@ -198,8 +219,324 @@ mod linux {
         Ok(())
     }
 
+    /// Move this process into an existing cgroup-v2 leaf without applying
+    /// ordinary-file creation or truncation flags to the cgroupfs control
+    /// file.  `std::fs::write` uses `File::create`, whose O_CREAT/O_TRUNC
+    /// semantics are inappropriate for kernel pseudo-files and can be
+    /// rejected with EROFS even when the delegated control file is writable.
+    fn join_cgroup(procs: &std::ffi::OsStr) -> io::Result<()> {
+        let path = PathBuf::from(procs);
+        if path.file_name() != Some(std::ffi::OsStr::new("cgroup.procs"))
+            || !path.starts_with("/sys/fs/cgroup")
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "cgroup target must be an absolute cgroup.procs path",
+            ));
+        }
+        let c_path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "cgroup path contained NUL")
+        })?;
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr(),
+                libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if fd < 0 {
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("open cgroup.procs: {error}; {}", cgroup_context()),
+            ));
+        }
+        let pid = b"0\n";
+        let written = unsafe { libc::write(fd, pid.as_ptr().cast(), pid.len()) };
+        let write_error = if written < 0 {
+            let error = io::Error::last_os_error();
+            Some(io::Error::new(
+                error.kind(),
+                format!("write cgroup.procs: {error}; {}", cgroup_context()),
+            ))
+        } else if written as usize != pid.len() {
+            Some(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "short write to cgroup.procs",
+            ))
+        } else {
+            None
+        };
+        let close_result = unsafe { libc::close(fd) };
+        if let Some(error) = write_error {
+            return Err(error);
+        }
+        if close_result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn cgroup_context() -> String {
+        let membership = std::fs::read_to_string("/proc/self/cgroup")
+            .unwrap_or_else(|error| format!("unavailable:{error}"))
+            .trim()
+            .replace('\n', ",");
+        let mount = std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|content| {
+                content
+                    .lines()
+                    .find(|line| line.contains(" - cgroup2 "))
+                    .map(str::to_owned)
+            })
+            .unwrap_or_else(|| "unavailable".to_string());
+        format!(
+            "euid={} cgroup={} mount={}",
+            unsafe { libc::geteuid() },
+            membership,
+            mount
+        )
+    }
+
+    fn validate_control_channel(fd: i32, needs_read: bool) -> io::Result<()> {
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let file_type = stat.st_mode & libc::S_IFMT;
+        if file_type != libc::S_IFIFO && file_type != libc::S_IFSOCK {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Playwright control fd {fd} is not a pipe/socket channel"),
+            ));
+        }
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let access = flags & libc::O_ACCMODE;
+        let wrong_direction = if needs_read {
+            access == libc::O_WRONLY
+        } else {
+            access == libc::O_RDONLY
+        };
+        if wrong_direction {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Playwright control fd {fd} has invalid access direction"),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Bubblewrap deliberately closes non-stdio descriptors and released
+    /// Ubuntu versions do not expose a portable arbitrary-FD preservation
+    /// option. Bridge Playwright's read/write pipes across the bwrap exec via
+    /// stdin/stdout, which bwrap preserves by contract. The inner launcher
+    /// restores the canonical Chromium FD 3/4 layout before installing
+    /// seccomp and execing the browser.
+    fn bridge_playwright_pipes_to_stdio() -> io::Result<()> {
+        validate_control_channel(3, true)?;
+        validate_control_channel(4, false)?;
+        if unsafe { libc::dup2(3, libc::STDIN_FILENO) } < 0
+            || unsafe { libc::dup2(4, libc::STDOUT_FILENO) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn restore_playwright_pipes_from_stdio() -> io::Result<()> {
+        if unsafe { libc::dup2(libc::STDIN_FILENO, 3) } < 0
+            || unsafe { libc::dup2(libc::STDOUT_FILENO, 4) } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        validate_control_channel(3, true)?;
+        validate_control_channel(4, false)?;
+
+        let dev_null = CString::new("/dev/null").expect("static path has no NUL");
+        let null_fd = unsafe { libc::open(dev_null.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if null_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let redirect_result = if unsafe { libc::dup2(null_fd, libc::STDIN_FILENO) } < 0
+            || unsafe { libc::dup2(null_fd, libc::STDOUT_FILENO) } < 0
+        {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(())
+        };
+        unsafe { libc::close(null_fd) };
+        redirect_result
+    }
+
     pub fn run() -> io::Result<()> {
         let mut args: Vec<_> = env::args_os().skip(1).collect();
+
+        // Round 8: Playwright executes this binary directly.  The immutable
+        // launch metadata is child-only environment supplied by
+        // BrowserManager; Chromium flags remain in argv exactly as Playwright
+        // produced them.  No forwarding shell participates in production.
+        if env::var_os("KHAOS_BROWSER_LAUNCH").as_deref() == Some(std::ffi::OsStr::new("1")) {
+            let real = env::var_os("KHAOS_BROWSER_REAL_EXECUTABLE").ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing browser executable")
+            })?;
+            let netns = env::var("KHAOS_BROWSER_NETNS").map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "missing browser netns")
+            })?;
+            if let Some(procs) = env::var_os("KHAOS_BROWSER_CGROUP_PROCS") {
+                join_cgroup(&procs).map_err(|error| {
+                    io::Error::new(error.kind(), format!("join browser cgroup: {error}"))
+                })?;
+            }
+            join_netns(&netns).map_err(|error| {
+                io::Error::new(error.kind(), format!("join browser netns: {error}"))
+            })?;
+
+            let launcher_path = env::current_exe().map_err(|error| {
+                io::Error::new(error.kind(), format!("resolve launcher image: {error}"))
+            })?;
+            let launcher_c_path = CString::new(launcher_path.as_os_str().as_encoded_bytes())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "launcher path contained NUL")
+                })?;
+            // Intentionally omit O_CLOEXEC: --ro-bind-data consumes this
+            // descriptor inside bwrap, allowing the verified running image
+            // to cross the user-namespace boundary without reopening a
+            // private parent directory by pathname.
+            let launcher_fd = unsafe { libc::open(launcher_c_path.as_ptr(), libc::O_RDONLY) };
+            if launcher_fd < 0 {
+                let error = io::Error::last_os_error();
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("open launcher image: {error}"),
+                ));
+            }
+
+            let real_path = PathBuf::from(&real);
+            let real_parent = real_path.parent().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "browser executable has no parent",
+                )
+            })?;
+            let real_name = real_path.file_name().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "browser executable has no filename",
+                )
+            })?;
+            let inner_real = PathBuf::from("/run/khaos-browser/runtime").join(real_name);
+
+            let mut bwrap_args: Vec<std::ffi::OsString> = vec![
+                "bwrap".into(),
+                "--die-with-parent".into(),
+                "--new-session".into(),
+                "--unshare-user-try".into(),
+                "--unshare-pid".into(),
+                "--unshare-ipc".into(),
+                "--unshare-uts".into(),
+                "--ro-bind".into(),
+                "/".into(),
+                "/".into(),
+                "--dev".into(),
+                "/dev".into(),
+                "--proc".into(),
+                "/proc".into(),
+                "--tmpfs".into(),
+                "/tmp".into(),
+                "--tmpfs".into(),
+                "/run".into(),
+                "--tmpfs".into(),
+                "/home".into(),
+                "--tmpfs".into(),
+                "/root".into(),
+                "--dir".into(),
+                "/run/khaos-browser".into(),
+                "--dir".into(),
+                "/run/khaos-browser/runtime".into(),
+                "--ro-bind".into(),
+                real_parent.as_os_str().into(),
+                "/run/khaos-browser/runtime".into(),
+                "--perms".into(),
+                "0500".into(),
+                "--ro-bind-data".into(),
+                launcher_fd.to_string().into(),
+                "/run/khaos-browser/launcher".into(),
+                "--dir".into(),
+                "/tmp/khaos-home".into(),
+                "--setenv".into(),
+                "HOME".into(),
+                "/tmp/khaos-home".into(),
+                "--chdir".into(),
+                "/tmp/khaos-home".into(),
+                // The inner image must not re-enter the privileged outer
+                // launch branch.  Strip all one-shot authority metadata at
+                // the namespace boundary; only the explicit --browser-inner
+                // argv contract continues into the read-only sandbox.
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_LAUNCH".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_REAL_EXECUTABLE".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_NETNS".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_CGROUP_PROCS".into(),
+                "--".into(),
+                "/run/khaos-browser/launcher".into(),
+                "--browser-inner".into(),
+                "--".into(),
+                inner_real.into_os_string(),
+            ];
+            bwrap_args.append(&mut args);
+            if bwrap_args
+                .iter()
+                .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe")
+            {
+                bridge_playwright_pipes_to_stdio().map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("bridge Playwright control channels: {error}"),
+                    )
+                })?;
+            }
+            return exec(&bwrap_args).map_err(|error| {
+                io::Error::new(error.kind(), format!("exec bubblewrap: {error}"))
+            });
+        }
+
+        if args.first().is_some_and(|arg| arg == "--browser-inner") {
+            args.remove(0);
+            if args.first().is_some_and(|arg| arg == "--") {
+                args.remove(0);
+            }
+            let remote_debugging_pipe = args
+                .iter()
+                .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
+            let preserved = if remote_debugging_pipe {
+                restore_playwright_pipes_from_stdio().map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("restore Playwright control channels: {error}"),
+                    )
+                })?;
+                vec![3, 4]
+            } else {
+                Vec::new()
+            };
+            for fd in &preserved {
+                validate_control_channel(*fd, *fd == 3)?;
+            }
+            sanitize_fds_except(&preserved).map_err(|error| {
+                io::Error::new(error.kind(), format!("sanitize browser fds: {error}"))
+            })?;
+            install_seccomp().map_err(|error| {
+                io::Error::new(error.kind(), format!("install browser seccomp: {error}"))
+            })?;
+            return exec(&args)
+                .map_err(|error| io::Error::new(error.kind(), format!("exec Chromium: {error}")));
+        }
 
         // Batch 7.4 (round-7 §十一): browser launcher mode.
         //   --browser --netns <name> --cgroup <procs> -- <chromium> <args>
@@ -212,15 +549,22 @@ mod linux {
             let mut netns: Option<String> = None;
             let mut cgroup: Option<PathBuf> = None;
             loop {
-                match args.first().map(|s| s.to_string_lossy().into_owned()).as_deref() {
+                match args
+                    .first()
+                    .map(|s| s.to_string_lossy().into_owned())
+                    .as_deref()
+                {
                     Some("--netns") => {
                         args.remove(0);
                         netns = Some(
                             args.remove(0)
                                 .to_str()
-                                .ok_or_else(|| io::Error::new(
-                                    io::ErrorKind::InvalidInput, "--netns value not UTF-8",
-                                ))?
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidInput,
+                                        "--netns value not UTF-8",
+                                    )
+                                })?
                                 .to_string(),
                         );
                     }
@@ -248,8 +592,18 @@ mod linux {
             if let Some(name) = netns {
                 join_netns(&name)?;
             }
-            // Sanitize inherited fds (close everything > stderr).
-            sanitize_fds()?;
+            let remote_debugging_pipe = args
+                .iter()
+                .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
+            let preserved = if remote_debugging_pipe {
+                for fd in [3, 4] {
+                    validate_control_channel(fd, fd == 3)?;
+                }
+                vec![3, 4]
+            } else {
+                Vec::new()
+            };
+            sanitize_fds_except(&preserved)?;
             // seccomp: no_new_privs + deny-list.  setns is in the deny
             // list, so Chromium cannot change namespaces after this point.
             install_seccomp()?;

@@ -173,9 +173,9 @@ async fn dispatch_write_file(payload: &str) -> Result<String, ExecutorError> {
     let path = std::path::Path::new(&params.path);
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
-            tokio::fs::create_dir_all(parent)
-                .await
-                .map_err(|e| ExecutorError::InvalidPayload(format!("mkdir {}: {}", parent.display(), e)))?;
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                ExecutorError::InvalidPayload(format!("mkdir {}: {}", parent.display(), e))
+            })?;
         }
     }
     let bytes_written = params.content.len();
@@ -362,10 +362,7 @@ mod tests {
     #[test]
     fn sum_handler_aggregates_numbers() {
         let rt = runtime();
-        let results = rt.block_on(run_parallel(
-            vec![call("1", "sum", "[1.5, 2.5, 3.0]")],
-            500,
-        ));
+        let results = rt.block_on(run_parallel(vec![call("1", "sum", "[1.5, 2.5, 3.0]")], 500));
         assert!(results[0].success);
         assert_eq!(results[0].output, "7");
     }
@@ -390,7 +387,10 @@ mod tests {
             500,
         ));
         assert_eq!(
-            results.iter().map(|r| r.call_id.as_str()).collect::<Vec<_>>(),
+            results
+                .iter()
+                .map(|r| r.call_id.as_str())
+                .collect::<Vec<_>>(),
             vec!["third", "first", "second"]
         );
     }
@@ -417,8 +417,7 @@ mod tests {
         let dir = tempdir();
         let path = dir.join("lines.txt");
         std::fs::write(&path, "a\nb\nc\nd\ne").unwrap();
-        let payload =
-            serde_json::json!({"path": path, "offset": 2, "limit": 2}).to_string();
+        let payload = serde_json::json!({"path": path, "offset": 2, "limit": 2}).to_string();
 
         let results = rt.block_on(run_parallel(vec![call("1", "read_file", &payload)], 2000));
 

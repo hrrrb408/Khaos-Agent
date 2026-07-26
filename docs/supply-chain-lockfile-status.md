@@ -1,31 +1,36 @@
-# Supply-chain Lockfile Status (Batch 7.6, round-7 §二十四)
+# Supply-chain Lockfile Status (Round 8 closure)
 
-## Current state
+## Python dependency authority
 
-`python/requirements-lock.txt` pins versions but does NOT pin hashes, and
-CI installs from `pyproject.toml` (``pip install -e '.[test]'``), not from
-the lockfile.  This means the dependency graph ``pip-audit`` scans is NOT
-necessarily the one CI actually builds.
+`uv.lock` is the canonical resolution for the project and every CI install
+uses `uv sync --frozen` with the job's required extras. The committed
+`python/requirements-lock.txt` is generated from that frozen resolution and
+contains hashes for the audit/install artifact set.
 
-## Known gap (review §二十四)
+The supply-chain workflow regenerates the export from `uv.lock`, fails on any
+diff, and runs `pip-audit --require-hashes` against that exact export. This
+prevents CI from resolving a graph different from the graph being audited.
 
-- ``pyproject.toml`` uses loose lower bounds (``aiosqlite>=0.19`` etc.).
-- CI resolves the full transitive graph fresh on each run, so two CI runs
-  a week apart may build against different transitive versions.
-- ``pip-audit`` scans ``requirements-lock.txt`` (a separate, hand-maintained
-  pin set) — not the resolved graph from ``pyproject.toml``.
+## Audit tool pins
 
-## Recommended end state (future work)
+The workflow pins its bootstrap tools rather than installing floating latest
+versions:
 
-1. Adopt ``uv.lock`` (or ``pip-tools``) — a single lockfile covering ALL
-   extras (test/browser/tui) with every transitive dependency pinned.
-2. Generate a ``--require-hashes`` companion so installs verify byte-for-byte.
-3. CI + Release install ONLY from the lock (``uv sync --frozen`` or
-   ``pip install --require-hashes -r requirements-lock.txt``).
-4. Add a "lock-in-sync-with-pyproject" CI check that fails when the lock
-   drifts (the equivalent of ``cargo update --dry-run`` / ``npm ci``).
-5. Pin the audit tools themselves (``pip-audit``, ``cargo-audit``,
-   ``govulncheck``) to exact versions in the lock.
+- `uv==0.11.9`
+- `pip-audit==2.10.0`
+- `cargo-audit==0.22.2`
+- `govulncheck@v1.6.0`
 
-This is tracked as future work — it is a build-pipeline migration, not a
-code fix, and is sized as its own batch.
+The Go vulnerability job also pins the standard-library toolchain to
+`go1.26.5`; this avoids reintroducing GO-2026-5856 from Go 1.26.4.
+
+Rust remains governed by `Cargo.lock`; web installs use `npm ci` and
+`package-lock.json`; Go vulnerability analysis runs against the checked-in Go
+module graph.
+
+## Update procedure
+
+Change `pyproject.toml`, run `uv lock`, regenerate
+`python/requirements-lock.txt` using the same frozen export command encoded in
+`.github/workflows/supply-chain-audit.yml`, and commit both files atomically.
+CI rejects a stale or manually edited companion export.

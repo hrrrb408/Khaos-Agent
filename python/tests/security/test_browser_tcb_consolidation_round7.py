@@ -19,6 +19,7 @@ sanitization + seccomp); falls back to the nsenter shell otherwise.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -154,7 +155,7 @@ class TestBrowserLauncherArgv:
         monkeypatch.setenv("KHAOS_SANDBOX_LAUNCHER", "/opt/khaos/launcher")
         wrapper = sb.create_wrapper_script("/usr/bin/chromium", 0)
         assert wrapper is not None
-        content = open(wrapper).read()
+        content = Path(wrapper).read_text(encoding="utf-8")
         # Forwards to the launcher, not the legacy nsenter.
         assert "/opt/khaos/launcher" in content
         assert "--browser" in content
@@ -175,7 +176,7 @@ class TestBrowserLauncherArgv:
         with patch("khaos.security.browser_sandbox.shutil.which", return_value=None):
             wrapper = sb.create_wrapper_script("/usr/bin/chromium", 0)
         assert wrapper is not None
-        content = open(wrapper).read()
+        content = Path(wrapper).read_text(encoding="utf-8")
         assert "nsenter" in content  # legacy fallback
 
 

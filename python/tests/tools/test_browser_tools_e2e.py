@@ -595,7 +595,7 @@ async def test_close_runtime_releases_all_contexts_across_sessions(fresh_manager
 
     await browser_navigate(http_server.url, principal_id="p1", session_id="s1", runtime_id="r1", network_guard=guard)
     await browser_navigate(http_server.url, principal_id="p1", session_id="s2", runtime_id="r1", network_guard=guard)
-    await browser_navigate(http_server.url, principal_id="p2", session_id="s3", runtime_id="r1", network_guard=guard)
+    await browser_navigate(http_server.url, principal_id="p1", session_id="s3", runtime_id="r1", network_guard=guard)
 
     assert len(fresh_manager._contexts) == 3
     await fresh_manager.close_runtime("r1")
