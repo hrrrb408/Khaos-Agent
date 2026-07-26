@@ -340,13 +340,6 @@ mod linux {
             })?;
             let inner_real = PathBuf::from("/run/khaos-browser/runtime").join(real_name);
 
-            // Resolve the trusted browser directory before entering bwrap's
-            // user namespace. A private parent such as /home/runner (0750)
-            // is intentionally not traversable by namespace-root. Binding
-            // the already-open cwd reference avoids relaxing that parent and
-            // exposes only the selected browser runtime directory.
-            env::set_current_dir(real_parent)?;
-
             let mut bwrap_args: Vec<std::ffi::OsString> = vec![
                 "bwrap".into(),
                 "--die-with-parent".into(),
@@ -373,7 +366,7 @@ mod linux {
                 "--dir".into(),
                 "/run/khaos-browser/runtime".into(),
                 "--ro-bind".into(),
-                "/proc/self/cwd".into(),
+                real_parent.as_os_str().into(),
                 "/run/khaos-browser/runtime".into(),
                 "--perms".into(),
                 "0500".into(),

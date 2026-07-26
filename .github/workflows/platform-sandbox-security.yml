@@ -316,7 +316,13 @@ jobs:
           uv sync --frozen --extra test --extra browser
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Download Chromium binary
-        run: python -m playwright install --with-deps chromium
+        env:
+          PLAYWRIGHT_BROWSERS_PATH: /opt/khaos-playwright
+        run: |
+          sudo install -d -m 0755 -o "$(id -u)" -g "$(id -g)" /opt/khaos-playwright
+          uv run python -m playwright install --with-deps chromium
+          sudo chown -R root:root /opt/khaos-playwright
+          sudo chmod -R go-w /opt/khaos-playwright
       - name: Run full-stack browser kernel tests (as root)
         env:
           # CRITICAL: unset dev-mode + mock-mode so the REAL production
@@ -327,9 +333,10 @@ jobs:
           KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser
           KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
+          PLAYWRIGHT_BROWSERS_PATH: /opt/khaos-playwright
         run: |
           python_bin="$(command -v python)"
-          sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_BROWSER_MOCK_MODE,KHAOS_RUN_BROWSER_E2E,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,KHAOS_SANDBOX_LAUNCHER,PYTHONPATH,HOME \
+          sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_BROWSER_MOCK_MODE,KHAOS_RUN_BROWSER_E2E,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,KHAOS_SANDBOX_LAUNCHER,PLAYWRIGHT_BROWSERS_PATH,PYTHONPATH,HOME \
             "$python_bin" -m pytest \
             python/tests/security/test_browser_fullstack_kernel_round8.py \
             -m kernel_real -v

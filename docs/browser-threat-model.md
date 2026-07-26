@@ -31,6 +31,10 @@ been established. Sandbox setup failure poisons the generation; retry cannot
 fall through to direct Chromium. The Rust launcher preserves only Playwright's
 FD 3/4 pipes, closes unrelated descriptors, joins cgroup/netns, enters the
 mount sandbox, installs `no_new_privs` and seccomp, then execs Chromium.
+The Chromium runtime itself must be installed in a root-owned, read-only path
+traversable by the launcher user namespace (for example
+`/opt/khaos-playwright`); a browser cache under a private user Home is rejected
+rather than weakening Home directory permissions.
 
 Context teardown removes its nft port while the authenticated proxy still owns
 the socket, closes the proxy, and finally closes the context. Generation
