@@ -43,7 +43,12 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install pip-audit
-        run: python -m pip install pip-audit==2.10.0 uv==0.11.9
+        # Batch 9.7b (round-9 §二十一): verify the bootstrap toolchain
+        # hashes before trusting it.  A compromised PyPI mirror that
+        # swapped the same-version uv/pip-audit wheel would previously
+        # control every subsequent frozen install silently.  Now pip
+        # refuses any wheel whose sha256 is not in bootstrap-requirements.txt.
+        run: python -m pip install --require-hashes -r python/bootstrap-requirements.txt
       - name: Audit Python dependencies
         run: |
           uv export --frozen --all-extras --no-dev --no-emit-project \

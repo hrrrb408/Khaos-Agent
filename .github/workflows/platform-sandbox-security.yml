@@ -45,7 +45,7 @@ jobs:
           test ! -u /usr/bin/bwrap
       - name: Install test dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Build inner seccomp launcher
@@ -212,7 +212,7 @@ jobs:
           test -w /sys/fs/cgroup/khaos-browser
       - name: Install test dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Capture pre-test kernel diagnostics
@@ -237,16 +237,21 @@ jobs:
           KHAOS_BROWSER_DEV_MODE: ""
           KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser
-        # ``sudo`` does not inherit the setup-python PATH/PYTHONPATH, so
-        # we capture the full interpreter path + PYTHONPATH and pass them
-        # through explicitly (mirrors the linux-bwrap-security job).
+        # Batch 9.7a (round-9 §十七): this job previously ran
+        # test_browser_fullstack_kernel_round8.py with -m "kernel_real and
+        # browser_real", but it only set KHAOS_RUN_KERNEL_BROWSER_E2E=1
+        # (not KHAOS_RUN_BROWSER_E2E=1), so the round8 _require_fullstack()
+        # gate called pytest.skip() — the required job was green but empty.
+        # Now it runs test_browser_kernel_isolation_round6.py, the pure
+        # kernel primitive suite that exercises real nft/netns/cgroup
+        # WITHOUT Chromium and only needs the kernel gate.
         run: |
           python_bin="$(command -v python)"
           py_path="$PYTHONPATH"
           sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,PYTHONPATH \
             "$python_bin" -m pytest \
-            python/tests/security/test_browser_fullstack_kernel_round8.py \
-            -m "kernel_real and browser_real" -v
+            python/tests/security/test_browser_kernel_isolation_round6.py \
+            -m kernel_real -v
       - name: Capture post-test kernel diagnostics
         if: always()
         run: |
@@ -325,7 +330,7 @@ jobs:
         run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
       - name: Install test + browser dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test --extra browser
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Download Chromium binary
@@ -374,7 +379,7 @@ jobs:
           python-version: "3.11"
       - name: Install test dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Capture pre-test diagnostics
@@ -422,7 +427,7 @@ jobs:
           python-version: "3.11"
       - name: Install test dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Prove Windows has no Host fallback

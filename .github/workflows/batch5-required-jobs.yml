@@ -46,7 +46,7 @@ jobs:
           cache: pip
       - name: Install test dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Run DB transaction adversarial tests
@@ -73,7 +73,7 @@ jobs:
           cache: pip
       - name: Install test dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Run shared DB project isolation tests
@@ -101,7 +101,7 @@ jobs:
           cache: pip
       - name: Install test + browser dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test --extra browser
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Download Chromium binary
@@ -167,7 +167,7 @@ jobs:
           cache: pip
       - name: Install test dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Run full Python security suite
@@ -188,7 +188,7 @@ jobs:
           cache: pip
       - name: Install test dependencies
         run: |
-          python -m pip install uv==0.11.9
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Run migration fixture matrix

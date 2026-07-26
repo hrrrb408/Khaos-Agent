@@ -199,6 +199,21 @@ def test_s102_tampering_migrator_method_changes_checksum():
         compute_manifest_checksum(bogus)
 
 
+def test_s103_migrator_symbols_are_unique():
+    """Batch 9.7c (round-9 §二十三.2): the v6 migrator-symbol tuple must
+    not contain duplicates.  A duplicate is cosmetic (the source extractor
+    dedupes via a dict) but it pollutes the manifest header and implies the
+    tuple was hand-maintained without a uniqueness guard.  Every version's
+    migrator_symbols must satisfy len == len(set)."""
+    for spec in MIGRATIONS:
+        if not spec.migrator_symbols:
+            continue
+        assert len(spec.migrator_symbols) == len(set(spec.migrator_symbols)), (
+            f"version {spec.version} migrator_symbols has duplicates: "
+            f"{spec.migrator_symbols}"
+        )
+
+
 def test_s102_verify_source_integrity_detects_drift_and_passes_clean():
     """§10.2 end-to-end: ``verify_source_integrity`` passes on clean
     source and raises on drift.  We tamper a real executed file in-place,
