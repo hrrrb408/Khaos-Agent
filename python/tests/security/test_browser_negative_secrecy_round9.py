@@ -69,6 +69,49 @@ def _read_in_netns(netns: str, path: str) -> tuple[int, bytes]:
     return result.returncode, result.stdout
 
 
+def _read_in_chromium_mountns(cgroup_procs: Path, host_path: str) -> tuple[int, bytes]:
+    """Read ``host_path`` as seen from Chromium's OWN mount namespace.
+
+    Batch 9.2 (round-9 §十/§十一): ``ip netns exec`` only switches the
+    NETWORK namespace — a helper run that way still sees the HOST mount
+    table, so it would always find the home sentinel and falsely report
+    a secrecy violation.  The bubblewrap ``--tmpfs`` mask only applies
+    inside Chromium's MOUNT namespace.
+
+    To observe the mount-namespace view, we read through
+    ``/proc/<chromium-pid>/root/<path>``: the kernel resolves this magic
+    symlink against the target process's own rootfs, so it reflects what
+    Chromium actually sees (the masked tmpfs).  No netns switch needed —
+    we read from the host using the Chromium PID's mount-namespace view.
+
+    Returns (returncode, stdout).  returncode 0 + non-empty output means
+    the path was readable from inside Chromium's namespace (a VIOLATION).
+    """
+    pids = [int(v) for v in cgroup_procs.read_text().split()]
+    assert pids, "Chromium process tree did not join browser cgroup"
+    script = (
+        "import sys\n"
+        "try:\n"
+        "    with open(sys.argv[1], 'rb') as f:\n"
+        "        sys.stdout.buffer.write(f.read())\n"
+        "    raise SystemExit(0)\n"
+        "except OSError:\n"
+        "    raise SystemExit(1)\n"
+    )
+    for pid in pids:
+        proc_root_path = f"/proc/{pid}/root{host_path}"
+        result = subprocess.run(
+            ["python3", "-c", script, proc_root_path],
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        if result.returncode == 0:
+            return result.returncode, result.stdout
+    # None of the Chromium PIDs could read it — secrecy holds.
+    return 1, b""
+
+
 def _read_chromium_environ(netns: str, cgroup_procs: Path) -> bytes:
     """Read /proc/<pid>/environ for every Chromium PID in the cgroup."""
     pids = [
@@ -144,12 +187,16 @@ async def test_resolved_home_not_readable_from_browser() -> None:
             sandbox = manager._browser_sandbox
             assert sandbox is not None and sandbox.is_active
 
-            rc, out = _read_in_netns(
-                sandbox._netns_name, str(sentinel)
+            # Read through /proc/<chromium-pid>/root/ to observe the
+            # bubblewrap mount-namespace view (ip netns exec only
+            # switches the network namespace, not the mount table).
+            rc, out = _read_in_chromium_mountns(
+                sandbox._cgroup_path / "cgroup.procs", str(sentinel)
             )
             assert rc != 0, (
-                f"HIGH: resolved home {sentinel} was readable from the "
-                f"browser namespace (got {out!r}) — Batch 9.2 regression"
+                f"HIGH: resolved home {sentinel} was readable from "
+                f"Chromium's mount namespace (got {out!r}) — Batch 9.2 "
+                f"regression"
             )
         finally:
             await manager.close()
@@ -201,10 +248,13 @@ async def test_sensitive_host_paths_not_readable_from_browser(tmp_path) -> None:
         assert sandbox is not None and sandbox.is_active
 
         for sentinel in sentinels:
-            rc, out = _read_in_netns(sandbox._netns_name, str(sentinel))
+            rc, out = _read_in_chromium_mountns(
+                sandbox._cgroup_path / "cgroup.procs", str(sentinel)
+            )
             assert rc != 0, (
                 f"HIGH: sensitive host path {sentinel} was readable from "
-                f"the browser namespace (got {out!r}) — Batch 9.2 regression"
+                f"Chromium's mount namespace (got {out!r}) — Batch 9.2 "
+                f"regression"
             )
     finally:
         await manager.close()
