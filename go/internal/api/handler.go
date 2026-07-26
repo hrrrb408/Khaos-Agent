@@ -136,6 +136,7 @@ func (h *Handler) WithSubagents(subagents SubagentClient) *Handler {
 // Routes returns all REST routes with auth and rate limiting middleware.
 func (h *Handler) Routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.HandleFunc("POST /api/auth/session", h.handleBrowserSession)
 	mux.HandleFunc("POST /api/chat", h.handleChat)
 	mux.HandleFunc("GET /api/chat/{id}/stream", h.handleChatStream)
 	mux.HandleFunc("POST /api/chat/{id}/stream", h.handleChatNDJSONStream)
@@ -552,6 +553,7 @@ func (h *Handler) originPolicy(next http.Handler) http.Handler {
 			return
 		}
 		w.Header().Set("Access-Control-Allow-Origin", normalized)
+		w.Header().Set("Access-Control-Allow-Credentials", "true")
 		w.Header().Set("Vary", "Origin")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, X-Khaos-Key")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
@@ -561,6 +563,18 @@ func (h *Handler) originPolicy(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (h *Handler) handleBrowserSession(w http.ResponseWriter, r *http.Request) {
+	if _, authenticated := auth.PrincipalFromContext(r.Context()); !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	if err := auth.SetBrowserSession(w, r, h.apiKey); err != nil {
+		writeError(w, http.StatusServiceUnavailable, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
 func (h *Handler) hostGuard(next http.Handler) http.Handler {
@@ -785,12 +799,12 @@ func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	principalID, _ := auth.PrincipalFromContext(r.Context())
-	lastSequence, _ := strconv.ParseUint(r.Header.Get("Last-Event-ID"), 10, 64)
+	lastEventID, _ := strconv.ParseUint(r.Header.Get("Last-Event-ID"), 10, 64)
 	if h.chatEvents == nil {
 		writeError(w, http.StatusServiceUnavailable, "durable chat event service not available")
 		return
 	}
-	stream, err := h.chatEvents.ChatEvents(r.Context(), principalID, sessionID, lastSequence)
+	stream, err := h.chatEvents.ChatEvents(r.Context(), principalID, sessionID, lastEventID)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, err.Error())
 		return
@@ -807,8 +821,14 @@ func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			payload, _ := json.Marshal(event.Data)
-			if event.Sequence > 0 {
-				fmt.Fprintf(w, "id: %d\n", event.Sequence)
+			cursor := event.EventID
+			if cursor == 0 {
+				// Compatibility for non-durable mocks/older agents. Current
+				// Python replay always supplies EventID.
+				cursor = event.Sequence
+			}
+			if cursor > 0 {
+				fmt.Fprintf(w, "id: %d\n", cursor)
 			}
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Event, payload)
 			if flusher != nil {

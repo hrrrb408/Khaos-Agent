@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from khaos.skills import Skill, SkillLoader, SkillParseError
+from khaos.skills.loader import MAX_SKILL_FILE_BYTES, MAX_SKILL_FILES
 
 
 def _write(path: Path, content: str) -> Path:
@@ -109,3 +110,46 @@ def test_load_from_subdirectory(tmp_path):
     skills = SkillLoader([tmp_path]).load_all()
 
     assert [s.name for s in skills] == ["python-expert"]
+
+
+def test_load_file_rejects_symlink(tmp_path):
+    target = _write(
+        tmp_path / "target.md",
+        "---\nname: target\ndescription: target.\n---\nbody\n",
+    )
+    link = tmp_path / "SKILL.md"
+    link.symlink_to(target)
+
+    with pytest.raises(SkillParseError, match="secure open failed"):
+        SkillLoader().load_file(link)
+
+
+def test_load_file_rejects_oversized_input(tmp_path):
+    file = tmp_path / "SKILL.md"
+    file.write_bytes(b"x" * (MAX_SKILL_FILE_BYTES + 1))
+
+    with pytest.raises(SkillParseError, match="exceeds"):
+        SkillLoader().load_file(file)
+
+
+def test_load_file_rejects_deep_yaml(tmp_path):
+    nested = "value"
+    for _ in range(20):
+        nested = f"[{nested}]"
+    file = _write(
+        tmp_path / "SKILL.md",
+        f"---\nname: deep\ndescription: deep.\nextra: {nested}\n---\nbody\n",
+    )
+
+    with pytest.raises(SkillParseError, match="nesting exceeds"):
+        SkillLoader().load_file(file)
+
+
+def test_load_all_enforces_global_file_limit(tmp_path):
+    for index in range(MAX_SKILL_FILES + 2):
+        _write(
+            tmp_path / f"{index:03}.md",
+            f"---\nname: skill-{index}\ndescription: skill.\n---\nbody\n",
+        )
+
+    assert len(SkillLoader([tmp_path]).load_all()) == MAX_SKILL_FILES

@@ -148,6 +148,7 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
       sourceRef.current = controller;
       const response = await fetch(`${settings.gatewayUrl}/api/chat/${sessionId}/stream`, {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
           ...(settings.apiKey ? { "X-Khaos-Key": settings.apiKey } : {}),
@@ -226,6 +227,7 @@ export function useChat({ settings, getSessionId, updateMessages }: UseChatArgs)
     try {
       const response = await fetch(`${settings.gatewayUrl}/api/chat/${sessionId}/confirm`, {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
           ...(settings.apiKey ? { "X-Khaos-Key": settings.apiKey } : {}),

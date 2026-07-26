@@ -16,7 +16,10 @@ function readSettings(): ChatSettings {
   try {
     const stored = window.localStorage.getItem(SETTINGS_KEY);
     if (!stored) return defaultSettings;
-    return { ...defaultSettings, ...JSON.parse(stored) };
+    const parsed = JSON.parse(stored) as Partial<ChatSettings>;
+    // The gateway master key is intentionally memory-only. Persisting it in
+    // localStorage makes a same-origin XSS a durable credential theft.
+    return { ...defaultSettings, ...parsed, apiKey: "" };
   } catch {
     return defaultSettings;
   }
@@ -48,13 +51,30 @@ export function useSettings() {
 
   const saveSettings = useCallback((next: ChatSettings) => {
     setSettingsState(next);
-    window.localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
+    window.localStorage.setItem(
+      SETTINGS_KEY,
+      JSON.stringify({ ...next, apiKey: "" }),
+    );
+    if (next.apiKey) {
+      void fetch(`${next.gatewayUrl}/api/auth/session`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "X-Khaos-Key": next.apiKey },
+      }).then((response) => {
+        if (response.ok) {
+          setSettingsState((current) => ({ ...current, apiKey: "" }));
+        }
+      }).catch(() => {
+        // Retain the memory-only bootstrap key so the user can retry.
+      });
+    }
   }, []);
 
   const refreshConfig = useCallback(async () => {
-    const current = readSettings();
+    const current = settings;
     try {
       const response = await fetch(`${current.gatewayUrl}/api/config`, {
+        credentials: "include",
         headers: current.apiKey ? { "X-Khaos-Key": current.apiKey } : {},
       });
       if (!response.ok) return;
@@ -66,7 +86,7 @@ export function useSettings() {
     } catch {
       // Local settings remain authoritative when the gateway is offline.
     }
-  }, [saveSettings]);
+  }, [saveSettings, settings]);
 
   useEffect(() => {
     if (isLoaded) {

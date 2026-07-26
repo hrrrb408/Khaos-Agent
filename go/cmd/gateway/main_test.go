@@ -9,6 +9,26 @@ import (
 	"khaos/go/internal/platform"
 )
 
+func TestValidateTLSConfig(t *testing.T) {
+	for _, tc := range []struct {
+		name, addr, cert, key string
+		wantErr               bool
+	}{
+		{"loopback http", "127.0.0.1:8080", "", "", false},
+		{"ipv6 loopback http", "[::1]:8080", "", "", false},
+		{"public without tls", "0.0.0.0:8080", "", "", true},
+		{"public tls", "0.0.0.0:8443", "cert.pem", "key.pem", false},
+		{"partial tls", "127.0.0.1:8080", "cert.pem", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTLSConfig(tc.addr, tc.cert, tc.key)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateTLSConfig() error=%v wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 // TestC_2_1_ResolvePythonClient_RejectsEmptyProjectRoot verifies that
 // production mode is fail-closed on empty --project-root.  C-2-1
 // CRITICAL fix: drift detection cannot be silently disabled.

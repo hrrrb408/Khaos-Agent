@@ -177,6 +177,31 @@ func serveUnauthenticated(handler http.Handler, method string, path string, body
 	return rec
 }
 
+func TestBrowserSessionExchangeUsesHttpOnlyCookie(t *testing.T) {
+	handler, _ := newTestHandler(testAPIKey)
+	bootstrap := httptest.NewRequest(http.MethodPost, "/api/auth/session", nil)
+	bootstrap.Host = "127.0.0.1:8080"
+	bootstrap.Header.Set("X-Khaos-Key", testAPIKey)
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, bootstrap)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("bootstrap status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	cookies := recorder.Result().Cookies()
+	if len(cookies) != 1 || !cookies[0].HttpOnly || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("unsafe browser session cookies: %#v", cookies)
+	}
+
+	probe := httptest.NewRequest(http.MethodGet, "/api/config", nil)
+	probe.Host = "127.0.0.1:8080"
+	probe.AddCookie(cookies[0])
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, probe)
+	if response.Code != http.StatusOK {
+		t.Fatalf("cookie auth status=%d body=%s", response.Code, response.Body.String())
+	}
+}
+
 func TestChatAndStream(t *testing.T) {
 	handler, _ := newTestHandler("")
 	rec := serve(handler, http.MethodPost, "/api/chat", `{"session_id":"s1","message":"hello","mode":"office"}`, "")

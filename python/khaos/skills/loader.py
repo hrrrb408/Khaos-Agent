@@ -9,6 +9,8 @@ warning rather than aborting the whole scan, mirroring Hermes' tolerant loader.
 from __future__ import annotations
 
 import logging
+import os
+import stat
 from pathlib import Path
 
 import yaml
@@ -22,6 +24,11 @@ _SKILL_FILENAMES = {"SKILL.md", "skill.md"}
 _SKILL_SUFFIX = ".md"
 
 _FRONTMATTER_DELIM = "---"
+MAX_SKILL_FILES = 128
+MAX_SKILL_FILE_BYTES = 1_048_576
+MAX_SKILL_FRONTMATTER_BYTES = 65_536
+MAX_SKILL_YAML_DEPTH = 16
+MAX_SKILL_BODY_CHARS = 500_000
 
 
 class SkillLoader:
@@ -41,6 +48,12 @@ class SkillLoader:
         skills: list[Skill] = []
         for root in self.roots:
             for path in sorted(self._iter_skill_files(root)):
+                if len(skills) >= MAX_SKILL_FILES:
+                    logger.warning(
+                        "skill limit reached (%d); remaining files ignored",
+                        MAX_SKILL_FILES,
+                    )
+                    return skills
                 try:
                     skill = self.load_file(path)
                 except SkillParseError as exc:
@@ -58,11 +71,44 @@ class SkillLoader:
 
     def load_file(self, path: Path) -> Skill:
         """Parse a single skill file. Raise SkillParseError on invalid input."""
-        text = Path(path).read_text(encoding="utf-8")
+        path = Path(path)
+        flags = os.O_RDONLY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            fd = os.open(path, flags)
+        except OSError as exc:
+            raise SkillParseError(f"{path}: secure open failed: {exc}") from exc
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
+                raise SkillParseError(f"{path}: skill must be a regular file")
+            if hasattr(os, "getuid") and info.st_uid != os.getuid():
+                raise SkillParseError(f"{path}: skill is not owned by current user")
+            if info.st_size > MAX_SKILL_FILE_BYTES:
+                raise SkillParseError(
+                    f"{path}: skill exceeds {MAX_SKILL_FILE_BYTES} bytes"
+                )
+            raw = os.read(fd, MAX_SKILL_FILE_BYTES + 1)
+        finally:
+            os.close(fd)
+        if len(raw) > MAX_SKILL_FILE_BYTES:
+            raise SkillParseError(f"{path}: skill exceeds size limit")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise SkillParseError(f"{path}: skill is not UTF-8") from exc
         frontmatter, body = self._split_frontmatter(text)
         if frontmatter is None:
             raise SkillParseError(f"{path}: missing YAML frontmatter")
+        if len(frontmatter.encode("utf-8")) > MAX_SKILL_FRONTMATTER_BYTES:
+            raise SkillParseError(f"{path}: YAML frontmatter exceeds size limit")
         try:
+            node = yaml.compose(frontmatter, Loader=yaml.SafeLoader)
+            if node is not None and _yaml_depth(node) > MAX_SKILL_YAML_DEPTH:
+                raise SkillParseError(
+                    f"{path}: YAML nesting exceeds {MAX_SKILL_YAML_DEPTH}"
+                )
             data = yaml.safe_load(frontmatter)
         except yaml.YAMLError as exc:
             raise SkillParseError(f"{path}: invalid YAML frontmatter: {exc}") from exc
@@ -81,12 +127,15 @@ class SkillLoader:
         if not isinstance(raw_triggers, list):
             raise SkillParseError(f"{path}: 'triggers' must be a list")
 
+        body = body.strip()
+        if len(body) > MAX_SKILL_BODY_CHARS:
+            raise SkillParseError(f"{path}: skill body exceeds prompt budget")
         return Skill(
             name=name,
             description=description,
             category=category,
             triggers=[str(trigger) for trigger in raw_triggers],
-            body=body.strip(),
+            body=body,
             path=Path(path),
         )
 
@@ -120,17 +169,41 @@ class SkillLoader:
     def _iter_skill_files(root: Path):
         """Yield candidate skill files under ``root`` (non-recursive top level
         plus one level of subdirectories named after the skill)."""
-        if not root.exists() or not root.is_dir():
+        try:
+            root_info = root.lstat()
+        except OSError:
+            return
+        if not stat.S_ISDIR(root_info.st_mode) or root.is_symlink():
+            return
+        if hasattr(os, "getuid") and root_info.st_uid != os.getuid():
+            logger.warning("skill root is not owned by current user: %s", root)
             return
         # Top-level skill files.
-        for entry in sorted(root.iterdir()):
-            if entry.is_file() and _is_skill_filename(entry):
-                yield entry
-            elif entry.is_dir():
+        with os.scandir(root) as entries:
+            root_entries = sorted(entries, key=lambda item: item.name)
+        for entry in root_entries:
+            entry_path = Path(entry.path)
+            if entry.is_file(follow_symlinks=False) and _is_skill_filename(entry_path):
+                yield entry_path
+            elif entry.is_dir(follow_symlinks=False):
                 # Subdirectory skill: <root>/<name>/SKILL.md
-                for child in sorted(entry.iterdir()):
-                    if child.is_file() and _is_skill_filename(child):
-                        yield child
+                with os.scandir(entry.path) as children:
+                    child_entries = sorted(children, key=lambda item: item.name)
+                for child in child_entries:
+                    child_path = Path(child.path)
+                    if child.is_file(follow_symlinks=False) and _is_skill_filename(child_path):
+                        yield child_path
+
+
+def _yaml_depth(node: yaml.Node, depth: int = 1) -> int:
+    """Return maximum composed YAML node depth without constructing data."""
+    if isinstance(node, yaml.MappingNode):
+        children = [item for pair in node.value for item in pair]
+    elif isinstance(node, yaml.SequenceNode):
+        children = list(node.value)
+    else:
+        children = []
+    return max([depth, *(_yaml_depth(child, depth + 1) for child in children)])
 
 
 def _is_skill_filename(path: Path) -> bool:
