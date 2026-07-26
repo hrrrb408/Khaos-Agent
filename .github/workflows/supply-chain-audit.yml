@@ -21,14 +21,6 @@ concurrency:
 on:
   pull_request:
     branches: [main]
-    paths:
-      - "python/requirements-lock.txt"
-      - "pyproject.toml"
-      - "rust/khaos-core/Cargo.lock"
-      - "rust/khaos-core/Cargo.toml"
-      - "go/go.mod"
-      - "go/go.sum"
-      - ".github/workflows/supply-chain-audit.yml"
   push:
     branches: [main]
   workflow_dispatch:
@@ -51,11 +43,16 @@ jobs:
           python-version: "3.11"
           cache: pip
       - name: Install pip-audit
-        run: python -m pip install pip-audit
+        run: python -m pip install pip-audit==2.10.0 uv==0.11.9
       - name: Audit Python dependencies
         run: |
+          uv export --frozen --all-extras --no-dev --no-emit-project \
+            --no-header --format requirements-txt \
+            --output-file requirements-audit.txt
+          diff -u python/requirements-lock.txt requirements-audit.txt
           pip-audit \
-            --requirement python/requirements-lock.txt \
+            --requirement requirements-audit.txt \
+            --require-hashes \
             --strict \
             --desc
 
@@ -69,7 +66,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        run: cargo install cargo-audit --version 0.22.2 --locked
       - name: Audit Rust dependencies
         working-directory: rust/khaos-core
         # --ignore flags suppress advisories that are not exploitable
@@ -91,16 +88,14 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
-      # NOTE: govulncheck@latest requires a newer Go than the build
-      # toolchain (go.mod says go 1.22; batch5 CI uses 1.24.x).  The
-      # supply-chain audit is independent of the build, so we use the
-      # latest Go here to run the latest govulncheck.
+      # The audit toolchain is independent of the build toolchain.  Both
+      # its Go runtime and module version are pinned for reproducibility.
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
-          go-version: "1.25.x"
+          go-version: "1.26.5"
           cache-dependency-path: go/go.mod
       - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@latest
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
       - name: Audit Go dependencies
         working-directory: go
         run: govulncheck ./...

@@ -1,11 +1,11 @@
 # Required Status Checks — Branch Protection Reference
 
-> Batch 6.6 (round-6 §22): GitHub branch protection is a **repository
-> setting**, not a file in the repo, so it cannot be enforced from code.
-> This document lists the exact check names that an admin MUST configure
-> as "required" in **Settings → Branches → Branch protection rules** for
-> `main`.  Without this step the CI jobs exist but a PR could be merged
-> with a failing/missing check.
+> GitHub rulesets are repository-side authority. The required configuration
+> below is continuously audited by `.github/workflows/ruleset-audit.yml` and
+> `scripts/audit-github-ruleset.sh`; drift produces a failed workflow and a
+> JSON evidence artifact. `RULESET_AUDIT_TOKEN` must have read access to
+> repository rulesets because the default Actions token cannot always inspect
+> organization-managed rules.
 
 ## How to apply
 
@@ -66,9 +66,9 @@ PR checks UI), grouped by workflow.
 
 | Check name | Proves |
 |---|---|
-| `pip-audit` | Python dependency vulnerabilities |
-| `cargo-audit` | Rust dependency vulnerabilities |
-| `govulncheck` | Go dependency vulnerabilities |
+| `pip-audit (Python)` | Python dependency vulnerabilities |
+| `cargo audit (Rust)` | Rust dependency vulnerabilities |
+| `govulncheck (Go)` | Go dependency vulnerabilities |
 
 ## Verification
 
@@ -76,3 +76,11 @@ After applying, open a PR against `main`. The PR view should show every
 check above as **Required** (a small "Required" badge next to the name).
 A PR with any of these failing or pending must be unmergeable until the
 check passes.
+
+The scheduled ruleset audit additionally requires active `main` coverage,
+deletion and non-fast-forward blocking, at least one approving review, strict
+status checks, and a non-empty required-check set. Run it locally with:
+
+```bash
+GITHUB_REPOSITORY=OWNER/REPO bash scripts/audit-github-ruleset.sh
+```
