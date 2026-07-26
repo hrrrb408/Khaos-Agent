@@ -16,7 +16,6 @@ import base64
 import os
 import secrets
 import sys
-from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from urllib.parse import urlsplit
@@ -30,7 +29,6 @@ from khaos.security.browser_egress_proxy import (
 )
 from khaos.security.browser_sandbox import (
     BrowserNetworkSandbox,
-    BrowserSandboxConfig,
     BrowserSandboxError,
     EnforcementStatus,
     _RUN_DIR_ROOT,
@@ -657,10 +655,8 @@ def test_c06_install_egress_pin_calls_nft_rules(
 
     Round-6 Batch 6.2: ``_apply_nft_script`` now calls nft TWICE —
     first ``nft -c -f -`` (syntax check) then ``nft -f -`` (apply).
-    Both calls receive the same script via stdin.  The script uses the
-    ``table inet <name> { … }`` block syntax (create-or-replace) so
-    the table is created if missing (fixes C-02 round-6: ``flush
-    table`` on a fresh table used to fail).
+    Both calls receive the same script via stdin.  Setup creates the
+    table; pin changes atomically flush and rebuild its existing chains.
     """
     mock_which.return_value = "/usr/sbin/nft"
     mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
@@ -685,15 +681,13 @@ def test_c06_install_egress_pin_calls_nft_rules(
     script = apply_call.kwargs.get("input", "")
     assert "9090" in script
     assert "10.200.1.1" in script
-    # C-01 (round-5): must use input hook, not just forward
-    assert "hook input" in script
-    assert "hook forward" in script
-    # C-03 (round-5): base chains must use policy accept, not policy drop
-    assert "policy accept" in script
+    # C-01/C-03 are properties of the base chains created during setup.
+    # A pin update must preserve those chains and replace their rules.
+    assert f"flush chain inet {sandbox._nft_table} khaos_input" in script
+    assert f"flush chain inet {sandbox._nft_table} khaos_forward" in script
     assert "policy drop" not in script
-    # Round-6 Batch 6.2 (C-02): the script uses the ``table inet <name>
-    # { … }`` block syntax so the table is CREATED if missing.
-    assert f"table inet khaos_browser_test1234 {{" in script
+    # The pin update targets the setup-created per-sandbox table.
+    assert "khaos_browser_test1234" in script
     # The check call's script must match the apply call's script.
     check_script = check_call.kwargs.get("input", "")
     assert check_script == script
@@ -821,37 +815,26 @@ def test_round5_teardown_only_deletes_own_nft_table():
 
 
 def test_round5_nft_script_uses_input_hook_not_forward_only():
-    """C-01: the nft script must include an 'input' hook for browser→host
-    local traffic, not just 'forward'."""
-    with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
-         patch("khaos.security.browser_sandbox.shutil.which", return_value="/usr/sbin/nft"):
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
-        sandbox = BrowserNetworkSandbox()
-        sandbox._active = True
-        sandbox._veth_host = "khbrh-abc123"
-        sandbox._host_ip = "10.200.1.1"
-        sandbox._nft_table = f"khaos_browser_{sandbox._token}"
-        sandbox.install_egress_pin(9090)
-        script = mock_run.call_args.kwargs.get("input", "")
-        assert "hook input" in script
-        assert "hook forward" in script
+    """C-01: initial table creation has both input and forward hooks."""
+    sandbox = BrowserNetworkSandbox()
+    sandbox._veth_host = "khbrh-abc123"
+    sandbox._host_ip = "10.200.1.1"
+    sandbox._nft_table = f"khaos_browser_{sandbox._token}"
+    script = sandbox._build_nft_script(include_table_create=True)
+    assert "hook input" in script
+    assert "hook forward" in script
 
 
 def test_round5_nft_script_uses_policy_accept_not_drop():
     """C-03: base chains must use 'policy accept' so unmatched host traffic
     is unaffected."""
-    with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
-         patch("khaos.security.browser_sandbox.shutil.which", return_value="/usr/sbin/nft"):
-        mock_run.return_value = MagicMock(returncode=0, stderr="", stdout="")
-        sandbox = BrowserNetworkSandbox()
-        sandbox._active = True
-        sandbox._veth_host = "khbrh-abc123"
-        sandbox._host_ip = "10.200.1.1"
-        sandbox._nft_table = f"khaos_browser_{sandbox._token}"
-        sandbox.install_egress_pin(9090)
-        script = mock_run.call_args.kwargs.get("input", "")
-        assert "policy accept" in script
-        assert "policy drop" not in script
+    sandbox = BrowserNetworkSandbox()
+    sandbox._veth_host = "khbrh-abc123"
+    sandbox._host_ip = "10.200.1.1"
+    sandbox._nft_table = f"khaos_browser_{sandbox._token}"
+    script = sandbox._build_nft_script(include_table_create=True)
+    assert "policy accept" in script
+    assert "policy drop" not in script
 
 
 def test_round5_nft_uses_nft_f_minus_not_split():

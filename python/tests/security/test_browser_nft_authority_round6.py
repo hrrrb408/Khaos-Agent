@@ -133,6 +133,36 @@ def test_6_2_b_install_egress_pin_adds_port_to_set():
         last_script = mock_run.call_args_list[-1].kwargs["input"]
         assert "40001" in last_script
         assert "40002" in last_script
+        assert last_script.startswith(
+            f"flush chain inet {s._nft_table} khaos_input\n"
+        )
+
+
+def test_6_2_b_reapply_flushes_before_reconstructing_rules():
+    """A dynamic pin must replace, not append to, the existing table.
+
+    Re-applying a ``table { ... }`` block appends a second chain body on
+    supported nft versions.  The original terminal drop then remains
+    ahead of the new allow rule and makes that rule unreachable.
+    """
+    s = _active_sandbox()
+    s._egress_ports = {40001}
+    script = s._build_nft_script(include_table_create=False)
+    lines = [line.strip() for line in script.splitlines() if line.strip()]
+    assert lines[:2] == [
+        f"flush chain inet {s._nft_table} khaos_input",
+        f"flush chain inet {s._nft_table} khaos_forward",
+    ]
+    allow_index = next(
+        index for index, line in enumerate(lines)
+        if "tcp dport 40001 accept" in line
+    )
+    drop_index = next(
+        index for index, line in enumerate(lines)
+        if line.endswith(f'iifname "{s._veth_host}" drop')
+    )
+    assert allow_index < drop_index
+    assert sum("tcp dport 40001 accept" in line for line in lines) == 1
 
 
 # ───── 6.2-C: multi-context port set preservation (§六) ─────────

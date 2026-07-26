@@ -72,17 +72,17 @@ Round-6 review Batch 6.2 fixes (C-02 round-6 + §四 + §五 + §六):
 
 from __future__ import annotations
 
-import logging
-import os
 import hashlib
 import hmac
 import json
+import logging
+import os
+import re as _re
 import secrets
 import shutil
 import subprocess
 import sys
-import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -114,8 +114,6 @@ _RESOURCE_REGISTRY = Path.home() / ".khaos" / "run" / "browser_registry"
 # strings.  Each derived name is validated against a strict regex so a
 # crafted/foreign name can never reach a privileged ``ip``/``nft`` command.
 # ---------------------------------------------------------------------------
-
-import re as _re
 
 # Strict format validators for every derived resource name.  A name that
 # does not match is REFUSED before any privileged operation — this closes
@@ -635,12 +633,13 @@ class BrowserNetworkSandbox:
         """Build the atomic nftables script for the current
         ``_egress_ports`` set.
 
-        When ``include_table_create`` is True (used by
-        ``_install_default_deny_nft`` and by every re-apply), the
-        script uses the ``table inet <name> { … }`` block syntax so
-        the table is CREATED if missing and atomically replaced if it
-        already exists.  This is the documented nftables way to do
-        "create-or-replace" and is accepted by ``nft --check -f -``.
+        When ``include_table_create`` is True (used only by
+        ``_install_default_deny_nft``), the script creates the table
+        and its initial chains.  Re-applies use an atomic
+        per-chain ``flush`` + reconstruction transaction instead.  A
+        repeated ``table { ... }`` block does *not* replace existing
+        rules; it appends to them, which can leave a prior terminal
+        drop ahead of a newly-added allow rule.
 
         The script always contains BOTH hooks (input + forward), so
         even with zero egress ports the browser veth is fully
@@ -670,7 +669,7 @@ class BrowserNetworkSandbox:
         else:
             port_rules = "# (no egress proxy port active — full default-deny)"
         if include_table_create:
-            # ``table inet <name> { … }`` block: create-or-replace.
+            # ``table inet <name> { … }`` block: create the initial table.
             # This is the fix for C-02 (round-6): previously only
             # ``flush table`` was emitted, which fails on a fresh
             # table because the table does not exist yet.
@@ -689,24 +688,25 @@ class BrowserNetworkSandbox:
                 f"    }}\n"
                 f"}}\n"
             )
-        # Legacy form: separate ``flush table`` + chains.  Kept for
-        # reference but no longer used in production — the block form
-        # above is strictly more correct.
+        # The table is known to exist after setup.  nft applies an
+        # entire input file as one transaction, so the old policy stays
+        # live if any command below fails; there is no fail-open window.
         return (
-            f"flush table {_NFT_TABLE_FAMILY} {table}\n"
-            f"\n"
-            f"chain khaos_input {{\n"
-            f"    type filter hook input priority -10; policy accept;\n"
-            f"    ct state established,related accept\n"
-            f"    {port_rules}\n"
-            f"    iifname \"{veth}\" drop\n"
-            f"}}\n"
-            f"\n"
-            f"chain khaos_forward {{\n"
-            f"    type filter hook forward priority -10; policy accept;\n"
-            f"    iifname \"{veth}\" drop\n"
-            f"    oifname \"{veth}\" ct state new drop\n"
-            f"}}\n"
+            f"flush chain {_NFT_TABLE_FAMILY} {table} khaos_input\n"
+            f"flush chain {_NFT_TABLE_FAMILY} {table} khaos_forward\n"
+            f"add rule {_NFT_TABLE_FAMILY} {table} khaos_input "
+            f"ct state established,related accept\n"
+            + "".join(
+                f"add rule {_NFT_TABLE_FAMILY} {table} khaos_input "
+                f'iifname "{veth}" ip daddr {host_ip} tcp dport {port} accept\n'
+                for port in ports
+            )
+            + f"add rule {_NFT_TABLE_FAMILY} {table} khaos_input "
+            f'iifname "{veth}" drop\n'
+            f"add rule {_NFT_TABLE_FAMILY} {table} khaos_forward "
+            f'iifname "{veth}" drop\n'
+            f"add rule {_NFT_TABLE_FAMILY} {table} khaos_forward "
+            f'oifname "{veth}" ct state new drop\n'
         )
 
     def _apply_nft_script(self, script: str, *, description: str) -> bool:
@@ -806,10 +806,10 @@ class BrowserNetworkSandbox:
         Round-6 Batch 6.2 changes:
           - ADDS the port to ``_egress_ports`` instead of ``flush``-ing
             the whole table.  Other contexts' ports are preserved.
-          - The table is rebuilt using the ``table inet <name> { … }``
-            block syntax (create-or-replace), so the table exists even
-            on the first call (fixes C-02 round-6: ``flush table`` on
-            a fresh table used to fail).
+          - Setup creates the table once; each pin change atomically
+            flushes and rebuilds the two existing chains.  This avoids
+            both ``flush`` on a missing table and rule appends behind a
+            previously installed terminal drop.
           - ``_apply_nft_script`` first syntax-checks the script with
             ``nft -c -f -`` (§四 "真实 nft --check").
 
@@ -835,7 +835,7 @@ class BrowserNetworkSandbox:
         saved = set(self._egress_ports)
         self._egress_ports = candidate
         try:
-            script = self._build_nft_script(include_table_create=True)
+            script = self._build_nft_script(include_table_create=False)
             applied = self._apply_nft_script(
                 script, description=f"egress pin port {port}",
             )
@@ -891,7 +891,7 @@ class BrowserNetworkSandbox:
         saved = set(self._egress_ports)
         self._egress_ports.discard(port)
         try:
-            script = self._build_nft_script(include_table_create=True)
+            script = self._build_nft_script(include_table_create=False)
             applied = self._apply_nft_script(
                 script, description=f"egress pin remove port {port}",
             )
