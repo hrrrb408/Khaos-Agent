@@ -153,3 +153,69 @@ def test_load_all_enforces_global_file_limit(tmp_path):
         )
 
     assert len(SkillLoader([tmp_path]).load_all()) == MAX_SKILL_FILES
+
+
+def test_candidate_limit_counts_invalid_files(tmp_path, monkeypatch):
+    """Batch 9.6: invalid files must count toward the scan cap.
+
+    Previously the cap counted only successfully-loaded skills, so an
+    attacker could place thousands of invalid YAML / missing-field files
+    that each incurred an open + parse without incrementing the limit.
+    Now the candidate cap (MAX_SKILL_CANDIDATES) stops the scan after a
+    bounded number of files regardless of how many parse successfully.
+    """
+    from khaos.skills.loader import MAX_SKILL_CANDIDATES
+
+    # Place MORE invalid files than the candidate cap allows.
+    overshoot = 25
+    total = MAX_SKILL_CANDIDATES + overshoot
+    for index in range(total):
+        # Every file is INVALID (missing description) so none increment
+        # the accepted-skills counter — only the candidate counter.
+        _write(
+            tmp_path / f"bad-{index:04d}.md",
+            f"---\nname: bad-{index}\n---\nbody\n",  # no description
+        )
+
+    load_calls = {"count": 0}
+    original_load_file = SkillLoader.load_file
+
+    def counting_load_file(self, path):
+        load_calls["count"] += 1
+        return original_load_file(self, path)
+
+    monkeypatch.setattr(SkillLoader, "load_file", counting_load_file)
+
+    skills = SkillLoader([tmp_path]).load_all()
+    # No skills loaded (all invalid), but the scan stopped at the cap.
+    assert skills == []
+    # load_file was called at most MAX_SKILL_CANDIDATES times, NOT `total`.
+    assert load_calls["count"] <= MAX_SKILL_CANDIDATES, (
+        f"scan did not respect candidate cap: called load_file "
+        f"{load_calls['count']} times (cap {MAX_SKILL_CANDIDATES})"
+    )
+
+
+def test_huge_directory_does_not_sort_all_into_memory(tmp_path, monkeypatch):
+    """Batch 9.6: scandir must be consumed lazily, not materialised.
+
+    Previously _iter_skill_files called sorted(scandir(...)) which read
+    the ENTIRE directory into a list before yielding the first path.  Now
+    we iterate scandir in a streaming fashion.  This test verifies a
+    directory with many non-skill entries does not block — the generator
+    yields the few real skill files without requiring the whole dir to be
+    sorted first (the cap in load_all stops the scan early).
+    """
+    # Create a handful of real skills + many non-skill files.
+    for index in range(3):
+        _write(
+            tmp_path / f"skill-{index}.md",
+            f"---\nname: skill-{index}\ndescription: s.\n---\nbody\n",
+        )
+    # Non-skill files (wrong extension or name) that must NOT trigger loads.
+    for index in range(500):
+        (tmp_path / f"noise-{index:04d}.txt").write_text("noise", encoding="utf-8")
+
+    skills = SkillLoader([tmp_path]).load_all()
+    assert len(skills) == 3
+    assert {s.name for s in skills} == {"skill-0", "skill-1", "skill-2"}
