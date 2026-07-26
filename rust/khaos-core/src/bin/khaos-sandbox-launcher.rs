@@ -407,7 +407,12 @@ mod linux {
                 .iter()
                 .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
             let preserved = if remote_debugging_pipe {
-                restore_playwright_pipes_from_stdio()?;
+                restore_playwright_pipes_from_stdio().map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!("restore Playwright control channels: {error}"),
+                    )
+                })?;
                 vec![3, 4]
             } else {
                 Vec::new()
@@ -415,9 +420,14 @@ mod linux {
             for fd in &preserved {
                 validate_control_channel(*fd, *fd == 3)?;
             }
-            sanitize_fds_except(&preserved)?;
-            install_seccomp()?;
-            return exec(&args);
+            sanitize_fds_except(&preserved).map_err(|error| {
+                io::Error::new(error.kind(), format!("sanitize browser fds: {error}"))
+            })?;
+            install_seccomp().map_err(|error| {
+                io::Error::new(error.kind(), format!("install browser seccomp: {error}"))
+            })?;
+            return exec(&args)
+                .map_err(|error| io::Error::new(error.kind(), format!("exec Chromium: {error}")));
         }
 
         // Batch 7.4 (round-7 §十一): browser launcher mode.
