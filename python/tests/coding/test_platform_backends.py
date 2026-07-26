@@ -642,9 +642,13 @@ async def test_real_macos_synthetic_home_capacity_is_enforced(tmp_path: Path):
     ):
         pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
     assert result.status == "resource-exhausted", result.diagnostics
-    assert result.diagnostics["resource_violation"] == {
-        "kind": "tmpfs", "observed": 16_384, "limit": 10_000,
-    }
+    violation = result.diagnostics["resource_violation"]
+    assert violation["kind"] == "tmpfs"
+    assert violation["limit"] == 10_000
+    # The monitor may stop the process after the third or fourth 4 KiB
+    # write. Both observations prove that the configured limit was crossed;
+    # requiring the final 16 KiB total makes the test scheduler-dependent.
+    assert 10_000 < violation["observed"] <= 16_384
 
 
 @pytest.mark.asyncio

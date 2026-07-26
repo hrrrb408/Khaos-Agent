@@ -311,7 +311,20 @@ mod linux {
             }
             join_netns(&netns)?;
 
-            let launcher = env::current_exe()?;
+            let launcher_path = env::current_exe()?;
+            let launcher_c_path = CString::new(launcher_path.as_os_str().as_encoded_bytes())
+                .map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "launcher path contained NUL")
+                })?;
+            // Intentionally omit O_CLOEXEC: --ro-bind-data consumes this
+            // descriptor inside bwrap, allowing the verified running image
+            // to cross the user-namespace boundary without reopening a
+            // private parent directory by pathname.
+            let launcher_fd = unsafe { libc::open(launcher_c_path.as_ptr(), libc::O_RDONLY) };
+            if launcher_fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+
             let real_path = PathBuf::from(&real);
             let real_parent = real_path.parent().ok_or_else(|| {
                 io::Error::new(
@@ -326,6 +339,13 @@ mod linux {
                 )
             })?;
             let inner_real = PathBuf::from("/run/khaos-browser/runtime").join(real_name);
+
+            // Resolve the trusted browser directory before entering bwrap's
+            // user namespace. A private parent such as /home/runner (0750)
+            // is intentionally not traversable by namespace-root. Binding
+            // the already-open cwd reference avoids relaxing that parent and
+            // exposes only the selected browser runtime directory.
+            env::set_current_dir(real_parent)?;
 
             let mut bwrap_args: Vec<std::ffi::OsString> = vec![
                 "bwrap".into(),
@@ -353,15 +373,19 @@ mod linux {
                 "--dir".into(),
                 "/run/khaos-browser/runtime".into(),
                 "--ro-bind".into(),
-                real_parent.as_os_str().into(),
+                "/proc/self/cwd".into(),
                 "/run/khaos-browser/runtime".into(),
-                "--ro-bind".into(),
-                launcher.as_os_str().into(),
+                "--perms".into(),
+                "0500".into(),
+                "--ro-bind-data".into(),
+                launcher_fd.to_string().into(),
                 "/run/khaos-browser/launcher".into(),
                 "--dir".into(),
                 "/tmp/khaos-home".into(),
                 "--setenv".into(),
                 "HOME".into(),
+                "/tmp/khaos-home".into(),
+                "--chdir".into(),
                 "/tmp/khaos-home".into(),
                 "--".into(),
                 "/run/khaos-browser/launcher".into(),
