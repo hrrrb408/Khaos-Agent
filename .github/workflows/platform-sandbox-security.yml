@@ -307,7 +307,20 @@ jobs:
               echo "+$controller" > /sys/fs/cgroup/khaos-browser/cgroup.subtree_control
             fi
           done
-          test -w /sys/fs/cgroup/khaos-browser
+          # Keep the test runner out of the delegated workloads subtree.
+          # The sibling-leaf topology satisfies cgroup v2's no-internal-
+          # process rule and lets the launcher atomically move Chromium into
+          # its constrained per-browser child without weakening enforcement.
+          sudo mkdir -p /sys/fs/cgroup/khaos-browser/runner /sys/fs/cgroup/khaos-browser/workloads
+          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/khaos-browser
+          for controller in cpu memory pids io; do
+            if grep -qw "$controller" /sys/fs/cgroup/khaos-browser/workloads/cgroup.controllers; then
+              echo "+$controller" > /sys/fs/cgroup/khaos-browser/workloads/cgroup.subtree_control
+            fi
+          done
+          test -w /sys/fs/cgroup/khaos-browser/runner/cgroup.procs
+          test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.procs
+          test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.subtree_control
       - name: Build inner browser launcher (Rust)
         run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
       - name: Install test + browser dependencies
@@ -331,15 +344,18 @@ jobs:
           KHAOS_BROWSER_MOCK_MODE: ""
           KHAOS_RUN_BROWSER_E2E: "1"
           KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
-          KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser
+          KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser/workloads
           KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
           PLAYWRIGHT_BROWSERS_PATH: /opt/khaos-playwright
         run: |
           python_bin="$(command -v python)"
           sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_BROWSER_MOCK_MODE,KHAOS_RUN_BROWSER_E2E,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,KHAOS_SANDBOX_LAUNCHER,PLAYWRIGHT_BROWSERS_PATH,PYTHONPATH,HOME \
-            "$python_bin" -m pytest \
-            python/tests/security/test_browser_fullstack_kernel_round8.py \
-            -m kernel_real -v
+            bash -c '
+              echo "$$" > /sys/fs/cgroup/khaos-browser/runner/cgroup.procs
+              exec "$1" -m pytest \
+                python/tests/security/test_browser_fullstack_kernel_round8.py \
+                -m kernel_real -v
+            ' bash "$python_bin"
 
   macos-sandbox-security:
     runs-on: macos-latest
