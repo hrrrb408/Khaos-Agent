@@ -910,6 +910,17 @@ class BrowserManager:
             else "127.0.0.1"
         )
         egress_proxy = BrowserEgressProxy(network_guard, bind_host=proxy_bind_host)
+        # Batch 10.2 (round-10 §五): context creation is now a local
+        # transaction.  We track which kernel/user-space resources have
+        # been acquired so a failure at ANY later step (new_context,
+        # route guard, new_page) rolls them back in the correct order:
+        # remove_egress_port (revoke kernel authority) → proxy.close →
+        # context.close.  Without this, an nft egress pin installed
+        # before new_context() would leak when new_context() raises,
+        # leaving kernel authority for a port whose proxy is gone.
+        proxy_port: int | None = None
+        pin_installed = False
+        context: Any = None
         try:
             await egress_proxy.start()
             # C-06: install nftables egress pin so the browser veth can
@@ -919,8 +930,8 @@ class BrowserManager:
             # Round-6 Batch 6.2 (§六): ``install_egress_pin`` now ADDS
             # the port to a per-sandbox ``_egress_ports`` set (instead
             # of ``flush``-ing the whole table).  The matching
-            # ``remove_egress_port`` is called by ``_close_one_context``.
-            proxy_port: int | None = None
+            # ``remove_egress_port`` is called by ``_close_one_context``
+            # and by the rollback below on creation failure.
             if (
                 self._browser_sandbox is not None
                 and self._browser_sandbox.is_active
@@ -934,6 +945,7 @@ class BrowserManager:
                 await asyncio.to_thread(
                     self._browser_sandbox.install_egress_pin, proxy_port
                 )
+                pin_installed = True
             # F-05: when the netns sandbox is active, the browser reaches
             # the proxy via the veth host IP.  The ``bypass`` list must
             # NOT include ``<-loopback>`` in that case because the proxy
@@ -955,7 +967,15 @@ class BrowserManager:
                 service_workers="block",
             )
         except Exception:
-            await egress_proxy.close()
+            # new_context() (or install_egress_pin) failed AFTER the pin
+            # may have been installed.  Roll back the kernel authority
+            # BEFORE closing the proxy (mirrors _close_one_context order).
+            await self._rollback_context_creation(
+                egress_proxy=egress_proxy,
+                context=context,
+                egress_port=proxy_port,
+                pin_installed=pin_installed,
+            )
             raise
         # B2: install the route interceptor BEFORE creating the page so the
         # very first navigation is gated.  The interceptor runs the
@@ -975,11 +995,12 @@ class BrowserManager:
                     "B2 route guard installation failed; closing context: %s",
                     exc,
                 )
-                try:
-                    await context.close()
-                except Exception:  # noqa: BLE001 — best-effort cleanup
-                    pass
-                await egress_proxy.close()
+                await self._rollback_context_creation(
+                    egress_proxy=egress_proxy,
+                    context=context,
+                    egress_port=proxy_port,
+                    pin_installed=pin_installed,
+                )
                 # H2: stash the specific failure reason so ``_safe_execute``
                 # can surface it instead of the generic "Browser not
                 # available" message.
@@ -987,7 +1008,24 @@ class BrowserManager:
                     "Browser security guard installation failed"
                 )
                 return None
-        page = await context.new_page()
+        # Batch 10.2: new_page() was previously outside any try/except — a
+        # failure here leaked the context, proxy AND the nft pin.  Now it
+        # rolls back the full transaction.
+        try:
+            page = await context.new_page()
+        except Exception as exc:  # noqa: BLE001 — surfaced as None
+            logger.error(
+                "context.new_page() failed; rolling back context creation: %s",
+                exc,
+            )
+            await self._rollback_context_creation(
+                egress_proxy=egress_proxy,
+                context=context,
+                egress_port=proxy_port,
+                pin_installed=pin_installed,
+            )
+            self._last_ensure_error = "Browser page creation failed"
+            return None
         page.set_default_timeout(30000)  # 30s default
         self._contexts[key] = {
             "context": context,
@@ -1010,6 +1048,49 @@ class BrowserManager:
         self._process_principal = principal_id
         logger.info("Browser context created for session: %s", key)
         return page
+
+    async def _rollback_context_creation(
+        self,
+        *,
+        egress_proxy: Any,
+        context: Any,
+        egress_port: int | None,
+        pin_installed: bool,
+    ) -> None:
+        """Batch 10.2 (round-10 §五): roll back a half-created context.
+
+        Mirrors the proven teardown order in ``_close_one_context``:
+        revoke the kernel nft egress authority WHILE the proxy still
+        owns the port, THEN close the proxy, THEN close the context.
+        If ``remove_egress_port`` raises we RETAIN the proxy socket
+        (do not close it) and quarantine the generation — a stale-open
+        kernel rule is safer than a stale-closed one, and the proxy
+        keeping the port prevents a host process from rebinding it.
+        """
+        if pin_installed and egress_port is not None:
+            sandbox = self._browser_sandbox
+            if sandbox is not None and sandbox.is_active:
+                try:
+                    await asyncio.to_thread(
+                        sandbox.remove_egress_port, egress_port
+                    )
+                except Exception as exc:  # noqa: BLE001 — quarantine path
+                    logger.error(
+                        "rollback: remove_egress_port(%s) raised: %s — "
+                        "RETAINING proxy socket to prevent port reuse; "
+                        "quarantining browser generation", egress_port, exc,
+                    )
+                    self._sandbox_generation_failed = True
+                    return
+        if context is not None:
+            try:
+                await context.close()
+            except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+                logger.debug("rollback: context.close() failed: %s", exc)
+        try:
+            await egress_proxy.close()
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            logger.debug("rollback: egress_proxy.close() failed: %s", exc)
 
     async def _install_route_guard(self, context: Any, guard: Any) -> None:
         """B2: install ``context.route("**/*", ...)`` to enforce the

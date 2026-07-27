@@ -373,6 +373,7 @@ jobs:
               exec "$1" -m pytest \
                 python/tests/security/test_browser_fullstack_kernel_round8.py \
                 python/tests/security/test_browser_negative_secrecy_round9.py \
+                python/tests/security/test_browser_fs_probe_round10.py \
                 -m kernel_real -v --log-cli-level=INFO
             ' bash "$python_bin"
 

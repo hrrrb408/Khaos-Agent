@@ -219,3 +219,69 @@ def test_huge_directory_does_not_sort_all_into_memory(tmp_path, monkeypatch):
     skills = SkillLoader([tmp_path]).load_all()
     assert len(skills) == 3
     assert {s.name for s in skills} == {"skill-0", "skill-1", "skill-2"}
+
+
+def test_recursive_yaml_alias_does_not_crash_loader(tmp_path):
+    """Batch 10.6 (round-10 §十): a YAML frontmatter with a cyclic alias
+    graph (``&a [*a]``) must be skipped, not crash the whole load_all().
+
+    Without cycle detection in _yaml_depth, the alias cycle blows the
+    Python recursion limit → RecursionError propagates out of load_all()
+    and takes down every subsequent skill in every root."""
+    # The cyclic alias: &a references itself in a list.
+    _write(
+        tmp_path / "cyclic.md",
+        "---\n"
+        "name: cyclic\n"
+        "description: has a cycle.\n"
+        "data: &a [*a]\n"
+        "---\nbody\n",
+    )
+    # A valid skill alongside the cyclic one — it must still load.
+    _write(
+        tmp_path / "good.md",
+        "---\nname: good\ndescription: valid.\n---\nbody\n",
+    )
+
+    skills = SkillLoader([tmp_path]).load_all()
+    # The cyclic skill is skipped; the good skill loads.
+    assert [s.name for s in skills] == ["good"]
+
+
+def test_directory_scan_budget_limits_entries(tmp_path, monkeypatch):
+    """Batch 10.6: a directory with more than MAX_SKILL_DIR_ENTRIES entries
+    is truncated, not fully materialised."""
+    from khaos.skills.loader import MAX_SKILL_DIR_ENTRIES
+
+    # Create more noise files than the budget allows.
+    overshoot = 50
+    total = MAX_SKILL_DIR_ENTRIES + overshoot
+    for index in range(total):
+        (tmp_path / f"noise-{index:06d}.txt").write_text("x", encoding="utf-8")
+    # One real skill that should still be found (within the budget).
+    _write(
+        tmp_path / "SKILL.md",
+        "---\nname: found\ndescription: within budget.\n---\nbody\n",
+    )
+
+    skills = SkillLoader([tmp_path]).load_all()
+    # The real skill is found (it sorts early: "SKILL.md" < "noise-...").
+    assert any(s.name == "found" for s in skills)
+
+
+def test_yaml_node_budget_aborts_huge_flat_document(tmp_path):
+    """Batch 10.6: a YAML document with a huge number of nodes (but within
+    the depth limit) is handled without crash or indefinite traversal."""
+    # Build a flat mapping with many keys — each key+value pair is a few
+    # nodes.  This is within the depth limit (depth 2) so it exercises the
+    # node-count budget path, not the depth path.
+    keys = "\n".join(f"k{i}: v" for i in range(500))
+    _write(
+        tmp_path / "huge.md",
+        f"---\nname: huge\ndescription: many nodes.\n{keys}\n---\nbody\n",
+    )
+    # This should load fine (well within both depth and node budget).
+    # The test mainly verifies no crash from the node-counting traversal.
+    skills = SkillLoader([tmp_path]).load_all()
+    assert len(skills) == 1
+    assert skills[0].name == "huge"

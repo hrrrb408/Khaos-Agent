@@ -128,20 +128,20 @@ async def test_timeout_is_terminal_and_registry_is_cleaned(tmp_path: Path):
 
 @pytest.mark.asyncio
 @POSIX_ONLY
-async def test_signal_death_before_timeout_is_classified_as_timeout(tmp_path: Path):
-    """Race fix: a process that dies from a signal (SIGTERM) and exits on
-    its own with returncode 143 BEFORE our wait_for raises TimeoutError must
-    be classified as "timed-out", not "failed".
+async def test_signal_death_before_deadline_is_failed_not_timeout(tmp_path: Path):
+    """Batch 10.1 (round-10 §四): a process that dies from a signal
+    (SIGTERM) and exits on its own with returncode 143 BEFORE the deadline
+    elapses must be classified as "failed", NOT "timed-out".
 
-    This reproduces the Docker daemon race: the daemon forwards SIGTERM to
-    the container, the CLI exits 143 before the supervisor's own timeout
-    fires, and without the fix the status becomes "failed" + returncode 143
-    instead of "timed-out" + returncode -1.
+    PR #115 misclassified any signal death (returncode < 0 or >= 128) with
+    a configured timeout as "timed-out", masking crashes, external kills,
+    OOM SIGKILL, and deliberate exit(200).  The deadline-task race now
+    proves the deadline had NOT elapsed, so the real status is preserved.
     """
     supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
     # The process sends itself SIGTERM after starting; the timeout is 2s,
     # so the process exits on its own (returncode 143, shell convention)
-    # well before wait_for raises TimeoutError.
+    # well before the deadline task fires.
     request = ExecutionRequest(
         (
             sys.executable, "-c",
@@ -155,11 +155,62 @@ async def test_signal_death_before_timeout_is_classified_as_timeout(tmp_path: Pa
 
     result = await supervisor.run(request)
 
-    assert result.status == "timed-out", (
-        f"signal-death before timeout should be timed-out, got "
-        f"{result.status} (rc={result.return_code})"
+    assert result.status == "failed", (
+        f"signal-death before the deadline must stay 'failed', got "
+        f"{result.status} (rc={result.return_code}) — Batch 10.1 regression"
     )
     assert result.return_code is not None and result.return_code != 0
+
+
+@pytest.mark.asyncio
+@POSIX_ONLY
+async def test_exit_200_stays_failed_not_timeout(tmp_path: Path):
+    """Batch 10.1: exit(200) (>= 128, shell signal range but a deliberate
+    exit) must NOT be misclassified as timed-out.  Many CLI tools use
+    exit codes 128-255 for real errors."""
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    request = ExecutionRequest(
+        (sys.executable, "-c", "import sys; sys.exit(200)"),
+        tmp_path,
+        budget=ResourceBudget(timeout_seconds=5),
+        correlation_id="exit-200",
+    )
+
+    result = await supervisor.run(request)
+    assert result.status == "failed", (
+        f"exit(200) must be 'failed', got {result.status}"
+    )
+    assert result.return_code == 200
+
+
+@pytest.mark.asyncio
+@POSIX_ONLY
+async def test_signal_death_stays_failed_not_timeout(tmp_path: Path):
+    """Batch 10.1: a process killed by a signal before the deadline must
+    stay 'failed' — it could be an OOM kill, external admin kill, or crash,
+    not a timeout.  Uses a self-SIGKILL via a shell wrapper so the
+    supervisor observes a signal-death returncode."""
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+    # The process sends itself SIGKILL; the supervisor sees returncode -9
+    # (Python convention).  The 10s timeout must NOT fire.
+    request = ExecutionRequest(
+        (
+            sys.executable, "-c",
+            "import os, signal; os.kill(os.getpid(), signal.SIGKILL)",
+        ),
+        tmp_path,
+        budget=ResourceBudget(timeout_seconds=10),
+        correlation_id="sigkill",
+    )
+
+    result = await supervisor.run(request)
+    assert result.status == "failed", (
+        f"SIGKILL before the deadline must stay 'failed', got "
+        f"{result.status} (rc={result.return_code}) — Batch 10.1 regression"
+    )
+    assert result.return_code == -9, (
+        f"expected -9 (SIGKILL), got {result.return_code}"
+    )
 
 
 @pytest.mark.asyncio
