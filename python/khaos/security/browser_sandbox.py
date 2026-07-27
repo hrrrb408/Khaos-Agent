@@ -175,6 +175,49 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
         os.close(fd)
 
 
+# Batch 10.3 (round-10 §六): cache of resolved + validated TCB tool paths.
+# ``ip``/``nft`` were previously invoked via bare PATH lookup
+# (subprocess.run(["ip", ...])).  Under Root or CAP_NET_ADMIN a malicious
+# PATH entry equals arbitrary high-privilege code execution BEFORE the
+# sandbox is established.  _resolve_tcb_tool resolves the absolute path
+# once and validates owner/mode/no-symlink; _run_command and the direct
+# subprocess.run calls consult this cache so every privileged invocation
+# uses the verified absolute path.
+_tcb_tool_cache: dict[str, str] = {}
+
+
+def _resolve_tcb_tool(name: str, *, validate: bool = True) -> str:
+    """Resolve ``name`` (e.g. ``ip``, ``nft``) to a validated absolute path.
+
+    Resolution is cached for the process lifetime.  When ``validate`` is
+    True (production / require_os_sandbox), the resolved path is checked
+    via ``_validate_tcb_binary`` (regular file, owner == current uid, no
+    group/other write, no symlink).  Dev mode (validate=False) skips the
+    check but STILL returns the absolute path (closing the bare-PATH
+    lookup gap even when ownership is not enforced).
+
+    Raises ``BrowserSandboxError`` if the tool is missing or fails
+    validation (production only).  Returns the bare ``name`` only if
+    ``shutil.which`` cannot find it AND validate is False (so dev-mode
+    on a non-Linux host without iproute2 still imports cleanly).
+    """
+    if name in _tcb_tool_cache:
+        return _tcb_tool_cache[name]
+    resolved = shutil.which(name)
+    if resolved is None:
+        if validate:
+            raise BrowserSandboxError(
+                f"required TCB tool {name!r} not found on PATH"
+            )
+        # Dev mode on a system without the tool: return the bare name so
+        # the caller's subprocess.run still works (or fails naturally).
+        return name
+    if validate:
+        _validate_tcb_binary(resolved, label=f"TCB tool {name!r}")
+    _tcb_tool_cache[name] = resolved
+    return resolved
+
+
 def _fsync_dir(path: str | Path) -> None:
     """fsync the parent directory so a rename/create is durable on crash.
 
@@ -595,10 +638,13 @@ class BrowserNetworkSandbox:
         assert self._netns_name is not None
         assert self._veth_host is not None
         assert self._nft_table is not None
+        # Batch 10.3: resolve ip/nft to validated absolute paths.
+        ip_path = _resolve_tcb_tool("ip", validate=self._require_os_sandbox)
+        nft_path = _resolve_tcb_tool("nft", validate=self._require_os_sandbox)
         probes = (
-            (["ip", "netns", "list"], self._netns_name, True),
-            (["ip", "link", "show", "dev", self._veth_host], "", False),
-            (["nft", "list", "table", _NFT_TABLE_FAMILY, self._nft_table], "", False),
+            ([ip_path, "netns", "list"], self._netns_name, True),
+            ([ip_path, "link", "show", "dev", self._veth_host], "", False),
+            ([nft_path, "list", "table", _NFT_TABLE_FAMILY, self._nft_table], "", False),
         )
         for argv, exact_name, list_probe in probes:
             result = subprocess.run(
@@ -840,10 +886,12 @@ class BrowserNetworkSandbox:
                 raise BrowserSandboxError(reason)
             logger.warning("browser netns sandbox: %s", reason)
             return False
+        # Batch 10.3: resolve nft to the validated absolute path once.
+        nft_path = _resolve_tcb_tool("nft", validate=self._require_os_sandbox)
         try:
             # 1) Syntax check (does not touch kernel state).
             check = subprocess.run(
-                ["nft", "-c", "-f", "-"],
+                [nft_path, "-c", "-f", "-"],
                 input=script,
                 capture_output=True,
                 text=True,
@@ -856,7 +904,7 @@ class BrowserNetworkSandbox:
                 )
             # 2) Apply for real.
             result = subprocess.run(
-                ["nft", "-f", "-"],
+                [nft_path, "-f", "-"],
                 input=script,
                 capture_output=True,
                 text=True,
@@ -1639,18 +1687,21 @@ def _has_net_admin() -> bool:
     """
     if not sys.platform.startswith("linux"):
         return False
-    if shutil.which("ip") is None:
+    # Batch 10.3: resolve ip to absolute path (validate=False — this is a
+    # capability probe, the production path validates at setup() time).
+    ip_path = _resolve_tcb_tool("ip", validate=False)
+    if ip_path == "ip":  # not found
         return False
     probe = f"khaos-cap-probe-{secrets.token_hex(4)}"
     try:
         result = subprocess.run(
-            ["ip", "netns", "add", probe],
+            [ip_path, "netns", "add", probe],
             capture_output=True, text=True, timeout=5,
         )
         if result.returncode != 0:
             return False
         subprocess.run(
-            ["ip", "netns", "del", probe],
+            [ip_path, "netns", "del", probe],
             capture_output=True, text=True, timeout=5,
         )
         return True
@@ -1659,7 +1710,15 @@ def _has_net_admin() -> bool:
 
 
 def _run_command(argv: list[str], description: str) -> None:
-    """Run a command and raise OSError on failure."""
+    """Run a command and raise OSError on failure.
+
+    Batch 10.3 (round-10 §六): if ``argv[0]`` is a bare ``ip``/``nft``
+    tool name, resolve it to the validated absolute path from the TCB
+    cache before invoking.  This closes the bare-PATH-lookup gap for
+    every privileged kernel operation (netns/veth/nft create+delete).
+    """
+    if argv and argv[0] in ("ip", "nft"):
+        argv = [_resolve_tcb_tool(argv[0], validate=False), *argv[1:]]
     result = subprocess.run(
         argv, capture_output=True, text=True, timeout=10,
     )

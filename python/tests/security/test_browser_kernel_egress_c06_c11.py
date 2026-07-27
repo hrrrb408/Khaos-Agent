@@ -674,8 +674,12 @@ def test_c06_install_egress_pin_calls_nft_rules(
     # once without (apply).  Both use -f - (stdin script).
     assert mock_run.call_count == 2
     check_call, apply_call = mock_run.call_args_list
-    assert check_call.args[0] == ["nft", "-c", "-f", "-"]
-    assert apply_call.args[0] == ["nft", "-f", "-"]
+    # Batch 10.3: nft is now resolved to an absolute path (no bare PATH
+    # lookup).  Assert the flags rather than the exact binary path.
+    assert check_call.args[0][1:] == ["-c", "-f", "-"]
+    assert Path(check_call.args[0][0]).is_absolute()
+    assert apply_call.args[0][1:] == ["-f", "-"]
+    assert Path(apply_call.args[0][0]).is_absolute()
     # The apply call's script must reference the proxy port, host IP,
     # and both hooks.
     script = apply_call.kwargs.get("input", "")

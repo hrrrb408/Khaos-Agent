@@ -27,6 +27,7 @@ Closes the following Round-6 review findings:
 """
 from __future__ import annotations
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -267,8 +268,11 @@ def test_6_2_d_apply_nft_script_runs_check_first():
         assert result is True
         assert mock_run.call_count == 2
         check_call, apply_call = mock_run.call_args_list
-        assert check_call.args[0] == ["nft", "-c", "-f", "-"]
-        assert apply_call.args[0] == ["nft", "-f", "-"]
+        # Batch 10.3: nft is resolved to an absolute path (no bare PATH).
+        assert check_call.args[0][1:] == ["-c", "-f", "-"]
+        assert Path(check_call.args[0][0]).is_absolute()
+        assert apply_call.args[0][1:] == ["-f", "-"]
+        assert Path(apply_call.args[0][0]).is_absolute()
         # Both calls receive the SAME script via stdin.
         assert check_call.kwargs["input"] == script
         assert apply_call.kwargs["input"] == script
