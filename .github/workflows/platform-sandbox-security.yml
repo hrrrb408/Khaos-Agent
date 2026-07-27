@@ -329,14 +329,20 @@ jobs:
       - name: Build inner browser launcher (Rust)
         run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
       - name: Harden browser launcher ownership (root-owned, like Chromium)
-        # Batch 9.3 (round-9 §十二): the TCB validation requires the
-        # launcher binary be owned by the UID that runs it (root in the
-        # fullstack test).  cargo builds as the runner user (uid 1001);
-        # chown to root + strip group/other write so the runtime TCB
-        # invariant holds, mirroring the Chromium runtime hardening below.
+        # Batch 9.3 + 11.3: the TCB validation requires the launcher
+        # binary AND its parent directory chain be owned by the UID that
+        # runs it (root in the fullstack test).  cargo builds under
+        # /home/runner (uid 1001); copy the binary to /usr/local/bin
+        # (root-owned directory chain) so the parent-chain validation
+        # passes when the test runs as root.
         run: |
-          sudo chown root:root rust/khaos-core/target/release/khaos-sandbox-launcher
-          sudo chmod go-w rust/khaos-core/target/release/khaos-sandbox-launcher
+          sudo cp rust/khaos-core/target/release/khaos-sandbox-launcher /usr/local/bin/khaos-sandbox-launcher
+          sudo chown root:root /usr/local/bin/khaos-sandbox-launcher
+          sudo chmod 0755 /usr/local/bin/khaos-sandbox-launcher
+          # Batch 11.3: tighten parent-directory permissions (Ubuntu runners
+          # default several system dirs to 0777) so the parent-chain
+          # validation accepts the launcher + Chromium runtime paths.
+          sudo chmod 0755 /usr/local/bin /usr/local /opt
       - name: Install test + browser dependencies
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
@@ -359,7 +365,10 @@ jobs:
           KHAOS_RUN_BROWSER_E2E: "1"
           KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser/workloads
-          KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
+          # Batch 11.3: point to the root-owned copy in /usr/local/bin so
+          # the parent-chain validation (root-owned /usr/local/bin → /usr/
+          # local → /usr → /) passes when the test runs as root.
+          KHAOS_SANDBOX_LAUNCHER: /usr/local/bin/khaos-sandbox-launcher
           PLAYWRIGHT_BROWSERS_PATH: /opt/khaos-playwright
           # Batch 9.1 (round-9 §九): inject a parent-process secret that
           # MUST NOT reach Chromium's environment.  The negative-secrecy

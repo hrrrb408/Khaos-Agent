@@ -124,6 +124,12 @@ class ProcessSupervisor:
         )
         status = "failed"
         diagnostics: dict[str, object] = {}
+        # Batch 11.6 (round-11 §十): track the race tasks so the finally
+        # block can cancel + await them on every exit path (including
+        # CancelledError).  Without this, a cancelled long-timeout run
+        # leaves the deadline sleep task alive until its original deadline.
+        process_wait_task: asyncio.Task[int] | None = None
+        deadline_task: asyncio.Task[None] | None = None
         try:
             try:
                 # Batch 10.1 (round-10 §四): replace the returncode-based
@@ -141,7 +147,6 @@ class ProcessSupervisor:
                     request.permission_profile.resources.timeout_seconds
                 )
                 process_wait_task = asyncio.create_task(process.wait())
-                deadline_task: asyncio.Task[None] | None = None
                 if timeout_seconds is not None:
                     deadline_task = asyncio.create_task(
                         asyncio.sleep(timeout_seconds)
@@ -199,8 +204,19 @@ class ProcessSupervisor:
             stdout, stdout_total = await stdout_task
             stderr, stderr_total = await stderr_task
         finally:
+            # Batch 11.6: cancel + await ALL race tasks on every exit
+            # path so no pending task outlives run().  This closes the
+            # leak where a cancelled long-timeout run left the deadline
+            # sleeper alive until its original deadline.
+            pending_tasks = [t for t in (process_wait_task, deadline_task) if t is not None]
+            for t in pending_tasks:
+                if not t.done():
+                    t.cancel()
+            if pending_tasks:
+                await asyncio.gather(*pending_tasks, return_exceptions=True)
             if not watchdog_task.done():
                 watchdog_task.cancel()
+                await asyncio.gather(watchdog_task, return_exceptions=True)
             await self._unregister(execution_id, active)
 
         diagnostics.update(

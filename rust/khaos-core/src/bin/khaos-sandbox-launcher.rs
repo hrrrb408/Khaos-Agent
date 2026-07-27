@@ -4,7 +4,7 @@
 mod linux {
     use std::env;
     use std::ffi::CString;
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
@@ -436,11 +436,21 @@ mod linux {
                 .ok()
                 .filter(|s| !s.is_empty());
             // Batch 9.3 (round-9 §十二): use the validated absolute bubblewrap
-            // path supplied by Python instead of relying on PATH lookup
-            // (which a pre-sandbox attacker could hijack).
-            let bwrap_exe = env::var_os("KHAOS_BROWSER_BWRAP_PATH")
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "bwrap".into());
+            // Batch 11.3 (round-11 §六): bwrap MUST be supplied by Python
+            // via KHAOS_BROWSER_BWRAP_PATH (validated absolute path).  The
+            // old fallback to a bare "bwrap" PATH lookup allowed a
+            // pre-sandbox attacker to hijack bubblewrap.  Now a missing
+            // env var is a hard error (the Python side is responsible for
+            // resolving + validating bwrap before launching).
+            let bwrap_exe = match env::var_os("KHAOS_BROWSER_BWRAP_PATH") {
+                Some(path) if !path.is_empty() => path,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "KHAOS_BROWSER_BWRAP_PATH not set — bubblewrap absolute path required (no PATH fallback)",
+                    ));
+                }
+            };
 
             // Batch 9.2: sensitive host paths that must NEVER be readable
             // from inside the browser namespace, regardless of the ro-bind
@@ -453,6 +463,23 @@ mod linux {
                 "/var/lib",
             ];
 
+            // Batch 11.5 (round-11 §八): EMPTY-ROOT ALLOWLIST.  Previously
+            // the namespace used --ro-bind / / (default-allow entire host)
+            // then masked known-sensitive paths.  This left /etc, /opt,
+            // custom project roots, etc. readable by a compromised Chromium.
+            // Now we start from an EMPTY root and only --ro-bind the
+            // specific runtime trees Chromium needs.  Project roots, /home,
+            // /root, /workspace, /srv, /data, /mnt, /var/lib are NOT mounted
+            // → default-deny.
+            let allowlist_ro_binds: [&str; 6] = [
+                "/usr",
+                "/lib",
+                "/lib64",
+                "/bin",
+                "/sbin",
+                "/etc",
+            ];
+
             let mut bwrap_args: Vec<std::ffi::OsString> = vec![
                 bwrap_exe,
                 "--die-with-parent".into(),
@@ -461,9 +488,16 @@ mod linux {
                 "--unshare-pid".into(),
                 "--unshare-ipc".into(),
                 "--unshare-uts".into(),
-                "--ro-bind".into(),
-                "/".into(),
-                "/".into(),
+            ];
+            // Mount only the allowlisted runtime trees (each must exist).
+            for path in allowlist_ro_binds {
+                if Path::new(path).is_dir() {
+                    bwrap_args.push("--ro-bind".into());
+                    bwrap_args.push(path.into());
+                    bwrap_args.push(path.into());
+                }
+            }
+            bwrap_args.extend([
                 "--dev".into(),
                 "/dev".into(),
                 "--proc".into(),
@@ -476,12 +510,10 @@ mod linux {
                 "/home".into(),
                 "--tmpfs".into(),
                 "/root".into(),
-            ];
+            ]);
             // Mask the resolved real home if it is not already covered by
             // the /home or /root tmpfs above.  Only mask paths that EXIST
-            // on the host: bwrap's --tmpfs requires the mount point to
-            // already exist (the ro-bind of / does not create missing dirs),
-            // and a non-existent path holds no secret to hide anyway.
+            // on the host.
             if let Some(home) = host_home.as_deref() {
                 let home_str = home.trim_end_matches('/');
                 let already_masked = home_str == "/home"
@@ -493,10 +525,9 @@ mod linux {
                     bwrap_args.push(home_str.into());
                 }
             }
-            // Mask the fixed sensitive host paths — only those that EXIST
-            // on the host (see rationale above).  A non-existent path has
-            // no secret to protect, and --tmpfs on a missing mount point
-            // fails with "Can't mkdir: Read-only file system".
+            // Batch 11.5: these paths are now default-deny (not in the
+            // allowlist) but we still mask them with tmpfs in case a future
+            // change re-adds a broader ro-bind.  Belt-and-suspenders.
             for path in sensitive_host_paths {
                 if Path::new(path).exists() {
                     bwrap_args.push("--tmpfs".into());
@@ -651,9 +682,33 @@ mod linux {
             let mut handle = stdout.lock();
             for path in &sentinel_paths {
                 let path_str = path.to_string_lossy();
-                match std::fs::read(path) {
-                    Ok(_) => {
-                        let _ = writeln!(handle, "{}\tREADABLE", path_str);
+                // Batch 11.6 (round-11 §九): use File::open + read 1 byte
+                // instead of std::fs::read (which slurps the whole file).
+                // The probe only needs to prove reachability — a huge
+                // file or special device must not cause memory/IO DoS.
+                match std::fs::File::open(path) {
+                    Ok(mut file) => {
+                        let mut byte = [0u8; 1];
+                        // read returns Ok(0) at EOF — for the probe, any
+                        // successful open+read (even 0 bytes) proves the
+                        // file is reachable.
+                        match file.read(&mut byte) {
+                            Ok(_n) => {
+                                // Any successful read (even 0 bytes at EOF)
+                                // proves the file is reachable.
+                                let _ = writeln!(handle, "{}\tREADABLE", path_str);
+                            }
+                            Err(error) => {
+                                let kind = error.raw_os_error().unwrap_or(0);
+                                let label = match kind {
+                                    libc::ENOENT => "ENOENT",
+                                    libc::EACCES => "EACCES",
+                                    libc::ENOTDIR => "ENOTDIR",
+                                    _ => "BLOCKED",
+                                };
+                                let _ = writeln!(handle, "{}\t{}", path_str, label);
+                            }
+                        }
                     }
                     Err(error) => {
                         let kind = error.raw_os_error().unwrap_or(0);

@@ -257,7 +257,7 @@ class TestTeardownResult:
         # Make _run_command raise for nft delete but succeed for others.
         from khaos.security.browser_sandbox import _run_command as real_rc
 
-        def fake_rc(cmd, desc):
+        def fake_rc(cmd, desc, *, validate=False):
             if "nft" in " ".join(cmd):
                 raise OSError("nft delete failed")
 

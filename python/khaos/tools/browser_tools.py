@@ -120,6 +120,13 @@ class BrowserManager:
     可被独立实例化（例如测试场景）。
     """
 
+    # Batch 11.6 (round-11 §十二): cap the number of concurrent browser
+    # contexts per Chromium process generation.  Each context owns a
+    # BrowserContext, Page, egress proxy socket, and an nft egress-pin
+    # port.  Without a cap an authenticated principal could exhaust
+    # resources by creating unbounded (session, runtime) tuples.
+    MAX_CONTEXTS_PER_GENERATION = 32
+
     def __init__(self):
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -177,6 +184,12 @@ class BrowserManager:
         # retry must never bypass setup and launch Chromium directly.
         self._sandbox_generation_failed: bool = False
         self._quarantined_sandboxes: list[BrowserNetworkSandbox] = []
+        # Batch 11.2 (round-11 §五): context-creation rollback failures
+        # retain the proxy/context (to prevent port reuse).  These
+        # retained resources are recorded here so close() can enumerate
+        # and retry their cleanup — without this they leak because they
+        # were never published to _contexts.
+        self._quarantined_context_transactions: list[dict[str, Any]] = []
         # Round 8: a Chromium process generation is leased to exactly one
         # authenticated principal. BrowserContext isolation is useful for
         # sessions, but it is not a process-security boundary: a compromised
@@ -607,6 +620,11 @@ class BrowserManager:
                 "to browser/playwright/sandbox teardown (some proxies "
                 "or nft ports may leak)", exc,
             )
+        # Batch 11.2: retry cleanup of retained rollback-failure transactions.
+        try:
+            await self._cleanup_quarantined_transactions()
+        except Exception as exc:  # noqa: BLE001 — degraded-path cleanup
+            logger.error("force-close: quarantine cleanup raised: %s", exc)
         # Step 2: stop the browser + playwright runtime.
         if self._browser is not None:
             try:
@@ -714,6 +732,9 @@ class BrowserManager:
             self._close_failed = False
             try:
                 await self._close_all_contexts()
+                # Batch 11.2: retry cleanup of any retained rollback-failure
+                # transactions (proxy/context/port not in _contexts).
+                await self._cleanup_quarantined_transactions()
                 if self._browser:
                     await self._browser.close()
                 if self._playwright:
@@ -865,6 +886,18 @@ class BrowserManager:
         if self._closing_requested:
             self._last_ensure_error = "browser manager is permanently closed"
             return None
+        # Batch 11.2 (round-11 §五): a quarantined generation must reject
+        # ALL browser operations — including reuse of an existing page.
+        # Previously _sandbox_generation_failed was only checked in
+        # _launch_locked, so an existing context could still be served
+        # after a rollback failure, and new contexts could be created as
+        # long as _browser was non-None (bypassing the launch gate).
+        if self._sandbox_generation_failed:
+            self._last_ensure_error = (
+                "browser generation is quarantined after a failed context "
+                "rollback; close this manager before retrying"
+            )
+            return None
         if (
             self._process_principal is not None
             and self._process_principal != principal_id
@@ -888,6 +921,16 @@ class BrowserManager:
             entry["refcount"] = int(entry.get("refcount", 0)) + 1
             return entry["page"]
         # Need to create a new context for this session.
+        # Batch 11.6 (round-11 §十二): enforce a per-generation context
+        # cap so a principal cannot exhaust proxy sockets / nft ports by
+        # creating unbounded (session, runtime) tuples.
+        if len(self._contexts) >= self.MAX_CONTEXTS_PER_GENERATION:
+            self._last_ensure_error = (
+                f"browser context limit reached "
+                f"({self.MAX_CONTEXTS_PER_GENERATION}); close existing "
+                f"runtimes before creating new ones"
+            )
+            return None
         if self._browser is None:
             result = await self._launch_locked()
             if not result.get("ok"):
@@ -1066,6 +1109,12 @@ class BrowserManager:
         (do not close it) and quarantine the generation — a stale-open
         kernel rule is safer than a stale-closed one, and the proxy
         keeping the port prevents a host process from rebinding it.
+
+        Batch 11.2 (round-11 §五): the retained proxy/context/port are
+        recorded in ``_quarantined_context_transactions`` so ``close()``
+        can enumerate and retry their cleanup.  Without this the retained
+        objects were unreachable (never published to ``_contexts``) and
+        leaked for the process lifetime.
         """
         if pin_installed and egress_port is not None:
             sandbox = self._browser_sandbox
@@ -1081,6 +1130,13 @@ class BrowserManager:
                         "quarantining browser generation", egress_port, exc,
                     )
                     self._sandbox_generation_failed = True
+                    # Record the retained resources so close() can retry.
+                    self._quarantined_context_transactions.append({
+                        "egress_proxy": egress_proxy,
+                        "context": context,
+                        "egress_port": egress_port,
+                        "pin_installed": pin_installed,
+                    })
                     return
         if context is not None:
             try:
@@ -1091,6 +1147,44 @@ class BrowserManager:
             await egress_proxy.close()
         except Exception as exc:  # noqa: BLE001 — best-effort cleanup
             logger.debug("rollback: egress_proxy.close() failed: %s", exc)
+
+    async def _cleanup_quarantined_transactions(self) -> None:
+        """Batch 11.2 (round-11 §五): retry cleanup of context-creation
+        rollback failures whose proxy/context/port were retained.
+
+        Called from close()/force-close to ensure retained resources do
+        not leak.  For each retained transaction: retry remove_egress_port
+        (the pin may now be removable), then close the context and proxy.
+        Best-effort: failures are logged but do not abort close() (we are
+        already in teardown).
+        """
+        if not self._quarantined_context_transactions:
+            return
+        sandbox = self._browser_sandbox
+        for tx in self._quarantined_context_transactions:
+            port = tx.get("egress_port")
+            pin_installed = tx.get("pin_installed", False)
+            if pin_installed and port is not None and sandbox is not None and sandbox.is_active:
+                try:
+                    await asyncio.to_thread(sandbox.remove_egress_port, port)
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.debug(
+                        "quarantine cleanup: remove_egress_port(%s) failed: %s",
+                        port, exc,
+                    )
+            ctx = tx.get("context")
+            if ctx is not None:
+                try:
+                    await ctx.close()
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.debug("quarantine cleanup: context.close() failed: %s", exc)
+            proxy = tx.get("egress_proxy")
+            if proxy is not None:
+                try:
+                    await proxy.close()
+                except Exception as exc:  # noqa: BLE001 — best-effort
+                    logger.debug("quarantine cleanup: proxy.close() failed: %s", exc)
+        self._quarantined_context_transactions.clear()
 
     async def _install_route_guard(self, context: Any, guard: Any) -> None:
         """B2: install ``context.route("**/*", ...)`` to enforce the

@@ -284,7 +284,9 @@ def test_6_2_d_apply_nft_script_rejects_malformed_script_in_production():
     """
     with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
          patch("khaos.security.browser_sandbox.shutil.which",
-               return_value="/usr/sbin/nft"):
+               return_value="/usr/sbin/nft"), \
+         patch("khaos.security.browser_sandbox._validate_tcb_binary"), \
+         patch("khaos.security.browser_sandbox._tcb_tool_cache", {}):
         # The check fails.
         mock_run.side_effect = [
             MagicMock(returncode=1, stderr="syntax error", stdout=""),
@@ -319,7 +321,9 @@ def test_6_2_d_apply_nft_script_apply_failure_in_production_raises():
     """
     with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
          patch("khaos.security.browser_sandbox.shutil.which",
-               return_value="/usr/sbin/nft"):
+               return_value="/usr/sbin/nft"), \
+         patch("khaos.security.browser_sandbox._validate_tcb_binary"), \
+         patch("khaos.security.browser_sandbox._tcb_tool_cache", {}):
         mock_run.side_effect = [
             MagicMock(returncode=0, stderr="", stdout=""),  # check ok
             MagicMock(returncode=1, stderr="permission denied", stdout=""),
