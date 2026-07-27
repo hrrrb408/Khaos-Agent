@@ -56,6 +56,7 @@ mod linux {
 
     /// Minimal JSON field extraction (avoids a serde dependency for the
     /// helper's tiny protocol).  Returns the value for ``key`` or None.
+    #[allow(clippy::manual_strip, clippy::manual_pattern_char_comparison)]
     fn json_field(json: &str, key: &str) -> Option<String> {
         let needle = format!("\"{key}\"");
         let idx = json.find(&needle)?;
@@ -63,15 +64,14 @@ mod linux {
         let colon = after.find(':')?;
         let rest = &after[colon + 1..];
         let trimmed = rest.trim_start();
-        if trimmed.starts_with('"') {
+        if let Some(stripped) = trimmed.strip_prefix('"') {
             // string value
-            let start = 1;
-            let end = trimmed[1..].find('"')? + 1;
-            Some(trimmed[start..end].to_string())
+            let end = stripped.find('"')?;
+            Some(stripped[..end].to_string())
         } else {
             // numeric / bare value up to comma/brace
             let end = trimmed
-                .find(|c: char| c == ',' || c == '}')
+                .find([',', '}'])
                 .unwrap_or(trimmed.len());
             Some(trimmed[..end].trim().to_string())
         }
@@ -88,14 +88,11 @@ mod linux {
     fn run(argv: &[&str]) -> io::Result<()> {
         let output = Command::new("ip").args(&argv[1..]).output()?;
         if !output.status.success() {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!(
-                    "{} failed: {}",
-                    argv.join(" "),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-            ));
+            return Err(io::Error::other(format!(
+                "{} failed: {}",
+                argv.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
         Ok(())
     }
