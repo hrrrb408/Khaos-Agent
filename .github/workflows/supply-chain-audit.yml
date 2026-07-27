@@ -42,22 +42,22 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-      - name: Install uv + pip-audit
-        # Batch 9.7b (round-9 §二十一): uv is installed via the hash-pinned
-        # bootstrap-requirements.txt (it is a single Rust binary with no
-        # Python deps, so hash verification is complete).  pip-audit is
-        # installed separately WITHOUT --require-hashes here because it has
-        # a heavy transitive dependency tree (CacheControl, cyclonedx, …)
-        # that would need its own hash pinning.  pip-audit is the AUDIT
-        # TOOL, not the trust root — the trust root for business deps is
-        # pip-audit's own --require-hashes check on requirements-lock.txt
-        # below.  pip-audit itself is version-pinned so a swapped same-
-        # version wheel is the only residual risk (acceptable for the
-        # audit tool, which does not influence what gets installed into
-        # production).
+      - name: Install uv + pip-audit (hash-locked)
+        # Batch 10.7 (round-10 §十一): pip-audit is now hash-locked via
+        # audit-requirements.txt (generated with `uv pip compile
+        # --generate-hashes`).  A compromised PyPI mirror that swaps the
+        # same-version pip-audit wheel (or any of its 28 transitive deps)
+        # is now refused by pip --require-hashes.  This closes the
+        # 'Security Evidence Trust Root' gap: pip-audit decides whether
+        # the required 'pip-audit (Python)' check is green or red, so a
+        # swapped tool could hide real CVEs.
+        #
+        # To refresh the lock: uv pip compile --generate-hashes
+        # --python-version 3.11 -o python/audit-requirements.txt
+        # pip-audit==<version>
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
-          python -m pip install pip-audit==2.10.0
+          python -m pip install --require-hashes -r python/audit-requirements.txt
       - name: Audit Python dependencies
         run: |
           uv export --frozen --all-extras --no-dev --no-emit-project \

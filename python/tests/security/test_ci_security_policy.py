@@ -206,12 +206,25 @@ def test_bootstrap_toolchain_is_hash_verified():
             f"use 'pip install --require-hashes -r "
             f"python/bootstrap-requirements.txt' instead"
         )
-    # pip-audit is the AUDIT TOOL (not the trust root).  It has a heavy
-    # transitive dependency tree that cannot be practically hash-pinned,
-    # and its own --require-hashes check on requirements-lock.txt is the
-    # real trust root for business dependencies.  It may be installed
-    # bare ONLY in the supply-chain-audit workflow, version-pinned.
-    audit = (WORKFLOWS / "supply-chain-audit.yml").read_text("utf-8")
-    assert "pip-audit==2.10.0" in audit, (
-        "supply-chain-audit.yml must pin pip-audit to a fixed version"
+    # Batch 10.7 (round-10 §十一): pip-audit is the Security Evidence
+    # Trust Root — it decides whether the required 'pip-audit (Python)'
+    # check is green or red.  It MUST be hash-locked (with its full
+    # transitive dependency tree) via audit-requirements.txt.  No workflow
+    # may install pip-audit bare (without --require-hashes).
+    audit_lock = ROOT / "python" / "audit-requirements.txt"
+    assert audit_lock.exists(), (
+        "python/audit-requirements.txt is missing — pip-audit has no "
+        "hash-pinned trust root"
     )
+    audit_lock_text = audit_lock.read_text("utf-8")
+    assert "pip-audit==2.10.0" in audit_lock_text and "--hash=sha256:" in audit_lock_text, (
+        "audit-requirements.txt must pin pip-audit with sha256 hashes "
+        "(including transitive deps)"
+    )
+    for workflow in _workflow_files():
+        wt = workflow.read_text("utf-8")
+        assert "pip install pip-audit==" not in wt, (
+            f"{workflow.name} installs pip-audit without --require-hashes: "
+            f"use 'pip install --require-hashes -r "
+            f"python/audit-requirements.txt' instead"
+        )
