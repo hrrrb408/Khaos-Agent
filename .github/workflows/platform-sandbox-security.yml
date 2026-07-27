@@ -339,6 +339,9 @@ jobs:
           sudo cp rust/khaos-core/target/release/khaos-sandbox-launcher /usr/local/bin/khaos-sandbox-launcher
           sudo chown root:root /usr/local/bin/khaos-sandbox-launcher
           sudo chmod 0755 /usr/local/bin/khaos-sandbox-launcher
+          # Batch 11.3: tighten /usr/local/bin permissions (Ubuntu runners
+          # default it to 0777) so the parent-chain validation accepts it.
+          sudo chmod 0755 /usr/local/bin /usr/local
       - name: Install test + browser dependencies
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
