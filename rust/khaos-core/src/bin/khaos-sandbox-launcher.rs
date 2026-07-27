@@ -693,7 +693,9 @@ mod linux {
                         // successful open+read (even 0 bytes) proves the
                         // file is reachable.
                         match file.read(&mut byte) {
-                            Ok(_) => {
+                            Ok(_n) => {
+                                // Any successful read (even 0 bytes at EOF)
+                                // proves the file is reachable.
                                 let _ = writeln!(handle, "{}\tREADABLE", path_str);
                             }
                             Err(error) => {
