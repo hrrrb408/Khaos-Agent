@@ -463,6 +463,23 @@ mod linux {
                 "/var/lib",
             ];
 
+            // Batch 11.5 (round-11 §八): EMPTY-ROOT ALLOWLIST.  Previously
+            // the namespace used --ro-bind / / (default-allow entire host)
+            // then masked known-sensitive paths.  This left /etc, /opt,
+            // custom project roots, etc. readable by a compromised Chromium.
+            // Now we start from an EMPTY root and only --ro-bind the
+            // specific runtime trees Chromium needs.  Project roots, /home,
+            // /root, /workspace, /srv, /data, /mnt, /var/lib are NOT mounted
+            // → default-deny.
+            let allowlist_ro_binds: [&str; 6] = [
+                "/usr",
+                "/lib",
+                "/lib64",
+                "/bin",
+                "/sbin",
+                "/etc",
+            ];
+
             let mut bwrap_args: Vec<std::ffi::OsString> = vec![
                 bwrap_exe,
                 "--die-with-parent".into(),
@@ -471,9 +488,16 @@ mod linux {
                 "--unshare-pid".into(),
                 "--unshare-ipc".into(),
                 "--unshare-uts".into(),
-                "--ro-bind".into(),
-                "/".into(),
-                "/".into(),
+            ];
+            // Mount only the allowlisted runtime trees (each must exist).
+            for path in allowlist_ro_binds {
+                if Path::new(path).is_dir() {
+                    bwrap_args.push("--ro-bind".into());
+                    bwrap_args.push(path.into());
+                    bwrap_args.push(path.into());
+                }
+            }
+            bwrap_args.extend([
                 "--dev".into(),
                 "/dev".into(),
                 "--proc".into(),
@@ -486,12 +510,10 @@ mod linux {
                 "/home".into(),
                 "--tmpfs".into(),
                 "/root".into(),
-            ];
+            ]);
             // Mask the resolved real home if it is not already covered by
             // the /home or /root tmpfs above.  Only mask paths that EXIST
-            // on the host: bwrap's --tmpfs requires the mount point to
-            // already exist (the ro-bind of / does not create missing dirs),
-            // and a non-existent path holds no secret to hide anyway.
+            // on the host.
             if let Some(home) = host_home.as_deref() {
                 let home_str = home.trim_end_matches('/');
                 let already_masked = home_str == "/home"
@@ -503,10 +525,9 @@ mod linux {
                     bwrap_args.push(home_str.into());
                 }
             }
-            // Mask the fixed sensitive host paths — only those that EXIST
-            // on the host (see rationale above).  A non-existent path has
-            // no secret to protect, and --tmpfs on a missing mount point
-            // fails with "Can't mkdir: Read-only file system".
+            // Batch 11.5: these paths are now default-deny (not in the
+            // allowlist) but we still mask them with tmpfs in case a future
+            // change re-adds a broader ro-bind.  Belt-and-suspenders.
             for path in sensitive_host_paths {
                 if Path::new(path).exists() {
                     bwrap_args.push("--tmpfs".into());
