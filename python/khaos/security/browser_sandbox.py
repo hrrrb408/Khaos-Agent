@@ -157,11 +157,20 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
     # binary.  A writable parent allows rename-over even when the binary
     # itself is root-owned.
     _validate_parent_chain(resolved, label=label)
+    # Resolve symlinks to the real binary (usrmerge systems symlink
+    # /usr/sbin/ip → /usr/bin/ip; the symlink is root-owned and safe).
+    # O_NOFOLLOW is then applied to the RESOLVED path.
+    try:
+        real_path = os.path.realpath(str(resolved))
+    except OSError as exc:
+        raise BrowserSandboxError(
+            f"{label} {path}: realpath resolution failed: {exc}"
+        ) from exc
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        fd = os.open(str(resolved), flags)
+        fd = os.open(real_path, flags)
     except OSError as exc:
         raise BrowserSandboxError(
             f"{label} {path}: secure open failed: {exc}"
@@ -205,14 +214,24 @@ def _validate_parent_chain(path: Path, *, label: str) -> None:
     if not hasattr(os, "getuid"):
         return  # non-POSIX
     current_uid = os.getuid()
+    # Resolve symlinks first so the chain walks the real directory tree
+    # (usrmerge systems symlink /sbin → /usr/sbin).
+    try:
+        real = os.path.realpath(str(path))
+    except OSError:
+        real = str(path)
     # Walk from the immediate parent up to (but not including) the root.
     # The root '/' is conventionally root:root 0755 and always trusted.
-    parts = path.resolve().parts[1:-1]  # drop leading '/' and the filename
+    parts = Path(real).resolve().parts[1:-1]  # drop leading '/' and filename
     current = Path("/")
     for component in parts:
         current = current / component
         try:
-            info = current.lstat()
+            # Use stat (follows symlinks) for directories in the chain —
+            # usrmerge systems symlink /sbin → /usr/sbin, /bin → /usr/bin,
+            # etc.  These root-owned symlinks are safe; the final binary
+            # is protected by O_NOFOLLOW on its resolved path.
+            info = current.stat()
         except OSError as exc:
             raise BrowserSandboxError(
                 f"{label}: cannot stat parent directory {current}: {exc}"

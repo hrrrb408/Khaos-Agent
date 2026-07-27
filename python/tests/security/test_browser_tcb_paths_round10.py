@@ -81,19 +81,19 @@ def test_production_rejects_group_writable_ip(monkeypatch, tmp_path) -> None:
         _resolve_tcb_tool("ip", validate=True)
 
 
-def test_production_rejects_symlink_ip(monkeypatch, tmp_path) -> None:
-    """Production rejects a symlink ip binary (O_NOFOLLOW)."""
+def test_production_rejects_symlink_to_group_writable_ip(monkeypatch, tmp_path) -> None:
+    """Production rejects a symlink whose target is group-writable."""
     monkeypatch.setattr(
         "khaos.security.browser_sandbox._tcb_tool_cache", {}
     )
-    target = _make_binary(tmp_path / "real-ip")
+    target = _make_binary(tmp_path / "real-ip", mode=0o774)  # group-writable
     link = tmp_path / "ip"
     link.symlink_to(target)
     monkeypatch.setattr(
         "khaos.security.browser_sandbox.shutil.which",
         lambda name: str(link) if name == "ip" else None,
     )
-    with pytest.raises(BrowserSandboxError, match="secure open failed"):
+    with pytest.raises(BrowserSandboxError, match="group/other writable"):
         _resolve_tcb_tool("ip", validate=True)
 
 

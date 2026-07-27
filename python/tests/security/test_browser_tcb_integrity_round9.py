@@ -61,11 +61,25 @@ def test_validate_rejects_other_writable(tmp_path) -> None:
         _validate_tcb_binary(str(binary), label="test")
 
 
-def test_validate_rejects_symlink(tmp_path) -> None:
+def test_validate_resolves_safe_symlink_to_trusted_target(tmp_path) -> None:
+    """Batch 11.3: a symlink to a trusted (owner, mode) binary is accepted.
+
+    System package managers symlink /usr/sbin/ip → /usr/bin/ip (usrmerge).
+    These root-owned symlinks are safe; the resolved target is validated.
+    """
     target = _make_binary(tmp_path / "real-launcher", mode=0o755)
     link = tmp_path / "launcher-link"
     link.symlink_to(target)
-    with pytest.raises(BrowserSandboxError, match="secure open failed"):
+    # Should NOT raise — the symlink resolves to a trusted target.
+    _validate_tcb_binary(str(link), label="test")
+
+
+def test_validate_rejects_symlink_to_group_writable(tmp_path) -> None:
+    """A symlink to a group-writable binary is rejected after resolution."""
+    target = _make_binary(tmp_path / "real-launcher", mode=0o774)
+    link = tmp_path / "launcher-link"
+    link.symlink_to(target)
+    with pytest.raises(BrowserSandboxError, match="group/other writable"):
         _validate_tcb_binary(str(link), label="test")
 
 
@@ -106,9 +120,9 @@ def test_production_rejects_group_writable_launcher(monkeypatch, tmp_path) -> No
         sandbox._locate_and_validate_browser_launcher()
 
 
-def test_production_rejects_symlink_launcher(monkeypatch, tmp_path) -> None:
-    """Production rejects a symlink launcher (O_NOFOLLOW)."""
-    target = _make_binary(tmp_path / "real", mode=0o755)
+def test_production_rejects_symlink_to_group_writable_launcher(monkeypatch, tmp_path) -> None:
+    """Production rejects a symlink whose target is group-writable."""
+    target = _make_binary(tmp_path / "real", mode=0o774)  # group-writable
     link = tmp_path / "launcher-link"
     link.symlink_to(target)
     sandbox = _active_sandbox(monkeypatch, require_os_sandbox=True)
@@ -116,7 +130,7 @@ def test_production_rejects_symlink_launcher(monkeypatch, tmp_path) -> None:
         BrowserNetworkSandbox, "_locate_browser_launcher",
         staticmethod(lambda: str(link)),
     )
-    with pytest.raises(BrowserSandboxError, match="secure open failed"):
+    with pytest.raises(BrowserSandboxError, match="group/other writable"):
         sandbox._locate_and_validate_browser_launcher()
 
 
@@ -189,7 +203,7 @@ def test_validate_rejects_other_owned_parent(tmp_path, monkeypatch) -> None:
     parent.mkdir(mode=0o755)
     binary = _make_binary(parent / "launcher", mode=0o755)
     # Mock the parent's owner to a different uid.
-    real_lstat = Path.lstat
+    real_stat = Path.stat
 
     class _FakeStat:
         def __init__(self, real):
@@ -200,12 +214,12 @@ def test_validate_rejects_other_owned_parent(tmp_path, monkeypatch) -> None:
             self.st_ino = real.st_ino
             self.st_dev = real.st_dev
 
-    def fake_lstat(self):
-        real = real_lstat(self)
+    def fake_stat(self):
+        real = real_stat(self)
         if self == parent:
             return _FakeStat(real)
         return real
 
-    monkeypatch.setattr(Path, "lstat", fake_lstat)
+    monkeypatch.setattr(Path, "stat", fake_stat)
     with pytest.raises(BrowserSandboxError, match="owner.*neither current uid.*nor root"):
         _validate_tcb_binary(str(binary), label="test")
