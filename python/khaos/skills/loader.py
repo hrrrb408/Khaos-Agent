@@ -289,8 +289,10 @@ class SkillLoader:
         for path in sorted(top_level, key=lambda p: p.name):
             yield path
         # Subdirectory skills: <root>/<name>/SKILL.md
-        # Batch 11.7: cap the number of subdirectories descended into.
-        subdirs_to_scan = subdirs[:MAX_SKILL_SUBDIRECTORIES]
+        # Batch 12.3 (round-12 §十三): sort subdirectories BEFORE truncating
+        # so the cap is deterministic regardless of filesystem iteration order.
+        subdirs_sorted = sorted(subdirs, key=lambda p: p.name)
+        subdirs_to_scan = subdirs_sorted[:MAX_SKILL_SUBDIRECTORIES]
         if len(subdirs) > MAX_SKILL_SUBDIRECTORIES:
             logger.warning(
                 "skill root %s has %d subdirectories; only scanning first %d",

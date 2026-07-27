@@ -25,11 +25,21 @@ const browserSessionTTL = 15 * time.Minute
 // epoch counter.  Each issued cookie embeds the current epoch; validating
 // rejects any cookie whose epoch is older than the current value.
 // RevokeAllSessions atomically bumps the epoch, invalidating every
-// outstanding cookie without storing per-session state.  The epoch is
-// reset to 0 on gateway restart (acceptable — a restart already
-// invalidates in-memory state and the master key rotation is the
-// nuclear option).
+// outstanding cookie without storing per-session state.
 var sessionEpoch atomic.Uint64
+
+// Batch 12.4 (round-12 §十一): per-boot nonce generated at package init.
+// This ensures that a gateway restart invalidates ALL outstanding cookies
+// even when the API key has not been rotated — the boot nonce changes on
+// every restart, so the HMAC signature no longer matches.
+var bootNonce = func() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Should never happen; fall back to a time-based value.
+		return fmt.Sprintf("%x", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b)
+}()
 
 // RevokeAllSessions invalidates every outstanding browser session cookie
 // by bumping the server-side epoch.  Outstanding cookies (carrying the
@@ -82,8 +92,10 @@ func SetBrowserSession(w http.ResponseWriter, r *http.Request, apiKey string) er
 	expires := time.Now().Add(browserSessionTTL)
 	// Batch 11.8: embed the current epoch so RevokeAllSessions can
 	// invalidate outstanding cookies by bumping it.
+	// Batch 12.4: embed the boot nonce so a gateway restart invalidates
+	// all outstanding cookies even without API key rotation.
 	epoch := sessionEpoch.Load()
-	payload := strconv.FormatInt(expires.Unix(), 10) + "." + strconv.FormatUint(epoch, 10) + "." + base64.RawURLEncoding.EncodeToString(nonce)
+	payload := strconv.FormatInt(expires.Unix(), 10) + "." + strconv.FormatUint(epoch, 10) + "." + bootNonce + "." + base64.RawURLEncoding.EncodeToString(nonce)
 	signature := signBrowserSession(payload, apiKey)
 	http.SetCookie(w, &http.Cookie{
 		Name:     browserSessionCookie,
@@ -104,12 +116,11 @@ func validBrowserSession(r *http.Request, apiKey string, now time.Time) bool {
 		return false
 	}
 	parts := strings.Split(cookie.Value, ".")
-	// Batch 11.8: payload is now expires.epoch.nonce (4 parts total
-	// including the signature).
-	if len(parts) != 4 {
-		// Fall back to the legacy 3-part format (pre-revocation cookies
-		// issued before a rolling deploy).  Reject — a rolling deploy
-		// effectively revokes all legacy sessions, which is acceptable.
+	// Batch 12.4: payload is now expires.epoch.bootNonce.nonce (5 parts
+	// total including the signature).
+	if len(parts) != 5 {
+		// Reject legacy formats (pre-boot-nonce cookies).  A rolling
+		// deploy effectively revokes all legacy sessions.
 		return false
 	}
 	expires, err := strconv.ParseInt(parts[0], 10, 64)
@@ -124,12 +135,16 @@ func validBrowserSession(r *http.Request, apiKey string, now time.Time) bool {
 	if cookieEpoch != sessionEpoch.Load() {
 		return false
 	}
-	payload := parts[0] + "." + parts[1] + "." + parts[2]
+	// Batch 12.4: reject cookies from a previous boot (gateway restarted).
+	if parts[2] != bootNonce {
+		return false
+	}
+	payload := parts[0] + "." + parts[1] + "." + parts[2] + "." + parts[3]
 	expected, err := base64.RawURLEncoding.DecodeString(signBrowserSession(payload, apiKey))
 	if err != nil {
 		return false
 	}
-	provided, err := base64.RawURLEncoding.DecodeString(parts[3])
+	provided, err := base64.RawURLEncoding.DecodeString(parts[4])
 	return err == nil && hmac.Equal(provided, expected)
 }
 

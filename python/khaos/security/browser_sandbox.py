@@ -1583,10 +1583,20 @@ class BrowserNetworkSandbox:
                 f"{result.stderr.strip()}"
             )
         outcomes: dict[str, str] = {}
+        # Batch 12.3 (round-12 §十四): validate each outcome belongs to
+        # the fixed enum so a buggy/corrupted probe cannot produce an
+        # unknown label that silently passes a negative test.
+        _valid_outcomes = {"READABLE", "ENOENT", "EACCES", "ENOTDIR", "BLOCKED"}
         for line in result.stdout.splitlines():
             parts = line.split("\t", 1)
             if len(parts) == 2:
                 outcomes[parts[0]] = parts[1]
+        invalid = {v for v in outcomes.values() if v not in _valid_outcomes}
+        if invalid:
+            raise BrowserSandboxError(
+                f"fs probe produced unknown outcome(s): {sorted(invalid)} "
+                f"(valid: {sorted(_valid_outcomes)})"
+            )
         # Batch 11.6: every requested path MUST have an outcome.  A
         # missing outcome means the probe is broken (false negative risk).
         missing = set(sentinel_paths) - set(outcomes.keys())
