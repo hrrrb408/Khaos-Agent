@@ -477,10 +477,12 @@ mod linux {
                 "/sbin",
             ];
             // Batch 12.6: minimal /etc files (not the whole tree).
-            let etc_files: [&str; 7] = [
+            let etc_files: [&str; 9] = [
                 "/etc/hosts",
+                "/etc/hostname",
                 "/etc/resolv.conf",
                 "/etc/nsswitch.conf",
+                "/etc/passwd",
                 "/etc/localtime",
                 "/etc/ssl/certs",
                 "/etc/ca-certificates",
