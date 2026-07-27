@@ -1401,6 +1401,51 @@ class BrowserNetworkSandbox:
             )
         return env
 
+    def run_fs_probe(
+        self, sentinel_paths: list[str], *, chromium_executable: str = "/bin/true",
+    ) -> dict[str, str]:
+        """Batch 10.5 (round-10 §八): run a mount-namespace secrecy probe.
+
+        Launches the Rust launcher with the SAME bwrap mount args used for
+        Chromium (same ``--tmpfs`` masks), but instead of exec-ing Chromium
+        it runs the ``--browser-fs-probe`` inner mode: for each sentinel
+        path it calls ``open(2)`` from inside the bubblewrap mount
+        namespace and reports ``READABLE`` / ``ENOENT`` / ``EACCES`` /
+        ``BLOCKED``.
+
+        This BYPASSES Playwright, Route Guard, and Web Security entirely
+        — a direct kernel-level proof of the mount mask.  The round-9
+        ``page.goto(file://)`` test could not distinguish "blocked by
+        Route Guard" from "blocked by mount namespace"; this probe can.
+
+        Returns a dict mapping each sentinel path to its outcome label.
+
+        Note: ``chromium_executable`` defaults to ``/bin/true`` because
+        the probe never execs Chromium — the launcher only needs a valid
+        parent directory to bind-mount.  ``/bin/true`` is always present
+        on Linux.
+        """
+        if not self._active or not self._netns_name:
+            raise BrowserSandboxError("browser sandbox is not active")
+        launcher = self._locate_and_validate_browser_launcher()
+        if launcher is None:
+            raise BrowserSandboxError("trusted Rust browser launcher required")
+        env = self.launcher_environment(chromium_executable)
+        env["KHAOS_BROWSER_FS_PROBE"] = ":".join(sentinel_paths)
+        result = subprocess.run(
+            [launcher],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        outcomes: dict[str, str] = {}
+        for line in result.stdout.splitlines():
+            parts = line.split("\t", 1)
+            if len(parts) == 2:
+                outcomes[parts[0]] = parts[1]
+        return outcomes
+
     def create_wrapper_script(
         self, real_executable: str, proxy_port: int,
     ) -> str | None:

@@ -536,8 +536,8 @@ mod linux {
                 "/tmp/khaos-home".into(),
                 // The inner image must not re-enter the privileged outer
                 // launch branch.  Strip all one-shot authority metadata at
-                // the namespace boundary; only the explicit --browser-inner
-                // argv contract continues into the read-only sandbox.
+                // the namespace boundary; only the explicit inner argv
+                // contract continues into the read-only sandbox.
                 "--unsetenv".into(),
                 "KHAOS_BROWSER_LAUNCH".into(),
                 "--unsetenv".into(),
@@ -550,16 +550,34 @@ mod linux {
                 "KHAOS_BROWSER_HOST_HOME".into(),
                 "--unsetenv".into(),
                 "KHAOS_BROWSER_BWRAP_PATH".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_FS_PROBE".into(),
                 "--".into(),
                 "/run/khaos-browser/launcher".into(),
-                "--browser-inner".into(),
-                "--".into(),
-                inner_real.into_os_string(),
             ]);
+            // Batch 10.5: if KHAOS_BROWSER_FS_PROBE is set (colon-separated
+            // sentinel paths), run the fs-probe inner mode instead of
+            // Chromium.  Same bwrap mount args → same mask → the probe
+            // observes the SAME mount-namespace view Chromium would.
+            let probe_paths = env::var("KHAOS_BROWSER_FS_PROBE").ok();
+            if let Some(paths) = probe_paths.as_deref() {
+                bwrap_args.push("--browser-fs-probe".into());
+                bwrap_args.push("--".into());
+                for path in paths.split(':') {
+                    if !path.is_empty() {
+                        bwrap_args.push(path.into());
+                    }
+                }
+            } else {
+                bwrap_args.push("--browser-inner".into());
+                bwrap_args.push("--".into());
+                bwrap_args.push(inner_real.into_os_string());
+            }
             bwrap_args.append(&mut args);
             if bwrap_args
                 .iter()
                 .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe")
+                && probe_paths.is_none()
             {
                 bridge_playwright_pipes_to_stdio().map_err(|error| {
                     io::Error::new(
@@ -603,6 +621,53 @@ mod linux {
             })?;
             return exec(&args)
                 .map_err(|error| io::Error::new(error.kind(), format!("exec Chromium: {error}")));
+        }
+
+        // Batch 10.5 (round-10 §八): filesystem secrecy probe mode.
+        //   --browser-fs-probe <sentinel_path> [<sentinel_path> ...]
+        // Runs INSIDE bubblewrap (re-exec'd by the outer launch branch
+        // with the same mount args that mask /home /root /workspace etc).
+        // For each sentinel path, attempts open(2) and reports the
+        // outcome on stdout as a line "PATH\tOK" or "PATH\tENOENT" (or
+        // the errno name).  Exit code 0 = all probes completed (regardless
+        // of readability); non-zero = probe error.  This bypasses
+        // Playwright/Route Guard/Web Security entirely — a direct
+        // mount-namespace open(2) proof.
+        if args.first().is_some_and(|arg| arg == "--browser-fs-probe") {
+            args.remove(0);
+            if args.first().is_some_and(|arg| arg == "--") {
+                args.remove(0);
+            }
+            let sentinel_paths: Vec<PathBuf> =
+                args.iter().map(PathBuf::from).collect();
+            // sanitize fds (no Playwright pipes needed for the probe).
+            sanitize_fds_except(&[]).map_err(|error| {
+                io::Error::new(error.kind(), format!("sanitize probe fds: {error}"))
+            })?;
+            install_seccomp().map_err(|error| {
+                io::Error::new(error.kind(), format!("install probe seccomp: {error}"))
+            })?;
+            let stdout = io::stdout();
+            let mut handle = stdout.lock();
+            for path in &sentinel_paths {
+                let path_str = path.to_string_lossy();
+                match std::fs::read(path) {
+                    Ok(_) => {
+                        let _ = writeln!(handle, "{}\tREADABLE", path_str);
+                    }
+                    Err(error) => {
+                        let kind = error.raw_os_error().unwrap_or(0);
+                        let label = match kind {
+                            libc::ENOENT => "ENOENT",
+                            libc::EACCES => "EACCES",
+                            libc::ENOTDIR => "ENOTDIR",
+                            _ => "BLOCKED",
+                        };
+                        let _ = writeln!(handle, "{}\t{}", path_str, label);
+                    }
+                }
+            }
+            return Ok(());
         }
 
         // Batch 7.4 (round-7 §十一): browser launcher mode.

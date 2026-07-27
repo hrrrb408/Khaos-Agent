@@ -151,9 +151,16 @@ async def test_chromium_environ_excludes_parent_secrets() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolved_home_not_readable_from_browser() -> None:
-    """High (§十): the resolved real home must not be readable from
-    inside Chromium's OWN mount namespace.
+async def test_route_guard_blocks_file_scheme_for_home() -> None:
+    """Route Guard proof (round-10 §八): the resolved real home ``file://``
+    URL must be blocked by the Route Guard's scheme allowlist.
+
+    NOTE (round-10): this test proves the Route Guard blocks ``file:``
+    scheme navigation — it does NOT prove the bubblewrap mount mask.
+    The mount-mask proof lives in test_browser_fs_probe_round10.py,
+    which calls ``open(2)`` directly inside the mount namespace,
+    bypassing Playwright/Route Guard.  Both tests are needed: this one
+    guards the Route Guard, the fs-probe guards the kernel mask.
 
     Batch 9.2 verification note: this MUST be observed from inside the
     Chromium process itself (via its Playwright page), NOT from an
@@ -212,8 +219,13 @@ async def test_resolved_home_not_readable_from_browser() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sensitive_host_paths_not_readable_from_browser(tmp_path) -> None:
-    """High (§十一): existing sensitive host paths must be masked.
+async def test_route_guard_blocks_file_scheme_for_sensitive_paths(tmp_path) -> None:
+    """Route Guard proof (round-10 §八): sensitive host paths' ``file://``
+    URLs must be blocked by the Route Guard's scheme allowlist.
+
+    NOTE (round-10): like the home test above, this proves the Route
+    Guard, NOT the mount mask.  The mount-mask proof lives in
+    test_browser_fs_probe_round10.py.
 
     Creates a sentinel under each sensitive path that EXISTS on the host
     and verifies none is readable from inside Chromium's OWN mount
