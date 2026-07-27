@@ -689,20 +689,22 @@ mod linux {
                 match std::fs::File::open(path) {
                     Ok(mut file) => {
                         let mut byte = [0u8; 1];
-                        match file.read(&mut byte) {
-                            Ok(_) => {
-                                let _ = writeln!(handle, "{}\tREADABLE", path_str);
-                            }
-                            Err(error) => {
-                                let kind = error.raw_os_error().unwrap_or(0);
-                                let label = match kind {
-                                    libc::ENOENT => "ENOENT",
-                                    libc::EACCES => "EACCES",
-                                    libc::ENOTDIR => "ENOTDIR",
-                                    _ => "BLOCKED",
-                                };
-                                let _ = writeln!(handle, "{}\t{}", path_str, label);
-                            }
+                        // read returns Ok(0) at EOF — for the probe, any
+                        // successful open+read (even 0 bytes) proves the
+                        // file is reachable.
+                        let _read_result = file.read(&mut byte);
+                        if _read_result.is_ok() {
+                            let _ = writeln!(handle, "{}\tREADABLE", path_str);
+                        } else {
+                            let error = _read_result.unwrap_err();
+                            let kind = error.raw_os_error().unwrap_or(0);
+                            let label = match kind {
+                                libc::ENOENT => "ENOENT",
+                                libc::EACCES => "EACCES",
+                                libc::ENOTDIR => "ENOTDIR",
+                                _ => "BLOCKED",
+                            };
+                            let _ = writeln!(handle, "{}\t{}", path_str, label);
                         }
                     }
                     Err(error) => {

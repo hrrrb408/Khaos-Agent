@@ -150,10 +150,8 @@ mod linux {
         // Validate the peer UID before reading any data.
         let uid = peer_uid(&stream)?;
         if uid != allowed_uid {
-            return stream
-                .write_all(br#"{"ok":false,"error":"peer uid not allowed"}"#)
-                .and_then(|_| Ok(()))
-                .or(Ok(()));
+            let _ = stream.write_all(br#"{"ok":false,"error":"peer uid not allowed"}"#);
+            return Ok(());
         }
         // Read a length-prefixed request.
         let mut len_buf = [0u8; 4];
