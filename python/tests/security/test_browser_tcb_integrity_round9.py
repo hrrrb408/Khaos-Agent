@@ -156,3 +156,56 @@ def test_launcher_environment_validates_chromium_in_production(
     )
     with pytest.raises(BrowserSandboxError, match="chromium runtime.*group/other writable"):
         sandbox.launcher_environment(str(chromium))
+
+
+# ---------------------------------------------------------------------------
+# Batch 11.3 (round-11 §六): parent directory chain validation.
+# ---------------------------------------------------------------------------
+
+def test_validate_rejects_binary_in_group_writable_parent(tmp_path) -> None:
+    """A root-owned binary in a group-writable parent directory must be
+    rejected — the parent's write bit allows rename-over."""
+    parent = tmp_path / "writable-parent"
+    parent.mkdir()
+    os.chmod(parent, 0o775)  # group-writable (explicit, umask-proof)
+    binary = _make_binary(parent / "launcher", mode=0o755)
+    with pytest.raises(BrowserSandboxError, match="parent directory.*group/other writable"):
+        _validate_tcb_binary(str(binary), label="test")
+
+
+def test_validate_accepts_binary_in_trusted_parent(tmp_path) -> None:
+    """A binary in a parent directory owned by the current uid with no
+    group/other write must be accepted."""
+    parent = tmp_path / "safe-parent"
+    parent.mkdir(mode=0o755)
+    binary = _make_binary(parent / "launcher", mode=0o755)
+    _validate_tcb_binary(str(binary), label="test")  # should not raise
+
+
+def test_validate_rejects_other_owned_parent(tmp_path, monkeypatch) -> None:
+    """A parent directory owned by a non-root, non-current-uid user is
+    rejected (untrusted directory chain)."""
+    parent = tmp_path / "other-owned"
+    parent.mkdir(mode=0o755)
+    binary = _make_binary(parent / "launcher", mode=0o755)
+    # Mock the parent's owner to a different uid.
+    real_lstat = Path.lstat
+
+    class _FakeStat:
+        def __init__(self, real):
+            self._real = real
+            self.st_mode = real.st_mode
+            self.st_uid = 99999  # not current uid, not root
+            self.st_size = real.st_size
+            self.st_ino = real.st_ino
+            self.st_dev = real.st_dev
+
+    def fake_lstat(self):
+        real = real_lstat(self)
+        if self == parent:
+            return _FakeStat(real)
+        return real
+
+    monkeypatch.setattr(Path, "lstat", fake_lstat)
+    with pytest.raises(BrowserSandboxError, match="owner.*neither current uid.*nor root"):
+        _validate_tcb_binary(str(binary), label="test")

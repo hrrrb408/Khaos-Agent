@@ -137,6 +137,13 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
     * symlink confusion — ``/usr/local/bin/bwrap`` is a symlink to an
       attacker-controlled location.
 
+    Batch 11.3 (round-11 §六): also validates the PARENT DIRECTORY CHAIN
+    up to the filesystem root.  A root-owned binary in a group-writable
+    directory can still be renamed-over by anyone with directory write
+    permission, defeating the per-file check.  Now every ancestor
+    directory must be owned by the current uid (or root, when running as
+    root) with no group/other write bit.
+
     Raises ``BrowserSandboxError`` on any violation.  The file is opened
     with ``O_NOFOLLOW`` so a trailing-symlink swap is rejected at the kernel
     level (the FD refers to the verified inode).
@@ -146,6 +153,10 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
         raise BrowserSandboxError(
             f"{label} path must be absolute, got {path!r}"
         )
+    # Batch 11.3: validate the parent directory chain BEFORE opening the
+    # binary.  A writable parent allows rename-over even when the binary
+    # itself is root-owned.
+    _validate_parent_chain(resolved, label=label)
     flags = os.O_RDONLY
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -173,6 +184,56 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
             )
     finally:
         os.close(fd)
+
+
+def _validate_parent_chain(path: Path, *, label: str) -> None:
+    """Validate that every ancestor directory of ``path`` is owned by the
+    current uid (or root, when running as root) with no group/other write.
+
+    Batch 11.3 (round-11 §六): a root-owned binary in a group-writable
+    parent directory can be renamed-over by anyone with directory write
+    permission.  Walking the chain from the binary's parent up to the
+    filesystem root rejects any directory whose mode allows group/other
+    write or whose owner is neither the current uid nor root.
+
+    System directories (/, /usr, /usr/local, /usr/sbin, /bin, /sbin,
+    /opt, /etc) are exempted from the owner check when the binary itself
+    is root-owned, because the kernel package manager owns them and
+    they are conventionally root:root.  The mode check (no group/other
+    write) still applies to ALL directories in the chain.
+    """
+    if not hasattr(os, "getuid"):
+        return  # non-POSIX
+    current_uid = os.getuid()
+    # Walk from the immediate parent up to (but not including) the root.
+    # The root '/' is conventionally root:root 0755 and always trusted.
+    parts = path.resolve().parts[1:-1]  # drop leading '/' and the filename
+    current = Path("/")
+    for component in parts:
+        current = current / component
+        try:
+            info = current.lstat()
+        except OSError as exc:
+            raise BrowserSandboxError(
+                f"{label}: cannot stat parent directory {current}: {exc}"
+            ) from exc
+        if not stat.S_ISDIR(info.st_mode):
+            raise BrowserSandboxError(
+                f"{label}: parent {current} is not a directory"
+            )
+        if info.st_mode & 0o022:
+            raise BrowserSandboxError(
+                f"{label}: parent directory {current} is group/other "
+                f"writable (mode {oct(info.st_mode & 0o777)})"
+            )
+        # Owner must be the current uid or root.  When running as root,
+        # system package-manager directories (root:root) are accepted.
+        if info.st_uid != current_uid and info.st_uid != 0:
+            raise BrowserSandboxError(
+                f"{label}: parent directory {current} owner "
+                f"{info.st_uid} is neither current uid {current_uid} "
+                f"nor root"
+            )
 
 
 # Batch 10.3 (round-10 §六): cache of resolved + validated TCB tool paths.
@@ -1439,12 +1500,19 @@ class BrowserNetworkSandbox:
         # Batch 9.2: resolved host home so the Rust launcher can mask the
         # REAL home directory (which may live outside /home or /root).
         env["KHAOS_BROWSER_HOST_HOME"] = str(Path.home().resolve())
-        # Batch 9.3: validated absolute bubblewrap path (TCB binary trust).
+        # Batch 9.3 + 11.3: validated absolute bubblewrap path (TCB binary
+        # trust).  Production REQUIRES bwrap (the Rust launcher no longer
+        # falls back to a PATH lookup); dev mode tolerates its absence.
         bwrap_path = shutil.which("bwrap")
         if bwrap_path:
             if self._require_os_sandbox:
                 _validate_tcb_binary(bwrap_path, label="bubblewrap runtime")
             env["KHAOS_BROWSER_BWRAP_PATH"] = bwrap_path
+        elif self._require_os_sandbox:
+            raise BrowserSandboxError(
+                "bubblewrap ('bwrap') is required for production browser "
+                "sandbox but was not found on PATH"
+            )
         if self._cgroup_path is not None:
             env["KHAOS_BROWSER_CGROUP_PROCS"] = str(
                 self._cgroup_path / "cgroup.procs"

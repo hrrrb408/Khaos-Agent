@@ -436,11 +436,21 @@ mod linux {
                 .ok()
                 .filter(|s| !s.is_empty());
             // Batch 9.3 (round-9 §十二): use the validated absolute bubblewrap
-            // path supplied by Python instead of relying on PATH lookup
-            // (which a pre-sandbox attacker could hijack).
-            let bwrap_exe = env::var_os("KHAOS_BROWSER_BWRAP_PATH")
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "bwrap".into());
+            // Batch 11.3 (round-11 §六): bwrap MUST be supplied by Python
+            // via KHAOS_BROWSER_BWRAP_PATH (validated absolute path).  The
+            // old fallback to a bare "bwrap" PATH lookup allowed a
+            // pre-sandbox attacker to hijack bubblewrap.  Now a missing
+            // env var is a hard error (the Python side is responsible for
+            // resolving + validating bwrap before launching).
+            let bwrap_exe = match env::var_os("KHAOS_BROWSER_BWRAP_PATH") {
+                Some(path) if !path.is_empty() => path,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "KHAOS_BROWSER_BWRAP_PATH not set — bubblewrap absolute path required (no PATH fallback)",
+                    ));
+                }
+            };
 
             // Batch 9.2: sensitive host paths that must NEVER be readable
             // from inside the browser namespace, regardless of the ro-bind
