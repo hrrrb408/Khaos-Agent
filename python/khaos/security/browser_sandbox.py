@@ -122,44 +122,25 @@ _BROWSER_ENV_ALLOWLIST: tuple[str, ...] = (
 )
 
 
-def _validate_tcb_binary(path: str, *, label: str) -> None:
-    """Validate that ``path`` is a trusted TCB binary.
+def _validate_tcb_binary(path: str, *, label: str) -> str:
+    """Validate that ``path`` is a trusted TCB binary and return the
+    CANONICAL (symlink-resolved) path.
 
-    Batch 9.3 (round-9 §十二): the browser launcher, bubblewrap and Chromium
-    runtime are part of the trusted computing base.  Their path must resolve
-    to a regular file (no symlink at the final component, via ``O_NOFOLLOW``)
-    owned by the current UID with no group/other write bit.  This closes:
+    Batch 12.1 (round-12 §四): the function now RETURNS the canonical
+    realpath so callers cache and execute the validated target, not the
+    original symlink alias.  This closes the symlink-retarget attack:
+    previously the cache stored the ``shutil.which`` result (a symlink
+    alias) while validating the resolved target — an attacker could
+    repoint the symlink between validation and execution.
 
-    * PATH hijack — a pre-sandbox attacker plants a malicious ``bwrap`` or
-      launcher earlier in PATH;
-    * binary replacement — a group-writable binary is swapped out between
-      validation and exec;
-    * symlink confusion — ``/usr/local/bin/bwrap`` is a symlink to an
-      attacker-controlled location.
-
-    Batch 11.3 (round-11 §六): also validates the PARENT DIRECTORY CHAIN
-    up to the filesystem root.  A root-owned binary in a group-writable
-    directory can still be renamed-over by anyone with directory write
-    permission, defeating the per-file check.  Now every ancestor
-    directory must be owned by the current uid (or root, when running as
-    root) with no group/other write bit.
-
-    Raises ``BrowserSandboxError`` on any violation.  The file is opened
-    with ``O_NOFOLLOW`` so a trailing-symlink swap is rejected at the kernel
-    level (the FD refers to the verified inode).
+    Raises ``BrowserSandboxError`` on any violation.
     """
     resolved = Path(path).expanduser()
     if not resolved.is_absolute():
         raise BrowserSandboxError(
             f"{label} path must be absolute, got {path!r}"
         )
-    # Batch 11.3: validate the parent directory chain BEFORE opening the
-    # binary.  A writable parent allows rename-over even when the binary
-    # itself is root-owned.
     _validate_parent_chain(resolved, label=label)
-    # Resolve symlinks to the real binary (usrmerge systems symlink
-    # /usr/sbin/ip → /usr/bin/ip; the symlink is root-owned and safe).
-    # O_NOFOLLOW is then applied to the RESOLVED path.
     try:
         real_path = os.path.realpath(str(resolved))
     except OSError as exc:
@@ -181,10 +162,14 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
             raise BrowserSandboxError(
                 f"{label} {path}: not a regular file"
             )
-        if hasattr(os, "getuid") and info.st_uid != os.getuid():
+        # Batch 12.1 (round-12 §八): accept root-owned binaries.  When
+        # the Python Agent is de-privileged in the future, system
+        # binaries (root-owned /usr/bin/bwrap) must be accepted.  The
+        # owner must be the current uid OR root (uid 0).
+        if hasattr(os, "getuid") and info.st_uid not in (os.getuid(), 0):
             raise BrowserSandboxError(
-                f"{label} {path}: owner {info.st_uid} != current uid "
-                f"{os.getuid()}"
+                f"{label} {path}: owner {info.st_uid} is neither current "
+                f"uid {os.getuid()} nor root"
             )
         if info.st_mode & 0o022:
             raise BrowserSandboxError(
@@ -193,6 +178,7 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
             )
     finally:
         os.close(fd)
+    return real_path
 
 
 def _validate_parent_chain(path: Path, *, label: str) -> None:
@@ -298,30 +284,29 @@ _tcb_tool_cache: dict[str, TrustedTool] = {}
 def _resolve_tcb_tool(name: str, *, validate: bool = True) -> str:
     """Resolve ``name`` (e.g. ``ip``, ``nft``) to a validated absolute path.
 
-    Batch 11.1 (round-11 §四): the cache records the validation level.
-    A cached entry resolved with ``validate=False`` (e.g. by an earlier
-    capability probe) is RE-VALIDATED when a later ``validate=True``
-    request arrives, then upgraded in the cache.  This closes the cache-
-    poisoning bypass where ``_has_net_admin(validate=False)`` ran first,
-    cached an unvalidated path, and a subsequent production
-    ``validate=True`` call returned the cached path without ever running
-    ``_validate_tcb_binary``.
+    Batch 11.1: the cache records the validation level; validate=True
+    re-validates an unvalidated cached entry.
+
+    Batch 12.1 (round-12 §四): the cache stores the CANONICAL (symlink-
+    resolved) path returned by ``_validate_tcb_binary``, not the raw
+    ``shutil.which`` result.  This closes the symlink-retarget attack:
+    previously an attacker could repoint a symlink between validation
+    (which resolved to the real target) and execution (which used the
+    cached symlink alias).
 
     Raises ``BrowserSandboxError`` if the tool is missing or fails
     validation (production only).  Returns the bare ``name`` only if
-    ``shutil.which`` cannot find it AND validate is False (so dev-mode
-    on a non-Linux host without iproute2 still imports cleanly).
+    ``shutil.which`` cannot find it AND validate is False.
     """
     cached = _tcb_tool_cache.get(name)
     if cached is not None:
         if not validate or cached.validated:
-            # Cache hit satisfies the request: either the caller doesn't
-            # need validation, or the cached entry was already validated.
             return cached.path
-        # validate=True but cached entry is unvalidated → RE-VALIDATE.
-        _validate_tcb_binary(cached.path, label=f"TCB tool {name!r}")
-        _tcb_tool_cache[name] = TrustedTool(path=cached.path, validated=True)
-        return cached.path
+        # validate=True but cached entry is unvalidated → RE-VALIDATE and
+        # upgrade to the canonical path.
+        canonical = _validate_tcb_binary(cached.path, label=f"TCB tool {name!r}")
+        _tcb_tool_cache[name] = TrustedTool(path=canonical, validated=True)
+        return canonical
     # Cache miss: resolve fresh.
     resolved = shutil.which(name)
     if resolved is None:
@@ -329,15 +314,14 @@ def _resolve_tcb_tool(name: str, *, validate: bool = True) -> str:
             raise BrowserSandboxError(
                 f"required TCB tool {name!r} not found on PATH"
             )
-        # Dev mode on a system without the tool: return the bare name so
-        # the caller's subprocess.run still works (or fails naturally).
-        # Not cached (no path to cache).
         return name
     if validate:
-        _validate_tcb_binary(resolved, label=f"TCB tool {name!r}")
-    # Cache the resolution WITH its validation level.  A later
-    # validate=True call will re-validate an unvalidated entry.
-    _tcb_tool_cache[name] = TrustedTool(path=resolved, validated=validate)
+        # _validate_tcb_binary returns the canonical (realpath) target;
+        # cache THAT, not the symlink alias.
+        canonical = _validate_tcb_binary(resolved, label=f"TCB tool {name!r}")
+        _tcb_tool_cache[name] = TrustedTool(path=canonical, validated=True)
+        return canonical
+    _tcb_tool_cache[name] = TrustedTool(path=resolved, validated=False)
     return resolved
 
 
@@ -794,7 +778,7 @@ class BrowserNetworkSandbox:
             raise BrowserSandboxError("browser registry token collision")
 
     @staticmethod
-    def startup_reaper() -> dict[str, int]:
+    def startup_reaper(*, validate: bool = False) -> dict[str, int]:
         """Round-5 review Batch 5.1 (H-03) + Batch 7.3 (round-7 §六):
         clean up resources from a previous process that crashed without
         calling ``teardown()``.
@@ -847,6 +831,7 @@ class BrowserNetworkSandbox:
                 _run_command(
                     ["ip", "netns", "del", netns_name],
                     f"reaper: delete orphaned netns {netns_name}",
+                    validate=validate,
                 )
                 counts["netns"] += 1
             # Delete veth (host end)
@@ -854,6 +839,7 @@ class BrowserNetworkSandbox:
                 _run_command(
                     ["ip", "link", "del", veth_host],
                     f"reaper: delete orphaned veth {veth_host}",
+                    validate=validate,
                 )
                 counts["veth"] += 1
             # Delete cgroup — §六: rebuild path from trusted root + token,
@@ -879,6 +865,7 @@ class BrowserNetworkSandbox:
                 _run_command(
                     ["nft", "delete", "table", _NFT_TABLE_FAMILY, nft_table],
                     f"reaper: delete orphaned nft table {nft_table}",
+                    validate=validate,
                 )
                 counts["nft"] += 1
             # Delete registry file
