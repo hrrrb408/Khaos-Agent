@@ -1482,18 +1482,38 @@ class BrowserNetworkSandbox:
             raise BrowserSandboxError("trusted Rust browser launcher required")
         env = self.launcher_environment(chromium_executable)
         env["KHAOS_BROWSER_FS_PROBE"] = ":".join(sentinel_paths)
-        result = subprocess.run(
-            [launcher],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=15,
-        )
+        try:
+            result = subprocess.run(
+                [launcher],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise BrowserSandboxError(
+                f"fs probe timed out: {exc}"
+            ) from exc
+        # Batch 11.6 (round-11 §九): check returncode + stderr so a
+        # crashed/failed launcher is not silently treated as success.
+        if result.returncode != 0:
+            raise BrowserSandboxError(
+                f"fs probe launcher exited {result.returncode}: "
+                f"{result.stderr.strip()}"
+            )
         outcomes: dict[str, str] = {}
         for line in result.stdout.splitlines():
             parts = line.split("\t", 1)
             if len(parts) == 2:
                 outcomes[parts[0]] = parts[1]
+        # Batch 11.6: every requested path MUST have an outcome.  A
+        # missing outcome means the probe is broken (false negative risk).
+        missing = set(sentinel_paths) - set(outcomes.keys())
+        if missing:
+            raise BrowserSandboxError(
+                f"fs probe produced no outcome for: {sorted(missing)} "
+                f"(stdout={result.stdout!r})"
+            )
         return outcomes
 
     def create_wrapper_script(

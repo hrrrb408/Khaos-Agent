@@ -651,9 +651,28 @@ mod linux {
             let mut handle = stdout.lock();
             for path in &sentinel_paths {
                 let path_str = path.to_string_lossy();
-                match std::fs::read(path) {
-                    Ok(_) => {
-                        let _ = writeln!(handle, "{}\tREADABLE", path_str);
+                // Batch 11.6 (round-11 §九): use File::open + read 1 byte
+                // instead of std::fs::read (which slurps the whole file).
+                // The probe only needs to prove reachability — a huge
+                // file or special device must not cause memory/IO DoS.
+                match std::fs::File::open(path) {
+                    Ok(mut file) => {
+                        let mut byte = [0u8; 1];
+                        match file.read(&mut byte) {
+                            Ok(_) => {
+                                let _ = writeln!(handle, "{}\tREADABLE", path_str);
+                            }
+                            Err(error) => {
+                                let kind = error.raw_os_error().unwrap_or(0);
+                                let label = match kind {
+                                    libc::ENOENT => "ENOENT",
+                                    libc::EACCES => "EACCES",
+                                    libc::ENOTDIR => "ENOTDIR",
+                                    _ => "BLOCKED",
+                                };
+                                let _ = writeln!(handle, "{}\t{}", path_str, label);
+                            }
+                        }
                     }
                     Err(error) => {
                         let kind = error.raw_os_error().unwrap_or(0);

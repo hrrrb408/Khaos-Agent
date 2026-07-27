@@ -120,6 +120,13 @@ class BrowserManager:
     可被独立实例化（例如测试场景）。
     """
 
+    # Batch 11.6 (round-11 §十二): cap the number of concurrent browser
+    # contexts per Chromium process generation.  Each context owns a
+    # BrowserContext, Page, egress proxy socket, and an nft egress-pin
+    # port.  Without a cap an authenticated principal could exhaust
+    # resources by creating unbounded (session, runtime) tuples.
+    MAX_CONTEXTS_PER_GENERATION = 32
+
     def __init__(self):
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -914,6 +921,16 @@ class BrowserManager:
             entry["refcount"] = int(entry.get("refcount", 0)) + 1
             return entry["page"]
         # Need to create a new context for this session.
+        # Batch 11.6 (round-11 §十二): enforce a per-generation context
+        # cap so a principal cannot exhaust proxy sockets / nft ports by
+        # creating unbounded (session, runtime) tuples.
+        if len(self._contexts) >= self.MAX_CONTEXTS_PER_GENERATION:
+            self._last_ensure_error = (
+                f"browser context limit reached "
+                f"({self.MAX_CONTEXTS_PER_GENERATION}); close existing "
+                f"runtimes before creating new ones"
+            )
+            return None
         if self._browser is None:
             result = await self._launch_locked()
             if not result.get("ok"):
