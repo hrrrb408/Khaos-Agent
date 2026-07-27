@@ -221,10 +221,17 @@ def _validate_parent_chain(path: Path, *, label: str) -> None:
             raise BrowserSandboxError(
                 f"{label}: parent {current} is not a directory"
             )
-        if info.st_mode & 0o022:
+        # A directory with the sticky bit (mode 0o1000) is safe even when
+        # group/other-writable: the sticky bit ensures only the file
+        # owner (or root) can rename/delete entries.  This is the standard
+        # /tmp model.  Without this carve-out, /tmp (0o1777) would be
+        # rejected, breaking every test that creates a binary under tmp_path.
+        has_sticky = bool(info.st_mode & stat.S_ISVTX)
+        if (info.st_mode & 0o022) and not has_sticky:
             raise BrowserSandboxError(
                 f"{label}: parent directory {current} is group/other "
-                f"writable (mode {oct(info.st_mode & 0o777)})"
+                f"writable without sticky bit (mode "
+                f"{oct(info.st_mode & 0o777)})"
             )
         # Owner must be the current uid or root.  When running as root,
         # system package-manager directories (root:root) are accepted.

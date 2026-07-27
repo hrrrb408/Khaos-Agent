@@ -30,7 +30,6 @@
 mod linux {
     use std::io::{self, Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::os::unix::process::CommandExt;
     use std::process::Command;
 
     const SOCKET_PATH_ENV: &str = "KHAOS_BROWSER_KERNEL_HELPER_SOCKET";
@@ -128,7 +127,25 @@ mod linux {
     }
 
     fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
-        let cred = std::os::unix::net::UnixStream::peer_cred(stream)?;
+        // Batch 11.4: use SO_PEERCRED via getsockopt (stable across Rust
+        // versions, unlike std::os::unix::net::UnixStream::peer_cred which
+        // requires a nightly feature on older toolchains).
+        use std::os::unix::io::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let mut cred = libc::ucred { pid: 0, uid: 0, gid: 0 };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let ret = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
         Ok(cred.uid)
     }
 

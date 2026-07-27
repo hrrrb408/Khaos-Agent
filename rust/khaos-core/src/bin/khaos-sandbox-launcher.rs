@@ -4,7 +4,7 @@
 mod linux {
     use std::env;
     use std::ffi::CString;
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
     use std::os::unix::ffi::OsStrExt;
     use std::path::{Path, PathBuf};
 
