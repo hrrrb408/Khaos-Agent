@@ -185,3 +185,77 @@ async def test_failed_pin_rollback_quarantines_generation(monkeypatch) -> None:
         "proxy socket must be RETAINED when remove_egress_port fails "
         "(stale-open kernel rule is safer than a stale-closed one)"
     )
+    # Batch 11.2: the retained transaction MUST be recorded so close()
+    # can enumerate and retry its cleanup.
+    assert len(manager._quarantined_context_transactions) == 1, (
+        "retained rollback-failure transaction must be recorded for "
+        "close() cleanup"
+    )
+    tx = manager._quarantined_context_transactions[0]
+    assert tx["egress_proxy"] is fake_proxy
+    assert tx["egress_port"] == 43210
+
+
+@pytest.mark.asyncio
+async def test_existing_page_rejected_after_quarantine(monkeypatch) -> None:
+    """Batch 11.2: a quarantined generation must reject reuse of an
+    EXISTING page, not just new context creation."""
+    manager = BrowserManager()
+    manager._sandbox_generation_failed = True
+    # Simulate an existing context entry that would normally be reused.
+    manager._contexts["p:s:r"] = {
+        "page": object(),
+        "refcount": 1,
+        "_runtime_owners": {"r"},
+    }
+
+    page = await manager._ensure_page_locked(
+        "p:s:r", principal_id="p", runtime_id="r", network_guard=None,
+    )
+    assert page is None, (
+        "quarantined generation must reject existing-page reuse"
+    )
+    assert "quarantined" in manager._last_ensure_error
+
+
+@pytest.mark.asyncio
+async def test_new_context_rejected_after_quarantine(monkeypatch) -> None:
+    """Batch 11.2: a quarantined generation must reject NEW context
+    creation even when _browser already exists (bypassing _launch_locked)."""
+    manager = BrowserManager()
+    manager._sandbox_generation_failed = True
+    manager._browser = _FakeBrowser()  # type: ignore[assignment] — browser exists
+
+    page = await manager._ensure_page_locked(
+        "new:key", principal_id="p", runtime_id="r", network_guard=None,
+    )
+    assert page is None, (
+        "quarantined generation must reject new context creation even "
+        "when _browser is non-None"
+    )
+    assert "quarantined" in manager._last_ensure_error
+
+
+@pytest.mark.asyncio
+async def test_close_retries_quarantined_transaction(monkeypatch) -> None:
+    """Batch 11.2: close() must enumerate and clean up retained rollback-
+    failure transactions (retry remove_egress_port, close proxy/context)."""
+    manager = _manager_with_active_sandbox(monkeypatch)
+    fake_proxy = _FakeProxy()
+    fake_context = _FakeContext()
+    # Simulate a retained transaction from a previous rollback failure.
+    manager._quarantined_context_transactions.append({
+        "egress_proxy": fake_proxy,
+        "context": fake_context,
+        "egress_port": 43210,
+        "pin_installed": True,
+    })
+
+    await manager._cleanup_quarantined_transactions()
+
+    assert manager._rollback_test_calls == [43210], (
+        "close must retry remove_egress_port on retained transactions"
+    )
+    assert fake_proxy.closed, "retained proxy must be closed during cleanup"
+    assert fake_context.closed, "retained context must be closed during cleanup"
+    assert manager._quarantined_context_transactions == []
