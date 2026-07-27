@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
@@ -185,7 +186,19 @@ func main() {
 		MaxHeaderBytes:    1 << 20,
 	}
 	if strings.TrimSpace(*tlsCert) != "" {
-		log.Fatal(server.ListenAndServeTLS(*tlsCert, *tlsKey))
+		// Batch 11.8 (round-11 §十五.1): load the cert/key via the
+		// protected-file pattern (Lstat/mode/SameFile) and serve from
+		// the in-memory tls.Certificate, instead of handing unvalidated
+		// paths to ListenAndServeTLS.
+		cert, err := loadTLSCertificateSecurely(strings.TrimSpace(*tlsCert), strings.TrimSpace(*tlsKey))
+		if err != nil {
+			log.Fatalf("load TLS certificate: %v", err)
+		}
+		server.TLSConfig = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+		}
+		log.Fatal(server.ListenAndServeTLS("", ""))
 	}
 	log.Fatal(server.ListenAndServe())
 }
@@ -280,6 +293,65 @@ func validateTLSConfig(addr, certPath, keyPath string) error {
 		return errors.New("refusing non-loopback gateway listen without TLS")
 	}
 	return nil
+}
+
+// loadTLSCertificateSecurely reads the cert and key files using the same
+// protected-file pattern as readProtectedToken (Lstat → regular-file +
+// mode check → Open → SameFile TOCTOU guards), then constructs a
+// tls.Certificate from the in-memory bytes.  This binds the served
+// certificate to the validated inode identity instead of handing an
+// unvalidated path to ListenAndServeTLS (which re-opens by name).
+//
+// Batch 11.8 (round-11 §十五.1): the TLS private key is as sensitive as
+// the gateway token, so it gets the same owner/mode/symlink/identity
+// enforcement.
+func loadTLSCertificateSecurely(certPath, keyPath string) (tls.Certificate, error) {
+	certPEM, err := readProtectedFile(certPath, "TLS certificate", 1<<20)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	keyPEM, err := readProtectedFile(keyPath, "TLS private key", 1<<20)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// readProtectedFile reads a file using the protected-file pattern:
+// Lstat (no symlink follow) → regular-file + mode check → Open →
+// SameFile TOCTOU re-verification.  Used for the TLS cert/key files.
+func readProtectedFile(path, label string, maxSize int64) ([]byte, error) {
+	entryInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", label, err)
+	}
+	if !entryInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s must be a regular file, not a symlink or device", label)
+	}
+	if runtime.GOOS != "windows" && entryInfo.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("%s must be inaccessible to group and others (mode %o)", label, entryInfo.Mode().Perm())
+	}
+	if entryInfo.Size() > maxSize {
+		return nil, fmt.Errorf("%s is too large (%d bytes)", label, entryInfo.Size())
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", label, err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(entryInfo, openedInfo) {
+		return nil, fmt.Errorf("%s identity changed while opening", label)
+	}
+	content, err := io.ReadAll(io.LimitReader(file, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", label, err)
+	}
+	finalInfo, err := os.Lstat(path)
+	if err != nil || !os.SameFile(openedInfo, finalInfo) {
+		return nil, fmt.Errorf("%s identity changed while reading", label)
+	}
+	return content, nil
 }
 
 func loadOrCreateAPIKey(configured, configuredPath string) (string, string, error) {
