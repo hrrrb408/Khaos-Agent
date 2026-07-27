@@ -148,3 +148,101 @@ def test_run_command_resolves_bare_ip_nft(monkeypatch, tmp_path) -> None:
         "_run_command must resolve bare 'ip' to the absolute path"
     )
     assert captured[0][1:] == ["netns", "list"]
+
+
+# ---------------------------------------------------------------------------
+# Batch 11.1 (round-11 §四): TCB cache validation-bypass regressions.
+# ---------------------------------------------------------------------------
+
+def test_dev_probe_then_production_request_re_validates(monkeypatch, tmp_path) -> None:
+    """Cache poisoning regression: a validate=False probe must NOT let a
+    later validate=True call skip validation.
+
+    Production startup calls _has_net_admin (validate=False in the old
+    code) BEFORE _assert_resource_names_available (validate=True).  The
+    old cache stored only the path string, so the validate=True call hit
+    the cache and skipped _validate_tcb_binary entirely.  A malicious
+    group-writable ip would be executed with CAP_NET_ADMIN.
+    """
+    from khaos.security import browser_sandbox as bs
+    from khaos.security.browser_sandbox import TrustedTool
+
+    # A group-writable binary that MUST be rejected by validate=True.
+    binary = _make_binary(tmp_path / "ip", mode=0o774)
+    monkeypatch.setattr(bs, "_tcb_tool_cache", {})
+    monkeypatch.setattr(
+        bs.shutil, "which",
+        lambda name: str(binary) if name == "ip" else None,
+    )
+    validate_calls = {"count": 0}
+    original_validate = bs._validate_tcb_binary
+
+    def counting_validate(path, *, label):
+        validate_calls["count"] += 1
+        return original_validate(path, label=label)
+
+    monkeypatch.setattr(bs, "_validate_tcb_binary", counting_validate)
+
+    # Step 1: dev probe (validate=False) — caches unvalidated path.
+    result1 = _resolve_tcb_tool("ip", validate=False)
+    assert result1 == str(binary)
+    assert validate_calls["count"] == 0, "validate=False must not validate"
+    cached = bs._tcb_tool_cache.get("ip")
+    assert cached is not None and cached.validated is False
+
+    # Step 2: production request (validate=True) — MUST re-validate.
+    with pytest.raises(BrowserSandboxError, match="group/other writable"):
+        _resolve_tcb_tool("ip", validate=True)
+    assert validate_calls["count"] == 1, (
+        "validate=True after validate=False MUST re-validate the cached "
+        "unvalidated entry (cache poisoning regression)"
+    )
+
+
+def test_validated_cache_entry_not_re_validated(monkeypatch, tmp_path) -> None:
+    """A validated cache entry is trusted on subsequent validate=True calls
+    (no redundant re-validation)."""
+    from khaos.security import browser_sandbox as bs
+
+    binary = _make_binary(tmp_path / "nft", mode=0o755)
+    monkeypatch.setattr(bs, "_tcb_tool_cache", {})
+    monkeypatch.setattr(
+        bs.shutil, "which",
+        lambda name: str(binary) if name == "nft" else None,
+    )
+    validate_calls = {"count": 0}
+    original_validate = bs._validate_tcb_binary
+
+    def counting_validate(path, *, label):
+        validate_calls["count"] += 1
+        return original_validate(path, label=label)
+
+    monkeypatch.setattr(bs, "_validate_tcb_binary", counting_validate)
+
+    _resolve_tcb_tool("nft", validate=True)
+    assert validate_calls["count"] == 1
+    # Second validate=True call should hit cache (already validated).
+    _resolve_tcb_tool("nft", validate=True)
+    assert validate_calls["count"] == 1, (
+        "already-validated cache entry must not be re-validated"
+    )
+
+
+def test_production_capability_probe_uses_validated_tool(monkeypatch, tmp_path) -> None:
+    """_has_net_admin(validate=True) must use a validated ip binary.
+
+    This reproduces the production startup order: _check_prerequisites
+    passes require_os_sandbox → _has_net_admin(validate=True)."""
+    from khaos.security import browser_sandbox as bs
+
+    binary = _make_binary(tmp_path / "ip", mode=0o774)  # group-writable
+    monkeypatch.setattr(bs, "_tcb_tool_cache", {})
+    monkeypatch.setattr(
+        bs.shutil, "which",
+        lambda name: str(binary) if name == "ip" else None,
+    )
+    # Force the Linux platform gate so the probe reaches _resolve_tcb_tool.
+    monkeypatch.setattr(bs.sys, "platform", "linux")
+    # Production probe with validate=True must reject the bad binary.
+    with pytest.raises(BrowserSandboxError, match="group/other writable"):
+        bs._has_net_admin(validate=True)

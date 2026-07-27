@@ -183,26 +183,59 @@ def _validate_tcb_binary(path: str, *, label: str) -> None:
 # once and validates owner/mode/no-symlink; _run_command and the direct
 # subprocess.run calls consult this cache so every privileged invocation
 # uses the verified absolute path.
-_tcb_tool_cache: dict[str, str] = {}
+#
+# Batch 11.1 (round-11 §四): the cache now records the validation LEVEL.
+# A validate=False probe (e.g. _has_net_admin) can no longer poison the
+# cache so that a later validate=True request silently skips validation.
+# validate=True always re-validates an unvalidated cache entry and
+# upgrades it; validate=False can never downgrade a validated entry.
+
+
+@dataclass(frozen=True)
+class TrustedTool:
+    """A resolved TCB tool with its validation provenance.
+
+    ``validated`` records whether ``_validate_tcb_binary`` was run on
+    ``path``.  The cache invariant is: validate=True may upgrade an
+    unvalidated entry but validate=False may never serve an unvalidated
+    entry to a validate=True caller.
+    """
+
+    path: str
+    validated: bool
+
+
+_tcb_tool_cache: dict[str, TrustedTool] = {}
 
 
 def _resolve_tcb_tool(name: str, *, validate: bool = True) -> str:
     """Resolve ``name`` (e.g. ``ip``, ``nft``) to a validated absolute path.
 
-    Resolution is cached for the process lifetime.  When ``validate`` is
-    True (production / require_os_sandbox), the resolved path is checked
-    via ``_validate_tcb_binary`` (regular file, owner == current uid, no
-    group/other write, no symlink).  Dev mode (validate=False) skips the
-    check but STILL returns the absolute path (closing the bare-PATH
-    lookup gap even when ownership is not enforced).
+    Batch 11.1 (round-11 §四): the cache records the validation level.
+    A cached entry resolved with ``validate=False`` (e.g. by an earlier
+    capability probe) is RE-VALIDATED when a later ``validate=True``
+    request arrives, then upgraded in the cache.  This closes the cache-
+    poisoning bypass where ``_has_net_admin(validate=False)`` ran first,
+    cached an unvalidated path, and a subsequent production
+    ``validate=True`` call returned the cached path without ever running
+    ``_validate_tcb_binary``.
 
     Raises ``BrowserSandboxError`` if the tool is missing or fails
     validation (production only).  Returns the bare ``name`` only if
     ``shutil.which`` cannot find it AND validate is False (so dev-mode
     on a non-Linux host without iproute2 still imports cleanly).
     """
-    if name in _tcb_tool_cache:
-        return _tcb_tool_cache[name]
+    cached = _tcb_tool_cache.get(name)
+    if cached is not None:
+        if not validate or cached.validated:
+            # Cache hit satisfies the request: either the caller doesn't
+            # need validation, or the cached entry was already validated.
+            return cached.path
+        # validate=True but cached entry is unvalidated → RE-VALIDATE.
+        _validate_tcb_binary(cached.path, label=f"TCB tool {name!r}")
+        _tcb_tool_cache[name] = TrustedTool(path=cached.path, validated=True)
+        return cached.path
+    # Cache miss: resolve fresh.
     resolved = shutil.which(name)
     if resolved is None:
         if validate:
@@ -211,10 +244,13 @@ def _resolve_tcb_tool(name: str, *, validate: bool = True) -> str:
             )
         # Dev mode on a system without the tool: return the bare name so
         # the caller's subprocess.run still works (or fails naturally).
+        # Not cached (no path to cache).
         return name
     if validate:
         _validate_tcb_binary(resolved, label=f"TCB tool {name!r}")
-    _tcb_tool_cache[name] = resolved
+    # Cache the resolution WITH its validation level.  A later
+    # validate=True call will re-validate an unvalidated entry.
+    _tcb_tool_cache[name] = TrustedTool(path=resolved, validated=validate)
     return resolved
 
 
@@ -772,7 +808,10 @@ class BrowserNetworkSandbox:
         """Return empty string if all prerequisites are met, else reason."""
         if not sys.platform.startswith("linux"):
             return f"non-Linux platform ({sys.platform})"
-        if not _has_net_admin():
+        # Batch 11.1: production must validate the ip binary even for the
+        # capability probe, otherwise an unvalidated path is cached and a
+        # later validate=True call returns it without re-checking.
+        if not _has_net_admin(validate=self._require_os_sandbox):
             return "CAP_NET_ADMIN not available"
         if shutil.which("ip") is None or shutil.which("nsenter") is None:
             return "'ip' or 'nsenter' not found"
@@ -1064,49 +1103,60 @@ class BrowserNetworkSandbox:
             port, self._nft_table, sorted(self._egress_ports),
         )
 
+    def _run_trusted(self, argv: list[str], description: str) -> None:
+        """Run a privileged command, validating TCB tools in production.
+
+        Batch 11.1 (round-11 §四): instance-method wrapper that threads
+        ``self._require_os_sandbox`` into ``_run_command`` so production
+        kernel operations (netns/veth/nft create+delete) always use a
+        validated ip/nft binary, never an unvalidated cache entry.
+        """
+        _run_command(argv, description, validate=self._require_os_sandbox)
+
     def _create_netns(self) -> None:
         """Create the network namespace."""
         # Ensure /var/run/netns exists
         Path(_NETNS_BASE).mkdir(parents=True, exist_ok=True)
-        _run_command(
+        self._run_trusted(
             ["ip", "netns", "add", self._netns_name],
             f"create netns {self._netns_name}",
         )
 
     def _configure_veth(self) -> None:
         """Create the veth pair and configure both ends."""
+        v = self._require_os_sandbox
         # Create veth pair
-        _run_command(
+        self._run_trusted(
             ["ip", "link", "add", self._veth_host, "type", "veth",
              "peer", "name", self._veth_ns],
             f"create veth pair {self._veth_host} <-> {self._veth_ns}",
         )
         # Move the namespace end into the netns
-        _run_command(
+        self._run_trusted(
             ["ip", "link", "set", self._veth_ns, "netns", self._netns_name],
             f"move {self._veth_ns} to {self._netns_name}",
         )
         # Configure host side
-        _run_command(
+        self._run_trusted(
             ["ip", "addr", "add", f"{self._host_ip}/30", "dev", self._veth_host],
             f"assign {self._host_ip}/30 to {self._veth_host}",
         )
-        _run_command(
+        self._run_trusted(
             ["ip", "link", "set", self._veth_host, "up"],
             f"bring up {self._veth_host}",
         )
         # Configure namespace side
         ns_prefix = ["ip", "netns", "exec", self._netns_name]
-        _run_command(
+        self._run_trusted(
             ns_prefix + ["ip", "addr", "add", f"{self._ns_ip}/30",
                          "dev", self._veth_ns],
             f"assign {self._ns_ip}/30 to {self._veth_ns}",
         )
-        _run_command(
+        self._run_trusted(
             ns_prefix + ["ip", "link", "set", self._veth_ns, "up"],
             f"bring up {self._veth_ns} in {self._netns_name}",
         )
-        _run_command(
+        self._run_trusted(
             ns_prefix + ["ip", "link", "set", "lo", "up"],
             f"bring up loopback in {self._netns_name}",
         )
@@ -1628,7 +1678,7 @@ class BrowserNetworkSandbox:
             result.cgroup_removed or not had_cgroup
         ):
             tbl = self._nft_table
-            result.nft_removed = _try(lambda: _run_command(
+            result.nft_removed = _try(lambda: self._run_trusted(
                 ["nft", "delete", "table", _NFT_TABLE_FAMILY, tbl],
                 f"delete nftables table {tbl}",
             ))
@@ -1639,7 +1689,7 @@ class BrowserNetworkSandbox:
         # Delete veth pair (deleting the host end removes both ends)
         if self._veth_host is not None:
             vh = self._veth_host
-            result.veth_removed = _try(lambda: _run_command(
+            result.veth_removed = _try(lambda: self._run_trusted(
                 ["ip", "link", "del", vh],
                 f"delete veth {vh}",
             ))
@@ -1650,7 +1700,7 @@ class BrowserNetworkSandbox:
         # Delete netns
         if self._netns_name is not None:
             nn = self._netns_name
-            result.netns_removed = _try(lambda: _run_command(
+            result.netns_removed = _try(lambda: self._run_trusted(
                 ["ip", "netns", "del", nn],
                 f"delete netns {nn}",
             ))
@@ -1721,7 +1771,7 @@ class _suppress_oserrors:
         return False
 
 
-def _has_net_admin() -> bool:
+def _has_net_admin(*, validate: bool = False) -> bool:
     """C-09: actually check CAP_NET_ADMIN instead of optimistically returning True.
 
     Uses ``ip netns add/delete`` as a side-effect-free probe because it
@@ -1729,12 +1779,17 @@ def _has_net_admin() -> bool:
     implementation unconditionally returned ``True``, which meant the
     real capability check was deferred to ``setup()`` failure — too late
     for a fail-closed decision.
+
+    Batch 11.1 (round-11 §四): ``validate`` defaults to False for
+    backward compatibility, but production callers MUST pass
+    validate=True so the capability probe itself uses a validated ip
+    binary (closing the cache-poisoning bypass where the probe ran first
+    with validate=False and a later validate=True call hit the cache).
     """
     if not sys.platform.startswith("linux"):
         return False
-    # Batch 10.3: resolve ip to absolute path (validate=False — this is a
-    # capability probe, the production path validates at setup() time).
-    ip_path = _resolve_tcb_tool("ip", validate=False)
+    # Batch 11.1: resolve ip with the caller's validation level.
+    ip_path = _resolve_tcb_tool("ip", validate=validate)
     if ip_path == "ip":  # not found
         return False
     probe = f"khaos-cap-probe-{secrets.token_hex(4)}"
@@ -1754,16 +1809,21 @@ def _has_net_admin() -> bool:
         return False
 
 
-def _run_command(argv: list[str], description: str) -> None:
+def _run_command(argv: list[str], description: str, *, validate: bool = False) -> None:
     """Run a command and raise OSError on failure.
 
     Batch 10.3 (round-10 §六): if ``argv[0]`` is a bare ``ip``/``nft``
     tool name, resolve it to the validated absolute path from the TCB
     cache before invoking.  This closes the bare-PATH-lookup gap for
     every privileged kernel operation (netns/veth/nft create+delete).
+
+    Batch 11.1 (round-11 §四): ``validate`` defaults to False for
+    backward compatibility, but production callers MUST pass validate=True
+    so the privileged invocation uses a validated binary (not an
+    unvalidated cache entry left by an earlier capability probe).
     """
     if argv and argv[0] in ("ip", "nft"):
-        argv = [_resolve_tcb_tool(argv[0], validate=False), *argv[1:]]
+        argv = [_resolve_tcb_tool(argv[0], validate=validate), *argv[1:]]
     result = subprocess.run(
         argv, capture_output=True, text=True, timeout=10,
     )
