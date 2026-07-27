@@ -295,26 +295,60 @@ func validateTLSConfig(addr, certPath, keyPath string) error {
 	return nil
 }
 
-// loadTLSCertificateSecurely reads the cert and key files using the same
-// protected-file pattern as readProtectedToken (Lstat → regular-file +
-// mode check → Open → SameFile TOCTOU guards), then constructs a
-// tls.Certificate from the in-memory bytes.  This binds the served
-// certificate to the validated inode identity instead of handing an
-// unvalidated path to ListenAndServeTLS (which re-opens by name).
+// loadTLSCertificateSecurely reads the cert and key files using the
+// protected-file pattern, then constructs a tls.Certificate from the
+// in-memory bytes.
 //
-// Batch 11.8 (round-11 §十五.1): the TLS private key is as sensitive as
-// the gateway token, so it gets the same owner/mode/symlink/identity
-// enforcement.
+// Batch 12.4 (round-12 §十七): the PRIVATE KEY gets strict mode
+// enforcement (no group/other access).  The PUBLIC CERTIFICATE is allowed
+// mode 0644 (standard for Let's Encrypt and similar deployments).
 func loadTLSCertificateSecurely(certPath, keyPath string) (tls.Certificate, error) {
-	certPEM, err := readProtectedFile(certPath, "TLS certificate", 1<<20)
+	// Certificate: allow 0644 (public certs are not secret).
+	certPEM, err := readProtectedFileRelaxed(certPath, "TLS certificate", 1<<20)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+	// Private key: strict mode (no group/other access).
 	keyPEM, err := readProtectedFile(keyPath, "TLS private key", 1<<20)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
 	return tls.X509KeyPair(certPEM, keyPEM)
+}
+
+// readProtectedFileRelaxed is like readProtectedFile but does NOT enforce
+// mode 0600 — it allows group/other-readable files (mode 0644).  Used for
+// the TLS CERTIFICATE (public certs are not secret; Let's Encrypt deploys
+// them as 0644).  Still enforces: regular file, no device, SameFile TOCTOU.
+func readProtectedFileRelaxed(path, label string, maxSize int64) ([]byte, error) {
+	entryInfo, err := os.Lstat(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", label, err)
+	}
+	if !entryInfo.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s must be a regular file, not a symlink or device", label)
+	}
+	if entryInfo.Size() > maxSize {
+		return nil, fmt.Errorf("%s is too large (%d bytes)", label, entryInfo.Size())
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", label, err)
+	}
+	defer file.Close()
+	openedInfo, err := file.Stat()
+	if err != nil || !openedInfo.Mode().IsRegular() || !os.SameFile(entryInfo, openedInfo) {
+		return nil, fmt.Errorf("%s identity changed while opening", label)
+	}
+	content, err := io.ReadAll(io.LimitReader(file, maxSize+1))
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", label, err)
+	}
+	finalInfo, err := os.Lstat(path)
+	if err != nil || !os.SameFile(openedInfo, finalInfo) {
+		return nil, fmt.Errorf("%s identity changed while reading", label)
+	}
+	return content, nil
 }
 
 // readProtectedFile reads a file using the protected-file pattern:

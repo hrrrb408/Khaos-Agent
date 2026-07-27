@@ -307,7 +307,10 @@ class BrowserManager:
                 # Round-5 Batch 5.4: run in a thread — startup_reaper()
                 # invokes subprocess.run (ip/nft/cgroup file I/O) which
                 # would block the event loop.
-                await asyncio.to_thread(BrowserNetworkSandbox.startup_reaper)
+                await asyncio.to_thread(
+                    BrowserNetworkSandbox.startup_reaper,
+                    validate=not _dev_mode,
+                )
                 candidate = BrowserNetworkSandbox(
                     require_os_sandbox=not _dev_mode,
                 )
@@ -1148,43 +1151,60 @@ class BrowserManager:
         except Exception as exc:  # noqa: BLE001 — best-effort cleanup
             logger.debug("rollback: egress_proxy.close() failed: %s", exc)
 
-    async def _cleanup_quarantined_transactions(self) -> None:
-        """Batch 11.2 (round-11 §五): retry cleanup of context-creation
+    async def _cleanup_quarantined_transactions(self) -> bool:
+        """Batch 12.2 (round-12 §六): retry cleanup of context-creation
         rollback failures whose proxy/context/port were retained.
 
-        Called from close()/force-close to ensure retained resources do
-        not leak.  For each retained transaction: retry remove_egress_port
-        (the pin may now be removable), then close the context and proxy.
-        Best-effort: failures are logged but do not abort close() (we are
-        already in teardown).
+        Returns True if ALL transactions were cleaned up, False if any
+        transaction's nft port could not be revoked (the proxy/context
+        are RETAINED for those — a stale-open kernel rule is safer than
+        a stale-closed one, and the proxy keeping the port prevents a
+        host process from rebinding it).
+
+        Transactions whose port WAS successfully revoked have their
+        context + proxy closed and are removed from the list.  Failed
+        transactions are RETAINED so the next close() can retry.
         """
         if not self._quarantined_context_transactions:
-            return
+            return True
         sandbox = self._browser_sandbox
+        all_cleaned = True
+        remaining: list[dict[str, Any]] = []
         for tx in self._quarantined_context_transactions:
             port = tx.get("egress_port")
             pin_installed = tx.get("pin_installed", False)
+            port_revoked = True
             if pin_installed and port is not None and sandbox is not None and sandbox.is_active:
                 try:
                     await asyncio.to_thread(sandbox.remove_egress_port, port)
-                except Exception as exc:  # noqa: BLE001 — best-effort
-                    logger.debug(
-                        "quarantine cleanup: remove_egress_port(%s) failed: %s",
-                        port, exc,
+                except Exception as exc:  # noqa: BLE001 — retain path
+                    logger.error(
+                        "quarantine cleanup: remove_egress_port(%s) STILL "
+                        "failing: %s — RETAINING proxy/context/port to "
+                        "prevent stale-open kernel rule", port, exc,
                     )
-            ctx = tx.get("context")
-            if ctx is not None:
-                try:
-                    await ctx.close()
-                except Exception as exc:  # noqa: BLE001 — best-effort
-                    logger.debug("quarantine cleanup: context.close() failed: %s", exc)
-            proxy = tx.get("egress_proxy")
-            if proxy is not None:
-                try:
-                    await proxy.close()
-                except Exception as exc:  # noqa: BLE001 — best-effort
-                    logger.debug("quarantine cleanup: proxy.close() failed: %s", exc)
-        self._quarantined_context_transactions.clear()
+                    port_revoked = False
+                    all_cleaned = False
+            if port_revoked:
+                # Port revoked (or no port to revoke) → safe to close.
+                ctx = tx.get("context")
+                if ctx is not None:
+                    try:
+                        await ctx.close()
+                    except Exception as exc:  # noqa: BLE001 — best-effort
+                        logger.debug("quarantine cleanup: context.close() failed: %s", exc)
+                proxy = tx.get("egress_proxy")
+                if proxy is not None:
+                    try:
+                        await proxy.close()
+                    except Exception as exc:  # noqa: BLE001 — best-effort
+                        logger.debug("quarantine cleanup: proxy.close() failed: %s", exc)
+                # Transaction fully cleaned — do NOT retain it.
+            else:
+                # Port still not revoked → retain proxy + context + tx.
+                remaining.append(tx)
+        self._quarantined_context_transactions = remaining
+        return all_cleaned
 
     async def _install_route_guard(self, context: Any, guard: Any) -> None:
         """B2: install ``context.route("**/*", ...)`` to enforce the

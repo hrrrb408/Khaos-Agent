@@ -23,7 +23,7 @@ async def test_failed_sandbox_setup_permanently_blocks_generation(monkeypatch) -
             pass
 
         @staticmethod
-        def startup_reaper() -> dict[str, int]:
+        def startup_reaper(*, validate: bool = False) -> dict[str, int]:
             return {}
 
         def setup(self) -> None:

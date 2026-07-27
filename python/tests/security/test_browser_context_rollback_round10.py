@@ -259,3 +259,46 @@ async def test_close_retries_quarantined_transaction(monkeypatch) -> None:
     assert fake_proxy.closed, "retained proxy must be closed during cleanup"
     assert fake_context.closed, "retained context must be closed during cleanup"
     assert manager._quarantined_context_transactions == []
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retains_proxy_when_retry_still_fails(monkeypatch) -> None:
+    """Batch 12.2 (round-12 §六): if remove_egress_port STILL fails during
+    cleanup retry, the proxy/context/transaction MUST be retained — not
+    closed and cleared.  Closing the proxy while the kernel nft rule is
+    still open recreates the stale-open port risk."""
+    manager = _manager_with_active_sandbox(monkeypatch)
+
+    class _FailingSandbox:
+        is_active = True
+        proxy_bind_host = "127.0.0.1"
+
+        def install_egress_pin(self, port: int) -> None:
+            pass
+
+        def remove_egress_port(self, port: int) -> None:
+            raise RuntimeError("nft STILL failing")
+
+    manager._browser_sandbox = _FailingSandbox()  # type: ignore[assignment]
+    fake_proxy = _FakeProxy()
+    fake_context = _FakeContext()
+    manager._quarantined_context_transactions.append({
+        "egress_proxy": fake_proxy,
+        "context": fake_context,
+        "egress_port": 43210,
+        "pin_installed": True,
+    })
+
+    result = await manager._cleanup_quarantined_transactions()
+
+    assert result is False, "cleanup must report False when port revoke fails"
+    assert not fake_proxy.closed, (
+        "proxy must be RETAINED when remove_egress_port still fails "
+        "(stale-open kernel rule is safer than stale-closed)"
+    )
+    assert not fake_context.closed, (
+        "context must be RETAINED when port revoke still fails"
+    )
+    assert len(manager._quarantined_context_transactions) == 1, (
+        "failed transaction must be RETAINED for next retry, not cleared"
+    )

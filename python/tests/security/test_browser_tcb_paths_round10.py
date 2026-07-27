@@ -246,3 +246,80 @@ def test_production_capability_probe_uses_validated_tool(monkeypatch, tmp_path) 
     # Production probe with validate=True must reject the bad binary.
     with pytest.raises(BrowserSandboxError, match="group/other writable"):
         bs._has_net_admin(validate=True)
+
+
+# ---------------------------------------------------------------------------
+# Batch 12.1 (round-12 §四): TCB canonical-path (symlink-retarget) regressions.
+# ---------------------------------------------------------------------------
+
+def test_validate_returns_canonical_not_alias(monkeypatch, tmp_path) -> None:
+    """Batch 12.1: _validate_tcb_binary returns the realpath, not the
+    symlink alias.  The cache must store and return the canonical path."""
+    from khaos.security import browser_sandbox as bs
+    from khaos.security.browser_sandbox import _resolve_tcb_tool
+
+    # Real binary in a deep path; symlink alias points to it.
+    real_dir = tmp_path / "deep" / "real"
+    real_dir.mkdir(parents=True)
+    real_binary = _make_binary(real_dir / "ip", mode=0o755)
+    alias = tmp_path / "ip-alias"
+    alias.symlink_to(real_binary)
+
+    monkeypatch.setattr(bs, "_tcb_tool_cache", {})
+    monkeypatch.setattr(
+        bs.shutil, "which", lambda name: str(alias) if name == "ip" else None,
+    )
+
+    resolved = _resolve_tcb_tool("ip", validate=True)
+    # The resolved path must be the CANONICAL (realpath), not the alias.
+    assert resolved == str(real_binary), (
+        f"resolve_tcb_tool must return canonical path {real_binary}, "
+        f"not symlink alias {alias}; got {resolved}"
+    )
+    # The cache also stores the canonical path.
+    cached = bs._tcb_tool_cache.get("ip")
+    assert cached is not None
+    assert cached.path == str(real_binary), (
+        "cache must store canonical path, not alias"
+    )
+
+
+def test_symlink_retarget_attack_blocked(monkeypatch, tmp_path) -> None:
+    """Batch 12.1 adversarial test: after validation, retargeting the
+    symlink must NOT affect what gets executed — because the cache and
+    execution use the canonical path, not the alias."""
+    from khaos.security import browser_sandbox as bs
+    from khaos.security.browser_sandbox import _resolve_tcb_tool
+
+    # Create a trusted target and a symlink alias.
+    trusted = _make_binary(tmp_path / "trusted", mode=0o755)
+    alias = tmp_path / "alias"
+    alias.symlink_to(trusted)
+
+    monkeypatch.setattr(bs, "_tcb_tool_cache", {})
+    monkeypatch.setattr(
+        bs.shutil, "which", lambda name: str(alias) if name == "ip" else None,
+    )
+
+    # Step 1: validate (resolves to trusted target).
+    resolved = _resolve_tcb_tool("ip", validate=True)
+    assert resolved == str(trusted)
+
+    # Step 2: attacker retargets the symlink to a malicious binary.
+    malicious = _make_binary(tmp_path / "malicious", mode=0o755)
+    alias.unlink()
+    alias.symlink_to(malicious)
+
+    # Step 3: the cached path is STILL the canonical trusted path.
+    cached = bs._tcb_tool_cache.get("ip")
+    assert cached is not None
+    assert cached.path == str(trusted), (
+        "after symlink retarget, cache must still hold the canonical "
+        "trusted path, not the alias"
+    )
+
+    # Step 4: subsequent resolution returns the cached canonical path.
+    resolved_again = _resolve_tcb_tool("ip", validate=True)
+    assert resolved_again == str(trusted), (
+        "subsequent resolve must return canonical path, not retargeted alias"
+    )

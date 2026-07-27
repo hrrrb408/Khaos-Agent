@@ -463,21 +463,30 @@ mod linux {
                 "/var/lib",
             ];
 
-            // Batch 11.5 (round-11 §八): EMPTY-ROOT ALLOWLIST.  Previously
-            // the namespace used --ro-bind / / (default-allow entire host)
-            // then masked known-sensitive paths.  This left /etc, /opt,
-            // custom project roots, etc. readable by a compromised Chromium.
-            // Now we start from an EMPTY root and only --ro-bind the
-            // specific runtime trees Chromium needs.  Project roots, /home,
-            // /root, /workspace, /srv, /data, /mnt, /var/lib are NOT mounted
-            // → default-deny.
-            let allowlist_ro_binds: [&str; 6] = [
+            // Batch 11.5 + 12.6 (round-11 §八 + round-12 §九): EMPTY-ROOT
+            // ALLOWLIST with MINIMAL /etc.  Previously /etc was bound as
+            // an entire tree, exposing /etc/shadow, application secrets,
+            // and machine identity files.  Now /etc is NOT bound as a
+            // whole — only the specific files Chromium needs are bound
+            // individually.
+            let allowlist_ro_binds: [&str; 5] = [
                 "/usr",
                 "/lib",
                 "/lib64",
                 "/bin",
                 "/sbin",
-                "/etc",
+            ];
+            // Batch 12.6: minimal /etc files (not the whole tree).
+            let etc_files: [&str; 9] = [
+                "/etc/hosts",
+                "/etc/hostname",
+                "/etc/resolv.conf",
+                "/etc/nsswitch.conf",
+                "/etc/passwd",
+                "/etc/localtime",
+                "/etc/ssl/certs",
+                "/etc/ca-certificates",
+                "/etc/machine-id",
             ];
 
             let mut bwrap_args: Vec<std::ffi::OsString> = vec![
@@ -492,6 +501,16 @@ mod linux {
             // Mount only the allowlisted runtime trees (each must exist).
             for path in allowlist_ro_binds {
                 if Path::new(path).is_dir() {
+                    bwrap_args.push("--ro-bind".into());
+                    bwrap_args.push(path.into());
+                    bwrap_args.push(path.into());
+                }
+            }
+            // Batch 12.6: mount only the minimal /etc files (not /etc as
+            // a whole tree).  Each file must exist on the host.
+            for path in etc_files {
+                let p = Path::new(path);
+                if p.exists() {
                     bwrap_args.push("--ro-bind".into());
                     bwrap_args.push(path.into());
                     bwrap_args.push(path.into());

@@ -78,6 +78,11 @@ mod linux {
     }
 
     fn derive_netns(token: &str) -> String {
+        // Batch 12.5 (round-12 §七.2): TODO — this MUST match the Python
+        // HMAC-based derivation (HMAC(registry_key, token)[:12]) when the
+        // helper is connected to production.  For now (framework mode) we
+        // use the token prefix directly; the Python BrowserNetworkSandbox
+        // is the production authority for resource names.
         format!("khaos-br-{}", &token[..12.min(token.len())])
     }
 
@@ -85,8 +90,26 @@ mod linux {
         format!("kh{}", &token[..12.min(token.len())])
     }
 
+    /// Batch 12.5 (round-12 §七.3): resolve ``ip`` to an absolute path
+    /// instead of relying on PATH lookup.  The helper runs as root, so a
+    /// bare PATH lookup re-introduces root PATH hijack.
+    fn ip_path() -> String {
+        // Check env override first (set by the systemd unit / launcher).
+        if let Ok(path) = std::env::var("KHAOS_HELPER_IP_PATH") {
+            if !path.is_empty() {
+                return path;
+            }
+        }
+        // Fall back to the standard system location.
+        "/usr/sbin/ip".to_string()
+    }
+
     fn run(argv: &[&str]) -> io::Result<()> {
-        let output = Command::new("ip").args(&argv[1..]).output()?;
+        let ip = ip_path();
+        let full_argv: Vec<&str> = std::iter::once(ip.as_str())
+            .chain(argv.iter().skip(1).copied())
+            .collect();
+        let output = Command::new(full_argv[0]).args(&full_argv[1..]).output()?;
         if !output.status.success() {
             return Err(io::Error::other(format!(
                 "{} failed: {}",
@@ -207,8 +230,28 @@ mod linux {
         // Remove any stale socket, then bind.
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path)?;
-        // Restrict to the allowed UID (0600 → only owner can connect).
-        std::fs::set_permissions(&socket_path, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+        // Batch 12.5 (round-12 §七.7): chown the socket to the allowed
+        // (non-root) UID so the client can actually connect.  A 0600
+        // socket owned by root would be unreachable by a non-root client
+        // even with SO_PEERCRED validation.  Mode 0660 + group shared
+        // with the khaos service user.
+        use std::os::unix::fs::PermissionsExt;
+        if allowed_uid != 0 {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(&socket_path)?;
+            let gid = metadata.gid();
+            let chown_ret = unsafe { libc::chown(
+                std::ffi::CString::new(socket_path.as_bytes())?.as_ptr(),
+                allowed_uid,
+                gid,
+            ) };
+            if chown_ret < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            std::fs::set_permissions(&socket_path, PermissionsExt::from_mode(0o660))?;
+        } else {
+            std::fs::set_permissions(&socket_path, PermissionsExt::from_mode(0o600))?;
+        }
         eprintln!(
             "khaos-browser-kernel-helper: listening on {} (allowed uid {})",
             socket_path, allowed_uid
