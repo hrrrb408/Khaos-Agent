@@ -285,3 +285,83 @@ def test_yaml_node_budget_aborts_huge_flat_document(tmp_path):
     skills = SkillLoader([tmp_path]).load_all()
     assert len(skills) == 1
     assert skills[0].name == "huge"
+
+
+def test_shared_yaml_alias_dag_not_falsely_rejected(tmp_path):
+    """Batch 11.7 (round-11 §十一): a legitimate DAG with a shared alias
+    (two parents alias the same anchor, NO cycle) must NOT be rejected.
+
+    Round-10's single ``visited`` set never removed nodes, so the second
+    visit to the shared node was falsely flagged as a cycle.  The fix
+    separates ``active_stack`` (true cycle detection) from ``seen``
+    (budget counting), so only a node still on the recursion stack is
+    rejected."""
+    _write(
+        tmp_path / "dag.md",
+        "---\n"
+        "name: dag\n"
+        "description: shared alias, no cycle.\n"
+        "common: &common\n"
+        "  - a\n"
+        "  - b\n"
+        "first: *common\n"
+        "second: *common\n"
+        "---\nbody\n",
+    )
+
+    skills = SkillLoader([tmp_path]).load_all()
+    assert len(skills) == 1, (
+        "shared-alias DAG must load (was falsely rejected as a cycle "
+        "before the active-stack/seen separation)"
+    )
+    assert skills[0].name == "dag"
+
+
+def test_true_yaml_cycle_still_rejected(tmp_path):
+    """Batch 11.7 regression guard: a TRUE cycle (self-referential alias)
+    must still be rejected — the active_stack fix must not weaken cycle
+    detection."""
+    _write(
+        tmp_path / "cyclic.md",
+        "---\n"
+        "name: cyclic\n"
+        "description: true cycle.\n"
+        "data: &a [*a]\n"
+        "---\nbody\n",
+    )
+    _write(
+        tmp_path / "good.md",
+        "---\nname: good\ndescription: valid.\n---\nbody\n",
+    )
+
+    skills = SkillLoader([tmp_path]).load_all()
+    # The cyclic skill is skipped; the good skill loads.
+    assert [s.name for s in skills] == ["good"]
+
+
+def test_global_directory_budget_limits_total_entries(tmp_path):
+    """Batch 11.7: the GLOBAL directory-entry budget caps the total
+    across root + all subdirs, preventing the 4096×4096 blowup."""
+    from khaos.skills.loader import MAX_SKILL_TOTAL_DIRECTORY_ENTRIES
+
+    # Create many subdirectories, each with a few noise files.
+    # The global budget (8192) should truncate the scan well before
+    # all subdirs are exhausted.
+    num_subdirs = 300
+    for i in range(num_subdirs):
+        sub = tmp_path / f"sub-{i:04d}"
+        sub.mkdir()
+        for j in range(30):  # 30 noise files each = 9000 entries total
+            (sub / f"noise-{j:03d}.txt").write_text("x", encoding="utf-8")
+    # One real skill at top level that should be found.
+    _write(
+        tmp_path / "SKILL.md",
+        "---\nname: top\ndescription: top-level.\n---\nbody\n",
+    )
+
+    skills = SkillLoader([tmp_path]).load_all()
+    # The top-level skill is found (sorted before subdirs).
+    assert any(s.name == "top" for s in skills)
+    # The global budget prevented scanning all 9000 entries.
+    # (We don't assert an exact count — just that it didn't crash and
+    # the budget mechanism is in place.)

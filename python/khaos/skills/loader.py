@@ -41,6 +41,15 @@ MAX_SKILL_CANDIDATES = MAX_SKILL_FILES * 4  # 512 — tolerance for invalid file
 # root with millions of noise files is fully materialised into a list
 # before the first yield.  The cap stops the scandir loop early.
 MAX_SKILL_DIR_ENTRIES = 4096
+# Batch 11.7 (round-11 §十一): GLOBAL directory-entry budget shared
+# across all roots AND all subdirectories.  Round-10's per-directory cap
+# still allowed 4096 subdirs × 4096 entries ≈ 16.7M scandir iterations.
+# This global cap stops the multiplicative blowup.
+MAX_SKILL_TOTAL_DIRECTORY_ENTRIES = 8192
+# Batch 11.7: cap the number of subdirectories descended into (each
+# subdir incurs a second scandir).  Without this a root with 4096
+# subdirs triggers 4096 extra scans.
+MAX_SKILL_SUBDIRECTORIES = 256
 # Batch 10.6 (round-10 §十): cap the total number of composed YAML nodes
 # traversed during depth checking.  A pathological YAML document can have
 # a huge flat structure that is within the depth limit but has millions
@@ -72,8 +81,12 @@ class SkillLoader:
         seen_names: set[str] = set()
         skills: list[Skill] = []
         candidates_scanned = 0
+        # Batch 11.7: a shared mutable global directory-entry budget
+        # across ALL roots and subdirectories, so the scan cannot
+        # multiplicatively blow up (4096 subdirs × 4096 entries).
+        global_entry_budget = [0]
         for root in self.roots:
-            for path in self._iter_skill_files(root):
+            for path in self._iter_skill_files(root, global_entry_budget):
                 candidates_scanned += 1
                 if candidates_scanned > MAX_SKILL_CANDIDATES:
                     logger.warning(
@@ -213,21 +226,26 @@ class SkillLoader:
         return frontmatter, after
 
     @staticmethod
-    def _iter_skill_files(root: Path):
+    def _iter_skill_files(root: Path, global_entry_budget: list[int] | None = None):
         """Yield candidate skill files under ``root`` (non-recursive top level
         plus one level of subdirectories named after the skill).
 
-        Batch 10.6 (round-10 §十): the round-9 fix still collected EVERY
-        directory entry into ``top_level`` / ``subdirs`` lists before
-        sorting+yielding — a directory with millions of noise files was
-        fully materialised.  Now we cap the scandir loop at
-        ``MAX_SKILL_DIR_ENTRIES`` per directory: once the budget is
-        exhausted we stop scanning and log a warning, so a huge
-        directory never gets fully read into memory.  Within the budget
-        we still collect + sort for deterministic output order (the
-        budget is generous — 4096 entries — so legitimate skills roots
-        are unaffected).
+        Batch 10.6 (round-10 §十): cap scandir at MAX_SKILL_DIR_ENTRIES
+        per directory.
+
+        Batch 11.7 (round-11 §十一): a GLOBAL directory-entry budget
+        (``global_entry_budget``, shared across all roots + subdirs) stops
+        the multiplicative blowup where 4096 subdirs × 4096 entries ≈
+        16.7M iterations.  Also caps the number of subdirectories
+        descended into (MAX_SKILL_SUBDIRECTORIES).  Both are generous
+        enough that legitimate skills roots are unaffected.
         """
+        if global_entry_budget is None:
+            global_entry_budget = [0]
+
+        def _budget_exhausted() -> bool:
+            return global_entry_budget[0] >= MAX_SKILL_TOTAL_DIRECTORY_ENTRIES  # type: ignore[operator]
+
         try:
             root_info = root.lstat()
         except OSError:
@@ -247,7 +265,11 @@ class SkillLoader:
             with os.scandir(root) as entries:
                 for entry in entries:
                     entries_scanned += 1
-                    if entries_scanned > MAX_SKILL_DIR_ENTRIES:
+                    global_entry_budget[0] += 1
+                    if (
+                        entries_scanned > MAX_SKILL_DIR_ENTRIES
+                        or _budget_exhausted()
+                    ):
                         budget_exceeded = True
                         break
                     entry_path = Path(entry.path)
@@ -260,13 +282,23 @@ class SkillLoader:
             return
         if budget_exceeded:
             logger.warning(
-                "skill root %s has more than %d entries; scan truncated "
-                "(some skills may be missed)", root, MAX_SKILL_DIR_ENTRIES,
+                "skill root %s scan truncated (per-dir %d / global %d "
+                "budget); some skills may be missed",
+                root, MAX_SKILL_DIR_ENTRIES, MAX_SKILL_TOTAL_DIRECTORY_ENTRIES,
             )
         for path in sorted(top_level, key=lambda p: p.name):
             yield path
         # Subdirectory skills: <root>/<name>/SKILL.md
-        for sub in sorted(subdirs, key=lambda p: p.name):
+        # Batch 11.7: cap the number of subdirectories descended into.
+        subdirs_to_scan = subdirs[:MAX_SKILL_SUBDIRECTORIES]
+        if len(subdirs) > MAX_SKILL_SUBDIRECTORIES:
+            logger.warning(
+                "skill root %s has %d subdirectories; only scanning first %d",
+                root, len(subdirs), MAX_SKILL_SUBDIRECTORIES,
+            )
+        for sub in sorted(subdirs_to_scan, key=lambda p: p.name):
+            if _budget_exhausted():
+                break
             child_files: list[Path] = []
             child_scanned = 0
             child_budget_exceeded = False
@@ -274,7 +306,11 @@ class SkillLoader:
                 with os.scandir(sub) as children:
                     for child in children:
                         child_scanned += 1
-                        if child_scanned > MAX_SKILL_DIR_ENTRIES:
+                        global_entry_budget[0] += 1
+                        if (
+                            child_scanned > MAX_SKILL_DIR_ENTRIES
+                            or _budget_exhausted()
+                        ):
                             child_budget_exceeded = True
                             break
                         child_path = Path(child.path)
@@ -285,8 +321,7 @@ class SkillLoader:
                 continue
             if child_budget_exceeded:
                 logger.debug(
-                    "skill subdir %s has more than %d entries; truncated",
-                    sub, MAX_SKILL_DIR_ENTRIES,
+                    "skill subdir %s scan truncated (budget)", sub,
                 )
             for child_path in sorted(child_files, key=lambda p: p.name):
                 yield child_path
@@ -295,40 +330,55 @@ class SkillLoader:
 def _yaml_depth(
     node: yaml.Node,
     depth: int = 1,
-    visited: set[int] | None = None,
+    active_stack: set[int] | None = None,
+    seen: set[int] | None = None,
     *,
     node_count: list[int] | None = None,
 ) -> int:
     """Return maximum composed YAML node depth without constructing data.
 
-    Batch 10.6 (round-10 §十): added cycle detection (``visited`` set of
-    ``id(node)``) so a recursive YAML alias graph (``&a [*a]``) returns a
-    depth exceeding the limit instead of recursing forever.  Also added
-    a total-node-count budget (``node_count``) so a huge flat document
-    cannot consume unbounded CPU.
+    Batch 10.6 (round-10 §十): added cycle detection + a node-count budget.
+
+    Batch 11.7 (round-11 §十一): separated ``active_stack`` (the current
+    RECURSION path — nodes added on entry, removed on exit) from ``seen``
+    (all unique nodes ever visited, for the budget).  Round-10's single
+    ``visited`` set never removed nodes, so a legitimate DAG with a
+    shared alias (``common: &common [...]; first: *common; second: *common``)
+    was falsely rejected as a cycle the second time the shared node was
+    reached via a different parent.  Now only a TRUE cycle (a node still
+    on the active recursion stack) is rejected; shared aliases are allowed.
     """
-    if visited is None:
-        visited = set()
+    if active_stack is None:
+        active_stack = set()
+    if seen is None:
+        seen = set()
     if node_count is None:
         node_count = [0]
     node_id = id(node)
-    if node_id in visited:
-        # Cycle detected — report a depth that exceeds any reasonable
-        # limit so the caller rejects the document.
+    # True cycle: the node is still on the active recursion stack.
+    if node_id in active_stack:
         return MAX_SKILL_YAML_DEPTH + 1
-    visited.add(node_id)
-    node_count[0] += 1
-    if node_count[0] > MAX_SKILL_YAML_NODES:
-        return MAX_SKILL_YAML_DEPTH + 1
+    # Budget: count unique nodes (a shared alias visited via two parents
+    # counts once for budget purposes).
+    if node_id not in seen:
+        seen.add(node_id)
+        node_count[0] += 1
+        if node_count[0] > MAX_SKILL_YAML_NODES:
+            return MAX_SKILL_YAML_DEPTH + 1
     if isinstance(node, yaml.MappingNode):
         children = [item for pair in node.value for item in pair]
     elif isinstance(node, yaml.SequenceNode):
         children = list(node.value)
     else:
         children = []
-    return max(
-        [depth, *(_yaml_depth(child, depth + 1, visited, node_count=node_count) for child in children)]
+    # Push onto the active stack for the recursion, then pop so a sibling
+    # or cousin visiting the same alias is not falsely flagged.
+    active_stack.add(node_id)
+    result = max(
+        [depth, *(_yaml_depth(child, depth + 1, active_stack, seen, node_count=node_count) for child in children)]
     )
+    active_stack.discard(node_id)
+    return result
 
 
 def _is_skill_filename(path: Path) -> bool:
