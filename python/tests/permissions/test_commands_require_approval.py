@@ -150,3 +150,23 @@ async def test_unlisted_read_only_command_still_auto_approved(tmp_path):
     # ls is read-only AND not on the approval list → shortcut still applies.
     assert decision.approved is ApprovalMode.AUTO_APPROVE
     assert not decision.requires_user_confirm
+
+
+async def test_deny_rule_overrides_read_only_shortcut(tmp_path):
+    """P1-3 (round-13): a persistent DENY rule for a read-only command
+    (cat/grep/ls) must take precedence over the read-only auto-approve
+    shortcut.  Previously the shortcut fired before the rule loop."""
+    engine = await _engine_with(tmp_path, approval_list=frozenset())
+    # Add a DENY rule for 'cat'.
+    await engine.grant_rule(PermissionRule(
+        id=None, pattern="cat *", approval=ApprovalMode.DENY, mode="all",
+        permission_level="write",
+    ))
+    await engine.load_rules()
+    decision = await engine.check(
+        "terminal", {"command": "cat /etc/passwd"}, "write", "coding"
+    )
+    assert decision.approved is ApprovalMode.DENY, (
+        "DENY rule for 'cat' must override read-only auto-approve shortcut"
+    )
+    assert "Matched rule" in decision.reason

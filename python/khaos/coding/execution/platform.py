@@ -417,7 +417,7 @@ class LinuxBubblewrapBackend:
         home = (synthetic_home or canonical_worktree / ".khaos-home").resolve()
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
         prefix = [
-            "bwrap",
+            _resolve_bwrap_path(),  # P1-1: validated absolute path, not bare PATH
             "--tmpfs", "/",
             "--dir", "/home",
             "--dir", "/etc",
@@ -512,8 +512,37 @@ class LinuxBubblewrapBackend:
             await self.supervisor.terminate(execution_id)
 
 
+def _resolve_bwrap_path() -> str:
+    """P1-1 (round-13): resolve bwrap to a validated absolute path.
+
+    Reuses the browser path's ``_validate_tcb_binary`` to enforce the same
+    canonical-path, owner/mode, parent-chain checks.  Falls back to the
+    bare ``"bwrap"`` name only in dev mode (KHAOS_REQUIRE_PLATFORM_SANDBOX
+    unset) so non-Linux/dev checkouts still import cleanly.
+    """
+    from khaos.security.browser_sandbox import _validate_tcb_binary, BrowserSandboxError
+    require = os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX", "").strip()
+    located = shutil.which("bwrap")
+    if located is None:
+        if require:
+            raise PermissionError("bubblewrap ('bwrap') required but not found")
+        return "bwrap"
+    if require:
+        try:
+            return _validate_tcb_binary(located, label="coding bwrap")
+        except BrowserSandboxError as exc:
+            raise PermissionError(f"coding bwrap TCB validation failed: {exc}") from exc
+    return located
+
+
 def _linux_sandbox_launcher() -> Path | None:
-    """Resolve the reviewed Rust inner TCB; never fall back to raw exec."""
+    """Resolve the reviewed Rust inner TCB.
+
+    P1-1 (round-13): production mode (KHAOS_REQUIRE_PLATFORM_SANDBOX)
+    validates the launcher via ``_validate_tcb_binary`` (canonical path,
+    owner/mode, parent chain) — the same checks the browser path uses.
+    Dev mode accepts any candidate that is a regular executable file.
+    """
     configured = os.environ.get("KHAOS_SANDBOX_LAUNCHER", "").strip()
     candidates: list[Path] = []
     if configured:
@@ -522,16 +551,29 @@ def _linux_sandbox_launcher() -> Path | None:
     candidates.extend((
         repository_root / "rust" / "khaos-core" / "target" / "release"
         / "khaos-sandbox-launcher",
-        repository_root / "rust" / "khaos-core" / "target" / "debug"
-        / "khaos-sandbox-launcher",
     ))
+    # P1-1: target/debug is dev-only; skip it in production.
+    if not os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX", "").strip():
+        candidates.append(
+            repository_root / "rust" / "khaos-core" / "target" / "debug"
+            / "khaos-sandbox-launcher"
+        )
     located = shutil.which("khaos-sandbox-launcher")
     if located:
         candidates.append(Path(located))
+    require = os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX", "").strip()
     for candidate in candidates:
         canonical = candidate.resolve()
-        if canonical.is_file() and os.access(canonical, os.X_OK):
-            return canonical
+        if not (canonical.is_file() and os.access(canonical, os.X_OK)):
+            continue
+        if require:
+            from khaos.security.browser_sandbox import _validate_tcb_binary, BrowserSandboxError
+            try:
+                validated = _validate_tcb_binary(str(canonical), label="coding launcher")
+                return Path(validated)
+            except BrowserSandboxError:
+                continue
+        return canonical
     return None
 
 

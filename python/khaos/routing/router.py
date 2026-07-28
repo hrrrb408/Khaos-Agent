@@ -99,7 +99,14 @@ class ModelRouter:
         messages: list[Message],
         **kwargs,
     ) -> AsyncIterator[Message]:
-        """Call primary model and fall back if it fails before streaming."""
+        """Call primary model and fall back ONLY if it fails BEFORE streaming.
+
+        P1-10 (round-13): if the primary model has already emitted output
+        chunks and THEN fails mid-stream, we do NOT fall back to the next
+        model — that would produce a garbled concatenation of two models'
+        outputs.  Instead we raise immediately so the caller can surface
+        the partial-output failure.
+        """
         rule = self._rules.get(function)
         if rule is None:
             raise ModelUnavailableError(f"no routing rule for function: {function}")
@@ -114,10 +121,17 @@ class ModelRouter:
                     stream = self._call_resolved(messages, kwargs)
                 else:
                     stream = self.model_client.stream_chat(provider, model, messages, kwargs.get("tools"))
+                emitted_anything = False
                 async for chunk in stream:
+                    emitted_anything = True
                     yield chunk
                 return
             except Exception as exc:
+                if emitted_anything:
+                    # P1-10: do NOT fall back after partial output.
+                    raise ModelUnavailableError(
+                        f"model {model_name} failed after partial output: {exc}"
+                    ) from exc
                 errors.append(f"{model_name}: {exc}")
         raise ModelUnavailableError("; ".join(errors) or f"no available model for function: {function}")
 

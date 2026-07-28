@@ -187,12 +187,15 @@ class PermissionEngine:
                     requires_user_confirm=True,
                 )
         if tool_name == "terminal" and _is_read_only_terminal_call(params):
-            return PermissionDecision(
-                approved=ApprovalMode.AUTO_APPROVE,
-                reason="Read-only terminal command",
-                target=target,
-                requires_user_confirm=False,
-            )
+            # P1-3 (round-13): read-only auto-approve is now a DEFAULT
+            # shortcut — it fires ONLY when no persistent rule matched.
+            # Previously it fired BEFORE the rule loop, so a remembered
+            # DENY rule for a "read-only" command (cat/grep/ls/rg…) was
+            # silently bypassed.  We set a flag and fall through to the
+            # rule loop; if no rule matches, we auto-approve at the end.
+            _read_only_terminal = True
+        else:
+            _read_only_terminal = False
         for rule in self._rules:
             if rule.mode != "all" and rule.mode != mode:
                 continue
@@ -207,6 +210,15 @@ class PermissionEngine:
                     requires_user_confirm=rule.approval == ApprovalMode.ASK_EVERY,
                 )
 
+        # P1-3: read-only terminal shortcut fires AFTER the rule loop —
+        # explicit DENY rules take precedence over the convenience default.
+        if _read_only_terminal:
+            return PermissionDecision(
+                approved=ApprovalMode.AUTO_APPROVE,
+                reason="Read-only terminal command (no deny rule matched)",
+                target=target,
+                requires_user_confirm=False,
+            )
         if self._default_mode == ApprovalMode.AUTO_APPROVE:
             return PermissionDecision(
                 approved=ApprovalMode.AUTO_APPROVE,
