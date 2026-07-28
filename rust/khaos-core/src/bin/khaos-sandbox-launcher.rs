@@ -788,7 +788,7 @@ mod linux {
             // P1-6 (round-13): use the safe join_cgroup (O_NOFOLLOW +
             // path validation) instead of bare std::fs::write.
             if let Some(procs) = cgroup {
-                join_cgroup(&procs).map_err(|error| {
+                join_cgroup(procs.as_os_str()).map_err(|error| {
                     io::Error::new(error.kind(), format!("browser join cgroup {}: {error}", procs.display()))
                 })?;
             }
@@ -825,7 +825,7 @@ mod linux {
             args.drain(0..2);
             // P1-6 (round-13): use the safe join_cgroup (O_NOFOLLOW +
             // path validation) instead of bare std::fs::write.
-            join_cgroup(&path).map_err(|error| {
+            join_cgroup(path.as_os_str()).map_err(|error| {
                 io::Error::new(error.kind(), format!("join cgroup {}: {error}", path.display()))
             })?;
             return exec(&args);
