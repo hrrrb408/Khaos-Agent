@@ -120,7 +120,7 @@ mod linux {
     }
 
     struct TrustedBinary {
-        path: &'static str,
+        path: PathBuf,
         device: u64,
         inode: u64,
     }
@@ -706,18 +706,38 @@ mod linux {
         }
         Err(io::Error::other(format!(
             "{} failed: {}",
-            binary.path,
+            binary.path.display(),
             String::from_utf8_lossy(&output.stderr)
         )))
     }
 
     impl TrustedBinary {
         fn open(path: &'static str) -> io::Result<Self> {
-            validate_parent_chain(Path::new(path))?;
+            let configured_path = Path::new(path);
+            if !configured_path.is_absolute() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "TCB binary path must be absolute",
+                ));
+            }
+            validate_parent_chain(configured_path)?;
+            let configured_metadata = fs::symlink_metadata(configured_path)?;
+            if configured_metadata.uid() != 0 || configured_metadata.mode() & 0o022 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "TCB binary link ownership or mode invalid",
+                ));
+            }
+            // usrmerge distributions expose package-managed tools through
+            // root-owned symlinks (for example /usr/sbin/ip -> /usr/bin/ip).
+            // Resolve that immutable link first, then apply O_NOFOLLOW,
+            // owner/mode and device/inode checks to the actual executable.
+            let resolved_path = fs::canonicalize(configured_path)?;
+            validate_parent_chain(&resolved_path)?;
             let file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(path)?;
+                .open(&resolved_path)?;
             let metadata = file.metadata()?;
             if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 || !metadata.is_file() {
                 return Err(io::Error::new(
@@ -726,7 +746,7 @@ mod linux {
                 ));
             }
             Ok(Self {
-                path,
+                path: resolved_path,
                 device: metadata.dev(),
                 inode: metadata.ino(),
             })
@@ -735,7 +755,7 @@ mod linux {
             let file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
-                .open(self.path)?;
+                .open(&self.path)?;
             let metadata = file.metadata()?;
             if metadata.dev() != self.device
                 || metadata.ino() != self.inode
