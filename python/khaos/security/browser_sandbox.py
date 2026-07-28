@@ -561,10 +561,17 @@ class EnforcementStatus:
 
     @property
     def ok(self) -> bool:
-        """True only for the complete production Chromium launch contract."""
+        """True only for the complete production Chromium launch contract.
+
+        P0-2 (round-13): ``process_isolation`` is NO LONGER part of ``ok``.
+        The current design shares one Chromium process across contexts;
+        ``process_isolation`` remains ``False`` and callers that need
+        per-principal OS process isolation must check it separately and
+        refuse to proceed.  ``ok`` means the kernel-level enforcement
+        layers are active, not that process-level isolation is guaranteed.
+        """
         return (
             self.kernel_ok
-            and self.process_isolation
             and self.trusted_launcher
             and self.fd_sanitized
             and self.filesystem_sandbox
@@ -718,7 +725,12 @@ class BrowserNetworkSandbox:
                 cgroup=self._cgroup_path is not None,
                 route_guard=True,
                 service_workers_blocked=True,
-                process_isolation=True,
+                # P0-2 (round-13): process_isolation stays False — the
+                # current design shares ONE Chromium process across all
+                # (session, runtime) contexts under a single principal.
+                # BrowserContext isolates cookies/DOM but is NOT a process
+                # security boundary.  Setting True here was a false claim.
+                process_isolation=False,
             )
             logger.info(
                 "browser netns sandbox active: netns=%s host=%s ns=%s token=%s",

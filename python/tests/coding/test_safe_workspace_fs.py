@@ -79,6 +79,28 @@ def test_safe_workspace_fs_rejects_protected_metadata(tmp_path, protected):
             filesystem.write_bytes(protected, b"blocked")
 
 
+@pytest.mark.parametrize(
+    "nested",
+    [
+        "submodule/.git/config",
+        "nested-repo/.git/refs",
+        "packages/foo/.agents/policy",
+        "vendor/.codex/config",
+        "deep/nested/path/.khaos/state",
+    ],
+)
+def test_safe_workspace_fs_rejects_nested_protected_metadata(tmp_path, nested):
+    """P1-4 (round-13): protected metadata at ANY depth in the path is
+    rejected, not just the first component.  Previously
+    ``submodule/.git/config`` passed because parts[0] == 'submodule'."""
+    # Create the parent directories so the path is valid.
+    nested_path = tmp_path / nested
+    nested_path.parent.mkdir(parents=True, exist_ok=True)
+    with SafeWorkspaceFS(tmp_path) as filesystem:
+        with pytest.raises(WorkspaceBoundaryError, match="protected"):
+            filesystem.write_bytes(nested, b"blocked")
+
+
 def test_safe_workspace_fs_rejects_traversal_symlink_and_hardlink(tmp_path):
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()

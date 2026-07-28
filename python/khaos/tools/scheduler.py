@@ -596,7 +596,17 @@ class ToolScheduler:
             }
         )
         if inspect.isawaitable(value):
-            value = await value
+            # P1-9 (round-13): enforce the approval expiration deadline.
+            # A hung UI/gateway callback must not block the tool batch,
+            # task owner, or shutdown indefinitely.
+            import time as _time
+            remaining = request.expires_at - _time.time()
+            if remaining <= 0:
+                return {"approved": False, "reason": "approval_expired_before_callback"}
+            try:
+                value = await asyncio.wait_for(value, timeout=remaining)
+            except asyncio.TimeoutError:
+                return {"approved": False, "reason": "approval_callback_timeout"}
         if isinstance(value, bool):
             return {"approved": value}
         return dict(value)

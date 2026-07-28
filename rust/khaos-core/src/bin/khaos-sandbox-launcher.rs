@@ -785,13 +785,11 @@ mod linux {
                     _ => break,
                 }
             }
-            // Join cgroup first (write our PID into cgroup.procs).
+            // P1-6 (round-13): use the safe join_cgroup (O_NOFOLLOW +
+            // path validation) instead of bare std::fs::write.
             if let Some(procs) = cgroup {
-                std::fs::write(&procs, b"0").map_err(|error| {
-                    io::Error::new(
-                        error.kind(),
-                        format!("browser join cgroup {}: {error}", procs.display()),
-                    )
+                join_cgroup(&procs).map_err(|error| {
+                    io::Error::new(error.kind(), format!("browser join cgroup {}: {error}", procs.display()))
                 })?;
             }
             // Join the netns BEFORE seccomp (setns is denied after install).
@@ -825,14 +823,10 @@ mod linux {
             }
             let path = PathBuf::from(args.remove(1));
             args.drain(0..2);
-            // This stage runs before bubblewrap creates a user namespace.
-            // Joining the delegated cgroup from inside that namespace is
-            // rejected by the kernel even when cgroup.procs is bind-mounted.
-            std::fs::write(&path, b"0").map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("join cgroup {}: {error}", path.display()),
-                )
+            // P1-6 (round-13): use the safe join_cgroup (O_NOFOLLOW +
+            // path validation) instead of bare std::fs::write.
+            join_cgroup(&path).map_err(|error| {
+                io::Error::new(error.kind(), format!("join cgroup {}: {error}", path.display()))
             })?;
             return exec(&args);
         }

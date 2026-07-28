@@ -103,9 +103,12 @@ class SafeWorkspaceFS:
             ) from exc
         if not relative.parts:
             raise WorkspaceBoundaryError("workspace root is not a file target")
-        if relative.parts[0].casefold() in {
-            name.casefold() for name in PROTECTED_WORKSPACE_NAMES
-        }:
+        # P1-4 (round-13): check ALL path components for protected metadata
+        # names, not just the first.  Previously ``submodule/.git/config``
+        # passed because parts[0] == "submodule".  Now any component that
+        # is .git/.agents/.codex/.khaos triggers the protection.
+        protected_lower = {name.casefold() for name in PROTECTED_WORKSPACE_NAMES}
+        if any(part.casefold() in protected_lower for part in relative.parts):
             raise WorkspaceBoundaryError("protected workspace metadata is read-only")
         return relative.as_posix()
 
@@ -959,9 +962,9 @@ class SafeWorkspaceFS:
             relative = absolute.relative_to(self.root)
         except ValueError as exc:
             raise WorkspaceBoundaryError("directory is outside task worktree") from exc
-        if relative.parts and relative.parts[0].casefold() in {
-            name.casefold() for name in PROTECTED_WORKSPACE_NAMES
-        }:
+        # P1-4: check ALL components (same fix as relative()).
+        protected_lower = {name.casefold() for name in PROTECTED_WORKSPACE_NAMES}
+        if any(part.casefold() in protected_lower for part in relative.parts):
             raise WorkspaceBoundaryError("protected workspace metadata is read-only")
         return relative.as_posix() if relative.parts else ""
 
