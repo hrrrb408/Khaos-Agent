@@ -38,13 +38,9 @@ try:
 except ImportError:  # pragma: no cover — Windows
     _fcntl = None
 
-from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.approval import ApprovalBroker
-from khaos.agent.compressor import ContextCompressor
-from khaos.agent.error_handler import ErrorHandler
 from khaos.audit import AuditLogger, resolve_safe_audit_log_path
 from khaos.coding.task_manager import TaskManager
-from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.channels import (
     ChannelRegistry,
@@ -60,25 +56,20 @@ from khaos.exceptions import ServiceShutdownError
 from khaos.maintenance import MaintenanceService
 from khaos.memory import (
     Memory,
-    MemoryBudget,
     MemoryConfidence,
-    MemoryManager,
     MemoryScope,
     MemoryStore,
 )
 from khaos.modes import ModeManager
-from khaos.permissions import PermissionEngine
 from khaos.rust_bridge import get_token_engine
 from khaos.routing.router import create_default_router
 from khaos.routing import ModelRouter
 from khaos.runtime import RequestContext
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
-from khaos.skills import SkillGenerator, SkillManager
+from khaos.skills import SkillManager
 from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
 from khaos.tools import create_runtime_registry
-from khaos.tools.cron_tools import set_cron_engine
-from khaos.tools.scheduler import ToolScheduler
 
 logger = logging.getLogger(__name__)
 
@@ -916,7 +907,6 @@ class AgentService:
             # so drift quarantine events land in the audit trail.
             audit_logger=self._audit_logger,
         )
-        set_cron_engine(self.cron_engine)
         self.channel_registry = ChannelRegistry()
         self._webhook_replay_guard = WebhookReplayGuard(
             consumer=self.db.consume_webhook_event
@@ -946,6 +936,7 @@ class AgentService:
         # A second chat() on a session that already has an active stream
         # gets SessionBusyError instead of racing on shared state.
         self._active_chat_sessions: set[str] = set()
+        self.subagent_spawner = None
         self._office_shutdown_task: asyncio.Task | None = None
         self.shutdown_failed = False
         # M4 batch 3.1.15 (CRITICAL-1): idempotency flag for shutdown().
@@ -1061,17 +1052,6 @@ class AgentService:
             )
         # Fence every in-flight Office mutation after runtimes have settled.
         await self._shutdown_office_authority()
-        # BrowserManager is process-scoped.  Its close contract retains
-        # failed Context owners and returns an observable error; do not close
-        # Audit/DB state if the browser generation is still live.
-        from khaos.tools.browser_tools import _manager as browser_manager
-        browser_result = await browser_manager.close()
-        if not browser_result.get("ok"):
-            self.shutdown_failed = True
-            raise ServiceShutdownError(
-                f"shared BrowserManager shutdown failed: "
-                f"{browser_result.get('error', 'unknown error')}"
-            )
         # The shared AuditLogger is process-owned and is closed exactly once,
         # after all runtime/authority shutdown events had a chance to log.
         if self._audit_logger is not None:
@@ -1658,6 +1638,8 @@ class AgentService:
             # cross-principal mutation).
             channel_registry=self.channel_registry,
             channel_admins=self._effective_policy.channel_admins,
+            cron_engine=self.cron_engine,
+            subagent_spawner=self.subagent_spawner,
         ))
 
     async def _wait_for_confirmation(self, request: dict) -> dict:
@@ -2406,6 +2388,7 @@ async def serve_json_lines(
                 # AgentLoop — no parallel unsupervised audit path.
                 audit_logger=agent._audit_logger,
             )
+            agent.subagent_spawner = subagent_service.spawner
 
         async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
             try:
@@ -2962,16 +2945,6 @@ async def _build_subagent_service(
         runner=runner.run,
         registry=create_runtime_registry(),
     )
-    # MEDIUM (batch 3.1.8): wire the orchestrator tool handlers
-    # (``spawn_subagent`` / ``collect_results`` / ``execute_plan`` /
-    # ``subagent_status``) with the real spawner + runner so they no
-    # longer return ``"Orchestrator not initialized"`` in production.
-    # The four handlers are registered in ``register_builtin_tools``
-    # with a placeholder handler; ``create_runtime_registry`` rebinds
-    # them to ``orchestrator_tools.{spawn_subagent,collect_results,...}``
-    # but those module-level globals stay ``None`` until this call.
-    from khaos.tools.orchestrator_tools import init_orchestrator
-    init_orchestrator(spawner, runner)
     return SubAgentService(spawner, runner)
 
 

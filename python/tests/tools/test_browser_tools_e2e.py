@@ -119,7 +119,7 @@ async def fresh_manager(monkeypatch):
     the test already closed it.
     """
     mgr = BrowserManager()
-    monkeypatch.setattr(browser_tools, "_manager", mgr)
+    monkeypatch.setattr(browser_tools, "BrowserManager", lambda: mgr)
     try:
         yield mgr
     finally:

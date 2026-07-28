@@ -52,8 +52,6 @@ from khaos.coding.task_manager import TaskManager
 from khaos.db import Database
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.grpc_server import (
-    AgentService,
-    GatewayRPCAuthenticator,
     serve_json_lines,
 )
 from khaos.memory import Memory, MemoryConfidence, MemoryScope, MemoryStore
@@ -62,10 +60,8 @@ from khaos.runtime import RequestContext
 from khaos.scheduler import ScheduleConfig
 from khaos.subagents.service import SubAgentService
 from khaos.subagents.spawner import SubAgentTask
-from khaos.tools import orchestrator_tools
 from khaos.tools.orchestrator_tools import (
     execute_plan,
-    init_orchestrator,
     spawn_subagent,
 )
 
@@ -291,7 +287,7 @@ async def test_acceptance_8_audit_log_owner_preserving_on_conflict(tmp_path):
         # Second write from a different project: must NOT overwrite.
         audit_b = AuditLogger(db, principal_id="u1", project_id=PROJECT_ID_B)
         await audit_b.log("write_file", "/tmp/x", "success", session_id="s1")
-        rows = await _fetch_project_id(db, "audit_log", "action='write_file'")
+        await _fetch_project_id(db, "audit_log", "action='write_file'")
         # The first row's project_id is preserved (owner-preserving).
         # NOTE: audit_log typically appends (no ON CONFLICT), so this
         # test verifies the FIRST row keeps its original stamp even
@@ -562,18 +558,14 @@ async def test_acceptance_13_spawn_subagent_passes_project_id(tmp_path):
 
     spawner = MagicMock()
     spawner.spawn = AsyncMock(side_effect=capturing_spawn)
-    init_orchestrator(spawner, MagicMock())
-    try:
-        result = await spawn_subagent(
-            goal="g", principal_id="u1", project_id=PROJECT_ID_A,
-        )
-        assert result["ok"] is True
-        assert len(captured_tasks) == 1
-        assert captured_tasks[0].project_id == PROJECT_ID_A
-        assert captured_tasks[0].principal_id == "u1"
-    finally:
-        orchestrator_tools._spawner = None
-        orchestrator_tools._runner = None
+    result = await spawn_subagent(
+        goal="g", principal_id="u1", project_id=PROJECT_ID_A,
+        subagent_spawner=spawner,
+    )
+    assert result["ok"] is True
+    assert len(captured_tasks) == 1
+    assert captured_tasks[0].project_id == PROJECT_ID_A
+    assert captured_tasks[0].principal_id == "u1"
 
 
 # ──────────────── orchestrator_tools.execute_plan ───────────────────────
@@ -592,25 +584,21 @@ async def test_acceptance_14_execute_plan_stamps_project_id(tmp_path):
     spawner = MagicMock()
     spawner.spawn = AsyncMock(side_effect=completing_spawn)
     spawner.wait_all = AsyncMock(return_value=[])
-    init_orchestrator(spawner, MagicMock())
-    try:
-        plan_json = json.dumps({
-            "description": "parallel",
-            "tasks": [{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
-        })
-        result = await execute_plan(
-            plan_json, principal_id="u1", project_id=PROJECT_ID_A,
-        )
-        assert result["ok"] is True
-        assert result["total"] == 3
-        assert len(captured_tasks) == 3
-        # Every task in the plan inherits project_id from the caller.
-        for task in captured_tasks:
-            assert task.project_id == PROJECT_ID_A
-            assert task.principal_id == "u1"
-    finally:
-        orchestrator_tools._spawner = None
-        orchestrator_tools._runner = None
+    plan_json = json.dumps({
+        "description": "parallel",
+        "tasks": [{"goal": "a"}, {"goal": "b"}, {"goal": "c"}],
+    })
+    result = await execute_plan(
+        plan_json, principal_id="u1", project_id=PROJECT_ID_A,
+        subagent_spawner=spawner,
+    )
+    assert result["ok"] is True
+    assert result["total"] == 3
+    assert len(captured_tasks) == 3
+    # Every task in the plan inherits project_id from the caller.
+    for task in captured_tasks:
+        assert task.project_id == PROJECT_ID_A
+        assert task.principal_id == "u1"
 
 
 # ──────────────────── SubAgentService.spawn ─────────────────────────────
@@ -706,8 +694,6 @@ async def test_acceptance_17_coding_tasks_update_same_owner_succeeds(tmp_path):
     When the same (principal_id, project_id) calls ``update_coding_task``,
     the Owner-Match predicate matches and the row is updated normally.
     """
-    from khaos.db.database import OwnerMismatchError
-
     db = await _make_db(tmp_path / "khaos.db")
     try:
         task_dict = {

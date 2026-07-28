@@ -26,7 +26,6 @@ from khaos.security.host_network import (
 )
 
 logger = logging.getLogger(__name__)
-_SECURITY_ENABLED = True
 _HOST_NETWORK_AUTHORITY = HostNetworkAuthority()
 _MAX_REDIRECTS = 5
 _MAX_HEADER_BYTES = 64 * 1024
@@ -440,15 +439,7 @@ def _is_valid_url(url: str) -> bool:
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and _is_safe_url(parsed)
 
 
-def enable_security(enabled: bool = True) -> None:
-    """启用/禁用 URL 安全检查（测试用）。"""
-    global _SECURITY_ENABLED
-    _SECURITY_ENABLED = enabled
-
-
 def _is_safe_url(parsed) -> bool:
-    if not _SECURITY_ENABLED:
-        return True
     hostname = (parsed.hostname or "").strip().lower().rstrip(".")
     if not hostname:
         return False

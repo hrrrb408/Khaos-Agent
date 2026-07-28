@@ -53,7 +53,6 @@ MUTATING_COMMANDS = {
 DANGEROUS_PATTERNS = {"rm -rf /", "rm -fr /", ":(){", "mkfs", "diskutil erase"}
 
 
-_SECURITY_ENABLED = True
 _COMMAND_GUARD = CommandGuard()
 
 # Environment-variable prefixes that are safe to pass through to spawned
@@ -96,12 +95,6 @@ def _build_safe_env() -> dict[str, str]:
         if key in SAFE_ENV_EXACT or any(key.startswith(prefix) for prefix in SAFE_ENV_PREFIXES):
             env[key] = value
     return env
-
-
-def enable_security(enabled: bool = True) -> None:
-    """启用/禁用安全检查（测试用）。"""
-    global _SECURITY_ENABLED
-    _SECURITY_ENABLED = enabled
 
 
 async def terminal(
@@ -222,8 +215,6 @@ async def terminal_shell(
 
 def check_command_safety(command: str) -> dict[str, Any]:
     """检查命令安全性。在 terminal() 执行前调用。"""
-    if not _SECURITY_ENABLED:
-        return {"safe": True, "risk_level": "safe", "reason": "security disabled"}
     result = _COMMAND_GUARD.check(command)
     return {
         "safe": result.safe,

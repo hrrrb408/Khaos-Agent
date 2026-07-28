@@ -4,10 +4,9 @@ Phase 8.3 — exposes the subagent spawner/runner as tool handlers so the
 Orchestrator agent (or any agent in office/coding mode) can drive parallel
 subagent execution through the normal tool-calling interface.
 
-Dependencies (``SubAgentSpawner`` / ``SubAgentRunner``) are injected once at
-startup via :func:`init_orchestrator` and held in module-level globals. This
-mirrors how other tool modules (e.g. ``browser_tools``) receive their runtime
-state, keeping the handler signatures compatible with the scheduler.
+The ``SubAgentSpawner`` authority is injected for every invocation by the
+runtime capability broker. No mutable server or principal authority is held
+in module-global state.
 
 MEDIUM (batch 3.1.8): the four orchestrator tool handlers now accept a
 ``principal_id`` keyword parameter (injected by the
@@ -19,8 +18,8 @@ only observes its own tasks.  ``spawn_subagent`` also returns the real
 post-spawn status (typically ``pending`` / ``initializing``) instead of the
 hardcoded ``"running"`` — so a spawn that failed during reservation reports
 the actual failure.  ``init_orchestrator`` is now wired in production by
-``_build_subagent_service`` (grpc_server.py) so the four handlers no longer
-return ``"Orchestrator not initialized"``.
+``_build_subagent_service`` (grpc_server.py) and then propagated through the
+runtime authority chain.
 
 MEDIUM (batch 3.1.9): two further closures.
   1. ``spawn_subagent`` now returns ``ok=false`` when the spawner reports a
@@ -40,17 +39,12 @@ MEDIUM (batch 3.1.9): two further closures.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from khaos.subagents.runner import SubAgentRunner
     from khaos.subagents.spawner import SubAgentSpawner
 
 logger = logging.getLogger(__name__)
-
-# 全局引用，在 create_runtime_registry / 应用启动时通过 init_orchestrator 注入。
-_spawner: Optional["SubAgentSpawner"] = None
-_runner: Optional["SubAgentRunner"] = None
 
 # MEDIUM (batch 3.1.9): statuses that represent a terminal failure of the
 # spawn itself (the task was never started, or was cancelled by a shutdown
@@ -58,22 +52,6 @@ _runner: Optional["SubAgentRunner"] = None
 # it returns ``ok=false`` so the caller can branch on ``ok`` rather than
 # re-checking ``status``.  Matches the RPC ``SubAgentService`` contract.
 _SPAWN_FAILURE_STATUSES = frozenset({"failed", "cancelled"})
-
-
-def init_orchestrator(spawner: "SubAgentSpawner", runner: "SubAgentRunner") -> None:
-    """初始化 orchestrator 工具的全局依赖。
-
-    在应用启动时调用一次，传入 SubAgentSpawner 和 SubAgentRunner 实例。
-    重复调用会覆盖旧引用（便于测试重置）。
-
-    MEDIUM (batch 3.1.8): this is now called in production by
-    ``_build_subagent_service`` (grpc_server.py) so the four orchestrator
-    tool handlers are wired with the real spawner / runner instead of
-    returning ``"Orchestrator not initialized"``.
-    """
-    global _spawner, _runner
-    _spawner = spawner
-    _runner = runner
 
 
 def _require_principal(principal_id: str) -> dict[str, Any] | None:
@@ -111,6 +89,7 @@ async def spawn_subagent(
     *,
     principal_id: str = "",
     project_id: str = "",
+    subagent_spawner: "SubAgentSpawner | None" = None,
 ) -> dict[str, Any]:
     """启动一个子代理执行指定任务。
 
@@ -144,7 +123,7 @@ async def spawn_subagent(
         ``ok``.  Also refuses empty ``principal_id`` instead of
         falling back to a shared pseudo-principal.
     """
-    if _spawner is None:
+    if subagent_spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
 
     # MEDIUM (batch 3.1.9): refuse empty principal — fail closed.
@@ -170,7 +149,7 @@ async def spawn_subagent(
         project_id=project_id,
     )
     try:
-        result = await _spawner.spawn(task)
+        result = await subagent_spawner.spawn(task)
         # MEDIUM (batch 3.1.9): if the spawner reports a terminal
         # failure (e.g. the spawn lost a shutdown race and the task
         # was aborted with status=failed / error=cancelled), return
@@ -202,6 +181,7 @@ async def collect_results(
     *,
     principal_id: str = "",
     project_id: str = "",
+    subagent_spawner: "SubAgentSpawner | None" = None,
 ) -> dict[str, Any]:
     """等待所有子任务完成并收集结果。
 
@@ -229,7 +209,7 @@ async def collect_results(
     MEDIUM (batch 3.1.9): refuses empty ``principal_id`` instead of
         falling back to a shared pseudo-principal.
     """
-    if _spawner is None:
+    if subagent_spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
 
     # MEDIUM (batch 3.1.9): refuse empty principal — fail closed.
@@ -238,7 +218,7 @@ async def collect_results(
         return principal_error
 
     try:
-        tasks = await _spawner.wait_all(
+        tasks = await subagent_spawner.wait_all(
             timeout=600, principal_id=principal_id,
         )
         results = [_task_to_dict(task) for task in tasks]
@@ -261,6 +241,7 @@ async def execute_plan(
     *,
     principal_id: str = "",
     project_id: str = "",
+    subagent_spawner: "SubAgentSpawner | None" = None,
 ) -> dict[str, Any]:
     """执行一个任务计划（JSON 格式）。
 
@@ -294,7 +275,7 @@ async def execute_plan(
         fills it in after parse so the spawner / runner propagate it
         into ``create_session`` + ``RuntimeConfig``.
     """
-    if _spawner is None:
+    if subagent_spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
 
     # MEDIUM (batch 3.1.9): refuse empty principal — fail closed.
@@ -319,7 +300,7 @@ async def execute_plan(
         task.project_id = project_id
 
     try:
-        tasks = await TaskPlanner.execute_plan(plan, _spawner)
+        tasks = await TaskPlanner.execute_plan(plan, subagent_spawner)
         results = [_task_to_dict(task) for task in tasks]
         completed = sum(1 for r in results if r["status"] == "completed")
         failed = sum(1 for r in results if r["status"] == "failed")
@@ -340,6 +321,7 @@ async def subagent_status(
     *,
     principal_id: str = "",
     project_id: str = "",
+    subagent_spawner: "SubAgentSpawner | None" = None,
 ) -> dict[str, Any]:
     """查看当前所有子任务状态（不等待）。
 
@@ -367,10 +349,13 @@ async def subagent_status(
     MEDIUM (batch 3.1.9): refuses empty ``principal_id`` instead of
         falling back to a shared pseudo-principal.
     """
-    if _spawner is None:
+    if subagent_spawner is None:
         return {"ok": False, "error": "Orchestrator not initialized"}
     # MEDIUM (batch 3.1.9): refuse empty principal — fail closed.
     principal_error = _require_principal(principal_id)
     if principal_error is not None:
         return principal_error
-    return {"ok": True, "stats": _spawner.stats(principal_id=principal_id)}
+    return {
+        "ok": True,
+        "stats": subagent_spawner.stats(principal_id=principal_id),
+    }

@@ -32,6 +32,7 @@ _INJECTED_CAPABILITY_FIELDS = frozenset({
     "execution_service", "workspace_manager", "approval_context",
     "principal_id", "project_id", "runtime_id", "network_guard",
     "credential_context", "process_supervisor", "process_authority",
+    "browser_manager", "cron_engine",
 })
 @dataclass(frozen=True)
 class ToolCapability:
@@ -321,9 +322,12 @@ class ToolInvocationBroker:
             handler_params.setdefault("session_id", context.get("session_id", ""))
             handler_params.setdefault("runtime_id", context.get("runtime_id", ""))
             handler_params.setdefault("project_id", context.get("project_id", ""))
+            handler_params.setdefault("browser_manager", context.get("browser_manager"))
             handler_params.setdefault(
                 "network_guard", context.get("network_guard")
             )
+        if name == "browser_close":
+            handler_params["browser_manager"] = context.get("browser_manager")
         if any(capability.name in {"remote.write", "remote.destructive-write"} for capability in capabilities):
             handler_params["approval_context"] = context.get("approval_context")
             handler_params["principal_id"] = context.get("principal_id")
@@ -343,6 +347,7 @@ class ToolInvocationBroker:
         if any(capability.name == "subagent.spawn" for capability in capabilities):
             handler_params["principal_id"] = context.get("principal_id", "")
             handler_params["project_id"] = context.get("project_id", "")
+            handler_params["subagent_spawner"] = context.get("subagent_spawner")
         # M4 batch 3.1.10 (CRITICAL): the five cron tools declare the
         # ``cron.manage`` capability so the broker injects the caller's
         # ``principal_id``.  The engine / DB layer filter every read and
@@ -357,6 +362,7 @@ class ToolInvocationBroker:
         # ever bypassed — fail-closed on the broker injection path.
         if any(capability.name == "cron.manage" for capability in capabilities):
             handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["cron_engine"] = context.get("cron_engine")
         # M4 batch 3.1.16A-4-4-1 (CRITICAL): the five permission tools
         # declare ``permission.read`` / ``permission.manage`` so the
         # broker injects the caller's ``principal_id`` +

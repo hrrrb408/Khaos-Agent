@@ -115,6 +115,9 @@ class AgentLoop:
         # these the handlers fail-closed (``unavailable`` / ``forbidden``).
         channel_registry=None,
         channel_admins: "frozenset[str] | None" = None,
+        cron_engine=None,
+        browser_manager=None,
+        subagent_spawner=None,
         # M4 batch 3.1.16A-5-1b (CRITICAL): project identity stamp.
         # Bound at construction from ``RuntimeConfig.project_id`` (set by
         # ``AgentService`` from the verified RPC payload) — NOT recomputed
@@ -186,6 +189,9 @@ class AgentLoop:
         # do not pass these kwargs (e.g. ad-hoc test loops) — they get
         # ``None`` / empty frozenset and the handlers fail-closed.
         self.channel_registry = channel_registry
+        self.cron_engine = cron_engine
+        self.browser_manager = browser_manager
+        self.subagent_spawner = subagent_spawner
         self.channel_admins = (
             channel_admins if channel_admins is not None else frozenset()
         )
@@ -499,6 +505,11 @@ class AgentLoop:
                         ),
                         "channel_admins": getattr(
                             self, "channel_admins", frozenset()
+                        ),
+                        "cron_engine": getattr(self, "cron_engine", None),
+                        "browser_manager": getattr(self, "browser_manager", None),
+                        "subagent_spawner": getattr(
+                            self, "subagent_spawner", None
                         ),
                     },
                 }

@@ -115,8 +115,8 @@ class BrowserManager:
     The guard is installed at context creation time and stays bound for
     the lifetime of the context.
 
-    模块底部 ``_manager`` 是推荐的共享实例；``BrowserManager`` 本身也
-    可被独立实例化（例如测试场景）。
+    ``BrowserManager`` 由 runtime authority 创建并注入工具调用；模块
+    不保存跨 principal/project 的可变浏览器单例。
     """
 
     # Batch 11.6 (round-11 §十二): cap the number of concurrent browser
@@ -1451,8 +1451,19 @@ class BrowserManager:
             return {"ok": False, "error": str(exc)}
 
 
-# 全局单例（模块级共享，工具函数默认使用它）
-_manager = BrowserManager()
+def _require_browser_manager(
+    browser_manager: BrowserManager | None,
+) -> BrowserManager | None:
+    """Return the injected runtime authority; production never invents one."""
+    if browser_manager is not None:
+        return browser_manager
+    if os.environ.get("KHAOS_DEV_MODE") == "1":
+        return BrowserManager()
+    return None
+
+
+def _browser_manager_unavailable() -> dict[str, Any]:
+    return {"ok": False, "error": "runtime browser authority is not configured"}
 
 
 # ─── 安全护栏 ───
@@ -1484,9 +1495,13 @@ async def browser_launch(
     principal_id: str = "",
     project_id: str = "",
     runtime_id: str = "",
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """启动浏览器。"""
-    return await _manager.launch(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager.launch(
         headless=headless,
         browser_type=browser_type,
         principal_id=principal_id,
@@ -1495,15 +1510,21 @@ async def browser_launch(
     )
 
 
-async def browser_close() -> dict[str, Any]:
+async def browser_close(
+    *, browser_manager: BrowserManager | None = None
+) -> dict[str, Any]:
     """关闭浏览器并释放资源。"""
-    return await _manager.close()
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager.close()
 
 
 async def browser_navigate(
     url: str, *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """导航到指定 URL 并等待页面基本加载完成。
 
@@ -1518,7 +1539,10 @@ async def browser_navigate(
     ``context.route("**/*")`` and gates EVERY request, redirect and
     subresource — not just the initial URL.
     """
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_make_navigate_real(url),
         mock=lambda: _navigate_mock(url),
         principal_id=principal_id,
@@ -1554,6 +1578,7 @@ async def browser_click(
     selector: str, *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """点击元素（CSS / text= / xpath=）。
 
@@ -1563,7 +1588,10 @@ async def browser_click(
     request, redirect and subresource (closing the click→blocked-domain
     bypass).
     """
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_make_click_real(selector),
         mock=lambda: _click_mock(selector),
         principal_id=principal_id,
@@ -1596,6 +1624,7 @@ async def browser_type(
     *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """在输入框中输入文本（先清空）。
 
@@ -1605,7 +1634,10 @@ async def browser_type(
     request, redirect and subresource (closing the type-enter→blocked-domain
     bypass).
     """
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_make_type_real(selector, text, press_enter),
         mock=lambda: _type_mock(selector, text),
         principal_id=principal_id,
@@ -1637,6 +1669,7 @@ async def browser_snapshot(
     *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """获取页面 DOM 快照（完整 HTML，过长截断）。
 
@@ -1645,7 +1678,10 @@ async def browser_snapshot(
     H5: ``session_id`` + ``runtime_id`` extend the context key.
     B2: ``network_guard`` is installed on the context.
     """
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_snapshot_real,
         mock=_snapshot_mock,
         principal_id=principal_id,
@@ -1680,6 +1716,7 @@ async def browser_screenshot(
     *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """Capture a screenshot and return base64 without filesystem writes.
 
@@ -1687,7 +1724,10 @@ async def browser_screenshot(
     H5: ``session_id`` + ``runtime_id`` extend the context key.
     B2: ``network_guard`` is installed on the context.
     """
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_make_screenshot_real(),
         mock=_screenshot_mock,
         principal_id=principal_id,
@@ -1715,6 +1755,7 @@ async def browser_scroll(
     direction: str = "down", amount: int = 3, *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """滚动页面（每 ``amount`` 滚动 ``amount * 500`` 像素）。
 
@@ -1722,7 +1763,10 @@ async def browser_scroll(
     H5: ``session_id`` + ``runtime_id`` extend the context key.
     B2: ``network_guard`` is installed on the context.
     """
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_make_scroll_real(direction, amount),
         mock=lambda: _scroll_mock(direction, amount),
         principal_id=principal_id,
@@ -1754,6 +1798,7 @@ async def browser_evaluate(
     expression: str, *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """在页面上下文中执行 JS 表达式（拦截网络类 API）。
 
@@ -1766,7 +1811,10 @@ async def browser_evaluate(
     blocked = _is_expression_blocked(expression)
     if blocked:
         return {"ok": False, "error": blocked}
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_make_evaluate_real(expression),
         mock=lambda: {"ok": False, "error": "JS evaluation not available in mock mode"},
         principal_id=principal_id,
@@ -1796,6 +1844,7 @@ async def browser_file_upload(
     runtime_id: str = "",
     project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """上传文件到 ``<input type=file>`` 元素。
 
@@ -1841,7 +1890,10 @@ async def browser_file_upload(
     if isinstance(read_result, dict):
         return read_result
     file_bytes, file_name = read_result
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_make_file_upload_real(selector, file_name, file_bytes),
         mock=lambda: _file_upload_mock(selector, file_path),
         principal_id=principal_id,
@@ -2103,6 +2155,7 @@ async def browser_vision(
     *, principal_id: str = "",
     session_id: str = "", runtime_id: str = "", project_id: str = "",
     network_guard: Any = None,
+    browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """返回页面状态的文字摘要（URL + 标题）。
 
@@ -2111,7 +2164,10 @@ async def browser_vision(
     H5: ``session_id`` + ``runtime_id`` extend the context key.
     B2: ``network_guard`` is installed on the context.
     """
-    return await _manager._safe_execute(
+    manager = _require_browser_manager(browser_manager)
+    if manager is None:
+        return _browser_manager_unavailable()
+    return await manager._safe_execute(
         real=_vision_real,
         mock=_vision_mock,
         principal_id=principal_id,

@@ -55,12 +55,14 @@ async def test_aclose_invokes_execution_service_shutdown():
     """B1: ``execution_service.shutdown`` must actually be reached."""
     execution = MagicMock()
     execution.shutdown = AsyncMock()
+    scheduler = MagicMock()
+    scheduler.aclose = AsyncMock()
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
         task_manager=None,
         skill_generator=None,
-        tool_scheduler=MagicMock(),
+        tool_scheduler=scheduler,
         memory_manager=MagicMock(aclose=AsyncMock()),
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
@@ -73,24 +75,22 @@ async def test_aclose_invokes_execution_service_shutdown():
 async def test_browser_context_close_failure_marks_runtime_failed(monkeypatch):
     """H4: Browser ownership failure participates in quarantine retries."""
     from khaos.exceptions import RuntimeCloseError
-    from khaos.tools import browser_tools
-
     manager = MagicMock()
-    manager.close_runtime = AsyncMock(side_effect=RuntimeError("browser live"))
-    monkeypatch.setattr(browser_tools, "_manager", manager)
+    manager.close = AsyncMock(side_effect=RuntimeError("browser live"))
     result = RuntimeResult(
         loop=MagicMock(), mode_manager=MagicMock(), task_manager=None,
         skill_generator=None, tool_scheduler=MagicMock(),
         memory_manager=MagicMock(aclose=AsyncMock()),
         skill_manager=MagicMock(), new_verify_fix_loop=None,
         runtime_id="runtime-browser",
+        browser_manager=manager,
     )
 
     with pytest.raises(RuntimeCloseError):
         await result.aclose()
     assert result._close_failed is True
     assert result._closed is False
-    assert manager.close_runtime.await_count == 3
+    assert manager.close.await_count == 3
 
 
 async def test_aclose_is_idempotent():
@@ -105,12 +105,14 @@ async def test_aclose_is_idempotent():
     office.shutdown = AsyncMock()
     execution = MagicMock()
     execution.shutdown = AsyncMock()
+    scheduler = MagicMock()
+    scheduler.aclose = AsyncMock()
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
         task_manager=None,
         skill_generator=None,
-        tool_scheduler=MagicMock(),
+        tool_scheduler=scheduler,
         memory_manager=memory,
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
@@ -145,12 +147,14 @@ async def test_aclose_shuts_down_office_before_memory_and_execution():
     memory.aclose = AsyncMock(side_effect=lambda: order.append("memory"))
     execution = MagicMock()
     execution.shutdown = AsyncMock(side_effect=lambda: order.append("execution"))
+    scheduler = MagicMock()
+    scheduler.aclose = AsyncMock()
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
         task_manager=None,
         skill_generator=None,
-        tool_scheduler=MagicMock(),
+        tool_scheduler=scheduler,
         memory_manager=memory,
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
@@ -184,12 +188,14 @@ async def test_aclose_tolerates_component_shutdown_failures():
     memory.aclose = AsyncMock(side_effect=RuntimeError("memory boom"))
     execution = MagicMock()
     execution.shutdown = AsyncMock(side_effect=RuntimeError("exec boom"))
+    scheduler = MagicMock()
+    scheduler.aclose = AsyncMock()
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
         task_manager=None,
         skill_generator=None,
-        tool_scheduler=MagicMock(),
+        tool_scheduler=scheduler,
         memory_manager=memory,
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
@@ -256,6 +262,7 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "skill_manager",
         "new_verify_fix_loop",
         "execution_service",
+        "browser_manager",
         "office_authority",
         "owns_office_authority",
         "principal_id",

@@ -17,14 +17,12 @@ Acceptance tests for the 10 criteria specified in the batch review:
 from __future__ import annotations
 
 import asyncio
-import json
 from datetime import datetime, timedelta
 
 import pytest
 
 from khaos.db import Database
-from khaos.scheduler import CronEngine, ScheduleConfig, ScheduledTask, TaskStatus
-from khaos.scheduler.engine import PendingPersistence
+from khaos.scheduler import CronEngine, ScheduleConfig, TaskStatus
 from khaos.time_utils import utc_now_naive
 from khaos.tools.cron_tools import (
     cron_create,
@@ -32,7 +30,6 @@ from khaos.tools.cron_tools import (
     cron_pause,
     cron_remove,
     cron_resume,
-    set_cron_engine,
 )
 
 
@@ -172,41 +169,37 @@ async def test_acceptance_2_cron_tools_principal_isolation(tmp_path) -> None:
     db = await _make_db(tmp_path)
     try:
         engine = CronEngine(db=db)
-        set_cron_engine(engine)
-        try:
-            # Alice creates a task via the tool layer.
-            alice_result = await cron_create(
-                "alice-tool-task", "p", "30m", principal_id="alice",
-            )
-            assert alice_result["status"] == "created"
-            alice_task_id = alice_result["task_id"]
+        # Alice creates a task via the tool layer.
+        alice_result = await cron_create(
+            "alice-tool-task", "p", "30m", principal_id="alice", cron_engine=engine,
+        )
+        assert alice_result["status"] == "created"
+        alice_task_id = alice_result["task_id"]
 
-            # Bob creates a task via the tool layer.
-            bob_result = await cron_create(
-                "bob-tool-task", "p", "30m", principal_id="bob",
-            )
-            assert bob_result["status"] == "created"
-            bob_task_id = bob_result["task_id"]
+        # Bob creates a task via the tool layer.
+        bob_result = await cron_create(
+            "bob-tool-task", "p", "30m", principal_id="bob", cron_engine=engine,
+        )
+        assert bob_result["status"] == "created"
+        bob_task_id = bob_result["task_id"]
 
-            # Alice's cron_list shows only her tasks.
-            alice_list = await cron_list(principal_id="alice")
-            alice_ids = {t["id"] for t in alice_list["tasks"]}
-            assert alice_ids == {alice_task_id}
+        # Alice's cron_list shows only her tasks.
+        alice_list = await cron_list(principal_id="alice", cron_engine=engine)
+        alice_ids = {t["id"] for t in alice_list["tasks"]}
+        assert alice_ids == {alice_task_id}
 
-            # Bob's cron_list shows only his tasks.
-            bob_list = await cron_list(principal_id="bob")
-            bob_ids = {t["id"] for t in bob_list["tasks"]}
-            assert bob_ids == {bob_task_id}
+        # Bob's cron_list shows only his tasks.
+        bob_list = await cron_list(principal_id="bob", cron_engine=engine)
+        bob_ids = {t["id"] for t in bob_list["tasks"]}
+        assert bob_ids == {bob_task_id}
 
-            # Alice cannot pause / remove Bob's task — ``not_found``.
-            assert (await cron_pause(bob_task_id, principal_id="alice"))["status"] == "not_found"
-            assert (await cron_remove(bob_task_id, principal_id="alice"))["status"] == "not_found"
+        # Alice cannot pause / remove Bob's task — ``not_found``.
+        assert (await cron_pause(bob_task_id, principal_id="alice", cron_engine=engine))["status"] == "not_found"
+        assert (await cron_remove(bob_task_id, principal_id="alice", cron_engine=engine))["status"] == "not_found"
 
-            # Empty principal is rejected.
-            assert (await cron_list(principal_id=""))["status"] == "error"
-            assert (await cron_pause(bob_task_id, principal_id=""))["status"] == "error"
-        finally:
-            set_cron_engine(None)
+        # Empty principal is rejected.
+        assert (await cron_list(principal_id="", cron_engine=engine))["status"] == "error"
+        assert (await cron_pause(bob_task_id, principal_id="", cron_engine=engine))["status"] == "error"
     finally:
         await db.close()
 
@@ -596,8 +589,6 @@ async def test_acceptance_8_stale_executor_cannot_clear_newer_control_marker(tmp
 
         # Capture the version at executor start (the executor captured
         # this for its conditional UPDATE).
-        version_at_start = task.lifecycle_version
-
         # M4 batch 3.1.11 (HIGH-2): patch ``control_finalize_scheduled_task``
         # (the idempotent CAS used by pause) to fail, so the PAUSED
         # marker is left in _pending_persistence.  pause() no longer
@@ -716,7 +707,7 @@ async def test_acceptance_9_commit_then_raise_no_version_drift(tmp_path) -> None
             if call_count["n"] == 1:
                 # First call: commit the UPDATE (call the real one),
                 # then raise to simulate an ambiguous commit.
-                result = await original_finalize(*args, **kwargs)
+                await original_finalize(*args, **kwargs)
                 raise RuntimeError("ambiguous commit — network error")
             # Subsequent calls: just return the real result (no raise).
             return await original_finalize(*args, **kwargs)
@@ -803,27 +794,14 @@ async def test_acceptance_10_cron_resume_propagates_persistence_pending(tmp_path
 
         # Tool layer: cron_resume also returns persistence_pending
         # (NOT execution_pending — that would mislead the user).
-        set_cron_engine(engine)
-        try:
-            tool_result = await cron_resume(task.id, principal_id="alice")
-            assert tool_result["status"] == "persistence_pending", (
-                f"expected tool status=persistence_pending, got "
-                f"{tool_result['status']} — the tool layer is not "
-                "propagating the persistence_pending branch correctly"
-            )
-            # The error message must mention DB write failure, NOT
-            # "old executor is still alive".
-            assert "DB write failed" in tool_result["error"], (
-                f"error message does not mention DB write failure: "
-                f"{tool_result['error']!r}"
-            )
-            assert "executor is still" not in tool_result["error"], (
-                f"error message misleadingly mentions executor: "
-                f"{tool_result['error']!r}"
-            )
-        finally:
-            set_cron_engine(None)
-
+        tool_result = await cron_resume(task.id, principal_id="alice", cron_engine=engine)
+        assert tool_result["status"] == "persistence_pending", (
+            f"expected tool status=persistence_pending, got "
+            f"{tool_result['status']} — the tool layer is not "
+            "propagating the persistence_pending branch correctly"
+        )
+        assert "DB write failed" in tool_result["error"]
+        assert "executor is still" not in tool_result["error"]
         db.control_finalize_scheduled_task = original_update
     finally:
         await db.close()
@@ -865,7 +843,6 @@ async def test_broker_injects_principal_id_for_cron_tools(tmp_path) -> None:
     principal injection is the same for all 5 cron tools because they
     all declare the ``cron.manage`` capability.
     """
-    from khaos.tools.cron_tools import set_cron_engine
     from khaos.tools.registry import ToolInvocationBroker, create_runtime_registry
 
     db = await _make_db(tmp_path)
@@ -877,21 +854,16 @@ async def test_broker_injects_principal_id_for_cron_tools(tmp_path) -> None:
             "broker-test", "p", ScheduleConfig(interval_seconds=60),
             principal_id="broker-alice",
         )
-        set_cron_engine(engine)
-        try:
-            registry = create_runtime_registry()
-            broker = ToolInvocationBroker(registry)
-            # Invoke cron_list via the broker with a principal_id.
-            result = await broker.invoke(
-                "cron_list",
-                mode="office",
-                context={"principal_id": "broker-alice"},
-            )
-            assert "tasks" in result
-            assert len(result["tasks"]) == 1
-            assert result["tasks"][0]["name"] == "broker-test"
-        finally:
-            set_cron_engine(None)
+        registry = create_runtime_registry()
+        broker = ToolInvocationBroker(registry)
+        result = await broker.invoke(
+            "cron_list",
+            mode="office",
+            context={"principal_id": "broker-alice", "cron_engine": engine},
+        )
+        assert "tasks" in result
+        assert len(result["tasks"]) == 1
+        assert result["tasks"][0]["name"] == "broker-test"
     finally:
         await db.close()
 
@@ -901,25 +873,19 @@ async def test_broker_rejects_empty_principal_for_cron_tools(tmp_path) -> None:
     injects an empty string and the cron handler rejects it with an
     error — fail-closed (no fallback to a shared pseudo-principal).
     """
-    from khaos.tools.cron_tools import set_cron_engine
     from khaos.tools.registry import ToolInvocationBroker, create_runtime_registry
 
     db = await _make_db(tmp_path)
     try:
         engine = CronEngine(db=db)
-        set_cron_engine(engine)
-        try:
-            registry = create_runtime_registry()
-            broker = ToolInvocationBroker(registry)
-            # No principal_id in context — broker injects "".
-            result = await broker.invoke(
-                "cron_list",
-                mode="office",
-                context={},  # no principal_id
-            )
-            assert result["status"] == "error"
-            assert "principal_id is required" in result["error"]
-        finally:
-            set_cron_engine(None)
+        registry = create_runtime_registry()
+        broker = ToolInvocationBroker(registry)
+        result = await broker.invoke(
+            "cron_list",
+            mode="office",
+            context={"cron_engine": engine},  # no principal_id
+        )
+        assert result["status"] == "error"
+        assert "principal_id is required" in result["error"]
     finally:
         await db.close()

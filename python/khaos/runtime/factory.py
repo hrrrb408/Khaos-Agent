@@ -57,6 +57,7 @@ class RuntimeConfig:
     tool_scheduler: ToolScheduler | None = None
     workspace_manager: WorkspaceManager | None = None
     execution_service: ExecutionService | None = None
+    browser_manager: Any = None
     approval_broker: Any = None
     # B1: an externally-owned OfficeMutationAuthority (e.g. the server-level
     # authority shared across every chat / webhook / cron turn) can be
@@ -102,6 +103,8 @@ class RuntimeConfig:
     # ``forbidden``.
     channel_registry: Any = None
     channel_admins: frozenset[str] = field(default_factory=frozenset)
+    cron_engine: Any = None
+    subagent_spawner: Any = None
     # M4 batch 3.1.16A-5-1b (CRITICAL): project identity closure.  When
     # set (non-empty), ``build_runtime`` uses this value as the project
     # identity for every component (PermissionEngine, MemoryStore,
@@ -124,6 +127,7 @@ class RuntimeResult:
     skill_manager: SkillManager
     new_verify_fix_loop: Callable[[], VerifyFixLoop] | None
     execution_service: ExecutionService | None = None
+    browser_manager: Any = None
     # H3: the OfficeMutationAuthority is owned by the runtime so aclose()
     # can fence every in-flight Office mutation before the process exits.
     office_authority: OfficeMutationAuthority | None = None
@@ -402,10 +406,11 @@ class RuntimeResult:
             # runtime acquired are released regardless of the key.  A
             # concurrent runtime sharing a context is NOT affected
             # (refcount only closes when the last owner releases).
-            if self.runtime_id:
+            if self.browser_manager is not None:
                 try:
-                    from khaos.tools.browser_tools import _manager as _browser_manager
-                    await _browser_manager.close_runtime(self.runtime_id)
+                    browser_result = await self.browser_manager.close()
+                    if not browser_result.get("ok", False):
+                        failed = True
                 except Exception:
                     failed = True
                     logger.debug(
@@ -660,6 +665,12 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
             runtime_id=cfg.runtime_id,
         )
     scheduler.set_office_authority(office_authority)
+    if cfg.browser_manager is None:
+        from khaos.tools.browser_tools import BrowserManager
+
+        browser_manager = BrowserManager()
+    else:
+        browser_manager = cfg.browser_manager
     # B1: register the authority on the scheduler only (instance attribute).
     # The previous module-global ``file_tools._office_authority`` was removed
     # — direct callers must pass ``office_authority`` explicitly or fall back
@@ -714,6 +725,9 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # ``channel.read`` / ``channel.manage`` capability injection.
         channel_registry=cfg.channel_registry,
         channel_admins=cfg.channel_admins,
+        cron_engine=cfg.cron_engine,
+        browser_manager=browser_manager,
+        subagent_spawner=cfg.subagent_spawner,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
         # project identity into the AgentLoop so every message / turn
         # write is stamped with it.  ``self._bound_project_id`` (set
@@ -739,6 +753,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # per-session BrowserContext keyed by (principal, session, runtime).
         session_id=cfg.session_id,
         runtime_id=cfg.runtime_id,
+        browser_manager=browser_manager,
         # H2: carry the AuditLogger so ``aclose`` can close its fd —
         # without this, configuring a file audit path would leak the fd
         # for the process's lifetime.

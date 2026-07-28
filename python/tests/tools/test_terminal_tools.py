@@ -4,7 +4,6 @@ from khaos.coding.execution import ExecutionService, HostExecutionBackend
 from khaos.tools.terminal_tools import (
     BackgroundProcessAuthority,
     check_command_safety,
-    enable_security,
     evaluate_command_safety,
     is_read_only_command,
     process,
@@ -67,25 +66,17 @@ async def test_terminal_blocks_dangerous_command(tmp_path):
 
 
 def test_check_command_safety_blocks_when_enabled():
-    enable_security(True)
-
     result = check_command_safety("sudo su")
 
     assert result["safe"] is False
     assert result["risk_level"] == "blocked"
 
 
-async def test_terminal_security_disabled_allows_command(tmp_path):
-    enable_security(False)
-    try:
-        result = await terminal(
-            "echo safe", cwd=str(tmp_path), timeout=5, execution_service=_execution_service()
-        )
-    finally:
-        enable_security(True)
+def test_terminal_security_has_no_runtime_disable_switch():
+    from khaos.tools import terminal_tools
 
-    assert result["returncode"] == 0
-    assert result["stdout"] == "safe\n"
+    assert not hasattr(terminal_tools, "enable_security")
+    assert not hasattr(terminal_tools, "_SECURITY_ENABLED")
 
 
 async def test_terminal_without_execution_service_fails_closed(tmp_path):
