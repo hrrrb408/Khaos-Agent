@@ -31,7 +31,17 @@ non-root client over a protected UDS using UID, PID, PID start time and boot
 identity. Production launch is permitted only after helper-authenticated
 netns, cgroup, nftables, trusted Rust launcher, FD sanitization and filesystem
 sandbox enforcement have been established. Helper unavailability or partial
-setup poisons the generation; no CLI or Host fallback is reachable. The Rust launcher preserves only Playwright's
+setup poisons the generation; no CLI or Host fallback is reachable.
+
+On Linux, the root-owned Rust launcher carries only the file capability
+`CAP_SYS_ADMIN=ep` needed for the single `setns` into the namespace descriptor
+returned by the authenticated helper. It validates the helper peer, protocol
+response, isolation evidence and nsfs descriptor before joining, then clears
+all effective, permitted and inheritable capabilities and sets `no_new_privs`
+before invoking bubblewrap or Chromium. Python and Chromium never receive that
+capability.
+
+The Rust launcher preserves only Playwright's
 FD 3/4 pipes, closes unrelated descriptors, joins cgroup/netns, enters the
 mount sandbox, installs `no_new_privs` and seccomp, then execs Chromium.
 The Chromium runtime itself must be installed in a root-owned, read-only path

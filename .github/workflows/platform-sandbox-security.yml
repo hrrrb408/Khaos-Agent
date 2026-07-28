@@ -291,7 +291,7 @@ jobs:
       - name: Install nftables + iproute2 + bubblewrap
         run: |
           sudo apt-get update
-          sudo apt-get install -y nftables iproute2 util-linux bubblewrap
+          sudo apt-get install -y nftables iproute2 util-linux bubblewrap libcap2-bin
           nft --version
           ip -V
       - name: Enable unprivileged user namespaces (if restricted)
@@ -344,6 +344,9 @@ jobs:
           sudo cp rust/khaos-core/target/release/khaos-sandbox-launcher /usr/local/bin/khaos-sandbox-launcher
           sudo chown root:root /usr/local/bin/khaos-sandbox-launcher
           sudo chmod 0755 /usr/local/bin/khaos-sandbox-launcher
+          sudo setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher
+          test "$(getcap /usr/local/bin/khaos-sandbox-launcher)" = \
+            "/usr/local/bin/khaos-sandbox-launcher cap_sys_admin=ep"
           # Batch 11.3: tighten parent-directory permissions (Ubuntu runners
           # default several system dirs to 0777) so the parent-chain
           # validation accepts the launcher + Chromium runtime paths.

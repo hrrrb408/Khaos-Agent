@@ -323,6 +323,45 @@ mod linux {
         Ok(())
     }
 
+    fn drop_join_capabilities() -> io::Result<()> {
+        #[repr(C)]
+        struct CapabilityHeader {
+            version: u32,
+            pid: i32,
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct CapabilityData {
+            effective: u32,
+            permitted: u32,
+            inheritable: u32,
+        }
+        const LINUX_CAPABILITY_VERSION_3: u32 = 0x2008_0522;
+        let header = CapabilityHeader {
+            version: LINUX_CAPABILITY_VERSION_3,
+            pid: 0,
+        };
+        let data = [
+            CapabilityData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+            CapabilityData {
+                effective: 0,
+                permitted: 0,
+                inheritable: 0,
+            },
+        ];
+        if unsafe { libc::syscall(libc::SYS_capset, &header, &data) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     fn join_browser_authority(project_id: &str, runtime_id: &str, token: &str) -> io::Result<()> {
         validate_authority_identifier(project_id, "project_id")?;
         validate_authority_identifier(runtime_id, "runtime_id")?;
@@ -401,8 +440,18 @@ mod linux {
         }
         validate_namespace_fd(namespace.as_raw_fd())?;
         if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
-            return Err(io::Error::last_os_error());
+            let error = io::Error::last_os_error();
+            return Err(io::Error::new(
+                error.kind(),
+                format!("join helper-owned network namespace: {error}"),
+            ));
         }
+        drop_join_capabilities().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("drop launcher join capabilities: {error}"),
+            )
+        })?;
         Ok(())
     }
 
