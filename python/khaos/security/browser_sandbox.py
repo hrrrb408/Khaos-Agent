@@ -34,7 +34,7 @@ Round-5 review Batch 5.1 fixes (C-01~C-04, H-01~H-04):
   unmatched host traffic is unaffected.  Only browser-veth traffic is
   restricted.
 * **C-04**: production callers must pass ``require_os_sandbox=True``.
-  ``browser_tools.py`` now does this unless ``KHAOS_BROWSER_DEV_MODE=1``.
+  ``browser_tools.py`` now does this unless ``KHAOS_DEV_MODE=1``.
 * **H-01/H-02**: every resource (netns, veth, cgroup, nft table) now
   includes a per-sandbox token.  Teardown only deletes its own table.
 * **H-03**: ``startup_reaper`` now verifies the creating process is

@@ -310,7 +310,8 @@ class BrowserManager:
                 self._playwright = await async_playwright().start()
             pw = self._playwright
             # C-04 (round-5): production defaults to fail-closed.
-            # Only KHAOS_BROWSER_DEV_MODE=1 allows proxy-only fallback.
+            # Only the explicit process-wide KHAOS_DEV_MODE=1 allows
+            # proxy-only fallback.
             _dev_mode = os.environ.get("KHAOS_DEV_MODE", "") == "1"
             # F-05: set up the OS-level netns sandbox before launching
             # Chromium.  On Linux with CAP_NET_ADMIN, this creates a
@@ -373,7 +374,7 @@ class BrowserManager:
                         raise BrowserSandboxError(
                             "Firefox does not support netns wrapper — "
                             "refusing to launch in production.  Set "
-                            "KHAOS_BROWSER_DEV_MODE=1 for dev/testing."
+                            "KHAOS_DEV_MODE=1 for dev/testing."
                         )
                     logger.warning(
                         "browser sandbox: Firefox launched WITHOUT netns "
@@ -388,7 +389,7 @@ class BrowserManager:
                         raise BrowserSandboxError(
                             "WebKit does not support netns wrapper — "
                             "refusing to launch in production.  Set "
-                            "KHAOS_BROWSER_DEV_MODE=1 for dev/testing."
+                            "KHAOS_DEV_MODE=1 for dev/testing."
                         )
                     logger.warning(
                         "browser sandbox: WebKit launched WITHOUT netns "

@@ -1,11 +1,12 @@
 """Batch 6.6 (round-6): real-kernel browser isolation E2E.
 
 Closes review §21 (CI 不能证明真实 nft) + §6.6 (真实安全 CI).  These
-tests run ONLY in the privileged ``browser-kernel-isolation`` CI job,
+tests run ONLY in the privileged ``browser-kernel-isolation`` CI job with
+the explicit development contract ``KHAOS_DEV_MODE=1``,
 which sets ``KHAOS_RUN_KERNEL_BROWSER_E2E=1`` and runs as root (or with
 ``CAP_NET_ADMIN``) on a Linux runner with ``nftables`` + ``iproute2``.
 
-They exercise the REAL production path (no ``KHAOS_BROWSER_DEV_MODE``):
+They exercise the legacy development-only kernel primitive path:
   - real ``nft --check`` parses the generated script (real nft parser)
   - ``BrowserNetworkSandbox.setup()`` actually creates netns/veth/cgroup/nft
   - the egress proxy port is reachable from inside the netns

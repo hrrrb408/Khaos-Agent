@@ -168,11 +168,10 @@ jobs:
           path: diagnostics/
 
   # ─── Batch 6.6 (round-6 §6.6): real-kernel browser isolation E2E ────
-  # This job proves the REAL production browser sandbox path (no
-  # KHAOS_BROWSER_DEV_MODE) on a privileged Linux runner: real nft parser,
-  # real netns/veth/cgroup creation, real egress isolation, real teardown.
-  # It closes review §21 ("CI 不能证明真实 nft").  Tests run as root
-  # because BrowserNetworkSandbox needs CAP_NET_ADMIN for ip netns / nft.
+  # This job validates the explicitly development-only legacy kernel
+  # primitives against the real nft/netns/cgroup APIs. Production authority
+  # is proven exclusively by fullstack-browser-kernel below, where non-root
+  # Python talks to the root-owned Rust helper.
   browser-kernel-isolation:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -232,10 +231,11 @@ jobs:
             ip netns del khaos-cap-probe 2>&1; echo "del exit: $?"
           } > diagnostics/browser-kernel-pre.txt
           exit 0
-      - name: Run real-kernel browser isolation tests (as root)
+      - name: Run development-only kernel primitive tests (as root)
         env:
-          # CRITICAL: unset dev-mode so the REAL production path runs.
-          KHAOS_BROWSER_DEV_MODE: ""
+          # Direct privileged Python primitives are reachable only in the
+          # explicitly selected development mode.
+          KHAOS_DEV_MODE: "1"
           KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser
         # Batch 9.7a (round-9 §十七): this job previously ran
@@ -243,13 +243,12 @@ jobs:
         # browser_real", but it only set KHAOS_RUN_KERNEL_BROWSER_E2E=1
         # (not KHAOS_RUN_BROWSER_E2E=1), so the round8 _require_fullstack()
         # gate called pytest.skip() — the required job was green but empty.
-        # Now it runs test_browser_kernel_isolation_round6.py, the pure
-        # kernel primitive suite that exercises real nft/netns/cgroup
-        # WITHOUT Chromium and only needs the kernel gate.
+        # This is supplementary parser/primitive coverage, not production
+        # isolation evidence.
         run: |
           python_bin="$(command -v python)"
           py_path="$PYTHONPATH"
-          sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,PYTHONPATH \
+          sudo --preserve-env=KHAOS_DEV_MODE,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,PYTHONPATH \
             "$python_bin" -m pytest \
             python/tests/security/test_browser_kernel_isolation_round6.py \
             -m kernel_real -v
@@ -394,7 +393,6 @@ jobs:
         env:
           # CRITICAL: unset dev-mode + mock-mode so the REAL production
           # path runs (real sandbox, no mock fallback).
-          KHAOS_BROWSER_DEV_MODE: ""
           KHAOS_BROWSER_MOCK_MODE: ""
           KHAOS_DEV_MODE: "0"
           KHAOS_RUN_BROWSER_E2E: "1"
