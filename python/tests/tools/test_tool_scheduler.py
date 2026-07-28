@@ -1,10 +1,11 @@
 import asyncio
+import time
 
 from khaos.agent.approval import ApprovalBroker
 from khaos.db import Database
 from khaos.permissions import ApprovalMode, PermissionEngine
 from khaos.tools.registry import ToolDefinition, ToolRegistry
-from khaos.tools.scheduler import ToolBudget, ToolScheduler
+from khaos.tools.scheduler import PermissionRequest, ToolBudget, ToolScheduler
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.sandbox import Sandbox, SandboxMode
 
@@ -322,6 +323,42 @@ async def test_scheduler_denies_when_bound_approval_cannot_be_resolved(tmp_path)
     assert not results[0].success
     assert results[0].error == "User denied permission"
     await db.close()
+
+
+async def test_sync_confirmation_callback_runs_off_the_event_loop():
+    """A slow synchronous confirmer must not starve unrelated async work."""
+    scheduler = ToolScheduler(_registry(), object())
+    request = PermissionRequest(
+        tool_call_id="call-1",
+        name="write",
+        arguments={"value": "safe"},
+        level="write",
+        target="write:safe",
+        reason="ask-every",
+        expires_at=time.time() + 1,
+    )
+    ticks = 0
+    stop = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    def slow_confirm(_request: dict) -> dict:
+        time.sleep(0.08)
+        return {"approved": True}
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        result = await scheduler._confirm(request, slow_confirm)
+    finally:
+        stop.set()
+        await ticker_task
+
+    assert result == {"approved": True}
+    assert ticks >= 5
 
 
 async def test_scheduler_budget_exhaustion_stops_serial_calls(tmp_path):

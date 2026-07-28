@@ -577,30 +577,47 @@ class ToolScheduler:
     ) -> dict:
         if confirm_callback is None:
             return {"approved": False}
-        value = confirm_callback(
-            {
-                "id": request.tool_call_id,
-                "name": request.name,
-                "arguments": request.arguments,
-                "level": request.level,
-                "target": request.target,
-                "reason": request.reason,
-                "binding_digest": request.binding_digest,
-                "expires_at": request.expires_at,
-                "principal_id": request.principal_id,
-                "session_id": request.session_id,
-                "task_id": request.task_id,
-                "workspace_id": request.workspace_id,
-                "arguments_digest": request.arguments_digest,
-                "profile_digest": request.profile_digest,
-            }
-        )
+        remaining = request.expires_at - time.time()
+        if remaining <= 0:
+            return {"approved": False, "reason": "approval_expired_before_callback"}
+        payload = {
+            "id": request.tool_call_id,
+            "name": request.name,
+            "arguments": request.arguments,
+            "level": request.level,
+            "target": request.target,
+            "reason": request.reason,
+            "binding_digest": request.binding_digest,
+            "expires_at": request.expires_at,
+            "principal_id": request.principal_id,
+            "session_id": request.session_id,
+            "task_id": request.task_id,
+            "workspace_id": request.workspace_id,
+            "arguments_digest": request.arguments_digest,
+            "profile_digest": request.profile_digest,
+        }
+        try:
+            if inspect.iscoroutinefunction(confirm_callback):
+                value = await asyncio.wait_for(
+                    confirm_callback(payload), timeout=remaining
+                )
+            else:
+                # UI and gateway integrations may supply a synchronous
+                # callback.  It is untrusted with respect to latency, so run
+                # it off-loop and apply the same approval deadline as an
+                # asynchronous callback.  A timed-out worker cannot be
+                # force-killed, but it no longer starves scheduling or
+                # shutdown and its late result is discarded.
+                value = await asyncio.wait_for(
+                    asyncio.to_thread(confirm_callback, payload),
+                    timeout=remaining,
+                )
+        except asyncio.TimeoutError:
+            return {"approved": False, "reason": "approval_callback_timeout"}
         if inspect.isawaitable(value):
-            # P1-9 (round-13): enforce the approval expiration deadline.
-            # A hung UI/gateway callback must not block the tool batch,
-            # task owner, or shutdown indefinitely.
-            import time as _time
-            remaining = request.expires_at - _time.time()
+            # A synchronous adapter may return an awaitable.  Preserve the
+            # same fixed approval deadline across both execution phases.
+            remaining = request.expires_at - time.time()
             if remaining <= 0:
                 return {"approved": False, "reason": "approval_expired_before_callback"}
             try:

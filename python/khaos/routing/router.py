@@ -112,6 +112,11 @@ class ModelRouter:
             raise ModelUnavailableError(f"no routing rule for function: {function}")
         errors: list[str] = []
         for model_name in [rule.primary_model, *rule.fallback_models]:
+            # This state belongs to exactly one candidate.  Initializing it
+            # before *any* provider lookup also makes a lookup failure safe:
+            # it must never inherit the previous candidate's partial-output
+            # state and suppress an otherwise valid fallback.
+            emitted_anything = False
             try:
                 if not self.provider_manager.is_model_available(model_name):
                     continue
@@ -121,7 +126,6 @@ class ModelRouter:
                     stream = self._call_resolved(messages, kwargs)
                 else:
                     stream = self.model_client.stream_chat(provider, model, messages, kwargs.get("tools"))
-                emitted_anything = False
                 async for chunk in stream:
                     emitted_anything = True
                     yield chunk

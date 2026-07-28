@@ -2,7 +2,7 @@ import pytest
 
 from khaos.agent.core import Message
 from khaos.exceptions import ModelUnavailableError
-from khaos.routing.router import RoutingRule, create_default_router
+from khaos.routing.router import ModelRouter, RoutingRule, create_default_router
 
 
 async def test_router_resolves_default_rules():
@@ -36,3 +36,31 @@ async def test_custom_rule_can_be_registered():
 
     assert await router.resolve("summary") == "mock-provider/mock-summary"
 
+
+async def test_fallback_state_is_reset_when_candidate_lookup_raises():
+    """A pre-stream candidate failure must not suppress the next candidate."""
+
+    class ProviderManager:
+        def is_model_available(self, name):
+            if name == "primary":
+                raise RuntimeError("primary lookup failed")
+            return True
+
+        def get_model(self, name):
+            return type("Model", (), {"provider": "fallback-provider"})()
+
+        def get_provider(self, _name):
+            return type("Provider", (), {"base_url": "mock://fallback"})()
+
+    router = ModelRouter(provider_manager=ProviderManager())
+    router.set_rule("chat", RoutingRule("chat", "primary", ["fallback"]))
+
+    chunks = [
+        chunk.content
+        async for chunk in router.call_with_fallback(
+            "chat", [Message(role="user", content="hi")]
+        )
+        if chunk.content
+    ]
+
+    assert "".join(chunks) == "Khaos mock response."
