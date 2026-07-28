@@ -170,6 +170,49 @@ def test_incomplete_evidence_is_rejected(monkeypatch: pytest.MonkeyPatch) -> Non
         _cleanup(socket_path, thread)
 
 
+def test_teardown_accepts_exact_absence_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def teardown_evidence(response: dict[str, object]) -> None:
+        response["status"] = {
+            "helper_authenticated": True,
+            "network_namespace": False,
+            "nft_default_deny": False,
+            "cgroup_attached": False,
+            "process_isolated": False,
+            "resource_registry_verified": True,
+            "quarantined": False,
+            "proxy_host": "",
+        }
+
+    socket_path, thread, _ = _start_fake_helper(mutate_response=teardown_evidence)
+    try:
+        evidence = _client(monkeypatch, socket_path).teardown()
+        assert evidence.helper_authenticated
+        assert evidence.resource_registry_verified
+        assert not evidence.network_namespace
+        assert evidence.proxy_host == ""
+    finally:
+        _cleanup(socket_path, thread)
+
+
+def test_teardown_rejects_partial_resource_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def partial_teardown(response: dict[str, object]) -> None:
+        response["status"] = {
+            **STATUS,
+            "proxy_host": "",
+        }
+
+    socket_path, thread, _ = _start_fake_helper(mutate_response=partial_teardown)
+    try:
+        with pytest.raises(RuntimeError, match="teardown evidence invalid"):
+            _client(monkeypatch, socket_path).teardown()
+    finally:
+        _cleanup(socket_path, thread)
+
+
 @pytest.mark.parametrize("token", ["short", "g" * 64, "a" * 257])
 def test_invalid_tokens_rejected(token: str) -> None:
     with pytest.raises(ValueError, match="sandbox token"):

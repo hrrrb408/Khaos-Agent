@@ -56,8 +56,20 @@ class KernelIsolationEvidence:
     proxy_host: str
 
     @classmethod
-    def from_payload(cls, payload: object) -> KernelIsolationEvidence:
-        """Parse an exact helper status object, rejecting type drift."""
+    def from_payload(
+        cls,
+        payload: object,
+        *,
+        resources_active: bool = True,
+    ) -> KernelIsolationEvidence:
+        """Parse exact operation-specific helper evidence.
+
+        Active operations must return a private IPv4 proxy endpoint.  A
+        successful teardown must instead prove that every kernel resource is
+        absent and must not retain a stale endpoint.  Keeping those contracts
+        distinct prevents cleanup success from being rejected by setup-only
+        validation while still failing closed on partial teardown.
+        """
         if not isinstance(payload, dict) or set(payload) != _STATUS_FIELDS:
             raise RuntimeError("kernel helper status contract invalid")
         boolean_fields = _STATUS_FIELDS - {"proxy_host"}
@@ -65,12 +77,24 @@ class KernelIsolationEvidence:
             raise RuntimeError("kernel helper status evidence must be boolean")
         if type(payload["proxy_host"]) is not str or len(payload["proxy_host"]) > 64:
             raise RuntimeError("kernel helper proxy host evidence invalid")
-        try:
-            proxy_host = ipaddress.ip_address(payload["proxy_host"])
-        except ValueError as error:
-            raise RuntimeError("kernel helper proxy host evidence invalid") from error
-        if proxy_host.version != 4 or not proxy_host.is_private or proxy_host.is_loopback:
-            raise RuntimeError("kernel helper proxy host authority invalid")
+        if resources_active:
+            try:
+                proxy_host = ipaddress.ip_address(payload["proxy_host"])
+            except ValueError as error:
+                raise RuntimeError("kernel helper proxy host evidence invalid") from error
+            if proxy_host.version != 4 or not proxy_host.is_private or proxy_host.is_loopback:
+                raise RuntimeError("kernel helper proxy host authority invalid")
+        elif (
+            payload["proxy_host"] != ""
+            or not payload["helper_authenticated"]
+            or not payload["resource_registry_verified"]
+            or payload["network_namespace"]
+            or payload["nft_default_deny"]
+            or payload["cgroup_attached"]
+            or payload["process_isolated"]
+            or payload["quarantined"]
+        ):
+            raise RuntimeError("kernel helper teardown evidence invalid")
         return cls(**payload)
 
 
@@ -193,7 +217,10 @@ class KernelAuthorityClient:
             raise RuntimeError(f"kernel helper rejected request: {response['error']}")
         if response["error"] is not None:
             raise RuntimeError("successful kernel helper response carried an error")
-        return KernelIsolationEvidence.from_payload(response["status"])
+        return KernelIsolationEvidence.from_payload(
+            response["status"],
+            resources_active=op != "teardown",
+        )
 
     def _validate_socket_authority(self) -> None:
         socket_path = Path(self._socket_path)

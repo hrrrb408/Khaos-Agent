@@ -69,8 +69,16 @@ def _require_fullstack() -> None:
         pytest.fail("production Python browser runtime must be non-root")
 
 
-def _descendant_environments(parent_pid: int) -> bytes:
-    """Read same-UID descendant environments without kernel resource names."""
+def _chromium_descendant_environments(parent_pid: int) -> bytes:
+    """Read environments only from Chromium descendants.
+
+    The Playwright Node driver is a trusted control-plane child and retains
+    the Python runtime environment by design.  It is outside Chromium's PID
+    and mount namespaces and cannot be read by the sandboxed browser.  The
+    secrecy property under test therefore selects actual Chrome/Chromium
+    executables instead of conflating every control-plane descendant with
+    the browser attack surface.
+    """
     descendants = {parent_pid}
     combined = bytearray()
     changed = True
@@ -87,12 +95,17 @@ def _descendant_environments(parent_pid: int) -> bytes:
             if parent in descendants:
                 descendants.add(int(entry.name))
                 changed = True
+    chromium_processes = 0
     for pid in descendants - {parent_pid}:
         try:
+            executable = Path(f"/proc/{pid}/exe").resolve(strict=True).name.lower()
+            if "chrome" not in executable and "chromium" not in executable:
+                continue
             combined.extend(Path(f"/proc/{pid}/environ").read_bytes())
+            chromium_processes += 1
         except OSError:
             continue
-    assert combined, "Chromium descendant process environments unavailable"
+    assert chromium_processes, "Chromium descendant process environments unavailable"
     return bytes(combined)
 
 
@@ -120,7 +133,7 @@ async def test_chromium_environ_excludes_parent_secrets() -> None:
         sandbox = manager._browser_sandbox
         assert sandbox is not None and sandbox.is_active
 
-        environ = _descendant_environments(os.getpid())
+        environ = _chromium_descendant_environments(os.getpid())
         # environ entries are NUL-separated; the sentinel value must not
         # appear anywhere in the concatenated buffer.
         sentinel_marker = sentinel.encode("ascii")
