@@ -325,10 +325,16 @@ class BrowserManager:
                 # Round-5 Batch 5.4: run in a thread — startup_reaper()
                 # invokes subprocess.run (ip/nft/cgroup file I/O) which
                 # would block the event loop.
-                await asyncio.to_thread(
-                    BrowserNetworkSandbox.startup_reaper,
-                    validate=not _dev_mode,
-                )
+                # Production recovery belongs exclusively to the Rust
+                # helper, which replays its root-owned transaction journal
+                # before accepting requests.  Calling the legacy Python
+                # reaper here would make ip/nft/cgroup operations reachable
+                # from the production control plane.
+                if _dev_mode:
+                    await asyncio.to_thread(
+                        BrowserNetworkSandbox.startup_reaper,
+                        validate=False,
+                    )
                 candidate = BrowserNetworkSandbox(
                     require_os_sandbox=not _dev_mode,
                     project_id=project_id,
