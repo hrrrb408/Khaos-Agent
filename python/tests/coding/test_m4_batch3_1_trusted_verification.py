@@ -5135,9 +5135,8 @@ def test_runtime_storage_capabilities_cannot_cross_runtime(tmp_path):
         artifact_root=tmp_path / "artifact-a",
         snapshot_root=tmp_path / "snapshot-a",
     )
-    from khaos.coding.planning.verification_storage import VERIFICATION_STORAGE_REGISTRY
     with pytest.raises(PermissionError, match="invalid or stale"):
-        VERIFICATION_STORAGE_REGISTRY.resolve(
+        runtime_b._verification_storage_registry.resolve(
             config.artifact_storage_capability_id,
             runtime_id=runtime_b._runtime_authority_id,
             boot_id=runtime_b.boot_context.boot_id, kind="artifact",
@@ -5177,8 +5176,7 @@ def test_runtime_storage_capability_detects_ancestor_symlink_swap(tmp_path):
         artifact_root=parent / "artifact",
         snapshot_root=tmp_path / "snapshot-safe",
     )
-    from khaos.coding.planning.verification_storage import VERIFICATION_STORAGE_REGISTRY
-    capability = VERIFICATION_STORAGE_REGISTRY.resolve(
+    capability = runtime._verification_storage_registry.resolve(
         config.artifact_storage_capability_id,
         runtime_id=runtime._runtime_authority_id,
         boot_id=runtime.boot_context.boot_id, kind="artifact",

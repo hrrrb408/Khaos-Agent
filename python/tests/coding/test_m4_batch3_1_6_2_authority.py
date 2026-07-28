@@ -18,7 +18,7 @@ import pytest
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.verification_authority import (
     PROTECTED_SCHEMA_OBJECTS,
-    VERIFICATION_AUTHORITIES,
+    VerificationAuthorityRegistry,
     VerificationReadHandle,
     VerificationWriteAuthority,
     VerificationWriteCapability,
@@ -35,6 +35,9 @@ from test_m4_batch3_1_trusted_verification import (
     _cleanup_proof,
     _finalize_test_store,
 )
+
+
+VERIFICATION_AUTHORITIES = VerificationAuthorityRegistry()
 
 
 def _authority_store(tmp_path, *, runtime_id=None, boot_id=None):

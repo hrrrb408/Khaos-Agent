@@ -14,6 +14,12 @@ from typing import Any
 from khaos.coding.planning.approval.gate import PlanExecutionGate
 from khaos.coding.planning.approval.repository import PersistedPlanRepository
 from khaos.coding.planning.approval.service import PlanApprovalService
+from khaos.coding.planning.verification_authority import (
+    VerificationAuthorityRegistry,
+)
+from khaos.coding.planning.verification_storage import (
+    RuntimeVerificationStorageRegistry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +58,7 @@ class RuntimeCapability:
     production Gate/Service consume them. Test code must use the explicit
     ``UnsafeTest*`` subclasses in ``tests/coding/_m4_batch2_helpers.py``.
     """
-    __slots__ = ("_capability_id",)
+    __slots__ = ("_capability_id", "_registry")
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         raise TypeError("RuntimeCapability cannot be constructed directly")
 
@@ -70,7 +76,10 @@ class _RuntimeAuthorityRegistry:
         with self._lock:
             if runtime_id not in self._boots: raise PermissionError("runtime authority is revoked")
             cap_id=secrets.token_hex(32); self._capabilities[cap_id]=(runtime_id,scope,False)
-        cap=object.__new__(RuntimeCapability); object.__setattr__(cap,"_capability_id",cap_id); return cap
+        cap = object.__new__(RuntimeCapability)
+        object.__setattr__(cap, "_capability_id", cap_id)
+        object.__setattr__(cap, "_registry", self)
+        return cap
 
     def consume(self, capability: Any, scope: str) -> BootContext:
         cap_id=getattr(capability,"_capability_id","")
@@ -94,10 +103,11 @@ class _RuntimeAuthorityRegistry:
         with self._lock:
             return self._boots.get(runtime_id) == boot
 
-_RUNTIME_AUTHORITIES = _RuntimeAuthorityRegistry()
-
 def _consume_runtime_capability(capability: Any, scope: str) -> BootContext:
-    return _RUNTIME_AUTHORITIES.consume(capability, scope)
+    registry = getattr(capability, "_registry", None)
+    if not isinstance(registry, _RuntimeAuthorityRegistry):
+        raise PermissionError("invalid or reused runtime capability")
+    return registry.consume(capability, scope)
 
 
 class VerificationSnapshotProvider:
@@ -270,6 +280,9 @@ class ApprovalRuntime:
         self._runtime_token = object()
         self.service=None; self.gate=None; self.boot_context=None; self.ready=False
         self._state = RuntimeState.UNINITIALIZED
+        self._runtime_authorities = _RuntimeAuthorityRegistry()
+        self._verification_authorities = VerificationAuthorityRegistry()
+        self._verification_storage_registry = RuntimeVerificationStorageRegistry()
         self._runtime_authority_id: str | None = None
         self._verification_contexts: dict[str, Any] = {}
         self._verification_cancel_events: dict[str, Any] = {}
@@ -313,7 +326,9 @@ class ApprovalRuntime:
             # 1. Rotate epoch (generates fresh boot_id, revokes old auths/leases)
             epoch, boot_id, _ = self._store.rotate_epoch()
             self.boot_context = BootContext(epoch, boot_id)
-            self._runtime_authority_id = _RUNTIME_AUTHORITIES.register_boot(self.boot_context)
+            self._runtime_authority_id = self._runtime_authorities.register_boot(
+                self.boot_context
+            )
 
             # Execution readiness requires one shared mutation fence wired to
             # every mutable workspace subsystem before Gate construction.
@@ -338,15 +353,17 @@ class ApprovalRuntime:
             store = self._store
             self._broker._rotate_receipt_signing_authority(epoch, boot_id)
             verifier = self._broker._receipt_public_verifier()
-            store_receipt_capability = _RUNTIME_AUTHORITIES.issue(
+            store_receipt_capability = self._runtime_authorities.issue(
                 self._runtime_authority_id, "receipt-store"
             )
-            broker_receipt_capability = _RUNTIME_AUTHORITIES.issue(
+            broker_receipt_capability = self._runtime_authorities.issue(
                 self._runtime_authority_id, "receipt-broker"
             )
+            writer_runtime_id = self._runtime_authority_id
+            writer_boot_context = self.boot_context
             def _writer(**fields):
-                if not _RUNTIME_AUTHORITIES.is_active(
-                    self._runtime_authority_id, self.boot_context
+                if not self._runtime_authorities.is_active(
+                    writer_runtime_id, writer_boot_context
                 ):
                     raise PermissionError("receipt runtime authority is revoked")
                 store._insert_signed_receipt(runtime_token=self._runtime_token, **fields)
@@ -364,8 +381,12 @@ class ApprovalRuntime:
 
             # 3. Construct Gate and Service + reconcile (Batch 2.6 §2)
             self._state = RuntimeState.RECONCILING
-            gate_capability = _RUNTIME_AUTHORITIES.issue(self._runtime_authority_id, "gate")
-            service_capability = _RUNTIME_AUTHORITIES.issue(self._runtime_authority_id, "service")
+            gate_capability = self._runtime_authorities.issue(
+                self._runtime_authority_id, "gate"
+            )
+            service_capability = self._runtime_authorities.issue(
+                self._runtime_authority_id, "service"
+            )
             self._lease_authority=object()
             self.gate = PlanExecutionGate(
                 store=self._store, context_provider=self._context_provider,
@@ -384,7 +405,7 @@ class ApprovalRuntime:
             self.guard.set_mutation_fence(self._mutation_fence)
             self._coordinator=WorkspaceExecutionLeaseCoordinator(self)
             self._head_mutation_adapter=PlannedHeadMutationAdapter(self._mutation_fence,self._coordinator)
-            mutation_capability = _RUNTIME_AUTHORITIES.issue(
+            mutation_capability = self._runtime_authorities.issue(
                 self._runtime_authority_id, "mutation-engine"
             )
             self._mutation_call_authority = object()
@@ -465,11 +486,10 @@ class ApprovalRuntime:
                 pass
 
         self.boot_context = None
-        from khaos.coding.planning.verification_storage import (
-            VERIFICATION_STORAGE_REGISTRY,
+        self._verification_storage_registry.revoke_runtime(
+            self._runtime_authority_id
         )
-        VERIFICATION_STORAGE_REGISTRY.revoke_runtime(self._runtime_authority_id)
-        _RUNTIME_AUTHORITIES.revoke(self._runtime_authority_id)
+        self._runtime_authorities.revoke(self._runtime_authority_id)
         self._runtime_authority_id = None
         logger.warning("approval runtime initialization failed at %s; rolled back", failed_state.name)
 
@@ -534,15 +554,12 @@ class ApprovalRuntime:
                 "ProductionVerificationConfig — caller-provided backends "
                 "are not accepted"
             )
-        from khaos.coding.planning.verification_storage import (
-            VERIFICATION_STORAGE_REGISTRY,
-        )
-        artifact_capability = VERIFICATION_STORAGE_REGISTRY.resolve(
+        artifact_capability = self._verification_storage_registry.resolve(
             config.artifact_storage_capability_id,
             runtime_id=self._runtime_authority_id,
             boot_id=self.boot_context.boot_id, kind="artifact",
         )
-        snapshot_capability = VERIFICATION_STORAGE_REGISTRY.resolve(
+        snapshot_capability = self._verification_storage_registry.resolve(
             config.snapshot_storage_capability_id,
             runtime_id=self._runtime_authority_id,
             boot_id=self.boot_context.boot_id, kind="snapshot",
@@ -564,9 +581,6 @@ class ApprovalRuntime:
         from khaos.coding.planning.verification_sandbox import (
             ProductionVerificationConfig,
         )
-        from khaos.coding.planning.verification_storage import (
-            VERIFICATION_STORAGE_REGISTRY,
-        )
         forbidden: list[_Path] = []
         workspaces = getattr(self._workspace_manager, "_workspaces", {})
         for workspace in workspaces.values():
@@ -581,7 +595,7 @@ class ApprovalRuntime:
             if database_path:
                 forbidden.append(_Path(database_path))
                 forbidden.append(_Path(database_path).parent)
-        artifact_id, snapshot_id = VERIFICATION_STORAGE_REGISTRY.issue_pair(
+        artifact_id, snapshot_id = self._verification_storage_registry.issue_pair(
             runtime_id=self._runtime_authority_id,
             boot_id=self.boot_context.boot_id,
             artifact_root=_Path(artifact_root), snapshot_root=_Path(snapshot_root),
@@ -660,10 +674,7 @@ class ApprovalRuntime:
         authority = self._verification_write_authority
         if authority is None:
             return
-        from khaos.coding.planning.verification_authority import (
-            VERIFICATION_AUTHORITIES,
-        )
-        VERIFICATION_AUTHORITIES.revoke(
+        self._verification_authorities.revoke(
             self._runtime_authority_id, self.boot_context.boot_id,
         )
         self._store._reset_verification_success_verifier()
@@ -734,10 +745,7 @@ class ApprovalRuntime:
         # Initialize the verification store early so attestation rows can
         # be persisted before sandbox reconciliation runs.
         self._verification_store = VerificationExecutionStore(self._store)
-        from khaos.coding.planning.verification_authority import (
-            VERIFICATION_AUTHORITIES,
-        )
-        self._verification_write_authority = VERIFICATION_AUTHORITIES.issue(
+        self._verification_write_authority = self._verification_authorities.issue(
             self._store._conn, runtime_id=self._runtime_authority_id,
             boot_id=self.boot_context.boot_id,
         )
@@ -1157,13 +1165,10 @@ class ApprovalRuntime:
             self.service = None
             self.boot_context = None
             self._state = RuntimeState.UNINITIALIZED
-            from khaos.coding.planning.verification_storage import (
-                VERIFICATION_STORAGE_REGISTRY,
-            )
-            VERIFICATION_STORAGE_REGISTRY.revoke_runtime(
+            self._verification_storage_registry.revoke_runtime(
                 self._runtime_authority_id,
             )
-            _RUNTIME_AUTHORITIES.revoke(self._runtime_authority_id)
+            self._runtime_authorities.revoke(self._runtime_authority_id)
             self._runtime_authority_id = None
             logger.info("approval runtime shut down")
 
