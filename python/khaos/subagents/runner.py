@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional
 
-from khaos.agent.core import AgentConfig, AgentLoop, Message, SimpleTokenEngine
+from khaos.agent.core import AgentConfig, Message, SimpleTokenEngine
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.subagents.spawner import SubAgentTask
 
@@ -55,6 +55,7 @@ class SubAgentRunner:
         audit_logger: Optional[Any] = None,      # B1: 继承审计 logger
         project_root: Optional[Path] = None,     # B1: 继承项目根（不可变）
         config_path: Optional[Path] = None,      # B1: 继承 config 路径
+        cleanup_authority: Optional[Any] = None,
     ):
         self.router = router
         self.db = db
@@ -101,6 +102,7 @@ class SubAgentRunner:
         # the server's project root, never the process cwd.
         self.project_root = project_root
         self.config_path = config_path
+        self.cleanup_authority = cleanup_authority
 
     async def run(self, task: SubAgentTask) -> str:
         """执行子任务并返回结果字符串。
@@ -200,6 +202,7 @@ class SubAgentRunner:
             # ``$CWD/khaos_policy.yaml`` — two security authorities.
             project_root=project_root,
             config_path=self.config_path,
+            cleanup_authority=self.cleanup_authority,
         ))
         try:
             logger.info(

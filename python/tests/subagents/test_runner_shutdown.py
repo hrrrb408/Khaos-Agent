@@ -25,6 +25,7 @@ from pathlib import Path
 from unittest.mock import MagicMock
 from khaos.db import Database
 from khaos.modes import ModeManager
+from khaos.runtime import RuntimeCleanupAuthority
 from khaos.subagents.runner import SubAgentRunner
 from khaos.subagents.spawner import SubAgentConfig, SubAgentSpawner, SubAgentTask
 
@@ -73,6 +74,7 @@ async def _build_runner(
             from khaos.agent.core import Message
             return [Message(role="assistant", content="stub-done")]
 
+    cleanup_authority = RuntimeCleanupAuthority()
     runner = SubAgentRunner(
         router=_StubRouter(),
         db=db,
@@ -88,6 +90,7 @@ async def _build_runner(
         audit_logger=audit_logger,
         project_root=tmp_path,
         config_path=tmp_path / "config.yaml",
+        cleanup_authority=cleanup_authority,
     )
     return db, runner
 
@@ -113,8 +116,7 @@ async def test_runner_run_closes_borrowed_runtime_on_success(tmp_path):
         assert task.status == "completed", task.error
         # The orphan registry must be empty: the runtime was closed cleanly
         # by the runner's finally block, not leaked.
-        from khaos.runtime.factory import _orphan_runtimes
-        assert len(_orphan_runtimes) == 0, (
+        assert runner.cleanup_authority.count == 0, (
             "subagent runtime leaked into orphan registry on success"
         )
     finally:
@@ -128,7 +130,7 @@ async def test_runner_run_closes_borrowed_runtime_on_cancellation(tmp_path):
     cancelled.  This is the exact path the detached-task-shutdown fix
     relies on: when ``SubAgentSpawner.shutdown`` cancels the active task,
     the runner must still close the runtime (or register it as an orphan)
-    so the server's ``drain_orphan_runtimes`` can boundedly finalize it.
+    so the server's cleanup authority can boundedly finalize it.
     """
     db, runner = await _build_runner(tmp_path)
     try:
@@ -165,16 +167,12 @@ async def test_runner_run_closes_borrowed_runtime_on_cancellation(tmp_path):
         # The runtime must have reached a terminal state or be registered
         # as an orphan (i.e. NOT silently leaked with no owner).  Either
         # outcome is acceptable; what is forbidden is "no owner at all".
-        from khaos.runtime.factory import (
-            _orphan_runtimes,
-            cleanup_orphan_runtimes,
-        )
         # Try one cleanup pass — if the runtime was registered as an orphan
         # (RuntimeCloseError on the first attempt), this finalizes it.
-        await cleanup_orphan_runtimes()
+        await runner.cleanup_authority.cleanup()
         # After cleanup, orphan registry must be empty (the borrowed runtime
         # did not own Office, so its aclose succeeds).
-        assert len(_orphan_runtimes) == 0, (
+        assert runner.cleanup_authority.count == 0, (
             "subagent runtime left as orphan after shutdown + cleanup"
         )
         release.set()

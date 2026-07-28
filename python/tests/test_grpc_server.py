@@ -26,7 +26,6 @@ from khaos.grpc_server import (
     serve_json_lines,
     TaskService,
 )
-from khaos.memory import MemoryStore
 from khaos.channels import ChannelType, PlatformMessage, Sender
 from khaos.runtime import RequestContext
 
@@ -142,11 +141,7 @@ async def test_agent_service_chat_quarantines_failed_runtime_close(
 ):
     """H4: production chat teardown registers an orphan before raising."""
     from khaos.exceptions import RuntimeCloseError
-    from khaos.runtime.factory import (
-        RuntimeResult,
-        _orphan_runtimes,
-        cleanup_orphan_runtimes,
-    )
+    from khaos.runtime.factory import RuntimeResult
 
     db = Database(tmp_path / "khaos.db")
     await db.connect()
@@ -174,6 +169,7 @@ async def test_agent_service_chat_quarantines_failed_runtime_close(
         principal_id="principal",
         session_id="session",
         runtime_id="runtime",
+        cleanup_authority=service.runtime_cleanup_authority,
     )
 
     async def fake_build(*args, **kwargs):
@@ -183,11 +179,11 @@ async def test_agent_service_chat_quarantines_failed_runtime_close(
     try:
         with pytest.raises(RuntimeCloseError):
             [event async for event in service.chat(_test_ctx(), ChatRequest("s1", "hi", "office"))]
-        assert any(item is runtime for item in _orphan_runtimes)
+        assert service.runtime_cleanup_authority.contains(runtime)
         assert runtime.quarantined is True
     finally:
         office.shutdown = AsyncMock()
-        await cleanup_orphan_runtimes()
+        await service.runtime_cleanup_authority.cleanup()
         await service.shutdown()
         await db.close()
 

@@ -937,6 +937,9 @@ class AgentService:
         # gets SessionBusyError instead of racing on shared state.
         self._active_chat_sessions: set[str] = set()
         self.subagent_spawner = None
+        from khaos.runtime import RuntimeCleanupAuthority
+
+        self.runtime_cleanup_authority = RuntimeCleanupAuthority()
         self._office_shutdown_task: asyncio.Task | None = None
         self.shutdown_failed = False
         # M4 batch 3.1.15 (CRITICAL-1): idempotency flag for shutdown().
@@ -1040,8 +1043,9 @@ class AgentService:
                 # failures.  Continue so drain can retry all retained owners.
                 logger.error("active runtime teardown failed", exc_info=True)
 
-        from khaos.runtime import drain_orphan_runtimes
-        remaining = await drain_orphan_runtimes(timeout_seconds=5.0)
+        remaining = await self.runtime_cleanup_authority.drain(
+            timeout_seconds=5.0
+        )
         if remaining:
             logger.error(
                 "server shutdown retaining %d quarantined runtime(s)", remaining
@@ -1640,6 +1644,7 @@ class AgentService:
             channel_admins=self._effective_policy.channel_admins,
             cron_engine=self.cron_engine,
             subagent_spawner=self.subagent_spawner,
+            cleanup_authority=self.runtime_cleanup_authority,
         ))
 
     async def _wait_for_confirmation(self, request: dict) -> dict:
@@ -2387,6 +2392,7 @@ async def serve_json_lines(
                 # security events land in the SAME audit trail as the main
                 # AgentLoop — no parallel unsupervised audit path.
                 audit_logger=agent._audit_logger,
+                cleanup_authority=agent.runtime_cleanup_authority,
             )
             agent.subagent_spawner = subagent_service.spawner
 
@@ -2872,6 +2878,7 @@ async def _build_subagent_service(
     office_authority: OfficeMutationAuthority | None = None,
     approval_broker: Any = None,
     audit_logger: Any = None,
+    cleanup_authority: Any = None,
 ) -> SubAgentService:
     """Build the SubAgent service bound to the server's shared security stack.
 
@@ -2932,6 +2939,7 @@ async def _build_subagent_service(
         # fail-closed gate on empty principal_id.
         principal_id="",
         audit_logger=audit_logger,
+        cleanup_authority=cleanup_authority,
         # B1: inherit the server's project_root / config_path so the subagent
         # loads the SAME ``khaos_policy.yaml`` and compiles the SAME
         # EffectivePolicy as the main AgentLoop — no second security
