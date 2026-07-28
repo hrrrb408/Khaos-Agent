@@ -540,18 +540,9 @@ async def test_aclose_cancellation_does_not_abort_cleanup():
 
 
 async def test_aclose_releases_principal_browser_context():
-    """H1 / H3: ``aclose`` must release the principal's per-session
-    BrowserContext so cookies / DOM / page state cannot leak into a
-    subsequent run by a different principal sharing the same process-wide
-    BrowserManager.
-    """
+    """H1 / H3: ``aclose`` closes its runtime-owned BrowserManager."""
     manager = MagicMock()
-    manager.close_runtime = AsyncMock(return_value={"ok": True})
-    # Patch the module-level _manager that factory.aclose imports.
-    import khaos.tools.browser_tools as bt
-
-    original = bt._manager
-    bt._manager = manager
+    manager.close = AsyncMock(return_value={"ok": True})
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
@@ -566,18 +557,10 @@ async def test_aclose_releases_principal_browser_context():
         # per-session context key is matched correctly.
         session_id="sess-1",
         runtime_id="rt-1",
+        browser_manager=manager,
     )
-    try:
-        await result.aclose()
-        # H1 (lifecycle): ``close_runtime(runtime_id)`` is called (not
-        # ``close_context(principal_id, ...)``) so ALL contexts the
-        # runtime acquired — regardless of which (principal, session,
-        # runtime) key they were originally created under — are released.
-        # This closes the leak where a runtime acquired contexts under
-        # multiple keys and ``close_context`` only released one of them.
-        manager.close_runtime.assert_awaited_once_with("rt-1")
-    finally:
-        bt._manager = original
+    await result.aclose()
+    manager.close.assert_awaited_once_with()
 
 
 # ───────────────────────── H1: per-principal BrowserContext ─────────────────

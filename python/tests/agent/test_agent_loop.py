@@ -193,7 +193,10 @@ async def test_agent_loop_terminal_read_only_without_workspace_fails_closed(tmp_
         tool_scheduler=scheduler,
     )
 
-    events = [message async for message in loop.run("/tool terminal echo hi", "s1")]
+    events = [
+        message
+        async for message in loop.run("/tool terminal_argv echo hi", "s1")
+    ]
 
     assert "permission_request" not in [message.event for message in events]
     tool_result = next(message for message in events if message.event == "tool_result")

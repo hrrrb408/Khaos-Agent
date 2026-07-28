@@ -452,24 +452,11 @@ class RuntimeResult:
                     logger.debug(
                         "execution service close failed", exc_info=True
                     )
-            # H1: release EVERY BrowserContext this runtime acquired so its
-            # cookies / DOM / page state cannot leak into a subsequent run by
-            # a different runtime sharing the same process-wide
-            # BrowserManager.  A close failure is safety-critical: the
-            # manager retains the live Context so this runtime must enter the
-            # same retry/quarantine path as other owned resources.
-            #
-            # H1 (lifecycle): we use ``close_runtime(runtime_id)`` (not
-            # ``close_context(principal_id, session_id, runtime_id)``)
-            # because a runtime may have acquired contexts under multiple
-            # keys (e.g. via different ``session_id``s during its
-            # lifetime).  ``close_context`` only releases ONE key and
-            # would leak the rest; ``close_runtime`` iterates every entry
-            # whose ``_runtime_owners`` set lists this ``runtime_id`` and
-            # decrements the refcount for each, so ALL contexts the
-            # runtime acquired are released regardless of the key.  A
-            # concurrent runtime sharing a context is NOT affected
-            # (refcount only closes when the last owner releases).
+            # H1: the BrowserManager is runtime-owned, so closing the manager
+            # releases every Context it acquired without consulting mutable
+            # module-global state. A close failure is safety-critical: live
+            # page state remains reachable, so the runtime enters the same
+            # retry/quarantine path as other owned resources.
             if self.browser_manager is not None:
                 try:
                     browser_result = await self.browser_manager.close()
