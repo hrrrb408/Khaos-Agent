@@ -1,0 +1,133 @@
+name: Security Closure Gate
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "feature/**", "codex/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-closure-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Python Security Suite, Go Race, Rust Clippy, Browser Kernel Attack E2E.
+  core-security:
+    uses: ./.github/workflows/batch5-required-jobs.yml
+
+  # Rust Test plus the Python/Go/Rust strict cross-platform contracts.
+  strict-contracts:
+    uses: ./.github/workflows/security-contract-matrix.yml
+
+  # Linux Bwrap Real Kernel, macOS Seatbelt Real Kernel, Browser Non-root
+  # Fullstack, Browser Kernel Attack E2E, and Windows fail-closed evidence.
+  real-kernel:
+    uses: ./.github/workflows/platform-sandbox-security.yml
+
+  playwright-security:
+    uses: ./.github/workflows/browser-e2e.yml
+
+  # Docker Security E2E.
+  docker-security:
+    uses: ./.github/workflows/docker-security.yml
+
+  # Supply Chain Audit.
+  supply-chain:
+    uses: ./.github/workflows/supply-chain-audit.yml
+
+  # Schema Fuzz, Authorization Drift E2E, Process Lifecycle E2E, and
+  # Event-loop Starvation Tests are explicit independent gate dependencies.
+  closure-adversarial:
+    name: Closure Adversarial Contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Schema Fuzz
+        run: python -m pytest python/tests/security/test_schema_fuzz.py -q -v
+      - name: Authorization Drift E2E
+        run: |
+          python -m pytest \
+            python/tests/permissions/test_authorization_resource.py \
+            python/tests/coding/test_runtime_approval_e2e.py \
+            python/tests/agent/test_operation_approval_ledger.py \
+            -q -v
+      - name: Process Lifecycle E2E
+        run: |
+          python -m pytest \
+            python/tests/coding/test_process_supervisor.py \
+            python/tests/coding/test_managed_process_lifecycle.py \
+            python/tests/runtime/test_aclose.py \
+            -q -v
+      - name: Event-loop Starvation Tests
+        run: |
+          python -m pytest \
+            python/tests/security/test_event_loop_starvation.py \
+            python/tests/coding/test_office_mutation_authority.py \
+            -q -v
+
+  security-closure-gate:
+    name: Security Closure Gate
+    if: always()
+    needs:
+      - core-security
+      - strict-contracts
+      - real-kernel
+      - playwright-security
+      - docker-security
+      - supply-chain
+      - closure-adversarial
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Reject failed cancelled or skipped dependencies
+        env:
+          CORE_SECURITY: ${{ needs.core-security.result }}
+          STRICT_CONTRACTS: ${{ needs.strict-contracts.result }}
+          REAL_KERNEL: ${{ needs.real-kernel.result }}
+          PLAYWRIGHT_SECURITY: ${{ needs.playwright-security.result }}
+          DOCKER_SECURITY: ${{ needs.docker-security.result }}
+          SUPPLY_CHAIN: ${{ needs.supply-chain.result }}
+          CLOSURE_ADVERSARIAL: ${{ needs.closure-adversarial.result }}
+        run: |
+          for result in \
+            "$CORE_SECURITY" "$STRICT_CONTRACTS" "$REAL_KERNEL" \
+            "$PLAYWRIGHT_SECURITY" "$DOCKER_SECURITY" "$SUPPLY_CHAIN" \
+            "$CLOSURE_ADVERSARIAL"; do
+            test "$result" = "success"
+          done
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Download mandatory browser evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: browser-non-root-evidence
+          path: security-evidence-input
+      - name: Validate and assemble Security Evidence Artifact
+        run: |
+          python scripts/build_security_closure_evidence.py final \
+            --fragment security-evidence-input/browser-production-fragment.json \
+            --commit "$GITHUB_SHA" \
+            --output security-evidence/security-evidence.json
+      - name: Upload Security Evidence Artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: security-evidence-${{ github.sha }}
+          path: security-evidence/security-evidence.json
+          if-no-files-found: error

@@ -8,6 +8,7 @@ concurrency:
   cancel-in-progress: true
 
 on:
+  workflow_call:
   pull_request:
     branches:
       - main
@@ -119,7 +120,7 @@ jobs:
           exit 0
       - name: Run real bwrap isolation E2E
         env:
-          KHAOS_REQUIRE_PLATFORM_SANDBOX: "1"
+          KHAOS_DEV_MODE: "0"
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos/workloads
           KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
         run: |
@@ -135,7 +136,7 @@ jobs:
             exec setpriv --reuid="$1" --regid="$2" --init-groups \
               env HOME="$4" PATH="$5" LD_LIBRARY_PATH="$7" \
               TMPDIR=/mnt/khaos-sandbox-workspace \
-              KHAOS_REQUIRE_PLATFORM_SANDBOX=1 \
+              KHAOS_DEV_MODE=0 \
               KHAOS_CGROUP_ROOT=/sys/fs/cgroup/khaos/workloads \
               KHAOS_SANDBOX_LAUNCHER="$6" \
               "$3" -m pytest python/tests/coding/test_platform_backends.py \
@@ -326,8 +327,12 @@ jobs:
           test -w /sys/fs/cgroup/khaos-browser/runner/cgroup.procs
           test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.procs
           test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.subtree_control
-      - name: Build inner browser launcher (Rust)
-        run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
+      - name: Build browser kernel TCB (Rust)
+        run: |
+          cargo build --release --no-default-features \
+            --bin khaos-sandbox-launcher \
+            --bin khaos-browser-kernel-helper \
+            --manifest-path rust/khaos-core/Cargo.toml
       - name: Harden browser launcher ownership (root-owned, like Chromium)
         # Batch 9.3 + 11.3: the TCB validation requires the launcher
         # binary AND its parent directory chain be owned by the UID that
@@ -343,6 +348,29 @@ jobs:
           # default several system dirs to 0777) so the parent-chain
           # validation accepts the launcher + Chromium runtime paths.
           sudo chmod 0755 /usr/local/bin /usr/local /opt
+      - name: Start root kernel helper for the non-root Python runtime
+        run: |
+          runner_uid="$(id -u)"
+          sudo install -o root -g root -m 0755 \
+            rust/khaos-core/target/release/khaos-browser-kernel-helper \
+            /usr/local/sbin/khaos-browser-kernel-helper
+          sudo install -d -o root -g root -m 0755 /var/lib/khaos /run/khaos
+          openssl rand -hex 32 | sudo tee /var/lib/khaos/browser-helper.secret >/dev/null
+          sudo chown root:root /var/lib/khaos/browser-helper.secret
+          sudo chmod 0600 /var/lib/khaos/browser-helper.secret
+          sudo nohup env \
+            KHAOS_BROWSER_KERNEL_HELPER_UID="$runner_uid" \
+            KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos/browser-kernel-helper.sock \
+            KHAOS_BROWSER_HELPER_SECRET_FILE=/var/lib/khaos/browser-helper.secret \
+            /usr/local/sbin/khaos-browser-kernel-helper \
+            >/tmp/khaos-browser-kernel-helper.log 2>&1 &
+          for attempt in $(seq 1 50); do
+            test -S /run/khaos/browser-kernel-helper.sock && break
+            sleep 0.1
+          done
+          test -S /run/khaos/browser-kernel-helper.sock
+          test "$(stat -c %u /run/khaos/browser-kernel-helper.sock)" = "$runner_uid"
+          test "$(stat -c %a /run/khaos/browser-kernel-helper.sock)" = "600"
       - name: Install test + browser dependencies
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
@@ -356,12 +384,13 @@ jobs:
           uv run python -m playwright install --with-deps chromium
           sudo chown -R root:root /opt/khaos-playwright
           sudo chmod -R go-w /opt/khaos-playwright
-      - name: Run full-stack browser kernel tests (as root)
+      - name: Run non-root full-stack browser kernel tests
         env:
           # CRITICAL: unset dev-mode + mock-mode so the REAL production
           # path runs (real sandbox, no mock fallback).
           KHAOS_BROWSER_DEV_MODE: ""
           KHAOS_BROWSER_MOCK_MODE: ""
+          KHAOS_DEV_MODE: "0"
           KHAOS_RUN_BROWSER_E2E: "1"
           KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser/workloads
@@ -369,22 +398,40 @@ jobs:
           # the parent-chain validation (root-owned /usr/local/bin → /usr/
           # local → /usr → /) passes when the test runs as root.
           KHAOS_SANDBOX_LAUNCHER: /usr/local/bin/khaos-sandbox-launcher
+          KHAOS_BROWSER_KERNEL_HELPER_SOCKET: /run/khaos/browser-kernel-helper.sock
           PLAYWRIGHT_BROWSERS_PATH: /opt/khaos-playwright
           # Batch 9.1 (round-9 §九): inject a parent-process secret that
           # MUST NOT reach Chromium's environment.  The negative-secrecy
           # test asserts this sentinel is absent from /proc/<pid>/environ.
           KHAOS_SENTINEL_SECRET: must-not-reach-browser
         run: |
-          python_bin="$(command -v python)"
-          sudo --preserve-env=KHAOS_BROWSER_DEV_MODE,KHAOS_BROWSER_MOCK_MODE,KHAOS_RUN_BROWSER_E2E,KHAOS_RUN_KERNEL_BROWSER_E2E,KHAOS_CGROUP_ROOT,KHAOS_SANDBOX_LAUNCHER,PLAYWRIGHT_BROWSERS_PATH,PYTHONPATH,HOME,KHAOS_SENTINEL_SECRET \
-            bash -c '
-              echo "$$" > /sys/fs/cgroup/khaos-browser/runner/cgroup.procs
-              exec "$1" -m pytest \
-                python/tests/security/test_browser_fullstack_kernel_round8.py \
-                python/tests/security/test_browser_negative_secrecy_round9.py \
-                python/tests/security/test_browser_fs_probe_round10.py \
-                -m kernel_real -v --log-cli-level=INFO
-            ' bash "$python_bin"
+          test "$(id -u)" != "0"
+          test "$(awk '/^CapEff:/ {print $2}' /proc/self/status)" = "0000000000000000"
+          python -m pytest \
+            python/tests/security/test_browser_fullstack_kernel_round8.py \
+            python/tests/security/test_browser_negative_secrecy_round9.py \
+            python/tests/security/test_browser_fs_probe_round10.py \
+            -m kernel_real -v --log-cli-level=INFO
+      - name: Capture non-root browser production evidence
+        run: |
+          mkdir -p diagnostics
+          python scripts/build_security_closure_evidence.py browser-fragment \
+            --launcher /usr/local/bin/khaos-sandbox-launcher \
+            --helper /usr/local/sbin/khaos-browser-kernel-helper \
+            --helper-socket /run/khaos/browser-kernel-helper.sock \
+            --output diagnostics/browser-production-fragment.json
+          cp /tmp/khaos-browser-kernel-helper.log diagnostics/helper.log
+          printf 'uid=%s\ncap_eff=%s\nhelper_socket_uid=%s\n' \
+            "$(id -u)" \
+            "$(awk '/^CapEff:/ {print $2}' /proc/self/status)" \
+            "$(stat -c %u /run/khaos/browser-kernel-helper.sock 2>/dev/null || echo missing)" \
+            > diagnostics/non-root-browser-evidence.txt
+      - name: Upload non-root browser evidence
+        if: always()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: browser-non-root-evidence
+          path: diagnostics/
 
   macos-sandbox-security:
     runs-on: macos-latest
@@ -415,7 +462,7 @@ jobs:
           exit 0
       - name: Run real sandbox-exec isolation E2E
         env:
-          KHAOS_REQUIRE_PLATFORM_SANDBOX: "1"
+          KHAOS_DEV_MODE: "0"
         run: python -m pytest python/tests/coding/test_platform_backends.py -q -k real_macos -v
       - name: Capture post-test diagnostics
         if: always()

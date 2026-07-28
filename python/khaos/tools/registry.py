@@ -159,6 +159,10 @@ class ToolRegistry:
         except KeyError as exc:
             raise ToolNotFoundError(name) from exc
 
+    def names(self) -> tuple[str, ...]:
+        """Return registered model-visible tool names in stable order."""
+        return tuple(sorted(self._tools))
+
     def list_by_mode(self, mode: str) -> list[ToolDefinition]:
         """List tools available to a mode."""
         return [

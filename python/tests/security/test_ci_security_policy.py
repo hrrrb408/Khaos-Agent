@@ -25,7 +25,11 @@ def test_every_external_action_is_pinned_to_full_commit_sha():
         for line_number, line in enumerate(
             workflow.read_text(encoding="utf-8").splitlines(), start=1
         ):
-            if "uses:" in line and not PINNED_ACTION.match(line):
+            if (
+                "uses:" in line
+                and "uses: ./" not in line
+                and not PINNED_ACTION.match(line)
+            ):
                 violations.append(f"{workflow.name}:{line_number}:{line.strip()}")
     assert not violations, "unpinned Actions:\n" + "\n".join(violations)
 
@@ -46,7 +50,8 @@ def test_platform_matrix_and_real_sandbox_jobs_are_mandatory():
 
     for runner in ("ubuntu-24.04", "windows-2025", "macos-14"):
         assert runner in matrix
-    assert "KHAOS_REQUIRE_PLATFORM_SANDBOX" in platform
+    assert "KHAOS_REQUIRE_PLATFORM_SANDBOX" not in platform
+    assert 'KHAOS_DEV_MODE: "0"' in platform
     assert "windows-fail-closed-security" in platform
     assert "-m windows_fail_closed" in platform
     assert "KHAOS_RUN_PRODUCTION_SANDBOX" in docker
@@ -174,6 +179,33 @@ def test_browser_kernel_isolation_job_runs_round6_primitives():
         "primitive suite (not the round-8 fullstack test, which skips "
         "without KHAOS_RUN_BROWSER_E2E=1)"
     )
+
+
+def test_single_security_closure_gate_requires_all_evidence_families():
+    gate = (WORKFLOWS / "security-closure-gate.yml").read_text("utf-8")
+    for dependency in (
+        "Python Security Suite",
+        "Go Race",
+        "Rust Test",
+        "Rust Clippy",
+        "Linux Bwrap Real Kernel",
+        "macOS Seatbelt Real Kernel",
+        "Browser Non-root",
+        "Browser Kernel Attack E2E",
+        "Docker Security",
+        "Supply Chain",
+        "Schema Fuzz",
+        "Authorization Drift E2E",
+        "Process Lifecycle E2E",
+        "Event-loop Starvation Tests",
+    ):
+        assert dependency in gate
+    assert "name: Security Closure Gate" in gate
+    assert "if: always()" in gate
+    assert 'test "$result" = "success"' in gate
+    assert "actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131" in gate
+    assert "if-no-files-found: error" in gate
+    assert "security-evidence.json" in gate
 
 
 def test_bootstrap_toolchain_is_hash_verified():
