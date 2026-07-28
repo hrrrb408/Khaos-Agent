@@ -722,7 +722,11 @@ mod linux {
             }
             validate_parent_chain(configured_path)?;
             let configured_metadata = fs::symlink_metadata(configured_path)?;
-            if configured_metadata.uid() != 0 || configured_metadata.mode() & 0o022 != 0 {
+            let configured_type = configured_metadata.file_type();
+            let configured_is_trusted = configured_metadata.uid() == 0
+                && (configured_type.is_symlink()
+                    || (configured_type.is_file() && configured_metadata.mode() & 0o022 == 0));
+            if !configured_is_trusted {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "TCB binary link ownership or mode invalid",
