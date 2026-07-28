@@ -187,8 +187,10 @@ class PermissionEngine:
         # H3 (preserved): this also runs before the persistent-rule loop, so
         # a remembered auto-approve rule cannot bypass a command the
         # effective policy demands confirmation for.
-        if self._commands_require_approval and tool_name in {"terminal", "process"}:
-            command_text = str(params.get("command") or params.get("id") or "")
+        if self._commands_require_approval and tool_name in {
+            "terminal", "terminal_argv", "terminal_shell", "process"
+        }:
+            command_text = _command_text(params)
             if _matches_required_approval(command_text, self._commands_require_approval):
                 return PermissionDecision(
                     approved=ApprovalMode.ASK_EVERY,
@@ -196,7 +198,7 @@ class PermissionEngine:
                     target=target,
                     requires_user_confirm=True,
                 )
-        if tool_name == "terminal" and _is_read_only_terminal_call(params):
+        if tool_name in {"terminal", "terminal_argv", "terminal_shell"} and _is_read_only_terminal_call(params):
             # P1-3 (round-13): read-only auto-approve is now a DEFAULT
             # shortcut — it fires ONLY when no persistent rule matched.
             # Previously it fired BEFORE the rule loop, so a remembered
@@ -461,7 +463,14 @@ def _append_segment(segments: list[str], chars: list[str]) -> None:
 def _is_read_only_terminal_call(params: dict) -> bool:
     from khaos.tools.terminal_tools import is_read_only_command
 
-    return is_read_only_command(str(params.get("command") or ""))
+    return is_read_only_command(_command_text(params))
+
+
+def _command_text(params: dict) -> str:
+    argv = params.get("argv")
+    if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
+        return shlex.join(argv)
+    return str(params.get("script") or params.get("command") or params.get("id") or "")
 
 
 def _matches_required_approval(command_text: str, approval_list: "frozenset[str]") -> bool:

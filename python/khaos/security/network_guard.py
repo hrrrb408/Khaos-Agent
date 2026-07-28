@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 from dataclasses import dataclass
 
 from khaos.security.host_network import (
@@ -265,8 +266,18 @@ class NetworkGuard:
             # allowlist/blocklist.
             return self._check_domain("github.com")
 
-        if tool_name == "terminal":
-            return self._check_terminal_command(arguments.get("command", ""))
+        if tool_name in {"terminal", "terminal_argv", "terminal_shell"}:
+            command = arguments.get("script") or arguments.get("command") or ""
+            argv = arguments.get("argv")
+            if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
+                command = shlex.join(argv)
+            from khaos.permissions.engine import split_command_segments
+
+            for segment in split_command_segments(str(command)):
+                result = self._check_terminal_command(segment)
+                if not result.allowed or result.reason != "not a network command":
+                    return result
+            return NetworkCheckResult(allowed=True, reason="not a network command")
 
         # H1: browser tools that can trigger network access (navigate,
         # click, type, evaluate, upload) are gated by the ``network.access``

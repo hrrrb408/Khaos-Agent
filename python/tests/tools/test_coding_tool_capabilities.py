@@ -14,6 +14,9 @@ def test_every_coding_tool_declares_capability_and_scope():
 
 def test_coding_process_and_write_tools_have_broker_enforceable_capabilities():
     registry = create_runtime_registry()
-    for name in ("terminal", "test_run", "sandbox_exec", "write_file", "multi_edit"):
+    for name in (
+        "terminal_argv", "terminal_shell", "test_run", "sandbox_exec",
+        "write_file", "multi_edit",
+    ):
         capability_names = {capability.name for capability in registry.capabilities_for(name)}
         assert capability_names & {"process.execute", "filesystem.write"}

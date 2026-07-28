@@ -262,11 +262,11 @@ def _tool_call_from_parts(parts: list[str]) -> dict | None:
             "name": name,
             "arguments": {"path": parts[1], "content": " ".join(parts[2:])},
         }
-    if name == "terminal" and len(parts) >= 2:
+    if name == "terminal_argv" and len(parts) >= 2:
         return {
             "id": str(uuid.uuid4()),
             "name": name,
-            "arguments": {"command": " ".join(parts[1:])},
+            "arguments": {"argv": parts[1:]},
         }
     if name == "search_files" and len(parts) >= 2:
         return {
@@ -320,8 +320,6 @@ def create_default_router(
 
 
 def _mock_fallback() -> ModelRouter:
-    from khaos.routing.provider import ProviderManager, ProviderConfig
-
     router = ModelRouter(provider_manager=_default_provider_manager())
     router.set_rule("agent_loop", RoutingRule(function="agent_loop", primary_model="mock-provider/mock-office"))
     router.set_rule("coding", RoutingRule(function="coding", primary_model="mock-provider/mock-coding", prefer_coding_model=True))

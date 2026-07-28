@@ -17,7 +17,8 @@ def test_registry_lists_tools_by_mode():
         "read_file",
         "write_file",
         "multi_edit",
-        "terminal",
+        "terminal_argv",
+        "terminal_shell",
         "todo_read",
         "todo_write",
         "todo_update",
@@ -36,6 +37,20 @@ def test_every_builtin_tool_has_an_explicit_capability_manifest():
     assert registry.get("clipboard_read").capabilities[0].name == "host.clipboard.read"
     assert registry.get("quick_note").capabilities[0].name == "host.notes.write"
     assert registry.get("markdown_to_text").capabilities[0].name == "compute.local"
+
+
+def test_production_schemas_are_closed_bounded_and_digest_stable():
+    left = create_builtin_registry()
+    right = create_builtin_registry()
+    for tool in left._tools.values():
+        assert tool.parameters["additionalProperties"] is False
+        assert tool.schema_digest == right.get(tool.name).schema_digest
+    assert not left.validate_call(
+        "read_file", {"path": "README.md", "principal_id": "model-forged"}
+    )
+    assert not left.validate_call("read_file", {"path": "x" * 4097})
+    assert not left.validate_call("terminal_argv", {"argv": []})
+    assert left.validate_call("terminal_argv", {"argv": ["pytest", "-q"]})
 
 
 def test_registry_get_missing_raises():

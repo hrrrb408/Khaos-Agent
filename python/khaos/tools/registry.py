@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 import hashlib
 import json
+import copy
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -25,6 +27,11 @@ _OFFICE_WORKSPACE_FILE_TOOLS = frozenset({
     # handler can validate the file path is contained within the workspace
     # root (no symlink escape, no arbitrary host file exfiltration).
     "browser_file_upload",
+})
+_INJECTED_CAPABILITY_FIELDS = frozenset({
+    "execution_service", "workspace_manager", "approval_context",
+    "principal_id", "project_id", "runtime_id", "network_guard",
+    "credential_context", "process_supervisor", "process_authority",
 })
 @dataclass(frozen=True)
 class ToolCapability:
@@ -70,7 +77,8 @@ _BUILTIN_CAPABILITY_MANIFEST: dict[str, tuple[ToolCapability, ...]] = {
     "format_markdown_table": _capability("compute.local", {"office"}, {"in-memory"}),
     "clipboard_read": _capability("host.clipboard.read", {"office"}, {"local-interactive-user"}),
     "clipboard_write": _capability("host.clipboard.write", {"office"}, {"local-interactive-user"}),
-    "terminal": _capability("process.execute", {"coding"}, {"task-workspace"}),
+    "terminal_argv": _capability("process.execute", {"coding"}, {"task-workspace"}),
+    "terminal_shell": _capability("process.execute", {"coding"}, {"task-workspace"}),
     "process": _capability("process.execute", {"coding"}, {"task-workspace"}),
     "test_run": _capability("process.execute", {"coding"}, {"task-workspace"}),
     "git_diff": _capability("vcs.read", {"coding"}, {"task-workspace"}),
@@ -139,6 +147,8 @@ class ToolRegistry:
                     f"tool {definition.name} must declare explicit capabilities"
                 )
             definition.capabilities = declared
+        if self.enforce_capabilities:
+            definition.parameters = _production_schema(definition.parameters)
         self._tools[definition.name] = definition
 
     def get(self, name: str) -> ToolDefinition:
@@ -170,6 +180,8 @@ class ToolRegistry:
 
     def validate_call(self, name: str, params: dict) -> bool:
         """Validate a small useful subset of JSON Schema."""
+        if any(field in params for field in _INJECTED_CAPABILITY_FIELDS):
+            return False
         schema = self.get(name).parameters
         return self._validate_schema_value(schema, params)
 
@@ -202,26 +214,7 @@ class ToolRegistry:
         return pruned
 
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:
-        expected = schema.get("type")
-        if "enum" in schema and value not in schema["enum"]:
-            return False
-        if expected == "string":
-            return isinstance(value, str)
-        if expected == "integer":
-            return isinstance(value, int)
-        if expected == "boolean":
-            return isinstance(value, bool)
-        if expected == "object":
-            if not isinstance(value, dict):
-                return False
-            if any(required not in value for required in schema.get("required", [])):
-                return False
-            properties = schema.get("properties", {})
-            return all(key not in properties or self._validate_schema_value(properties[key], item) for key, item in value.items())
-        if expected == "array":
-            items = schema.get("items")
-            return isinstance(value, list) and (items is None or all(self._validate_schema_value(items, item) for item in value))
-        return True
+        return _validate_json_schema(schema, value)
 
 
 class ToolInvocationBroker:
@@ -286,6 +279,8 @@ class ToolInvocationBroker:
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
+            handler_params["workspace_manager"] = context.get("workspace_manager")
+            handler_params["process_authority"] = context.get("process_authority")
         if any(capability.name.startswith("vcs.") for capability in capabilities):
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")
@@ -440,34 +435,113 @@ class ToolInvocationBroker:
         return await definition.handler(**handler_params)
 
     def _validate_schema_value(self, schema: dict, value: Any) -> bool:
-        expected = schema.get("type")
-        if "enum" in schema and value not in schema["enum"]:
-            return False
-        if expected == "string":
-            return isinstance(value, str)
-        if expected == "integer":
-            return isinstance(value, int)
-        if expected == "boolean":
-            return isinstance(value, bool)
-        if expected == "object":
-            if not isinstance(value, dict):
-                return False
-            for required in schema.get("required", []):
-                if required not in value:
-                    return False
-            properties = schema.get("properties", {})
-            return all(
-                key not in properties or self._validate_schema_value(properties[key], item)
-                for key, item in value.items()
+        return _validate_json_schema(schema, value)
+
+
+def _production_schema(schema: dict[str, Any], *, property_name: str = "") -> dict[str, Any]:
+    """Return a bounded, closed model-visible JSON Schema."""
+    normalized = copy.deepcopy(schema)
+    expected = normalized.get("type")
+    if expected == "object":
+        normalized.setdefault("additionalProperties", False)
+        normalized.setdefault("maxProperties", 64)
+        normalized["properties"] = {
+            key: _production_schema(value, property_name=key)
+            for key, value in normalized.get("properties", {}).items()
+        }
+        for key in normalized.get("required", []):
+            child = normalized["properties"].get(key)
+            if child is None:
+                continue
+            if child.get("type") == "string":
+                child["minLength"] = max(1, int(child.get("minLength", 0)))
+            elif child.get("type") == "array":
+                child["minItems"] = max(1, int(child.get("minItems", 0)))
+    elif expected == "array":
+        normalized.setdefault("minItems", 0)
+        normalized.setdefault("maxItems", 256 if property_name == "argv" else 1024)
+        if isinstance(normalized.get("items"), dict):
+            normalized["items"] = _production_schema(
+                normalized["items"], property_name=property_name
             )
-        if expected == "array":
-            if not isinstance(value, list):
-                return False
-            item_schema = schema.get("items")
-            if item_schema is None:
-                return True
-            return all(self._validate_schema_value(item_schema, item) for item in value)
-        return True
+    elif expected == "string":
+        normalized.setdefault("minLength", 0)
+        if property_name in {"path", "root", "cwd", "source", "destination"}:
+            normalized.setdefault("maxLength", 4096)
+        elif property_name in {"url"}:
+            normalized.setdefault("maxLength", 8192)
+        elif property_name in {"id", "task_id", "session_id", "runtime_id"}:
+            normalized.setdefault("maxLength", 256)
+        elif property_name in {"content", "text", "script", "prompt"}:
+            normalized.setdefault("maxLength", 1_048_576)
+        else:
+            normalized.setdefault("maxLength", 65_536)
+    elif expected == "integer":
+        normalized.setdefault("minimum", 0)
+        normalized.setdefault("maximum", 86_400)
+    elif expected == "number":
+        normalized.setdefault("minimum", 0)
+        normalized.setdefault("maximum", 1_000_000)
+    return normalized
+
+
+def _validate_json_schema(schema: dict[str, Any], value: Any) -> bool:
+    """Validate the production subset used by Khaos tool contracts."""
+    if "enum" in schema and value not in schema["enum"]:
+        return False
+    expected = schema.get("type")
+    if expected == "string":
+        if not isinstance(value, str):
+            return False
+        if len(value) < int(schema.get("minLength", 0)):
+            return False
+        if len(value) > int(schema.get("maxLength", 2**31 - 1)):
+            return False
+        pattern = schema.get("pattern")
+        return pattern is None or re.fullmatch(str(pattern), value) is not None
+    if expected == "integer":
+        return (
+            isinstance(value, int)
+            and not isinstance(value, bool)
+            and value >= schema.get("minimum", value)
+            and value <= schema.get("maximum", value)
+        )
+    if expected == "number":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value >= schema.get("minimum", value)
+            and value <= schema.get("maximum", value)
+        )
+    if expected == "boolean":
+        return isinstance(value, bool)
+    if expected == "object":
+        if not isinstance(value, dict):
+            return False
+        required = schema.get("required", [])
+        if any(key not in value for key in required):
+            return False
+        if len(value) > int(schema.get("maxProperties", 2**31 - 1)):
+            return False
+        properties = schema.get("properties", {})
+        if schema.get("additionalProperties") is False and any(
+            key not in properties for key in value
+        ):
+            return False
+        return all(
+            key not in properties or _validate_json_schema(properties[key], item)
+            for key, item in value.items()
+        )
+    if expected == "array":
+        if not isinstance(value, list):
+            return False
+        if len(value) < int(schema.get("minItems", 0)):
+            return False
+        if len(value) > int(schema.get("maxItems", 2**31 - 1)):
+            return False
+        items = schema.get("items")
+        return items is None or all(_validate_json_schema(items, item) for item in value)
+    return expected is None
 
 
 # Hermes batch 5: declarative specs for cron + history tools. Defined here
@@ -1013,17 +1087,37 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     )
     registry.register(
         ToolDefinition(
-            name="terminal",
-            description="Run a foreground or background terminal command.",
+            name="terminal_argv",
+            description="Execute an argv vector without a shell.",
             parameters={
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string"},
+                    "argv": {"type": "array", "items": {"type": "string"}},
                     "cwd": {"type": "string"},
                     "background": {"type": "boolean"},
-                    "timeout": {"type": "integer"},
+                    "timeout_seconds": {"type": "integer"},
                 },
-                "required": ["command"],
+                "required": ["argv"],
+            },
+            modes=["coding"],
+            permission_level="execute",
+            parallel=False,
+        )
+    )
+    registry.register(
+        ToolDefinition(
+            name="terminal_shell",
+            description="Execute a script with an explicitly selected shell.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "shell": {"type": "string", "enum": ["/bin/sh", "/bin/bash", "/bin/zsh"]},
+                    "script": {"type": "string"},
+                    "cwd": {"type": "string"},
+                    "background": {"type": "boolean"},
+                    "timeout_seconds": {"type": "integer"},
+                },
+                "required": ["shell", "script"],
             },
             modes=["coding"],
             permission_level="execute",
@@ -1037,9 +1131,9 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             parameters={
                 "type": "object",
                 "properties": {
-                    "action": {"type": "string"},
+                    "action": {"type": "string", "enum": ["poll", "wait", "kill", "log"]},
                     "id": {"type": "string"},
-                    "timeout": {"type": "integer"},
+                    "timeout_seconds": {"type": "integer"},
                 },
                 "required": ["action", "id"],
             },
@@ -2015,7 +2109,8 @@ def create_runtime_registry() -> ToolRegistry:
     registry.get("format_markdown_table").handler = markdown_tools.format_markdown_table
     registry.get("clipboard_read").handler = clipboard_tools.clipboard_read
     registry.get("clipboard_write").handler = clipboard_tools.clipboard_write
-    registry.get("terminal").handler = terminal_tools.terminal
+    registry.get("terminal_argv").handler = terminal_tools.terminal_argv
+    registry.get("terminal_shell").handler = terminal_tools.terminal_shell
     registry.get("process").handler = terminal_tools.process
     registry.get("sandbox_exec").handler = sandbox_tools.sandbox_exec
     registry.get("sandbox_build").handler = sandbox_tools.sandbox_build

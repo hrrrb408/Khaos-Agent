@@ -1,11 +1,16 @@
+import pytest
+
 from khaos.coding.execution import ExecutionService, HostExecutionBackend
 from khaos.tools.terminal_tools import (
+    BackgroundProcessAuthority,
     check_command_safety,
     enable_security,
     evaluate_command_safety,
     is_read_only_command,
     process,
     terminal,
+    terminal_argv,
+    terminal_shell,
 )
 
 
@@ -102,9 +107,29 @@ async def test_terminal_background_without_execution_service_fails_closed(tmp_pa
 
 
 async def test_process_poll_unknown_raises():
+    authority = BackgroundProcessAuthority()
     try:
-        await process("poll", "missing")
+        await process("poll", "missing", process_authority=authority)
     except KeyError as exc:
         assert "unknown process" in str(exc)
     else:
         raise AssertionError("expected KeyError")
+
+
+async def test_terminal_argv_never_parses_shell_operators(tmp_path):
+    result = await terminal_argv(
+        ["echo", "hello | touch escaped"],
+        cwd=str(tmp_path),
+        timeout_seconds=5,
+        execution_service=_execution_service(),
+    )
+    assert result["stdout"] == "hello | touch escaped\n"
+    assert not (tmp_path / "escaped").exists()
+
+
+async def test_terminal_shell_requires_explicit_absolute_shell(tmp_path):
+    with pytest.raises(PermissionError, match="absolute shell"):
+        await terminal_shell(
+            "bash", "echo hello", cwd=str(tmp_path),
+            execution_service=_execution_service(),
+        )

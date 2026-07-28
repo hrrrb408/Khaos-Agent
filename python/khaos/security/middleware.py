@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import re
+import shlex
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -35,7 +36,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-COMMAND_TOOLS = frozenset({"terminal", "process", "test_run"})
+COMMAND_TOOLS = frozenset({
+    "terminal", "terminal_argv", "terminal_shell", "process", "test_run"
+})
 READ_PATH_TOOLS = frozenset({
     "read_file", "search_files", "file_info", "list_directory", "tree_view",
     "file_search_content",
@@ -316,7 +319,7 @@ class SecurityMiddleware:
                 )
 
         if tool_name in COMMAND_TOOLS:
-            command = str(arguments.get("command", ""))
+            command = _command_text(arguments)
             if command:
                 # M1: block environment-dump commands when the policy
                 # requires it (secrets_block_env_dump).  These commands
@@ -489,3 +492,10 @@ def _is_env_dump_command(command: str) -> bool:
     if base in {"export", "declare"} and len(parts) == 2 and parts[1] in {"-p", "-xp", "-px"}:
         return True
     return False
+
+
+def _command_text(arguments: dict) -> str:
+    argv = arguments.get("argv")
+    if isinstance(argv, list) and all(isinstance(item, str) for item in argv):
+        return shlex.join(argv)
+    return str(arguments.get("script") or arguments.get("command") or "")

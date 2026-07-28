@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -369,6 +370,13 @@ class RuntimeResult:
                             "memory manager close failed", exc_info=True
                         )
             if self.execution_service is not None:
+                try:
+                    await self.tool_scheduler.aclose()
+                except Exception:
+                    failed = True
+                    logger.debug(
+                        "tool scheduler process authority close failed", exc_info=True
+                    )
                 try:
                     await self.execution_service.shutdown()
                 except Exception:

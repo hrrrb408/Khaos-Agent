@@ -10,6 +10,23 @@ from khaos.security.middleware import SecurityMiddleware
 from khaos.security.sandbox import Sandbox, SandboxMode
 
 
+async def test_tool_budget_atomic_reservations_do_not_oversubscribe() -> None:
+    budget = ToolBudget(
+        max_calls=2,
+        max_parallel_calls=2,
+        max_output_per_tool=10,
+        max_output_chars=20,
+        max_total_output=20,
+    )
+    reservations = await asyncio.gather(
+        *(budget.reserve(parallel=True) for _ in range(20))
+    )
+    granted = [item for item in reservations if item is not None]
+    assert len(granted) == 2
+    await asyncio.gather(*(item.commit(10) for item in granted))
+    assert budget.is_exhausted
+
+
 async def _ok(value: str = "ok") -> str:
     return value
 
@@ -241,7 +258,6 @@ async def test_profile_digest_binds_effective_policy(tmp_path):
     but different effective policies must produce different profile digests.
     """
     from khaos.security.effective_policy import (
-        EffectiveSecurityPolicy,
         compile_effective_policy,
     )
     from khaos.security.policy import SandboxPolicy

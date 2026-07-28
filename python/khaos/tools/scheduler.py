@@ -7,7 +7,7 @@ import hashlib
 import inspect
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
@@ -19,6 +19,7 @@ from khaos.agent.approval import ApprovalBinding
 from khaos.exceptions import PermissionDeniedError
 from khaos.security.middleware import SecurityMiddleware
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
+from khaos.tools.terminal_tools import BackgroundProcessAuthority
 
 
 ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
@@ -74,22 +75,94 @@ class SchedulerEvent:
 
 @dataclass
 class ToolBudget:
-    """Tool execution budget."""
+    """Atomic hard budget shared by serial and parallel tool dispatch."""
 
     max_calls: int = 50
     max_output_chars: int = 100000
+    max_batch_calls: int = 16
+    max_parallel_calls: int = 8
+    max_output_per_tool: int = 65536
+    max_total_output: int = 100000
+    max_background_processes: int = 4
+    max_processes_per_workspace: int = 2
+    max_browser_contexts: int = 4
     _call_count: int = 0
     _output_chars: int = 0
+    _reserved_calls: int = 0
+    _reserved_output: int = 0
+    _parallel_active: int = 0
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     @property
     def is_exhausted(self) -> bool:
         """Return true once call or output budget is exhausted."""
-        return self._call_count >= self.max_calls or self._output_chars >= self.max_output_chars
+        return (
+            self._call_count + self._reserved_calls >= self.max_calls
+            or self._output_chars + self._reserved_output >= self._total_output_limit
+        )
+
+    @property
+    def _total_output_limit(self) -> int:
+        return min(self.max_output_chars, self.max_total_output)
+
+    def validate_batch(self, size: int) -> bool:
+        return 0 <= size <= self.max_batch_calls
+
+    async def reserve(self, *, parallel: bool = False) -> "ToolBudgetReservation | None":
+        async with self._lock:
+            if self._call_count + self._reserved_calls >= self.max_calls:
+                return None
+            if parallel and self._parallel_active >= self.max_parallel_calls:
+                return None
+            remaining = (
+                self._total_output_limit
+                - self._output_chars
+                - self._reserved_output
+            )
+            if remaining <= 0:
+                return None
+            output_limit = min(self.max_output_per_tool, remaining)
+            self._reserved_calls += 1
+            self._reserved_output += output_limit
+            if parallel:
+                self._parallel_active += 1
+            return ToolBudgetReservation(self, output_limit, parallel)
+
+    async def _finish(
+        self, reservation: "ToolBudgetReservation", *, output_chars: int | None
+    ) -> None:
+        async with self._lock:
+            if not reservation.active:
+                return
+            reservation.active = False
+            self._reserved_calls -= 1
+            self._reserved_output -= reservation.output_limit
+            if reservation.parallel:
+                self._parallel_active -= 1
+            if output_chars is not None:
+                if output_chars > reservation.output_limit:
+                    raise RuntimeError("tool output exceeded reserved hard budget")
+                self._call_count += 1
+                self._output_chars += output_chars
 
     def record(self, output_chars: int) -> None:
-        """Record one completed tool call."""
+        """Compatibility hook for trusted single-threaded callers."""
         self._call_count += 1
         self._output_chars += output_chars
+
+
+@dataclass
+class ToolBudgetReservation:
+    budget: ToolBudget
+    output_limit: int
+    parallel: bool
+    active: bool = True
+
+    async def commit(self, output_chars: int) -> None:
+        await self.budget._finish(self, output_chars=output_chars)
+
+    async def release(self) -> None:
+        await self.budget._finish(self, output_chars=None)
 
 
 class ToolScheduler:
@@ -121,6 +194,11 @@ class ToolScheduler:
         # any tool without a Rust fast path keep using the asyncio handler.
         self.use_rust_executor = use_rust_executor
         self.invocation_broker = ToolInvocationBroker(registry)
+        self.process_authority = BackgroundProcessAuthority(
+            max_background_processes=self.budget.max_background_processes,
+            max_processes_per_workspace=self.budget.max_processes_per_workspace,
+            output_limit=self.budget.max_output_per_tool,
+        )
         # H1: optional shared OfficeMutationAuthority. Set by the runtime
         # factory so Office copy/move are fenced against cancellation/timeout.
         self.office_authority: Any = None
@@ -153,6 +231,20 @@ class ToolScheduler:
         tool_context: dict[str, Any] | None = None,
     ):
         """Execute a batch while yielding permission and result events."""
+        if not self.budget.validate_batch(len(tool_calls)):
+            for call in tool_calls:
+                normalized = self._normalize_call(call)
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=normalized["name"],
+                        success=False,
+                        error="Tool batch exceeds max_batch_calls",
+                        arguments=normalized["arguments"],
+                    ),
+                )
+            return
         if self.budget.is_exhausted:
             return
         tool_context = dict(tool_context or {})
@@ -504,11 +596,29 @@ class ToolScheduler:
 
         parallel_calls, serial_calls = self.registry.get_parallel_tools(approved_calls)
         if parallel_calls:
-            tasks = [self._execute_one(call, session_id, mode, tool_context or {}) for call in parallel_calls]
+            tasks = []
+            for call in parallel_calls:
+                reservation = await self.budget.reserve(parallel=True)
+                if reservation is None:
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=call["id"], name=call["name"],
+                            success=False, error="Tool budget reservation denied",
+                            arguments=call["arguments"],
+                        ),
+                    )
+                    continue
+                tasks.append(
+                    self._execute_one(
+                        call, session_id, mode, tool_context or {}, reservation
+                    )
+                )
             for result in await asyncio.gather(*tasks):
                 yield SchedulerEvent(event="tool_result", result=result)
         for call in serial_calls:
-            if self.budget.is_exhausted:
+            reservation = await self.budget.reserve(parallel=False)
+            if reservation is None:
                 yield SchedulerEvent(
                     event="tool_result",
                     result=ToolResult(
@@ -519,17 +629,27 @@ class ToolScheduler:
                         arguments=call["arguments"],
                     ),
                 )
-                break
+                continue
             yield SchedulerEvent(
                 event="tool_result",
-                result=await self._execute_one(call, session_id, mode, tool_context or {}),
+                result=await self._execute_one(
+                    call, session_id, mode, tool_context or {}, reservation
+                ),
             )
 
-    async def _execute_one(self, call: dict, session_id: str | None, mode: str, tool_context: dict[str, Any]) -> ToolResult:
+    async def _execute_one(
+        self,
+        call: dict,
+        session_id: str | None,
+        mode: str,
+        tool_context: dict[str, Any],
+        reservation: ToolBudgetReservation,
+    ) -> ToolResult:
         start = time.monotonic()
         tool = self.registry.get(call["name"])
         resource: AuthorizationResource | None = call.get("_authorization_resource")
         if tool.handler is None:
+            await reservation.release()
             return ToolResult(
                 tool_call_id=call["id"],
                 name=call["name"],
@@ -594,6 +714,7 @@ class ToolScheduler:
                     },
                     session_id,
                 )
+                await reservation.release()
                 return ToolResult(
                     tool_call_id=call["id"],
                     name=tool.name,
@@ -603,6 +724,7 @@ class ToolScheduler:
                     arguments=call["arguments"],
                 )
             invocation_context = dict(tool_context)
+            invocation_context["process_authority"] = self.process_authority
             sandbox = self.security_middleware.sandbox
             if mode == "office" and sandbox is not None:
                 # Internal capability: never sourced from model arguments.
@@ -618,13 +740,15 @@ class ToolScheduler:
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
                 timeout=tool.timeout,
             )
-            self.budget.record(len(str(output)))
             target = (
                 resource.canonical_target
                 if resource is not None
                 else self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
             )
             secret_scan, output = await self.security_middleware.post_check(tool.name, output)
+            output_chars = len(str(output))
+            if output_chars > reservation.output_limit:
+                raise RuntimeError("tool output exceeded max_output_per_tool")
             detail: dict[str, Any] = {"tool_call_id": call["id"]}
             if resource is not None:
                 detail["authorization_resource_digest"] = resource.digest()
@@ -640,6 +764,7 @@ class ToolScheduler:
                 detail,
                 session_id,
             )
+            await reservation.commit(output_chars)
             remember_rule = call.get("_remember_rule")
             if remember_rule is not None:
                 await self.permission_engine.grant_rule(remember_rule)
@@ -652,6 +777,7 @@ class ToolScheduler:
                 arguments=call["arguments"],
             )
         except Exception as exc:
+            await reservation.release()
             target = (
                 resource.canonical_target
                 if resource is not None
@@ -738,6 +864,10 @@ class ToolScheduler:
         if isinstance(value, bool):
             return {"approved": value}
         return dict(value)
+
+    async def aclose(self) -> None:
+        """Close every runtime-owned background process handle."""
+        await self.process_authority.shutdown()
 
     @staticmethod
     def _normalize_call(call: dict) -> dict:
