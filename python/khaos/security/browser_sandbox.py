@@ -84,7 +84,13 @@ import stat
 import subprocess
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
+
+from khaos.security.kernel_helper_client import (
+    KernelAuthorityClient,
+    KernelIsolationEvidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -520,6 +526,17 @@ class BrowserSandboxConfig:
     cpu_period: int = 100_000
 
 
+class IsolationLevel(str, Enum):
+    """Evidence-backed browser isolation levels."""
+
+    NONE = "NONE"
+    APPLICATION_POLICY = "APPLICATION_POLICY"
+    NETWORK_NAMESPACE = "NETWORK_NAMESPACE"
+    NETWORK_NAMESPACE_AND_NFT = "NETWORK_NAMESPACE_AND_NFT"
+    FULL_KERNEL_ISOLATION = "FULL_KERNEL_ISOLATION"
+    QUARANTINED = "QUARANTINED"
+
+
 @dataclass
 class EnforcementStatus:
     """C-09: structured report of which enforcement layers are active.
@@ -546,6 +563,32 @@ class EnforcementStatus:
     fd_sanitized: bool = False
     filesystem_sandbox: bool = False
     failure_reason: str = ""
+    helper_authenticated: bool = False
+    nft_default_deny: bool = False
+    cgroup_attached: bool = False
+    resource_registry_verified: bool = False
+    quarantined: bool = False
+
+    @property
+    def isolation_level(self) -> IsolationLevel:
+        """Return the strongest level proven by the concrete evidence."""
+        if self.quarantined:
+            return IsolationLevel.QUARANTINED
+        if (
+            self.helper_authenticated
+            and self.network_namespace
+            and self.nft_default_deny
+            and self.cgroup_attached
+            and self.resource_registry_verified
+        ):
+            return IsolationLevel.FULL_KERNEL_ISOLATION
+        if self.network_namespace and self.nft_default_deny:
+            return IsolationLevel.NETWORK_NAMESPACE_AND_NFT
+        if self.network_namespace:
+            return IsolationLevel.NETWORK_NAMESPACE
+        if self.proxy_required or self.service_workers_blocked:
+            return IsolationLevel.APPLICATION_POLICY
+        return IsolationLevel.NONE
 
     @property
     def kernel_ok(self) -> bool:
@@ -598,11 +641,31 @@ class BrowserNetworkSandbox:
         config: BrowserSandboxConfig | None = None,
         *,
         require_os_sandbox: bool = False,
+        project_id: str = "",
+        runtime_id: str = "",
+        sandbox_token: str | None = None,
+        kernel_authority: KernelAuthorityClient | None = None,
     ) -> None:
         self._config = config or BrowserSandboxConfig()
         self._require_os_sandbox = require_os_sandbox
         # Round-5 H-01: per-sandbox token used in all resource names.
-        self._token: str = secrets.token_hex(8)
+        self._token: str = sandbox_token or secrets.token_hex(32)
+        self._project_id = project_id
+        self._runtime_id = runtime_id
+        self._kernel_authority = kernel_authority
+        self._production_authority = (
+            require_os_sandbox and os.environ.get("KHAOS_DEV_MODE") != "1"
+        )
+        if self._production_authority:
+            if not project_id or not runtime_id:
+                raise BrowserSandboxError(
+                    "production browser sandbox requires project and runtime identity"
+                )
+            self._kernel_authority = self._kernel_authority or KernelAuthorityClient(
+                project_id=project_id,
+                runtime_id=runtime_id,
+                sandbox_token=self._token,
+            )
         self._netns_name: str | None = None
         self._veth_host: str | None = None
         self._veth_ns: str | None = None
@@ -662,6 +725,9 @@ class BrowserNetworkSandbox:
         missing prerequisites are logged as warnings and the sandbox
         remains inactive.
         """
+        if self._production_authority:
+            self._setup_through_helper()
+            return
         reason = self._check_prerequisites()
         if reason:
             if self._require_os_sandbox:
@@ -751,6 +817,43 @@ class BrowserNetworkSandbox:
                 exc,
             )
             self.teardown()
+
+    def _setup_through_helper(self) -> None:
+        """Establish the production sandbox solely through Rust authority."""
+        if not sys.platform.startswith("linux"):
+            raise BrowserSandboxError("production browser kernel isolation is Linux-only")
+        validate_production_python_privileges()
+        authority = self._kernel_authority
+        if authority is None or not authority.available:
+            raise BrowserSandboxError("authenticated browser kernel helper unavailable")
+        try:
+            evidence = authority.setup()
+        except (OSError, RuntimeError) as error:
+            raise BrowserSandboxError(f"kernel helper setup failed: {error}") from error
+        self._apply_helper_evidence(evidence)
+        if self._enforcement.isolation_level is not IsolationLevel.FULL_KERNEL_ISOLATION:
+            try:
+                authority.teardown()
+            except (OSError, RuntimeError):
+                self._enforcement.quarantined = True
+            raise BrowserSandboxError("kernel helper returned incomplete isolation evidence")
+        self._host_ip = evidence.proxy_host
+        self._active = True
+
+    def _apply_helper_evidence(self, evidence: KernelIsolationEvidence) -> None:
+        self._enforcement = EnforcementStatus(
+            network_namespace=evidence.network_namespace,
+            proxy_required=True,
+            cgroup=evidence.cgroup_attached,
+            route_guard=evidence.nft_default_deny,
+            service_workers_blocked=True,
+            process_isolation=evidence.process_isolated,
+            helper_authenticated=evidence.helper_authenticated,
+            nft_default_deny=evidence.nft_default_deny,
+            cgroup_attached=evidence.cgroup_attached,
+            resource_registry_verified=evidence.resource_registry_verified,
+            quarantined=evidence.quarantined,
+        )
 
     def _assert_resource_names_available(self) -> None:
         """Reject any pre-existing derived kernel/registry resource."""
@@ -1098,12 +1201,26 @@ class BrowserNetworkSandbox:
         port) and AFTER ``setup()`` (which installs the default-deny
         table).
         """
-        if not self._active or self._veth_host is None:
-            return
         if not isinstance(proxy_port, int) or not (1 <= proxy_port <= 65535):
             raise BrowserSandboxError(
                 f"invalid egress proxy port: {proxy_port!r}"
             )
+        if self._production_authority:
+            if not self._active or self._kernel_authority is None:
+                raise BrowserSandboxError("kernel sandbox is not active")
+            try:
+                evidence = self._kernel_authority.allow_proxy(proxy_port)
+            except (OSError, RuntimeError) as error:
+                raise BrowserSandboxError(
+                    f"kernel helper egress pin failed: {error}"
+                ) from error
+            self._apply_helper_evidence(evidence)
+            if evidence.quarantined or not evidence.nft_default_deny:
+                raise BrowserSandboxError("kernel helper egress evidence invalid")
+            self._egress_ports.add(proxy_port)
+            return
+        if not self._active or self._veth_host is None:
+            return
         # Batch 7.3 (round-7 §九): transactional — APPLY the nft script
         # FIRST (with the candidate set = current + new port), and only
         # commit the port to ``_egress_ports`` on success.  Previously
@@ -1154,6 +1271,22 @@ class BrowserNetworkSandbox:
         No-op (with a debug log) if the port was not in the set — this
         makes the call safe against double-close paths.
         """
+        if self._production_authority:
+            if proxy_port not in self._egress_ports:
+                return
+            if self._kernel_authority is None:
+                raise BrowserSandboxError("kernel authority missing during revoke")
+            try:
+                evidence = self._kernel_authority.revoke_proxy(proxy_port)
+            except (OSError, RuntimeError) as error:
+                raise BrowserSandboxError(
+                    f"kernel helper egress revoke failed: {error}"
+                ) from error
+            self._apply_helper_evidence(evidence)
+            if evidence.quarantined or not evidence.nft_default_deny:
+                raise BrowserSandboxError("kernel helper revoke evidence invalid")
+            self._egress_ports.discard(proxy_port)
+            return
         if not self._active or self._veth_host is None:
             return
         port = int(proxy_port)
@@ -1210,7 +1343,6 @@ class BrowserNetworkSandbox:
 
     def _configure_veth(self) -> None:
         """Create the veth pair and configure both ends."""
-        v = self._require_os_sandbox
         # Create veth pair
         self._run_trusted(
             ["ip", "link", "add", self._veth_host, "type", "veth",
@@ -1428,10 +1560,17 @@ class BrowserNetworkSandbox:
         setns/unshare afterward) → execve(chromium).  This removes the
         shell from the TCB and adds FD sanitization + browser seccomp.
         """
-        if not self._active or self._netns_name is None:
+        if not self._active:
             return None
         launcher = self._locate_and_validate_browser_launcher()
         if launcher is None:
+            return None
+        if self._production_authority:
+            argv = [launcher, "--browser-authority", "--", real_executable]
+            if extra_args:
+                argv.extend(extra_args)
+            return argv
+        if self._netns_name is None:
             return None
         argv: list[str] = [
             launcher, "--browser",
@@ -1504,7 +1643,7 @@ class BrowserNetworkSandbox:
         launcher = self._locate_and_validate_browser_launcher()
         if launcher is None:
             raise BrowserSandboxError("trusted Rust browser launcher required")
-        if not self._active or not self._netns_name:
+        if not self._active:
             raise BrowserSandboxError("browser sandbox is not active")
         # Batch 9.3: validate the Chromium (real_executable) and bubblewrap
         # binaries in production so a planted/writable binary cannot enter
@@ -1521,7 +1660,18 @@ class BrowserNetworkSandbox:
         # the bubblewrap namespace so Chromium never sees them.
         env["KHAOS_BROWSER_LAUNCH"] = "1"
         env["KHAOS_BROWSER_REAL_EXECUTABLE"] = real_executable
-        env["KHAOS_BROWSER_NETNS"] = self._netns_name
+        if self._production_authority:
+            env["KHAOS_BROWSER_AUTHORITY"] = "1"
+            env["KHAOS_BROWSER_PROJECT_ID"] = self._project_id
+            env["KHAOS_BROWSER_RUNTIME_ID"] = self._runtime_id
+            env["KHAOS_BROWSER_SANDBOX_TOKEN"] = self._token
+            helper_socket = os.environ.get("KHAOS_BROWSER_KERNEL_HELPER_SOCKET")
+            if helper_socket:
+                env["KHAOS_BROWSER_KERNEL_HELPER_SOCKET"] = helper_socket
+        else:
+            if not self._netns_name:
+                raise BrowserSandboxError("development netns identity missing")
+            env["KHAOS_BROWSER_NETNS"] = self._netns_name
         # Batch 9.2: resolved host home so the Rust launcher can mask the
         # REAL home directory (which may live outside /home or /root).
         env["KHAOS_BROWSER_HOST_HOME"] = str(Path.home().resolve())
@@ -1538,7 +1688,7 @@ class BrowserNetworkSandbox:
                 "bubblewrap ('bwrap') is required for production browser "
                 "sandbox but was not found on PATH"
             )
-        if self._cgroup_path is not None:
+        if not self._production_authority and self._cgroup_path is not None:
             env["KHAOS_BROWSER_CGROUP_PROCS"] = str(
                 self._cgroup_path / "cgroup.procs"
             )
@@ -1568,7 +1718,7 @@ class BrowserNetworkSandbox:
         parent directory to bind-mount.  ``/bin/true`` is always present
         on Linux.
         """
-        if not self._active or not self._netns_name:
+        if not self._active:
             raise BrowserSandboxError("browser sandbox is not active")
         launcher = self._locate_and_validate_browser_launcher()
         if launcher is None:
@@ -1650,6 +1800,10 @@ class BrowserNetworkSandbox:
         """
         if not self._active:
             return None
+        if self._production_authority:
+            raise BrowserSandboxError(
+                "production browser launch requires the direct Rust launcher"
+            )
         if self._run_dir is None:
             # C-04 (round-5): fail closed in production.
             if self._require_os_sandbox:
@@ -1754,6 +1908,40 @@ class BrowserNetworkSandbox:
         so the old guard let it abort teardown mid-way).
         """
         result = CleanupResult()
+        if self._production_authority:
+            if self._kernel_authority is None:
+                result.registry_retained = True
+                self._enforcement.quarantined = True
+                self._active = False
+                return result
+            try:
+                evidence = self._kernel_authority.teardown()
+            except (OSError, RuntimeError) as error:
+                logger.error("kernel helper teardown failed; sandbox quarantined: %s", error)
+                result.registry_retained = True
+                self._enforcement.quarantined = True
+                self._active = False
+                return result
+            self._apply_helper_evidence(evidence)
+            result.nft_removed = not evidence.nft_default_deny
+            result.veth_removed = not evidence.network_namespace
+            result.netns_removed = not evidence.network_namespace
+            result.cgroup_removed = not evidence.cgroup_attached
+            result.fully_closed = (
+                result.nft_removed
+                and result.veth_removed
+                and result.netns_removed
+                and result.cgroup_removed
+                and not evidence.quarantined
+            )
+            result.registry_retained = not result.fully_closed
+            self._active = False
+            self._egress_ports.clear()
+            if result.fully_closed:
+                self._enforcement = EnforcementStatus()
+            else:
+                self._enforcement.quarantined = True
+            return result
         # Track which kernel resources were present BEFORE deletion so an
         # inactive sandbox (nothing present) is vacuously clean.
         had_nft = self._nft_table is not None
@@ -1879,6 +2067,29 @@ class BrowserSandboxError(Exception):
     caller so the browser launch is refused rather than silently
     degrading to a weaker enforcement level.
     """
+
+
+def validate_production_python_privileges() -> None:
+    """Reject a privileged Python browser control plane in production."""
+    if not sys.platform.startswith("linux"):
+        raise BrowserSandboxError("production privilege validation requires Linux")
+    if not hasattr(os, "geteuid") or os.geteuid() == 0:
+        raise BrowserSandboxError("production Python browser runtime must be non-root")
+    try:
+        status = Path("/proc/self/status").read_text(encoding="ascii")
+        cap_eff_line = next(
+            line for line in status.splitlines() if line.startswith("CapEff:")
+        )
+        capabilities = int(cap_eff_line.split(":", 1)[1].strip(), 16)
+    except (OSError, StopIteration, ValueError) as error:
+        raise BrowserSandboxError(
+            "production Python capability evidence unavailable"
+        ) from error
+    forbidden = (1 << 12) | (1 << 21)  # CAP_NET_ADMIN | CAP_SYS_ADMIN
+    if capabilities & forbidden:
+        raise BrowserSandboxError(
+            "production Python browser runtime has forbidden kernel capabilities"
+        )
 
 
 class _suppress_oserrors:

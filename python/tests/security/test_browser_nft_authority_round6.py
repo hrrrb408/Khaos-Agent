@@ -278,10 +278,11 @@ def test_6_2_d_apply_nft_script_runs_check_first():
         assert apply_call.kwargs["input"] == script
 
 
-def test_6_2_d_apply_nft_script_rejects_malformed_script_in_production():
+def test_6_2_d_apply_nft_script_rejects_malformed_script_in_production(monkeypatch):
     """6.2-D: when ``nft -c -f -`` rejects the script, production mode
     raises ``BrowserSandboxError`` and does NOT apply.
     """
+    monkeypatch.setenv("KHAOS_DEV_MODE", "1")
     with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
          patch("khaos.security.browser_sandbox.shutil.which",
                return_value="/usr/sbin/nft"), \
@@ -315,10 +316,11 @@ def test_6_2_d_apply_nft_script_dev_mode_returns_false_on_check_failure():
         assert mock_run.call_count == 1  # apply NOT attempted
 
 
-def test_6_2_d_apply_nft_script_apply_failure_in_production_raises():
+def test_6_2_d_apply_nft_script_apply_failure_in_production_raises(monkeypatch):
     """6.2-D: when the check passes but the apply fails, production
     mode raises ``BrowserSandboxError``.
     """
+    monkeypatch.setenv("KHAOS_DEV_MODE", "1")
     with patch("khaos.security.browser_sandbox.subprocess.run") as mock_run, \
          patch("khaos.security.browser_sandbox.shutil.which",
                return_value="/usr/sbin/nft"), \

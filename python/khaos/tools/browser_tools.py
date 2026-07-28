@@ -39,7 +39,6 @@ import base64
 import logging
 import os
 import re
-import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -217,7 +216,13 @@ class BrowserManager:
         return _MOCK_STATE.url
 
     async def launch(
-        self, headless: bool = True, browser_type: str = "chromium"
+        self,
+        headless: bool = True,
+        browser_type: str = "chromium",
+        *,
+        principal_id: str = "",
+        project_id: str = "",
+        runtime_id: str = "",
     ) -> dict[str, Any]:
         """Start the process browser under the singleton lifecycle lock."""
         # H1: the closed-state check happens INSIDE the lock (in
@@ -228,10 +233,22 @@ class BrowserManager:
         # ``ensure_page`` acquires the lock and relaunches via
         # ``_launch_locked`` which previously had no closed-state guard.
         async with self._lifecycle_lock:
-            return await self._launch_locked(headless, browser_type)
+            return await self._launch_locked(
+                headless,
+                browser_type,
+                principal_id=principal_id,
+                project_id=project_id,
+                runtime_id=runtime_id,
+            )
 
     async def _launch_locked(
-        self, headless: bool = True, browser_type: str = "chromium"
+        self,
+        headless: bool = True,
+        browser_type: str = "chromium",
+        *,
+        principal_id: str = "",
+        project_id: str = "",
+        runtime_id: str = "",
     ) -> dict[str, Any]:
         """启动浏览器。
 
@@ -294,7 +311,7 @@ class BrowserManager:
             pw = self._playwright
             # C-04 (round-5): production defaults to fail-closed.
             # Only KHAOS_BROWSER_DEV_MODE=1 allows proxy-only fallback.
-            _dev_mode = os.environ.get("KHAOS_BROWSER_DEV_MODE", "") == "1"
+            _dev_mode = os.environ.get("KHAOS_DEV_MODE", "") == "1"
             # F-05: set up the OS-level netns sandbox before launching
             # Chromium.  On Linux with CAP_NET_ADMIN, this creates a
             # dedicated network namespace with no default route so even
@@ -313,6 +330,8 @@ class BrowserManager:
                 )
                 candidate = BrowserNetworkSandbox(
                     require_os_sandbox=not _dev_mode,
+                    project_id=project_id,
+                    runtime_id=runtime_id,
                 )
                 # Round-5 Batch 5.4: setup() invokes subprocess.run
                 # (ip netns add, ip link add, nft -f -, cgroup mkdir)
@@ -818,6 +837,7 @@ class BrowserManager:
         *,
         session_id: str = "",
         runtime_id: str = "",
+        project_id: str = "",
         network_guard: Any = None,
     ) -> Optional[Page]:
         """确保浏览器已启动，未启动则自动启动（chromium, headless）。
@@ -866,6 +886,7 @@ class BrowserManager:
             return await self._ensure_page_locked(
                 key,
                 principal_id=effective_principal,
+                project_id=project_id,
                 runtime_id=runtime_id,
                 network_guard=network_guard,
             )
@@ -875,6 +896,7 @@ class BrowserManager:
         key: str,
         *,
         principal_id: str,
+        project_id: str = "",
         runtime_id: str,
         network_guard: Any,
     ) -> Optional[Page]:
@@ -935,7 +957,11 @@ class BrowserManager:
             )
             return None
         if self._browser is None:
-            result = await self._launch_locked()
+            result = await self._launch_locked(
+                principal_id=principal_id,
+                project_id=project_id,
+                runtime_id=runtime_id,
+            )
             if not result.get("ok"):
                 return None
         if self._browser is None:
@@ -1361,6 +1387,7 @@ class BrowserManager:
         *,
         session_id: str = "",
         runtime_id: str = "",
+        project_id: str = "",
         network_guard: Any = None,
     ) -> dict[str, Any]:
         """安全执行浏览器操作：Playwright 不可用时走 ``mock``，否则走 ``real``。
@@ -1403,6 +1430,7 @@ class BrowserManager:
             principal_id,
             session_id=session_id,
             runtime_id=runtime_id,
+            project_id=project_id,
             network_guard=network_guard,
         )
         if page is None:
@@ -1450,10 +1478,21 @@ def _is_expression_blocked(expression: str) -> Optional[str]:
 
 
 async def browser_launch(
-    headless: bool = True, browser_type: str = "chromium"
+    headless: bool = True,
+    browser_type: str = "chromium",
+    *,
+    principal_id: str = "",
+    project_id: str = "",
+    runtime_id: str = "",
 ) -> dict[str, Any]:
     """启动浏览器。"""
-    return await _manager.launch(headless=headless, browser_type=browser_type)
+    return await _manager.launch(
+        headless=headless,
+        browser_type=browser_type,
+        principal_id=principal_id,
+        project_id=project_id,
+        runtime_id=runtime_id,
+    )
 
 
 async def browser_close() -> dict[str, Any]:
@@ -1463,7 +1502,8 @@ async def browser_close() -> dict[str, Any]:
 
 async def browser_navigate(
     url: str, *, principal_id: str = "",
-    session_id: str = "", runtime_id: str = "", network_guard: Any = None,
+    session_id: str = "", runtime_id: str = "", project_id: str = "",
+    network_guard: Any = None,
 ) -> dict[str, Any]:
     """导航到指定 URL 并等待页面基本加载完成。
 
@@ -1484,6 +1524,7 @@ async def browser_navigate(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 
@@ -1511,7 +1552,8 @@ def _navigate_mock(url: str) -> dict[str, Any]:
 
 async def browser_click(
     selector: str, *, principal_id: str = "",
-    session_id: str = "", runtime_id: str = "", network_guard: Any = None,
+    session_id: str = "", runtime_id: str = "", project_id: str = "",
+    network_guard: Any = None,
 ) -> dict[str, Any]:
     """点击元素（CSS / text= / xpath=）。
 
@@ -1527,6 +1569,7 @@ async def browser_click(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 
@@ -1551,7 +1594,8 @@ def _click_mock(selector: str) -> dict[str, Any]:
 async def browser_type(
     selector: str, text: str, press_enter: bool = False,
     *, principal_id: str = "",
-    session_id: str = "", runtime_id: str = "", network_guard: Any = None,
+    session_id: str = "", runtime_id: str = "", project_id: str = "",
+    network_guard: Any = None,
 ) -> dict[str, Any]:
     """在输入框中输入文本（先清空）。
 
@@ -1567,6 +1611,7 @@ async def browser_type(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 
@@ -1590,7 +1635,8 @@ def _type_mock(selector: str, text: str) -> dict[str, Any]:
 
 async def browser_snapshot(
     *, principal_id: str = "",
-    session_id: str = "", runtime_id: str = "", network_guard: Any = None,
+    session_id: str = "", runtime_id: str = "", project_id: str = "",
+    network_guard: Any = None,
 ) -> dict[str, Any]:
     """获取页面 DOM 快照（完整 HTML，过长截断）。
 
@@ -1605,6 +1651,7 @@ async def browser_snapshot(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 
@@ -1631,7 +1678,8 @@ def _snapshot_mock() -> dict[str, Any]:
 
 async def browser_screenshot(
     *, principal_id: str = "",
-    session_id: str = "", runtime_id: str = "", network_guard: Any = None,
+    session_id: str = "", runtime_id: str = "", project_id: str = "",
+    network_guard: Any = None,
 ) -> dict[str, Any]:
     """Capture a screenshot and return base64 without filesystem writes.
 
@@ -1645,6 +1693,7 @@ async def browser_screenshot(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 
@@ -1664,7 +1713,8 @@ def _screenshot_mock() -> dict[str, Any]:
 
 async def browser_scroll(
     direction: str = "down", amount: int = 3, *, principal_id: str = "",
-    session_id: str = "", runtime_id: str = "", network_guard: Any = None,
+    session_id: str = "", runtime_id: str = "", project_id: str = "",
+    network_guard: Any = None,
 ) -> dict[str, Any]:
     """滚动页面（每 ``amount`` 滚动 ``amount * 500`` 像素）。
 
@@ -1678,6 +1728,7 @@ async def browser_scroll(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 
@@ -1701,7 +1752,8 @@ def _scroll_mock(direction: str, amount: int) -> dict[str, Any]:
 
 async def browser_evaluate(
     expression: str, *, principal_id: str = "",
-    session_id: str = "", runtime_id: str = "", network_guard: Any = None,
+    session_id: str = "", runtime_id: str = "", project_id: str = "",
+    network_guard: Any = None,
 ) -> dict[str, Any]:
     """在页面上下文中执行 JS 表达式（拦截网络类 API）。
 
@@ -1720,6 +1772,7 @@ async def browser_evaluate(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 
@@ -1741,6 +1794,7 @@ async def browser_file_upload(
     principal_id: str = "",
     session_id: str = "",
     runtime_id: str = "",
+    project_id: str = "",
     network_guard: Any = None,
 ) -> dict[str, Any]:
     """上传文件到 ``<input type=file>`` 元素。
@@ -1793,6 +1847,7 @@ async def browser_file_upload(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 
@@ -2046,7 +2101,8 @@ def _file_upload_mock(selector: str, file_path: str) -> dict[str, Any]:
 
 async def browser_vision(
     *, principal_id: str = "",
-    session_id: str = "", runtime_id: str = "", network_guard: Any = None,
+    session_id: str = "", runtime_id: str = "", project_id: str = "",
+    network_guard: Any = None,
 ) -> dict[str, Any]:
     """返回页面状态的文字摘要（URL + 标题）。
 
@@ -2061,6 +2117,7 @@ async def browser_vision(
         principal_id=principal_id,
         session_id=session_id,
         runtime_id=runtime_id,
+        project_id=project_id,
         network_guard=network_guard,
     )
 

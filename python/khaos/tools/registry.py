@@ -303,8 +303,8 @@ class ToolInvocationBroker:
         # browser tools (snapshot / screenshot / scroll / vision) declare
         # ``filesystem.read``; without principal_id here they would all
         # share the "default" BrowserContext, leaking one principal's DOM /
-        # cookies to another.  ``browser_launch`` / ``browser_close`` are
-        # process-global lifecycle operations and don't accept principal_id.
+        # cookies to another. ``browser_close`` remains a lifecycle operation;
+        # every launch/page operation receives the exact runtime authority.
         # B2 + H5: also propagate ``session_id`` + ``runtime_id`` +
         # ``network_guard`` so browser tools key their BrowserContext by
         # (principal, session, runtime) AND install a Playwright
@@ -314,12 +314,13 @@ class ToolInvocationBroker:
         # reach a blocked domain because they don't carry a ``url`` arg).
         if (
             name.startswith("browser_")
-            and name not in {"browser_launch", "browser_close"}
+            and name != "browser_close"
         ):
             if "principal_id" not in handler_params:
                 handler_params["principal_id"] = context.get("principal_id", "")
             handler_params.setdefault("session_id", context.get("session_id", ""))
             handler_params.setdefault("runtime_id", context.get("runtime_id", ""))
+            handler_params.setdefault("project_id", context.get("project_id", ""))
             handler_params.setdefault(
                 "network_guard", context.get("network_guard")
             )
