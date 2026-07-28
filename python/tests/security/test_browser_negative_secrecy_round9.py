@@ -98,8 +98,14 @@ def _chromium_descendant_environments(parent_pid: int) -> bytes:
     chromium_processes = 0
     for pid in descendants - {parent_pid}:
         try:
-            executable = Path(f"/proc/{pid}/exe").resolve(strict=True).name.lower()
-            if "chrome" not in executable and "chromium" not in executable:
+            # /proc/<pid>/exe may point at the Chromium path inside its
+            # private mount namespace, which is intentionally unresolvable
+            # from the host.  ``comm`` is kernel-provided process identity
+            # and remains readable without crossing that mount boundary.
+            command_name = Path(f"/proc/{pid}/comm").read_text(
+                encoding="ascii"
+            ).strip().lower()
+            if "chrome" not in command_name and "chromium" not in command_name:
                 continue
             combined.extend(Path(f"/proc/{pid}/environ").read_bytes())
             chromium_processes += 1
