@@ -2,10 +2,14 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use serde::{Deserialize, Serialize};
     use std::env;
     use std::ffi::CString;
     use std::io::{self, Read, Write};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
     use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
 
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
@@ -15,6 +19,48 @@ mod linux {
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
+    const HELPER_PROTOCOL_VERSION: u16 = 1;
+    const HELPER_MAX_MESSAGE: usize = 8192;
+    const DEFAULT_HELPER_SOCKET: &str = "/run/khaos/browser-kernel-helper.sock";
+
+    #[derive(Serialize)]
+    struct HelperRequest<'a> {
+        protocol_version: u16,
+        request_id: String,
+        boot_id: String,
+        client_pid: u32,
+        client_start_time: u64,
+        project_id: &'a str,
+        runtime_id: &'a str,
+        sandbox_token: &'a str,
+        op: &'static str,
+        port: Option<u16>,
+        target_pid: Option<u32>,
+        target_start_time: Option<u64>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HelperResponse {
+        protocol_version: u16,
+        request_id: String,
+        ok: bool,
+        error: Option<String>,
+        status: Option<HelperStatus>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct HelperStatus {
+        helper_authenticated: bool,
+        network_namespace: bool,
+        nft_default_deny: bool,
+        cgroup_attached: bool,
+        process_isolated: bool,
+        resource_registry_verified: bool,
+        quarantined: bool,
+        proxy_host: String,
+    }
 
     const BPF_LD: u16 = 0x00;
     const BPF_W: u16 = 0x00;
@@ -204,19 +250,290 @@ mod linux {
     /// CLONE_NEWNET)``.  Must run BEFORE seccomp installs (the filter
     /// denies ``setns`` so a later-compromised browser cannot escape).
     fn join_netns(name: &str) -> io::Result<()> {
-        let path = format!("/var/run/netns/{}", name);
-        let c_path = CString::new(path.as_bytes())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "netns path contained NUL"))?;
-        let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-        if fd < 0 {
+        validate_netns_name(name)?;
+        let authority = CString::new("/var/run/netns").map_err(io::Error::other)?;
+        let directory = unsafe {
+            libc::open(
+                authority.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if directory < 0 {
             return Err(io::Error::last_os_error());
         }
-        let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
-        unsafe { libc::close(fd) };
+        let directory = unsafe { OwnedFd::from_raw_fd(directory) };
+        let entry = CString::new(name).map_err(io::Error::other)?;
+        let descriptor = unsafe {
+            libc::openat(
+                directory.as_raw_fd(),
+                entry.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            )
+        };
+        if descriptor < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let descriptor = unsafe { OwnedFd::from_raw_fd(descriptor) };
+        validate_namespace_fd(descriptor.as_raw_fd())?;
+        let rc = unsafe { libc::setns(descriptor.as_raw_fd(), libc::CLONE_NEWNET) };
         if rc != 0 {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    fn validate_netns_name(name: &str) -> io::Result<()> {
+        if name == "."
+            || name == ".."
+            || name.contains('/')
+            || !name.starts_with("khaos-br-")
+            || name.len() != 21
+            || !name[9..].bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid managed netns name",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_namespace_fd(descriptor: RawFd) -> io::Result<()> {
+        let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstat(descriptor, &mut metadata) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if metadata.st_mode & libc::S_IFMT != libc::S_IFREG {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "network namespace descriptor is not a regular namespace file",
+            ));
+        }
+        let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::fstatfs(descriptor, &mut filesystem) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        const NSFS_MAGIC: libc::c_long = 0x6e736673;
+        if filesystem.f_type != NSFS_MAGIC {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "network namespace descriptor is not nsfs",
+            ));
+        }
+        Ok(())
+    }
+
+    fn join_browser_authority(project_id: &str, runtime_id: &str, token: &str) -> io::Result<()> {
+        validate_authority_identifier(project_id, "project_id")?;
+        validate_authority_identifier(runtime_id, "runtime_id")?;
+        if token.len() < 32
+            || token.len() > 256
+            || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid sandbox token",
+            ));
+        }
+        let socket_path = env::var("KHAOS_BROWSER_KERNEL_HELPER_SOCKET")
+            .unwrap_or_else(|_| DEFAULT_HELPER_SOCKET.to_owned());
+        validate_helper_socket(&socket_path)?;
+        let mut stream = UnixStream::connect(&socket_path)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+        validate_helper_peer(&stream)?;
+        let client_pid = std::process::id();
+        let client_start_time = process_start_time(client_pid)?;
+        let request_id = format!("join-{client_pid}-{client_start_time}");
+        let request = HelperRequest {
+            protocol_version: HELPER_PROTOCOL_VERSION,
+            request_id: request_id.clone(),
+            boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+                .trim()
+                .to_owned(),
+            client_pid,
+            client_start_time,
+            project_id,
+            runtime_id,
+            sandbox_token: token,
+            op: "join",
+            port: None,
+            target_pid: None,
+            target_start_time: None,
+        };
+        let data = serde_json::to_vec(&request).map_err(io::Error::other)?;
+        if data.len() > HELPER_MAX_MESSAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "helper request too large",
+            ));
+        }
+        stream.write_all(&(data.len() as u32).to_be_bytes())?;
+        stream.write_all(&data)?;
+        let (response, namespace) = receive_helper_fd(&stream)?;
+        if response.protocol_version != HELPER_PROTOCOL_VERSION
+            || response.request_id != request_id
+            || !response.ok
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                response
+                    .error
+                    .unwrap_or_else(|| "helper response invalid".to_owned()),
+            ));
+        }
+        let status = response
+            .status
+            .ok_or_else(|| io::Error::other("helper isolation evidence missing"))?;
+        if !status.helper_authenticated
+            || !status.network_namespace
+            || !status.nft_default_deny
+            || !status.cgroup_attached
+            || !status.process_isolated
+            || !status.resource_registry_verified
+            || status.quarantined
+            || status.proxy_host.parse::<std::net::IpAddr>().is_err()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper returned incomplete or quarantined isolation evidence",
+            ));
+        }
+        validate_namespace_fd(namespace.as_raw_fd())?;
+        if unsafe { libc::setns(namespace.as_raw_fd(), libc::CLONE_NEWNET) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn validate_authority_identifier(value: &str, label: &str) -> io::Result<()> {
+        if value.is_empty()
+            || value.len() > 128
+            || !value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b':' | b'.')
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid {label}"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_helper_socket(path: &str) -> io::Result<()> {
+        let path = Path::new(path);
+        if !path.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "helper socket path must be absolute",
+            ));
+        }
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("helper socket parent missing"))?;
+        let parent_metadata = std::fs::symlink_metadata(parent)?;
+        if parent_metadata.uid() != 0 || parent_metadata.mode() & 0o022 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper socket parent is not protected",
+            ));
+        }
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.file_type().is_socket() || metadata.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper socket type or mode invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_helper_peer(stream: &UnixStream) -> io::Result<()> {
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        if unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut cred as *mut _ as *mut libc::c_void,
+                &mut length,
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        if cred.uid != 0 || cred.pid <= 1 || process_start_time(cred.pid as u32)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper peer identity invalid",
+            ));
+        }
+        Ok(())
+    }
+
+    fn process_start_time(pid: u32) -> io::Result<u64> {
+        let value = std::fs::read_to_string(format!("/proc/{pid}/stat"))?;
+        let end = value
+            .rfind(')')
+            .ok_or_else(|| io::Error::other("invalid proc stat"))?;
+        value[end + 2..]
+            .split_whitespace()
+            .nth(19)
+            .ok_or_else(|| io::Error::other("missing process start time"))?
+            .parse()
+            .map_err(io::Error::other)
+    }
+
+    fn receive_helper_fd(stream: &UnixStream) -> io::Result<(HelperResponse, OwnedFd)> {
+        let mut data = vec![0_u8; HELPER_MAX_MESSAGE + 4];
+        let mut vector = libc::iovec {
+            iov_base: data.as_mut_ptr().cast(),
+            iov_len: data.len(),
+        };
+        let control_length = unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) };
+        let mut control = vec![0_u8; control_length as usize];
+        let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+        message.msg_iov = &mut vector;
+        message.msg_iovlen = 1;
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len();
+        let received =
+            unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+        if received < 4 {
+            return Err(if received < 0 {
+                io::Error::last_os_error()
+            } else {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "short helper response")
+            });
+        }
+        let length = u32::from_be_bytes(data[..4].try_into().map_err(io::Error::other)?) as usize;
+        if length == 0 || length > HELPER_MAX_MESSAGE || received as usize != length + 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "helper response length invalid",
+            ));
+        }
+        let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        if header.is_null()
+            || unsafe { (*header).cmsg_level } != libc::SOL_SOCKET
+            || unsafe { (*header).cmsg_type } != libc::SCM_RIGHTS
+            || unsafe { (*header).cmsg_len }
+                != unsafe { libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize }
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper namespace descriptor missing",
+            ));
+        }
+        let descriptor = unsafe { *libc::CMSG_DATA(header).cast::<RawFd>() };
+        if descriptor < 0 {
+            return Err(io::Error::other("helper namespace descriptor invalid"));
+        }
+        let response = serde_json::from_slice::<HelperResponse>(&data[4..4 + length])
+            .map_err(io::Error::other)?;
+        Ok((response, unsafe { OwnedFd::from_raw_fd(descriptor) }))
     }
 
     /// Move this process into an existing cgroup-v2 leaf without applying
@@ -382,17 +699,37 @@ mod linux {
             let real = env::var_os("KHAOS_BROWSER_REAL_EXECUTABLE").ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing browser executable")
             })?;
-            let netns = env::var("KHAOS_BROWSER_NETNS").map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, "missing browser netns")
-            })?;
-            if let Some(procs) = env::var_os("KHAOS_BROWSER_CGROUP_PROCS") {
-                join_cgroup(&procs).map_err(|error| {
-                    io::Error::new(error.kind(), format!("join browser cgroup: {error}"))
+            if env::var_os("KHAOS_BROWSER_AUTHORITY").as_deref()
+                == Some(std::ffi::OsStr::new("1"))
+            {
+                let project_id = env::var("KHAOS_BROWSER_PROJECT_ID")
+                    .map_err(|_| io::Error::other("browser project identity missing"))?;
+                let runtime_id = env::var("KHAOS_BROWSER_RUNTIME_ID")
+                    .map_err(|_| io::Error::other("browser runtime identity missing"))?;
+                let token = env::var("KHAOS_BROWSER_SANDBOX_TOKEN")
+                    .map_err(|_| io::Error::other("browser sandbox token missing"))?;
+                join_browser_authority(&project_id, &runtime_id, &token)?;
+            } else {
+                if env::var_os("KHAOS_DEV_MODE").as_deref()
+                    != Some(std::ffi::OsStr::new("1"))
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "legacy browser netns contract is development-only",
+                    ));
+                }
+                let netns = env::var("KHAOS_BROWSER_NETNS").map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "missing browser netns")
+                })?;
+                if let Some(procs) = env::var_os("KHAOS_BROWSER_CGROUP_PROCS") {
+                    join_cgroup(&procs).map_err(|error| {
+                        io::Error::new(error.kind(), format!("join browser cgroup: {error}"))
+                    })?;
+                }
+                join_netns(&netns).map_err(|error| {
+                    io::Error::new(error.kind(), format!("join browser netns: {error}"))
                 })?;
             }
-            join_netns(&netns).map_err(|error| {
-                io::Error::new(error.kind(), format!("join browser netns: {error}"))
-            })?;
 
             let launcher_path = env::current_exe().map_err(|error| {
                 io::Error::new(error.kind(), format!("resolve launcher image: {error}"))
@@ -597,6 +934,16 @@ mod linux {
                 "--unsetenv".into(),
                 "KHAOS_BROWSER_CGROUP_PROCS".into(),
                 "--unsetenv".into(),
+                "KHAOS_BROWSER_AUTHORITY".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_PROJECT_ID".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_RUNTIME_ID".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_SANDBOX_TOKEN".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_KERNEL_HELPER_SOCKET".into(),
+                "--unsetenv".into(),
                 "KHAOS_BROWSER_HOST_HOME".into(),
                 "--unsetenv".into(),
                 "KHAOS_BROWSER_BWRAP_PATH".into(),
@@ -744,7 +1091,42 @@ mod linux {
             return Ok(());
         }
 
-        // Batch 7.4 (round-7 §十一): browser launcher mode.
+        // Production browser authority mode.  The launcher receives only the
+        // abstract identity tuple; the authenticated helper returns the
+        // already-validated namespace descriptor via SCM_RIGHTS and attaches
+        // this launcher to the helper-owned cgroup before setns.
+        if args.first().is_some_and(|arg| arg == "--browser-authority") {
+            args.remove(0);
+            if args.first().is_some_and(|arg| arg == "--") {
+                args.remove(0);
+            }
+            let project_id = env::var("KHAOS_BROWSER_PROJECT_ID")
+                .map_err(|_| io::Error::other("browser project identity missing"))?;
+            let runtime_id = env::var("KHAOS_BROWSER_RUNTIME_ID")
+                .map_err(|_| io::Error::other("browser runtime identity missing"))?;
+            let token = env::var("KHAOS_BROWSER_SANDBOX_TOKEN")
+                .map_err(|_| io::Error::other("browser sandbox token missing"))?;
+            env::remove_var("KHAOS_BROWSER_PROJECT_ID");
+            env::remove_var("KHAOS_BROWSER_RUNTIME_ID");
+            env::remove_var("KHAOS_BROWSER_SANDBOX_TOKEN");
+            join_browser_authority(&project_id, &runtime_id, &token)?;
+            let remote_debugging_pipe = args
+                .iter()
+                .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
+            let preserved = if remote_debugging_pipe {
+                for fd in [3, 4] {
+                    validate_control_channel(fd, fd == 3)?;
+                }
+                vec![3, 4]
+            } else {
+                Vec::new()
+            };
+            sanitize_fds_except(&preserved)?;
+            install_seccomp()?;
+            return exec(&args);
+        }
+
+        // Development compatibility browser launcher mode.
         //   --browser --netns <name> --cgroup <procs> -- <chromium> <args>
         // Order: validate → join cgroup → join netns → sanitize fds →
         // no_new_privs → install seccomp (denies setns, so the browser
