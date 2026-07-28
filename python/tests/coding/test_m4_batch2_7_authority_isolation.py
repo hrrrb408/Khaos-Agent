@@ -24,7 +24,11 @@ from khaos.coding.planning.approval import (
     PlannedExecutionGuard,
 )
 from khaos.coding.planning.approval.receipt_crypto import ReceiptPublicVerifier
-from khaos.coding.planning.approval.runtime import BootContext, RuntimeCapability
+from khaos.coding.planning.approval.runtime import (
+    BootContext,
+    RuntimeCapability,
+    _consume_runtime_capability,
+)
 
 
 def test_broker_and_public_package_do_not_expose_receipt_signer() -> None:
@@ -118,6 +122,37 @@ def test_runtime_capability_and_copied_boot_context_are_not_authority() -> None:
             plan_repository=PersistedPlanRepository(store),
             planning_service=DeepFakePlanningService(),
         )
+
+
+def test_runtime_capability_registries_are_instance_scoped() -> None:
+    runtime_a = _runtime(_store())
+    runtime_b = _runtime(_store())
+    runtime_a.initialize()
+    runtime_b.initialize()
+
+    assert runtime_a._runtime_authorities is not runtime_b._runtime_authorities
+    capability = runtime_a._runtime_authorities.issue(
+        runtime_a._runtime_authority_id, "isolation-test"
+    )
+    with pytest.raises(PermissionError, match="invalid or reused"):
+        runtime_b._runtime_authorities.consume(capability, "isolation-test")
+    assert _consume_runtime_capability(
+        capability, "isolation-test"
+    ) == runtime_a.boot_context
+
+
+def test_receipt_writer_cannot_revive_after_runtime_restart() -> None:
+    runtime = _runtime(_store())
+    runtime.initialize()
+    stale_writer = getattr(
+        runtime._broker, "_ApprovalBroker__runtime_receipt_writer"
+    )
+
+    runtime.shutdown()
+    runtime.initialize()
+
+    with pytest.raises(PermissionError, match="revoked"):
+        stale_writer()
 
 
 @pytest.mark.parametrize("missing", ["task", "workspace", "indexer"])

@@ -156,6 +156,3 @@ class RuntimeVerificationStorageRegistry:
                 self._records.pop(key, None)
         for _, record in selected:
             record.capability.close()
-
-
-VERIFICATION_STORAGE_REGISTRY = RuntimeVerificationStorageRegistry()

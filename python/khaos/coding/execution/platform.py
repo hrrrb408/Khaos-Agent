@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 import os
 import shutil
 import secrets
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -19,11 +21,127 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
+class CapabilityEvidence:
+    """System and TCB identity to which a capability probe is bound."""
+
+    boot_id: str
+    uid: int
+    mount_namespace_inode: int | None
+    user_namespace_inode: int | None
+    binary_device: int
+    binary_inode: int
+    binary_digest: str
+    cgroup_root_device: int | None
+    cgroup_root_inode: int | None
+    probe_timestamp: float
+
+    @property
+    def identity(self) -> tuple[object, ...]:
+        """Stable evidence fields; timestamp is freshness metadata only."""
+        return (
+            self.boot_id,
+            self.uid,
+            self.mount_namespace_inode,
+            self.user_namespace_inode,
+            self.binary_device,
+            self.binary_inode,
+            self.binary_digest,
+            self.cgroup_root_device,
+            self.cgroup_root_inode,
+        )
+
+
+@dataclass(frozen=True)
 class BackendAvailability:
     name: str
     available: bool
     network_enforced: bool
     reason: str = ""
+    evidence: CapabilityEvidence | None = None
+
+
+@dataclass(frozen=True)
+class _CapabilityCacheEntry:
+    availability: BackendAvailability
+    evidence: CapabilityEvidence
+
+
+_CAPABILITY_CACHE_TTL_SECONDS = 60.0
+
+
+def _cached_availability(
+    entry: _CapabilityCacheEntry | None,
+    current: CapabilityEvidence,
+) -> BackendAvailability | None:
+    if entry is None:
+        return None
+    if entry.evidence.identity != current.identity:
+        return None
+    if time.time() - entry.evidence.probe_timestamp > _CAPABILITY_CACHE_TTL_SECONDS:
+        return None
+    return entry.availability
+
+
+def _capability_evidence(
+    binaries: tuple[Path, ...],
+    *,
+    cgroup_root: Path | None = None,
+) -> CapabilityEvidence:
+    if not binaries:
+        raise RuntimeError("capability evidence requires a TCB binary")
+    digest = hashlib.sha256()
+    primary = binaries[0].resolve(strict=True)
+    primary_stat = primary.stat()
+    for binary in binaries:
+        canonical = binary.resolve(strict=True)
+        metadata = canonical.stat()
+        digest.update(str(canonical).encode("utf-8"))
+        digest.update(metadata.st_dev.to_bytes(8, "big", signed=False))
+        digest.update(metadata.st_ino.to_bytes(8, "big", signed=False))
+        with canonical.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    boot_id_path = Path("/proc/sys/kernel/random/boot_id")
+    if boot_id_path.is_file():
+        boot_id = boot_id_path.read_text(encoding="ascii").strip()
+    elif sys.platform == "darwin":
+        boot = subprocess.run(
+            ("/usr/sbin/sysctl", "-n", "kern.boottime"),
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=True,
+        )
+        boot_id = boot.stdout.strip()
+    else:
+        boot_id = "unsupported"
+    mount_inode = _namespace_inode("/proc/self/ns/mnt")
+    user_inode = _namespace_inode("/proc/self/ns/user")
+    cgroup_device: int | None = None
+    cgroup_inode: int | None = None
+    if cgroup_root is not None:
+        cgroup_stat = cgroup_root.resolve(strict=True).stat()
+        cgroup_device = cgroup_stat.st_dev
+        cgroup_inode = cgroup_stat.st_ino
+    return CapabilityEvidence(
+        boot_id=boot_id,
+        uid=os.getuid() if hasattr(os, "getuid") else -1,
+        mount_namespace_inode=mount_inode,
+        user_namespace_inode=user_inode,
+        binary_device=primary_stat.st_dev,
+        binary_inode=primary_stat.st_ino,
+        binary_digest=digest.hexdigest(),
+        cgroup_root_device=cgroup_device,
+        cgroup_root_inode=cgroup_inode,
+        probe_timestamp=time.time(),
+    )
+
+
+def _namespace_inode(path: str) -> int | None:
+    try:
+        return Path(path).stat().st_ino
+    except OSError:
+        return None
 
 
 class UnsupportedBackend:
@@ -98,10 +216,10 @@ class BackendSelector:
 
 class MacOSSandboxBackend:
     name = "macos-sandbox-exec"
-    _capability_cache: "BackendAvailability | None" = None
 
     def __init__(self, supervisor=None) -> None:
         self.supervisor = supervisor
+        self._capability_cache: _CapabilityCacheEntry | None = None
 
     @staticmethod
     def runtime_read_roots(
@@ -121,8 +239,21 @@ class MacOSSandboxBackend:
             return BackendAvailability(
                 self.name, False, False, "sandbox-exec unavailable"
             )
-        if MacOSSandboxBackend._capability_cache is not None:
-            return MacOSSandboxBackend._capability_cache
+        try:
+            evidence = _capability_evidence(
+                (Path("/usr/bin/sandbox-exec"), Path(sys.executable))
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return BackendAvailability(
+                self.name,
+                False,
+                False,
+                "sandbox-exec TCB evidence unavailable: "
+                f"{type(exc).__name__}: {exc}",
+            )
+        cached = _cached_availability(self._capability_cache, evidence)
+        if cached is not None:
+            return cached
         try:
             with tempfile.TemporaryDirectory() as temporary:
                 root = Path(temporary)
@@ -190,7 +321,14 @@ class MacOSSandboxBackend:
                     f"(rc={completed.returncode}): {stderr}"
                 ),
             )
-        MacOSSandboxBackend._capability_cache = availability
+        availability = BackendAvailability(
+            availability.name,
+            availability.available,
+            availability.network_enforced,
+            availability.reason,
+            evidence,
+        )
+        self._capability_cache = _CapabilityCacheEntry(availability, evidence)
         return availability
 
     def profile(
@@ -220,6 +358,19 @@ class MacOSSandboxBackend:
         literal_reads = "".join(
             f'(allow file-read* (literal "{_seatbelt_escape(path)}"))'
             for path in _macos_literal_read_files() if path.exists()
+        )
+        metadata_ancestors = _deduplicate_paths(
+            (*read_roots, *tuple(
+                ancestor
+                for path in read_roots
+                for ancestor in reversed(path.parents)
+                if ancestor != Path("/")
+            ))
+        )
+        metadata_rules = "".join(
+            '(allow file-read-metadata '
+            f'(literal "{_seatbelt_escape(path)}"))'
+            for path in metadata_ancestors
         )
         executable_map_rules = "".join(
             f'(allow file-map-executable (subpath "{_seatbelt_escape(path)}"))'
@@ -254,12 +405,13 @@ class MacOSSandboxBackend:
             "(version 1)(deny default)(allow process-exec process-fork)",
             "(allow signal (target same-sandbox))",
             "(allow process-info* (target same-sandbox))",
-            "(allow sysctl-read)(allow file-read-metadata)",
+            "(allow sysctl-read)",
             '(allow file-read* (literal "/"))',
             '(allow file-read* file-write-data (literal "/dev/null"))',
             '(allow file-read* (literal "/dev/random"))',
             '(allow file-read* (literal "/dev/urandom"))',
-            read_rules, literal_reads, executable_map_rules, write_rules,
+            metadata_rules, read_rules, literal_reads,
+            executable_map_rules, write_rules,
             protected_write_rules,
             mach_lookup_rules,
             "(deny network*)",
@@ -271,7 +423,11 @@ class MacOSSandboxBackend:
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
         with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
-            home = Path(home_value)
+            # macOS exposes /var as a symlink to /private/var.  Bind the
+            # environment and Seatbelt rules to the same canonical identity;
+            # otherwise HOME uses the lexical /var path while the profile
+            # allows /private/var and legitimate synthetic-home writes fail.
+            home = Path(home_value).resolve()
             sandbox_tmp = home / "tmp"
             sandbox_tmp.mkdir(mode=0o700)
             sandbox_profile = self.profile(
@@ -295,14 +451,18 @@ class MacOSSandboxBackend:
             )
             supervisor = self.supervisor or ProcessSupervisor()
             self.supervisor = supervisor
-            return await supervisor.run(
-                sandboxed,
-                cwd=request.cwd.resolve(),
-                env=environment,
-                tmp_root=home,
-                workspace_root=worktree if writable else None,
-                workspace_baseline=request.workspace_baseline,
-            )
+            try:
+                return await supervisor.run(
+                    sandboxed,
+                    cwd=request.cwd.resolve(),
+                    env=environment,
+                    tmp_root=home,
+                    workspace_root=worktree if writable else None,
+                    workspace_baseline=request.workspace_baseline,
+                )
+            except (OSError, PermissionError):
+                self._capability_cache = None
+                raise
 
     async def terminate(self, execution_id: str) -> None:
         if self.supervisor is not None:
@@ -311,10 +471,10 @@ class MacOSSandboxBackend:
 
 class LinuxBubblewrapBackend:
     name = "linux-bwrap"
-    _capability_cache: "BackendAvailability | None" = None
 
     def __init__(self, supervisor=None) -> None:
         self.supervisor = supervisor
+        self._capability_cache: _CapabilityCacheEntry | None = None
 
     async def probe(self) -> BackendAvailability:
         return self.probe_capability()
@@ -344,8 +504,13 @@ class LinuxBubblewrapBackend:
                 self.name, False, False,
                 "khaos-sandbox-launcher unavailable; no_new_privs/seccomp TCB is required",
             )
-        if LinuxBubblewrapBackend._capability_cache is not None:
-            return LinuxBubblewrapBackend._capability_cache
+        evidence = _capability_evidence(
+            (Path(_resolve_bwrap_path()), launcher),
+            cgroup_root=_linux_cgroup_root(),
+        )
+        cached = _cached_availability(self._capability_cache, evidence)
+        if cached is not None:
+            return cached
         cgroup: Path | None = None
         try:
             with tempfile.TemporaryDirectory() as tmp, \
@@ -373,7 +538,14 @@ class LinuxBubblewrapBackend:
                 False,
                 f"bwrap isolation probe could not run: {type(exc).__name__}: {exc}",
             )
-            LinuxBubblewrapBackend._capability_cache = availability
+            availability = BackendAvailability(
+                availability.name,
+                availability.available,
+                availability.network_enforced,
+                availability.reason,
+                evidence,
+            )
+            self._capability_cache = _CapabilityCacheEntry(availability, evidence)
             if cgroup is not None:
                 _remove_linux_cgroup(cgroup)
             return availability
@@ -385,7 +557,14 @@ class LinuxBubblewrapBackend:
                 self.name, False, False,
                 f"bwrap isolation probe failed (rc={completed.returncode}): {stderr}",
             )
-        LinuxBubblewrapBackend._capability_cache = availability
+        availability = BackendAvailability(
+            availability.name,
+            availability.available,
+            availability.network_enforced,
+            availability.reason,
+            evidence,
+        )
+        self._capability_cache = _CapabilityCacheEntry(availability, evidence)
         if cgroup is not None:
             _remove_linux_cgroup(cgroup)
         return availability
@@ -497,13 +676,17 @@ class LinuxBubblewrapBackend:
             supervisor = self.supervisor or ProcessSupervisor()
             self.supervisor = supervisor
             try:
-                return await supervisor.run(
-                    sandboxed,
-                    cwd=request.cwd.resolve(),
-                    sandbox_storage_paths=("/home/khaos", "/tmp"),
-                    workspace_root=worktree if writable else None,
-                    workspace_baseline=request.workspace_baseline,
-                )
+                try:
+                    return await supervisor.run(
+                        sandboxed,
+                        cwd=request.cwd.resolve(),
+                        sandbox_storage_paths=("/home/khaos", "/tmp"),
+                        workspace_root=worktree if writable else None,
+                        workspace_baseline=request.workspace_baseline,
+                    )
+                except (OSError, PermissionError):
+                    self._capability_cache = None
+                    raise
             finally:
                 _remove_linux_cgroup(cgroup)
 
@@ -516,12 +699,11 @@ def _resolve_bwrap_path() -> str:
     """P1-1 (round-13): resolve bwrap to a validated absolute path.
 
     Reuses the browser path's ``_validate_tcb_binary`` to enforce the same
-    canonical-path, owner/mode, parent-chain checks.  Falls back to the
-    bare ``"bwrap"`` name only in dev mode (KHAOS_REQUIRE_PLATFORM_SANDBOX
-    unset) so non-Linux/dev checkouts still import cleanly.
+    canonical-path, owner/mode, parent-chain checks. A bare PATH lookup is
+    permitted only under explicit ``KHAOS_DEV_MODE=1``.
     """
     from khaos.security.browser_sandbox import _validate_tcb_binary, BrowserSandboxError
-    require = os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX", "").strip()
+    require = not _development_mode()
     located = shutil.which("bwrap")
     if located is None:
         if require:
@@ -538,7 +720,7 @@ def _resolve_bwrap_path() -> str:
 def _linux_sandbox_launcher() -> Path | None:
     """Resolve the reviewed Rust inner TCB.
 
-    P1-1 (round-13): production mode (KHAOS_REQUIRE_PLATFORM_SANDBOX)
+    P1-1 (round-13): secure production mode
     validates the launcher via ``_validate_tcb_binary`` (canonical path,
     owner/mode, parent chain) — the same checks the browser path uses.
     Dev mode accepts any candidate that is a regular executable file.
@@ -553,7 +735,7 @@ def _linux_sandbox_launcher() -> Path | None:
         / "khaos-sandbox-launcher",
     ))
     # P1-1: target/debug is dev-only; skip it in production.
-    if not os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX", "").strip():
+    if _development_mode():
         candidates.append(
             repository_root / "rust" / "khaos-core" / "target" / "debug"
             / "khaos-sandbox-launcher"
@@ -561,7 +743,7 @@ def _linux_sandbox_launcher() -> Path | None:
     located = shutil.which("khaos-sandbox-launcher")
     if located:
         candidates.append(Path(located))
-    require = os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX", "").strip()
+    require = not _development_mode()
     for candidate in candidates:
         canonical = candidate.resolve()
         if not (canonical.is_file() and os.access(canonical, os.X_OK)):
@@ -575,6 +757,11 @@ def _linux_sandbox_launcher() -> Path | None:
                 continue
         return canonical
     return None
+
+
+def _development_mode() -> bool:
+    """Only the exact explicit opt-in enables development fallbacks."""
+    return os.environ.get("KHAOS_DEV_MODE") == "1"
 
 
 def _linux_cgroup_root() -> Path | None:

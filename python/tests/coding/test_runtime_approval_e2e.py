@@ -60,17 +60,23 @@ async def _runtime(tmp_path: Path, repository: Path, responses: list[list[Messag
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
-    await db.create_session("session", mode="coding")
+    await db.create_session(
+        "session", mode="coding", principal_id="legacy", project_id="project-test"
+    )
     modes = ModeManager(db, project_root=repository)
     await modes.switch(Mode.CODING)
     manager = WorkspaceManager(tmp_path / "worktrees")
     execution = ExecutionService(HostExecutionBackend(), manager)
-    scheduler = ToolScheduler(create_runtime_registry(), PermissionEngine(db))
+    scheduler = ToolScheduler(
+        create_runtime_registry(),
+        PermissionEngine(db, principal_id="legacy", project_id="project-test"),
+    )
     loop = AgentLoop(
         AgentConfig(max_turns=4), modes, _FakeRouter(responses), db,
         tool_scheduler=scheduler, confirm_callback=lambda _request: {"approved": True},
         task_manager=TaskManager(), workspace_manager=manager,
         execution_service=execution, project_root=repository,
+        principal_id="legacy", project_id="project-test",
     )
     return db, manager, execution, loop
 
@@ -83,7 +89,7 @@ async def test_fake_agent_runtime_changes_only_worktree_then_approved_apply(tmp_
             "id": "write", "name": "write_file", "arguments": {"path": "README.txt", "content": "after\n"},
         }], stop_reason="tool_use")],
         [Message(role="assistant", content="", tool_calls=[{
-            "id": "terminal", "name": "terminal", "arguments": {"command": "cat README.txt", "cwd": "PLACEHOLDER"},
+            "id": "terminal", "name": "terminal_argv", "arguments": {"argv": ["cat", "README.txt"], "cwd": "PLACEHOLDER"},
         }], stop_reason="tool_use")],
         [Message(role="assistant", content="done", stop_reason="end_turn")],
     ]
@@ -107,7 +113,7 @@ async def test_fake_agent_runtime_changes_only_worktree_then_approved_apply(tmp_
     assert (workspace.worktree_path / "README.txt").read_text(encoding="utf-8") == "after\n"
     assert (repository / "README.txt").read_text(encoding="utf-8") == "before\n"
     assert subprocess.run(["git", "status", "--porcelain"], cwd=repository, capture_output=True, text=True, check=True).stdout == ""
-    assert any(event.metadata.get("name") == "terminal" and event.metadata.get("success") for event in events if event.event == "tool_result")
+    assert any(event.metadata.get("name") == "terminal_argv" and event.metadata.get("success") for event in events if event.event == "tool_result")
 
     pipeline = VerificationPipeline(execution_service=execution)
     plan = VerificationPlan((VerificationStep("check", "unit-test", (sys.executable, "-c", "assert open('README.txt').read() == 'after\\n'"), workspace.worktree_path),))

@@ -1,10 +1,8 @@
 """Tools for scheduled task management.
 
-The handlers delegate to a process-wide :class:`CronEngine` instance injected
-via :func:`set_cron_engine` (called once at startup, mirroring how
-``terminal_tools`` holds a module-level guard). Until an engine is injected the
-handlers report "not available" rather than pretending success — a tool that
-claims to create a task but creates nothing is worse than an honest failure.
+The handlers receive their lifecycle-scoped :class:`CronEngine` from the
+capability broker. No mutable module-global engine can be overwritten by a
+concurrent server/project runtime.
 
 M4 batch 3.1.10 (CRITICAL): all handlers now accept a ``principal_id``
 keyword parameter (injected by the ``ToolInvocationBroker`` via the
@@ -26,22 +24,9 @@ error and knows to retry against a fresh engine.
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
-logger = logging.getLogger(__name__)
-
-# Module-level holder for the live CronEngine. Injected at startup by the
-# server bootstrap (grpc_server / CLI). Same pattern as terminal_tools.
-_cron_engine: Any = None
-
-
-def set_cron_engine(engine: Any) -> None:
-    """Inject the process-wide CronEngine instance (called at startup)."""
-    global _cron_engine
-    _cron_engine = engine
-    logger.info("cron engine injected into cron_tools")
-
+from khaos.scheduler.models import ScheduleConfig
 
 def _require_principal(principal_id: str) -> dict[str, Any] | None:
     """M4 batch 3.1.10 (CRITICAL): return an ``ok=false`` error dict if
@@ -102,7 +87,15 @@ def _lifecycle_lock_response(lock_error: str, task_id: str | None = None) -> dic
     return resp
 
 
-async def cron_create(name: str, prompt: str, schedule: str, *, principal_id: str = "", **kwargs: Any) -> dict:
+async def cron_create(
+    name: str,
+    prompt: str,
+    schedule: str,
+    *,
+    principal_id: str = "",
+    cron_engine: Any = None,
+    **kwargs: Any,
+) -> dict:
     """Create a new scheduled task.
 
     Args:
@@ -124,14 +117,14 @@ async def cron_create(name: str, prompt: str, schedule: str, *, principal_id: st
         config.repeat = int(kwargs["repeat"])
     deliver = kwargs.get("deliver_to") or "local"
 
-    if _cron_engine is None:
+    if cron_engine is None:
         return {
             "status": "unavailable",
             "error": "cron engine not configured",
             "name": name,
         }
     try:
-        task = await _cron_engine.create(
+        task = await cron_engine.create(
             name, prompt, config, deliver_to=deliver,
             principal_id=principal_id,
         )
@@ -161,7 +154,9 @@ async def cron_create(name: str, prompt: str, schedule: str, *, principal_id: st
     }
 
 
-async def cron_list(*, principal_id: str = "", **kwargs: Any) -> dict:
+async def cron_list(
+    *, principal_id: str = "", cron_engine: Any = None, **kwargs: Any
+) -> dict:
     """List scheduled tasks for the caller's principal.
 
     M4 batch 3.1.10 (CRITICAL): only tasks belonging to
@@ -179,9 +174,9 @@ async def cron_list(*, principal_id: str = "", **kwargs: Any) -> dict:
     if principal_error is not None:
         return principal_error
 
-    if _cron_engine is None:
+    if cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured", "tasks": []}
-    tasks = await _cron_engine.list_tasks(principal_id=principal_id)
+    tasks = await cron_engine.list_tasks(principal_id=principal_id)
     return {
         "tasks": [
             {
@@ -209,7 +204,13 @@ async def cron_list(*, principal_id: str = "", **kwargs: Any) -> dict:
     }
 
 
-async def cron_remove(task_id: str, *, principal_id: str = "", **kwargs: Any) -> dict:
+async def cron_remove(
+    task_id: str,
+    *,
+    principal_id: str = "",
+    cron_engine: Any = None,
+    **kwargs: Any,
+) -> dict:
     """Remove a scheduled task.
 
     M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
@@ -220,9 +221,9 @@ async def cron_remove(task_id: str, *, principal_id: str = "", **kwargs: Any) ->
     if principal_error is not None:
         return principal_error
 
-    if _cron_engine is None:
+    if cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    result = await _cron_engine.remove(task_id, principal_id=principal_id)
+    result = await cron_engine.remove(task_id, principal_id=principal_id)
     # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
     # FIRST because the lock runs before the per-task lock and returns
     # before any task-level branching.
@@ -260,7 +261,13 @@ async def cron_remove(task_id: str, *, principal_id: str = "", **kwargs: Any) ->
     }
 
 
-async def cron_pause(task_id: str, *, principal_id: str = "", **kwargs: Any) -> dict:
+async def cron_pause(
+    task_id: str,
+    *,
+    principal_id: str = "",
+    cron_engine: Any = None,
+    **kwargs: Any,
+) -> dict:
     """Pause a scheduled task.
 
     M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
@@ -270,9 +277,9 @@ async def cron_pause(task_id: str, *, principal_id: str = "", **kwargs: Any) -> 
     if principal_error is not None:
         return principal_error
 
-    if _cron_engine is None:
+    if cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    result = await _cron_engine.pause(task_id, principal_id=principal_id)
+    result = await cron_engine.pause(task_id, principal_id=principal_id)
     # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
     # FIRST because the lock runs before the per-task lock.
     if result in ("engine_unavailable", "engine_degraded"):
@@ -307,7 +314,13 @@ async def cron_pause(task_id: str, *, principal_id: str = "", **kwargs: Any) -> 
     }
 
 
-async def cron_resume(task_id: str, *, principal_id: str = "", **kwargs: Any) -> dict:
+async def cron_resume(
+    task_id: str,
+    *,
+    principal_id: str = "",
+    cron_engine: Any = None,
+    **kwargs: Any,
+) -> dict:
     """Resume a paused scheduled task.
 
     M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
@@ -325,9 +338,9 @@ async def cron_resume(task_id: str, *, principal_id: str = "", **kwargs: Any) ->
     if principal_error is not None:
         return principal_error
 
-    if _cron_engine is None:
+    if cron_engine is None:
         return {"status": "unavailable", "error": "cron engine not configured"}
-    result = await _cron_engine.resume(task_id, principal_id=principal_id)
+    result = await cron_engine.resume(task_id, principal_id=principal_id)
     # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
     # FIRST because the lock runs before the per-task lock.
     if result in ("engine_unavailable", "engine_degraded"):
@@ -366,10 +379,8 @@ async def cron_resume(task_id: str, *, principal_id: str = "", **kwargs: Any) ->
     }
 
 
-def _parse_schedule(schedule: str) -> "ScheduleConfig":
+def _parse_schedule(schedule: str) -> ScheduleConfig:
     """Parse schedule expression into ScheduleConfig."""
-    from khaos.scheduler.models import ScheduleConfig
-
     config = ScheduleConfig()
 
     # ISO timestamp

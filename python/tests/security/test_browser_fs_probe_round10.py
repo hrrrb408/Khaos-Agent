@@ -31,8 +31,8 @@ def _require_fullstack() -> None:
         pytest.skip("set KHAOS_RUN_BROWSER_E2E=1")
     if os.environ.get("KHAOS_RUN_KERNEL_BROWSER_E2E") != "1":
         pytest.skip("set KHAOS_RUN_KERNEL_BROWSER_E2E=1")
-    if os.geteuid() != 0:
-        pytest.skip("privileged kernel test requires root")
+    if os.geteuid() == 0:
+        pytest.fail("production Python browser runtime must be non-root")
 
 
 @pytest.mark.asyncio
@@ -47,7 +47,9 @@ async def test_fs_probe_proves_home_is_masked() -> None:
     try:
         manager = BrowserManager()
         try:
-            launch = await manager.launch()
+            launch = await manager.launch(
+                project_id="round10-home", runtime_id="round10-home"
+            )
             assert launch["ok"], launch
             sandbox = manager._browser_sandbox
             assert sandbox is not None and sandbox.is_active
@@ -92,7 +94,9 @@ async def test_fs_probe_proves_sensitive_paths_are_masked() -> None:
 
     manager = BrowserManager()
     try:
-        launch = await manager.launch()
+        launch = await manager.launch(
+            project_id="round10-paths", runtime_id="round10-paths"
+        )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
         assert sandbox is not None and sandbox.is_active
@@ -130,7 +134,9 @@ async def test_fs_probe_detects_unmasked_path() -> None:
 
     manager = BrowserManager()
     try:
-        launch = await manager.launch()
+        launch = await manager.launch(
+            project_id="round10-positive", runtime_id="round10-positive"
+        )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
         assert sandbox is not None and sandbox.is_active

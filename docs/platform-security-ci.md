@@ -1,7 +1,7 @@
 # 跨平台安全 CI 与真实 Sandbox 门禁
 
-状态：已实现并由远端 runner 验证。日期：2026-07-17。验证提交：
-`7f54ef75139ccbf309555e842a6a0562e2514648`。
+状态：Closure gate 已实现；本 PR 最新 head 的远端 runner 证据待完成。
+旧提交的通过结果不得替代当前 head。
 
 ## 门禁分层
 
@@ -12,6 +12,7 @@
 | `Platform Sandbox Security E2E / macos-sandbox-security` | macOS hosted runner | sandbox-exec workspace-write、`.git`/case alias write denial、外部写拒绝、禁网、secret root、pasteboard/Keychain IPC、whole-HOME 与 TaskWorkspace 相对 byte budget 拒绝 | Linux namespace |
 | `Platform Sandbox Security E2E / windows-fail-closed-security` | Windows hosted runner | 未实现 native backend 时明确 Unsupported，执行和 dirfd mutation 都拒绝 | Windows 可执行 sandbox；当前产品不宣称支持 |
 | `Docker Security E2E / docker-isolation` | Ubuntu + Docker | digest-pinned image、network none、read-only root、非 root、`.git` readonly mount、deleted-open-file PID namespace watchdog、资源限制、timeout/cancel/shutdown cleanup、Trusted Verification secret/output 边界 | 非容器宿主策略 |
+| `Security Closure Gate` | reusable workflow 聚合 | 上述真实平台矩阵、Python security、Go race、Rust test/clippy、供应链、schema fuzz、authorization drift、process lifecycle、event-loop starvation 全部成功，并生成 commit-bound Security Evidence Artifact | 绝对安全；未支持平台的功能可用性 |
 
 Windows 当前的安全承诺是 **fail closed**，不是功能可用。没有 AppContainer/Job Object 等经
 真实 runner 验证的 native backend 前，Coding command execution 和依赖 dirfd 的 mutation
@@ -27,11 +28,11 @@ Windows 当前的安全承诺是 **fail closed**，不是功能可用。没有 A
 
 ## 仓库设置
 
-在 GitHub branch protection 中把上述五类 check 设为 required。首次推送后，应保存每个
-job 的 run URL、runner image/version、artifact digest 和结论到审计记录。runner image 会
+在 GitHub branch protection 中把单一 `Security Closure Gate` job 设为 required；细分 job
+仍保留用于定位失败，但不得代替聚合 gate。首次推送后，应保存每个 job 的 run URL、runner image/version、artifact digest 和结论到审计记录。runner image 会
 随 GitHub 更新，因此 Actions 结果是“该次运行”的证据，不是永久的平台认证。
 
-## 远端验证证据
+## 历史远端验证证据（仅作基线）
 
 | Workflow run | 结论 | 覆盖 |
 | --- | --- | --- |
@@ -39,8 +40,8 @@ job 的 run URL、runner image/version、artifact digest 和结论到审计记�
 | [Platform Sandbox Security E2E #29543447066](https://github.com/hrrrb408/Khaos-Agent/actions/runs/29543447066) | PASS | merge SHA 上 Linux bwrap、macOS sandbox-exec、Windows fail-closed |
 | [Docker Security E2E #29543447054](https://github.com/hrrrb408/Khaos-Agent/actions/runs/29543447054) | PASS | merge SHA 上 Docker 与 Trusted Verification 真实隔离 |
 
-以上结论绑定验证提交和对应 run；后续代码、Action SHA、runner image 或平台策略变化后必须
-重新运行，不得沿用旧证据。
+以上结论只绑定历史提交；本 Closure 必须等待 PR 最新 head 的 `Security Closure Gate`
+以及 `security-evidence-<sha>` artifact，不得沿用旧证据。
 
 ## 本地与远端边界
 

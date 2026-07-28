@@ -20,9 +20,7 @@ kernel stack).  They are skipped everywhere else.
 
 from __future__ import annotations
 
-import asyncio
 import os
-import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -67,47 +65,54 @@ def _require_fullstack() -> None:
         pytest.skip("set KHAOS_RUN_BROWSER_E2E=1")
     if os.environ.get("KHAOS_RUN_KERNEL_BROWSER_E2E") != "1":
         pytest.skip("set KHAOS_RUN_KERNEL_BROWSER_E2E=1")
-    if os.geteuid() != 0:
-        pytest.skip("privileged kernel test requires root")
+    if os.geteuid() == 0:
+        pytest.fail("production Python browser runtime must be non-root")
 
 
-def _read_in_netns(netns: str, path: str) -> tuple[int, bytes]:
-    """Try to read ``path`` from inside the browser netns via a helper.
+def _chromium_descendant_environments(parent_pid: int) -> bytes:
+    """Read environments only from Chromium descendants.
 
-    Returns (returncode, stdout).  returncode 0 + non-empty output means
-    the path was readable (a secrecy VIOLATION).
+    The Playwright Node driver is a trusted control-plane child and retains
+    the Python runtime environment by design.  It is outside Chromium's PID
+    and mount namespaces and cannot be read by the sandboxed browser.  The
+    secrecy property under test therefore selects actual Chrome/Chromium
+    executables instead of conflating every control-plane descendant with
+    the browser attack surface.
     """
-    script = (
-        "import sys\n"
-        "try:\n"
-        "    with open(sys.argv[1], 'rb') as f:\n"
-        "        sys.stdout.buffer.write(f.read())\n"
-        "    raise SystemExit(0)\n"
-        "except OSError:\n"
-        "    raise SystemExit(1)\n"
-    )
-    result = subprocess.run(
-        ["ip", "netns", "exec", netns, "python3", "-c", script, path],
-        capture_output=True,
-        timeout=5,
-        check=False,
-    )
-    return result.returncode, result.stdout
-
-
-def _read_chromium_environ(netns: str, cgroup_procs: Path) -> bytes:
-    """Read /proc/<pid>/environ for every Chromium PID in the cgroup."""
-    pids = [
-        int(value)
-        for value in cgroup_procs.read_text().split()
-    ]
-    assert pids, "Chromium process tree did not join browser cgroup"
-    combined = b""
-    for pid in pids:
-        rc, out = _read_in_netns(netns, f"/proc/{pid}/environ")
-        if rc == 0:
-            combined += out
-    return combined
+    descendants = {parent_pid}
+    combined = bytearray()
+    changed = True
+    while changed:
+        changed = False
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) in descendants:
+                continue
+            try:
+                stat_value = (entry / "stat").read_text(encoding="ascii")
+                parent = int(stat_value[stat_value.rfind(")") + 2 :].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            if parent in descendants:
+                descendants.add(int(entry.name))
+                changed = True
+    chromium_processes = 0
+    for pid in descendants - {parent_pid}:
+        try:
+            # /proc/<pid>/exe may point at the Chromium path inside its
+            # private mount namespace, which is intentionally unresolvable
+            # from the host.  ``comm`` is kernel-provided process identity
+            # and remains readable without crossing that mount boundary.
+            command_name = Path(f"/proc/{pid}/comm").read_text(
+                encoding="ascii"
+            ).strip().lower()
+            if "chrome" not in command_name and "chromium" not in command_name:
+                continue
+            combined.extend(Path(f"/proc/{pid}/environ").read_bytes())
+            chromium_processes += 1
+        except OSError:
+            continue
+    assert chromium_processes, "Chromium descendant process environments unavailable"
+    return bytes(combined)
 
 
 @pytest.mark.asyncio
@@ -127,14 +132,14 @@ async def test_chromium_environ_excludes_parent_secrets() -> None:
 
     manager = BrowserManager()
     try:
-        launch = await manager.launch()
+        launch = await manager.launch(
+            project_id="round9-env", runtime_id="round9-env"
+        )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
         assert sandbox is not None and sandbox.is_active
 
-        environ = _read_chromium_environ(
-            sandbox._netns_name, sandbox._cgroup_path / "cgroup.procs"
-        )
+        environ = _chromium_descendant_environments(os.getpid())
         # environ entries are NUL-separated; the sentinel value must not
         # appear anywhere in the concatenated buffer.
         sentinel_marker = sentinel.encode("ascii")
@@ -181,7 +186,9 @@ async def test_route_guard_blocks_file_scheme_for_home() -> None:
     try:
         manager = BrowserManager()
         try:
-            launch = await manager.launch()
+            launch = await manager.launch(
+                project_id="round9-home", runtime_id="round9-home"
+            )
             assert launch["ok"], launch
             sandbox = manager._browser_sandbox
             assert sandbox is not None and sandbox.is_active
@@ -256,7 +263,9 @@ async def test_route_guard_blocks_file_scheme_for_sensitive_paths(tmp_path) -> N
 
     manager = BrowserManager()
     try:
-        launch = await manager.launch()
+        launch = await manager.launch(
+            project_id="round9-paths", runtime_id="round9-paths"
+        )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
         assert sandbox is not None and sandbox.is_active

@@ -32,9 +32,9 @@ class RuntimeCloseError(KhaosError):
     components (OfficeMutationAuthority, ExecutionService, MemoryManager)
     fail to reach a terminal state after 3 attempts.  The caller
     (AgentService / SubAgentRunner) must observe the failure and
-    escalate — call ``register_orphan_runtime(runtime)`` so the
-    orphan-cleanup registry retains the runtime's component references
-    for a later retry via ``cleanup_orphan_runtimes()``.  Without this,
+    escalate through the runtime's server-scoped
+    ``RuntimeCleanupAuthority`` so it retains the component references
+    for a later bounded retry. Without this,
     the runtime's file descriptors / Office mutation fences /
     BrowserContexts would be silently leaked because the caller discarded
     the reference after the exception.

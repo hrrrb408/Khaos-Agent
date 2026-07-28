@@ -28,9 +28,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
-
-import pytest
 
 from khaos.audit import AuditLogger
 from khaos.db import Database
@@ -266,7 +263,6 @@ async def test_acceptance_5_cron_list_exposes_error(tmp_path):
     engine = _make_engine(
         db, project_id="proj-x", policy_digest="sha256:policy-b",
     )
-    cron_tools.set_cron_engine(engine)
     try:
         await engine.start()
         # Create a task under policy A (different from engine's policy B).
@@ -285,7 +281,7 @@ async def test_acceptance_5_cron_list_exposes_error(tmp_path):
             if drift_reason is not None:
                 await engine._quarantine_drifted_task(task, drift_reason)
         # Call cron_list — the error field must be present.
-        result = await cron_tools.cron_list(principal_id="alice")
+        result = await cron_tools.cron_list(principal_id="alice", cron_engine=engine)
         assert "tasks" in result
         assert len(result["tasks"]) == 1
         task_dict = result["tasks"][0]
@@ -296,7 +292,6 @@ async def test_acceptance_5_cron_list_exposes_error(tmp_path):
         )
     finally:
         await _force_cleanup_engine(engine)
-        cron_tools.set_cron_engine(None)
         await db.close()
 
 
@@ -308,14 +303,13 @@ async def test_acceptance_6_cron_list_exposes_truncated_digest(tmp_path):
     engine = _make_engine(
         db, project_id="proj-1234567890", policy_digest="sha256:abcdefghijklmnop",
     )
-    cron_tools.set_cron_engine(engine)
     try:
         await engine.start()
         task = await engine.create(
             "truncation test", "hello", ScheduleConfig(cron="0 9"),
             principal_id="alice",
         )
-        result = await cron_tools.cron_list(principal_id="alice")
+        result = await cron_tools.cron_list(principal_id="alice", cron_engine=engine)
         assert len(result["tasks"]) == 1
         task_dict = result["tasks"][0]
         assert task_dict["policy_digest_prefix"] == "sha256:a", (
@@ -333,7 +327,6 @@ async def test_acceptance_6_cron_list_exposes_truncated_digest(tmp_path):
         )
     finally:
         await _force_cleanup_engine(engine)
-        cron_tools.set_cron_engine(None)
         await db.close()
 
 
@@ -410,7 +403,6 @@ async def test_acceptance_9_cron_remove_tool_clears_quarantined(tmp_path):
     engine = _make_engine(
         db, project_id="proj-x", policy_digest="sha256:policy-b",
     )
-    cron_tools.set_cron_engine(engine)
     try:
         await engine.start()
         task_id = await db.insert_scheduled_task(
@@ -426,13 +418,12 @@ async def test_acceptance_9_cron_remove_tool_clears_quarantined(tmp_path):
             if drift_reason is not None:
                 await engine._quarantine_drifted_task(task, drift_reason)
         # Call cron_remove — should return "removed".
-        result = await cron_tools.cron_remove(task_id, principal_id="alice")
+        result = await cron_tools.cron_remove(task_id, principal_id="alice", cron_engine=engine)
         assert result["status"] == "removed", (
             f"cron_remove must return 'removed' for quarantined task, got {result}"
         )
     finally:
         await _force_cleanup_engine(engine)
-        cron_tools.set_cron_engine(None)
         await db.close()
 
 
@@ -465,7 +456,6 @@ async def test_acceptance_10_end_to_end_drift_quarantine_audit_list_remove(tmp_p
         db, project_id="proj-x", policy_digest="sha256:policy-b-v2",
         audit_logger=audit_logger,
     )
-    cron_tools.set_cron_engine(engine_b)
     try:
         await engine_b.start()
         # Step 1: verify the task was quarantined.
@@ -481,7 +471,7 @@ async def test_acceptance_10_end_to_end_drift_quarantine_audit_list_remove(tmp_p
         assert entries[0].task_id == task_id
 
         # Step 3: cron_list shows the error.
-        listing = await cron_tools.cron_list(principal_id="alice")
+        listing = await cron_tools.cron_list(principal_id="alice", cron_engine=engine_b)
         assert len(listing["tasks"]) == 1
         listed = listing["tasks"][0]
         assert listed["status"] == "failed"
@@ -489,15 +479,14 @@ async def test_acceptance_10_end_to_end_drift_quarantine_audit_list_remove(tmp_p
         assert "quarantined:" in listed["error"]
 
         # Step 4: cron_remove clears it.
-        result = await cron_tools.cron_remove(task_id, principal_id="alice")
+        result = await cron_tools.cron_remove(task_id, principal_id="alice", cron_engine=engine_b)
         assert result["status"] == "removed"
 
         # Step 5: cron_list now shows 0 tasks.
-        listing = await cron_tools.cron_list(principal_id="alice")
+        listing = await cron_tools.cron_list(principal_id="alice", cron_engine=engine_b)
         assert len(listing["tasks"]) == 0, (
             "task must be cleared from cron_list after removal"
         )
     finally:
         await _force_cleanup_engine(engine_b)
-        cron_tools.set_cron_engine(None)
         await db.close()

@@ -779,9 +779,10 @@ def test_round5_per_sandbox_token_in_resource_names():
     s2 = BrowserNetworkSandbox()
     # Two instances must have different tokens.
     assert s1._token != s2._token
-    # After setup names would include the token — verify the token is
-    # 16 hex chars (8 bytes).
-    assert len(s1._token) == 16
+    # The abstract helper token carries 256 bits of entropy. Production
+    # kernel resource identities are derived inside the helper and are not
+    # exposed through this value.
+    assert len(s1._token) == 64
     assert all(c in "0123456789abcdef" for c in s1._token)
 
 

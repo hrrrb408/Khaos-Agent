@@ -51,8 +51,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any
-
 import pytest
 
 from khaos.audit import AuditLogger
@@ -843,13 +841,12 @@ async def test_acceptance_23_cron_create_converts_lifecycle_lock(tmp_path):
     ``{"status": "error", ...}`` response."""
     db = await _make_db(tmp_path)
     engine = _make_engine(db, policy_digest="sha256:p")
-    cron_tools.set_cron_engine(engine)
     try:
         await engine.start()
         # Test engine_unavailable.
         engine._lifecycle_state = CronEngineState.QUARANTINED
         result = await cron_tools.cron_create(
-            "test", "hello", "0 9", principal_id="alice",
+            "test", "hello", "0 9", principal_id="alice", cron_engine=engine,
         )
         assert result["status"] == "error"
         assert result["error"] == "engine_unavailable"
@@ -859,14 +856,13 @@ async def test_acceptance_23_cron_create_converts_lifecycle_lock(tmp_path):
         engine._lifecycle_state = CronEngineState.RUNNING
         engine._degraded = True
         result = await cron_tools.cron_create(
-            "test", "hello", "0 9", principal_id="alice",
+            "test", "hello", "0 9", principal_id="alice", cron_engine=engine,
         )
         assert result["status"] == "error"
         assert result["error"] == "engine_degraded"
         assert result["retry_after"] == "engine_restart"
     finally:
         await _force_cleanup_engine(engine)
-        cron_tools.set_cron_engine(None)
         await db.close()
 
 
@@ -875,7 +871,6 @@ async def test_acceptance_24_cron_pause_resume_remove_convert_lifecycle_lock(tmp
     ``"engine_unavailable"`` to a structured response."""
     db = await _make_db(tmp_path)
     engine = _make_engine(db, policy_digest="sha256:p")
-    cron_tools.set_cron_engine(engine)
     try:
         await engine.start()
         task = await engine.create(
@@ -884,22 +879,21 @@ async def test_acceptance_24_cron_pause_resume_remove_convert_lifecycle_lock(tmp
         )
         engine._lifecycle_state = CronEngineState.QUARANTINED
         # pause
-        result = await cron_tools.cron_pause(task.id, principal_id="alice")
+        result = await cron_tools.cron_pause(task.id, principal_id="alice", cron_engine=engine)
         assert result["status"] == "error"
         assert result["error"] == "engine_unavailable"
         assert result["task_id"] == task.id
         assert result["retry_after"] == "engine_restart"
         # resume
-        result = await cron_tools.cron_resume(task.id, principal_id="alice")
+        result = await cron_tools.cron_resume(task.id, principal_id="alice", cron_engine=engine)
         assert result["status"] == "error"
         assert result["error"] == "engine_unavailable"
         # remove
-        result = await cron_tools.cron_remove(task.id, principal_id="alice")
+        result = await cron_tools.cron_remove(task.id, principal_id="alice", cron_engine=engine)
         assert result["status"] == "error"
         assert result["error"] == "engine_unavailable"
     finally:
         await _force_cleanup_engine(engine)
-        cron_tools.set_cron_engine(None)
         await db.close()
 
 

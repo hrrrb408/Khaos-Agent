@@ -55,12 +55,14 @@ async def test_aclose_invokes_execution_service_shutdown():
     """B1: ``execution_service.shutdown`` must actually be reached."""
     execution = MagicMock()
     execution.shutdown = AsyncMock()
+    scheduler = MagicMock()
+    scheduler.aclose = AsyncMock()
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
         task_manager=None,
         skill_generator=None,
-        tool_scheduler=MagicMock(),
+        tool_scheduler=scheduler,
         memory_manager=MagicMock(aclose=AsyncMock()),
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
@@ -73,24 +75,22 @@ async def test_aclose_invokes_execution_service_shutdown():
 async def test_browser_context_close_failure_marks_runtime_failed(monkeypatch):
     """H4: Browser ownership failure participates in quarantine retries."""
     from khaos.exceptions import RuntimeCloseError
-    from khaos.tools import browser_tools
-
     manager = MagicMock()
-    manager.close_runtime = AsyncMock(side_effect=RuntimeError("browser live"))
-    monkeypatch.setattr(browser_tools, "_manager", manager)
+    manager.close = AsyncMock(side_effect=RuntimeError("browser live"))
     result = RuntimeResult(
         loop=MagicMock(), mode_manager=MagicMock(), task_manager=None,
         skill_generator=None, tool_scheduler=MagicMock(),
         memory_manager=MagicMock(aclose=AsyncMock()),
         skill_manager=MagicMock(), new_verify_fix_loop=None,
         runtime_id="runtime-browser",
+        browser_manager=manager,
     )
 
     with pytest.raises(RuntimeCloseError):
         await result.aclose()
     assert result._close_failed is True
     assert result._closed is False
-    assert manager.close_runtime.await_count == 3
+    assert manager.close.await_count == 3
 
 
 async def test_aclose_is_idempotent():
@@ -105,12 +105,14 @@ async def test_aclose_is_idempotent():
     office.shutdown = AsyncMock()
     execution = MagicMock()
     execution.shutdown = AsyncMock()
+    scheduler = MagicMock()
+    scheduler.aclose = AsyncMock()
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
         task_manager=None,
         skill_generator=None,
-        tool_scheduler=MagicMock(),
+        tool_scheduler=scheduler,
         memory_manager=memory,
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
@@ -145,12 +147,14 @@ async def test_aclose_shuts_down_office_before_memory_and_execution():
     memory.aclose = AsyncMock(side_effect=lambda: order.append("memory"))
     execution = MagicMock()
     execution.shutdown = AsyncMock(side_effect=lambda: order.append("execution"))
+    scheduler = MagicMock()
+    scheduler.aclose = AsyncMock()
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
         task_manager=None,
         skill_generator=None,
-        tool_scheduler=MagicMock(),
+        tool_scheduler=scheduler,
         memory_manager=memory,
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
@@ -184,12 +188,14 @@ async def test_aclose_tolerates_component_shutdown_failures():
     memory.aclose = AsyncMock(side_effect=RuntimeError("memory boom"))
     execution = MagicMock()
     execution.shutdown = AsyncMock(side_effect=RuntimeError("exec boom"))
+    scheduler = MagicMock()
+    scheduler.aclose = AsyncMock()
     result = RuntimeResult(
         loop=MagicMock(),
         mode_manager=MagicMock(),
         task_manager=None,
         skill_generator=None,
-        tool_scheduler=MagicMock(),
+        tool_scheduler=scheduler,
         memory_manager=memory,
         skill_manager=MagicMock(),
         new_verify_fix_loop=None,
@@ -256,6 +262,8 @@ async def test_closed_field_is_not_bound_by_positional_construction():
         "skill_manager",
         "new_verify_fix_loop",
         "execution_service",
+        "browser_manager",
+        "cleanup_authority",
         "office_authority",
         "owns_office_authority",
         "principal_id",
@@ -345,17 +353,13 @@ async def test_aclose_does_not_close_borrowed_audit_logger():
 
 async def test_orphan_cleanup_registry_retries_failed_runtime():
     """H3: a runtime that fails ``aclose()`` can be registered as an
-    orphan and ``cleanup_orphan_runtimes()`` will retry it.
+    orphan and its ``RuntimeCleanupAuthority`` will retry it.
 
     The retry resets ``_close_failed`` so the orphan gets a fresh
     3-attempt auto-retry cycle (``aclose`` returns immediately when
     ``_close_failed`` is True to prevent concurrent callers from
     re-running the retries — see H4).
     """
-    from khaos.runtime.factory import (
-        cleanup_orphan_runtimes,
-        register_orphan_runtime,
-    )
     from khaos.exceptions import RuntimeCloseError
 
     office = MagicMock()
@@ -375,13 +379,13 @@ async def test_orphan_cleanup_registry_retries_failed_runtime():
         await result.aclose()
     # Register as orphan — the registry retains the runtime's component
     # references so they are not silently leaked.
-    register_orphan_runtime(result)
+    result.cleanup_authority.register(result)
     # Cleanup retries — still fails, so the orphan remains.
-    remaining = await cleanup_orphan_runtimes()
+    remaining = await result.cleanup_authority.cleanup()
     assert remaining >= 1
     # Now fix the office shutdown and retry — the orphan is removed.
     office.shutdown = AsyncMock()
-    remaining = await cleanup_orphan_runtimes()
+    remaining = await result.cleanup_authority.cleanup()
     assert remaining == 0
     assert result.quarantined is False
 
@@ -389,10 +393,7 @@ async def test_orphan_cleanup_registry_retries_failed_runtime():
 async def test_production_close_registers_failed_runtime_before_raising():
     """H4: the production close helper retains a persistently failed owner."""
     from khaos.exceptions import RuntimeCloseError
-    from khaos.runtime.factory import (
-        _orphan_runtimes,
-        close_runtime_or_register,
-    )
+    from khaos.runtime.factory import close_runtime_or_register
 
     office = MagicMock()
     office.shutdown = AsyncMock(side_effect=RuntimeError("persistent failure"))
@@ -410,22 +411,17 @@ async def test_production_close_registers_failed_runtime_before_raising():
     try:
         with pytest.raises(RuntimeCloseError):
             await close_runtime_or_register(result)
-        assert any(item is result for item in _orphan_runtimes)
+        assert result.cleanup_authority.contains(result)
         assert result.quarantined is True
     finally:
         office.shutdown = AsyncMock()
-        from khaos.runtime.factory import cleanup_orphan_runtimes
-        await cleanup_orphan_runtimes()
+        await result.cleanup_authority.cleanup()
 
 
 async def test_production_close_delays_cancellation_until_terminal_or_quarantine():
     """H2: owner cancellation cannot escape before cleanup is retained."""
     import asyncio
-    from khaos.runtime.factory import (
-        _orphan_runtimes,
-        cleanup_orphan_runtimes,
-        close_runtime_or_register,
-    )
+    from khaos.runtime.factory import close_runtime_or_register
 
     started = asyncio.Event()
     release = asyncio.Event()
@@ -453,13 +449,34 @@ async def test_production_close_delays_cancellation_until_terminal_or_quarantine
         await owner
     assert result._closed or result.quarantined
     assert result.quarantined
-    assert any(runtime is result for runtime in _orphan_runtimes)
+    assert result.cleanup_authority.contains(result)
 
     office.shutdown = AsyncMock()
-    await cleanup_orphan_runtimes()
+    await result.cleanup_authority.cleanup()
 
 
 # ───────────────────────── H4: concurrent aclose lock ──────────────────────
+
+
+def test_runtime_cleanup_authorities_are_server_isolated():
+    from khaos.runtime import RuntimeCleanupAuthority
+
+    first = RuntimeCleanupAuthority()
+    second = RuntimeCleanupAuthority()
+    runtime = RuntimeResult(
+        loop=MagicMock(), mode_manager=MagicMock(), task_manager=None,
+        skill_generator=None, tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(), new_verify_fix_loop=None,
+        cleanup_authority=first,
+    )
+
+    first.register(runtime)
+
+    assert first.contains(runtime)
+    assert first.count == 1
+    assert not second.contains(runtime)
+    assert second.count == 0
 
 
 async def test_concurrent_aclose_callers_do_not_create_multiple_close_tasks():

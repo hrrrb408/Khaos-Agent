@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -36,6 +37,66 @@ from khaos.tools.scheduler import ToolScheduler
 logger = logging.getLogger(__name__)
 
 
+class RuntimeCleanupAuthority:
+    """Server-scoped owner of runtimes that failed terminal cleanup."""
+
+    def __init__(self) -> None:
+        self._runtimes: list[RuntimeResult] = []
+
+    @property
+    def count(self) -> int:
+        """Return the number of quarantined runtimes retained by this owner."""
+        return len(self._runtimes)
+
+    def contains(self, runtime: RuntimeResult) -> bool:
+        """Return whether this exact runtime is retained."""
+        return any(existing is runtime for existing in self._runtimes)
+
+    def register(self, runtime: RuntimeResult) -> None:
+        """Retain one failed runtime for bounded retry, idempotently."""
+        runtime.quarantined = True
+        if not self.contains(runtime):
+            self._runtimes.append(runtime)
+
+    async def cleanup(self) -> int:
+        """Retry every retained runtime once and return the remaining count."""
+        remaining: list[RuntimeResult] = []
+        for runtime in self._runtimes:
+            runtime._close_failed = False
+            runtime._close_task = None
+            try:
+                await runtime.aclose()
+            except RuntimeCloseError:
+                remaining.append(runtime)
+                continue
+            if not runtime._closed:
+                remaining.append(runtime)
+            else:
+                runtime.quarantined = False
+        self._runtimes = remaining
+        return len(self._runtimes)
+
+    async def drain(
+        self, *, timeout_seconds: float = 5.0,
+        retry_interval: float = 0.05,
+    ) -> int:
+        """Retry retained runtimes until empty or the bounded deadline."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, timeout_seconds)
+        remaining = len(self._runtimes)
+        while remaining and loop.time() <= deadline:
+            remaining = await self.cleanup()
+            if remaining and loop.time() < deadline:
+                await asyncio.sleep(max(0.0, retry_interval))
+        if remaining:
+            logger.error(
+                "%d quarantined runtime(s) remain after %.2fs shutdown deadline",
+                remaining,
+                timeout_seconds,
+            )
+        return remaining
+
+
 @dataclass
 class RuntimeConfig:
     project_root: Path = field(default_factory=Path.cwd)
@@ -56,6 +117,8 @@ class RuntimeConfig:
     tool_scheduler: ToolScheduler | None = None
     workspace_manager: WorkspaceManager | None = None
     execution_service: ExecutionService | None = None
+    browser_manager: Any = None
+    cleanup_authority: RuntimeCleanupAuthority | None = None
     approval_broker: Any = None
     # B1: an externally-owned OfficeMutationAuthority (e.g. the server-level
     # authority shared across every chat / webhook / cron turn) can be
@@ -101,6 +164,8 @@ class RuntimeConfig:
     # ``forbidden``.
     channel_registry: Any = None
     channel_admins: frozenset[str] = field(default_factory=frozenset)
+    cron_engine: Any = None
+    subagent_spawner: Any = None
     # M4 batch 3.1.16A-5-1b (CRITICAL): project identity closure.  When
     # set (non-empty), ``build_runtime`` uses this value as the project
     # identity for every component (PermissionEngine, MemoryStore,
@@ -123,6 +188,10 @@ class RuntimeResult:
     skill_manager: SkillManager
     new_verify_fix_loop: Callable[[], VerifyFixLoop] | None
     execution_service: ExecutionService | None = None
+    browser_manager: Any = None
+    cleanup_authority: RuntimeCleanupAuthority = field(
+        default_factory=RuntimeCleanupAuthority
+    )
     # H3: the OfficeMutationAuthority is owned by the runtime so aclose()
     # can fence every in-flight Office mutation before the process exits.
     office_authority: OfficeMutationAuthority | None = None
@@ -211,14 +280,14 @@ class RuntimeResult:
         concurrently).  Other callers wait on the lock, then see
         ``_closed=True`` (if the first caller succeeded) or
         ``_close_failed=True`` (if it exhausted retries) and return
-        without re-running the retries.  The orphan-cleanup registry
-        (``cleanup_orphan_runtimes``) resets ``_close_failed`` before
+        without re-running the retries. The runtime cleanup authority
+        resets ``_close_failed`` before
         retrying so a persistently-failing runtime gets a fresh attempt
         cycle.
 
         H1: releases the principal's per-session ``BrowserContext`` so
         cookies / DOM / page state cannot leak into a subsequent run by
-        a different principal sharing the same process-wide BrowserManager.
+        a different principal after this runtime-owned BrowserManager closes.
         """
         import asyncio as _asyncio
 
@@ -236,8 +305,8 @@ class RuntimeResult:
                 return
             # H4: a previous caller already exhausted the auto-retries.
             # Don't re-run them — the caller is expected to register the
-            # runtime with the orphan-cleanup registry for further retries
-            # (``cleanup_orphan_runtimes`` resets ``_close_failed`` before
+            # runtime with its cleanup authority for further retries
+            # (the authority resets ``_close_failed`` before
             # retrying).  Returning here (rather than raising) means a
             # concurrent caller that was waiting on the lock observes the
             # first caller's ``RuntimeCloseError`` via ``asyncio.gather``
@@ -305,8 +374,8 @@ class RuntimeResult:
                     )
                     continue
                 # H4: all retries exhausted — raise so the caller observes
-                # the failure and can escalate (register with the
-                # orphan-cleanup registry via ``register_orphan_runtime``).
+                # the failure and can escalate through the runtime's
+                # server-scoped cleanup authority.
                 if self._close_failed:
                     raise RuntimeCloseError(
                         f"runtime cleanup failed after {max_attempts} attempts; "
@@ -370,34 +439,29 @@ class RuntimeResult:
                         )
             if self.execution_service is not None:
                 try:
+                    await self.tool_scheduler.aclose()
+                except Exception:
+                    failed = True
+                    logger.debug(
+                        "tool scheduler process authority close failed", exc_info=True
+                    )
+                try:
                     await self.execution_service.shutdown()
                 except Exception:
                     failed = True
                     logger.debug(
                         "execution service close failed", exc_info=True
                     )
-            # H1: release EVERY BrowserContext this runtime acquired so its
-            # cookies / DOM / page state cannot leak into a subsequent run by
-            # a different runtime sharing the same process-wide
-            # BrowserManager.  A close failure is safety-critical: the
-            # manager retains the live Context so this runtime must enter the
-            # same retry/quarantine path as other owned resources.
-            #
-            # H1 (lifecycle): we use ``close_runtime(runtime_id)`` (not
-            # ``close_context(principal_id, session_id, runtime_id)``)
-            # because a runtime may have acquired contexts under multiple
-            # keys (e.g. via different ``session_id``s during its
-            # lifetime).  ``close_context`` only releases ONE key and
-            # would leak the rest; ``close_runtime`` iterates every entry
-            # whose ``_runtime_owners`` set lists this ``runtime_id`` and
-            # decrements the refcount for each, so ALL contexts the
-            # runtime acquired are released regardless of the key.  A
-            # concurrent runtime sharing a context is NOT affected
-            # (refcount only closes when the last owner releases).
-            if self.runtime_id:
+            # H1: the BrowserManager is runtime-owned, so closing the manager
+            # releases every Context it acquired without consulting mutable
+            # module-global state. A close failure is safety-critical: live
+            # page state remains reachable, so the runtime enters the same
+            # retry/quarantine path as other owned resources.
+            if self.browser_manager is not None:
                 try:
-                    from khaos.tools.browser_tools import _manager as _browser_manager
-                    await _browser_manager.close_runtime(self.runtime_id)
+                    browser_result = await self.browser_manager.close()
+                    if not browser_result.get("ok", False):
+                        failed = True
                 except Exception:
                     failed = True
                     logger.debug(
@@ -652,6 +716,12 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
             runtime_id=cfg.runtime_id,
         )
     scheduler.set_office_authority(office_authority)
+    if cfg.browser_manager is None:
+        from khaos.tools.browser_tools import BrowserManager
+
+        browser_manager = BrowserManager()
+    else:
+        browser_manager = cfg.browser_manager
     # B1: register the authority on the scheduler only (instance attribute).
     # The previous module-global ``file_tools._office_authority`` was removed
     # — direct callers must pass ``office_authority`` explicitly or fall back
@@ -670,6 +740,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     compressor = ContextCompressor(router, memory_manager=memory_manager)
     verify_factory = VerifyFixLoop
     skill_generator = SkillGenerator()
+    cleanup_authority = cfg.cleanup_authority or RuntimeCleanupAuthority()
     loop = AgentLoop(
         cfg.agent_config or AgentConfig(), mode_manager, router, cfg.db,
         tool_scheduler=scheduler, confirm_callback=cfg.confirm_callback,
@@ -706,6 +777,9 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # ``channel.read`` / ``channel.manage`` capability injection.
         channel_registry=cfg.channel_registry,
         channel_admins=cfg.channel_admins,
+        cron_engine=cfg.cron_engine,
+        browser_manager=browser_manager,
+        subagent_spawner=cfg.subagent_spawner,
         # M4 batch 3.1.16A-5-1b (CRITICAL): carry the RPC-verified
         # project identity into the AgentLoop so every message / turn
         # write is stamped with it.  ``self._bound_project_id`` (set
@@ -731,86 +805,14 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # per-session BrowserContext keyed by (principal, session, runtime).
         session_id=cfg.session_id,
         runtime_id=cfg.runtime_id,
+        browser_manager=browser_manager,
+        cleanup_authority=cleanup_authority,
         # H2: carry the AuditLogger so ``aclose`` can close its fd —
         # without this, configuring a file audit path would leak the fd
         # for the process's lifetime.
         audit_logger=audit_logger,
         owns_audit_logger=owns_audit_logger,
     )
-
-
-# ──────────────────────── H3: orphan-cleanup registry ────────────────────────
-#
-# H3: when a runtime's ``aclose()`` exhausts its 3 auto-retries and raises
-# ``RuntimeCloseError``, the production caller (AgentService / SubAgentRunner)
-# is expected to catch the exception and call ``register_orphan_runtime``
-# so the runtime's component references are not silently leaked.  The
-# registry is a module-level list — ``cleanup_orphan_runtimes`` iterates it
-# and retries ``aclose()`` on each orphan, removing the ones that succeed.
-# This closes the gap where a persistently-failing runtime's resources
-# (file descriptors, Office mutation fences, BrowserContexts) were lost
-# because the caller discarded the runtime reference after the exception.
-
-_orphan_runtimes: list[RuntimeResult] = []
-
-
-def register_orphan_runtime(runtime: RuntimeResult) -> None:
-    """Register a runtime whose ``aclose()`` failed as an orphan.
-
-    H3: production callers should call this in the ``except`` clause
-    when ``RuntimeCloseError`` is raised from ``runtime.aclose()`` so the
-    runtime's component references are retained for a later retry via
-    ``cleanup_orphan_runtimes()``.  Without this, the runtime's file
-    descriptors / Office mutation fences / BrowserContexts would be
-    silently leaked because the caller discarded the reference.
-
-    Idempotent: registering the same runtime twice is a no-op (the
-    registry deduplicates by identity).
-    """
-    runtime.quarantined = True
-    for existing in _orphan_runtimes:
-        if existing is runtime:
-            return
-    _orphan_runtimes.append(runtime)
-
-
-async def cleanup_orphan_runtimes() -> int:
-    """Retry ``aclose()`` on every registered orphan; remove the ones
-    that succeed.
-
-    H3: iterates ``_orphan_runtimes``, resets ``_close_failed`` /
-    ``_close_task`` on each orphan (so it gets a FRESH 3-attempt
-    auto-retry cycle — ``aclose()`` returns immediately when
-    ``_close_failed`` is True to prevent concurrent callers from
-    re-running the retries, see H4), then calls ``aclose()``.  Orphans
-    that succeed (``_closed`` becomes True) are removed; orphans that
-    raise ``RuntimeCloseError`` again are kept for a future retry.
-
-    Returns the count of remaining orphans.
-    """
-    remaining: list[RuntimeResult] = []
-    for runtime in _orphan_runtimes:
-        # H4: reset the exhaustion flag so the orphan gets a fresh
-        # 3-attempt auto-retry cycle.  ``aclose()`` returns immediately
-        # when ``_close_failed`` is True (to prevent concurrent callers
-        # from re-running the retries), so we MUST clear it here.
-        runtime._close_failed = False
-        runtime._close_task = None
-        try:
-            await runtime.aclose()
-        except RuntimeCloseError:
-            # Still failing — keep the orphan for a future retry.
-            remaining.append(runtime)
-            continue
-        if not runtime._closed:
-            # aclose returned without raising but didn't close (defensive
-            # — shouldn't happen after the reset above, but keep the
-            # orphan so a future retry can pick it up).
-            remaining.append(runtime)
-        else:
-            runtime.quarantined = False
-    _orphan_runtimes[:] = remaining
-    return len(_orphan_runtimes)
 
 
 async def close_runtime_or_register(runtime: RuntimeResult) -> None:
@@ -837,7 +839,7 @@ async def close_runtime_or_register(runtime: RuntimeResult) -> None:
                 current.uncancel()
             continue
         except RuntimeCloseError:
-            register_orphan_runtime(runtime)
+            runtime.cleanup_authority.register(runtime)
             logger.error(
                 "runtime cleanup failed; quarantined for bounded shutdown retry: "
                 "principal=%s session=%s runtime=%s",
@@ -849,7 +851,7 @@ async def close_runtime_or_register(runtime: RuntimeResult) -> None:
                 raise asyncio.CancelledError
             raise
     if not runtime._closed:
-        register_orphan_runtime(runtime)
+        runtime.cleanup_authority.register(runtime)
         logger.error(
             "runtime cleanup returned without terminal state; quarantined: "
             "principal=%s session=%s runtime=%s",
@@ -859,27 +861,3 @@ async def close_runtime_or_register(runtime: RuntimeResult) -> None:
         )
     if cancellation_requested:
         raise asyncio.CancelledError
-
-
-async def drain_orphan_runtimes(
-    *, timeout_seconds: float = 5.0, retry_interval: float = 0.05,
-) -> int:
-    """Retry quarantined runtimes until empty or a bounded deadline.
-
-    Returns the remaining count.  The caller must surface a non-zero result;
-    this function never silently drops a runtime that still owns resources.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + max(0.0, timeout_seconds)
-    remaining = len(_orphan_runtimes)
-    while remaining and loop.time() <= deadline:
-        remaining = await cleanup_orphan_runtimes()
-        if remaining and loop.time() < deadline:
-            await asyncio.sleep(max(0.0, retry_interval))
-    if remaining:
-        logger.error(
-            "%d quarantined runtime(s) remain after %.2fs shutdown deadline",
-            remaining,
-            timeout_seconds,
-        )
-    return remaining

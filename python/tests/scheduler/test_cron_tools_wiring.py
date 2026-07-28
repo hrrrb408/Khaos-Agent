@@ -7,7 +7,6 @@ rather than faking success.
 
 from __future__ import annotations
 
-import khaos.tools.cron_tools as cron_tools
 from khaos.scheduler import CronEngine, ScheduleConfig
 from khaos.tools.cron_tools import (
     cron_create,
@@ -15,69 +14,49 @@ from khaos.tools.cron_tools import (
     cron_pause,
     cron_remove,
     cron_resume,
-    set_cron_engine,
 )
 
 
 async def test_create_with_injected_engine_creates_real_task() -> None:
     """With an engine injected, cron_create actually creates a task."""
     engine = CronEngine(db=None)
-    set_cron_engine(engine)
-
-    try:
-        result = await cron_create("standup", "summarize", "30m", principal_id="test")
-        assert result["status"] == "created"
-        assert result["task_id"] is not None
-        # The task really exists in the engine.
-        tasks = await engine.list_tasks(principal_id="test")
-        assert any(t.id == result["task_id"] for t in tasks)
-    finally:
-        set_cron_engine(None)  # reset for other tests
+    result = await cron_create(
+        "standup", "summarize", "30m", principal_id="test", cron_engine=engine
+    )
+    assert result["status"] == "created"
+    assert result["task_id"] is not None
+    tasks = await engine.list_tasks(principal_id="test")
+    assert any(t.id == result["task_id"] for t in tasks)
 
 
 async def test_list_with_injected_engine_returns_tasks() -> None:
     engine = CronEngine(db=None)
     await engine.create("a", "p", ScheduleConfig(interval_seconds=60), principal_id="test")
-    set_cron_engine(engine)
-
-    try:
-        result = await cron_list(principal_id="test")
-        assert len(result["tasks"]) == 1
-        assert result["tasks"][0]["name"] == "a"
-    finally:
-        set_cron_engine(None)
+    result = await cron_list(principal_id="test", cron_engine=engine)
+    assert len(result["tasks"]) == 1
+    assert result["tasks"][0]["name"] == "a"
 
 
 async def test_pause_resume_remove_with_injected_engine() -> None:
     engine = CronEngine(db=None)
     task = await engine.create("t", "p", ScheduleConfig(interval_seconds=60), principal_id="test")
-    set_cron_engine(engine)
-
-    try:
-        assert (await cron_pause(task.id, principal_id="test"))["status"] == "paused"
-        assert (await engine.get(task.id)).status.value == "paused"
-
-        assert (await cron_resume(task.id, principal_id="test"))["status"] == "resumed"
-        assert (await engine.get(task.id)).status.value == "pending"
-
-        assert (await cron_remove(task.id, principal_id="test"))["status"] == "removed"
-        assert await engine.get(task.id) is None
-    finally:
-        set_cron_engine(None)
+    assert (await cron_pause(task.id, principal_id="test", cron_engine=engine))["status"] == "paused"
+    assert (await engine.get(task.id)).status.value == "paused"
+    assert (await cron_resume(task.id, principal_id="test", cron_engine=engine))["status"] == "resumed"
+    assert (await engine.get(task.id)).status.value == "pending"
+    assert (await cron_remove(task.id, principal_id="test", cron_engine=engine))["status"] == "removed"
+    assert await engine.get(task.id) is None
 
 
 async def test_pause_unknown_task_returns_not_found() -> None:
     engine = CronEngine(db=None)
-    set_cron_engine(engine)
-    try:
-        assert (await cron_pause("ghost", principal_id="test"))["status"] == "not_found"
-    finally:
-        set_cron_engine(None)
+    assert (
+        await cron_pause("ghost", principal_id="test", cron_engine=engine)
+    )["status"] == "not_found"
 
 
 async def test_create_without_engine_reports_unavailable() -> None:
     """No engine injected → honest 'unavailable', not a fake 'created'."""
-    set_cron_engine(None)
     result = await cron_create("x", "y", "30m", principal_id="test")
 
     assert result["status"] == "unavailable"
@@ -85,7 +64,6 @@ async def test_create_without_engine_reports_unavailable() -> None:
 
 
 async def test_list_without_engine_reports_unavailable() -> None:
-    set_cron_engine(None)
     result = await cron_list(principal_id="test")
 
     assert result["status"] == "unavailable"
@@ -93,7 +71,13 @@ async def test_list_without_engine_reports_unavailable() -> None:
 
 
 async def test_remove_without_engine_reports_unavailable() -> None:
-    set_cron_engine(None)
     result = await cron_remove("any", principal_id="test")
 
     assert result["status"] == "unavailable"
+
+
+def test_module_global_cron_authority_removed() -> None:
+    import khaos.tools.cron_tools as cron_tools
+
+    assert not hasattr(cron_tools, "_cron_engine")
+    assert not hasattr(cron_tools, "set_cron_engine")

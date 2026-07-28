@@ -14,7 +14,6 @@ is additionally covered by the ``kernel_real`` tests in
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -130,6 +129,9 @@ class TestRegistryProductionRefusal:
         """§六: when require_os_sandbox=True, a registry write failure must
         RAISE (not best-effort debug log) — an un-trackable sandbox must
         not start."""
+        # Exercise the legacy CLI transaction only under explicit dev mode;
+        # production now delegates all registry/kernel state to Rust.
+        monkeypatch.setenv("KHAOS_DEV_MODE", "1")
         # Force mkdir to fail.
         monkeypatch.setattr(
             "khaos.security.browser_sandbox._RESOURCE_REGISTRY",
@@ -255,8 +257,6 @@ class TestTeardownResult:
         sb._veth_host = "khbrh-a1b2c3"
         sb._cgroup_path = None  # no cgroup → cgroup_removed True (vacuous)
         # Make _run_command raise for nft delete but succeed for others.
-        from khaos.security.browser_sandbox import _run_command as real_rc
-
         def fake_rc(cmd, desc, *, validate=False):
             if "nft" in " ".join(cmd):
                 raise OSError("nft delete failed")

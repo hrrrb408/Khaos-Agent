@@ -17,6 +17,16 @@
 
 ## Required check names
 
+The only merge-authority check for M4 Closure is:
+
+| Check name | Proves |
+|---|---|
+| `Security Closure Gate` | every reusable security workflow and the explicit schema/authz/process/event-loop adversarial job succeeded; mandatory evidence artifact was validated and uploaded |
+
+Configure this one aggregate check as required. The detailed checks below are
+diagnostic dependencies and remain visible, but branch protection must not use
+an incomplete subset of them as a substitute for the aggregate result.
+
 These are the `name:` fields of the jobs (the names shown in the GitHub
 PR checks UI), grouped by workflow.
 

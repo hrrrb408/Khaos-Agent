@@ -131,7 +131,10 @@ async def test_workspace_write_mode_full_flow(tmp_path: Path) -> None:
     assert inside.allowed is True
 
     # curl → blocked by network guard
-    curl = await middleware.pre_check("terminal", {"command": "curl https://x.com"})
+    curl = await middleware.pre_check(
+        "terminal_shell",
+        {"shell": "/bin/bash", "script": "curl https://x.com"},
+    )
     assert curl.allowed is False
     assert curl.check_type == "network"
 
@@ -139,7 +142,7 @@ async def test_workspace_write_mode_full_flow(tmp_path: Path) -> None:
     # because environment-dump commands are the most common source of
     # API key / token leakage).  The check_type is ``env_dump``, not
     # ``command``.
-    env = await middleware.pre_check("terminal", {"command": "env"})
+    env = await middleware.pre_check("terminal_argv", {"argv": ["env"]})
     assert env.allowed is False
     assert env.check_type == "env_dump"
 

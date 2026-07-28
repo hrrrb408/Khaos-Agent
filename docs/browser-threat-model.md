@@ -2,11 +2,11 @@
 
 ## Enforced authority boundary
 
-A `BrowserManager` generation owns one Chromium process tree, network
-namespace, cgroup, nftables table and registry record. That generation is
-leased to exactly one authenticated principal. Sessions and runtimes for that
-principal may use separate `BrowserContext` objects, but a second principal is
-rejected fail-closed for the lifetime of the process generation.
+A runtime-owned `BrowserManager` generation owns one Chromium process tree.
+Its kernel resources are owned exclusively by the root Rust helper and keyed
+by project/runtime identity plus an opaque sandbox token. Python never chooses
+netns, veth, nft or cgroup names. A manager is injected into one runtime; it is
+not stored in a mutable module-global holder.
 
 This single-principal lease is intentional. A `BrowserContext` is an API state
 boundary, not a containment boundary for a compromised Chromium process. A
@@ -25,10 +25,23 @@ singleton between principals.
 
 ## Launch and teardown transaction
 
-Production launch is permitted only after netns, cgroup, nftables, trusted
-Rust launcher, FD sanitization and filesystem sandbox enforcement have all
-been established. Sandbox setup failure poisons the generation; retry cannot
-fall through to direct Chromium. The Rust launcher preserves only Playwright's
+Production Python must run with effective UID other than zero and without
+`CAP_NET_ADMIN` or `CAP_SYS_ADMIN`. A root-owned helper authenticates the
+non-root client over a protected UDS using UID, PID, PID start time and boot
+identity. Production launch is permitted only after helper-authenticated
+netns, cgroup, nftables, trusted Rust launcher, FD sanitization and filesystem
+sandbox enforcement have been established. Helper unavailability or partial
+setup poisons the generation; no CLI or Host fallback is reachable.
+
+On Linux, the root-owned Rust launcher carries only the file capability
+`CAP_SYS_ADMIN=ep` needed for the single `setns` into the namespace descriptor
+returned by the authenticated helper. It validates the helper peer, protocol
+response, isolation evidence and nsfs descriptor before joining, then clears
+all effective, permitted and inheritable capabilities and sets `no_new_privs`
+before invoking bubblewrap or Chromium. Python and Chromium never receive that
+capability.
+
+The Rust launcher preserves only Playwright's
 FD 3/4 pipes, closes unrelated descriptors, joins cgroup/netns, enters the
 mount sandbox, installs `no_new_privs` and seccomp, then execs Chromium.
 The Chromium runtime itself must be installed in a root-owned, read-only path
@@ -42,17 +55,18 @@ teardown removes wrappers, kills and removes the cgroup, then removes nft/netns
 resources. Partial cleanup remains registered and makes shutdown fail until a
 retry succeeds; it is never reported as closed.
 
-Registry entries contain owner PID/start-time, boot ID, lifecycle stage and an
-HMAC. Resource names are derived from the same per-install secret. The Browser
+Helper journal entries contain boot and lifecycle identity. Resource names are
+derived as HMAC(helper secret, boot ID, project ID, runtime ID, sandbox token).
+The Browser
 mount namespace cannot access that secret. Corrupt or unauthenticated entries
 are quarantined rather than trusted by the reaper.
 
 ## Claims and deployment rule
 
-Safe claim: Khaos enforces a single-principal Chromium generation with
+Safe claim: on the Linux workflow proven by the current commit's required
+gate, Khaos enforces a runtime-owned Chromium generation with
 kernel-default-deny egress, filesystem hiding, cgroup limits, descriptor
 sanitization and retryable fail-closed teardown on supported Linux hosts.
 
-Not a safe claim: one `BrowserManager` can safely serve several principals.
-Multi-user deployments must instantiate independent generations; if they do
-not, the built-in principal lease rejects the second principal.
+Not a safe claim: absolute containment, or support on an OS without a passing
+real-kernel gate. Windows remains explicitly unsupported and fail-closed.

@@ -1015,6 +1015,3 @@ class VerificationAuthorityRegistry:
             authority = self._authorities.pop(key, None)
         if authority is not None:
             authority.close()
-
-
-VERIFICATION_AUTHORITIES = VerificationAuthorityRegistry()

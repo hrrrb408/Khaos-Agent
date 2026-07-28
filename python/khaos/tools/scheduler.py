@@ -7,14 +7,19 @@ import hashlib
 import inspect
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
+from khaos.permissions.resource import (
+    AuthorizationResource,
+    resolve_authorization_resource,
+)
 from khaos.agent.approval import ApprovalBinding
 from khaos.exceptions import PermissionDeniedError
 from khaos.security.middleware import SecurityMiddleware
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
+from khaos.tools.terminal_tools import BackgroundProcessAuthority
 
 
 ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
@@ -51,6 +56,12 @@ class PermissionRequest:
     workspace_id: str = ""
     arguments_digest: str = ""
     profile_digest: str = ""
+    project_id: str = ""
+    workspace_generation: int = 0
+    authorization_resource_digest: str = ""
+    authorization_epoch: int = 0
+    policy_digest: str = ""
+    tool_schema_digest: str = ""
 
 
 @dataclass
@@ -64,22 +75,94 @@ class SchedulerEvent:
 
 @dataclass
 class ToolBudget:
-    """Tool execution budget."""
+    """Atomic hard budget shared by serial and parallel tool dispatch."""
 
     max_calls: int = 50
     max_output_chars: int = 100000
+    max_batch_calls: int = 16
+    max_parallel_calls: int = 8
+    max_output_per_tool: int = 65536
+    max_total_output: int = 100000
+    max_background_processes: int = 4
+    max_processes_per_workspace: int = 2
+    max_browser_contexts: int = 4
     _call_count: int = 0
     _output_chars: int = 0
+    _reserved_calls: int = 0
+    _reserved_output: int = 0
+    _parallel_active: int = 0
+    _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     @property
     def is_exhausted(self) -> bool:
         """Return true once call or output budget is exhausted."""
-        return self._call_count >= self.max_calls or self._output_chars >= self.max_output_chars
+        return (
+            self._call_count + self._reserved_calls >= self.max_calls
+            or self._output_chars + self._reserved_output >= self._total_output_limit
+        )
+
+    @property
+    def _total_output_limit(self) -> int:
+        return min(self.max_output_chars, self.max_total_output)
+
+    def validate_batch(self, size: int) -> bool:
+        return 0 <= size <= self.max_batch_calls
+
+    async def reserve(self, *, parallel: bool = False) -> "ToolBudgetReservation | None":
+        async with self._lock:
+            if self._call_count + self._reserved_calls >= self.max_calls:
+                return None
+            if parallel and self._parallel_active >= self.max_parallel_calls:
+                return None
+            remaining = (
+                self._total_output_limit
+                - self._output_chars
+                - self._reserved_output
+            )
+            if remaining <= 0:
+                return None
+            output_limit = min(self.max_output_per_tool, remaining)
+            self._reserved_calls += 1
+            self._reserved_output += output_limit
+            if parallel:
+                self._parallel_active += 1
+            return ToolBudgetReservation(self, output_limit, parallel)
+
+    async def _finish(
+        self, reservation: "ToolBudgetReservation", *, output_chars: int | None
+    ) -> None:
+        async with self._lock:
+            if not reservation.active:
+                return
+            reservation.active = False
+            self._reserved_calls -= 1
+            self._reserved_output -= reservation.output_limit
+            if reservation.parallel:
+                self._parallel_active -= 1
+            if output_chars is not None:
+                if output_chars > reservation.output_limit:
+                    raise RuntimeError("tool output exceeded reserved hard budget")
+                self._call_count += 1
+                self._output_chars += output_chars
 
     def record(self, output_chars: int) -> None:
-        """Record one completed tool call."""
+        """Compatibility hook for trusted single-threaded callers."""
         self._call_count += 1
         self._output_chars += output_chars
+
+
+@dataclass
+class ToolBudgetReservation:
+    budget: ToolBudget
+    output_limit: int
+    parallel: bool
+    active: bool = True
+
+    async def commit(self, output_chars: int) -> None:
+        await self.budget._finish(self, output_chars=output_chars)
+
+    async def release(self) -> None:
+        await self.budget._finish(self, output_chars=None)
 
 
 class ToolScheduler:
@@ -111,6 +194,11 @@ class ToolScheduler:
         # any tool without a Rust fast path keep using the asyncio handler.
         self.use_rust_executor = use_rust_executor
         self.invocation_broker = ToolInvocationBroker(registry)
+        self.process_authority = BackgroundProcessAuthority(
+            max_background_processes=self.budget.max_background_processes,
+            max_processes_per_workspace=self.budget.max_processes_per_workspace,
+            output_limit=self.budget.max_output_per_tool,
+        )
         # H1: optional shared OfficeMutationAuthority. Set by the runtime
         # factory so Office copy/move are fenced against cancellation/timeout.
         self.office_authority: Any = None
@@ -143,6 +231,20 @@ class ToolScheduler:
         tool_context: dict[str, Any] | None = None,
     ):
         """Execute a batch while yielding permission and result events."""
+        if not self.budget.validate_batch(len(tool_calls)):
+            for call in tool_calls:
+                normalized = self._normalize_call(call)
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=normalized["name"],
+                        success=False,
+                        error="Tool batch exceeds max_batch_calls",
+                        arguments=normalized["arguments"],
+                    ),
+                )
+            return
         if self.budget.is_exhausted:
             return
         tool_context = dict(tool_context or {})
@@ -199,11 +301,38 @@ class ToolScheduler:
                 )
                 continue
 
+            resource: AuthorizationResource | None = None
+            if tool_context.get("coding_workspace_enforced"):
+                try:
+                    resource = resolve_authorization_resource(
+                        tool.name,
+                        normalized["arguments"],
+                        principal_id=str(tool_context.get("principal_id") or ""),
+                        project_id=str(tool_context.get("project_id") or ""),
+                        task_id=str(tool_context.get("task_id") or ""),
+                        workspace_id=str(tool_context.get("workspace_id") or ""),
+                        workspace_manager=tool_context.get("workspace_manager"),
+                    )
+                except (OSError, PermissionError, ValueError) as exc:
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=normalized["id"],
+                            name=tool.name,
+                            success=False,
+                            error=f"Authorization resource rejected: {exc}",
+                            arguments=normalized["arguments"],
+                        ),
+                    )
+                    continue
+                normalized["_authorization_resource"] = resource
+
             decision = await self.permission_engine.check(
                 tool_name=tool.name,
                 params=normalized["arguments"],
                 permission_level=tool.permission_level,
                 mode=mode,
+                resource=resource,
             )
             if decision.approved == ApprovalMode.DENY:
                 await self.permission_engine.audit(
@@ -297,6 +426,10 @@ class ToolScheduler:
                     )
                     continue
                 expires_at = time.time() + 120.0
+                authorization_epoch = await self.permission_engine.authorization_snapshot()
+                project_id = str(tool_context.get("project_id") or "")
+                if resource is None and tool_context.get("coding_workspace_enforced"):
+                    raise PermissionDeniedError("workspace authorization resource is missing")
                 binding = ApprovalBinding(
                     principal_id=principal_id,
                     session_id=current_session,
@@ -334,6 +467,12 @@ class ToolScheduler:
                         }
                     ),
                     expires_at=expires_at,
+                    project_id=project_id,
+                    workspace_generation=(resource.workspace_generation if resource else 0),
+                    authorization_resource_digest=(resource.digest() if resource else ""),
+                    authorization_epoch=authorization_epoch,
+                    policy_digest=self.permission_engine.policy_digest,
+                    tool_schema_digest=tool.schema_digest,
                 )
                 broker = tool_context.get("approval_broker")
                 if broker is None:
@@ -349,6 +488,9 @@ class ToolScheduler:
                     )
                     continue
                 binding_digest = await broker.register_tool_approval(binding)
+                normalized["_approval_schema_digest"] = binding.tool_schema_digest
+                normalized["_approval_policy_digest"] = binding.policy_digest
+                normalized["_approval_authorization_epoch"] = binding.authorization_epoch
                 request = PermissionRequest(
                     tool_call_id=normalized["id"],
                     name=tool.name,
@@ -364,6 +506,12 @@ class ToolScheduler:
                     workspace_id=binding.workspace_id,
                     arguments_digest=binding.arguments_digest,
                     profile_digest=binding.profile_digest,
+                    project_id=binding.project_id,
+                    workspace_generation=binding.workspace_generation,
+                    authorization_resource_digest=binding.authorization_resource_digest,
+                    authorization_epoch=binding.authorization_epoch,
+                    policy_digest=binding.policy_digest,
+                    tool_schema_digest=binding.tool_schema_digest,
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
@@ -415,14 +563,12 @@ class ToolScheduler:
                         continue
                     normalized["_approval_context"] = destructive_context
                 if confirmation.get("remember"):
-                    await self.permission_engine.grant_rule(
-                        PermissionRule(
-                            id=None,
-                            pattern=confirmation.get("pattern", decision.target),
-                            permission_level=tool.permission_level,
-                            approval=ApprovalMode.AUTO_APPROVE,
-                            mode=mode,
-                        )
+                    normalized["_remember_rule"] = PermissionRule(
+                        id=None,
+                        pattern=confirmation.get("pattern", decision.target),
+                        permission_level=tool.permission_level,
+                        approval=ApprovalMode.AUTO_APPROVE,
+                        mode=mode,
                     )
             approved_calls.append(normalized)
 
@@ -450,11 +596,29 @@ class ToolScheduler:
 
         parallel_calls, serial_calls = self.registry.get_parallel_tools(approved_calls)
         if parallel_calls:
-            tasks = [self._execute_one(call, session_id, mode, tool_context or {}) for call in parallel_calls]
+            tasks = []
+            for call in parallel_calls:
+                reservation = await self.budget.reserve(parallel=True)
+                if reservation is None:
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=call["id"], name=call["name"],
+                            success=False, error="Tool budget reservation denied",
+                            arguments=call["arguments"],
+                        ),
+                    )
+                    continue
+                tasks.append(
+                    self._execute_one(
+                        call, session_id, mode, tool_context or {}, reservation
+                    )
+                )
             for result in await asyncio.gather(*tasks):
                 yield SchedulerEvent(event="tool_result", result=result)
         for call in serial_calls:
-            if self.budget.is_exhausted:
+            reservation = await self.budget.reserve(parallel=False)
+            if reservation is None:
                 yield SchedulerEvent(
                     event="tool_result",
                     result=ToolResult(
@@ -465,16 +629,27 @@ class ToolScheduler:
                         arguments=call["arguments"],
                     ),
                 )
-                break
+                continue
             yield SchedulerEvent(
                 event="tool_result",
-                result=await self._execute_one(call, session_id, mode, tool_context or {}),
+                result=await self._execute_one(
+                    call, session_id, mode, tool_context or {}, reservation
+                ),
             )
 
-    async def _execute_one(self, call: dict, session_id: str | None, mode: str, tool_context: dict[str, Any]) -> ToolResult:
+    async def _execute_one(
+        self,
+        call: dict,
+        session_id: str | None,
+        mode: str,
+        tool_context: dict[str, Any],
+        reservation: ToolBudgetReservation,
+    ) -> ToolResult:
         start = time.monotonic()
         tool = self.registry.get(call["name"])
+        resource: AuthorizationResource | None = call.get("_authorization_resource")
         if tool.handler is None:
+            await reservation.release()
             return ToolResult(
                 tool_call_id=call["id"],
                 name=call["name"],
@@ -486,12 +661,47 @@ class ToolScheduler:
             await self.permission_engine.validate_dispatch_epoch(
                 int(call.get("_authorization_epoch", 0))
             )
+            expected_schema = call.get("_approval_schema_digest")
+            if expected_schema and expected_schema != tool.schema_digest:
+                raise PermissionDeniedError(
+                    "Tool schema changed before dispatch; re-approval required"
+                )
+            expected_policy = call.get("_approval_policy_digest")
+            if expected_policy and expected_policy != self.permission_engine.policy_digest:
+                raise PermissionDeniedError(
+                    "Policy changed before dispatch; re-approval required"
+                )
+            expected_approval_epoch = call.get("_approval_authorization_epoch")
+            if expected_approval_epoch is not None:
+                await self.permission_engine.validate_dispatch_epoch(
+                    int(expected_approval_epoch)
+                )
+            if resource is not None:
+                current_resource = resolve_authorization_resource(
+                    tool.name,
+                    call.get("arguments", {}),
+                    principal_id=str(tool_context.get("principal_id") or ""),
+                    project_id=str(tool_context.get("project_id") or ""),
+                    task_id=str(tool_context.get("task_id") or ""),
+                    workspace_id=str(tool_context.get("workspace_id") or ""),
+                    workspace_manager=tool_context.get("workspace_manager"),
+                )
+                if current_resource.digest() != resource.digest():
+                    raise PermissionDeniedError(
+                        "Authorization resource changed before dispatch; re-approval required"
+                    )
             security = await self.security_middleware.pre_check(
                 tool.name,
                 call.get("arguments", {}),
             )
             if not security.allowed:
-                target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+                target = (
+                    resource.canonical_target
+                    if resource is not None
+                    else self.permission_engine.normalize_target(
+                        tool.name, call.get("arguments", {})
+                    )
+                )
                 await self.permission_engine.audit(
                     tool.name,
                     target,
@@ -504,6 +714,7 @@ class ToolScheduler:
                     },
                     session_id,
                 )
+                await reservation.release()
                 return ToolResult(
                     tool_call_id=call["id"],
                     name=tool.name,
@@ -513,6 +724,7 @@ class ToolScheduler:
                     arguments=call["arguments"],
                 )
             invocation_context = dict(tool_context)
+            invocation_context["process_authority"] = self.process_authority
             sandbox = self.security_middleware.sandbox
             if mode == "office" and sandbox is not None:
                 # Internal capability: never sourced from model arguments.
@@ -528,10 +740,18 @@ class ToolScheduler:
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
                 timeout=tool.timeout,
             )
-            self.budget.record(len(str(output)))
-            target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            target = (
+                resource.canonical_target
+                if resource is not None
+                else self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            )
             secret_scan, output = await self.security_middleware.post_check(tool.name, output)
+            output_chars = len(str(output))
+            if output_chars > reservation.output_limit:
+                raise RuntimeError("tool output exceeded max_output_per_tool")
             detail: dict[str, Any] = {"tool_call_id": call["id"]}
+            if resource is not None:
+                detail["authorization_resource_digest"] = resource.digest()
             if secret_scan.has_secrets:
                 detail["secrets_detected"] = True
                 detail["secret_categories"] = [
@@ -544,6 +764,10 @@ class ToolScheduler:
                 detail,
                 session_id,
             )
+            await reservation.commit(output_chars)
+            remember_rule = call.get("_remember_rule")
+            if remember_rule is not None:
+                await self.permission_engine.grant_rule(remember_rule)
             return ToolResult(
                 tool_call_id=call["id"],
                 name=tool.name,
@@ -553,7 +777,14 @@ class ToolScheduler:
                 arguments=call["arguments"],
             )
         except Exception as exc:
-            target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            await reservation.release()
+            target = (
+                resource.canonical_target
+                if resource is not None
+                else self.permission_engine.normalize_target(
+                    tool.name, call.get("arguments", {})
+                )
+            )
             await self.permission_engine.audit(
                 tool.name,
                 target,
@@ -577,30 +808,53 @@ class ToolScheduler:
     ) -> dict:
         if confirm_callback is None:
             return {"approved": False}
-        value = confirm_callback(
-            {
-                "id": request.tool_call_id,
-                "name": request.name,
-                "arguments": request.arguments,
-                "level": request.level,
-                "target": request.target,
-                "reason": request.reason,
-                "binding_digest": request.binding_digest,
-                "expires_at": request.expires_at,
-                "principal_id": request.principal_id,
-                "session_id": request.session_id,
-                "task_id": request.task_id,
-                "workspace_id": request.workspace_id,
-                "arguments_digest": request.arguments_digest,
-                "profile_digest": request.profile_digest,
-            }
-        )
+        remaining = request.expires_at - time.time()
+        if remaining <= 0:
+            return {"approved": False, "reason": "approval_expired_before_callback"}
+        payload = {
+            "id": request.tool_call_id,
+            "name": request.name,
+            "arguments": request.arguments,
+            "level": request.level,
+            "target": request.target,
+            "reason": request.reason,
+            "binding_digest": request.binding_digest,
+            "expires_at": request.expires_at,
+            "principal_id": request.principal_id,
+            "session_id": request.session_id,
+            "task_id": request.task_id,
+            "workspace_id": request.workspace_id,
+            "arguments_digest": request.arguments_digest,
+            "profile_digest": request.profile_digest,
+            "project_id": request.project_id,
+            "workspace_generation": request.workspace_generation,
+            "authorization_resource_digest": request.authorization_resource_digest,
+            "authorization_epoch": request.authorization_epoch,
+            "policy_digest": request.policy_digest,
+            "tool_schema_digest": request.tool_schema_digest,
+        }
+        try:
+            if inspect.iscoroutinefunction(confirm_callback):
+                value = await asyncio.wait_for(
+                    confirm_callback(payload), timeout=remaining
+                )
+            else:
+                # UI and gateway integrations may supply a synchronous
+                # callback.  It is untrusted with respect to latency, so run
+                # it off-loop and apply the same approval deadline as an
+                # asynchronous callback.  A timed-out worker cannot be
+                # force-killed, but it no longer starves scheduling or
+                # shutdown and its late result is discarded.
+                value = await asyncio.wait_for(
+                    asyncio.to_thread(confirm_callback, payload),
+                    timeout=remaining,
+                )
+        except asyncio.TimeoutError:
+            return {"approved": False, "reason": "approval_callback_timeout"}
         if inspect.isawaitable(value):
-            # P1-9 (round-13): enforce the approval expiration deadline.
-            # A hung UI/gateway callback must not block the tool batch,
-            # task owner, or shutdown indefinitely.
-            import time as _time
-            remaining = request.expires_at - _time.time()
+            # A synchronous adapter may return an awaitable.  Preserve the
+            # same fixed approval deadline across both execution phases.
+            remaining = request.expires_at - time.time()
             if remaining <= 0:
                 return {"approved": False, "reason": "approval_expired_before_callback"}
             try:
@@ -610,6 +864,10 @@ class ToolScheduler:
         if isinstance(value, bool):
             return {"approved": value}
         return dict(value)
+
+    async def aclose(self) -> None:
+        """Close every runtime-owned background process handle."""
+        await self.process_authority.shutdown()
 
     @staticmethod
     def _normalize_call(call: dict) -> dict:

@@ -1,6 +1,7 @@
 name: Security Contract Matrix
 
 on:
+  workflow_call:
   pull_request:
     branches: [main]
   push:

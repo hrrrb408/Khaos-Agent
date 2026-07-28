@@ -83,10 +83,12 @@ def test_from_policy_mode_valid() -> None:
 
 
 def test_capability_terminal_in_workspace() -> None:
-    """terminal is in the workspace-write capability set."""
+    """Explicit terminal contracts are workspace-write capabilities."""
     sandbox = Sandbox(mode=SandboxMode.WORKSPACE_WRITE, workspace_root=Path("/tmp"))
 
-    assert sandbox.check_tool("terminal").allowed is True
+    assert sandbox.check_tool("terminal_argv").allowed is True
+    assert sandbox.check_tool("terminal_shell").allowed is True
+    assert sandbox.check_tool("terminal").allowed is False
 
 
 def test_capability_terminal_not_in_readonly() -> None:

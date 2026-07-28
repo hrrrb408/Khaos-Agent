@@ -23,6 +23,7 @@ def _active_sandbox(monkeypatch) -> BrowserNetworkSandbox:
     sandbox._netns_name = "khaos-br-test"
     sandbox._cgroup_path = None
     sandbox._require_os_sandbox = False  # dev mode: skip TCB validation
+    sandbox._production_authority = False
     # The launcher binary is not built in unit-test environments; stub it.
     monkeypatch.setattr(
         BrowserNetworkSandbox, "_locate_browser_launcher",

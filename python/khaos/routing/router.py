@@ -112,6 +112,11 @@ class ModelRouter:
             raise ModelUnavailableError(f"no routing rule for function: {function}")
         errors: list[str] = []
         for model_name in [rule.primary_model, *rule.fallback_models]:
+            # This state belongs to exactly one candidate.  Initializing it
+            # before *any* provider lookup also makes a lookup failure safe:
+            # it must never inherit the previous candidate's partial-output
+            # state and suppress an otherwise valid fallback.
+            emitted_anything = False
             try:
                 if not self.provider_manager.is_model_available(model_name):
                     continue
@@ -121,7 +126,6 @@ class ModelRouter:
                     stream = self._call_resolved(messages, kwargs)
                 else:
                     stream = self.model_client.stream_chat(provider, model, messages, kwargs.get("tools"))
-                emitted_anything = False
                 async for chunk in stream:
                     emitted_anything = True
                     yield chunk
@@ -258,11 +262,11 @@ def _tool_call_from_parts(parts: list[str]) -> dict | None:
             "name": name,
             "arguments": {"path": parts[1], "content": " ".join(parts[2:])},
         }
-    if name == "terminal" and len(parts) >= 2:
+    if name == "terminal_argv" and len(parts) >= 2:
         return {
             "id": str(uuid.uuid4()),
             "name": name,
-            "arguments": {"command": " ".join(parts[1:])},
+            "arguments": {"argv": parts[1:]},
         }
     if name == "search_files" and len(parts) >= 2:
         return {
@@ -316,8 +320,6 @@ def create_default_router(
 
 
 def _mock_fallback() -> ModelRouter:
-    from khaos.routing.provider import ProviderManager, ProviderConfig
-
     router = ModelRouter(provider_manager=_default_provider_manager())
     router.set_rule("agent_loop", RoutingRule(function="agent_loop", primary_model="mock-provider/mock-office"))
     router.set_rule("coding", RoutingRule(function="coding", primary_model="mock-provider/mock-coding", prefer_coding_model=True))

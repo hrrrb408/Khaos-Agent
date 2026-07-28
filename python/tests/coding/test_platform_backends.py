@@ -23,16 +23,6 @@ from khaos.coding.execution.platform import (
 )
 
 
-@pytest.fixture(autouse=True)
-def _reset_bwrap_cache():
-    """Ensure each test probes bwrap capability fresh (no cross-test leakage)."""
-    LinuxBubblewrapBackend._capability_cache = None
-    MacOSSandboxBackend._capability_cache = None
-    yield
-    LinuxBubblewrapBackend._capability_cache = None
-    MacOSSandboxBackend._capability_cache = None
-
-
 @pytest.mark.asyncio
 async def test_unsupported_backend_refuses_writable_execution():
     with pytest.raises(PermissionError):
@@ -249,7 +239,7 @@ def test_platform_profiles_hide_explicit_secret_roots(tmp_path: Path):
 def _require_or_skip(binary: str) -> None:
     if shutil.which(binary):
         return
-    if os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") == "1":
+    if os.environ.get("KHAOS_DEV_MODE") != "1":
         pytest.fail(f"required platform sandbox binary is unavailable: {binary}")
     pytest.skip(f"platform sandbox binary is unavailable: {binary}")
 
@@ -278,7 +268,7 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
     # test as passed.
     availability = LinuxBubblewrapBackend().probe_capability()
     if not (availability.available and availability.network_enforced):
-        if os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") == "1":
+        if os.environ.get("KHAOS_DEV_MODE") != "1":
             pytest.fail(
                 f"bwrap cannot enforce isolation on this platform: {availability.reason}"
             )
@@ -299,6 +289,15 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
     )
     secret_root.mkdir()
     secret_file.write_text("host-secret", encoding="utf-8")
+    sensitive_roots = tuple(
+        secret_root / name
+        for name in (".ssh", ".aws", "browser-profile")
+    )
+    for sensitive_root in sensitive_roots:
+        sensitive_root.mkdir()
+        (sensitive_root / "credential").write_text(
+            "secret", encoding="utf-8"
+        )
     main_repo.mkdir()
     (main_repo / "README.txt").write_text("main\n", encoding="utf-8")
 
@@ -385,7 +384,7 @@ async def test_real_bwrap_home_capacity_and_inode_budget(tmp_path: Path):
     backend = LinuxBubblewrapBackend()
     availability = backend.probe_capability()
     if not (availability.available and availability.network_enforced):
-        if os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") == "1":
+        if os.environ.get("KHAOS_DEV_MODE") != "1":
             pytest.fail(availability.reason)
         pytest.skip(availability.reason)
     workspace = tmp_path / "workspace"
@@ -410,7 +409,11 @@ async def test_real_bwrap_home_capacity_and_inode_budget(tmp_path: Path):
         ).bind_workspace(workspace),
     ))
 
-    assert result.status == "resource-exhausted", result.diagnostics
+    assert result.status == "resource-exhausted", {
+        "diagnostics": result.diagnostics,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
     assert result.diagnostics["resource_violation"]["kind"] == "filesystem-entries"
 
 
@@ -422,7 +425,7 @@ async def test_real_bwrap_workspace_relative_entry_budget(tmp_path: Path):
     backend = LinuxBubblewrapBackend()
     availability = backend.probe_capability()
     if not (availability.available and availability.network_enforced):
-        if os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") == "1":
+        if os.environ.get("KHAOS_DEV_MODE") != "1":
             pytest.fail(availability.reason)
         pytest.skip(availability.reason)
     workspace = tmp_path / "workspace"
@@ -546,7 +549,7 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
     availability = MacOSSandboxBackend().probe_capability()
     if (
         not availability.available
-        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+        and os.environ.get("KHAOS_DEV_MODE") == "1"
     ):
         pytest.skip(availability.reason)
     assert availability.available, availability.reason
@@ -561,6 +564,15 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
     )
     secret_root.mkdir()
     secret_file.write_text("host-secret", encoding="utf-8")
+    sensitive_roots = tuple(
+        secret_root / name
+        for name in (".ssh", ".aws", "browser-profile")
+    )
+    for sensitive_root in sensitive_roots:
+        sensitive_root.mkdir()
+        (sensitive_root / "credential").write_text(
+            "secret", encoding="utf-8"
+        )
     protected_pointer_names = (
         (".git", ".GIT")
         if (workspace / ".GIT").exists()
@@ -576,6 +588,16 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
         f"\ntry: Path({str(outside)!r}).write_text('no')\nexcept OSError: pass\nelse: raise SystemExit('outside write allowed'); "
         "\ntry: socket.create_connection(('1.1.1.1', 53), timeout=1)\nexcept OSError: pass\nelse: raise SystemExit('network allowed')"
         f"\ntry: Path({str(secret_file)!r}).read_text()\nexcept OSError: pass\nelse: raise SystemExit('host secret readable')"
+        f"\nfor hidden in {tuple(str(path) for path in sensitive_roots)!r}:"
+        "\n for operation in (lambda p: p.stat(), lambda p: list(p.iterdir()), "
+        "lambda p: (p / 'credential').read_text()):"
+        "\n  try: operation(Path(hidden))"
+        "\n  except OSError: pass"
+        "\n  else: raise SystemExit(f'host metadata visible: {hidden}')"
+        "\nfor external in (Path('/private/tmp'), Path('/tmp')):"
+        "\n try: list(external.iterdir())"
+        "\n except OSError: pass"
+        "\n else: raise SystemExit(f'system temp visible: {external}')"
         "\nfor ipc_command in (('/usr/bin/pbpaste',), ('/usr/bin/security', 'list-keychains')):"
         "\n result = subprocess.run(ipc_command, capture_output=True)"
         "\n if result.returncode == 0: raise SystemExit(f'host IPC allowed: {ipc_command[0]}')"
@@ -593,7 +615,7 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
     if (
         result.status != "passed"
         and "Operation not permitted" in result.stderr
-        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+        and os.environ.get("KHAOS_DEV_MODE") == "1"
     ):
         pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
     assert result.status == "passed", result.stderr
@@ -611,7 +633,7 @@ async def test_real_macos_synthetic_home_capacity_is_enforced(tmp_path: Path):
     availability = backend.probe_capability()
     if (
         not availability.available
-        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+        and os.environ.get("KHAOS_DEV_MODE") == "1"
     ):
         pytest.skip(availability.reason)
     assert availability.available, availability.reason
@@ -638,10 +660,14 @@ async def test_real_macos_synthetic_home_capacity_is_enforced(tmp_path: Path):
     if (
         result.status != "resource-exhausted"
         and "Operation not permitted" in result.stderr
-        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+        and os.environ.get("KHAOS_DEV_MODE") == "1"
     ):
         pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
-    assert result.status == "resource-exhausted", result.diagnostics
+    assert result.status == "resource-exhausted", {
+        "diagnostics": result.diagnostics,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+    }
     violation = result.diagnostics["resource_violation"]
     assert violation["kind"] == "tmpfs"
     assert violation["limit"] == 10_000
@@ -660,7 +686,7 @@ async def test_real_macos_workspace_relative_byte_budget(tmp_path: Path):
     availability = backend.probe_capability()
     if (
         not availability.available
-        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+        and os.environ.get("KHAOS_DEV_MODE") == "1"
     ):
         pytest.skip(availability.reason)
     assert availability.available, availability.reason
@@ -685,7 +711,7 @@ async def test_real_macos_workspace_relative_byte_budget(tmp_path: Path):
     if (
         result.status != "resource-exhausted"
         and "Operation not permitted" in result.stderr
-        and os.environ.get("KHAOS_REQUIRE_PLATFORM_SANDBOX") != "1"
+        and os.environ.get("KHAOS_DEV_MODE") == "1"
     ):
         pytest.skip("current execution sandbox cannot invoke host sandbox-exec")
     assert result.status == "resource-exhausted", result.diagnostics

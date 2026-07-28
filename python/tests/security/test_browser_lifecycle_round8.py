@@ -58,6 +58,44 @@ async def test_failed_sandbox_setup_permanently_blocks_generation(monkeypatch) -
 
 
 @pytest.mark.asyncio
+async def test_production_launch_never_calls_python_kernel_reaper(
+    monkeypatch,
+) -> None:
+    class FailedSandbox:
+        enforcement_status = EnforcementStatus(failure_reason="setup failed")
+        is_active = False
+
+        def __init__(self, **_: object) -> None:
+            pass
+
+        @staticmethod
+        def startup_reaper(*, validate: bool = False) -> dict[str, int]:
+            raise AssertionError("production reached privileged Python reaper")
+
+        def setup(self) -> None:
+            raise RuntimeError("injected helper setup failure")
+
+        def teardown(self) -> CleanupResult:
+            return CleanupResult(fully_closed=True)
+
+    class Starter:
+        async def start(self) -> object:
+            return SimpleNamespace()
+
+    monkeypatch.setattr(browser_tools, "_HAS_PLAYWRIGHT", True)
+    monkeypatch.setattr(browser_tools, "BrowserNetworkSandbox", FailedSandbox)
+    monkeypatch.setattr(browser_tools, "async_playwright", lambda: Starter())
+    monkeypatch.setenv("KHAOS_DEV_MODE", "0")
+
+    result = await BrowserManager().launch(
+        project_id="project", runtime_id="runtime"
+    )
+
+    assert result["ok"] is False
+    assert "injected helper setup failure" in result["error"]
+
+
+@pytest.mark.asyncio
 async def test_manager_retains_sandbox_when_cleanup_is_partial() -> None:
     class ResidualSandbox:
         def teardown(self) -> CleanupResult:
