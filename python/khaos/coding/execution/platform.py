@@ -359,6 +359,19 @@ class MacOSSandboxBackend:
             f'(allow file-read* (literal "{_seatbelt_escape(path)}"))'
             for path in _macos_literal_read_files() if path.exists()
         )
+        metadata_ancestors = _deduplicate_paths(
+            (*read_roots, *tuple(
+                ancestor
+                for path in read_roots
+                for ancestor in reversed(path.parents)
+                if ancestor != Path("/")
+            ))
+        )
+        metadata_rules = "".join(
+            '(allow file-read-metadata '
+            f'(literal "{_seatbelt_escape(path)}"))'
+            for path in metadata_ancestors
+        )
         executable_map_rules = "".join(
             f'(allow file-map-executable (subpath "{_seatbelt_escape(path)}"))'
             for path in read_roots if path.exists()
@@ -397,7 +410,8 @@ class MacOSSandboxBackend:
             '(allow file-read* file-write-data (literal "/dev/null"))',
             '(allow file-read* (literal "/dev/random"))',
             '(allow file-read* (literal "/dev/urandom"))',
-            read_rules, literal_reads, executable_map_rules, write_rules,
+            metadata_rules, read_rules, literal_reads,
+            executable_map_rules, write_rules,
             protected_write_rules,
             mach_lookup_rules,
             "(deny network*)",
@@ -409,7 +423,11 @@ class MacOSSandboxBackend:
         writable = profile.filesystem.value == "workspace-write"
         worktree = profile.workspace_roots[0]
         with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
-            home = Path(home_value)
+            # macOS exposes /var as a symlink to /private/var.  Bind the
+            # environment and Seatbelt rules to the same canonical identity;
+            # otherwise HOME uses the lexical /var path while the profile
+            # allows /private/var and legitimate synthetic-home writes fail.
+            home = Path(home_value).resolve()
             sandbox_tmp = home / "tmp"
             sandbox_tmp.mkdir(mode=0o700)
             sandbox_profile = self.profile(
