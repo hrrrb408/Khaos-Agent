@@ -699,8 +699,7 @@ mod linux {
             let real = env::var_os("KHAOS_BROWSER_REAL_EXECUTABLE").ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing browser executable")
             })?;
-            if env::var_os("KHAOS_BROWSER_AUTHORITY").as_deref()
-                == Some(std::ffi::OsStr::new("1"))
+            if env::var_os("KHAOS_BROWSER_AUTHORITY").as_deref() == Some(std::ffi::OsStr::new("1"))
             {
                 let project_id = env::var("KHAOS_BROWSER_PROJECT_ID")
                     .map_err(|_| io::Error::other("browser project identity missing"))?;
@@ -710,9 +709,7 @@ mod linux {
                     .map_err(|_| io::Error::other("browser sandbox token missing"))?;
                 join_browser_authority(&project_id, &runtime_id, &token)?;
             } else {
-                if env::var_os("KHAOS_DEV_MODE").as_deref()
-                    != Some(std::ffi::OsStr::new("1"))
-                {
+                if env::var_os("KHAOS_DEV_MODE").as_deref() != Some(std::ffi::OsStr::new("1")) {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "legacy browser netns contract is development-only",
@@ -792,13 +789,8 @@ mod linux {
             // Batch 9.2: sensitive host paths that must NEVER be readable
             // from inside the browser namespace, regardless of the ro-bind
             // of /.  tmpfs overwrites the ro-bind at these mount points.
-            let sensitive_host_paths: [&str; 5] = [
-                "/workspace",
-                "/srv",
-                "/data",
-                "/mnt",
-                "/var/lib",
-            ];
+            let sensitive_host_paths: [&str; 5] =
+                ["/workspace", "/srv", "/data", "/mnt", "/var/lib"];
 
             // Batch 11.5 + 12.6 (round-11 §八 + round-12 §九): EMPTY-ROOT
             // ALLOWLIST with MINIMAL /etc.  Previously /etc was bound as
@@ -806,13 +798,7 @@ mod linux {
             // and machine identity files.  Now /etc is NOT bound as a
             // whole — only the specific files Chromium needs are bound
             // individually.
-            let allowlist_ro_binds: [&str; 5] = [
-                "/usr",
-                "/lib",
-                "/lib64",
-                "/bin",
-                "/sbin",
-            ];
+            let allowlist_ro_binds: [&str; 5] = ["/usr", "/lib", "/lib64", "/bin", "/sbin"];
             // Batch 12.6: minimal /etc files (not the whole tree).
             let etc_files: [&str; 9] = [
                 "/etc/hosts",
@@ -1035,8 +1021,7 @@ mod linux {
             if args.first().is_some_and(|arg| arg == "--") {
                 args.remove(0);
             }
-            let sentinel_paths: Vec<PathBuf> =
-                args.iter().map(PathBuf::from).collect();
+            let sentinel_paths: Vec<PathBuf> = args.iter().map(PathBuf::from).collect();
             // sanitize fds (no Playwright pipes needed for the probe).
             sanitize_fds_except(&[]).map_err(|error| {
                 io::Error::new(error.kind(), format!("sanitize probe fds: {error}"))
@@ -1171,7 +1156,10 @@ mod linux {
             // path validation) instead of bare std::fs::write.
             if let Some(procs) = cgroup {
                 join_cgroup(procs.as_os_str()).map_err(|error| {
-                    io::Error::new(error.kind(), format!("browser join cgroup {}: {error}", procs.display()))
+                    io::Error::new(
+                        error.kind(),
+                        format!("browser join cgroup {}: {error}", procs.display()),
+                    )
                 })?;
             }
             // Join the netns BEFORE seccomp (setns is denied after install).
@@ -1208,7 +1196,10 @@ mod linux {
             // P1-6 (round-13): use the safe join_cgroup (O_NOFOLLOW +
             // path validation) instead of bare std::fs::write.
             join_cgroup(path.as_os_str()).map_err(|error| {
-                io::Error::new(error.kind(), format!("join cgroup {}: {error}", path.display()))
+                io::Error::new(
+                    error.kind(),
+                    format!("join cgroup {}: {error}", path.display()),
+                )
             })?;
             return exec(&args);
         }
