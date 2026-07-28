@@ -11,6 +11,10 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
+from khaos.permissions.resource import (
+    AuthorizationResource,
+    resolve_authorization_resource,
+)
 from khaos.agent.approval import ApprovalBinding
 from khaos.exceptions import PermissionDeniedError
 from khaos.security.middleware import SecurityMiddleware
@@ -51,6 +55,12 @@ class PermissionRequest:
     workspace_id: str = ""
     arguments_digest: str = ""
     profile_digest: str = ""
+    project_id: str = ""
+    workspace_generation: int = 0
+    authorization_resource_digest: str = ""
+    authorization_epoch: int = 0
+    policy_digest: str = ""
+    tool_schema_digest: str = ""
 
 
 @dataclass
@@ -199,11 +209,38 @@ class ToolScheduler:
                 )
                 continue
 
+            resource: AuthorizationResource | None = None
+            if tool_context.get("coding_workspace_enforced"):
+                try:
+                    resource = resolve_authorization_resource(
+                        tool.name,
+                        normalized["arguments"],
+                        principal_id=str(tool_context.get("principal_id") or ""),
+                        project_id=str(tool_context.get("project_id") or ""),
+                        task_id=str(tool_context.get("task_id") or ""),
+                        workspace_id=str(tool_context.get("workspace_id") or ""),
+                        workspace_manager=tool_context.get("workspace_manager"),
+                    )
+                except (OSError, PermissionError, ValueError) as exc:
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=normalized["id"],
+                            name=tool.name,
+                            success=False,
+                            error=f"Authorization resource rejected: {exc}",
+                            arguments=normalized["arguments"],
+                        ),
+                    )
+                    continue
+                normalized["_authorization_resource"] = resource
+
             decision = await self.permission_engine.check(
                 tool_name=tool.name,
                 params=normalized["arguments"],
                 permission_level=tool.permission_level,
                 mode=mode,
+                resource=resource,
             )
             if decision.approved == ApprovalMode.DENY:
                 await self.permission_engine.audit(
@@ -297,6 +334,10 @@ class ToolScheduler:
                     )
                     continue
                 expires_at = time.time() + 120.0
+                authorization_epoch = await self.permission_engine.authorization_snapshot()
+                project_id = str(tool_context.get("project_id") or "")
+                if resource is None and tool_context.get("coding_workspace_enforced"):
+                    raise PermissionDeniedError("workspace authorization resource is missing")
                 binding = ApprovalBinding(
                     principal_id=principal_id,
                     session_id=current_session,
@@ -334,6 +375,12 @@ class ToolScheduler:
                         }
                     ),
                     expires_at=expires_at,
+                    project_id=project_id,
+                    workspace_generation=(resource.workspace_generation if resource else 0),
+                    authorization_resource_digest=(resource.digest() if resource else ""),
+                    authorization_epoch=authorization_epoch,
+                    policy_digest=self.permission_engine.policy_digest,
+                    tool_schema_digest=tool.schema_digest,
                 )
                 broker = tool_context.get("approval_broker")
                 if broker is None:
@@ -349,6 +396,9 @@ class ToolScheduler:
                     )
                     continue
                 binding_digest = await broker.register_tool_approval(binding)
+                normalized["_approval_schema_digest"] = binding.tool_schema_digest
+                normalized["_approval_policy_digest"] = binding.policy_digest
+                normalized["_approval_authorization_epoch"] = binding.authorization_epoch
                 request = PermissionRequest(
                     tool_call_id=normalized["id"],
                     name=tool.name,
@@ -364,6 +414,12 @@ class ToolScheduler:
                     workspace_id=binding.workspace_id,
                     arguments_digest=binding.arguments_digest,
                     profile_digest=binding.profile_digest,
+                    project_id=binding.project_id,
+                    workspace_generation=binding.workspace_generation,
+                    authorization_resource_digest=binding.authorization_resource_digest,
+                    authorization_epoch=binding.authorization_epoch,
+                    policy_digest=binding.policy_digest,
+                    tool_schema_digest=binding.tool_schema_digest,
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
@@ -415,14 +471,12 @@ class ToolScheduler:
                         continue
                     normalized["_approval_context"] = destructive_context
                 if confirmation.get("remember"):
-                    await self.permission_engine.grant_rule(
-                        PermissionRule(
-                            id=None,
-                            pattern=confirmation.get("pattern", decision.target),
-                            permission_level=tool.permission_level,
-                            approval=ApprovalMode.AUTO_APPROVE,
-                            mode=mode,
-                        )
+                    normalized["_remember_rule"] = PermissionRule(
+                        id=None,
+                        pattern=confirmation.get("pattern", decision.target),
+                        permission_level=tool.permission_level,
+                        approval=ApprovalMode.AUTO_APPROVE,
+                        mode=mode,
                     )
             approved_calls.append(normalized)
 
@@ -474,6 +528,7 @@ class ToolScheduler:
     async def _execute_one(self, call: dict, session_id: str | None, mode: str, tool_context: dict[str, Any]) -> ToolResult:
         start = time.monotonic()
         tool = self.registry.get(call["name"])
+        resource: AuthorizationResource | None = call.get("_authorization_resource")
         if tool.handler is None:
             return ToolResult(
                 tool_call_id=call["id"],
@@ -486,12 +541,47 @@ class ToolScheduler:
             await self.permission_engine.validate_dispatch_epoch(
                 int(call.get("_authorization_epoch", 0))
             )
+            expected_schema = call.get("_approval_schema_digest")
+            if expected_schema and expected_schema != tool.schema_digest:
+                raise PermissionDeniedError(
+                    "Tool schema changed before dispatch; re-approval required"
+                )
+            expected_policy = call.get("_approval_policy_digest")
+            if expected_policy and expected_policy != self.permission_engine.policy_digest:
+                raise PermissionDeniedError(
+                    "Policy changed before dispatch; re-approval required"
+                )
+            expected_approval_epoch = call.get("_approval_authorization_epoch")
+            if expected_approval_epoch is not None:
+                await self.permission_engine.validate_dispatch_epoch(
+                    int(expected_approval_epoch)
+                )
+            if resource is not None:
+                current_resource = resolve_authorization_resource(
+                    tool.name,
+                    call.get("arguments", {}),
+                    principal_id=str(tool_context.get("principal_id") or ""),
+                    project_id=str(tool_context.get("project_id") or ""),
+                    task_id=str(tool_context.get("task_id") or ""),
+                    workspace_id=str(tool_context.get("workspace_id") or ""),
+                    workspace_manager=tool_context.get("workspace_manager"),
+                )
+                if current_resource.digest() != resource.digest():
+                    raise PermissionDeniedError(
+                        "Authorization resource changed before dispatch; re-approval required"
+                    )
             security = await self.security_middleware.pre_check(
                 tool.name,
                 call.get("arguments", {}),
             )
             if not security.allowed:
-                target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+                target = (
+                    resource.canonical_target
+                    if resource is not None
+                    else self.permission_engine.normalize_target(
+                        tool.name, call.get("arguments", {})
+                    )
+                )
                 await self.permission_engine.audit(
                     tool.name,
                     target,
@@ -529,9 +619,15 @@ class ToolScheduler:
                 timeout=tool.timeout,
             )
             self.budget.record(len(str(output)))
-            target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            target = (
+                resource.canonical_target
+                if resource is not None
+                else self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            )
             secret_scan, output = await self.security_middleware.post_check(tool.name, output)
             detail: dict[str, Any] = {"tool_call_id": call["id"]}
+            if resource is not None:
+                detail["authorization_resource_digest"] = resource.digest()
             if secret_scan.has_secrets:
                 detail["secrets_detected"] = True
                 detail["secret_categories"] = [
@@ -544,6 +640,9 @@ class ToolScheduler:
                 detail,
                 session_id,
             )
+            remember_rule = call.get("_remember_rule")
+            if remember_rule is not None:
+                await self.permission_engine.grant_rule(remember_rule)
             return ToolResult(
                 tool_call_id=call["id"],
                 name=tool.name,
@@ -553,7 +652,13 @@ class ToolScheduler:
                 arguments=call["arguments"],
             )
         except Exception as exc:
-            target = self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            target = (
+                resource.canonical_target
+                if resource is not None
+                else self.permission_engine.normalize_target(
+                    tool.name, call.get("arguments", {})
+                )
+            )
             await self.permission_engine.audit(
                 tool.name,
                 target,
@@ -595,6 +700,12 @@ class ToolScheduler:
             "workspace_id": request.workspace_id,
             "arguments_digest": request.arguments_digest,
             "profile_digest": request.profile_digest,
+            "project_id": request.project_id,
+            "workspace_generation": request.workspace_generation,
+            "authorization_resource_digest": request.authorization_resource_digest,
+            "authorization_epoch": request.authorization_epoch,
+            "policy_digest": request.policy_digest,
+            "tool_schema_digest": request.tool_schema_digest,
         }
         try:
             if inspect.iscoroutinefunction(confirm_callback):

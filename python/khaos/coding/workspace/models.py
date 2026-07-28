@@ -56,6 +56,7 @@ class TaskWorkspace:
         default_factory=WorkspaceStorageLimits
     )
     git_identity: GitWorktreeIdentity | None = None
+    generation: int = 1
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,12 @@ class ApprovalBinding:
     profile_digest: str
     expires_at: float
     nonce: str = field(default_factory=lambda: secrets.token_hex(32))
+    project_id: str = ""
+    workspace_generation: int = 0
+    authorization_resource_digest: str = ""
+    authorization_epoch: int = 0
+    policy_digest: str = ""
+    tool_schema_digest: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -70,6 +76,12 @@ class ApprovalBinding:
             "profile_digest": self.profile_digest,
             "expires_at": self.expires_at,
             "nonce": self.nonce,
+            "project_id": self.project_id,
+            "workspace_generation": self.workspace_generation,
+            "authorization_resource_digest": self.authorization_resource_digest,
+            "authorization_epoch": self.authorization_epoch,
+            "policy_digest": self.policy_digest,
+            "tool_schema_digest": self.tool_schema_digest,
         }
         canonical = json.dumps(
             payload, sort_keys=True, separators=(",", ":")

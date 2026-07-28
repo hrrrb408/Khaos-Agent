@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
@@ -99,6 +101,18 @@ class ToolDefinition:
     timeout: int = 60
     handler: Callable[..., Awaitable[Any]] | None = None
     capabilities: tuple[ToolCapability, ...] = ()
+
+    @property
+    def schema_digest(self) -> str:
+        """Stable digest of the model-visible tool contract."""
+        payload = {
+            "name": self.name,
+            "parameters": self.parameters,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
 
 
 class ToolRegistry:

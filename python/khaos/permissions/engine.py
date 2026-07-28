@@ -12,6 +12,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 from khaos.exceptions import PermissionDeniedError
+from khaos.permissions.resource import AuthorizationResource
 
 
 class ApprovalMode(Enum):
@@ -98,6 +99,10 @@ class PermissionEngine:
         self._runtime_id = runtime_id
         self._authorization_epoch = 0
 
+    @property
+    def policy_digest(self) -> str:
+        return self._policy_digest
+
     async def load_rules(self) -> None:
         """Load persisted rules from SQLite, scoped to this principal."""
         self._authorization_epoch = await self.db.bind_authorization_context(
@@ -129,9 +134,14 @@ class PermissionEngine:
         params: dict,
         permission_level: str,
         mode: str,
+        resource: AuthorizationResource | None = None,
     ) -> PermissionDecision:
         """Check whether a tool call is approved, denied, or needs confirmation."""
-        target = self.normalize_target(tool_name, params)
+        target = (
+            resource.canonical_target
+            if resource is not None
+            else self.normalize_target(tool_name, params)
+        )
         if self._authorization_epoch == 0:
             # Factory startup loads eagerly; direct/library callers remain safe
             # by binding the authoritative context before their first check.
