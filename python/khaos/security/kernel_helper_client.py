@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import ipaddress
 import os
+import re
 import socket
 import stat
 import struct
@@ -19,10 +20,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from khaos.security.browser_kernel_protocol_generated import (
+    MAX_MESSAGE_BYTES,
+    OPERATIONS,
+    PROTOCOL_VERSION,
+    REQUEST_FIELDS,
+    SANDBOX_TOKEN_PATTERN,
+)
+
 _SOCKET_ENV: Final = "KHAOS_BROWSER_KERNEL_HELPER_SOCKET"
 _DEFAULT_SOCKET: Final = "/run/khaos/browser-kernel-helper.sock"
-_PROTOCOL_VERSION: Final = 1
-_MAX_MESSAGE: Final = 8192
+_PROTOCOL_VERSION: Final = PROTOCOL_VERSION
+_MAX_MESSAGE: Final = MAX_MESSAGE_BYTES
+_TOKEN_PATTERN: Final = re.compile(SANDBOX_TOKEN_PATTERN)
 _RESPONSE_FIELDS: Final = {
     "protocol_version",
     "request_id",
@@ -200,6 +210,8 @@ class KernelAuthorityClient:
             "target_pid": target_pid,
             "target_start_time": target_start_time,
         }
+        if set(request) != REQUEST_FIELDS or op not in OPERATIONS:
+            raise RuntimeError("kernel helper request contract invalid")
         body = json.dumps(request, separators=(",", ":"), sort_keys=True).encode()
         if len(body) > _MAX_MESSAGE:
             raise RuntimeError("kernel helper request exceeds protocol limit")
@@ -318,9 +330,7 @@ class KernelAuthorityClient:
 
     @staticmethod
     def _validate_token(value: str) -> str:
-        if not 32 <= len(value) <= 128 or any(
-            character not in "0123456789abcdefABCDEF" for character in value
-        ):
+        if type(value) is not str or _TOKEN_PATTERN.fullmatch(value) is None:
             raise ValueError("invalid sandbox token")
         return value.lower()
 

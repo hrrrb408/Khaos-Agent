@@ -6,6 +6,10 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use _khaos_core::browser_kernel_protocol_generated::{
+        BrowserKernelOperation as Operation, BrowserKernelRequest as Request, MAX_MESSAGE_BYTES,
+        PROTOCOL_VERSION,
+    };
     use hmac::{Hmac, Mac};
     use serde::{Deserialize, Serialize};
     use sha2::Sha256;
@@ -25,8 +29,6 @@ mod linux {
 
     type HmacSha256 = Hmac<Sha256>;
 
-    const PROTOCOL_VERSION: u16 = 1;
-    const MAX_MESSAGE: usize = 8192;
     const MAX_CONNECTIONS: usize = 32;
     const MAX_REPLAY_IDS: usize = 4096;
     const DEFAULT_SOCKET: &str = "/run/khaos/browser-kernel-helper.sock";
@@ -34,39 +36,6 @@ mod linux {
     const DEFAULT_JOURNAL: &str = "/run/khaos/browser-helper";
     const IP_PATH: &str = "/usr/sbin/ip";
     const NFT_PATH: &str = "/usr/sbin/nft";
-
-    #[derive(Debug, Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Request {
-        protocol_version: u16,
-        request_id: String,
-        boot_id: String,
-        client_pid: u32,
-        client_start_time: u64,
-        project_id: String,
-        runtime_id: String,
-        principal_id: String,
-        task_id: String,
-        sandbox_token: String,
-        runtime_capability: Option<String>,
-        op: Operation,
-        port: Option<u16>,
-        target_pid: Option<u32>,
-        target_start_time: Option<u64>,
-    }
-
-    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-    #[serde(rename_all = "snake_case")]
-    enum Operation {
-        Authorize,
-        Setup,
-        AllowProxy,
-        RevokeProxy,
-        AttachProcess,
-        Join,
-        Teardown,
-        Status,
-    }
 
     #[derive(Serialize)]
     struct Response<'a> {
@@ -1117,7 +1086,7 @@ mod linux {
         let mut length = [0_u8; 4];
         stream.read_exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
-        if length == 0 || length > MAX_MESSAGE {
+        if length == 0 || length > MAX_MESSAGE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "request length invalid",

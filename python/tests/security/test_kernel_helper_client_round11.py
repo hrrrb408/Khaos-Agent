@@ -323,7 +323,11 @@ def test_python_and_rust_protocol_contract_matches_canonical_schema() -> None:
             encoding="utf-8"
         )
     )
-    rust_source = (
+    rust_generated = (
+        repository
+        / "rust/khaos-core/src/browser_kernel_protocol_generated.rs"
+    ).read_text(encoding="utf-8")
+    helper_source = (
         repository
         / "rust/khaos-core/src/bin/khaos-browser-kernel-helper.rs"
     ).read_text(encoding="utf-8")
@@ -344,6 +348,7 @@ def test_python_and_rust_protocol_contract_matches_canonical_schema() -> None:
     }
     for field in ("principal_id", "project_id", "runtime_id", "task_id"):
         assert field in schema["required"]
-        assert f"{field}: String" in rust_source
-    assert "validate_hex(&request.sandbox_token, 32, 128" in rust_source
-    assert "const MAX_MESSAGE: usize = 8192" in rust_source
+        assert f"pub {field}: String" in rust_generated
+    assert "validate_hex(&request.sandbox_token, 32, 128" in helper_source
+    assert "MAX_MESSAGE_BYTES" in helper_source
+    assert "PROTOCOL_VERSION" in helper_source

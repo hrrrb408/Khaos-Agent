@@ -6,6 +6,7 @@
 //! extension module named `_khaos_core` (leading underscore avoids clashing
 //! with a plain `import`).
 
+pub mod browser_kernel_protocol_generated;
 pub mod executor;
 pub mod token;
 
