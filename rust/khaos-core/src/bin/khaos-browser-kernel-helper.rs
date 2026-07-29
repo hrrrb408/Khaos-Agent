@@ -12,7 +12,7 @@ mod linux {
     };
     use hmac::{Hmac, Mac};
     use serde::{Deserialize, Serialize};
-    use sha2::Sha256;
+    use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
@@ -109,6 +109,7 @@ mod linux {
         path: PathBuf,
         device: u64,
         inode: u64,
+        digest: [u8; 32],
     }
 
     struct State {
@@ -979,7 +980,7 @@ mod linux {
             // owner/mode and device/inode checks to the actual executable.
             let resolved_path = fs::canonicalize(configured_path)?;
             validate_parent_chain(&resolved_path)?;
-            let file = OpenOptions::new()
+            let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&resolved_path)?;
@@ -994,10 +995,11 @@ mod linux {
                 path: resolved_path,
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                digest: digest_file(&mut file)?,
             })
         }
         fn open_for_exec(&self) -> io::Result<File> {
-            let file = OpenOptions::new()
+            let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&self.path)?;
@@ -1012,8 +1014,27 @@ mod linux {
                     "TCB binary identity changed",
                 ));
             }
+            if digest_file(&mut file)? != self.digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "TCB binary content digest changed",
+                ));
+            }
             Ok(file)
         }
+    }
+
+    fn digest_file(file: &mut File) -> io::Result<[u8; 32]> {
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(digest.finalize().into())
     }
 
     fn validate_parent_chain(path: &Path) -> io::Result<()> {

@@ -66,6 +66,9 @@ probing; two live sandboxes never receive the same `/30` merely because their
 digest prefixes collide. The allocator covers 262,143 `/30` leases in
 `10.192.0.0/12`, persists the selected lease in the authenticated journal, and
 fails closed on actual pool exhaustion instead of aliasing a live subnet.
+The helper pins the absolute root-owned `ip` and `nft` executables by parent
+chain, mode, device/inode and SHA-256, then reopens with `O_NOFOLLOW` and
+recomputes the digest before and after every invocation.
 The Browser
 mount namespace cannot access that secret. Corrupt or unauthenticated entries
 are quarantined rather than trusted by the reaper.
