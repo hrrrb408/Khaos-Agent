@@ -120,6 +120,7 @@ _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
     "move_file": resolve_copy_or_move,
     "terminal_argv": resolve_terminal_argv,
     "terminal_shell": resolve_terminal_shell,
+    "terminal": resolve_terminal_shell,
     "process": resolve_process_control,
     "test_run": resolve_terminal_shell,
     **{name: resolve_workspace_root for name in {
