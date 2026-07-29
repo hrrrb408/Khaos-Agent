@@ -6,6 +6,7 @@ import pytest
 
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import WorkspaceState, WorkspaceTransition
+from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 
 
 def _repo(path: Path) -> Path:
@@ -25,6 +26,10 @@ async def test_worktree_lifecycle_and_changeset_binding(tmp_path: Path):
     manager = WorkspaceManager(tmp_path / "worktrees")
     workspace = await manager.create(repository, "task-1")
     assert workspace.state is WorkspaceState.READY
+    for name in PROTECTED_WORKSPACE_NAMES:
+        protected = workspace.worktree_path / name
+        assert protected.exists()
+        assert not protected.is_symlink()
     (workspace.worktree_path / "README.md").write_text("changed\n")
     changeset = await manager.build_changeset(workspace.id)
     assert "README.md" in changeset.changed_files

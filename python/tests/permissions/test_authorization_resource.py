@@ -74,6 +74,18 @@ def test_workspace_escape_and_cross_workspace_replay_are_rejected(tmp_path: Path
             workspace_manager=manager,
             resource_resolver=resolve_single_workspace_path,
         )
+    with pytest.raises(PermissionError, match="protected"):
+        resolve_authorization_resource(
+            "write_file",
+            {"path": ".codex/instructions.md", "content": "unsafe"},
+            principal_id="principal-a",
+            project_id="project-a",
+            runtime_id="runtime-a",
+            task_id="task-a",
+            workspace_id="workspace-a",
+            workspace_manager=manager,
+            resource_resolver=resolve_single_workspace_path,
+        )
 
 
 def test_workspace_owner_replay_is_rejected(tmp_path: Path) -> None:

@@ -399,13 +399,11 @@ class MacOSSandboxBackend:
         from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 
         protected_write_rules = "".join(
-            (
-                f'(deny file-write* (subpath "{_seatbelt_escape(path)}"))'
-                if path.is_dir()
-                else f'(deny file-write* (literal "{_seatbelt_escape(path)}"))'
+            f'(deny file-write* (literal "{_seatbelt_escape(path)}"))'
+            f'(deny file-write* (subpath "{_seatbelt_escape(path)}"))'
+            for path in (
+                workspace / name for name in sorted(PROTECTED_WORKSPACE_NAMES)
             )
-            for name in sorted(PROTECTED_WORKSPACE_NAMES)
-            if (path := workspace / name).exists()
         )
         mach_lookup_rules = "".join(
             f'(allow mach-lookup (global-name "{service}"))'

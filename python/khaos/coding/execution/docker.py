@@ -152,14 +152,22 @@ class DockerBackend:
             "--ulimit", f"nofile={context.budget.open_files}:{context.budget.open_files}",
             "--network", "none", "--mount",
             f"type=bind,src={context.worktree_path},dst=/workspace",
-            "--mount",
-            (
-                "type=bind,"
-                f"src={context.worktree_path / '.git'},"
-                "dst=/workspace/.git,readonly"
-            ),
-            "--workdir", str(container_cwd),
         ]
+        from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+
+        for name in sorted(PROTECTED_WORKSPACE_NAMES):
+            source = context.worktree_path / name
+            if not source.exists() or source.is_symlink():
+                raise PermissionError(
+                    f"protected workspace mount target is unavailable: {name}"
+                )
+            argv.extend(
+                (
+                    "--mount",
+                    f"type=bind,src={source},dst=/workspace/{name},readonly",
+                )
+            )
+        argv.extend(("--workdir", str(container_cwd)))
         env_file = self._write_env_file(context)
         if env_file is not None:
             argv.extend(["--env-file", str(env_file)])

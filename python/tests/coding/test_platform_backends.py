@@ -69,6 +69,14 @@ def test_writable_platform_profiles_protect_all_control_metadata(tmp_path: Path)
     assert ("--ro-bind", str(policy.resolve()), "/workspace/khaos_policy.yaml") in mounts
 
 
+def test_macos_profile_denies_creation_of_missing_control_metadata(tmp_path: Path):
+    profile = MacOSSandboxBackend().profile(tmp_path)
+    for name in (".agents", ".codex", ".khaos", "khaos_policy.yaml"):
+        path = tmp_path.resolve() / name
+        assert f'(deny file-write* (literal "{path}"))' in profile
+        assert f'(deny file-write* (subpath "{path}"))' in profile
+
+
 def test_read_only_platform_profiles_do_not_mount_workspace_writable(tmp_path: Path):
     mac_profile = MacOSSandboxBackend().profile(tmp_path, writable=False)
     assert f'(allow file-write* (subpath "{tmp_path.resolve()}"))' not in mac_profile

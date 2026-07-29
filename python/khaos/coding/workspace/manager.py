@@ -27,6 +27,7 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageViolation,
     capture_workspace_snapshot,
 )
+from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -35,6 +36,28 @@ FileIdentity = tuple[int, int, int, int]
 
 class WorkspaceError(RuntimeError):
     """Raised when a worktree operation cannot be completed safely."""
+
+
+def _install_protected_metadata_guards(worktree: Path) -> None:
+    """Ensure every protected name has a non-symlink mount target.
+
+    Linux namespace and Docker backends can only apply a child read-only bind
+    when the mountpoint exists.  Missing protected names are therefore
+    represented by empty directories inside the disposable worktree.  They
+    are part of the storage baseline and are removed with the worktree.
+    """
+    entries = {entry.name.casefold(): entry for entry in worktree.iterdir()}
+    for name in sorted(PROTECTED_WORKSPACE_NAMES):
+        path = entries.get(name.casefold(), worktree / name)
+        if not path.exists() and not path.is_symlink():
+            path.mkdir(mode=0o500)
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            raise WorkspaceError(f"protected workspace metadata is a symlink: {name}")
+        if not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode)):
+            raise WorkspaceError(f"protected workspace metadata has unsafe type: {name}")
+        if stat.S_ISREG(info.st_mode) and info.st_nlink != 1:
+            raise WorkspaceError(f"protected workspace metadata is hardlinked: {name}")
 
 
 def _identity(info: os.stat_result) -> FileIdentity:
@@ -301,6 +324,13 @@ class WorkspaceManager:
                 root_device=int(root_stat.st_dev),
                 root_inode=int(root_stat.st_ino),
             )
+            try:
+                await asyncio.to_thread(_install_protected_metadata_guards, path)
+            except Exception:
+                await self._git(
+                    repository, "worktree", "remove", "--force", str(path)
+                )
+                raise
             baseline = await asyncio.to_thread(capture_workspace_snapshot, path)
             if not baseline.complete:
                 await self._git(
@@ -467,6 +497,10 @@ class WorkspaceManager:
         patch = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--binary", workspace.base_sha, preserve_output=True)
         stat = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--stat", workspace.base_sha)
         names = await self._workspace_git(workspace, "diff", "--no-ext-diff", "--name-only", workspace.base_sha)
+        protected = {name.casefold() for name in PROTECTED_WORKSPACE_NAMES}
+        for changed in names.splitlines():
+            if any(part.casefold() in protected for part in Path(changed).parts):
+                raise WorkspaceError("changeset contains protected workspace metadata")
         changeset = ChangeSet.create(id=uuid.uuid4().hex[:12], workspace_id=workspace_id, base_sha=workspace.base_sha, head_sha=None, patch=patch, diff_stat=stat, changed_files=tuple(line for line in names.splitlines() if line))
         artifact = workspace.worktree_path.parent / f"{changeset.id}.patch"
         artifact.write_text(patch, encoding="utf-8")

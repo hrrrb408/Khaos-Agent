@@ -211,9 +211,14 @@ def _resolve_workspace_path(root: Path, value: Any) -> str:
     else:
         resolved = (root / candidate).resolve(strict=False)
     try:
-        resolved.relative_to(root)
+        relative = resolved.relative_to(root)
     except ValueError as exc:
         raise PermissionError("tool target escapes active TaskWorkspace") from exc
+    from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+
+    protected = {name.casefold() for name in PROTECTED_WORKSPACE_NAMES}
+    if any(part.casefold() in protected for part in relative.parts):
+        raise PermissionError("tool target is protected workspace metadata")
     return os.fspath(resolved)
 
 
