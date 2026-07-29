@@ -181,6 +181,13 @@ def test_browser_kernel_isolation_job_runs_round6_primitives():
     )
 
 
+def test_fullstack_helper_binds_to_live_non_root_step_ancestor():
+    """The helper authority must outlive sudo and parent the pytest clients."""
+    platform = (WORKFLOWS / "platform-sandbox-security.yml").read_text("utf-8")
+    assert 'KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID="$$"' in platform
+    assert 'KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID="$BASHPID"' not in platform
+
+
 def test_single_security_closure_gate_requires_all_evidence_families():
     gate = (WORKFLOWS / "security-closure-gate.yml").read_text("utf-8")
     for dependency in (

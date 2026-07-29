@@ -394,9 +394,13 @@ jobs:
           KHAOS_SENTINEL_SECRET: must-not-reach-browser
         run: |
           runner_uid="$(id -u)"
+          # Bind the helper to this still-running step shell.  BASHPID is
+          # evaluated in the asynchronous sudo list and names the process
+          # that immediately becomes root, so it cannot satisfy the helper's
+          # non-root UID check.  The pytest clients remain descendants of $$.
           sudo nohup env \
             KHAOS_BROWSER_KERNEL_HELPER_UID="$runner_uid" \
-            KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID="$BASHPID" \
+            KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID="$$" \
             KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos/browser-kernel-helper.sock \
             KHAOS_BROWSER_HELPER_SECRET_FILE=/var/lib/khaos/browser-helper.secret \
             /usr/local/sbin/khaos-browser-kernel-helper \
