@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import pytest
 
 from khaos.coding.execution import BackendSelector, UnsupportedBackend
@@ -7,6 +10,24 @@ from khaos.coding.execution import BackendSelector, UnsupportedBackend
 async def test_selector_never_uses_host_for_write_without_platform_sandbox(monkeypatch):
     monkeypatch.setattr("khaos.coding.execution.platform.sys.platform", "unknown")
     assert isinstance(BackendSelector().select(writable=True), UnsupportedBackend)
+
+
+@pytest.mark.asyncio
+async def test_async_selector_does_not_block_event_loop(monkeypatch):
+    selector = BackendSelector()
+    monkeypatch.setattr(
+        selector,
+        "select",
+        lambda *, writable: (time.sleep(0.08), UnsupportedBackend())[1],
+    )
+    ticks: list[float] = []
+
+    async def heartbeat() -> None:
+        await asyncio.sleep(0.01)
+        ticks.append(time.monotonic())
+
+    await asyncio.gather(selector.select_async(writable=True), heartbeat())
+    assert ticks
 
 
 def test_selector_never_uses_host_for_read_without_platform_sandbox(monkeypatch):
