@@ -72,12 +72,12 @@ use serde::{{Deserialize, Serialize}};
 pub const PROTOCOL_VERSION: u16 = {properties["protocol_version"]["const"]};
 pub const MAX_MESSAGE_BYTES: usize = {schema["x-khaos-max-message-bytes"]};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum BrowserKernelOperation {{
 {variants}
 }}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserKernelRequest {{
     pub protocol_version: u16,
@@ -97,7 +97,7 @@ pub struct BrowserKernelRequest {{
     pub target_start_time: Option<u64>,
 }}
 
-#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
 pub enum BrowserKernelErrorCode {{
 {error_variants}
 }}
@@ -119,6 +119,18 @@ pub struct BrowserKernelIsolationStatus {{
 pub struct BrowserKernelResponse<'a> {{
     pub protocol_version: u16,
     pub request_id: &'a str,
+    pub ok: bool,
+    pub error_code: Option<BrowserKernelErrorCode>,
+    pub error: Option<String>,
+    pub status: Option<BrowserKernelIsolationStatus>,
+    pub runtime_capability: Option<String>,
+}}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserKernelResponseOwned {{
+    pub protocol_version: u16,
+    pub request_id: String,
     pub ok: bool,
     pub error_code: Option<BrowserKernelErrorCode>,
     pub error: Option<String>,

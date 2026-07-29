@@ -359,6 +359,9 @@ def test_python_and_rust_protocol_contract_matches_canonical_schema() -> None:
         repository
         / "rust/khaos-core/src/bin/khaos-browser-kernel-helper.rs"
     ).read_text(encoding="utf-8")
+    launcher_source = (
+        repository / "rust/khaos-core/src/bin/khaos-sandbox-launcher.rs"
+    ).read_text(encoding="utf-8")
 
     assert schema["x-khaos-max-message-bytes"] == 8192
     assert schema["properties"]["sandbox_token"]["pattern"] == (
@@ -380,3 +383,15 @@ def test_python_and_rust_protocol_contract_matches_canonical_schema() -> None:
     assert "validate_hex(&request.sandbox_token, 32, 128" in helper_source
     assert "MAX_MESSAGE_BYTES" in helper_source
     assert "PROTOCOL_VERSION" in helper_source
+    assert "BrowserKernelRequest as HelperRequest" in launcher_source
+    assert "BrowserKernelResponseOwned as HelperResponse" in launcher_source
+    assert "struct HelperRequest" not in launcher_source
+    assert "HelperOperation::Authorize" in launcher_source
+    assert "HelperOperation::Join" in launcher_source
+    for identity_env in (
+        "KHAOS_BROWSER_PRINCIPAL_ID",
+        "KHAOS_BROWSER_PROJECT_ID",
+        "KHAOS_BROWSER_RUNTIME_ID",
+        "KHAOS_BROWSER_TASK_ID",
+    ):
+        assert identity_env in launcher_source

@@ -654,6 +654,8 @@ class BrowserNetworkSandbox:
         self._token: str = sandbox_token or secrets.token_hex(32)
         self._project_id = project_id
         self._runtime_id = runtime_id
+        self._principal_id = principal_id
+        self._task_id = task_id
         self._kernel_authority = kernel_authority
         self._production_authority = (
             require_os_sandbox and os.environ.get("KHAOS_DEV_MODE") != "1"
@@ -1640,11 +1642,13 @@ class BrowserNetworkSandbox:
         Batch 9.1 (round-9 §九): this dict is the COMPLETE Chromium
         environment — it NO LONGER inherits ``os.environ``.  Only an
         explicit allowlist of benign runtime variables (PATH, locale, TLS
-        roots, Playwright browser path) is forwarded, plus the four
+        roots, Playwright browser path) is forwarded, plus the bounded
         ``KHAOS_BROWSER_*`` authority-metadata vars that the Rust launcher
         strips at the namespace boundary.  Provider API keys, cloud
         credentials, proxy secrets and any other parent-process env are
-        therefore NOT visible to a compromised Chromium.
+        therefore NOT visible to a compromised Chromium.  The complete
+        abstract authorization identity is forwarded only to the trusted
+        outer launcher and removed before Chromium starts.
         """
         launcher = self._locate_and_validate_browser_launcher()
         if launcher is None:
@@ -1668,8 +1672,10 @@ class BrowserNetworkSandbox:
         env["KHAOS_BROWSER_REAL_EXECUTABLE"] = real_executable
         if self._production_authority:
             env["KHAOS_BROWSER_AUTHORITY"] = "1"
+            env["KHAOS_BROWSER_PRINCIPAL_ID"] = self._principal_id
             env["KHAOS_BROWSER_PROJECT_ID"] = self._project_id
             env["KHAOS_BROWSER_RUNTIME_ID"] = self._runtime_id
+            env["KHAOS_BROWSER_TASK_ID"] = self._task_id
             env["KHAOS_BROWSER_SANDBOX_TOKEN"] = self._token
             helper_socket = os.environ.get("KHAOS_BROWSER_KERNEL_HELPER_SOCKET")
             if helper_socket:

@@ -73,7 +73,9 @@ def test_production_routes_setup_policy_and_teardown_only_to_helper(
     )
     sandbox = BrowserNetworkSandbox(
         require_os_sandbox=True,
+        principal_id="principal-a",
         project_id="project-a",
+        task_id="task-a",
         runtime_id="runtime-a",
         sandbox_token="ab" * 32,
         kernel_authority=authority,  # type: ignore[arg-type]
@@ -97,7 +99,9 @@ def test_production_routes_setup_policy_and_teardown_only_to_helper(
 def test_production_status_is_evidence_backed(production: None) -> None:
     sandbox = BrowserNetworkSandbox(
         require_os_sandbox=True,
+        principal_id="principal-a",
         project_id="project-a",
+        task_id="task-a",
         runtime_id="runtime-a",
         sandbox_token="ab" * 32,
         kernel_authority=FakeAuthority(),  # type: ignore[arg-type]
@@ -137,7 +141,9 @@ def test_launcher_environment_contains_no_kernel_resource_identity(
 ) -> None:
     sandbox = BrowserNetworkSandbox(
         require_os_sandbox=True,
+        principal_id="principal-a",
         project_id="project-a",
+        task_id="task-a",
         runtime_id="runtime-a",
         sandbox_token="ab" * 32,
         kernel_authority=FakeAuthority(),  # type: ignore[arg-type]
@@ -153,6 +159,10 @@ def test_launcher_environment_contains_no_kernel_resource_identity(
     environment = sandbox.launcher_environment("/trusted/chromium")
 
     assert environment["KHAOS_BROWSER_AUTHORITY"] == "1"
+    assert environment["KHAOS_BROWSER_PRINCIPAL_ID"] == "principal-a"
+    assert environment["KHAOS_BROWSER_PROJECT_ID"] == "project-a"
+    assert environment["KHAOS_BROWSER_RUNTIME_ID"] == "runtime-a"
+    assert environment["KHAOS_BROWSER_TASK_ID"] == "task-a"
     assert environment["KHAOS_BROWSER_SANDBOX_TOKEN"] == "ab" * 32
     assert "KHAOS_BROWSER_NETNS" not in environment
     assert "KHAOS_BROWSER_CGROUP_PROCS" not in environment

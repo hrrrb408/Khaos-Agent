@@ -2,7 +2,11 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
-    use serde::{Deserialize, Serialize};
+    use _khaos_core::browser_kernel_protocol_generated::{
+        BrowserKernelOperation as HelperOperation, BrowserKernelRequest as HelperRequest,
+        BrowserKernelResponseOwned as HelperResponse, MAX_MESSAGE_BYTES as HELPER_MAX_MESSAGE,
+        PROTOCOL_VERSION as HELPER_PROTOCOL_VERSION,
+    };
     use std::env;
     use std::ffi::CString;
     use std::io::{self, Read, Write};
@@ -19,48 +23,7 @@ mod linux {
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
     const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
     const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
-    const HELPER_PROTOCOL_VERSION: u16 = 1;
-    const HELPER_MAX_MESSAGE: usize = 8192;
     const DEFAULT_HELPER_SOCKET: &str = "/run/khaos/browser-kernel-helper.sock";
-
-    #[derive(Serialize)]
-    struct HelperRequest<'a> {
-        protocol_version: u16,
-        request_id: String,
-        boot_id: String,
-        client_pid: u32,
-        client_start_time: u64,
-        project_id: &'a str,
-        runtime_id: &'a str,
-        sandbox_token: &'a str,
-        op: &'static str,
-        port: Option<u16>,
-        target_pid: Option<u32>,
-        target_start_time: Option<u64>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct HelperResponse {
-        protocol_version: u16,
-        request_id: String,
-        ok: bool,
-        error: Option<String>,
-        status: Option<HelperStatus>,
-    }
-
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct HelperStatus {
-        helper_authenticated: bool,
-        network_namespace: bool,
-        nft_default_deny: bool,
-        cgroup_attached: bool,
-        process_isolated: bool,
-        resource_registry_verified: bool,
-        quarantined: bool,
-        proxy_host: String,
-    }
 
     const BPF_LD: u16 = 0x00;
     const BPF_W: u16 = 0x00;
@@ -362,9 +325,17 @@ mod linux {
         Ok(())
     }
 
-    fn join_browser_authority(project_id: &str, runtime_id: &str, token: &str) -> io::Result<()> {
+    fn join_browser_authority(
+        principal_id: &str,
+        project_id: &str,
+        runtime_id: &str,
+        task_id: &str,
+        token: &str,
+    ) -> io::Result<()> {
+        validate_authority_identifier(principal_id, "principal_id")?;
         validate_authority_identifier(project_id, "project_id")?;
         validate_authority_identifier(runtime_id, "runtime_id")?;
+        validate_authority_identifier(task_id, "task_id")?;
         if token.len() < 32
             || token.len() > 256
             || !token.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -377,50 +348,85 @@ mod linux {
         let socket_path = env::var("KHAOS_BROWSER_KERNEL_HELPER_SOCKET")
             .unwrap_or_else(|_| DEFAULT_HELPER_SOCKET.to_owned());
         validate_helper_socket(&socket_path)?;
-        let mut stream = UnixStream::connect(&socket_path)?;
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
-        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
-        validate_helper_peer(&stream)?;
         let client_pid = std::process::id();
         let client_start_time = process_start_time(client_pid)?;
-        let request_id = format!("join-{client_pid}-{client_start_time}");
-        let request = HelperRequest {
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
+            .trim()
+            .to_owned();
+
+        // Capabilities are bound to the exact launcher PID/start-time.  The
+        // Python client's capability therefore cannot be replayed by this
+        // child: authorize this peer first, then use the returned capability
+        // for the descriptor-bearing join request.
+        let authorize_id = format!("authorize-{client_pid}-{client_start_time}");
+        let authorize = HelperRequest {
             protocol_version: HELPER_PROTOCOL_VERSION,
-            request_id: request_id.clone(),
-            boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?
-                .trim()
-                .to_owned(),
+            request_id: authorize_id.clone(),
+            boot_id: boot_id.clone(),
             client_pid,
             client_start_time,
-            project_id,
-            runtime_id,
-            sandbox_token: token,
-            op: "join",
+            principal_id: principal_id.to_owned(),
+            project_id: project_id.to_owned(),
+            runtime_id: runtime_id.to_owned(),
+            task_id: task_id.to_owned(),
+            sandbox_token: token.to_owned(),
+            runtime_capability: None,
+            op: HelperOperation::Authorize,
             port: None,
             target_pid: None,
             target_start_time: None,
         };
-        let data = serde_json::to_vec(&request).map_err(io::Error::other)?;
-        if data.len() > HELPER_MAX_MESSAGE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "helper request too large",
-            ));
-        }
-        stream.write_all(&(data.len() as u32).to_be_bytes())?;
-        stream.write_all(&data)?;
-        let (response, namespace) = receive_helper_fd(&stream)?;
-        if response.protocol_version != HELPER_PROTOCOL_VERSION
-            || response.request_id != request_id
-            || !response.ok
-        {
+        let mut authorize_stream = connect_helper(&socket_path)?;
+        send_helper_request(&mut authorize_stream, &authorize)?;
+        let authorize_response = receive_helper_response(&mut authorize_stream)?;
+        validate_helper_response(&authorize_response, &authorize_id)?;
+        let capability = authorize_response.runtime_capability.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper runtime capability missing",
+            )
+        })?;
+        if capability.len() != 64 || !capability.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                response
-                    .error
-                    .unwrap_or_else(|| "helper response invalid".to_owned()),
+                "helper runtime capability invalid",
             ));
         }
+
+        let request_id = format!("join-{client_pid}-{client_start_time}");
+        let request = HelperRequest {
+            protocol_version: HELPER_PROTOCOL_VERSION,
+            request_id: request_id.clone(),
+            boot_id,
+            client_pid,
+            client_start_time,
+            principal_id: principal_id.to_owned(),
+            project_id: project_id.to_owned(),
+            runtime_id: runtime_id.to_owned(),
+            task_id: task_id.to_owned(),
+            sandbox_token: token.to_owned(),
+            runtime_capability: Some(capability),
+            op: HelperOperation::Join,
+            port: None,
+            target_pid: None,
+            target_start_time: None,
+        };
+        let mut stream = connect_helper(&socket_path)?;
+        send_helper_request(&mut stream, &request)?;
+        let (response, namespace) = receive_helper_fd(&mut stream)?;
+        validate_helper_response(&response, &request_id)?;
+        if response.runtime_capability.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "join response leaked a runtime capability",
+            ));
+        }
+        let namespace = namespace.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper namespace descriptor missing",
+            )
+        })?;
         let status = response
             .status
             .ok_or_else(|| io::Error::other("helper isolation evidence missing"))?;
@@ -535,7 +541,68 @@ mod linux {
             .map_err(io::Error::other)
     }
 
-    fn receive_helper_fd(stream: &UnixStream) -> io::Result<(HelperResponse, OwnedFd)> {
+    fn connect_helper(socket_path: &str) -> io::Result<UnixStream> {
+        let stream = UnixStream::connect(socket_path)?;
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(5)))?;
+        stream.set_write_timeout(Some(std::time::Duration::from_secs(5)))?;
+        validate_helper_peer(&stream)?;
+        Ok(stream)
+    }
+
+    fn send_helper_request(stream: &mut UnixStream, request: &HelperRequest) -> io::Result<()> {
+        let data = serde_json::to_vec(request).map_err(io::Error::other)?;
+        if data.is_empty() || data.len() > HELPER_MAX_MESSAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "helper request too large",
+            ));
+        }
+        stream.write_all(&(data.len() as u32).to_be_bytes())?;
+        stream.write_all(&data)
+    }
+
+    fn validate_helper_response(response: &HelperResponse, request_id: &str) -> io::Result<()> {
+        if response.protocol_version != HELPER_PROTOCOL_VERSION || response.request_id != request_id
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "helper response identity invalid",
+            ));
+        }
+        if !response.ok {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                response
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "helper rejected request".to_owned()),
+            ));
+        }
+        if response.error.is_some() || response.error_code.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "successful helper response carried an error",
+            ));
+        }
+        Ok(())
+    }
+
+    fn receive_helper_response(stream: &mut UnixStream) -> io::Result<HelperResponse> {
+        let mut length = [0_u8; 4];
+        stream.read_exact(&mut length)?;
+        let length = u32::from_be_bytes(length) as usize;
+        if length == 0 || length > HELPER_MAX_MESSAGE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "helper response length invalid",
+            ));
+        }
+        let mut data = vec![0_u8; length];
+        stream.read_exact(&mut data)?;
+        serde_json::from_slice(&data).map_err(io::Error::other)
+    }
+
+    fn receive_helper_fd(stream: &mut UnixStream) -> io::Result<(HelperResponse, Option<OwnedFd>)> {
         let mut data = vec![0_u8; HELPER_MAX_MESSAGE + 4];
         let mut vector = libc::iovec {
             iov_base: data.as_mut_ptr().cast(),
@@ -550,39 +617,58 @@ mod linux {
         message.msg_controllen = control.len();
         let received =
             unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
-        if received < 4 {
+        if received <= 0 {
             return Err(if received < 0 {
                 io::Error::last_os_error()
             } else {
-                io::Error::new(io::ErrorKind::UnexpectedEof, "short helper response")
+                io::Error::new(io::ErrorKind::UnexpectedEof, "empty helper response")
             });
         }
+        if message.msg_flags & libc::MSG_CTRUNC != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "helper descriptor control data truncated",
+            ));
+        }
+        let mut total = received as usize;
+        if total < 4 {
+            stream.read_exact(&mut data[total..4])?;
+            total = 4;
+        }
         let length = u32::from_be_bytes(data[..4].try_into().map_err(io::Error::other)?) as usize;
-        if length == 0 || length > HELPER_MAX_MESSAGE || received as usize != length + 4 {
+        let frame_length = length.saturating_add(4);
+        if length == 0 || length > HELPER_MAX_MESSAGE || total > frame_length {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "helper response length invalid",
             ));
         }
+        if total < frame_length {
+            stream.read_exact(&mut data[total..frame_length])?;
+        }
         let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-        if header.is_null()
-            || unsafe { (*header).cmsg_level } != libc::SOL_SOCKET
-            || unsafe { (*header).cmsg_type } != libc::SCM_RIGHTS
-            || unsafe { (*header).cmsg_len }
-                != unsafe { libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize }
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "helper namespace descriptor missing",
-            ));
-        }
-        let descriptor = unsafe { *libc::CMSG_DATA(header).cast::<RawFd>() };
-        if descriptor < 0 {
-            return Err(io::Error::other("helper namespace descriptor invalid"));
-        }
+        let descriptor = if header.is_null() {
+            None
+        } else {
+            if unsafe { (*header).cmsg_level } != libc::SOL_SOCKET
+                || unsafe { (*header).cmsg_type } != libc::SCM_RIGHTS
+                || unsafe { (*header).cmsg_len }
+                    != unsafe { libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize }
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "helper namespace descriptor invalid",
+                ));
+            }
+            let descriptor = unsafe { *libc::CMSG_DATA(header).cast::<RawFd>() };
+            if descriptor < 0 {
+                return Err(io::Error::other("helper namespace descriptor invalid"));
+            }
+            Some(unsafe { OwnedFd::from_raw_fd(descriptor) })
+        };
         let response = serde_json::from_slice::<HelperResponse>(&data[4..4 + length])
             .map_err(io::Error::other)?;
-        Ok((response, unsafe { OwnedFd::from_raw_fd(descriptor) }))
+        Ok((response, descriptor))
     }
 
     /// Move this process into an existing cgroup-v2 leaf without applying
@@ -750,13 +836,17 @@ mod linux {
             })?;
             if env::var_os("KHAOS_BROWSER_AUTHORITY").as_deref() == Some(std::ffi::OsStr::new("1"))
             {
+                let principal_id = env::var("KHAOS_BROWSER_PRINCIPAL_ID")
+                    .map_err(|_| io::Error::other("browser principal identity missing"))?;
                 let project_id = env::var("KHAOS_BROWSER_PROJECT_ID")
                     .map_err(|_| io::Error::other("browser project identity missing"))?;
                 let runtime_id = env::var("KHAOS_BROWSER_RUNTIME_ID")
                     .map_err(|_| io::Error::other("browser runtime identity missing"))?;
+                let task_id = env::var("KHAOS_BROWSER_TASK_ID")
+                    .map_err(|_| io::Error::other("browser task identity missing"))?;
                 let token = env::var("KHAOS_BROWSER_SANDBOX_TOKEN")
                     .map_err(|_| io::Error::other("browser sandbox token missing"))?;
-                join_browser_authority(&project_id, &runtime_id, &token)?;
+                join_browser_authority(&principal_id, &project_id, &runtime_id, &task_id, &token)?;
             } else {
                 if env::var_os("KHAOS_DEV_MODE").as_deref() != Some(std::ffi::OsStr::new("1")) {
                     return Err(io::Error::new(
@@ -971,9 +1061,13 @@ mod linux {
                 "--unsetenv".into(),
                 "KHAOS_BROWSER_AUTHORITY".into(),
                 "--unsetenv".into(),
+                "KHAOS_BROWSER_PRINCIPAL_ID".into(),
+                "--unsetenv".into(),
                 "KHAOS_BROWSER_PROJECT_ID".into(),
                 "--unsetenv".into(),
                 "KHAOS_BROWSER_RUNTIME_ID".into(),
+                "--unsetenv".into(),
+                "KHAOS_BROWSER_TASK_ID".into(),
                 "--unsetenv".into(),
                 "KHAOS_BROWSER_SANDBOX_TOKEN".into(),
                 "--unsetenv".into(),
@@ -1134,16 +1228,22 @@ mod linux {
             if args.first().is_some_and(|arg| arg == "--") {
                 args.remove(0);
             }
+            let principal_id = env::var("KHAOS_BROWSER_PRINCIPAL_ID")
+                .map_err(|_| io::Error::other("browser principal identity missing"))?;
             let project_id = env::var("KHAOS_BROWSER_PROJECT_ID")
                 .map_err(|_| io::Error::other("browser project identity missing"))?;
             let runtime_id = env::var("KHAOS_BROWSER_RUNTIME_ID")
                 .map_err(|_| io::Error::other("browser runtime identity missing"))?;
+            let task_id = env::var("KHAOS_BROWSER_TASK_ID")
+                .map_err(|_| io::Error::other("browser task identity missing"))?;
             let token = env::var("KHAOS_BROWSER_SANDBOX_TOKEN")
                 .map_err(|_| io::Error::other("browser sandbox token missing"))?;
+            env::remove_var("KHAOS_BROWSER_PRINCIPAL_ID");
             env::remove_var("KHAOS_BROWSER_PROJECT_ID");
             env::remove_var("KHAOS_BROWSER_RUNTIME_ID");
+            env::remove_var("KHAOS_BROWSER_TASK_ID");
             env::remove_var("KHAOS_BROWSER_SANDBOX_TOKEN");
-            join_browser_authority(&project_id, &runtime_id, &token)?;
+            join_browser_authority(&principal_id, &project_id, &runtime_id, &task_id, &token)?;
             let remote_debugging_pipe = args
                 .iter()
                 .any(|arg| arg.to_string_lossy() == "--remote-debugging-pipe");
