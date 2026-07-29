@@ -1,0 +1,26 @@
+[Unit]
+Description=Khaos non-root agent runtime
+After=network.target
+
+[Service]
+Type=simple
+User=khaos
+Group=khaos
+WorkingDirectory=/opt/khaos
+Environment=KHAOS_DEV_MODE=0
+Environment=KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
+Environment=KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
+RuntimeDirectory=khaos
+RuntimeDirectoryMode=0700
+ExecStart=/opt/khaos/venv/bin/khaos start --socket /run/khaos/agent.sock --db /var/lib/khaos/khaos.db
+Restart=on-failure
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/run/khaos /var/lib/khaos /run/khaos-helper
+
+[Install]
+WantedBy=multi-user.target

@@ -6,7 +6,8 @@
 
 - **Python**：Agent 核心循环、工具系统、记忆/技能/审计、安全中间件
 - **Go**：API 网关（REST/SSE/Subagent API）
-- **Rust**：高性能 token 计数与并行执行（可选）
+- **Rust**：token/并行执行，以及 Linux production 必需的 sandbox launcher 与
+  browser kernel helper
 
 ## 功能
 
@@ -22,12 +23,22 @@
 
 ```bash
 # Docker
+export KHAOS_PYTHON_CAPABILITY="$(openssl rand -hex 32)"
+export KHAOS_BROWSER_HELPER_SECRET="$(openssl rand -hex 32)"
 docker compose up -d
 
 # 本地
 pip install -e .
 khaos start
 ```
+
+普通启动采用 secure production behavior；只有显式 `KHAOS_DEV_MODE=1` 才允许开发
+fallback。Docker 中 Python 固定为 UID 10001 且没有 kernel capability；root helper
+是 netns/veth/nft/cgroup 的唯一 authority，并通过独立只读 socket volume 与 agent
+通信。Linux 原生部署先审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用
+`khaos-agent.service` 和 `khaos-browser-kernel-helper.service`。不支持的 Windows
+sandbox 路径明确拒绝执行，不回退 Host，也不报告 isolated。详细边界见
+`docs/browser-threat-model.md` 和 `docs/platform-security-guarantees.md`。
 
 ## 开发
 
