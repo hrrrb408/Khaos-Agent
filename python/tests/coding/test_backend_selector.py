@@ -45,5 +45,7 @@ async def test_windows_is_explicitly_unsupported_and_fails_closed(monkeypatch):
 
     assert isinstance(backend, UnsupportedBackend)
     assert "Windows" in availability.reason
+    assert availability.available is False
+    assert availability.network_enforced is False
     with pytest.raises(PermissionError, match="Windows"):
         await backend.execute(object())

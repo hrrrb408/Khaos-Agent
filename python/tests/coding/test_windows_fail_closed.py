@@ -19,8 +19,11 @@ pytestmark = [
 
 async def test_windows_agent_execution_has_no_host_fallback():
     backend = BackendSelector().select(writable=True)
+    availability = await backend.probe()
 
     assert isinstance(backend, UnsupportedBackend)
+    assert availability.available is False
+    assert availability.network_enforced is False
     with pytest.raises(PermissionError, match="Windows"):
         await backend.execute(object())
 

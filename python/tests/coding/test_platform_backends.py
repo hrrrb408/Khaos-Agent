@@ -3,6 +3,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import pytest
@@ -612,9 +613,10 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
         "\n  except OSError: pass"
         "\n  else: raise SystemExit(f'host metadata visible: {hidden}')"
         "\nfor external in (Path('/private/tmp'), Path('/tmp')):"
-        "\n try: list(external.iterdir())"
-        "\n except OSError: pass"
-        "\n else: raise SystemExit(f'system temp visible: {external}')"
+        "\n for operation in (lambda p: p.stat(), lambda p: list(p.iterdir())):"
+        "\n  try: operation(external)"
+        "\n  except OSError: pass"
+        "\n  else: raise SystemExit(f'system temp visible: {external}')"
         "\nfor ipc_command in (('/usr/bin/pbpaste',), ('/usr/bin/security', 'list-keychains')):"
         "\n result = subprocess.run(ipc_command, capture_output=True)"
         "\n if result.returncode == 0: raise SystemExit(f'host IPC allowed: {ipc_command[0]}')"
@@ -639,6 +641,66 @@ async def test_real_macos_sandbox_blocks_network_and_external_writes(tmp_path: P
     assert (workspace / "inside.txt").read_text(encoding="utf-8") == "ok"
     assert (workspace / ".git").read_text(encoding="utf-8").startswith("gitdir: ")
     assert not outside.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.platform_sandbox_real
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS sandbox-exec evidence")
+async def test_real_macos_home_metadata_and_profile_boundaries(tmp_path: Path):
+    """Probe the real credential/profile locations named by the guarantee."""
+    _require_or_skip("sandbox-exec")
+    backend = MacOSSandboxBackend()
+    availability = backend.probe_capability()
+    assert availability.available, availability.reason
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = Path.home()
+    roots = (
+        home / ".ssh",
+        home / ".aws",
+        home / "Library" / "Application Support" / "Google" / "Chrome",
+    )
+    created_roots: list[Path] = []
+    sentinels: list[Path] = []
+    try:
+        for root in roots:
+            if not root.exists():
+                root.mkdir(parents=True)
+                created_roots.append(root)
+            sentinel = root / f"khaos-seatbelt-probe-{uuid.uuid4().hex}"
+            sentinel.write_text("must-not-be-visible", encoding="utf-8")
+            sentinels.append(sentinel)
+        command = (
+            "from pathlib import Path; "
+            f"roots={tuple(str(path) for path in roots)!r}; "
+            f"sentinels={tuple(str(path) for path in sentinels)!r}"
+            "\nfor raw in roots:"
+            "\n path=Path(raw)"
+            "\n for operation in (lambda p: p.stat(), lambda p: list(p.iterdir())):"
+            "\n  try: operation(path)"
+            "\n  except OSError: pass"
+            "\n  else: raise SystemExit(f'home metadata visible: {raw}')"
+            "\nfor raw in sentinels:"
+            "\n try: Path(raw).read_text()"
+            "\n except OSError: pass"
+            "\n else: raise SystemExit(f'home content visible: {raw}')"
+        )
+        result = await backend.execute(
+            ExecutionRequest(
+                (sys.executable, "-c", command),
+                workspace,
+                permission_profile=PermissionProfile(
+                    filesystem=FileSystemAccess.READ_ONLY,
+                    resources=ResourceBudget(timeout_seconds=15),
+                ).bind_workspace(workspace),
+            )
+        )
+        assert result.status == "passed", result.stderr
+    finally:
+        for sentinel in sentinels:
+            sentinel.unlink(missing_ok=True)
+        for root in reversed(created_roots):
+            shutil.rmtree(root, ignore_errors=True)
 
 
 @pytest.mark.asyncio
