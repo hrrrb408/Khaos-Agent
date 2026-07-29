@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import shutil
@@ -102,7 +103,18 @@ def _open_private_authority_root(configured: Path) -> tuple[Path, FileIdentity]:
     return canonical, _identity(info)
 
 
-def _resolve_trusted_git() -> tuple[Path, FileIdentity]:
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        while chunk := os.read(descriptor, 1024 * 1024):
+            digest.update(chunk)
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def _resolve_trusted_git() -> tuple[Path, FileIdentity, str]:
     """Resolve Git once and pin its root-owned immutable file identity."""
     candidate = shutil.which("git")
     if candidate is None:
@@ -122,7 +134,7 @@ def _resolve_trusted_git() -> tuple[Path, FileIdentity]:
         parent_info = parent.stat()
         if parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
             raise WorkspaceError("Git executable parent chain is not trusted")
-    return executable, _identity(info)
+    return executable, _identity(info), _file_digest(executable)
 
 
 def _verify_identity(
@@ -131,6 +143,7 @@ def _verify_identity(
     *,
     require_root_owner: bool,
     label: str,
+    expected_digest: str | None = None,
 ) -> None:
     """Open with no-follow and compare the live device/inode/mode authority."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
@@ -140,6 +153,12 @@ def _verify_identity(
         descriptor = os.open(path, flags)
         try:
             current = os.fstat(descriptor)
+            if expected_digest is not None:
+                digest = hashlib.sha256()
+                while chunk := os.read(descriptor, 1024 * 1024):
+                    digest.update(chunk)
+                if digest.hexdigest() != expected_digest:
+                    raise WorkspaceError(f"{label} content digest drifted")
         finally:
             os.close(descriptor)
     except OSError as exc:
@@ -184,7 +203,11 @@ class WorkspaceManager:
         self.root, self._root_identity = _open_private_authority_root(
             configured_root
         )
-        self._git_executable, self._git_identity = _resolve_trusted_git()
+        (
+            self._git_executable,
+            self._git_identity,
+            self._git_digest,
+        ) = _resolve_trusted_git()
         self.storage_limits = storage_limits or WorkspaceStorageLimits()
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._workspaces: dict[str, TaskWorkspace] = {}
@@ -216,6 +239,7 @@ class WorkspaceManager:
             self._git_identity,
             require_root_owner=True,
             label="Git executable",
+            expected_digest=self._git_digest,
         )
         _verify_identity(
             self.root,

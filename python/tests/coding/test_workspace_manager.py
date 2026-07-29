@@ -132,6 +132,16 @@ async def test_host_git_does_not_inherit_git_configuration_environment(
 
 
 @pytest.mark.asyncio
+async def test_host_git_digest_drift_fails_before_execution(tmp_path: Path):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    manager._git_digest = "0" * 64
+
+    with pytest.raises(WorkspaceError, match="content digest drifted"):
+        await manager._git(repository, "status", "--porcelain")
+
+
+@pytest.mark.asyncio
 async def test_workspace_authority_root_mode_drift_fails_before_git(
     tmp_path: Path,
 ):
