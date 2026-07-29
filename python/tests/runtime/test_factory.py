@@ -22,3 +22,26 @@ async def test_factory_wires_office_and_coding_runtime(tmp_path):
     assert coding.task_manager and coding.skill_generator and coding.new_verify_fix_loop
     assert coding.new_verify_fix_loop() is not coding.new_verify_fix_loop()
     await db.close()
+
+
+async def test_factory_rejects_mock_router_outside_explicit_dev_mode(
+    tmp_path, monkeypatch,
+):
+    db = Database(tmp_path / "runtime.db")
+    await db.connect()
+    await db.run_migrations()
+    monkeypatch.delenv("KHAOS_DEV_MODE", raising=False)
+
+    def unavailable(*_args, **_kwargs):
+        raise ValueError("invalid model configuration")
+
+    monkeypatch.setattr("khaos.grpc_server.load_router_from_config", unavailable)
+    with pytest.raises(ValueError, match="invalid model configuration"):
+        await build_runtime(
+            RuntimeConfig(
+                db=db,
+                project_root=tmp_path,
+                principal_id="local-uid:test",
+            )
+        )
+    await db.close()
