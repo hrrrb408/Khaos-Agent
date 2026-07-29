@@ -78,7 +78,8 @@ mod linux {
         runtime_capability: Option<String>,
     }
 
-    #[derive(Clone, Default, Serialize)]
+    #[derive(Clone, Default, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
     struct IsolationStatus {
         helper_authenticated: bool,
         network_namespace: bool,
@@ -98,6 +99,8 @@ mod linux {
         runtime_id: String,
         task_id: String,
         sandbox_token: String,
+        client_pid: u32,
+        client_start_time: u64,
     }
 
     #[derive(Clone)]
@@ -127,6 +130,8 @@ mod linux {
         identity: ResourceIdentity,
         names: ResourceNames,
         stage: String,
+        ports: Vec<u16>,
+        status: IsolationStatus,
         mac: String,
     }
 
@@ -244,14 +249,21 @@ mod linux {
             identity: &ResourceIdentity,
             names: &ResourceNames,
             stage: &str,
+            ports: &HashSet<u16>,
+            status: &IsolationStatus,
         ) -> io::Result<()> {
             fs::create_dir_all(&self.journal_root)?;
             fs::set_permissions(&self.journal_root, fs::Permissions::from_mode(0o700))?;
-            let body = serde_json::to_vec(&(identity, names, stage)).map_err(io::Error::other)?;
+            let mut sorted_ports: Vec<u16> = ports.iter().copied().collect();
+            sorted_ports.sort_unstable();
+            let body = serde_json::to_vec(&(identity, names, stage, &sorted_ports, status))
+                .map_err(io::Error::other)?;
             let envelope = JournalEnvelope {
                 identity: identity.clone(),
                 names: names.clone(),
                 stage: stage.to_owned(),
+                ports: sorted_ports,
+                status: status.clone(),
                 mac: hmac_hex(&self.secret, &body)?,
             };
             let path = self.journal_root.join(format!("{}.json", names.key));
@@ -367,6 +379,8 @@ mod linux {
             runtime_id: request.runtime_id.clone(),
             task_id: request.task_id.clone(),
             sandbox_token: request.sandbox_token.clone(),
+            client_pid: request.client_pid,
+            client_start_time: request.client_start_time,
         };
         let key = state.derive_key(&identity)?;
         match request.op {
@@ -437,10 +451,22 @@ mod linux {
                 ));
             }
         }
-        state.journal(&identity, &names, "intent")?;
+        let empty_ports = HashSet::new();
+        let pending_status = IsolationStatus::default();
+        let active_status = IsolationStatus {
+            helper_authenticated: true,
+            network_namespace: true,
+            nft_default_deny: true,
+            cgroup_attached: true,
+            process_isolated: false,
+            resource_registry_verified: true,
+            quarantined: false,
+            proxy_host: names.host_ip.clone(),
+        };
+        state.journal(&identity, &names, "intent", &empty_ports, &pending_status)?;
         let result = (|| {
             run_ip(state, &["netns", "add", &names.netns])?;
-            state.journal(&identity, &names, "netns")?;
+            state.journal(&identity, &names, "netns", &empty_ports, &pending_status)?;
             run_ip(
                 state,
                 &[
@@ -498,11 +524,11 @@ mod linux {
                     &names.host_ip,
                 ],
             )?;
-            state.journal(&identity, &names, "veth")?;
+            state.journal(&identity, &names, "veth", &empty_ports, &pending_status)?;
             create_cgroup(&names.cgroup)?;
-            state.journal(&identity, &names, "cgroup")?;
+            state.journal(&identity, &names, "cgroup", &empty_ports, &pending_status)?;
             apply_nft(state, &names, &HashSet::new(), false)?;
-            state.journal(&identity, &names, "active")?;
+            state.journal(&identity, &names, "active", &empty_ports, &active_status)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -520,7 +546,13 @@ mod linux {
                 // Without this insertion a live helper cannot report or retry
                 // cleanup until a restart reconstructs the journal.
                 record.status.quarantined = true;
-                state.journal(&identity, &names, "quarantined")?;
+                state.journal(
+                    &identity,
+                    &names,
+                    "quarantined",
+                    &record.ports,
+                    &record.status,
+                )?;
                 state
                     .resources
                     .lock()
@@ -534,16 +566,6 @@ mod linux {
             state.release_subnet(&names)?;
             return Err(error);
         }
-        let status = IsolationStatus {
-            helper_authenticated: true,
-            network_namespace: true,
-            nft_default_deny: true,
-            cgroup_attached: true,
-            process_isolated: false,
-            resource_registry_verified: true,
-            quarantined: false,
-            proxy_host: names.host_ip.clone(),
-        };
         state
             .resources
             .lock()
@@ -554,10 +576,10 @@ mod linux {
                     identity,
                     names,
                     ports: HashSet::new(),
-                    status: status.clone(),
+                    status: active_status.clone(),
                 },
             );
-        Ok(status)
+        Ok(active_status)
     }
 
     fn update_proxy(
@@ -584,8 +606,28 @@ mod linux {
         } else {
             desired.remove(&port);
         }
-        apply_nft(state, &record.names, &desired, true)?;
+        state.journal(
+            &record.identity,
+            &record.names,
+            "proxy_pending",
+            &desired,
+            &record.status,
+        )?;
+        if let Err(error) = apply_nft(state, &record.names, &desired, true) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         record.ports = desired;
+        if let Err(error) = state.journal(
+            &record.identity,
+            &record.names,
+            "active",
+            &record.ports,
+            &record.status,
+        ) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         Ok(record.status.clone())
     }
 
@@ -601,12 +643,38 @@ mod linux {
         let record = resources
             .get_mut(key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sandbox not found"))?;
-        fs::write(
+        state.journal(
+            &record.identity,
+            &record.names,
+            "join_pending",
+            &record.ports,
+            &record.status,
+        )?;
+        if let Err(error) = fs::write(
             record.names.cgroup.join("cgroup.procs"),
             peer.pid.to_string(),
-        )?;
-        let namespace = open_managed_netns(&record.names.netns)?;
+        ) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
+        let namespace = match open_managed_netns(&record.names.netns) {
+            Ok(namespace) => namespace,
+            Err(error) => {
+                record.status.quarantined = true;
+                return Err(error);
+            }
+        };
         record.status.process_isolated = true;
+        if let Err(error) = state.journal(
+            &record.identity,
+            &record.names,
+            "active",
+            &record.ports,
+            &record.status,
+        ) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         Ok((record.status.clone(), namespace))
     }
 
@@ -630,8 +698,28 @@ mod linux {
         let record = resources
             .get_mut(key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sandbox not found"))?;
-        fs::write(record.names.cgroup.join("cgroup.procs"), pid.to_string())?;
+        state.journal(
+            &record.identity,
+            &record.names,
+            "attach_pending",
+            &record.ports,
+            &record.status,
+        )?;
+        if let Err(error) = fs::write(record.names.cgroup.join("cgroup.procs"), pid.to_string()) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         record.status.process_isolated = true;
+        if let Err(error) = state.journal(
+            &record.identity,
+            &record.names,
+            "active",
+            &record.ports,
+            &record.status,
+        ) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         Ok(record.status.clone())
     }
 
@@ -654,7 +742,13 @@ mod linux {
             }
             Err(error) => {
                 record.status.quarantined = true;
-                state.journal(&record.identity, &record.names, "quarantined")?;
+                state.journal(
+                    &record.identity,
+                    &record.names,
+                    "quarantined",
+                    &record.ports,
+                    &record.status,
+                )?;
                 state
                     .resources
                     .lock()
@@ -829,7 +923,21 @@ mod linux {
         run_trusted(&state.nft, args, stdin)
     }
 
+    fn run_nft_capture(state: &State, args: &[&str]) -> io::Result<String> {
+        let output = run_trusted_capture(&state.nft, args, None)?;
+        String::from_utf8(output)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nft output is not UTF-8"))
+    }
+
     fn run_trusted(binary: &TrustedBinary, args: &[&str], stdin: Option<&[u8]>) -> io::Result<()> {
+        run_trusted_capture(binary, args, stdin).map(|_| ())
+    }
+
+    fn run_trusted_capture(
+        binary: &TrustedBinary,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> io::Result<Vec<u8>> {
         let executable = binary.open_for_exec()?;
         let executable_path = format!("/proc/self/fd/{}", executable.as_raw_fd());
         let mut command = Command::new(&executable_path);
@@ -847,7 +955,7 @@ mod linux {
         let output = child.wait_with_output()?;
         binary.open_for_exec()?;
         if output.status.success() {
-            return Ok(());
+            return Ok(output.stdout);
         }
         Err(io::Error::other(format!(
             "{} failed: {}",
@@ -968,6 +1076,8 @@ mod linux {
                 runtime_id: request.runtime_id.clone(),
                 task_id: request.task_id.clone(),
                 sandbox_token: request.sandbox_token.clone(),
+                client_pid: request.client_pid,
+                client_start_time: request.client_start_time,
             };
             let key = state.derive_key(&identity)?;
             let (status, namespace) = join_authority(&state, &key, peer)?;
@@ -1220,6 +1330,13 @@ mod linux {
         fs::create_dir_all(&state.journal_root)?;
         for entry in fs::read_dir(&state.journal_root)? {
             let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("tmp") {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0 {
+                    fs::remove_file(entry.path())?;
+                }
+                continue;
+            }
             if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
@@ -1231,8 +1348,14 @@ mod linux {
                     continue;
                 }
             };
-            let body = serde_json::to_vec(&(&envelope.identity, &envelope.names, &envelope.stage))
-                .map_err(io::Error::other)?;
+            let body = serde_json::to_vec(&(
+                &envelope.identity,
+                &envelope.names,
+                &envelope.stage,
+                &envelope.ports,
+                &envelope.status,
+            ))
+            .map_err(io::Error::other)?;
             if hmac_hex(&state.secret, &body)? != envelope.mac {
                 fs::rename(entry.path(), entry.path().with_extension("quarantine"))?;
                 continue;
@@ -1256,12 +1379,37 @@ mod linux {
             let mut record = ResourceRecord {
                 identity: envelope.identity,
                 names: names.clone(),
-                ports: HashSet::new(),
+                ports: envelope.ports.into_iter().collect(),
                 status: IsolationStatus {
                     quarantined: true,
                     ..IsolationStatus::default()
                 },
             };
+            if envelope.stage == "active" {
+                match verify_active_record(state, &record) {
+                    Ok(status) => {
+                        record.status = status;
+                        state.journal(
+                            &record.identity,
+                            &record.names,
+                            "active",
+                            &record.ports,
+                            &record.status,
+                        )?;
+                        state
+                            .resources
+                            .lock()
+                            .map_err(|_| io::Error::other("resource lock poisoned"))?
+                            .insert(names.key, record);
+                        continue;
+                    }
+                    Err(_) => {
+                        // An active journal is only adoptable when both its
+                        // process owner and every kernel resource can be
+                        // re-established from current evidence.
+                    }
+                }
+            }
             if teardown_record(state, &mut record).is_ok() {
                 let _ = fs::remove_file(entry.path());
                 state.release_subnet(&names)?;
@@ -1274,6 +1422,64 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    fn verify_active_record(state: &State, record: &ResourceRecord) -> io::Result<IsolationStatus> {
+        if process_start_time(record.identity.client_pid)? != record.identity.client_start_time
+            || !is_descendant(record.identity.client_pid, state.allowed_peer.pid)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "journal owner process identity is no longer authorized",
+            ));
+        }
+        let _namespace = open_managed_netns(&record.names.netns)?;
+        run_ip(state, &["link", "show", "dev", &record.names.veth_host])?;
+        run_ip(
+            state,
+            &[
+                "-n",
+                &record.names.netns,
+                "link",
+                "show",
+                "dev",
+                &record.names.veth_peer,
+            ],
+        )?;
+        let nft = run_nft_capture(state, &["list", "table", "inet", &record.names.nft_table])?;
+        if !nft.contains(&format!("iifname \"{}\" drop", record.names.veth_host)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered nft table lacks the sandbox default-deny rule",
+            ));
+        }
+        for port in &record.ports {
+            if !nft.contains(&format!("tcp dport {port} accept")) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "recovered nft table lacks a journaled proxy rule",
+                ));
+            }
+        }
+        let metadata = fs::symlink_metadata(&record.names.cgroup)?;
+        if !metadata.is_dir() || metadata.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered cgroup authority is invalid",
+            ));
+        }
+        let processes = fs::read_to_string(record.names.cgroup.join("cgroup.procs"))?;
+        let process_isolated = processes.lines().any(|line| !line.trim().is_empty());
+        Ok(IsolationStatus {
+            helper_authenticated: true,
+            network_namespace: true,
+            nft_default_deny: true,
+            cgroup_attached: true,
+            process_isolated,
+            resource_registry_verified: true,
+            quarantined: false,
+            proxy_host: record.names.host_ip.clone(),
+        })
     }
 
     fn acquire_instance_lock(socket_path: &Path) -> io::Result<File> {
