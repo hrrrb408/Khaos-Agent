@@ -396,11 +396,16 @@ class MacOSSandboxBackend:
             f'(allow file-write* (subpath "{_seatbelt_escape(path)}"))'
             for path in write_roots
         )
-        git_pointer = workspace / ".git"
-        protected_write_rules = (
-            f'(deny file-write* (literal "{_seatbelt_escape(git_pointer)}"))'
-            if git_pointer.exists()
-            else ""
+        from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+
+        protected_write_rules = "".join(
+            (
+                f'(deny file-write* (subpath "{_seatbelt_escape(path)}"))'
+                if path.is_dir()
+                else f'(deny file-write* (literal "{_seatbelt_escape(path)}"))'
+            )
+            for name in sorted(PROTECTED_WORKSPACE_NAMES)
+            if (path := workspace / name).exists()
         )
         mach_lookup_rules = "".join(
             f'(allow mach-lookup (global-name "{service}"))'
@@ -619,11 +624,19 @@ class LinuxBubblewrapBackend:
             "--tmpfs", "/tmp",
             "--bind" if writable else "--ro-bind", str(canonical_worktree), self.SANDBOX_WORKDIR,
         ]
-        git_pointer = canonical_worktree / ".git"
-        if writable and git_pointer.is_file():
-            prefix.extend(
-                ("--ro-bind", str(git_pointer), f"{self.SANDBOX_WORKDIR}/.git")
-            )
+        if writable:
+            from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+
+            for name in sorted(PROTECTED_WORKSPACE_NAMES):
+                metadata = canonical_worktree / name
+                if metadata.exists():
+                    prefix.extend(
+                        (
+                            "--ro-bind",
+                            str(metadata.resolve()),
+                            f"{self.SANDBOX_WORKDIR}/{name}",
+                        )
+                    )
         for link in (Path("/bin"), Path("/sbin"), Path("/lib"), Path("/lib64")):
             if link.is_symlink():
                 prefix.extend(("--symlink", os.readlink(link), str(link)))

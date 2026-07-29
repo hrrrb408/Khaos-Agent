@@ -71,6 +71,7 @@ def test_safe_workspace_fs_atomic_create_update_and_read(tmp_path):
         ".agents/policy", ".AGENTS/policy",
         ".codex/config", ".CODEX/config",
         ".khaos/state", ".KHAOS/state",
+        "khaos_policy.yaml",
     ],
 )
 def test_safe_workspace_fs_rejects_protected_metadata(tmp_path, protected):

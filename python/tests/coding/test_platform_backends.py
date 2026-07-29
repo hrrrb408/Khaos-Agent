@@ -51,6 +51,23 @@ def test_writable_platform_profiles_protect_git_pointer(tmp_path: Path):
     assert ("--ro-bind", str(pointer.resolve()), "/workspace/.git") in mounts
 
 
+def test_writable_platform_profiles_protect_all_control_metadata(tmp_path: Path):
+    for name in (".agents", ".codex", ".khaos"):
+        (tmp_path / name).mkdir()
+    policy = tmp_path / "khaos_policy.yaml"
+    policy.write_text("read-only\n", encoding="utf-8")
+
+    mac_profile = MacOSSandboxBackend().profile(tmp_path)
+    linux_argv = LinuxBubblewrapBackend().argv_prefix(tmp_path)
+    mounts = tuple(linux_argv[index:index + 3] for index in range(len(linux_argv) - 2))
+    for name in (".agents", ".codex", ".khaos"):
+        path = (tmp_path / name).resolve()
+        assert f'(deny file-write* (subpath "{path}"))' in mac_profile
+        assert ("--ro-bind", str(path), f"/workspace/{name}") in mounts
+    assert f'(deny file-write* (literal "{policy.resolve()}"))' in mac_profile
+    assert ("--ro-bind", str(policy.resolve()), "/workspace/khaos_policy.yaml") in mounts
+
+
 def test_read_only_platform_profiles_do_not_mount_workspace_writable(tmp_path: Path):
     mac_profile = MacOSSandboxBackend().profile(tmp_path, writable=False)
     assert f'(allow file-write* (subpath "{tmp_path.resolve()}"))' not in mac_profile
