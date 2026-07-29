@@ -31,6 +31,7 @@ mod linux {
 
     const MAX_CONNECTIONS: usize = 32;
     const MAX_REPLAY_IDS: usize = 4096;
+    const SUBNET_POOL_SIZE: u32 = 262_143;
     const DEFAULT_SOCKET: &str = "/run/khaos/browser-kernel-helper.sock";
     const DEFAULT_SECRET: &str = "/var/lib/khaos/browser-helper.secret";
     const DEFAULT_JOURNAL: &str = "/run/khaos/browser-helper";
@@ -91,7 +92,7 @@ mod linux {
         cgroup: PathBuf,
         host_ip: String,
         namespace_ip: String,
-        subnet: u16,
+        subnet: u32,
     }
 
     #[derive(Deserialize, Serialize)]
@@ -116,7 +117,7 @@ mod linux {
         journal_root: PathBuf,
         resources: Mutex<HashMap<String, ResourceRecord>>,
         replay: Mutex<(HashSet<String>, VecDeque<String>)>,
-        subnet_leases: Mutex<HashMap<u16, String>>,
+        subnet_leases: Mutex<HashMap<u32, String>>,
         ip: TrustedBinary,
         nft: TrustedBinary,
         allowed_peer: PeerCred,
@@ -142,7 +143,8 @@ mod linux {
             hmac_hex(&self.secret, input.as_bytes())
         }
 
-        fn names_for_subnet(&self, key: String, subnet: u16) -> ResourceNames {
+        fn names_for_subnet(&self, key: String, subnet: u32) -> ResourceNames {
+            let (host_ip, namespace_ip) = subnet_addresses(subnet);
             ResourceNames {
                 key: key.clone(),
                 netns: format!("khaos-br-{}", &key[..12]),
@@ -150,15 +152,16 @@ mod linux {
                 veth_peer: format!("kn{}", &key[..12]),
                 nft_table: format!("khaos_browser_{}", &key[..32]),
                 cgroup: Path::new("/sys/fs/cgroup/khaos-browser").join(&key[..32]),
-                host_ip: format!("10.203.{subnet}.1"),
-                namespace_ip: format!("10.203.{subnet}.2"),
+                host_ip,
+                namespace_ip,
                 subnet,
             }
         }
 
         fn allocate_names(&self, identity: &ResourceIdentity) -> io::Result<ResourceNames> {
             let key = self.derive_key(identity)?;
-            let preferred = (u16::from_str_radix(&key[0..4], 16).unwrap_or(0) % 250) + 1;
+            let preferred =
+                (u32::from_str_radix(&key[0..8], 16).unwrap_or(0) % SUBNET_POOL_SIZE) + 1;
             let mut leases = self
                 .subnet_leases
                 .lock()
@@ -263,12 +266,12 @@ mod linux {
     }
 
     fn reserve_subnet(
-        leases: &mut HashMap<u16, String>,
-        preferred: u16,
+        leases: &mut HashMap<u32, String>,
+        preferred: u32,
         key: &str,
-    ) -> io::Result<u16> {
-        for offset in 0..250_u16 {
-            let subnet = ((preferred - 1 + offset) % 250) + 1;
+    ) -> io::Result<u32> {
+        for offset in 0..SUBNET_POOL_SIZE {
+            let subnet = ((preferred - 1 + offset) % SUBNET_POOL_SIZE) + 1;
             match leases.get(&subnet) {
                 Some(owner) if owner != key => continue,
                 Some(_) => {
@@ -284,6 +287,22 @@ mod linux {
             }
         }
         Err(io::Error::other("browser subnet lease pool exhausted"))
+    }
+
+    fn subnet_addresses(subnet: u32) -> (String, String) {
+        debug_assert!((1..=SUBNET_POOL_SIZE).contains(&subnet));
+        let base = 0x0ac0_0000_u32 + subnet * 4;
+        let address = |offset: u32| {
+            let value = base + offset;
+            format!(
+                "{}.{}.{}.{}",
+                value >> 24,
+                (value >> 16) & 0xff,
+                (value >> 8) & 0xff,
+                value & 0xff
+            )
+        };
+        (address(1), address(2))
     }
 
     fn validate_request(request: &Request, peer: PeerCred, state: &State) -> io::Result<()> {
@@ -1331,7 +1350,7 @@ mod linux {
             }
             let names = envelope.names;
             let expected_key = state.derive_key(&envelope.identity)?;
-            if names.key != expected_key || !(1..=250).contains(&names.subnet) {
+            if names.key != expected_key || !(1..=SUBNET_POOL_SIZE).contains(&names.subnet) {
                 fs::rename(entry.path(), entry.path().with_extension("quarantine"))?;
                 continue;
             }
@@ -1610,6 +1629,23 @@ mod linux {
             assert!(reserve_subnet(&mut leases, 42, "sandbox-a").is_err());
             assert_eq!(leases.get(&42).map(String::as_str), Some("sandbox-a"));
             assert_eq!(leases.get(&43).map(String::as_str), Some("sandbox-b"));
+            for index in 0..1_000_u32 {
+                let key = format!("bulk-{index}");
+                reserve_subnet(&mut leases, 42, &key).unwrap();
+            }
+            assert_eq!(leases.len(), 1_002);
+        }
+
+        #[test]
+        fn subnet_pool_spans_the_private_ten_dot_192_slash_12_range() {
+            assert_eq!(
+                subnet_addresses(1),
+                ("10.192.0.5".into(), "10.192.0.6".into())
+            );
+            assert_eq!(
+                subnet_addresses(SUBNET_POOL_SIZE),
+                ("10.207.255.253".into(), "10.207.255.254".into())
+            );
         }
 
         #[test]

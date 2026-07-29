@@ -63,7 +63,9 @@ subnet lease. Resource names are derived as HMAC(helper secret, boot ID,
 principal ID, project ID, runtime ID, task ID, sandbox token). Address allocation
 uses an active in-memory and authenticated-journal lease registry with collision
 probing; two live sandboxes never receive the same `/30` merely because their
-digest prefixes collide.
+digest prefixes collide. The allocator covers 262,143 `/30` leases in
+`10.192.0.0/12`, persists the selected lease in the authenticated journal, and
+fails closed on actual pool exhaustion instead of aliasing a live subnet.
 The Browser
 mount namespace cannot access that secret. Corrupt or unauthenticated entries
 are quarantined rather than trusted by the reaper.
