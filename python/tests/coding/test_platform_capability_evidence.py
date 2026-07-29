@@ -60,7 +60,10 @@ def test_cache_invalidates_on_every_system_or_tcb_identity_change(
     monkeypatch: pytest.MonkeyPatch, field: str, value: object
 ) -> None:
     original = _evidence()
-    monkeypatch.setattr("khaos.coding.execution.platform.time.time", lambda: 1_000_000_001.0)
+    monkeypatch.setattr(
+        "khaos.coding.execution.capability.time.time",
+        lambda: 1_000_000_001.0,
+    )
     availability = BackendAvailability("linux-bwrap", True, True, evidence=original)
     entry = _CapabilityCacheEntry(availability, original)
     assert _cached_availability(entry, original) is availability
