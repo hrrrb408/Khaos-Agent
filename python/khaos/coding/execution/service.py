@@ -148,9 +148,12 @@ class ExecutionService:
                 profile.environment_keys, request.argv, correlation_id, profile,
                 storage_baseline,
             )
-        backend = self.backend_selector.select(
-            writable=profile.filesystem is FileSystemAccess.WORKSPACE_WRITE
-        ) if self.backend_selector is not None else self.backend
+        if self.backend_selector is not None:
+            backend = await self.backend_selector.select_async(
+                writable=profile.filesystem is FileSystemAccess.WORKSPACE_WRITE
+            )
+        else:
+            backend = self.backend
         if backend is None:
             raise PermissionError("execution refused: no execution backend configured")
         if request.backend_hint == "docker":
@@ -252,7 +255,7 @@ class ExecutionService:
             return
         backend = active[2] if active is not None else self.backend
         if backend is None and self.backend_selector is not None:
-            backend = self.backend_selector.select(writable=False)
+            backend = await self.backend_selector.select_async(writable=False)
         if isinstance(backend, ManagedProcessHandle):
             await backend.aclose()
         else:
@@ -282,7 +285,7 @@ class ExecutionService:
         if not (root / ".git").is_file():
             raise PermissionError("managed process requires an active Git Worktree")
         backend = (
-            self.backend_selector.select(writable=False)
+            await self.backend_selector.select_async(writable=False)
             if self.backend_selector is not None
             else self.backend
         )

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import hashlib
 import os
@@ -213,6 +214,12 @@ class BackendSelector:
             )
         return UnsupportedBackend()
 
+    async def select_async(self, *, writable: bool):
+        """Select after the real kernel capability probe off the event loop."""
+        import asyncio
+
+        return await asyncio.to_thread(self.select, writable=writable)
+
 
 class MacOSSandboxBackend:
     name = "macos-sandbox-exec"
@@ -228,7 +235,9 @@ class MacOSSandboxBackend:
         return _runtime_read_roots(command, workspace)
 
     async def probe(self) -> BackendAvailability:
-        return self.probe_capability()
+        import asyncio
+
+        return await asyncio.to_thread(self.probe_capability)
 
     def probe_capability(self) -> BackendAvailability:
         """Execute Seatbelt and prove write and network denial before use."""
@@ -387,11 +396,16 @@ class MacOSSandboxBackend:
             f'(allow file-write* (subpath "{_seatbelt_escape(path)}"))'
             for path in write_roots
         )
-        git_pointer = workspace / ".git"
-        protected_write_rules = (
-            f'(deny file-write* (literal "{_seatbelt_escape(git_pointer)}"))'
-            if git_pointer.exists()
-            else ""
+        from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+
+        protected_write_rules = "".join(
+            (
+                f'(deny file-write* (subpath "{_seatbelt_escape(path)}"))'
+                if path.is_dir()
+                else f'(deny file-write* (literal "{_seatbelt_escape(path)}"))'
+            )
+            for name in sorted(PROTECTED_WORKSPACE_NAMES)
+            if (path := workspace / name).exists()
         )
         mach_lookup_rules = "".join(
             f'(allow mach-lookup (global-name "{service}"))'
@@ -477,7 +491,9 @@ class LinuxBubblewrapBackend:
         self._capability_cache: _CapabilityCacheEntry | None = None
 
     async def probe(self) -> BackendAvailability:
-        return self.probe_capability()
+        import asyncio
+
+        return await asyncio.to_thread(self.probe_capability)
 
     def probe_capability(self) -> BackendAvailability:
         """Actually execute bwrap to verify --unshare-net/--unshare-pid AND
@@ -608,11 +624,19 @@ class LinuxBubblewrapBackend:
             "--tmpfs", "/tmp",
             "--bind" if writable else "--ro-bind", str(canonical_worktree), self.SANDBOX_WORKDIR,
         ]
-        git_pointer = canonical_worktree / ".git"
-        if writable and git_pointer.is_file():
-            prefix.extend(
-                ("--ro-bind", str(git_pointer), f"{self.SANDBOX_WORKDIR}/.git")
-            )
+        if writable:
+            from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+
+            for name in sorted(PROTECTED_WORKSPACE_NAMES):
+                metadata = canonical_worktree / name
+                if metadata.exists():
+                    prefix.extend(
+                        (
+                            "--ro-bind",
+                            str(metadata.resolve()),
+                            f"{self.SANDBOX_WORKDIR}/{name}",
+                        )
+                    )
         for link in (Path("/bin"), Path("/sbin"), Path("/lib"), Path("/lib64")):
             if link.is_symlink():
                 prefix.extend(("--symlink", os.readlink(link), str(link)))
@@ -648,7 +672,9 @@ class LinuxBubblewrapBackend:
         worktree = profile.workspace_roots[0]
         with tempfile.TemporaryDirectory(prefix="khaos-home-") as home_value:
             try:
-                cgroup = _create_linux_cgroup(profile.resources, worktree)
+                cgroup = await asyncio.to_thread(
+                    _create_linux_cgroup, profile.resources, worktree
+                )
             except OSError as exc:
                 raise PermissionError(
                     f"execution refused: delegated cgroup v2 limits unavailable: {exc}"
@@ -688,7 +714,7 @@ class LinuxBubblewrapBackend:
                     self._capability_cache = None
                     raise
             finally:
-                _remove_linux_cgroup(cgroup)
+                await asyncio.to_thread(_remove_linux_cgroup, cgroup)
 
     async def terminate(self, execution_id: str) -> None:
         if self.supervisor is not None:

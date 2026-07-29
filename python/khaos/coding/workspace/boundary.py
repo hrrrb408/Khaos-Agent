@@ -55,7 +55,11 @@ class CreatedDirectoryIdentity:
     inode: int
 
 
-PROTECTED_WORKSPACE_NAMES = frozenset({".git", ".agents", ".codex", ".khaos"})
+# Consumed by SafeWorkspaceFS and OS execution backends.  A terminal must not
+# be able to rewrite the policy file when file APIs deny the same mutation.
+PROTECTED_WORKSPACE_NAMES = frozenset(
+    {".git", ".agents", ".codex", ".khaos", "khaos_policy.yaml"}
+)
 DEFAULT_FILE_TOOL_BYTES = 16 * 1024 * 1024
 DEFAULT_TREE_BYTES = 64 * 1024 * 1024
 DEFAULT_TREE_ENTRIES = 4096

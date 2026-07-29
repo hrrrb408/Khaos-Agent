@@ -1,3 +1,6 @@
+import asyncio
+from types import SimpleNamespace
+
 import pytest
 
 from khaos.coding.execution import ExecutionService, HostExecutionBackend
@@ -100,11 +103,67 @@ async def test_terminal_background_without_execution_service_fails_closed(tmp_pa
 async def test_process_poll_unknown_raises():
     authority = BackgroundProcessAuthority()
     try:
-        await process("poll", "missing", process_authority=authority)
+        await process(
+            "poll",
+            "missing",
+            process_authority=authority,
+            principal_id="principal-a",
+            project_id="project-a",
+            runtime_id="runtime-a",
+            task_id="task-a",
+            workspace_id="workspace-a",
+        )
     except KeyError as exc:
         assert "unknown process" in str(exc)
     else:
         raise AssertionError("expected KeyError")
+
+
+async def test_process_control_rejects_cross_runtime_replay():
+    class _Handle:
+        def __init__(self) -> None:
+            self.stdout = asyncio.StreamReader()
+            self.stdout.feed_eof()
+            self.stderr_text = ""
+            self.returncode = None
+
+        async def wait(self):
+            self.returncode = 0
+            return 0
+
+        async def aclose(self) -> None:
+            self.returncode = -15
+
+    class _Service:
+        async def start_managed_process(self, _request):
+            return _Handle()
+
+    request = SimpleNamespace(
+        workspace_id="workspace-a",
+        task_id="task-a",
+        correlation_id="owned-process",
+    )
+    authority = BackgroundProcessAuthority()
+    process_id = await authority.start(
+        _Service(),
+        request,
+        principal_id="principal-a",
+        project_id="project-a",
+        runtime_id="runtime-a",
+    )
+
+    with pytest.raises(PermissionError, match="different runtime authority"):
+        await process(
+            "poll",
+            process_id,
+            process_authority=authority,
+            principal_id="principal-a",
+            project_id="project-a",
+            runtime_id="runtime-b",
+            task_id="task-a",
+            workspace_id="workspace-a",
+        )
+    await authority.shutdown()
 
 
 async def test_terminal_argv_never_parses_shell_operators(tmp_path):

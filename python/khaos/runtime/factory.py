@@ -539,13 +539,13 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
 
             router = load_router_from_config(cfg.config_path or root / "config.yaml", project_root=root)
         except (OSError, ValueError, KeyError):
-            # P1-11 (round-13): production must fail-closed on config
-            # errors — a silent mock fallback produces false success
-            # (user thinks the Agent is working with a real model).
-            if os.environ.get("KHAOS_ENV", "").strip().lower() == "production":
-                logger.error("production config router unavailable; refusing to start with mock")
+            # Production-safe behaviour is the default.  Mock routing is a
+            # test/development fixture only, never an implicit result of a
+            # missing KHAOS_ENV deployment variable.
+            if os.environ.get("KHAOS_DEV_MODE") != "1":
+                logger.error("runtime config router unavailable; refusing mock fallback")
                 raise
-            logger.warning("runtime config router unavailable; using default", exc_info=True)
+            logger.warning("development runtime config router unavailable; using mock", exc_info=True)
             router = create_default_router()
     # B1: load and compile the *layered* effective policy — user (∼/.khaos/
     # policy.yaml) ∩ project (<repo>/khaos_policy.yaml) ∩ platform — so it is

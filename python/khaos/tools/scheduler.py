@@ -312,6 +312,7 @@ class ToolScheduler:
                         task_id=str(tool_context.get("task_id") or ""),
                         workspace_id=str(tool_context.get("workspace_id") or ""),
                         workspace_manager=tool_context.get("workspace_manager"),
+                        resource_resolver=tool.resource_resolver,
                     )
                 except (OSError, PermissionError, ValueError) as exc:
                     yield SchedulerEvent(
@@ -685,6 +686,7 @@ class ToolScheduler:
                     task_id=str(tool_context.get("task_id") or ""),
                     workspace_id=str(tool_context.get("workspace_id") or ""),
                     workspace_manager=tool_context.get("workspace_manager"),
+                    resource_resolver=tool.resource_resolver,
                 )
                 if current_resource.digest() != resource.digest():
                     raise PermissionDeniedError(

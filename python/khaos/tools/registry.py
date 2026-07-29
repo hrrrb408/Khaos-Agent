@@ -11,6 +11,16 @@ from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
 
 from khaos.exceptions import ToolNotFoundError
+from khaos.permissions.resource import (
+    ResourceResolver,
+    resolve_copy_or_move,
+    resolve_network_origin,
+    resolve_process_control,
+    resolve_single_workspace_path,
+    resolve_terminal_argv,
+    resolve_terminal_shell,
+    resolve_workspace_root,
+)
 
 
 _WORKSPACE_FILE_TOOLS = frozenset({
@@ -96,6 +106,40 @@ _BUILTIN_CAPABILITY_MANIFEST: dict[str, tuple[ToolCapability, ...]] = {
     "todo_update": _capability("task.state.write", {"coding"}, {"runtime"}),
 }
 
+# The resolver is part of each ToolDefinition's security contract.  This
+# manifest only supplies the reviewed built-ins during registration; custom
+# production tools must declare their own resolver and cannot silently fall
+# back to a name/argument heuristic in the scheduler.
+_BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
+    **{name: resolve_single_workspace_path for name in {
+        "read_file", "search_files", "list_directory", "file_info", "tree_view",
+        "file_search_content", "write_file", "patch", "multi_edit", "code_search",
+        "code_symbols",
+    }},
+    "copy_file": resolve_copy_or_move,
+    "move_file": resolve_copy_or_move,
+    "terminal_argv": resolve_terminal_argv,
+    "terminal_shell": resolve_terminal_shell,
+    "terminal": resolve_terminal_shell,
+    "process": resolve_process_control,
+    "test_run": resolve_terminal_shell,
+    **{name: resolve_workspace_root for name in {
+        "git_diff", "git_log", "git_status", "git_pr_body", "git_commit",
+        "git_branch", "git_smart_commit", "git_undo", "git_create_branch",
+        "git_push", "github_create_pr", "github_read_issue", "github_comment_issue",
+        "github_request_review",
+    }},
+    **{name: resolve_network_origin for name in {
+        "browser_navigate", "web_fetch", "web_extract_tables", "web_metadata",
+    }},
+    **{name: resolve_workspace_root for name in {
+        "sandbox_exec", "browser_launch", "browser_close", "browser_click",
+        "browser_snapshot", "browser_screenshot", "browser_scroll", "browser_vision",
+        "browser_type", "browser_evaluate",
+    }},
+    "browser_file_upload": resolve_single_workspace_path,
+}
+
 
 @dataclass
 class ToolDefinition:
@@ -110,6 +154,7 @@ class ToolDefinition:
     timeout: int = 60
     handler: Callable[..., Awaitable[Any]] | None = None
     capabilities: tuple[ToolCapability, ...] = ()
+    resource_resolver: ResourceResolver | None = None
 
     @property
     def schema_digest(self) -> str:
@@ -148,6 +193,17 @@ class ToolRegistry:
                     f"tool {definition.name} must declare explicit capabilities"
                 )
             definition.capabilities = declared
+        if definition.resource_resolver is None:
+            definition.resource_resolver = _BUILTIN_RESOURCE_RESOLVERS.get(
+                definition.name
+            )
+        if self.enforce_capabilities and any(
+            capability.name.startswith(("filesystem.", "process.", "network."))
+            for capability in definition.capabilities
+        ) and definition.resource_resolver is None:
+            raise ValueError(
+                f"tool {definition.name} must declare an authorization resource resolver"
+            )
         if self.enforce_capabilities:
             definition.parameters = _production_schema(definition.parameters)
         self._tools[definition.name] = definition
@@ -286,6 +342,9 @@ class ToolInvocationBroker:
             handler_params["workspace_id"] = context.get("workspace_id")
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["process_authority"] = context.get("process_authority")
+            handler_params["principal_id"] = context.get("principal_id", "")
+            handler_params["project_id"] = context.get("project_id", "")
+            handler_params["runtime_id"] = context.get("runtime_id", "")
         if any(capability.name.startswith("vcs.") for capability in capabilities):
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")

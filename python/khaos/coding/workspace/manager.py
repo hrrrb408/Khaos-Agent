@@ -129,7 +129,16 @@ class WorkspaceManager:
             preserve_output=preserve_output,
         )
 
-    async def create(self, repository_root: Path, task_id: str, *, base_ref: str = "HEAD") -> TaskWorkspace:
+    async def create(
+        self,
+        repository_root: Path,
+        task_id: str,
+        *,
+        base_ref: str = "HEAD",
+        principal_id: str = "legacy",
+        project_id: str = "",
+        creator_runtime_id: str = "",
+    ) -> TaskWorkspace:
         repository = repository_root.resolve()
         async with self._lock:
             if task_id in self._task_ids:
@@ -155,11 +164,26 @@ class WorkspaceManager:
                 )
                 raise
             recovery_root = (self.root.parent / ".khaos-recovery").resolve()
+            root_stat = path.stat()
             workspace = TaskWorkspace(
-                workspace_id, task_id, repository, path, base_ref, base_sha,
-                branch, WorkspaceState.READY, (path,), recovery_root=recovery_root,
+                id=workspace_id,
+                task_id=task_id,
+                repository_root=repository,
+                worktree_path=path,
+                base_ref=base_ref,
+                base_sha=base_sha,
+                branch_name=branch,
+                state=WorkspaceState.READY,
+                writable_roots=(path,),
+                recovery_root=recovery_root,
                 storage_limits=self.storage_limits,
                 git_identity=git_identity,
+                principal_id=principal_id,
+                project_id=project_id,
+                creator_runtime_id=creator_runtime_id,
+                authority_generation=1,
+                root_device=int(root_stat.st_dev),
+                root_inode=int(root_stat.st_ino),
             )
             baseline = await asyncio.to_thread(capture_workspace_snapshot, path)
             if not baseline.complete:
@@ -185,6 +209,31 @@ class WorkspaceManager:
     def get(self, workspace_id: str) -> TaskWorkspace | None:
         """Return a workspace without allowing callers to mutate its registry."""
         return self._workspaces.get(workspace_id)
+
+    def require(
+        self,
+        workspace_id: str,
+        *,
+        task_id: str,
+        principal_id: str,
+        project_id: str,
+    ) -> TaskWorkspace:
+        """Return only a workspace owned by this exact task and tenant."""
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("active TaskWorkspace identity does not match tool call")
+        if workspace.principal_id != principal_id or workspace.project_id != project_id:
+            raise PermissionError("TaskWorkspace owner does not match tool call")
+        try:
+            current = workspace.worktree_path.resolve(strict=True).stat()
+        except OSError as exc:
+            raise PermissionError("TaskWorkspace root is unavailable") from exc
+        if (
+            workspace.root_device != int(current.st_dev)
+            or workspace.root_inode != int(current.st_ino)
+        ):
+            raise PermissionError("TaskWorkspace root identity drifted")
+        return workspace
 
     def file_recovery_root(self, workspace_id: str) -> Path:
         """Return a private, authority-owned rollback directory."""
