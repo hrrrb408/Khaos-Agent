@@ -401,6 +401,92 @@ async def test_scheduler_budget_exhaustion_stops_serial_calls(tmp_path):
     await db.close()
 
 
+async def test_scheduler_rejects_oversized_output_without_materializing_it(
+    tmp_path,
+):
+    class MustNotStringify:
+        def __str__(self):
+            raise AssertionError("unbounded output was stringified")
+
+        def __repr__(self):
+            raise AssertionError("unbounded output was represented")
+
+    async def oversized():
+        # The first value alone exceeds the reservation.  Measurement must
+        # stop there and never touch/stringify the following hostile object.
+        return {"large": "x" * 1024, "hostile": MustNotStringify()}
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="oversized",
+            description="oversized",
+            parameters={"type": "object", "properties": {}},
+            modes=["all"],
+            permission_level="read",
+            parallel=True,
+            handler=oversized,
+        )
+    )
+    db = Database(tmp_path / "bounded-output.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        registry,
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+        budget=ToolBudget(max_output_per_tool=64, max_total_output=64),
+    )
+
+    results = await scheduler.execute_batch(
+        [{"id": "large", "name": "oversized", "arguments": {}}],
+        mode="coding",
+    )
+
+    assert results[0].success is False
+    assert results[0].error == "tool output exceeded reserved hard budget"
+    assert scheduler.budget._output_chars == 0
+    assert scheduler.budget._reserved_output == 0
+    await db.close()
+
+
+async def test_scheduler_counts_post_redaction_output_against_reservation(tmp_path):
+    async def secret_output():
+        return {"stdout": "api_key=abcd1234abcd1234abcd1234"}
+
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name="secret-output",
+            description="secret",
+            parameters={"type": "object", "properties": {}},
+            modes=["all"],
+            permission_level="read",
+            parallel=True,
+            handler=secret_output,
+        )
+    )
+    db = Database(tmp_path / "redacted-output.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        registry,
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+        budget=ToolBudget(max_output_per_tool=128, max_total_output=128),
+    )
+
+    result = (
+        await scheduler.execute_batch(
+            [{"id": "secret", "name": "secret-output", "arguments": {}}],
+            mode="coding",
+        )
+    )[0]
+
+    assert result.success is True
+    assert "abcd1234abcd1234abcd1234" not in str(result.output)
+    assert 0 < scheduler.budget._output_chars <= 128
+    await db.close()
+
+
 async def test_scheduler_partial_failure_does_not_stop_others(tmp_path):
     db = Database(tmp_path / "khaos.db")
     await db.connect()
