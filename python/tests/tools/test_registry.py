@@ -4,10 +4,16 @@ from khaos.exceptions import ToolNotFoundError
 from khaos.modes.manager import MODE_CONFIGS, Mode
 from khaos.tools import (
     ToolDefinition,
+    ToolCapability,
     ToolRegistry,
     create_builtin_registry,
     create_runtime_registry,
 )
+
+
+def test_capability_names_are_a_closed_typed_contract():
+    with pytest.raises(ValueError):
+        ToolCapability("filesystem.typo", frozenset({"coding"}), frozenset())
 
 
 def test_registry_lists_tools_by_mode():

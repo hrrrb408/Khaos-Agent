@@ -13,17 +13,30 @@ import json
 import os
 import shlex
 from dataclasses import asdict, dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 
-ResourceResolver = Callable[[str, dict[str, Any], Path], tuple[str, str]]
+class AuthorizationResourceKind(str, Enum):
+    WORKSPACE_PATH = "workspace-path"
+    WORKSPACE_COPY_MOVE = "workspace-copy-move"
+    PROCESS_ARGV = "process-argv"
+    PROCESS_SHELL = "process-shell"
+    PROCESS_CONTROL = "process-control"
+    NETWORK_ORIGIN = "network-origin"
+    WORKSPACE = "workspace"
+
+
+ResourceResolver = Callable[
+    [str, dict[str, Any], Path], tuple[str, AuthorizationResourceKind]
+]
 
 
 @dataclass(frozen=True)
 class AuthorizationResource:
-    kind: str
+    kind: AuthorizationResourceKind
     principal_id: str
     project_id: str
     task_id: str
@@ -34,6 +47,7 @@ class AuthorizationResource:
     root_inode: int | None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "kind", AuthorizationResourceKind(self.kind))
         required = (
             self.kind,
             self.principal_id,
@@ -113,7 +127,7 @@ def resolve_authorization_resource(
 
 def resolve_single_workspace_path(
     tool_name: str, arguments: dict[str, Any], root: Path
-) -> tuple[str, str]:
+) -> tuple[str, AuthorizationResourceKind]:
     """Resolve the standard one-path workspace capability."""
     field = next(
         (
@@ -124,23 +138,26 @@ def resolve_single_workspace_path(
         "path",
     )
     path = _resolve_workspace_path(root, arguments.get(field, "."))
-    return _canonical_json({"tool": tool_name, "path": path}), "workspace-path"
+    return (
+        _canonical_json({"tool": tool_name, "path": path}),
+        AuthorizationResourceKind.WORKSPACE_PATH,
+    )
 
 
 def resolve_copy_or_move(
     tool_name: str, arguments: dict[str, Any], root: Path
-) -> tuple[str, str]:
+) -> tuple[str, AuthorizationResourceKind]:
     """Resolve the exact read and write paths of a copy or move operation."""
     source = _resolve_workspace_path(root, arguments.get("src", ""))
     destination = _resolve_workspace_path(root, arguments.get("dst", ""))
     return _canonical_json(
         {"tool": tool_name, "source": source, "destination": destination}
-    ), "workspace-copy-move"
+    ), AuthorizationResourceKind.WORKSPACE_COPY_MOVE
 
 
 def resolve_terminal_argv(
     tool_name: str, arguments: dict[str, Any], root: Path
-) -> tuple[str, str]:
+) -> tuple[str, AuthorizationResourceKind]:
     """Resolve argv execution without applying shell interpretation."""
     argv = arguments.get("argv")
     if not isinstance(argv, list) or not argv or not all(
@@ -148,12 +165,15 @@ def resolve_terminal_argv(
     ):
         raise PermissionError("terminal argv is invalid")
     cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
-    return _canonical_json({"tool": tool_name, "argv": argv, "cwd": cwd}), "process-argv"
+    return (
+        _canonical_json({"tool": tool_name, "argv": argv, "cwd": cwd}),
+        AuthorizationResourceKind.PROCESS_ARGV,
+    )
 
 
 def resolve_terminal_shell(
     tool_name: str, arguments: dict[str, Any], root: Path
-) -> tuple[str, str]:
+) -> tuple[str, AuthorizationResourceKind]:
     """Bind shell approval to the complete script, including control flow."""
     script = arguments.get("script", arguments.get("command", ""))
     if not isinstance(script, str) or not script.strip():
@@ -168,12 +188,12 @@ def resolve_terminal_shell(
             "tokens": tokens,
             "cwd": cwd,
         }
-    ), "process-shell"
+    ), AuthorizationResourceKind.PROCESS_SHELL
 
 
 def resolve_process_control(
     tool_name: str, arguments: dict[str, Any], root: Path
-) -> tuple[str, str]:
+) -> tuple[str, AuthorizationResourceKind]:
     """Resolve an existing process handle; process control is never shell code."""
     action = arguments.get("action")
     process_id = arguments.get("id")
@@ -181,12 +201,12 @@ def resolve_process_control(
         raise PermissionError("process control target is invalid")
     return _canonical_json(
         {"tool": tool_name, "action": action, "process_id": process_id}
-    ), "process-control"
+    ), AuthorizationResourceKind.PROCESS_CONTROL
 
 
 def resolve_network_origin(
     tool_name: str, arguments: dict[str, Any], root: Path
-) -> tuple[str, str]:
+) -> tuple[str, AuthorizationResourceKind]:
     """Resolve the origin that a network-capable tool will contact."""
     parsed = urlsplit(str(arguments.get("url", "")))
     if not parsed.scheme or not parsed.hostname:
@@ -194,14 +214,20 @@ def resolve_network_origin(
     host = parsed.hostname.encode("idna").decode("ascii").lower()
     port = f":{parsed.port}" if parsed.port is not None else ""
     authority = f"{host}{port}"
-    return urlunsplit((parsed.scheme.lower(), authority, "", "", "")), "network-origin"
+    return (
+        urlunsplit((parsed.scheme.lower(), authority, "", "", "")),
+        AuthorizationResourceKind.NETWORK_ORIGIN,
+    )
 
 
 def resolve_workspace_root(
     tool_name: str, arguments: dict[str, Any], root: Path
-) -> tuple[str, str]:
+) -> tuple[str, AuthorizationResourceKind]:
     """Resolve workspace-scoped operations without a more specific target."""
-    return _canonical_json({"tool": tool_name, "workspace_root": os.fspath(root)}), "workspace"
+    return (
+        _canonical_json({"tool": tool_name, "workspace_root": os.fspath(root)}),
+        AuthorizationResourceKind.WORKSPACE,
+    )
 
 
 def _resolve_workspace_path(root: Path, value: Any) -> str:

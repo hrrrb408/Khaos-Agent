@@ -8,6 +8,7 @@ import json
 import copy
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Awaitable, Callable
 
 from khaos.exceptions import ToolNotFoundError
@@ -60,15 +61,47 @@ _SCHEMA_KEYWORDS_BY_TYPE: dict[str, frozenset[str]] = {
     "number": frozenset({"type", "minimum", "maximum", "enum"}),
     "boolean": frozenset({"type", "enum"}),
 }
+class CapabilityName(str, Enum):
+    COMPUTE_LOCAL = "compute.local"
+    FILESYSTEM_READ = "filesystem.read"
+    FILESYSTEM_WRITE = "filesystem.write"
+    PROCESS_EXECUTE = "process.execute"
+    NETWORK_ACCESS = "network.access"
+    CREDENTIAL_ACCESS = "credential.access"
+    VCS_READ = "vcs.read"
+    VCS_WRITE = "vcs.write"
+    VCS_REMOTE_WRITE = "vcs.remote-write"
+    REMOTE_READ = "remote.read"
+    REMOTE_WRITE = "remote.write"
+    REMOTE_DESTRUCTIVE_WRITE = "remote.destructive-write"
+    HOST_INTEGRATION = "host.integration"
+    HOST_NOTES_READ = "host.notes.read"
+    HOST_NOTES_WRITE = "host.notes.write"
+    HOST_CLIPBOARD_READ = "host.clipboard.read"
+    HOST_CLIPBOARD_WRITE = "host.clipboard.write"
+    TASK_STATE_READ = "task.state.read"
+    TASK_STATE_WRITE = "task.state.write"
+    SUBAGENT_SPAWN = "subagent.spawn"
+    PERMISSION_READ = "permission.read"
+    PERMISSION_MANAGE = "permission.manage"
+    CRON_MANAGE = "cron.manage"
+    HISTORY_READ = "history.read"
+    CHANNEL_READ = "channel.read"
+    CHANNEL_MANAGE = "channel.manage"
+
+
 @dataclass(frozen=True)
 class ToolCapability:
-    name: str
+    name: CapabilityName
     modes: frozenset[str]
     scopes: frozenset[str]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", CapabilityName(self.name))
+
 
 def _capability(
-    name: str,
+    name: CapabilityName | str,
     modes: set[str],
     scopes: set[str],
 ) -> tuple[ToolCapability, ...]:
