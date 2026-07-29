@@ -44,6 +44,22 @@ _INJECTED_CAPABILITY_FIELDS = frozenset({
     "credential_context", "process_supervisor", "process_authority",
     "browser_manager", "cron_engine",
 })
+
+# Khaos intentionally implements a small, auditable JSON Schema subset for
+# model-supplied tool arguments.  Registration rejects every other keyword so
+# a declaration can never appear stricter than the validator that enforces it.
+_SCHEMA_ANNOTATION_KEYWORDS = frozenset({"description", "default", "title"})
+_SCHEMA_KEYWORDS_BY_TYPE: dict[str, frozenset[str]] = {
+    "object": frozenset({
+        "type", "properties", "required", "additionalProperties",
+        "maxProperties",
+    }),
+    "array": frozenset({"type", "items", "minItems", "maxItems"}),
+    "string": frozenset({"type", "minLength", "maxLength", "pattern", "enum"}),
+    "integer": frozenset({"type", "minimum", "maximum", "enum"}),
+    "number": frozenset({"type", "minimum", "maximum", "enum"}),
+    "boolean": frozenset({"type", "enum"}),
+}
 @dataclass(frozen=True)
 class ToolCapability:
     name: str
@@ -205,6 +221,9 @@ class ToolRegistry:
                 f"tool {definition.name} must declare an authorization resource resolver"
             )
         if self.enforce_capabilities:
+            _validate_schema_definition(
+                definition.parameters, path=f"tool:{definition.name}"
+            )
             definition.parameters = _production_schema(definition.parameters)
         self._tools[definition.name] = definition
 
@@ -553,6 +572,71 @@ def _production_schema(schema: dict[str, Any], *, property_name: str = "") -> di
         normalized.setdefault("minimum", 0)
         normalized.setdefault("maximum", 1_000_000)
     return normalized
+
+
+def _validate_schema_definition(schema: Any, *, path: str) -> None:
+    """Reject schemas outside the exact subset enforced at dispatch time."""
+    if not isinstance(schema, dict):
+        raise ValueError(f"{path}: schema must be an object")
+    expected = schema.get("type")
+    if expected not in _SCHEMA_KEYWORDS_BY_TYPE:
+        raise ValueError(f"{path}: unsupported or missing schema type: {expected!r}")
+
+    allowed = _SCHEMA_KEYWORDS_BY_TYPE[expected] | _SCHEMA_ANNOTATION_KEYWORDS
+    unsupported = sorted(set(schema) - allowed)
+    if unsupported:
+        raise ValueError(
+            f"{path}: unsupported JSON Schema keywords: {', '.join(unsupported)}"
+        )
+
+    if "enum" in schema:
+        enum_values = schema["enum"]
+        if not isinstance(enum_values, list) or not enum_values:
+            raise ValueError(f"{path}.enum: must be a non-empty array")
+        if any(not _schema_value_matches_type(expected, item) for item in enum_values):
+            raise ValueError(f"{path}.enum: values must match type {expected}")
+
+    if expected == "object":
+        properties = schema.get("properties", {})
+        required = schema.get("required", [])
+        additional = schema.get("additionalProperties", False)
+        if not isinstance(properties, dict) or any(
+            not isinstance(name, str) for name in properties
+        ):
+            raise ValueError(f"{path}.properties: must be an object with string keys")
+        if (
+            not isinstance(required, list)
+            or any(not isinstance(name, str) for name in required)
+            or len(required) != len(set(required))
+        ):
+            raise ValueError(f"{path}.required: must contain unique string names")
+        missing = sorted(set(required) - set(properties))
+        if missing:
+            raise ValueError(
+                f"{path}.required: unknown properties: {', '.join(missing)}"
+            )
+        if not isinstance(additional, bool):
+            raise ValueError(f"{path}.additionalProperties: must be boolean")
+        for name, child in properties.items():
+            _validate_schema_definition(child, path=f"{path}.properties.{name}")
+    elif expected == "array":
+        items = schema.get("items")
+        if not isinstance(items, dict):
+            raise ValueError(f"{path}.items: a typed item schema is required")
+        _validate_schema_definition(items, path=f"{path}.items")
+
+
+def _schema_value_matches_type(expected: str, value: Any) -> bool:
+    """Return whether an enum literal matches its declared JSON type."""
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if expected == "boolean":
+        return isinstance(value, bool)
+    return False
 
 
 def _validate_json_schema(schema: dict[str, Any], value: Any) -> bool:
