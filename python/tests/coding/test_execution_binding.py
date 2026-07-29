@@ -32,6 +32,48 @@ async def test_execution_service_rejects_cross_task_workspace(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_execution_service_rejects_cross_principal_workspace(tmp_path: Path):
+    repo = tmp_path / "repo-owner"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "x@y"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "x"], cwd=repo, check=True)
+    (repo / "a").write_text("a")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "base"], cwd=repo, check=True)
+    manager = WorkspaceManager(tmp_path / "wt-owner")
+    workspace = await manager.create(
+        repo, "task-owner", principal_id="alice", project_id="project-a"
+    )
+    service = ExecutionService(HostExecutionBackend(), manager)
+    service.bind_runtime_authority(
+        principal_id="mallory", project_id="project-a", runtime_id="runtime-m"
+    )
+    request = ExecutionRequest(
+        (sys.executable, "-c", "print('should-not-run')"),
+        workspace.worktree_path,
+        access_mode="workspace-write",
+        task_id=workspace.task_id,
+        workspace_id=workspace.id,
+    )
+
+    with pytest.raises(PermissionError, match="owner"):
+        await service.execute(request)
+
+
+def test_execution_service_cannot_be_rebound_to_another_runtime():
+    service = ExecutionService(HostExecutionBackend())
+    service.bind_runtime_authority(
+        principal_id="alice", project_id="project-a", runtime_id="runtime-a"
+    )
+
+    with pytest.raises(PermissionError, match="cannot be shared"):
+        service.bind_runtime_authority(
+            principal_id="alice", project_id="project-a", runtime_id="runtime-b"
+        )
+
+
+@pytest.mark.asyncio
 async def test_execution_git_pointer_drift_is_quarantined_before_return(tmp_path: Path):
     repo = tmp_path / "repo"
     repo.mkdir()

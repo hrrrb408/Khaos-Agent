@@ -36,6 +36,9 @@ class ExecutionService:
         managed_process_factory=None,
         backend_selector=None,
         process_supervisor: ProcessSupervisor | None = None,
+        principal_id: str = "legacy",
+        project_id: str = "",
+        runtime_id: str = "",
     ) -> None:
         self.process_supervisor = process_supervisor or ProcessSupervisor()
         self.backend = backend
@@ -45,6 +48,10 @@ class ExecutionService:
         self.managed_process_factory = managed_process_factory
         self._active: dict[str, tuple[str, str, object]] = {}
         self._closed = False
+        self.principal_id = principal_id
+        self.project_id = project_id
+        self.runtime_id = runtime_id
+        self._authority_bound = False
         if self.workspace_manager is not None and hasattr(
             self.workspace_manager, "storage_authority"
         ):
@@ -59,6 +66,21 @@ class ExecutionService:
             self.docker_backend.supervisor = self.process_supervisor
         if self.backend_selector is not None:
             self.backend_selector.set_supervisor(self.process_supervisor)
+
+    def bind_runtime_authority(
+        self, *, principal_id: str, project_id: str, runtime_id: str
+    ) -> None:
+        """Bind this service once to one runtime authority tuple."""
+        authority = (principal_id, project_id, runtime_id)
+        current = (self.principal_id, self.project_id, self.runtime_id)
+        if self._authority_bound and current != authority:
+            raise PermissionError(
+                "ExecutionService cannot be shared across runtime authorities"
+            )
+        if self._active:
+            raise RuntimeError("cannot bind ExecutionService with active executions")
+        self.principal_id, self.project_id, self.runtime_id = authority
+        self._authority_bound = True
 
     async def execute(self, request: ExecutionRequest) -> ExecutionResult:
         if self._closed:
@@ -80,9 +102,12 @@ class ExecutionService:
                 raise PermissionError(
                     f"{profile.filesystem.value} requires an active TaskWorkspace"
                 )
-            workspace = self.workspace_manager.get(request.workspace_id)
-            if workspace is None or workspace.task_id != request.task_id:
-                raise PermissionError("task/workspace binding is invalid")
+            workspace = self.workspace_manager.require(
+                request.workspace_id,
+                task_id=request.task_id,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
             if workspace.state in {
                 WorkspaceState.CANCELLED,
                 WorkspaceState.CLEANING,
@@ -272,9 +297,12 @@ class ExecutionService:
             raise PermissionError("managed process network policy must be none")
         if not request.argv:
             raise ValueError("managed process argv must not be empty")
-        workspace = self.workspace_manager.get(request.workspace_id)
-        if workspace is None or workspace.task_id != request.task_id:
-            raise PermissionError("task/workspace binding is invalid")
+        workspace = self.workspace_manager.require(
+            request.workspace_id,
+            task_id=request.task_id,
+            principal_id=self.principal_id,
+            project_id=self.project_id,
+        )
         if workspace.state not in {WorkspaceState.READY, WorkspaceState.RUNNING, WorkspaceState.VERIFYING}:
             raise PermissionError("workspace is not available for managed process")
         await self.workspace_manager.verify_git_identity(request.workspace_id)

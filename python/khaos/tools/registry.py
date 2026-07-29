@@ -507,6 +507,13 @@ class ToolInvocationBroker:
             capability.name in {"filesystem.read", "filesystem.write"}
             for capability in capabilities
         ):
+            manager = context.get("workspace_manager")
+            manager.require(
+                str(context.get("workspace_id") or ""),
+                task_id=str(context.get("task_id") or ""),
+                principal_id=str(context.get("principal_id") or ""),
+                project_id=str(context.get("project_id") or ""),
+            )
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")

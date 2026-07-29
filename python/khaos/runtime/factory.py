@@ -606,6 +606,14 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     execution_service = cfg.execution_service or ExecutionService(
         workspace_manager=workspace_manager,
         backend_selector=BackendSelector(),
+        principal_id=cfg.principal_id,
+        project_id=project_id,
+        runtime_id=cfg.runtime_id,
+    )
+    execution_service.bind_runtime_authority(
+        principal_id=cfg.principal_id,
+        project_id=project_id,
+        runtime_id=cfg.runtime_id,
     )
     # B1: the OfficeMutationAuthority is a server/project-lifecycle object.
     # When ``cfg.office_authority`` is injected (AgentService / SubAgentService
