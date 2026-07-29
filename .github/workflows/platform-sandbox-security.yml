@@ -405,7 +405,10 @@ jobs:
             test -S /run/khaos/browser-kernel-helper.sock && break
             sleep 0.1
           done
-          test -S /run/khaos/browser-kernel-helper.sock
+          if ! test -S /run/khaos/browser-kernel-helper.sock; then
+            sudo cat /tmp/khaos-browser-kernel-helper.log
+            exit 1
+          fi
           test "$(stat -c %u /run/khaos/browser-kernel-helper.sock)" = "$runner_uid"
           test "$(stat -c %a /run/khaos/browser-kernel-helper.sock)" = "600"
           test "$(id -u)" != "0"
