@@ -59,7 +59,12 @@ jobs:
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
       - name: Schema Fuzz
-        run: python -m pytest python/tests/security/test_schema_fuzz.py -q -v
+        run: |
+          python -m pytest python/tests/security/test_schema_fuzz.py -q -v
+          python scripts/build_security_closure_evidence.py test-fragment \
+            --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            --job closure-adversarial --test schema_injection \
+            --runner-os "$RUNNER_OS" --output evidence/schema_injection.json
       - name: Authorization Drift E2E
         run: |
           python -m pytest \
@@ -67,6 +72,12 @@ jobs:
             python/tests/coding/test_runtime_approval_e2e.py \
             python/tests/agent/test_operation_approval_ledger.py \
             -q -v
+          for test_name in workspace_escape approval_replay; do
+            python scripts/build_security_closure_evidence.py test-fragment \
+              --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+              --job closure-adversarial --test "$test_name" \
+              --runner-os "$RUNNER_OS" --output "evidence/$test_name.json"
+          done
       - name: Process Lifecycle E2E
         run: |
           python -m pytest \
@@ -74,12 +85,22 @@ jobs:
             python/tests/coding/test_managed_process_lifecycle.py \
             python/tests/runtime/test_aclose.py \
             -q -v
+          python scripts/build_security_closure_evidence.py test-fragment \
+            --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            --job closure-adversarial --test process_tree_escape \
+            --runner-os "$RUNNER_OS" --output evidence/process_tree_escape.json
       - name: Event-loop Starvation Tests
         run: |
           python -m pytest \
             python/tests/security/test_event_loop_starvation.py \
             python/tests/coding/test_office_mutation_authority.py \
             -q -v
+      - name: Upload closure adversarial evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: closure-adversarial-evidence
+          path: evidence/*.json
+          if-no-files-found: error
 
   security-closure-gate:
     name: Security Closure Gate
@@ -119,10 +140,22 @@ jobs:
         with:
           name: browser-non-root-evidence
           path: security-evidence-input
+      - name: Download mandatory adversarial evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          pattern: security-test-evidence-*
+          path: security-test-evidence-input
+          merge-multiple: true
+      - name: Download closure adversarial evidence
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: closure-adversarial-evidence
+          path: security-test-evidence-input
       - name: Validate and assemble Security Evidence Artifact
         run: |
           python scripts/build_security_closure_evidence.py final \
             --fragment security-evidence-input/browser-production-fragment.json \
+            --fragments-dir security-test-evidence-input \
             --commit "$GITHUB_SHA" \
             --output security-evidence/security-evidence.json
       - name: Upload Security Evidence Artifact

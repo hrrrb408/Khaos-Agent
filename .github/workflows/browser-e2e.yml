@@ -50,3 +50,15 @@ jobs:
         env:
           KHAOS_RUN_BROWSER_E2E: "1"
         run: python -m pytest python/tests/tools/test_browser_tools_e2e.py -q -m browser_real -v
+      - name: Emit DNS rebinding evidence
+        run: |
+          python scripts/build_security_closure_evidence.py test-fragment \
+            --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            --job playwright-security --test browser_dns_rebinding \
+            --runner-os "$RUNNER_OS" --output evidence/browser_dns_rebinding.json
+      - name: Upload DNS rebinding evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: security-test-evidence-browser-dns-rebinding
+          path: evidence/browser_dns_rebinding.json
+          if-no-files-found: error

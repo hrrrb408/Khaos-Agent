@@ -119,6 +119,20 @@ jobs:
             python/tests/security/test_browser_nft_authority_round6.py \
             python/tests/tools/test_browser_tools_e2e.py \
             -q -v -m "browser_real or not browser_real"
+      - name: Emit browser kernel attack evidence
+        run: |
+          for test_name in browser_direct_ip helper_confused_deputy; do
+            python scripts/build_security_closure_evidence.py test-fragment \
+              --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+              --job browser-netns-attack-e2e --test "$test_name" \
+              --runner-os "$RUNNER_OS" --output "evidence/$test_name.json"
+          done
+      - name: Upload browser kernel attack evidence
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: security-test-evidence-browser-kernel
+          path: evidence/*.json
+          if-no-files-found: error
 
   # ─── 4. Go race test ─────────────────────────────────────────────────
   go-race:
