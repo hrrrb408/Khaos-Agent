@@ -60,13 +60,14 @@ def resolve_authorization_resource(
     *,
     principal_id: str,
     project_id: str,
+    runtime_id: str,
     task_id: str,
     workspace_id: str,
     workspace_manager: Any,
     resource_resolver: ResourceResolver | None = None,
 ) -> AuthorizationResource:
     """Resolve one production tool call against its active TaskWorkspace."""
-    if not principal_id or not project_id or not task_id or not workspace_id:
+    if not principal_id or not project_id or not runtime_id or not task_id or not workspace_id:
         raise PermissionError("tool authorization requires complete workspace identity")
     if workspace_manager is None:
         raise PermissionError("tool authorization requires WorkspaceManager")
@@ -77,6 +78,7 @@ def resolve_authorization_resource(
             task_id=task_id,
             principal_id=principal_id,
             project_id=project_id,
+            runtime_id=runtime_id,
         )
     else:
         workspace = workspace_manager.get(workspace_id)
@@ -84,8 +86,11 @@ def resolve_authorization_resource(
             raise PermissionError("active TaskWorkspace identity does not match tool call")
         workspace_principal = getattr(workspace, "principal_id", principal_id)
         workspace_project = getattr(workspace, "project_id", project_id)
+        workspace_runtime = getattr(workspace, "creator_runtime_id", runtime_id)
         if workspace_principal != principal_id or workspace_project != project_id:
             raise PermissionError("TaskWorkspace owner does not match tool call")
+        if workspace_runtime != runtime_id:
+            raise PermissionError("TaskWorkspace runtime owner does not match tool call")
 
     root = workspace.worktree_path.resolve(strict=True)
     root_stat = root.stat()

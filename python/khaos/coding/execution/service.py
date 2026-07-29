@@ -107,6 +107,7 @@ class ExecutionService:
                 task_id=request.task_id,
                 principal_id=self.principal_id,
                 project_id=self.project_id,
+                runtime_id=self.runtime_id,
             )
             if workspace.state in {
                 WorkspaceState.CANCELLED,
@@ -302,6 +303,7 @@ class ExecutionService:
             task_id=request.task_id,
             principal_id=self.principal_id,
             project_id=self.project_id,
+            runtime_id=self.runtime_id,
         )
         if workspace.state not in {WorkspaceState.READY, WorkspaceState.RUNNING, WorkspaceState.VERIFYING}:
             raise PermissionError("workspace is not available for managed process")

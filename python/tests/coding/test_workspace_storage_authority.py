@@ -1,6 +1,5 @@
 import asyncio
 import threading
-import os
 import sys
 import time
 from pathlib import Path
@@ -38,6 +37,7 @@ def _registered_manager(
     entry_limit: int = 100_000,
 ) -> tuple[WorkspaceManager, TaskWorkspace]:
     limits = WorkspaceStorageLimits(byte_limit, entry_limit)
+    root_identity = root.stat()
     manager = WorkspaceManager(
         root=root.parent / "managed-worktrees", storage_limits=limits
     )
@@ -53,6 +53,8 @@ def _registered_manager(
         writable_roots=(root,),
         storage_baseline=capture_workspace_snapshot(root),
         storage_limits=limits,
+        root_device=root_identity.st_dev,
+        root_inode=root_identity.st_ino,
     )
     manager._workspaces[workspace.id] = workspace
     manager._task_ids.add(workspace.task_id)

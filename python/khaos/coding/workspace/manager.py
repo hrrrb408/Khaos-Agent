@@ -333,6 +333,7 @@ class WorkspaceManager:
         task_id: str,
         principal_id: str,
         project_id: str,
+        runtime_id: str,
     ) -> TaskWorkspace:
         """Return only a workspace owned by this exact task and tenant."""
         workspace = self._workspaces.get(workspace_id)
@@ -340,6 +341,8 @@ class WorkspaceManager:
             raise PermissionError("active TaskWorkspace identity does not match tool call")
         if workspace.principal_id != principal_id or workspace.project_id != project_id:
             raise PermissionError("TaskWorkspace owner does not match tool call")
+        if workspace.creator_runtime_id != runtime_id:
+            raise PermissionError("TaskWorkspace runtime owner does not match tool call")
         try:
             current = workspace.worktree_path.resolve(strict=True).stat()
         except OSError as exc:

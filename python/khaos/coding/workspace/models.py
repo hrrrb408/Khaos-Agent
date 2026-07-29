@@ -65,6 +65,33 @@ class TaskWorkspace:
     authority_generation: int = 1
     root_device: int | None = None
     root_inode: int | None = None
+    _authority_sealed: bool = field(default=False, init=False, repr=False)
+
+    _IMMUTABLE_AUTHORITY_FIELDS = frozenset(
+        {
+            "id",
+            "task_id",
+            "principal_id",
+            "project_id",
+            "creator_runtime_id",
+            "authority_generation",
+            "root_device",
+            "root_inode",
+        }
+    )
+
+    def __post_init__(self) -> None:
+        if self.authority_generation <= 0:
+            raise ValueError("workspace authority generation must be positive")
+        object.__setattr__(self, "_authority_sealed", True)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if (
+            name in self._IMMUTABLE_AUTHORITY_FIELDS
+            and getattr(self, "_authority_sealed", False)
+        ):
+            raise AttributeError(f"TaskWorkspace authority field is immutable: {name}")
+        object.__setattr__(self, name, value)
 
 
 @dataclass(frozen=True)

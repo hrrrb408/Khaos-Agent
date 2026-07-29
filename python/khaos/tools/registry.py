@@ -514,6 +514,7 @@ class ToolInvocationBroker:
                 task_id=str(context.get("task_id") or ""),
                 principal_id=str(context.get("principal_id") or ""),
                 project_id=str(context.get("project_id") or ""),
+                runtime_id=str(context.get("runtime_id") or ""),
             )
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
