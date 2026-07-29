@@ -48,7 +48,10 @@ async def test_fs_probe_proves_home_is_masked() -> None:
         manager = BrowserManager()
         try:
             launch = await manager.launch(
-                project_id="round10-home", runtime_id="round10-home"
+                principal_id="round10-home-principal",
+                project_id="round10-home",
+                task_id="round10-home-task",
+                runtime_id="round10-home",
             )
             assert launch["ok"], launch
             sandbox = manager._browser_sandbox
@@ -95,7 +98,10 @@ async def test_fs_probe_proves_sensitive_paths_are_masked() -> None:
     manager = BrowserManager()
     try:
         launch = await manager.launch(
-            project_id="round10-paths", runtime_id="round10-paths"
+            principal_id="round10-paths-principal",
+            project_id="round10-paths",
+            task_id="round10-paths-task",
+            runtime_id="round10-paths",
         )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
@@ -135,7 +141,10 @@ async def test_fs_probe_detects_unmasked_path() -> None:
     manager = BrowserManager()
     try:
         launch = await manager.launch(
-            project_id="round10-positive", runtime_id="round10-positive"
+            principal_id="round10-positive-principal",
+            project_id="round10-positive",
+            task_id="round10-positive-task",
+            runtime_id="round10-positive",
         )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox

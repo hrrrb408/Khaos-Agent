@@ -22,6 +22,7 @@ from khaos.coding.execution.models import (
 )
 from khaos.coding.execution.service import ExecutionService
 from khaos.coding.workspace.models import WorkspaceState
+from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 from khaos.tools.registry import create_runtime_registry
 from khaos.tools.sandbox_tools import sandbox_build, sandbox_exec
 
@@ -72,10 +73,16 @@ class _BlockingDockerBackend(_FakeDockerBackend):
         self.released.set()
 
 
+def _install_protected_guards(worktree: Path) -> None:
+    for name in PROTECTED_WORKSPACE_NAMES - {".git"}:
+        (worktree / name).mkdir(exist_ok=True)
+
+
 def _service(tmp_path, *, task_id="task", state=WorkspaceState.RUNNING, docker_backend=None):
     worktree = tmp_path / "worktree"
     worktree.mkdir(exist_ok=True)
     (worktree / ".git").write_text("gitdir: ../repo/.git/worktrees/task\n", encoding="utf-8")
+    _install_protected_guards(worktree)
     repository = tmp_path / "repo"
     repository.mkdir(exist_ok=True)
     workspace = SimpleNamespace(
@@ -86,6 +93,9 @@ def _service(tmp_path, *, task_id="task", state=WorkspaceState.RUNNING, docker_b
     )
     manager = SimpleNamespace(
         get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        require=lambda workspace_id, **_authority: (
+            workspace if workspace_id == "workspace" else None
+        ),
         verify_git_identity=AsyncMock(),
     )
     backend = docker_backend or _FakeDockerBackend()
@@ -252,6 +262,7 @@ def _resolved(tmp_path, *, image=DEFAULT_DOCKER_IMAGE, budget=None, environment=
     worktree = tmp_path / "worktree"
     worktree.mkdir(exist_ok=True)
     (worktree / ".git").write_text("gitdir: ../repo/.git/worktrees/task\n", encoding="utf-8")
+    _install_protected_guards(worktree)
     repository = tmp_path / "repo"
     repository.mkdir(exist_ok=True)
     env = {"KHAOS_DOCKER_IMAGE": image, **(environment or {})}
@@ -295,10 +306,13 @@ async def test_docker_backend_builds_hardened_fixed_argv(tmp_path):
     ]
     assert mounts == [
         f"type=bind,src={tmp_path / 'worktree'},dst=/workspace",
-        (
-            f"type=bind,src={tmp_path / 'worktree' / '.git'},"
-            "dst=/workspace/.git,readonly"
-        ),
+        *[
+            (
+                f"type=bind,src={tmp_path / 'worktree' / name},"
+                f"dst=/workspace/{name},readonly"
+            )
+            for name in sorted(PROTECTED_WORKSPACE_NAMES)
+        ],
     ]
     assert str(tmp_path / "repo") not in " ".join(argv)
     assert "/var/run/docker.sock" not in " ".join(argv)
@@ -492,6 +506,7 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
         ["git", "worktree", "add", "-b", "task/docker", str(worktree), "HEAD"],
         cwd=repository, check=True, capture_output=True,
     )
+    _install_protected_guards(worktree)
     worktree.chmod(0o777)
     workspace = SimpleNamespace(
         task_id="task", worktree_path=worktree, repository_root=repository,
@@ -499,6 +514,9 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
     )
     manager = SimpleNamespace(
         get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        require=lambda workspace_id, **_authority: (
+            workspace if workspace_id == "workspace" else None
+        ),
         verify_git_identity=AsyncMock(),
     )
     service = ExecutionService(
@@ -574,6 +592,7 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
         ["git", "worktree", "add", "-b", f"task/{action}", str(worktree), "HEAD"],
         cwd=repository, check=True, capture_output=True,
     )
+    _install_protected_guards(worktree)
     worktree.chmod(0o777)
     workspace = SimpleNamespace(
         task_id="task", worktree_path=worktree, repository_root=repository,
@@ -581,6 +600,9 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
     )
     manager = SimpleNamespace(
         get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        require=lambda workspace_id, **_authority: (
+            workspace if workspace_id == "workspace" else None
+        ),
         verify_git_identity=AsyncMock(),
     )
     backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})

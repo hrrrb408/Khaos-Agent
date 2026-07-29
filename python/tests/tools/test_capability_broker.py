@@ -46,6 +46,47 @@ async def test_workspace_ids_cannot_replace_workspace_authority():
         )
 
 
+@pytest.mark.asyncio
+async def test_workspace_tool_requires_exact_tenant_owner_before_handler():
+    called = False
+
+    async def handler(**_kwargs):
+        nonlocal called
+        called = True
+
+    class Manager:
+        def require(self, _workspace_id, **_authority):
+            raise PermissionError("TaskWorkspace owner does not match tool call")
+
+    registry = ToolRegistry(enforce_capabilities=True)
+    registry.register(
+        ToolDefinition(
+            "write_file",
+            "",
+            {"type": "object"},
+            ["coding"],
+            "write",
+            False,
+            handler=handler,
+            capabilities=(WRITE_CAP,),
+        )
+    )
+
+    with pytest.raises(PermissionError, match="owner"):
+        await ToolInvocationBroker(registry).invoke(
+            "write_file",
+            mode="coding",
+            context={
+                "workspace_manager": Manager(),
+                "workspace_id": "workspace-a",
+                "task_id": "task-a",
+                "principal_id": "mallory",
+                "project_id": "project-a",
+            },
+        )
+    assert called is False
+
+
 def test_registry_rejects_missing_capability_in_enforced_mode():
     registry = ToolRegistry(enforce_capabilities=True)
     with pytest.raises(ValueError, match="must declare explicit capabilities"):

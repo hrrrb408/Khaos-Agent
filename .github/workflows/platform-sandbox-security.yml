@@ -350,7 +350,7 @@ jobs:
           # default several system dirs to 0777) so the parent-chain
           # validation accepts the launcher + Chromium runtime paths.
           sudo chmod 0755 /usr/local/bin /usr/local /opt
-      - name: Start root kernel helper for the non-root Python runtime
+      - name: Install root kernel helper for the non-root Python runtime
         run: |
           runner_uid="$(id -u)"
           sudo install -o root -g root -m 0755 \
@@ -360,22 +360,6 @@ jobs:
           openssl rand -hex 32 | sudo tee /var/lib/khaos/browser-helper.secret >/dev/null
           sudo chown root:root /var/lib/khaos/browser-helper.secret
           sudo chmod 0600 /var/lib/khaos/browser-helper.secret
-          sudo nohup env \
-            KHAOS_BROWSER_KERNEL_HELPER_UID="$runner_uid" \
-            KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos/browser-kernel-helper.sock \
-            KHAOS_BROWSER_HELPER_SECRET_FILE=/var/lib/khaos/browser-helper.secret \
-            /usr/local/sbin/khaos-browser-kernel-helper \
-            >/tmp/khaos-browser-kernel-helper.log 2>&1 &
-          for attempt in $(seq 1 50); do
-            test -S /run/khaos/browser-kernel-helper.sock && break
-            sleep 0.1
-          done
-          if ! test -S /run/khaos/browser-kernel-helper.sock; then
-            sudo cat /tmp/khaos-browser-kernel-helper.log
-            exit 1
-          fi
-          test "$(stat -c %u /run/khaos/browser-kernel-helper.sock)" = "$runner_uid"
-          test "$(stat -c %a /run/khaos/browser-kernel-helper.sock)" = "600"
       - name: Install test + browser dependencies
         run: |
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
@@ -409,6 +393,28 @@ jobs:
           # test asserts this sentinel is absent from /proc/<pid>/environ.
           KHAOS_SENTINEL_SECRET: must-not-reach-browser
         run: |
+          runner_uid="$(id -u)"
+          # Bind the helper to this still-running step shell.  BASHPID is
+          # evaluated in the asynchronous sudo list and names the process
+          # that immediately becomes root, so it cannot satisfy the helper's
+          # non-root UID check.  The pytest clients remain descendants of $$.
+          sudo nohup env \
+            KHAOS_BROWSER_KERNEL_HELPER_UID="$runner_uid" \
+            KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID="$$" \
+            KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos/browser-kernel-helper.sock \
+            KHAOS_BROWSER_HELPER_SECRET_FILE=/var/lib/khaos/browser-helper.secret \
+            /usr/local/sbin/khaos-browser-kernel-helper \
+            >/tmp/khaos-browser-kernel-helper.log 2>&1 &
+          for attempt in $(seq 1 50); do
+            test -S /run/khaos/browser-kernel-helper.sock && break
+            sleep 0.1
+          done
+          if ! test -S /run/khaos/browser-kernel-helper.sock; then
+            sudo cat /tmp/khaos-browser-kernel-helper.log
+            exit 1
+          fi
+          test "$(stat -c %u /run/khaos/browser-kernel-helper.sock)" = "$runner_uid"
+          test "$(stat -c %a /run/khaos/browser-kernel-helper.sock)" = "600"
           test "$(id -u)" != "0"
           test "$(awk '/^CapEff:/ {print $2}' /proc/self/status)" = "0000000000000000"
           python -m pytest \
@@ -423,6 +429,9 @@ jobs:
             --launcher /usr/local/bin/khaos-sandbox-launcher \
             --helper /usr/local/sbin/khaos-browser-kernel-helper \
             --helper-socket /run/khaos/browser-kernel-helper.sock \
+            --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --job browser-non-root-fullstack \
             --output diagnostics/browser-production-fragment.json
           cp /tmp/khaos-browser-kernel-helper.log diagnostics/helper.log
           printf 'uid=%s\ncap_eff=%s\nhelper_socket_uid=%s\n' \

@@ -202,6 +202,12 @@ class AgentLoop:
         # drift-check contract.
         self.project_id = project_id
         self._bound_project_id = project_id
+        if self.execution_service is not None:
+            self.execution_service.bind_runtime_authority(
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+                runtime_id=self.runtime_id,
+            )
         self._active_context_facts: list[Message] = []
         if self.execution_service is None:
             from khaos.coding.execution import ExecutionService, UnsupportedBackend

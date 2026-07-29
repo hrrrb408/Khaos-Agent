@@ -223,6 +223,7 @@ class BrowserManager:
         principal_id: str = "",
         project_id: str = "",
         runtime_id: str = "",
+        task_id: str = "",
     ) -> dict[str, Any]:
         """Start the process browser under the singleton lifecycle lock."""
         # H1: the closed-state check happens INSIDE the lock (in
@@ -239,6 +240,7 @@ class BrowserManager:
                 principal_id=principal_id,
                 project_id=project_id,
                 runtime_id=runtime_id,
+                task_id=task_id,
             )
 
     async def _launch_locked(
@@ -249,6 +251,7 @@ class BrowserManager:
         principal_id: str = "",
         project_id: str = "",
         runtime_id: str = "",
+        task_id: str = "",
     ) -> dict[str, Any]:
         """启动浏览器。
 
@@ -339,6 +342,8 @@ class BrowserManager:
                     require_os_sandbox=not _dev_mode,
                     project_id=project_id,
                     runtime_id=runtime_id,
+                    principal_id=principal_id,
+                    task_id=task_id or f"runtime:{runtime_id}",
                 )
                 # Round-5 Batch 5.4: setup() invokes subprocess.run
                 # (ip netns add, ip link add, nft -f -, cgroup mkdir)
@@ -1502,6 +1507,7 @@ async def browser_launch(
     principal_id: str = "",
     project_id: str = "",
     runtime_id: str = "",
+    task_id: str = "",
     browser_manager: BrowserManager | None = None,
 ) -> dict[str, Any]:
     """启动浏览器。"""
@@ -1514,6 +1520,7 @@ async def browser_launch(
         principal_id=principal_id,
         project_id=project_id,
         runtime_id=runtime_id,
+        task_id=task_id,
     )
 
 

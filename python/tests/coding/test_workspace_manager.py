@@ -6,6 +6,7 @@ import pytest
 
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import WorkspaceState, WorkspaceTransition
+from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 
 
 def _repo(path: Path) -> Path:
@@ -25,6 +26,10 @@ async def test_worktree_lifecycle_and_changeset_binding(tmp_path: Path):
     manager = WorkspaceManager(tmp_path / "worktrees")
     workspace = await manager.create(repository, "task-1")
     assert workspace.state is WorkspaceState.READY
+    for name in PROTECTED_WORKSPACE_NAMES:
+        protected = workspace.worktree_path / name
+        assert protected.exists()
+        assert not protected.is_symlink()
     (workspace.worktree_path / "README.md").write_text("changed\n")
     changeset = await manager.build_changeset(workspace.id)
     assert "README.md" in changeset.changed_files
@@ -109,3 +114,66 @@ async def test_workspace_commit_disables_repository_hooks(tmp_path: Path):
     await manager.commit_in_worktree(workspace.id, changeset, "safe commit")
 
     assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_host_git_does_not_inherit_git_configuration_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    marker = tmp_path / "injected-git-alias-ran"
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "alias.status")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", f"!touch {marker}")
+
+    assert await manager._git(repository, "status", "--porcelain") == ""
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_host_git_digest_drift_fails_before_execution(tmp_path: Path):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    manager._git_digest = "0" * 64
+
+    with pytest.raises(WorkspaceError, match="content digest drifted"):
+        await manager._git(repository, "status", "--porcelain")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses a fixed system Git path")
+def test_host_git_authority_ignores_caller_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attacker = tmp_path / "git"
+    attacker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    attacker.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    manager = WorkspaceManager(tmp_path / "worktrees")
+
+    assert manager._git_executable == Path("/usr/bin/git").resolve(strict=True)
+
+
+@pytest.mark.asyncio
+async def test_workspace_authority_root_mode_drift_fails_before_git(
+    tmp_path: Path,
+):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    manager.root.chmod(0o777)
+
+    try:
+        with pytest.raises(WorkspaceError, match="authority root identity drifted"):
+            await manager._git(repository, "status", "--porcelain")
+    finally:
+        manager.root.chmod(0o700)
+
+
+def test_workspace_authority_rejects_preexisting_shared_root(tmp_path: Path):
+    shared = tmp_path / "shared-worktrees"
+    shared.mkdir(mode=0o777)
+    shared.chmod(0o777)
+
+    with pytest.raises(WorkspaceError, match="user-owned and not group/other writable"):
+        WorkspaceManager(shared)

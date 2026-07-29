@@ -133,7 +133,10 @@ async def test_chromium_environ_excludes_parent_secrets() -> None:
     manager = BrowserManager()
     try:
         launch = await manager.launch(
-            project_id="round9-env", runtime_id="round9-env"
+            principal_id="round9-env-principal",
+            project_id="round9-env",
+            task_id="round9-env-task",
+            runtime_id="round9-env",
         )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
@@ -187,7 +190,10 @@ async def test_route_guard_blocks_file_scheme_for_home() -> None:
         manager = BrowserManager()
         try:
             launch = await manager.launch(
-                project_id="round9-home", runtime_id="round9-home"
+                principal_id="round9-fs-principal",
+                project_id="round9-home",
+                task_id="round9-home-task",
+                runtime_id="round9-home",
             )
             assert launch["ok"], launch
             sandbox = manager._browser_sandbox
@@ -195,7 +201,8 @@ async def test_route_guard_blocks_file_scheme_for_home() -> None:
             page = await manager.ensure_page(
                 "round9-fs-principal",
                 session_id="round9-fs",
-                runtime_id="round9-fs",
+                runtime_id="round9-home",
+                project_id="round9-home",
                 network_guard=_PinnedLocalGuard(sandbox._host_ip),
             )
             assert page is not None
@@ -264,7 +271,10 @@ async def test_route_guard_blocks_file_scheme_for_sensitive_paths(tmp_path) -> N
     manager = BrowserManager()
     try:
         launch = await manager.launch(
-            project_id="round9-paths", runtime_id="round9-paths"
+            principal_id="round9-fs2-principal",
+            project_id="round9-paths",
+            task_id="round9-paths-task",
+            runtime_id="round9-paths",
         )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
@@ -272,7 +282,8 @@ async def test_route_guard_blocks_file_scheme_for_sensitive_paths(tmp_path) -> N
         page = await manager.ensure_page(
             "round9-fs2-principal",
             session_id="round9-fs2",
-            runtime_id="round9-fs2",
+            runtime_id="round9-paths",
+            project_id="round9-paths",
             network_guard=_PinnedLocalGuard(sandbox._host_ip),
         )
         assert page is not None

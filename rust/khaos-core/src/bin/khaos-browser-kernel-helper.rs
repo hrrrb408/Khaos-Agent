@@ -6,9 +6,14 @@
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use _khaos_core::browser_kernel_protocol_generated::{
+        BrowserKernelErrorCode as ErrorCode, BrowserKernelIsolationStatus as IsolationStatus,
+        BrowserKernelOperation as Operation, BrowserKernelRequest as Request,
+        BrowserKernelResponse as Response, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
+    };
     use hmac::{Hmac, Mac};
     use serde::{Deserialize, Serialize};
-    use sha2::Sha256;
+    use sha2::{Digest, Sha256};
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::ffi::CString;
     use std::fs::{self, File, OpenOptions};
@@ -25,71 +30,25 @@ mod linux {
 
     type HmacSha256 = Hmac<Sha256>;
 
-    const PROTOCOL_VERSION: u16 = 1;
-    const MAX_MESSAGE: usize = 8192;
     const MAX_CONNECTIONS: usize = 32;
     const MAX_REPLAY_IDS: usize = 4096;
+    const SUBNET_POOL_SIZE: u32 = 262_143;
     const DEFAULT_SOCKET: &str = "/run/khaos/browser-kernel-helper.sock";
     const DEFAULT_SECRET: &str = "/var/lib/khaos/browser-helper.secret";
     const DEFAULT_JOURNAL: &str = "/run/khaos/browser-helper";
     const IP_PATH: &str = "/usr/sbin/ip";
     const NFT_PATH: &str = "/usr/sbin/nft";
 
-    #[derive(Debug, Deserialize)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
-    struct Request {
-        protocol_version: u16,
-        request_id: String,
-        boot_id: String,
+    struct ResourceIdentity {
+        principal_id: String,
+        project_id: String,
+        runtime_id: String,
+        task_id: String,
+        sandbox_token: String,
         client_pid: u32,
         client_start_time: u64,
-        project_id: String,
-        runtime_id: String,
-        sandbox_token: String,
-        op: Operation,
-        port: Option<u16>,
-        target_pid: Option<u32>,
-        target_start_time: Option<u64>,
-    }
-
-    #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-    #[serde(rename_all = "snake_case")]
-    enum Operation {
-        Setup,
-        AllowProxy,
-        RevokeProxy,
-        AttachProcess,
-        Join,
-        Teardown,
-        Status,
-    }
-
-    #[derive(Serialize)]
-    struct Response<'a> {
-        protocol_version: u16,
-        request_id: &'a str,
-        ok: bool,
-        error: Option<String>,
-        status: Option<IsolationStatus>,
-    }
-
-    #[derive(Clone, Default, Serialize)]
-    struct IsolationStatus {
-        helper_authenticated: bool,
-        network_namespace: bool,
-        nft_default_deny: bool,
-        cgroup_attached: bool,
-        process_isolated: bool,
-        resource_registry_verified: bool,
-        quarantined: bool,
-        proxy_host: String,
-    }
-
-    #[derive(Clone, Debug, Deserialize, Serialize)]
-    struct ResourceIdentity {
-        project_id: String,
-        runtime_id: String,
-        sandbox_token: String,
     }
 
     #[derive(Clone)]
@@ -100,7 +59,8 @@ mod linux {
         status: IsolationStatus,
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
     struct ResourceNames {
         key: String,
         netns: String,
@@ -110,12 +70,16 @@ mod linux {
         cgroup: PathBuf,
         host_ip: String,
         namespace_ip: String,
+        subnet: u32,
     }
 
     #[derive(Deserialize, Serialize)]
     struct JournalEnvelope {
         identity: ResourceIdentity,
+        names: ResourceNames,
         stage: String,
+        ports: Vec<u16>,
+        status: IsolationStatus,
         mac: String,
     }
 
@@ -123,6 +87,7 @@ mod linux {
         path: PathBuf,
         device: u64,
         inode: u64,
+        digest: [u8; 32],
     }
 
     struct State {
@@ -131,8 +96,10 @@ mod linux {
         journal_root: PathBuf,
         resources: Mutex<HashMap<String, ResourceRecord>>,
         replay: Mutex<(HashSet<String>, VecDeque<String>)>,
+        subnet_leases: Mutex<HashMap<u32, String>>,
         ip: TrustedBinary,
         nft: TrustedBinary,
+        allowed_peer: PeerCred,
     }
 
     #[derive(Clone, Copy)]
@@ -142,24 +109,69 @@ mod linux {
     }
 
     impl State {
-        fn derive(&self, identity: &ResourceIdentity) -> io::Result<ResourceNames> {
+        fn derive_key(&self, identity: &ResourceIdentity) -> io::Result<String> {
             let input = format!(
-                "{}\0{}\0{}\0{}",
-                self.boot_id, identity.project_id, identity.runtime_id, identity.sandbox_token
+                "{}\0{}\0{}\0{}\0{}\0{}",
+                self.boot_id,
+                identity.principal_id,
+                identity.project_id,
+                identity.runtime_id,
+                identity.task_id,
+                identity.sandbox_token
             );
-            let digest = hmac_hex(&self.secret, input.as_bytes())?;
-            let octet = u8::from_str_radix(&digest[0..2], 16).unwrap_or(1).max(1);
-            let subnet = (octet % 250).max(1);
-            Ok(ResourceNames {
-                key: digest.clone(),
-                netns: format!("khaos-br-{}", &digest[..12]),
-                veth_host: format!("kh{}", &digest[..12]),
-                veth_peer: format!("kn{}", &digest[..12]),
-                nft_table: format!("khaos_browser_{}", &digest[..32]),
-                cgroup: Path::new("/sys/fs/cgroup/khaos-browser").join(&digest[..32]),
-                host_ip: format!("10.203.{subnet}.1"),
-                namespace_ip: format!("10.203.{subnet}.2"),
-            })
+            hmac_hex(&self.secret, input.as_bytes())
+        }
+
+        fn names_for_subnet(&self, key: String, subnet: u32) -> ResourceNames {
+            let (host_ip, namespace_ip) = subnet_addresses(subnet);
+            ResourceNames {
+                key: key.clone(),
+                netns: format!("khaos-br-{}", &key[..12]),
+                veth_host: format!("kh{}", &key[..12]),
+                veth_peer: format!("kn{}", &key[..12]),
+                nft_table: format!("khaos_browser_{}", &key[..32]),
+                cgroup: Path::new("/sys/fs/cgroup/khaos-browser").join(&key[..32]),
+                host_ip,
+                namespace_ip,
+                subnet,
+            }
+        }
+
+        fn allocate_names(&self, identity: &ResourceIdentity) -> io::Result<ResourceNames> {
+            let key = self.derive_key(identity)?;
+            let preferred =
+                (u32::from_str_radix(&key[0..8], 16).unwrap_or(0) % SUBNET_POOL_SIZE) + 1;
+            let mut leases = self
+                .subnet_leases
+                .lock()
+                .map_err(|_| io::Error::other("subnet lease lock poisoned"))?;
+            let subnet = reserve_subnet(&mut leases, preferred, &key)?;
+            Ok(self.names_for_subnet(key, subnet))
+        }
+
+        fn release_subnet(&self, names: &ResourceNames) -> io::Result<()> {
+            let mut leases = self
+                .subnet_leases
+                .lock()
+                .map_err(|_| io::Error::other("subnet lease lock poisoned"))?;
+            if leases.get(&names.subnet) == Some(&names.key) {
+                leases.remove(&names.subnet);
+            }
+            Ok(())
+        }
+
+        fn runtime_capability(&self, request: &Request) -> io::Result<String> {
+            let input = format!(
+                "runtime-capability\0{}\0{}\0{}\0{}\0{}\0{}\0{}",
+                self.boot_id,
+                request.principal_id,
+                request.project_id,
+                request.runtime_id,
+                request.task_id,
+                request.client_pid,
+                request.client_start_time,
+            );
+            hmac_hex(&self.secret, input.as_bytes())
         }
 
         fn accept_request_id(&self, request_id: &str) -> io::Result<()> {
@@ -183,16 +195,28 @@ mod linux {
             Ok(())
         }
 
-        fn journal(&self, identity: &ResourceIdentity, stage: &str) -> io::Result<()> {
+        fn journal(
+            &self,
+            identity: &ResourceIdentity,
+            names: &ResourceNames,
+            stage: &str,
+            ports: &HashSet<u16>,
+            status: &IsolationStatus,
+        ) -> io::Result<()> {
             fs::create_dir_all(&self.journal_root)?;
             fs::set_permissions(&self.journal_root, fs::Permissions::from_mode(0o700))?;
-            let body = serde_json::to_vec(&(identity, stage)).map_err(io::Error::other)?;
+            let mut sorted_ports: Vec<u16> = ports.iter().copied().collect();
+            sorted_ports.sort_unstable();
+            let body = serde_json::to_vec(&(identity, names, stage, &sorted_ports, status))
+                .map_err(io::Error::other)?;
             let envelope = JournalEnvelope {
                 identity: identity.clone(),
+                names: names.clone(),
                 stage: stage.to_owned(),
+                ports: sorted_ports,
+                status: status.clone(),
                 mac: hmac_hex(&self.secret, &body)?,
             };
-            let names = self.derive(identity)?;
             let path = self.journal_root.join(format!("{}.json", names.key));
             let temporary = self.journal_root.join(format!(".{}.tmp", names.key));
             let data = serde_json::to_vec(&envelope).map_err(io::Error::other)?;
@@ -211,13 +235,53 @@ mod linux {
         fn remove_journal(&self, identity: &ResourceIdentity) -> io::Result<()> {
             let path = self
                 .journal_root
-                .join(format!("{}.json", self.derive(identity)?.key));
+                .join(format!("{}.json", self.derive_key(identity)?));
             match fs::remove_file(path) {
                 Ok(()) => File::open(&self.journal_root)?.sync_all(),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
                 Err(error) => Err(error),
             }
         }
+    }
+
+    fn reserve_subnet(
+        leases: &mut HashMap<u32, String>,
+        preferred: u32,
+        key: &str,
+    ) -> io::Result<u32> {
+        for offset in 0..SUBNET_POOL_SIZE {
+            let subnet = ((preferred - 1 + offset) % SUBNET_POOL_SIZE) + 1;
+            match leases.get(&subnet) {
+                Some(owner) if owner != key => continue,
+                Some(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "sandbox subnet lease already exists",
+                    ));
+                }
+                None => {
+                    leases.insert(subnet, key.to_owned());
+                    return Ok(subnet);
+                }
+            }
+        }
+        Err(io::Error::other("browser subnet lease pool exhausted"))
+    }
+
+    fn subnet_addresses(subnet: u32) -> (String, String) {
+        debug_assert!((1..=SUBNET_POOL_SIZE).contains(&subnet));
+        let base = 0x0ac0_0000_u32 + subnet * 4;
+        let address = |offset: u32| {
+            let value = base + offset;
+            format!(
+                "{}.{}.{}.{}",
+                value >> 24,
+                (value >> 16) & 0xff,
+                (value >> 8) & 0xff,
+                value & 0xff
+            )
+        };
+        (address(1), address(2))
     }
 
     fn validate_request(request: &Request, peer: PeerCred, state: &State) -> io::Result<()> {
@@ -247,24 +311,70 @@ mod linux {
         }
         validate_identifier(&request.project_id, 1, 128, "project_id")?;
         validate_identifier(&request.runtime_id, 1, 128, "runtime_id")?;
-        validate_hex(&request.sandbox_token, 16, 128, "sandbox_token")?;
+        validate_identifier(&request.principal_id, 1, 128, "principal_id")?;
+        validate_identifier(&request.task_id, 1, 128, "task_id")?;
+        validate_hex(&request.sandbox_token, 32, 128, "sandbox_token")?;
+        if request.op == Operation::Authorize {
+            if request.runtime_capability.is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "authorize must not carry a runtime capability",
+                ));
+            }
+        } else {
+            let supplied = request.runtime_capability.as_deref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "runtime capability required",
+                )
+            })?;
+            let expected = state.runtime_capability(request)?;
+            if !constant_time_equal(supplied.as_bytes(), expected.as_bytes()) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "runtime capability invalid",
+                ));
+            }
+        }
         state.accept_request_id(&request.request_id)
     }
 
     fn dispatch(request: &Request, state: &State) -> io::Result<IsolationStatus> {
         let identity = ResourceIdentity {
+            principal_id: request.principal_id.clone(),
             project_id: request.project_id.clone(),
             runtime_id: request.runtime_id.clone(),
+            task_id: request.task_id.clone(),
             sandbox_token: request.sandbox_token.clone(),
+            client_pid: request.client_pid,
+            client_start_time: request.client_start_time,
         };
-        let names = state.derive(&identity)?;
+        let key = state.derive_key(&identity)?;
         match request.op {
-            Operation::Setup => setup(state, identity, names),
-            Operation::AllowProxy => update_proxy(state, &names.key, request.port, true),
-            Operation::RevokeProxy => update_proxy(state, &names.key, request.port, false),
+            Operation::Authorize => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "authorize is handled by the connection authority",
+            )),
+            Operation::Setup => {
+                if state
+                    .resources
+                    .lock()
+                    .map_err(|_| io::Error::other("resource lock poisoned"))?
+                    .contains_key(&key)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "sandbox already exists",
+                    ));
+                }
+                let names = state.allocate_names(&identity)?;
+                setup(state, identity, names)
+            }
+            Operation::AllowProxy => update_proxy(state, &key, request.port, true),
+            Operation::RevokeProxy => update_proxy(state, &key, request.port, false),
             Operation::AttachProcess => attach_process(
                 state,
-                &names.key,
+                &key,
                 request
                     .target_pid
                     .ok_or_else(|| io::Error::other("target_pid required"))?,
@@ -277,14 +387,14 @@ mod linux {
                 io::ErrorKind::InvalidInput,
                 "join requires descriptor response",
             )),
-            Operation::Teardown => teardown_key(state, &names.key),
+            Operation::Teardown => teardown_key(state, &key),
             Operation::Status => {
                 let resources = state
                     .resources
                     .lock()
                     .map_err(|_| io::Error::other("resource lock poisoned"))?;
                 resources
-                    .get(&names.key)
+                    .get(&key)
                     .map(|record| record.status.clone())
                     .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sandbox not found"))
             }
@@ -308,10 +418,22 @@ mod linux {
                 ));
             }
         }
-        state.journal(&identity, "intent")?;
+        let empty_ports = HashSet::new();
+        let pending_status = IsolationStatus::default();
+        let active_status = IsolationStatus {
+            helper_authenticated: true,
+            network_namespace: true,
+            nft_default_deny: true,
+            cgroup_attached: true,
+            process_isolated: false,
+            resource_registry_verified: true,
+            quarantined: false,
+            proxy_host: names.host_ip.clone(),
+        };
+        state.journal(&identity, &names, "intent", &empty_ports, &pending_status)?;
         let result = (|| {
             run_ip(state, &["netns", "add", &names.netns])?;
-            state.journal(&identity, "netns")?;
+            state.journal(&identity, &names, "netns", &empty_ports, &pending_status)?;
             run_ip(
                 state,
                 &[
@@ -369,11 +491,11 @@ mod linux {
                     &names.host_ip,
                 ],
             )?;
-            state.journal(&identity, "veth")?;
+            state.journal(&identity, &names, "veth", &empty_ports, &pending_status)?;
             create_cgroup(&names.cgroup)?;
-            state.journal(&identity, "cgroup")?;
+            state.journal(&identity, &names, "cgroup", &empty_ports, &pending_status)?;
             apply_nft(state, &names, &HashSet::new(), false)?;
-            state.journal(&identity, "active")?;
+            state.journal(&identity, &names, "active", &empty_ports, &active_status)?;
             Ok(())
         })();
         if let Err(error) = result {
@@ -391,7 +513,13 @@ mod linux {
                 // Without this insertion a live helper cannot report or retry
                 // cleanup until a restart reconstructs the journal.
                 record.status.quarantined = true;
-                state.journal(&identity, "quarantined")?;
+                state.journal(
+                    &identity,
+                    &names,
+                    "quarantined",
+                    &record.ports,
+                    &record.status,
+                )?;
                 state
                     .resources
                     .lock()
@@ -402,18 +530,9 @@ mod linux {
                 )));
             }
             state.remove_journal(&identity)?;
+            state.release_subnet(&names)?;
             return Err(error);
         }
-        let status = IsolationStatus {
-            helper_authenticated: true,
-            network_namespace: true,
-            nft_default_deny: true,
-            cgroup_attached: true,
-            process_isolated: false,
-            resource_registry_verified: true,
-            quarantined: false,
-            proxy_host: names.host_ip.clone(),
-        };
         state
             .resources
             .lock()
@@ -424,10 +543,10 @@ mod linux {
                     identity,
                     names,
                     ports: HashSet::new(),
-                    status: status.clone(),
+                    status: active_status.clone(),
                 },
             );
-        Ok(status)
+        Ok(active_status)
     }
 
     fn update_proxy(
@@ -454,8 +573,28 @@ mod linux {
         } else {
             desired.remove(&port);
         }
-        apply_nft(state, &record.names, &desired, true)?;
+        state.journal(
+            &record.identity,
+            &record.names,
+            "proxy_pending",
+            &desired,
+            &record.status,
+        )?;
+        if let Err(error) = apply_nft(state, &record.names, &desired, true) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         record.ports = desired;
+        if let Err(error) = state.journal(
+            &record.identity,
+            &record.names,
+            "active",
+            &record.ports,
+            &record.status,
+        ) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         Ok(record.status.clone())
     }
 
@@ -471,12 +610,38 @@ mod linux {
         let record = resources
             .get_mut(key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sandbox not found"))?;
-        fs::write(
+        state.journal(
+            &record.identity,
+            &record.names,
+            "join_pending",
+            &record.ports,
+            &record.status,
+        )?;
+        if let Err(error) = fs::write(
             record.names.cgroup.join("cgroup.procs"),
             peer.pid.to_string(),
-        )?;
-        let namespace = open_managed_netns(&record.names.netns)?;
+        ) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
+        let namespace = match open_managed_netns(&record.names.netns) {
+            Ok(namespace) => namespace,
+            Err(error) => {
+                record.status.quarantined = true;
+                return Err(error);
+            }
+        };
         record.status.process_isolated = true;
+        if let Err(error) = state.journal(
+            &record.identity,
+            &record.names,
+            "active",
+            &record.ports,
+            &record.status,
+        ) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         Ok((record.status.clone(), namespace))
     }
 
@@ -500,8 +665,28 @@ mod linux {
         let record = resources
             .get_mut(key)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "sandbox not found"))?;
-        fs::write(record.names.cgroup.join("cgroup.procs"), pid.to_string())?;
+        state.journal(
+            &record.identity,
+            &record.names,
+            "attach_pending",
+            &record.ports,
+            &record.status,
+        )?;
+        if let Err(error) = fs::write(record.names.cgroup.join("cgroup.procs"), pid.to_string()) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         record.status.process_isolated = true;
+        if let Err(error) = state.journal(
+            &record.identity,
+            &record.names,
+            "active",
+            &record.ports,
+            &record.status,
+        ) {
+            record.status.quarantined = true;
+            return Err(error);
+        }
         Ok(record.status.clone())
     }
 
@@ -515,6 +700,7 @@ mod linux {
         match teardown_record(state, &mut record) {
             Ok(()) => {
                 state.remove_journal(&record.identity)?;
+                state.release_subnet(&record.names)?;
                 Ok(IsolationStatus {
                     helper_authenticated: true,
                     resource_registry_verified: true,
@@ -523,7 +709,13 @@ mod linux {
             }
             Err(error) => {
                 record.status.quarantined = true;
-                state.journal(&record.identity, "quarantined")?;
+                state.journal(
+                    &record.identity,
+                    &record.names,
+                    "quarantined",
+                    &record.ports,
+                    &record.status,
+                )?;
                 state
                     .resources
                     .lock()
@@ -698,7 +890,21 @@ mod linux {
         run_trusted(&state.nft, args, stdin)
     }
 
+    fn run_nft_capture(state: &State, args: &[&str]) -> io::Result<String> {
+        let output = run_trusted_capture(&state.nft, args, None)?;
+        String::from_utf8(output)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "nft output is not UTF-8"))
+    }
+
     fn run_trusted(binary: &TrustedBinary, args: &[&str], stdin: Option<&[u8]>) -> io::Result<()> {
+        run_trusted_capture(binary, args, stdin).map(|_| ())
+    }
+
+    fn run_trusted_capture(
+        binary: &TrustedBinary,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+    ) -> io::Result<Vec<u8>> {
         let executable = binary.open_for_exec()?;
         let executable_path = format!("/proc/self/fd/{}", executable.as_raw_fd());
         let mut command = Command::new(&executable_path);
@@ -716,7 +922,7 @@ mod linux {
         let output = child.wait_with_output()?;
         binary.open_for_exec()?;
         if output.status.success() {
-            return Ok(());
+            return Ok(output.stdout);
         }
         Err(io::Error::other(format!(
             "{} failed: {}",
@@ -752,7 +958,7 @@ mod linux {
             // owner/mode and device/inode checks to the actual executable.
             let resolved_path = fs::canonicalize(configured_path)?;
             validate_parent_chain(&resolved_path)?;
-            let file = OpenOptions::new()
+            let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
                 .open(&resolved_path)?;
@@ -767,10 +973,11 @@ mod linux {
                 path: resolved_path,
                 device: metadata.dev(),
                 inode: metadata.ino(),
+                digest: digest_file(&mut file)?,
             })
         }
         fn open_for_exec(&self) -> io::Result<File> {
-            let file = OpenOptions::new()
+            let mut file = OpenOptions::new()
                 .read(true)
                 .custom_flags(libc::O_NOFOLLOW)
                 .open(&self.path)?;
@@ -785,8 +992,27 @@ mod linux {
                     "TCB binary identity changed",
                 ));
             }
+            if digest_file(&mut file)? != self.digest {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "TCB binary content digest changed",
+                ));
+            }
             Ok(file)
         }
+    }
+
+    fn digest_file(file: &mut File) -> io::Result<[u8; 32]> {
+        let mut digest = Sha256::new();
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            digest.update(&buffer[..read]);
+        }
+        Ok(digest.finalize().into())
     }
 
     fn validate_parent_chain(path: &Path) -> io::Result<()> {
@@ -804,34 +1030,75 @@ mod linux {
         Ok(())
     }
 
-    fn handle_connection(
-        mut stream: UnixStream,
-        allowed_uid: u32,
-        state: Arc<State>,
-    ) -> io::Result<()> {
+    fn handle_connection(mut stream: UnixStream, state: Arc<State>) -> io::Result<()> {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let peer = peer_cred(&stream)?;
-        if peer.uid != allowed_uid {
-            return write_error(&mut stream, "", "peer uid not allowed");
+        if peer.uid != state.allowed_peer.uid || !is_descendant(peer.pid, state.allowed_peer.pid)? {
+            return write_error(
+                &mut stream,
+                "",
+                ErrorCode::PeerAuthenticationFailed,
+                "peer process authority not allowed",
+            );
         }
-        let request = read_request(&mut stream)?;
+        let request = match read_request(&mut stream) {
+            Ok(request) => request,
+            Err(error) => {
+                return write_error(
+                    &mut stream,
+                    "",
+                    ErrorCode::InvalidRequest,
+                    &error.to_string(),
+                )
+            }
+        };
         let request_id = request.request_id.clone();
-        validate_request(&request, peer, &state)?;
-        if request.op == Operation::Join {
-            let identity = ResourceIdentity {
-                project_id: request.project_id.clone(),
-                runtime_id: request.runtime_id.clone(),
-                sandbox_token: request.sandbox_token.clone(),
-            };
-            let names = state.derive(&identity)?;
-            let (status, namespace) = join_authority(&state, &names.key, peer)?;
+        if let Err(error) = validate_request(&request, peer, &state) {
+            return write_error(
+                &mut stream,
+                &request_id,
+                error_code_for(&error),
+                &error.to_string(),
+            );
+        }
+        if request.op == Operation::Authorize {
+            let capability = state.runtime_capability(&request)?;
             let response = Response {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: &request_id,
                 ok: true,
+                error_code: None,
+                error: None,
+                status: Some(IsolationStatus {
+                    helper_authenticated: true,
+                    resource_registry_verified: true,
+                    ..IsolationStatus::default()
+                }),
+                runtime_capability: Some(capability),
+            };
+            return write_response(&mut stream, &response);
+        }
+        if request.op == Operation::Join {
+            let identity = ResourceIdentity {
+                principal_id: request.principal_id.clone(),
+                project_id: request.project_id.clone(),
+                runtime_id: request.runtime_id.clone(),
+                task_id: request.task_id.clone(),
+                sandbox_token: request.sandbox_token.clone(),
+                client_pid: request.client_pid,
+                client_start_time: request.client_start_time,
+            };
+            let key = state.derive_key(&identity)?;
+            let (status, namespace) = join_authority(&state, &key, peer)?;
+            let response = Response {
+                protocol_version: PROTOCOL_VERSION,
+                request_id: &request_id,
+                ok: true,
+                error_code: None,
                 error: None,
                 status: Some(status),
+                runtime_capability: None,
             };
             return write_response_with_fd(&stream, &response, namespace.as_raw_fd());
         }
@@ -841,15 +1108,19 @@ mod linux {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: &request_id,
                 ok: true,
+                error_code: None,
                 error: None,
                 status: Some(status),
+                runtime_capability: None,
             },
             Err(error) => Response {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: &request_id,
                 ok: false,
+                error_code: Some(error_code_for(&error)),
                 error: Some(error.to_string()),
                 status: None,
+                runtime_capability: None,
             },
         };
         write_response(&mut stream, &response)
@@ -859,7 +1130,7 @@ mod linux {
         let mut length = [0_u8; 4];
         stream.read_exact(&mut length)?;
         let length = u32::from_be_bytes(length) as usize;
-        if length == 0 || length > MAX_MESSAGE {
+        if length == 0 || length > MAX_MESSAGE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "request length invalid",
@@ -923,15 +1194,48 @@ mod linux {
         }
         Ok(())
     }
-    fn write_error(stream: &mut UnixStream, request_id: &str, error: &str) -> io::Result<()> {
+    fn error_code_for(error: &io::Error) -> ErrorCode {
+        let message = error.to_string();
+        if message.contains("replay") {
+            return ErrorCode::ReplayDetected;
+        }
+        if message.contains("TCB")
+            || message.contains("binary")
+            || message.contains("ownership or mode")
+            || message.contains("parent directory is mutable")
+        {
+            return ErrorCode::TcbIntegrityFailure;
+        }
+        if message.contains("pool exhausted") {
+            return ErrorCode::ResourceExhausted;
+        }
+        match error.kind() {
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => ErrorCode::InvalidRequest,
+            io::ErrorKind::PermissionDenied => ErrorCode::AuthorizationDenied,
+            io::ErrorKind::NotFound => ErrorCode::ResourceNotFound,
+            io::ErrorKind::AlreadyExists => ErrorCode::ResourceConflict,
+            io::ErrorKind::TimedOut => ErrorCode::DeadlineExceeded,
+            io::ErrorKind::OutOfMemory => ErrorCode::ResourceExhausted,
+            _ => ErrorCode::KernelOperationFailed,
+        }
+    }
+
+    fn write_error(
+        stream: &mut UnixStream,
+        request_id: &str,
+        error_code: ErrorCode,
+        error: &str,
+    ) -> io::Result<()> {
         write_response(
             stream,
             &Response {
                 protocol_version: PROTOCOL_VERSION,
                 request_id,
                 ok: false,
+                error_code: Some(error_code),
                 error: Some(error.to_owned()),
                 status: None,
+                runtime_capability: None,
             },
         )
     }
@@ -1030,6 +1334,16 @@ mod linux {
             .map(|byte| format!("{byte:02x}"))
             .collect())
     }
+
+    fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+        if left.len() != right.len() {
+            return false;
+        }
+        left.iter()
+            .zip(right.iter())
+            .fold(0_u8, |difference, (a, b)| difference | (a ^ b))
+            == 0
+    }
     fn validate_identifier(value: &str, min: usize, max: usize, label: &str) -> io::Result<()> {
         if value.len() < min
             || value.len() > max
@@ -1061,6 +1375,13 @@ mod linux {
         fs::create_dir_all(&state.journal_root)?;
         for entry in fs::read_dir(&state.journal_root)? {
             let entry = entry?;
+            if entry.path().extension().and_then(|value| value.to_str()) == Some("tmp") {
+                let metadata = fs::symlink_metadata(entry.path())?;
+                if metadata.is_file() && metadata.uid() == 0 && metadata.mode() & 0o022 == 0 {
+                    fs::remove_file(entry.path())?;
+                }
+                continue;
+            }
             if entry.path().extension().and_then(|value| value.to_str()) != Some("json") {
                 continue;
             }
@@ -1072,24 +1393,71 @@ mod linux {
                     continue;
                 }
             };
-            let body = serde_json::to_vec(&(&envelope.identity, &envelope.stage))
-                .map_err(io::Error::other)?;
+            let body = serde_json::to_vec(&(
+                &envelope.identity,
+                &envelope.names,
+                &envelope.stage,
+                &envelope.ports,
+                &envelope.status,
+            ))
+            .map_err(io::Error::other)?;
             if hmac_hex(&state.secret, &body)? != envelope.mac {
                 fs::rename(entry.path(), entry.path().with_extension("quarantine"))?;
                 continue;
             }
-            let names = state.derive(&envelope.identity)?;
+            let names = envelope.names;
+            let expected_key = state.derive_key(&envelope.identity)?;
+            if names.key != expected_key || !(1..=SUBNET_POOL_SIZE).contains(&names.subnet) {
+                fs::rename(entry.path(), entry.path().with_extension("quarantine"))?;
+                continue;
+            }
+            {
+                let mut leases = state
+                    .subnet_leases
+                    .lock()
+                    .map_err(|_| io::Error::other("subnet lease lock poisoned"))?;
+                if leases.insert(names.subnet, names.key.clone()).is_some() {
+                    fs::rename(entry.path(), entry.path().with_extension("quarantine"))?;
+                    continue;
+                }
+            }
             let mut record = ResourceRecord {
                 identity: envelope.identity,
                 names: names.clone(),
-                ports: HashSet::new(),
+                ports: envelope.ports.into_iter().collect(),
                 status: IsolationStatus {
                     quarantined: true,
                     ..IsolationStatus::default()
                 },
             };
+            if envelope.stage == "active" {
+                match verify_active_record(state, &record) {
+                    Ok(status) => {
+                        record.status = status;
+                        state.journal(
+                            &record.identity,
+                            &record.names,
+                            "active",
+                            &record.ports,
+                            &record.status,
+                        )?;
+                        state
+                            .resources
+                            .lock()
+                            .map_err(|_| io::Error::other("resource lock poisoned"))?
+                            .insert(names.key, record);
+                        continue;
+                    }
+                    Err(_) => {
+                        // An active journal is only adoptable when both its
+                        // process owner and every kernel resource can be
+                        // re-established from current evidence.
+                    }
+                }
+            }
             if teardown_record(state, &mut record).is_ok() {
                 let _ = fs::remove_file(entry.path());
+                state.release_subnet(&names)?;
             } else {
                 state
                     .resources
@@ -1099,6 +1467,64 @@ mod linux {
             }
         }
         Ok(())
+    }
+
+    fn verify_active_record(state: &State, record: &ResourceRecord) -> io::Result<IsolationStatus> {
+        if process_start_time(record.identity.client_pid)? != record.identity.client_start_time
+            || !is_descendant(record.identity.client_pid, state.allowed_peer.pid)?
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "journal owner process identity is no longer authorized",
+            ));
+        }
+        let _namespace = open_managed_netns(&record.names.netns)?;
+        run_ip(state, &["link", "show", "dev", &record.names.veth_host])?;
+        run_ip(
+            state,
+            &[
+                "-n",
+                &record.names.netns,
+                "link",
+                "show",
+                "dev",
+                &record.names.veth_peer,
+            ],
+        )?;
+        let nft = run_nft_capture(state, &["list", "table", "inet", &record.names.nft_table])?;
+        if !nft.contains(&format!("iifname \"{}\" drop", record.names.veth_host)) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered nft table lacks the sandbox default-deny rule",
+            ));
+        }
+        for port in &record.ports {
+            if !nft.contains(&format!("tcp dport {port} accept")) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "recovered nft table lacks a journaled proxy rule",
+                ));
+            }
+        }
+        let metadata = fs::symlink_metadata(&record.names.cgroup)?;
+        if !metadata.is_dir() || metadata.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "recovered cgroup authority is invalid",
+            ));
+        }
+        let processes = fs::read_to_string(record.names.cgroup.join("cgroup.procs"))?;
+        let process_isolated = processes.lines().any(|line| !line.trim().is_empty());
+        Ok(IsolationStatus {
+            helper_authenticated: true,
+            network_namespace: true,
+            nft_default_deny: true,
+            cgroup_attached: true,
+            process_isolated,
+            resource_registry_verified: true,
+            quarantined: false,
+            proxy_host: record.names.host_ip.clone(),
+        })
     }
 
     fn acquire_instance_lock(socket_path: &Path) -> io::Result<File> {
@@ -1133,6 +1559,24 @@ mod linux {
                 "browser client uid must be non-root",
             ));
         }
+        let allowed_pid = std::env::var("KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID")
+            .map_err(|_| io::Error::other("allowed helper client pid is required"))?
+            .parse::<u32>()
+            .map_err(io::Error::other)?;
+        if allowed_pid <= 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "browser client pid is invalid",
+            ));
+        }
+        let process_metadata = fs::metadata(format!("/proc/{allowed_pid}"))?;
+        if process_metadata.uid() != allowed_uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "browser client pid does not belong to allowed uid",
+            ));
+        }
+        process_start_time(allowed_pid)?;
         let secret_path = PathBuf::from(
             std::env::var("KHAOS_BROWSER_HELPER_SECRET_FILE")
                 .unwrap_or_else(|_| DEFAULT_SECRET.to_owned()),
@@ -1149,8 +1593,13 @@ mod linux {
             journal_root,
             resources: Mutex::new(HashMap::new()),
             replay: Mutex::new((HashSet::new(), VecDeque::new())),
+            subnet_leases: Mutex::new(HashMap::new()),
             ip: TrustedBinary::open(IP_PATH)?,
             nft: TrustedBinary::open(NFT_PATH)?,
+            allowed_peer: PeerCred {
+                pid: allowed_pid,
+                uid: allowed_uid,
+            },
         });
         recover(&state)?;
         if let Some(parent) = Path::new(&socket_path).parent() {
@@ -1185,7 +1634,7 @@ mod linux {
             let state = Arc::clone(&state);
             let active = Arc::clone(&active);
             thread::spawn(move || {
-                let _ = handle_connection(stream, allowed_uid, state);
+                let _ = handle_connection(stream, state);
                 active.fetch_sub(1, Ordering::AcqRel);
             });
         }
@@ -1198,7 +1647,7 @@ mod linux {
 
         fn request_json(extra: &str) -> String {
             format!(
-                r#"{{"protocol_version":1,"request_id":"request-123","boot_id":"boot","client_pid":42,"client_start_time":99,"project_id":"project","runtime_id":"runtime","sandbox_token":"0123456789abcdef0123456789abcdef","op":"status","port":null,"target_pid":null,"target_start_time":null{extra}}}"#
+                r#"{{"protocol_version":1,"request_id":"request-123","boot_id":"boot","client_pid":42,"client_start_time":99,"principal_id":"principal","project_id":"project","runtime_id":"runtime","task_id":"task","sandbox_token":"0123456789abcdef0123456789abcdef","runtime_capability":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","op":"status","port":null,"target_pid":null,"target_start_time":null{extra}}}"#
             )
         }
 
@@ -1230,12 +1679,43 @@ mod linux {
         }
 
         #[test]
+        fn subnet_allocator_resolves_collisions_and_never_reuses_active_lease() {
+            let mut leases = HashMap::new();
+            assert_eq!(reserve_subnet(&mut leases, 42, "sandbox-a").unwrap(), 42);
+            assert_eq!(reserve_subnet(&mut leases, 42, "sandbox-b").unwrap(), 43);
+            assert!(reserve_subnet(&mut leases, 42, "sandbox-a").is_err());
+            assert_eq!(leases.get(&42).map(String::as_str), Some("sandbox-a"));
+            assert_eq!(leases.get(&43).map(String::as_str), Some("sandbox-b"));
+            for index in 0..1_000_u32 {
+                let key = format!("bulk-{index}");
+                reserve_subnet(&mut leases, 42, &key).unwrap();
+            }
+            assert_eq!(leases.len(), 1_002);
+        }
+
+        #[test]
+        fn subnet_pool_spans_the_private_ten_dot_192_slash_12_range() {
+            assert_eq!(
+                subnet_addresses(1),
+                ("10.192.0.5".into(), "10.192.0.6".into())
+            );
+            assert_eq!(
+                subnet_addresses(SUBNET_POOL_SIZE),
+                ("10.207.255.253".into(), "10.207.255.254".into())
+            );
+        }
+
+        #[test]
         fn resource_identity_is_bound_to_boot_and_principal_scope() {
             let secret = [0x5a_u8; 32];
-            let first = hmac_hex(&secret, b"boot-a\0project\0runtime\0token").unwrap();
-            let same = hmac_hex(&secret, b"boot-a\0project\0runtime\0token").unwrap();
-            let other_boot = hmac_hex(&secret, b"boot-b\0project\0runtime\0token").unwrap();
-            let other_project = hmac_hex(&secret, b"boot-a\0other\0runtime\0token").unwrap();
+            let first =
+                hmac_hex(&secret, b"boot-a\0principal\0project\0runtime\0task\0token").unwrap();
+            let same =
+                hmac_hex(&secret, b"boot-a\0principal\0project\0runtime\0task\0token").unwrap();
+            let other_boot =
+                hmac_hex(&secret, b"boot-b\0principal\0project\0runtime\0task\0token").unwrap();
+            let other_project =
+                hmac_hex(&secret, b"boot-a\0principal\0other\0runtime\0task\0token").unwrap();
             assert_eq!(first, same);
             assert_ne!(first, other_boot);
             assert_ne!(first, other_project);

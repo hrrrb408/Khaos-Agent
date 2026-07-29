@@ -4,10 +4,16 @@ from khaos.exceptions import ToolNotFoundError
 from khaos.modes.manager import MODE_CONFIGS, Mode
 from khaos.tools import (
     ToolDefinition,
+    ToolCapability,
     ToolRegistry,
     create_builtin_registry,
     create_runtime_registry,
 )
+
+
+def test_capability_names_are_a_closed_typed_contract():
+    with pytest.raises(ValueError):
+        ToolCapability("filesystem.typo", frozenset({"coding"}), frozenset())
 
 
 def test_registry_lists_tools_by_mode():
@@ -91,6 +97,75 @@ def test_registry_rejects_duplicate_names():
 
     with pytest.raises(ValueError):
         registry.register(definition)
+
+
+@pytest.mark.parametrize("keyword", ["oneOf", "anyOf", "allOf", "format", "const"])
+def test_production_registry_rejects_unsupported_schema_keywords(keyword):
+    registry = ToolRegistry(
+        enforce_capabilities=True,
+        capability_manifest={
+            "strict": (),
+        },
+    )
+    definition = ToolDefinition(
+        name="strict",
+        description="strict",
+        parameters={
+            "type": "object",
+            "properties": {
+                "value": {"type": "string", keyword: "ignored-security-rule"},
+            },
+        },
+        modes=["all"],
+        permission_level="read",
+        parallel=True,
+        capabilities=(
+            # A harmless explicit capability lets this test exercise schema
+            # registration without involving a privileged resource resolver.
+            create_builtin_registry().get("count_words").capabilities[0],
+        ),
+    )
+
+    with pytest.raises(ValueError, match="unsupported JSON Schema keywords"):
+        registry.register(definition)
+
+
+def test_production_registry_rejects_invalid_nested_schema_contracts():
+    registry = ToolRegistry(enforce_capabilities=True)
+    capability = create_builtin_registry().get("count_words").capabilities
+
+    with pytest.raises(ValueError, match="unknown properties"):
+        registry.register(
+            ToolDefinition(
+                name="invalid-required",
+                description="invalid",
+                parameters={
+                    "type": "object",
+                    "properties": {},
+                    "required": ["missing"],
+                },
+                modes=["all"],
+                permission_level="read",
+                parallel=True,
+                capabilities=capability,
+            )
+        )
+
+    with pytest.raises(ValueError, match="typed item schema is required"):
+        registry.register(
+            ToolDefinition(
+                name="invalid-array",
+                description="invalid",
+                parameters={
+                    "type": "object",
+                    "properties": {"items": {"type": "array"}},
+                },
+                modes=["all"],
+                permission_level="read",
+                parallel=True,
+                capabilities=capability,
+            )
+        )
 
 
 def test_registry_validates_required_and_types():

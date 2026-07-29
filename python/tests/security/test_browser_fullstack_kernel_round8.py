@@ -86,7 +86,10 @@ async def test_browser_manager_real_chromium_kernel_stack() -> None:
     server = None
     try:
         launch = await manager.launch(
-            project_id="round8-project", runtime_id="round8-runtime"
+            principal_id="round8-principal",
+            project_id="round8-project",
+            task_id="round8-task",
+            runtime_id="round8-runtime",
         )
         assert launch["ok"], launch
         sandbox = manager._browser_sandbox
@@ -106,6 +109,7 @@ async def test_browser_manager_real_chromium_kernel_stack() -> None:
             "round8-principal",
             session_id="round8-session",
             runtime_id="round8-runtime",
+            project_id="round8-project",
             network_guard=_PinnedLocalGuard(sandbox._host_ip),
         )
         assert page is not None, manager._last_ensure_error

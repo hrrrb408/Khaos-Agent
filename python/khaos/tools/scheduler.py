@@ -8,6 +8,7 @@ import inspect
 import json
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from khaos.permissions import ApprovalMode, PermissionRule
@@ -165,6 +166,93 @@ class ToolBudgetReservation:
         await self.budget._finish(self, output_chars=None)
 
 
+class ToolOutputBudgetExceeded(RuntimeError):
+    """Raised without materializing an output larger than its reservation."""
+
+
+def _measure_tool_output(
+    value: Any,
+    limit: int,
+    *,
+    _depth: int = 0,
+    _seen: set[int] | None = None,
+) -> int:
+    """Measure JSON-compatible output incrementally and stop at ``limit``."""
+    if _depth > 64:
+        raise ToolOutputBudgetExceeded("tool output nesting exceeds 64 levels")
+    if value is None:
+        size = 4
+    elif isinstance(value, bool):
+        size = 4 if value else 5
+    elif isinstance(value, (int, float)):
+        size = len(json.dumps(value, allow_nan=False))
+    elif isinstance(value, str):
+        # json.dumps would allocate an escaped copy.  Reject obviously large
+        # strings first; accepted strings are at most one reservation.
+        if len(value) > limit:
+            raise ToolOutputBudgetExceeded(
+                "tool output exceeded reserved hard budget"
+            )
+        size = len(json.dumps(value, ensure_ascii=False))
+    elif isinstance(value, Path):
+        path_text = str(value)
+        if len(path_text) > limit:
+            raise ToolOutputBudgetExceeded(
+                "tool output exceeded reserved hard budget"
+            )
+        size = len(json.dumps(path_text, ensure_ascii=False))
+    elif isinstance(value, (list, tuple, dict)):
+        seen = _seen if _seen is not None else set()
+        identity = id(value)
+        if identity in seen:
+            raise ToolOutputBudgetExceeded("tool output contains a cycle")
+        seen.add(identity)
+        try:
+            size = 2
+            if isinstance(value, dict):
+                iterator = value.items()
+                for index, (key, item) in enumerate(iterator):
+                    if not isinstance(key, str):
+                        raise ToolOutputBudgetExceeded(
+                            "tool output object keys must be strings"
+                        )
+                    size += (1 if index else 0) + len(
+                        json.dumps(key, ensure_ascii=False)
+                    ) + 1
+                    if size > limit:
+                        raise ToolOutputBudgetExceeded(
+                            "tool output exceeded reserved hard budget"
+                        )
+                    size += _measure_tool_output(
+                        item,
+                        limit - size,
+                        _depth=_depth + 1,
+                        _seen=seen,
+                    )
+            else:
+                for index, item in enumerate(value):
+                    size += 1 if index else 0
+                    if size > limit:
+                        raise ToolOutputBudgetExceeded(
+                            "tool output exceeded reserved hard budget"
+                        )
+                    size += _measure_tool_output(
+                        item,
+                        limit - size,
+                        _depth=_depth + 1,
+                        _seen=seen,
+                    )
+        finally:
+            seen.remove(identity)
+    else:
+        raise ToolOutputBudgetExceeded(
+            f"tool output type is not JSON-compatible: {type(value).__name__}"
+        )
+    if size > limit:
+        raise ToolOutputBudgetExceeded("tool output exceeded reserved hard budget")
+    return size
+
+
 class ToolScheduler:
     """Split, authorize, and execute tool calls."""
 
@@ -309,6 +397,7 @@ class ToolScheduler:
                         normalized["arguments"],
                         principal_id=str(tool_context.get("principal_id") or ""),
                         project_id=str(tool_context.get("project_id") or ""),
+                        runtime_id=str(tool_context.get("runtime_id") or ""),
                         task_id=str(tool_context.get("task_id") or ""),
                         workspace_id=str(tool_context.get("workspace_id") or ""),
                         workspace_manager=tool_context.get("workspace_manager"),
@@ -683,6 +772,7 @@ class ToolScheduler:
                     call.get("arguments", {}),
                     principal_id=str(tool_context.get("principal_id") or ""),
                     project_id=str(tool_context.get("project_id") or ""),
+                    runtime_id=str(tool_context.get("runtime_id") or ""),
                     task_id=str(tool_context.get("task_id") or ""),
                     workspace_id=str(tool_context.get("workspace_id") or ""),
                     workspace_manager=tool_context.get("workspace_manager"),
@@ -747,10 +837,13 @@ class ToolScheduler:
                 if resource is not None
                 else self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
             )
+            # Bound the structure before secret scanning.  This traversal
+            # stops as soon as the reservation is consumed and never calls an
+            # arbitrary result object's __str__/__repr__ method.
+            _measure_tool_output(output, reservation.output_limit)
             secret_scan, output = await self.security_middleware.post_check(tool.name, output)
-            output_chars = len(str(output))
-            if output_chars > reservation.output_limit:
-                raise RuntimeError("tool output exceeded max_output_per_tool")
+            # Redaction can change length, so commit the post-redaction size.
+            output_chars = _measure_tool_output(output, reservation.output_limit)
             detail: dict[str, Any] = {"tool_call_id": call["id"]}
             if resource is not None:
                 detail["authorization_resource_digest"] = resource.digest()

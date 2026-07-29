@@ -63,6 +63,9 @@ def _runtime(tmp_path: Path, *, state=WorkspaceState.RUNNING):
     )
     manager = SimpleNamespace(
         get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        require=lambda workspace_id, **_authority: (
+            workspace if workspace_id == "workspace" else None
+        ),
         verify_git_identity=AsyncMock(),
     )
     captured = []

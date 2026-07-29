@@ -27,6 +27,12 @@ Configure this one aggregate check as required. The detailed checks below are
 diagnostic dependencies and remain visible, but branch protection must not use
 an incomplete subset of them as a substitute for the aggregate result.
 
+The aggregate job also downloads per-test evidence emitted only after the
+owning job succeeds. Every fragment binds `commit`, Actions `run_id`, `job`,
+test name, exact `blocked` result, production environment and a canonical
+SHA-256 digest. The assembler rejects missing, duplicate, cross-commit or
+digest-mismatched fragments; it never synthesizes a passing test result.
+
 These are the `name:` fields of the jobs (the names shown in the GitHub
 PR checks UI), grouped by workflow.
 

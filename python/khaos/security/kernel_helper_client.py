@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import ipaddress
 import os
+import re
 import socket
 import stat
 import struct
@@ -19,27 +20,32 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Final
 
+from khaos.security.browser_kernel_protocol_generated import (
+    ERROR_CODES,
+    MAX_MESSAGE_BYTES,
+    OPERATIONS,
+    PROTOCOL_VERSION,
+    REQUEST_FIELDS,
+    RESPONSE_FIELDS,
+    SANDBOX_TOKEN_PATTERN,
+    STATUS_FIELDS,
+)
+
 _SOCKET_ENV: Final = "KHAOS_BROWSER_KERNEL_HELPER_SOCKET"
 _DEFAULT_SOCKET: Final = "/run/khaos/browser-kernel-helper.sock"
-_PROTOCOL_VERSION: Final = 1
-_MAX_MESSAGE: Final = 8192
-_RESPONSE_FIELDS: Final = {
-    "protocol_version",
-    "request_id",
-    "ok",
-    "error",
-    "status",
-}
-_STATUS_FIELDS: Final = {
-    "helper_authenticated",
-    "network_namespace",
-    "nft_default_deny",
-    "cgroup_attached",
-    "process_isolated",
-    "resource_registry_verified",
-    "quarantined",
-    "proxy_host",
-}
+_PROTOCOL_VERSION: Final = PROTOCOL_VERSION
+_MAX_MESSAGE: Final = MAX_MESSAGE_BYTES
+_TOKEN_PATTERN: Final = re.compile(SANDBOX_TOKEN_PATTERN)
+_RESPONSE_FIELDS: Final = RESPONSE_FIELDS
+_STATUS_FIELDS: Final = STATUS_FIELDS
+
+
+class KernelHelperRejected(RuntimeError):
+    """A fail-closed helper rejection with a stable protocol error code."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"kernel helper rejected request [{code}]: {detail}")
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -106,13 +112,23 @@ class KernelAuthorityClient:
         *,
         project_id: str,
         runtime_id: str,
+        principal_id: str,
+        task_id: str,
         sandbox_token: str,
+        runtime_capability: str | None = None,
         socket_path: str | None = None,
         timeout_seconds: float = 5.0,
     ) -> None:
         self._project_id = self._validate_identifier(project_id, "project_id")
         self._runtime_id = self._validate_identifier(runtime_id, "runtime_id")
+        self._principal_id = self._validate_identifier(principal_id, "principal_id")
+        self._task_id = self._validate_identifier(task_id, "task_id")
         self._sandbox_token = self._validate_token(sandbox_token)
+        self._runtime_capability = (
+            self._validate_capability(runtime_capability)
+            if runtime_capability is not None
+            else None
+        )
         self._socket_path = socket_path or os.environ.get(_SOCKET_ENV, _DEFAULT_SOCKET)
         if not Path(self._socket_path).is_absolute():
             raise ValueError("kernel helper socket must be absolute")
@@ -167,6 +183,8 @@ class KernelAuthorityClient:
         target_pid: int | None = None,
         target_start_time: int | None = None,
     ) -> KernelIsolationEvidence:
+        if op != "authorize" and self._runtime_capability is None:
+            self._request("authorize")
         self._validate_socket_authority()
         request_id = str(uuid.uuid4())
         client_pid = os.getpid()
@@ -178,12 +196,17 @@ class KernelAuthorityClient:
             "client_start_time": self._process_start_time(client_pid),
             "project_id": self._project_id,
             "runtime_id": self._runtime_id,
+            "principal_id": self._principal_id,
+            "task_id": self._task_id,
             "sandbox_token": self._sandbox_token,
+            "runtime_capability": self._runtime_capability,
             "op": op,
             "port": port,
             "target_pid": target_pid,
             "target_start_time": target_start_time,
         }
+        if set(request) != REQUEST_FIELDS or op not in OPERATIONS:
+            raise RuntimeError("kernel helper request contract invalid")
         body = json.dumps(request, separators=(",", ":"), sort_keys=True).encode()
         if len(body) > _MAX_MESSAGE:
             raise RuntimeError("kernel helper request exceeds protocol limit")
@@ -209,17 +232,37 @@ class KernelAuthorityClient:
             or type(response["request_id"]) is not str
             or response["request_id"] != request_id
             or type(response["ok"]) is not bool
+            or response["error_code"] is not None
+            and type(response["error_code"]) is not str
             or response["error"] is not None
             and type(response["error"]) is not str
         ):
             raise RuntimeError("kernel helper response identity invalid")
         if not response["ok"]:
-            raise RuntimeError(f"kernel helper rejected request: {response['error']}")
-        if response["error"] is not None:
+            error_code = response["error_code"]
+            error = response["error"]
+            if (
+                error_code not in ERROR_CODES
+                or type(error) is not str
+                or not error
+                or len(error) > 1024
+                or response["status"] is not None
+                or response["runtime_capability"] is not None
+            ):
+                raise RuntimeError("kernel helper error response contract invalid")
+            raise KernelHelperRejected(error_code, error)
+        if response["error"] is not None or response["error_code"] is not None:
             raise RuntimeError("successful kernel helper response carried an error")
+        response_capability = response["runtime_capability"]
+        if op == "authorize":
+            if self._runtime_capability is not None:
+                raise RuntimeError("kernel helper replaced an active runtime capability")
+            self._runtime_capability = self._validate_capability(response_capability)
+        elif response_capability is not None:
+            raise RuntimeError("kernel helper leaked runtime capability")
         return KernelIsolationEvidence.from_payload(
             response["status"],
-            resources_active=op != "teardown",
+            resources_active=op not in {"authorize", "teardown"},
         )
 
     def _validate_socket_authority(self) -> None:
@@ -295,10 +338,16 @@ class KernelAuthorityClient:
 
     @staticmethod
     def _validate_token(value: str) -> str:
-        if not 32 <= len(value) <= 256 or any(
+        if type(value) is not str or _TOKEN_PATTERN.fullmatch(value) is None:
+            raise ValueError("invalid sandbox token")
+        return value.lower()
+
+    @staticmethod
+    def _validate_capability(value: object) -> str:
+        if type(value) is not str or len(value) != 64 or any(
             character not in "0123456789abcdefABCDEF" for character in value
         ):
-            raise ValueError("invalid sandbox token")
+            raise ValueError("invalid runtime capability")
         return value.lower()
 
     @staticmethod

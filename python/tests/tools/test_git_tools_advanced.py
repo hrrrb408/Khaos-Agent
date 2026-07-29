@@ -41,6 +41,9 @@ def _ctx(repo, access_mode="vcs.destructive-write"):
     )
     manager = SimpleNamespace(
         get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        require=lambda workspace_id, **_authority: (
+            workspace if workspace_id == "workspace" else None
+        ),
         verify_git_identity=AsyncMock(),
     )
     service = ExecutionService(_LocalRemoteBackend(), manager)
