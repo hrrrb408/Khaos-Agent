@@ -71,7 +71,7 @@ mod py {
         m.add_function(wrap_pyfunction!(version, m)?)?;
         // Expose a single attribute indicating build provenance for diagnostics.
         m.add("__rust__", true)?;
-        let info = PyDict::new_bound(m.py());
+        let info = PyDict::new(m.py());
         info.set_item("token_engine", "heuristic")?;
         info.set_item("executor", "tokio")?;
         m.add("build_info", info)?;
