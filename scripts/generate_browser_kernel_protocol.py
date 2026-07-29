@@ -22,6 +22,9 @@ def _load() -> dict[str, object]:
     required = schema["required"]
     if set(properties) != set(required):
         raise SystemExit("browser protocol requires every request field")
+    response = schema["x-khaos-response"]
+    if set(response["properties"]) != set(response["required"]):
+        raise SystemExit("browser protocol requires every response field")
     return schema
 
 
@@ -30,6 +33,10 @@ def _python(schema: dict[str, object]) -> str:
     operations = properties["op"]["enum"]
     fields = schema["required"]
     token_pattern = properties["sandbox_token"]["pattern"]
+    response = schema["x-khaos-response"]
+    response_fields = response["required"]
+    error_codes = response["properties"]["error_code"]["oneOf"][1]["enum"]
+    status = response["properties"]["status"]["oneOf"][1]
     return f'''"""Generated from security/browser-kernel-protocol-v1.json; do not edit."""
 
 from typing import Final
@@ -39,6 +46,9 @@ MAX_MESSAGE_BYTES: Final = {schema["x-khaos-max-message-bytes"]}
 REQUEST_FIELDS: Final = frozenset({fields!r})
 OPERATIONS: Final = frozenset({operations!r})
 SANDBOX_TOKEN_PATTERN: Final = {token_pattern!r}
+RESPONSE_FIELDS: Final = frozenset({response_fields!r})
+ERROR_CODES: Final = frozenset({error_codes!r})
+STATUS_FIELDS: Final = frozenset({status["required"]!r})
 '''
 
 
@@ -49,9 +59,15 @@ def _rust(schema: dict[str, object]) -> str:
         f'    #[serde(rename = "{operation}")]\n    {"".join(part.title() for part in operation.split("_"))},'
         for operation in operations
     )
+    response = schema["x-khaos-response"]
+    error_codes = response["properties"]["error_code"]["oneOf"][1]["enum"]
+    error_variants = "\n".join(
+        f'    #[serde(rename = "{code}")]\n    {"".join(part.title() for part in code.split("_"))},'
+        for code in error_codes
+    )
     return f'''//! Generated from security/browser-kernel-protocol-v1.json; do not edit.
 
-use serde::Deserialize;
+use serde::{{Deserialize, Serialize}};
 
 pub const PROTOCOL_VERSION: u16 = {properties["protocol_version"]["const"]};
 pub const MAX_MESSAGE_BYTES: usize = {schema["x-khaos-max-message-bytes"]};
@@ -80,6 +96,35 @@ pub struct BrowserKernelRequest {{
     pub target_pid: Option<u32>,
     pub target_start_time: Option<u64>,
 }}
+
+#[derive(Clone, Copy, Debug, Serialize, Eq, PartialEq)]
+pub enum BrowserKernelErrorCode {{
+{error_variants}
+}}
+
+#[derive(Clone, Default, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserKernelIsolationStatus {{
+    pub helper_authenticated: bool,
+    pub network_namespace: bool,
+    pub nft_default_deny: bool,
+    pub cgroup_attached: bool,
+    pub process_isolated: bool,
+    pub resource_registry_verified: bool,
+    pub quarantined: bool,
+    pub proxy_host: String,
+}}
+
+#[derive(Debug, Serialize)]
+pub struct BrowserKernelResponse<'a> {{
+    pub protocol_version: u16,
+    pub request_id: &'a str,
+    pub ok: bool,
+    pub error_code: Option<BrowserKernelErrorCode>,
+    pub error: Option<String>,
+    pub status: Option<BrowserKernelIsolationStatus>,
+    pub runtime_capability: Option<String>,
+}}
 '''
 
 
@@ -89,6 +134,12 @@ def _go(schema: dict[str, object]) -> str:
     constants = "\n".join(
         f'\tBrowserKernelOperation{"".join(part.title() for part in operation.split("_"))} BrowserKernelOperation = "{operation}"'
         for operation in operations
+    )
+    response = schema["x-khaos-response"]
+    error_codes = response["properties"]["error_code"]["oneOf"][1]["enum"]
+    error_constants = "\n".join(
+        f'\tBrowserKernelErrorCode{"".join(part.title() for part in code.split("_"))} BrowserKernelErrorCode = "{code}"'
+        for code in error_codes
     )
     source = f'''// Code generated from security/browser-kernel-protocol-v1.json; DO NOT EDIT.
 package platform
@@ -118,6 +169,33 @@ type BrowserKernelRequest struct {{
 \tPort *uint16 `json:"port"`
 \tTargetPID *uint32 `json:"target_pid"`
 \tTargetStartTime *uint64 `json:"target_start_time"`
+}}
+
+type BrowserKernelErrorCode string
+
+const (
+{error_constants}
+)
+
+type BrowserKernelIsolationStatus struct {{
+\tHelperAuthenticated bool `json:"helper_authenticated"`
+\tNetworkNamespace bool `json:"network_namespace"`
+\tNFTDefaultDeny bool `json:"nft_default_deny"`
+\tCgroupAttached bool `json:"cgroup_attached"`
+\tProcessIsolated bool `json:"process_isolated"`
+\tResourceRegistryVerified bool `json:"resource_registry_verified"`
+\tQuarantined bool `json:"quarantined"`
+\tProxyHost string `json:"proxy_host"`
+}}
+
+type BrowserKernelResponse struct {{
+\tProtocolVersion uint16 `json:"protocol_version"`
+\tRequestID string `json:"request_id"`
+\tOK bool `json:"ok"`
+\tErrorCode *BrowserKernelErrorCode `json:"error_code"`
+\tError *string `json:"error"`
+\tStatus *BrowserKernelIsolationStatus `json:"status"`
+\tRuntimeCapability *string `json:"runtime_capability"`
 }}
 '''
     formatted = subprocess.run(

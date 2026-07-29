@@ -7,8 +7,9 @@
 #[cfg(target_os = "linux")]
 mod linux {
     use _khaos_core::browser_kernel_protocol_generated::{
-        BrowserKernelOperation as Operation, BrowserKernelRequest as Request, MAX_MESSAGE_BYTES,
-        PROTOCOL_VERSION,
+        BrowserKernelErrorCode as ErrorCode, BrowserKernelIsolationStatus as IsolationStatus,
+        BrowserKernelOperation as Operation, BrowserKernelRequest as Request,
+        BrowserKernelResponse as Response, MAX_MESSAGE_BYTES, PROTOCOL_VERSION,
     };
     use hmac::{Hmac, Mac};
     use serde::{Deserialize, Serialize};
@@ -37,29 +38,6 @@ mod linux {
     const DEFAULT_JOURNAL: &str = "/run/khaos/browser-helper";
     const IP_PATH: &str = "/usr/sbin/ip";
     const NFT_PATH: &str = "/usr/sbin/nft";
-
-    #[derive(Serialize)]
-    struct Response<'a> {
-        protocol_version: u16,
-        request_id: &'a str,
-        ok: bool,
-        error: Option<String>,
-        status: Option<IsolationStatus>,
-        runtime_capability: Option<String>,
-    }
-
-    #[derive(Clone, Default, Deserialize, Serialize)]
-    #[serde(deny_unknown_fields)]
-    struct IsolationStatus {
-        helper_authenticated: bool,
-        network_namespace: bool,
-        nft_default_deny: bool,
-        cgroup_attached: bool,
-        process_isolated: bool,
-        resource_registry_verified: bool,
-        quarantined: bool,
-        proxy_host: String,
-    }
 
     #[derive(Clone, Debug, Deserialize, Serialize)]
     #[serde(deny_unknown_fields)]
@@ -1057,17 +1035,40 @@ mod linux {
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let peer = peer_cred(&stream)?;
         if peer.uid != state.allowed_peer.uid || !is_descendant(peer.pid, state.allowed_peer.pid)? {
-            return write_error(&mut stream, "", "peer process authority not allowed");
+            return write_error(
+                &mut stream,
+                "",
+                ErrorCode::PeerAuthenticationFailed,
+                "peer process authority not allowed",
+            );
         }
-        let request = read_request(&mut stream)?;
+        let request = match read_request(&mut stream) {
+            Ok(request) => request,
+            Err(error) => {
+                return write_error(
+                    &mut stream,
+                    "",
+                    ErrorCode::InvalidRequest,
+                    &error.to_string(),
+                )
+            }
+        };
         let request_id = request.request_id.clone();
-        validate_request(&request, peer, &state)?;
+        if let Err(error) = validate_request(&request, peer, &state) {
+            return write_error(
+                &mut stream,
+                &request_id,
+                error_code_for(&error),
+                &error.to_string(),
+            );
+        }
         if request.op == Operation::Authorize {
             let capability = state.runtime_capability(&request)?;
             let response = Response {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: &request_id,
                 ok: true,
+                error_code: None,
                 error: None,
                 status: Some(IsolationStatus {
                     helper_authenticated: true,
@@ -1094,6 +1095,7 @@ mod linux {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: &request_id,
                 ok: true,
+                error_code: None,
                 error: None,
                 status: Some(status),
                 runtime_capability: None,
@@ -1106,6 +1108,7 @@ mod linux {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: &request_id,
                 ok: true,
+                error_code: None,
                 error: None,
                 status: Some(status),
                 runtime_capability: None,
@@ -1114,6 +1117,7 @@ mod linux {
                 protocol_version: PROTOCOL_VERSION,
                 request_id: &request_id,
                 ok: false,
+                error_code: Some(error_code_for(&error)),
                 error: Some(error.to_string()),
                 status: None,
                 runtime_capability: None,
@@ -1190,13 +1194,45 @@ mod linux {
         }
         Ok(())
     }
-    fn write_error(stream: &mut UnixStream, request_id: &str, error: &str) -> io::Result<()> {
+    fn error_code_for(error: &io::Error) -> ErrorCode {
+        let message = error.to_string();
+        if message.contains("replay") {
+            return ErrorCode::ReplayDetected;
+        }
+        if message.contains("TCB")
+            || message.contains("binary")
+            || message.contains("ownership or mode")
+            || message.contains("parent directory is mutable")
+        {
+            return ErrorCode::TcbIntegrityFailure;
+        }
+        if message.contains("pool exhausted") {
+            return ErrorCode::ResourceExhausted;
+        }
+        match error.kind() {
+            io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => ErrorCode::InvalidRequest,
+            io::ErrorKind::PermissionDenied => ErrorCode::AuthorizationDenied,
+            io::ErrorKind::NotFound => ErrorCode::ResourceNotFound,
+            io::ErrorKind::AlreadyExists => ErrorCode::ResourceConflict,
+            io::ErrorKind::TimedOut => ErrorCode::DeadlineExceeded,
+            io::ErrorKind::OutOfMemory => ErrorCode::ResourceExhausted,
+            _ => ErrorCode::KernelOperationFailed,
+        }
+    }
+
+    fn write_error(
+        stream: &mut UnixStream,
+        request_id: &str,
+        error_code: ErrorCode,
+        error: &str,
+    ) -> io::Result<()> {
         write_response(
             stream,
             &Response {
                 protocol_version: PROTOCOL_VERSION,
                 request_id,
                 ok: false,
+                error_code: Some(error_code),
                 error: Some(error.to_owned()),
                 status: None,
                 runtime_capability: None,

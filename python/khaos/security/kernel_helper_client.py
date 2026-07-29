@@ -21,11 +21,14 @@ from pathlib import Path
 from typing import Final
 
 from khaos.security.browser_kernel_protocol_generated import (
+    ERROR_CODES,
     MAX_MESSAGE_BYTES,
     OPERATIONS,
     PROTOCOL_VERSION,
     REQUEST_FIELDS,
+    RESPONSE_FIELDS,
     SANDBOX_TOKEN_PATTERN,
+    STATUS_FIELDS,
 )
 
 _SOCKET_ENV: Final = "KHAOS_BROWSER_KERNEL_HELPER_SOCKET"
@@ -33,24 +36,16 @@ _DEFAULT_SOCKET: Final = "/run/khaos/browser-kernel-helper.sock"
 _PROTOCOL_VERSION: Final = PROTOCOL_VERSION
 _MAX_MESSAGE: Final = MAX_MESSAGE_BYTES
 _TOKEN_PATTERN: Final = re.compile(SANDBOX_TOKEN_PATTERN)
-_RESPONSE_FIELDS: Final = {
-    "protocol_version",
-    "request_id",
-    "ok",
-    "error",
-    "status",
-    "runtime_capability",
-}
-_STATUS_FIELDS: Final = {
-    "helper_authenticated",
-    "network_namespace",
-    "nft_default_deny",
-    "cgroup_attached",
-    "process_isolated",
-    "resource_registry_verified",
-    "quarantined",
-    "proxy_host",
-}
+_RESPONSE_FIELDS: Final = RESPONSE_FIELDS
+_STATUS_FIELDS: Final = STATUS_FIELDS
+
+
+class KernelHelperRejected(RuntimeError):
+    """A fail-closed helper rejection with a stable protocol error code."""
+
+    def __init__(self, code: str, detail: str) -> None:
+        super().__init__(f"kernel helper rejected request [{code}]: {detail}")
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -237,13 +232,26 @@ class KernelAuthorityClient:
             or type(response["request_id"]) is not str
             or response["request_id"] != request_id
             or type(response["ok"]) is not bool
+            or response["error_code"] is not None
+            and type(response["error_code"]) is not str
             or response["error"] is not None
             and type(response["error"]) is not str
         ):
             raise RuntimeError("kernel helper response identity invalid")
         if not response["ok"]:
-            raise RuntimeError(f"kernel helper rejected request: {response['error']}")
-        if response["error"] is not None:
+            error_code = response["error_code"]
+            error = response["error"]
+            if (
+                error_code not in ERROR_CODES
+                or type(error) is not str
+                or not error
+                or len(error) > 1024
+                or response["status"] is not None
+                or response["runtime_capability"] is not None
+            ):
+                raise RuntimeError("kernel helper error response contract invalid")
+            raise KernelHelperRejected(error_code, error)
+        if response["error"] is not None or response["error_code"] is not None:
             raise RuntimeError("successful kernel helper response carried an error")
         response_capability = response["runtime_capability"]
         if op == "authorize":

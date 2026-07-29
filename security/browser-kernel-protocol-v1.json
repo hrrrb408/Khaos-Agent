@@ -62,5 +62,77 @@
       "pattern": "^[A-Za-z0-9_:.-]+$"
     }
   },
-  "x-khaos-max-message-bytes": 8192
+  "x-khaos-max-message-bytes": 8192,
+  "x-khaos-response": {
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "protocol_version",
+      "request_id",
+      "ok",
+      "error_code",
+      "error",
+      "status",
+      "runtime_capability"
+    ],
+    "properties": {
+      "protocol_version": {"const": 1},
+      "request_id": {"type": "string", "maxLength": 128},
+      "ok": {"type": "boolean"},
+      "error_code": {
+        "oneOf": [
+          {"type": "null"},
+          {"enum": [
+            "invalid_request",
+            "peer_authentication_failed",
+            "authorization_denied",
+            "replay_detected",
+            "resource_not_found",
+            "resource_conflict",
+            "resource_exhausted",
+            "deadline_exceeded",
+            "tcb_integrity_failure",
+            "kernel_operation_failed",
+            "internal_error"
+          ]}
+        ]
+      },
+      "error": {"type": ["string", "null"], "maxLength": 1024},
+      "status": {
+        "oneOf": [
+          {"type": "null"},
+          {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "helper_authenticated",
+              "network_namespace",
+              "nft_default_deny",
+              "cgroup_attached",
+              "process_isolated",
+              "resource_registry_verified",
+              "quarantined",
+              "proxy_host"
+            ],
+            "properties": {
+              "helper_authenticated": {"type": "boolean"},
+              "network_namespace": {"type": "boolean"},
+              "nft_default_deny": {"type": "boolean"},
+              "cgroup_attached": {"type": "boolean"},
+              "process_isolated": {"type": "boolean"},
+              "resource_registry_verified": {"type": "boolean"},
+              "quarantined": {"type": "boolean"},
+              "proxy_host": {"type": "string", "maxLength": 64}
+            }
+          }
+        ]
+      },
+      "runtime_capability": {
+        "oneOf": [
+          {"type": "null"},
+          {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}
+        ]
+      }
+    }
+  }
 }

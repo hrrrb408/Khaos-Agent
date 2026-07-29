@@ -11,7 +11,10 @@ from pathlib import Path
 
 import pytest
 
-from khaos.security.kernel_helper_client import KernelAuthorityClient
+from khaos.security.kernel_helper_client import (
+    KernelAuthorityClient,
+    KernelHelperRejected,
+)
 
 TOKEN = "ab" * 32
 STATUS = {
@@ -59,6 +62,7 @@ def _start_fake_helper(
                 "protocol_version": 1,
                 "request_id": request["request_id"],
                 "ok": True,
+                "error_code": None,
                 "error": None,
                 "status": dict(STATUS),
                 "runtime_capability": None,
@@ -145,6 +149,7 @@ def _start_capability_helper() -> tuple[str, threading.Thread, dict[str, object]
                     "protocol_version": 1,
                     "request_id": request["request_id"],
                     "ok": True,
+                    "error_code": None,
                     "error": None,
                     "status": status,
                     "runtime_capability": capability if authorizing else None,
@@ -245,6 +250,29 @@ def test_unknown_response_field_is_rejected(monkeypatch: pytest.MonkeyPatch) -> 
     try:
         with pytest.raises(RuntimeError, match="response contract invalid"):
             _client(monkeypatch, socket_path).status()
+    finally:
+        _cleanup(socket_path, thread)
+
+
+def test_rejection_exposes_only_generated_stable_error_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject(response: dict[str, object]) -> None:
+        response.update(
+            {
+                "ok": False,
+                "error_code": "authorization_denied",
+                "error": "runtime capability invalid",
+                "status": None,
+                "runtime_capability": None,
+            }
+        )
+
+    socket_path, thread, _ = _start_fake_helper(mutate_response=reject)
+    try:
+        with pytest.raises(KernelHelperRejected) as rejected:
+            _client(monkeypatch, socket_path).status()
+        assert rejected.value.code == "authorization_denied"
     finally:
         _cleanup(socket_path, thread)
 
