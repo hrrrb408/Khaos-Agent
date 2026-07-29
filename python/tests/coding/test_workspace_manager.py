@@ -141,6 +141,20 @@ async def test_host_git_digest_drift_fails_before_execution(tmp_path: Path):
         await manager._git(repository, "status", "--porcelain")
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Windows uses a fixed system Git path")
+def test_host_git_authority_ignores_caller_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    attacker = tmp_path / "git"
+    attacker.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    attacker.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    manager = WorkspaceManager(tmp_path / "worktrees")
+
+    assert manager._git_executable == Path("/usr/bin/git").resolve(strict=True)
+
+
 @pytest.mark.asyncio
 async def test_workspace_authority_root_mode_drift_fails_before_git(
     tmp_path: Path,

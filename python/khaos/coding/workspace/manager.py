@@ -115,11 +115,16 @@ def _file_digest(path: Path) -> str:
 
 
 def _resolve_trusted_git() -> tuple[Path, FileIdentity, str]:
-    """Resolve Git once and pin its root-owned immutable file identity."""
-    candidate = shutil.which("git")
-    if candidate is None:
-        raise WorkspaceError("trusted Git executable is unavailable")
-    executable = Path(candidate).resolve(strict=True)
+    """Pin the platform system Git without consulting caller-controlled PATH."""
+    system_git = (
+        Path("C:/Program Files/Git/cmd/git.exe")
+        if os.name == "nt"
+        else Path("/usr/bin/git")
+    )
+    try:
+        executable = system_git.resolve(strict=True)
+    except OSError as error:
+        raise WorkspaceError("trusted system Git executable is unavailable") from error
     info = executable.stat()
     if (
         not executable.is_absolute()
