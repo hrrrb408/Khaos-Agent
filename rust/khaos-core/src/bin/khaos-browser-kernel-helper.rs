@@ -386,8 +386,22 @@ mod linux {
                     ..IsolationStatus::default()
                 },
             };
-            let _ = teardown_record(state, &mut record);
-            let _ = state.journal(&identity, "quarantined");
+            if let Err(cleanup_error) = teardown_record(state, &mut record) {
+                // A failed rollback remains an addressable authority object.
+                // Without this insertion a live helper cannot report or retry
+                // cleanup until a restart reconstructs the journal.
+                record.status.quarantined = true;
+                state.journal(&identity, "quarantined")?;
+                state
+                    .resources
+                    .lock()
+                    .map_err(|_| io::Error::other("resource lock poisoned"))?
+                    .insert(names.key.clone(), record);
+                return Err(io::Error::other(format!(
+                    "setup failed: {error}; rollback failed: {cleanup_error}"
+                )));
+            }
+            state.remove_journal(&identity)?;
             return Err(error);
         }
         let status = IsolationStatus {
@@ -1087,6 +1101,24 @@ mod linux {
         Ok(())
     }
 
+    fn acquire_instance_lock(socket_path: &Path) -> io::Result<File> {
+        let lock_path = socket_path.with_extension("lock");
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .open(&lock_path)?;
+        let result = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if result != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "another browser kernel helper instance is active",
+            ));
+        }
+        Ok(lock)
+    }
+
     pub fn main() -> io::Result<()> {
         let socket_path = std::env::var("KHAOS_BROWSER_KERNEL_HELPER_SOCKET")
             .unwrap_or_else(|_| DEFAULT_SOCKET.to_owned());
@@ -1123,7 +1155,18 @@ mod linux {
         if let Some(parent) = Path::new(&socket_path).parent() {
             fs::create_dir_all(parent)?;
         }
-        let _ = fs::remove_file(&socket_path);
+        let _instance_lock = acquire_instance_lock(Path::new(&socket_path))?;
+        if Path::new(&socket_path).exists() {
+            match UnixStream::connect(&socket_path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        "browser kernel helper socket is already accepting connections",
+                    ));
+                }
+                Err(_) => fs::remove_file(&socket_path)?,
+            }
+        }
         let listener = UnixListener::bind(&socket_path)?;
         let socket_c = CString::new(socket_path.clone()).map_err(io::Error::other)?;
         if unsafe { libc::chown(socket_c.as_ptr(), allowed_uid, u32::MAX) } != 0 {
