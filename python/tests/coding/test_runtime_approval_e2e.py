@@ -66,7 +66,10 @@ async def _runtime(tmp_path: Path, repository: Path, responses: list[list[Messag
     modes = ModeManager(db, project_root=repository)
     await modes.switch(Mode.CODING)
     manager = WorkspaceManager(tmp_path / "worktrees")
-    execution = ExecutionService(HostExecutionBackend(), manager)
+    execution = ExecutionService(
+        HostExecutionBackend(), manager,
+        principal_id="legacy", project_id="project-test", runtime_id="runtime-test",
+    )
     scheduler = ToolScheduler(
         create_runtime_registry(),
         PermissionEngine(db, principal_id="legacy", project_id="project-test"),
@@ -77,6 +80,7 @@ async def _runtime(tmp_path: Path, repository: Path, responses: list[list[Messag
         task_manager=TaskManager(), workspace_manager=manager,
         execution_service=execution, project_root=repository,
         principal_id="legacy", project_id="project-test",
+        runtime_id="runtime-test",
     )
     return db, manager, execution, loop
 

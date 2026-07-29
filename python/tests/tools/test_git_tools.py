@@ -32,6 +32,9 @@ def _ctx(repo, access_mode="vcs.write"):
     )
     manager = SimpleNamespace(
         get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        require=lambda workspace_id, **_authority: (
+            workspace if workspace_id == "workspace" else None
+        ),
         verify_git_identity=AsyncMock(),
     )
     service = ExecutionService(HostExecutionBackend(), manager)
@@ -128,6 +131,9 @@ async def test_git_commit_stays_in_task_worktree_and_skips_hooks(tmp_path):
     )
     manager = SimpleNamespace(
         get=lambda workspace_id: workspace if workspace_id == "workspace" else None,
+        require=lambda workspace_id, **_authority: (
+            workspace if workspace_id == "workspace" else None
+        ),
         verify_git_identity=AsyncMock(),
     )
     context = {
