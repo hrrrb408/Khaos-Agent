@@ -109,3 +109,42 @@ async def test_workspace_commit_disables_repository_hooks(tmp_path: Path):
     await manager.commit_in_worktree(workspace.id, changeset, "safe commit")
 
     assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_host_git_does_not_inherit_git_configuration_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    marker = tmp_path / "injected-git-alias-ran"
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "alias.status")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", f"!touch {marker}")
+
+    assert await manager._git(repository, "status", "--porcelain") == ""
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_workspace_authority_root_mode_drift_fails_before_git(
+    tmp_path: Path,
+):
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    manager.root.chmod(0o777)
+
+    try:
+        with pytest.raises(WorkspaceError, match="authority root identity drifted"):
+            await manager._git(repository, "status", "--porcelain")
+    finally:
+        manager.root.chmod(0o700)
+
+
+def test_workspace_authority_rejects_preexisting_shared_root(tmp_path: Path):
+    shared = tmp_path / "shared-worktrees"
+    shared.mkdir(mode=0o777)
+    shared.chmod(0o777)
+
+    with pytest.raises(WorkspaceError, match="user-owned and not group/other writable"):
+        WorkspaceManager(shared)

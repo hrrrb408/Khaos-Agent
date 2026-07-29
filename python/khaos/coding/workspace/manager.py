@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
+import stat
 import tempfile
 import uuid
 from collections.abc import Callable
@@ -28,10 +30,102 @@ from khaos.coding.workspace.storage import (
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
+FileIdentity = tuple[int, int, int, int]
 
 
 class WorkspaceError(RuntimeError):
     """Raised when a worktree operation cannot be completed safely."""
+
+
+def _identity(info: os.stat_result) -> FileIdentity:
+    return (int(info.st_dev), int(info.st_ino), int(info.st_uid), int(info.st_mode))
+
+
+def _open_private_authority_root(configured: Path) -> tuple[Path, FileIdentity]:
+    """Create a private root without following attacker-controlled components."""
+    missing: list[str] = []
+    ancestor = configured
+    while not ancestor.exists():
+        missing.append(ancestor.name)
+        ancestor = ancestor.parent
+    canonical_ancestor = ancestor.resolve(strict=True)
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    directory_fd = os.open(canonical_ancestor, flags | nofollow)
+    canonical = canonical_ancestor
+    try:
+        for component in reversed(missing):
+            if component in {"", ".", ".."} or "/" in component:
+                raise WorkspaceError("workspace authority root is invalid")
+            try:
+                os.mkdir(component, mode=0o700, dir_fd=directory_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(component, flags | nofollow, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+            canonical /= component
+        info = os.fstat(directory_fd)
+    except Exception:
+        os.close(directory_fd)
+        raise
+    os.close(directory_fd)
+    if not stat.S_ISDIR(info.st_mode):
+        raise WorkspaceError("workspace authority root is not a directory")
+    if info.st_uid != os.getuid() or info.st_mode & 0o022:
+        raise WorkspaceError(
+            "workspace authority root must be user-owned and not group/other writable"
+        )
+    return canonical, _identity(info)
+
+
+def _resolve_trusted_git() -> tuple[Path, FileIdentity]:
+    """Resolve Git once and pin its root-owned immutable file identity."""
+    candidate = shutil.which("git")
+    if candidate is None:
+        raise WorkspaceError("trusted Git executable is unavailable")
+    executable = Path(candidate).resolve(strict=True)
+    info = executable.stat()
+    if (
+        not executable.is_absolute()
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_mode & 0o022
+    ):
+        raise WorkspaceError(
+            "Git executable must be absolute, root-owned, regular, and immutable"
+        )
+    for parent in executable.parents:
+        parent_info = parent.stat()
+        if parent_info.st_uid != 0 or parent_info.st_mode & 0o022:
+            raise WorkspaceError("Git executable parent chain is not trusted")
+    return executable, _identity(info)
+
+
+def _verify_identity(
+    path: Path,
+    expected: FileIdentity,
+    *,
+    require_root_owner: bool,
+    label: str,
+) -> None:
+    """Open with no-follow and compare the live device/inode/mode authority."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    if path.is_dir():
+        flags |= getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(path, flags)
+        try:
+            current = os.fstat(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError as exc:
+        raise WorkspaceError(f"{label} is unavailable") from exc
+    if _identity(current) != expected:
+        raise WorkspaceError(f"{label} identity drifted")
+    required_uid = 0 if require_root_owner else os.getuid()
+    if current.st_uid != required_uid or current.st_mode & 0o022:
+        raise WorkspaceError(f"{label} trust policy failed")
 
 
 ALLOWED: dict[WorkspaceState, frozenset[WorkspaceState]] = {
@@ -61,7 +155,13 @@ class WorkspaceManager:
         storage_limits: WorkspaceStorageLimits | None = None,
         storage_authority: WorkspaceStorageAuthority | None = None,
     ) -> None:
-        self.root = (root or Path(tempfile.gettempdir()) / "khaos" / "worktrees").expanduser().resolve()
+        configured_root = (
+            root or Path(tempfile.gettempdir()) / "khaos" / "worktrees"
+        ).expanduser().absolute()
+        self.root, self._root_identity = _open_private_authority_root(
+            configured_root
+        )
+        self._git_executable, self._git_identity = _resolve_trusted_git()
         self.storage_limits = storage_limits or WorkspaceStorageLimits()
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._workspaces: dict[str, TaskWorkspace] = {}
@@ -88,14 +188,30 @@ class WorkspaceManager:
         self._mutation_fence = fence
 
     async def _git(self, repository: Path, *args: str, preserve_output: bool = False) -> str:
-        environment = os.environ.copy()
-        environment.update({
+        _verify_identity(
+            self._git_executable,
+            self._git_identity,
+            require_root_owner=True,
+            label="Git executable",
+        )
+        _verify_identity(
+            self.root,
+            self._root_identity,
+            require_root_owner=False,
+            label="workspace authority root",
+        )
+        environment = {
             "GIT_CONFIG_NOSYSTEM": "1",
             "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_TERMINAL_PROMPT": "0",
-        })
+            "GIT_ASKPASS": os.devnull,
+            "SSH_ASKPASS": os.devnull,
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "HOME": str(self.root),
+        }
         process = await asyncio.create_subprocess_exec(
-            "git", *args, cwd=str(repository), env=environment,
+            str(self._git_executable), *args, cwd=str(repository), env=environment,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
         )
         stdout, stderr = await process.communicate()
