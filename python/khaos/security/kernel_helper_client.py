@@ -29,6 +29,7 @@ _RESPONSE_FIELDS: Final = {
     "ok",
     "error",
     "status",
+    "runtime_capability",
 }
 _STATUS_FIELDS: Final = {
     "helper_authenticated",
@@ -106,13 +107,23 @@ class KernelAuthorityClient:
         *,
         project_id: str,
         runtime_id: str,
+        principal_id: str,
+        task_id: str,
         sandbox_token: str,
+        runtime_capability: str | None = None,
         socket_path: str | None = None,
         timeout_seconds: float = 5.0,
     ) -> None:
         self._project_id = self._validate_identifier(project_id, "project_id")
         self._runtime_id = self._validate_identifier(runtime_id, "runtime_id")
+        self._principal_id = self._validate_identifier(principal_id, "principal_id")
+        self._task_id = self._validate_identifier(task_id, "task_id")
         self._sandbox_token = self._validate_token(sandbox_token)
+        self._runtime_capability = (
+            self._validate_capability(runtime_capability)
+            if runtime_capability is not None
+            else None
+        )
         self._socket_path = socket_path or os.environ.get(_SOCKET_ENV, _DEFAULT_SOCKET)
         if not Path(self._socket_path).is_absolute():
             raise ValueError("kernel helper socket must be absolute")
@@ -167,6 +178,8 @@ class KernelAuthorityClient:
         target_pid: int | None = None,
         target_start_time: int | None = None,
     ) -> KernelIsolationEvidence:
+        if op != "authorize" and self._runtime_capability is None:
+            self._request("authorize")
         self._validate_socket_authority()
         request_id = str(uuid.uuid4())
         client_pid = os.getpid()
@@ -178,7 +191,10 @@ class KernelAuthorityClient:
             "client_start_time": self._process_start_time(client_pid),
             "project_id": self._project_id,
             "runtime_id": self._runtime_id,
+            "principal_id": self._principal_id,
+            "task_id": self._task_id,
             "sandbox_token": self._sandbox_token,
+            "runtime_capability": self._runtime_capability,
             "op": op,
             "port": port,
             "target_pid": target_pid,
@@ -217,9 +233,16 @@ class KernelAuthorityClient:
             raise RuntimeError(f"kernel helper rejected request: {response['error']}")
         if response["error"] is not None:
             raise RuntimeError("successful kernel helper response carried an error")
+        response_capability = response["runtime_capability"]
+        if op == "authorize":
+            if self._runtime_capability is not None:
+                raise RuntimeError("kernel helper replaced an active runtime capability")
+            self._runtime_capability = self._validate_capability(response_capability)
+        elif response_capability is not None:
+            raise RuntimeError("kernel helper leaked runtime capability")
         return KernelIsolationEvidence.from_payload(
             response["status"],
-            resources_active=op != "teardown",
+            resources_active=op not in {"authorize", "teardown"},
         )
 
     def _validate_socket_authority(self) -> None:
@@ -295,10 +318,18 @@ class KernelAuthorityClient:
 
     @staticmethod
     def _validate_token(value: str) -> str:
-        if not 32 <= len(value) <= 256 or any(
+        if not 32 <= len(value) <= 128 or any(
             character not in "0123456789abcdefABCDEF" for character in value
         ):
             raise ValueError("invalid sandbox token")
+        return value.lower()
+
+    @staticmethod
+    def _validate_capability(value: object) -> str:
+        if type(value) is not str or len(value) != 64 or any(
+            character not in "0123456789abcdefABCDEF" for character in value
+        ):
+            raise ValueError("invalid runtime capability")
         return value.lower()
 
     @staticmethod

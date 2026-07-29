@@ -404,6 +404,7 @@ class ToolInvocationBroker:
             handler_params.setdefault("session_id", context.get("session_id", ""))
             handler_params.setdefault("runtime_id", context.get("runtime_id", ""))
             handler_params.setdefault("project_id", context.get("project_id", ""))
+            handler_params.setdefault("task_id", context.get("task_id", ""))
             handler_params.setdefault("browser_manager", context.get("browser_manager"))
             handler_params.setdefault(
                 "network_guard", context.get("network_guard")

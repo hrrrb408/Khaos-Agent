@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://khaos.local/protocol/browser-kernel-v1",
+  "title": "Khaos Browser Kernel Helper Protocol v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "boot_id",
+    "client_pid",
+    "client_start_time",
+    "principal_id",
+    "project_id",
+    "runtime_id",
+    "task_id",
+    "sandbox_token",
+    "runtime_capability",
+    "op",
+    "port",
+    "target_pid",
+    "target_start_time"
+  ],
+  "properties": {
+    "protocol_version": {"const": 1},
+    "request_id": {"type": "string", "minLength": 8, "maxLength": 128},
+    "boot_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "client_pid": {"type": "integer", "minimum": 2, "maximum": 4294967295},
+    "client_start_time": {"type": "integer", "minimum": 1},
+    "principal_id": {"$ref": "#/$defs/identifier"},
+    "project_id": {"$ref": "#/$defs/identifier"},
+    "runtime_id": {"$ref": "#/$defs/identifier"},
+    "task_id": {"$ref": "#/$defs/identifier"},
+    "sandbox_token": {"type": "string", "pattern": "^[0-9a-fA-F]{32,128}$"},
+    "runtime_capability": {
+      "oneOf": [
+        {"type": "null"},
+        {"type": "string", "pattern": "^[0-9a-fA-F]{64}$"}
+      ]
+    },
+    "op": {
+      "enum": [
+        "authorize",
+        "setup",
+        "allow_proxy",
+        "revoke_proxy",
+        "attach_process",
+        "join",
+        "teardown",
+        "status"
+      ]
+    },
+    "port": {"type": ["integer", "null"], "minimum": 1, "maximum": 65535},
+    "target_pid": {"type": ["integer", "null"], "minimum": 2, "maximum": 4294967295},
+    "target_start_time": {"type": ["integer", "null"], "minimum": 1}
+  },
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_:.-]+$"
+    }
+  },
+  "x-khaos-max-message-bytes": 8192
+}

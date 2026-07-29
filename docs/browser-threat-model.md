@@ -4,7 +4,7 @@
 
 A runtime-owned `BrowserManager` generation owns one Chromium process tree.
 Its kernel resources are owned exclusively by the root Rust helper and keyed
-by project/runtime identity plus an opaque sandbox token. Python never chooses
+by principal/project/task/runtime identity plus an opaque sandbox token. Python never chooses
 netns, veth, nft or cgroup names. A manager is injected into one runtime; it is
 not stored in a mutable module-global holder.
 
@@ -27,8 +27,11 @@ singleton between principals.
 
 Production Python must run with effective UID other than zero and without
 `CAP_NET_ADMIN` or `CAP_SYS_ADMIN`. A root-owned helper authenticates the
-non-root client over a protected UDS using UID, PID, PID start time and boot
-identity. Production launch is permitted only after helper-authenticated
+non-root client over a protected UDS using an explicitly configured daemon PID,
+UID, PID start time and boot identity. The daemon first obtains a secret-backed,
+principal/project/task/runtime-bound capability; all later operations must present
+that capability and cannot be issued by another process that merely shares the UID.
+Production launch is permitted only after helper-authenticated
 netns, cgroup, nftables, trusted Rust launcher, FD sanitization and filesystem
 sandbox enforcement have been established. Helper unavailability or partial
 setup poisons the generation; no CLI or Host fallback is reachable.
@@ -55,8 +58,12 @@ teardown removes wrappers, kills and removes the cgroup, then removes nft/netns
 resources. Partial cleanup remains registered and makes shutdown fail until a
 retry succeeds; it is never reported as closed.
 
-Helper journal entries contain boot and lifecycle identity. Resource names are
-derived as HMAC(helper secret, boot ID, project ID, runtime ID, sandbox token).
+Helper journal entries contain boot and lifecycle identity plus the allocated
+subnet lease. Resource names are derived as HMAC(helper secret, boot ID,
+principal ID, project ID, runtime ID, task ID, sandbox token). Address allocation
+uses an active in-memory and authenticated-journal lease registry with collision
+probing; two live sandboxes never receive the same `/30` merely because their
+digest prefixes collide.
 The Browser
 mount namespace cannot access that secret. Corrupt or unauthenticated entries
 are quarantined rather than trusted by the reaper.

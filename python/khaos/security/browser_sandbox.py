@@ -643,6 +643,8 @@ class BrowserNetworkSandbox:
         require_os_sandbox: bool = False,
         project_id: str = "",
         runtime_id: str = "",
+        principal_id: str = "",
+        task_id: str = "",
         sandbox_token: str | None = None,
         kernel_authority: KernelAuthorityClient | None = None,
     ) -> None:
@@ -657,15 +659,19 @@ class BrowserNetworkSandbox:
             require_os_sandbox and os.environ.get("KHAOS_DEV_MODE") != "1"
         )
         if self._production_authority:
-            if not project_id or not runtime_id:
-                raise BrowserSandboxError(
-                    "production browser sandbox requires project and runtime identity"
+            if self._kernel_authority is None:
+                if not project_id or not runtime_id or not principal_id or not task_id:
+                    raise BrowserSandboxError(
+                        "production browser sandbox requires principal, project, "
+                        "task, and runtime identity"
+                    )
+                self._kernel_authority = KernelAuthorityClient(
+                    project_id=project_id,
+                    runtime_id=runtime_id,
+                    principal_id=principal_id,
+                    task_id=task_id,
+                    sandbox_token=self._token,
                 )
-            self._kernel_authority = self._kernel_authority or KernelAuthorityClient(
-                project_id=project_id,
-                runtime_id=runtime_id,
-                sandbox_token=self._token,
-            )
         self._netns_name: str | None = None
         self._veth_host: str | None = None
         self._veth_ns: str | None = None
