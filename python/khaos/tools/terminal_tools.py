@@ -134,6 +134,9 @@ async def terminal_argv(
     workspace_id: str | None = None,
     workspace_manager=None,
     process_authority=None,
+    principal_id: str = "",
+    project_id: str = "",
+    runtime_id: str = "",
     _safety_command: str | None = None,
 ) -> dict[str, Any]:
     """Execute an argv vector without shell parsing or expansion."""
@@ -174,7 +177,13 @@ async def terminal_argv(
     if background:
         if process_authority is None:
             raise PermissionError("background execution requires ProcessAuthority")
-        process_id = await process_authority.start(execution_service, request)
+        process_id = await process_authority.start(
+            execution_service,
+            request,
+            principal_id=principal_id,
+            project_id=project_id,
+            runtime_id=runtime_id,
+        )
         return {"id": process_id, "status": "running", "argv": list(argv)}
     result = await execution_service.execute(request)
     return {"command": command, "returncode": result.return_code, "stdout": result.stdout, "stderr": result.stderr, "status": result.status, "safety": safety}
@@ -192,6 +201,9 @@ async def terminal_shell(
     workspace_id: str | None = None,
     workspace_manager=None,
     process_authority=None,
+    principal_id: str = "",
+    project_id: str = "",
+    runtime_id: str = "",
 ) -> dict[str, Any]:
     """Execute a script only through an explicitly selected absolute shell."""
     shell_path = Path(shell)
@@ -209,6 +221,9 @@ async def terminal_shell(
         workspace_id=workspace_id,
         workspace_manager=workspace_manager,
         process_authority=process_authority,
+        principal_id=principal_id,
+        project_id=project_id,
+        runtime_id=runtime_id,
         _safety_command=script,
     )
 
@@ -230,18 +245,37 @@ async def process(
     timeout_seconds: int = 30,
     *,
     process_authority=None,
+    principal_id: str = "",
+    project_id: str = "",
+    runtime_id: str = "",
+    task_id: str | None = None,
+    workspace_id: str | None = None,
     **_injected: Any,
 ) -> dict[str, Any]:
     """Poll, wait, kill, or read logs for a background process."""
     if process_authority is None:
         raise PermissionError("process operation requires ProcessAuthority")
-    return await process_authority.control(action, id, timeout_seconds)
+    return await process_authority.control(
+        action,
+        id,
+        timeout_seconds,
+        principal_id=principal_id,
+        project_id=project_id,
+        runtime_id=runtime_id,
+        task_id=task_id or "",
+        workspace_id=workspace_id or "",
+    )
 
 
 @dataclass
 class _BackgroundRecord:
     handle: Any
     stdout_task: asyncio.Task[str]
+    principal_id: str
+    project_id: str
+    runtime_id: str
+    task_id: str
+    workspace_id: str
 
 
 class BackgroundProcessAuthority:
@@ -261,7 +295,15 @@ class BackgroundProcessAuthority:
         self._workspace_ids: dict[str, str] = {}
         self._lock = asyncio.Lock()
 
-    async def start(self, execution_service: Any, request: Any) -> str:
+    async def start(
+        self,
+        execution_service: Any,
+        request: Any,
+        *,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+    ) -> str:
         workspace_id = str(request.workspace_id or "")
         async with self._lock:
             self._prune_finished_locked()
@@ -277,15 +319,42 @@ class BackgroundProcessAuthority:
             stdout_task = asyncio.create_task(
                 _collect_bounded_stdout(handle.stdout, self.output_limit)
             )
-            self._records[process_id] = _BackgroundRecord(handle, stdout_task)
+            self._records[process_id] = _BackgroundRecord(
+                handle=handle,
+                stdout_task=stdout_task,
+                principal_id=principal_id,
+                project_id=project_id,
+                runtime_id=runtime_id,
+                task_id=str(request.task_id or ""),
+                workspace_id=workspace_id,
+            )
             self._workspace_ids[process_id] = workspace_id
             return process_id
 
-    async def control(self, action: str, process_id: str, timeout: int) -> dict[str, Any]:
+    async def control(
+        self,
+        action: str,
+        process_id: str,
+        timeout: int,
+        *,
+        principal_id: str,
+        project_id: str,
+        runtime_id: str,
+        task_id: str,
+        workspace_id: str,
+    ) -> dict[str, Any]:
         async with self._lock:
             record = self._records.get(process_id)
         if record is None:
             raise KeyError(f"unknown process: {process_id}")
+        if (
+            record.principal_id,
+            record.project_id,
+            record.runtime_id,
+            record.task_id,
+            record.workspace_id,
+        ) != (principal_id, project_id, runtime_id, task_id, workspace_id):
+            raise PermissionError("background process belongs to a different runtime authority")
         handle = record.handle
         if action == "poll":
             return {"id": process_id, "running": handle.returncode is None, "returncode": handle.returncode}

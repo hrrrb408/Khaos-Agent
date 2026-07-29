@@ -57,6 +57,14 @@ class TaskWorkspace:
     )
     git_identity: GitWorktreeIdentity | None = None
     generation: int = 1
+    # Authority identity is appended to preserve the pre-M5 positional
+    # construction contract used by migration and test fixtures.
+    principal_id: str = "legacy"
+    project_id: str = ""
+    creator_runtime_id: str = ""
+    authority_generation: int = 1
+    root_device: int | None = None
+    root_inode: int | None = None
 
 
 @dataclass(frozen=True)

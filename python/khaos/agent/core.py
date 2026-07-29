@@ -243,7 +243,13 @@ class AgentLoop:
                 if self.workspace_manager is not None and self.project_root is not None:
                     root = Path(self.project_root).expanduser().resolve()
                     if (root / ".git").exists():
-                        self.active_workspace = await self.workspace_manager.create(root, active_task_id)
+                        self.active_workspace = await self.workspace_manager.create(
+                            root,
+                            active_task_id,
+                            principal_id=self.principal_id,
+                            project_id=self.project_id,
+                            creator_runtime_id=self.runtime_id,
+                        )
                         await self.task_manager.update_status(
                             active_task_id,
                             "running",

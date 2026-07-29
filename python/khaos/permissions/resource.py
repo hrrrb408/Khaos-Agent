@@ -14,22 +14,11 @@ import os
 import shlex
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
 
-_PATH_KEYS: dict[str, tuple[str, ...]] = {
-    "read_file": ("path",),
-    "write_file": ("path",),
-    "patch": ("path",),
-    "multi_edit": ("path",),
-    "search_files": ("root",),
-    "file_info": ("path",),
-    "list_directory": ("path",),
-    "directory_tree": ("path",),
-    "copy_file": ("source", "destination"),
-    "move_file": ("source", "destination"),
-}
+ResourceResolver = Callable[[str, dict[str, Any], Path], tuple[str, str]]
 
 
 @dataclass(frozen=True)
@@ -74,20 +63,36 @@ def resolve_authorization_resource(
     task_id: str,
     workspace_id: str,
     workspace_manager: Any,
+    resource_resolver: ResourceResolver | None = None,
 ) -> AuthorizationResource:
     """Resolve one production tool call against its active TaskWorkspace."""
     if not principal_id or not project_id or not task_id or not workspace_id:
         raise PermissionError("tool authorization requires complete workspace identity")
     if workspace_manager is None:
         raise PermissionError("tool authorization requires WorkspaceManager")
-    workspace = workspace_manager.get(workspace_id)
-    if workspace is None or workspace.task_id != task_id:
-        raise PermissionError("active TaskWorkspace identity does not match tool call")
+    require = getattr(workspace_manager, "require", None)
+    if callable(require):
+        workspace = require(
+            workspace_id,
+            task_id=task_id,
+            principal_id=principal_id,
+            project_id=project_id,
+        )
+    else:
+        workspace = workspace_manager.get(workspace_id)
+        if workspace is None or workspace.task_id != task_id:
+            raise PermissionError("active TaskWorkspace identity does not match tool call")
+        workspace_principal = getattr(workspace, "principal_id", principal_id)
+        workspace_project = getattr(workspace, "project_id", project_id)
+        if workspace_principal != principal_id or workspace_project != project_id:
+            raise PermissionError("TaskWorkspace owner does not match tool call")
 
     root = workspace.worktree_path.resolve(strict=True)
     root_stat = root.stat()
     generation = int(getattr(workspace, "generation", 0))
-    target, kind = _canonical_target(tool_name, arguments, root)
+    if resource_resolver is None:
+        raise PermissionError(f"tool {tool_name} has no authorization resource resolver")
+    target, kind = resource_resolver(tool_name, arguments, root)
     return AuthorizationResource(
         kind=kind,
         principal_id=principal_id,
@@ -101,44 +106,97 @@ def resolve_authorization_resource(
     )
 
 
-def _canonical_target(
+def resolve_single_workspace_path(
     tool_name: str, arguments: dict[str, Any], root: Path
 ) -> tuple[str, str]:
-    keys = _PATH_KEYS.get(tool_name)
-    if keys:
-        paths = [_resolve_workspace_path(root, arguments.get(key, ".")) for key in keys]
-        value: str | list[str] = paths[0] if len(paths) == 1 else paths
-        return _canonical_json({"tool": tool_name, "paths": value}), "workspace-path"
+    """Resolve the standard one-path workspace capability."""
+    field = next(
+        (
+            name
+            for name in ("path", "root", "file_path", "cwd", "project_dir", "context")
+            if name in arguments
+        ),
+        "path",
+    )
+    path = _resolve_workspace_path(root, arguments.get(field, "."))
+    return _canonical_json({"tool": tool_name, "path": path}), "workspace-path"
 
-    if tool_name in {"terminal_argv", "terminal"} and "argv" in arguments:
-        argv = arguments.get("argv")
-        if not isinstance(argv, list) or not argv or not all(
-            isinstance(item, str) and item for item in argv
-        ):
-            raise PermissionError("terminal argv is invalid")
-        cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
-        return _canonical_json({"tool": tool_name, "argv": argv, "cwd": cwd}), "process-argv"
 
-    if tool_name in {"terminal_shell", "terminal", "process"}:
-        script = arguments.get("script", arguments.get("command", ""))
-        if not isinstance(script, str) or not script.strip():
-            raise PermissionError("shell script is empty")
-        cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
-        segments = _normalize_shell_segments(script)
-        return _canonical_json(
-            {"tool": tool_name, "shell": arguments.get("shell", ""), "segments": segments, "cwd": cwd}
-        ), "process-shell"
+def resolve_copy_or_move(
+    tool_name: str, arguments: dict[str, Any], root: Path
+) -> tuple[str, str]:
+    """Resolve the exact read and write paths of a copy or move operation."""
+    source = _resolve_workspace_path(root, arguments.get("src", ""))
+    destination = _resolve_workspace_path(root, arguments.get("dst", ""))
+    return _canonical_json(
+        {"tool": tool_name, "source": source, "destination": destination}
+    ), "workspace-copy-move"
 
-    if "url" in arguments:
-        parsed = urlsplit(str(arguments["url"]))
-        if not parsed.scheme or not parsed.hostname:
-            raise PermissionError("network target is invalid")
-        host = parsed.hostname.encode("idna").decode("ascii").lower()
-        port = f":{parsed.port}" if parsed.port is not None else ""
-        authority = f"{host}{port}"
-        return urlunsplit((parsed.scheme.lower(), authority, "", "", "")), "network-origin"
 
-    return _canonical_json({"tool": tool_name, "arguments": arguments}), "tool-call"
+def resolve_terminal_argv(
+    tool_name: str, arguments: dict[str, Any], root: Path
+) -> tuple[str, str]:
+    """Resolve argv execution without applying shell interpretation."""
+    argv = arguments.get("argv")
+    if not isinstance(argv, list) or not argv or not all(
+        isinstance(item, str) and item for item in argv
+    ):
+        raise PermissionError("terminal argv is invalid")
+    cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
+    return _canonical_json({"tool": tool_name, "argv": argv, "cwd": cwd}), "process-argv"
+
+
+def resolve_terminal_shell(
+    tool_name: str, arguments: dict[str, Any], root: Path
+) -> tuple[str, str]:
+    """Bind shell approval to the complete script, including control flow."""
+    script = arguments.get("script", arguments.get("command", ""))
+    if not isinstance(script, str) or not script.strip():
+        raise PermissionError("shell script is empty")
+    cwd = _resolve_workspace_path(root, arguments.get("cwd", "."))
+    tokens = _shell_tokens(script)
+    return _canonical_json(
+        {
+            "tool": tool_name,
+            "shell": arguments.get("shell", ""),
+            "script_digest": hashlib.sha256(script.encode("utf-8")).hexdigest(),
+            "tokens": tokens,
+            "cwd": cwd,
+        }
+    ), "process-shell"
+
+
+def resolve_process_control(
+    tool_name: str, arguments: dict[str, Any], root: Path
+) -> tuple[str, str]:
+    """Resolve an existing process handle; process control is never shell code."""
+    action = arguments.get("action")
+    process_id = arguments.get("id")
+    if action not in {"poll", "wait", "kill", "log"} or not isinstance(process_id, str) or not process_id:
+        raise PermissionError("process control target is invalid")
+    return _canonical_json(
+        {"tool": tool_name, "action": action, "process_id": process_id}
+    ), "process-control"
+
+
+def resolve_network_origin(
+    tool_name: str, arguments: dict[str, Any], root: Path
+) -> tuple[str, str]:
+    """Resolve the origin that a network-capable tool will contact."""
+    parsed = urlsplit(str(arguments.get("url", "")))
+    if not parsed.scheme or not parsed.hostname:
+        raise PermissionError("network target is invalid")
+    host = parsed.hostname.encode("idna").decode("ascii").lower()
+    port = f":{parsed.port}" if parsed.port is not None else ""
+    authority = f"{host}{port}"
+    return urlunsplit((parsed.scheme.lower(), authority, "", "", "")), "network-origin"
+
+
+def resolve_workspace_root(
+    tool_name: str, arguments: dict[str, Any], root: Path
+) -> tuple[str, str]:
+    """Resolve workspace-scoped operations without a more specific target."""
+    return _canonical_json({"tool": tool_name, "workspace_root": os.fspath(root)}), "workspace"
 
 
 def _resolve_workspace_path(root: Path, value: Any) -> str:
@@ -154,24 +212,13 @@ def _resolve_workspace_path(root: Path, value: Any) -> str:
     return os.fspath(resolved)
 
 
-def _normalize_shell_segments(script: str) -> list[list[str]]:
-    lexer = shlex.shlex(script, posix=True, punctuation_chars="|&;")
+def _shell_tokens(script: str) -> list[str]:
+    lexer = shlex.shlex(script, posix=True, punctuation_chars="|&;<>")
     lexer.whitespace_split = True
     tokens = list(lexer)
-    segments: list[list[str]] = []
-    current: list[str] = []
-    for token in tokens:
-        if token in {"|", "||", "&", "&&", ";"}:
-            if current:
-                segments.append(current)
-                current = []
-            continue
-        current.append(token)
-    if current:
-        segments.append(current)
-    if not segments:
+    if not any(token not in {"|", "||", "&", "&&", ";", "<", ">", "<<", ">>"} for token in tokens):
         raise PermissionError("shell script has no executable segment")
-    return segments
+    return tokens
 
 
 def _canonical_json(value: object) -> str:
