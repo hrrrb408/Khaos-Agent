@@ -939,7 +939,7 @@ mod linux {
         stream.set_read_timeout(Some(Duration::from_secs(5)))?;
         stream.set_write_timeout(Some(Duration::from_secs(5)))?;
         let peer = peer_cred(&stream)?;
-        if peer.uid != state.allowed_peer.uid || peer.pid != state.allowed_peer.pid {
+        if peer.uid != state.allowed_peer.uid || !is_descendant(peer.pid, state.allowed_peer.pid)? {
             return write_error(&mut stream, "", "peer process authority not allowed");
         }
         let request = read_request(&mut stream)?;
