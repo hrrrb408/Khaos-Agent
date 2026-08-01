@@ -45,6 +45,7 @@ def _ctx(repo, access_mode="vcs.destructive-write"):
             workspace if workspace_id == "workspace" else None
         ),
         verify_git_identity=AsyncMock(),
+        verify_execution_root=AsyncMock(),
     )
     service = ExecutionService(_LocalRemoteBackend(), manager)
     return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}

@@ -4,15 +4,38 @@ from __future__ import annotations
 
 import fnmatch
 import json
+import logging
 import os
 import shlex
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import urlparse
 
 from khaos.exceptions import PermissionDeniedError
 from khaos.permissions.resource import AuthorizationResource
+
+logger = logging.getLogger(__name__)
+
+
+# Round-14 §7 / Round-15 A-4: tools that can invoke a shell command and
+# therefore must respect ``commands_require_approval``.  Used as the default
+# for ``PermissionEngine.exec_tool_names`` when the runtime does not derive
+# the set from the live ``ToolRegistry``.  The runtime factory passes the
+# registry-derived ``permission_level == "execute"`` set so a newly added
+# exec-style tool is gated automatically instead of bypassing the policy
+# approval requirement.
+#
+# Round-15 A-4: this default MUST track every tool the registry registers
+# with ``permission_level == "execute"`` (registry.py), otherwise a non-
+# factory PermissionEngine (CLI / admin adapter / library caller / future
+# runtime) silently under-gates the missing tools.  ``sandbox_exec`` runs
+# arbitrary commands inside Docker and ``sandbox_build`` builds images; both
+# are ``permission_level="execute"`` and must be gated.
+_DEFAULT_EXEC_TOOLS = frozenset({
+    "terminal", "terminal_argv", "terminal_shell", "process",
+    "sandbox_exec", "sandbox_build",
+})
 
 
 class ApprovalMode(Enum):
@@ -22,6 +45,25 @@ class ApprovalMode(Enum):
     SUGGEST = "suggest"
     ASK_EVERY = "ask-every"
     DENY = "deny"
+
+
+
+# Round-15 B-2: transports that are "interactive" — a human is present and can
+# confirm approvals.  ``""`` (unknown) is treated as interactive for backward
+# compatibility (the CLI/TUI default before explicit transport tracking).
+# Everything else (``"webhook"``, ``"cron"``, ``"rpc"``) is unattended: a
+# malicious inbound message must not auto-approve even read-only shell.
+_INTERACTIVE_TRANSPORTS = frozenset({"cli", "tui", ""})
+
+
+def _is_interactive_transport(source_transport: str) -> bool:
+    """Return True when a human can confirm approvals for this turn.
+
+    Non-interactive transports (webhook / cron / rpc) drive turns without a
+    human present, so the read-only terminal auto-approve shortcut is unsafe
+    there — a malicious inbound message could read secrets unattended.
+    """
+    return str(source_transport or "") in _INTERACTIVE_TRANSPORTS
 
 
 @dataclass
@@ -79,6 +121,7 @@ class PermissionEngine:
         project_id: str = "",
         policy_digest: str = "",
         runtime_id: str = "",
+        exec_tool_names: "frozenset[str] | None" = None,
     ):
         self.db = db
         self._default_mode = default_mode
@@ -87,6 +130,13 @@ class PermissionEngine:
         # rules so an auto-approve rule can never bypass a policy that
         # requires explicit confirmation for a command.
         self._commands_require_approval = commands_require_approval or frozenset()
+        # Round-14 §7: the set of tool names that can invoke a shell command
+        # and therefore must respect ``commands_require_approval``.  Defaults
+        # to the known exec tools; the runtime factory derives this from the
+        # live ``ToolRegistry`` (``permission_level == "execute"``) so a newly
+        # registered exec-style tool is automatically gated instead of
+        # bypassing the policy approval requirement.
+        self._exec_tool_names = frozenset(exec_tool_names) if exec_tool_names else _DEFAULT_EXEC_TOOLS
         # A2-3: principal binding.  Every rule loaded, granted, or revoked
         # through this engine is scoped to (principal_id, project_id,
         # policy_digest).  ``principal_id='legacy'`` is the fail-closed
@@ -104,7 +154,18 @@ class PermissionEngine:
         return self._policy_digest
 
     async def load_rules(self) -> None:
-        """Load persisted rules from SQLite, scoped to this principal."""
+        """Load persisted rules from SQLite, scoped to this principal.
+
+        Round-15 A-1: every row loaded from the DB is run through
+        ``validate_rule_pattern``.  The trust boundary is the DB row (a
+        restored backup, a pre-fix migration, or any direct SQL insert can
+        write a ``"*"`` AUTO_APPROVE rule that bypassed the Python
+        ``grant_rule`` guard), so loading must validate too — otherwise the
+        Round-14 §3 guard is defeated by writing the rule any other way.
+        A row whose pattern is overbroad is quarantined (logged + skipped)
+        rather than raising, because it may be a legitimate-but-stale
+        carryover rather than an attack.
+        """
         self._authorization_epoch = await self.db.bind_authorization_context(
             self._principal_id, self._project_id, self._policy_digest
         )
@@ -114,19 +175,7 @@ class PermissionEngine:
             policy_digest=self._policy_digest,
             generation=self._authorization_epoch,
         )
-        self._rules = [
-            PermissionRule(
-                id=int(row["id"]),
-                pattern=str(row["pattern"]),
-                permission_level=str(row["permission_level"]),
-                approval=ApprovalMode(str(row["approval"])),
-                mode=str(row["mode"]),
-                granted_at=float(row["granted_at"] or 0),
-                policy_digest=str(row["policy_digest"]),
-                generation=int(row["generation"]),
-            )
-            for row in rows
-        ]
+        self._rules = self._materialize_rules(rows)
 
     async def check(
         self,
@@ -135,8 +184,20 @@ class PermissionEngine:
         permission_level: str,
         mode: str,
         resource: AuthorizationResource | None = None,
+        *,
+        source_transport: str = "",
     ) -> PermissionDecision:
-        """Check whether a tool call is approved, denied, or needs confirmation."""
+        """Check whether a tool call is approved, denied, or needs confirmation.
+
+        Round-15 B-2: ``source_transport`` gates the read-only-terminal
+        auto-approve shortcut.  An unattended transport (``"webhook"`` /
+        ``"cron"`` / ``"rpc"``) must NOT auto-approve even read-only shell,
+        because a malicious inbound message could otherwise drive
+        ``cat ~/.ssh/id_rsa`` / ``grep AKIA .`` with no human approval and
+        exfiltrate the output.  Only interactive transports
+        (``"cli"`` / ``"tui"`` / unknown-empty) keep the convenience
+        shortcut.
+        """
         target = (
             resource.canonical_target
             if resource is not None
@@ -165,19 +226,10 @@ class PermissionEngine:
                 policy_digest=self._policy_digest,
                 generation=current_epoch,
             )
-            self._rules = [
-                PermissionRule(
-                    id=int(row["id"]),
-                    pattern=str(row["pattern"]),
-                    permission_level=str(row["permission_level"]),
-                    approval=ApprovalMode(str(row["approval"])),
-                    mode=str(row["mode"]),
-                    granted_at=float(row["granted_at"] or 0),
-                    policy_digest=str(row["policy_digest"]),
-                    generation=int(row["generation"]),
-                )
-                for row in rows
-            ]
+            # Round-15 A-1: validate on epoch-reload too (same reason as
+            # load_rules — a concurrent grant via another path could have
+            # inserted an overbroad rule).
+            self._rules = self._materialize_rules(rows)
         # H4: policy-level required-approval list runs BEFORE every other
         # shortcut, including the read-only terminal shortcut.  Otherwise a
         # command classified as read-only (cat / grep / ls / rg / head /
@@ -187,9 +239,7 @@ class PermissionEngine:
         # H3 (preserved): this also runs before the persistent-rule loop, so
         # a remembered auto-approve rule cannot bypass a command the
         # effective policy demands confirmation for.
-        if self._commands_require_approval and tool_name in {
-            "terminal", "terminal_argv", "terminal_shell", "process"
-        }:
+        if self._commands_require_approval and tool_name in self._exec_tool_names:
             command_text = _command_text(params)
             if _matches_required_approval(command_text, self._commands_require_approval):
                 return PermissionDecision(
@@ -198,7 +248,16 @@ class PermissionEngine:
                     target=target,
                     requires_user_confirm=True,
                 )
-        if tool_name in {"terminal", "terminal_argv", "terminal_shell"} and _is_read_only_terminal_call(params):
+        if (
+            tool_name in {"terminal", "terminal_argv", "terminal_shell"}
+            and _is_read_only_terminal_call(params)
+            # Round-15 B-2: the read-only auto-approve shortcut is a
+            # CONVENIENCE for interactive sessions.  An unattended transport
+            # (webhook / cron / rpc) must not auto-approve even read-only
+            # shell — a malicious inbound message could otherwise read
+            # secrets (``cat ~/.ssh/id_rsa``) with no human in the loop.
+            and _is_interactive_transport(source_transport)
+        ):
             # P1-3 (round-13): read-only auto-approve is now a DEFAULT
             # shortcut — it fires ONLY when no persistent rule matched.
             # Previously it fired BEFORE the rule loop, so a remembered
@@ -251,7 +310,21 @@ class PermissionEngine:
         )
 
     async def grant_rule(self, rule: PermissionRule) -> PermissionRule:
-        """Persist and cache a permission rule scoped to this principal."""
+        """Persist and cache a permission rule scoped to this principal.
+
+        Round-14 §3: an ``AUTO_APPROVE`` (or ``SUGGEST``) rule whose
+        pattern is so broad it matches every target for its
+        ``permission_level`` silently disables the approval gate for
+        that entire level — the ask-every default (ADR-003) is voided
+        by a single ``"*"``.  ``validate_rule_pattern`` rejects such
+        overbroad *auto-grant* patterns at the engine layer (defense
+        in depth) so neither the permission tool nor any future caller
+        can install one.  ``ASK_EVERY`` / ``DENY`` rules are never a
+        relaxation and are exempt.
+        """
+        validate_rule_pattern(
+            rule.pattern, rule.approval, source="PermissionEngine.grant_rule"
+        )
         rule_id = await self.db.insert_permission_rule(
             rule.pattern,
             rule.permission_level,
@@ -308,19 +381,48 @@ class PermissionEngine:
             policy_digest=self._policy_digest,
             generation=self._authorization_epoch,
         )
-        self._rules = [
-            PermissionRule(
-                id=int(row["id"]),
-                pattern=str(row["pattern"]),
-                permission_level=str(row["permission_level"]),
-                approval=ApprovalMode(str(row["approval"])),
-                mode=str(row["mode"]),
-                granted_at=float(row["granted_at"] or 0),
-                policy_digest=str(row["policy_digest"]),
-                generation=int(row["generation"]),
+        # Round-15 A-1: validate on this reload path too.
+        self._rules = self._materialize_rules(rows)
+
+    def _materialize_rules(self, rows: Any) -> list[PermissionRule]:
+        """Build ``PermissionRule`` objects from DB rows, validating patterns.
+
+        Round-15 A-1: every row is run through ``validate_rule_pattern``.
+        A row whose pattern is overbroad for a relaxing approval
+        (``AUTO_APPROVE``/``SUGGEST``) is quarantined — logged and skipped
+        — rather than loaded into ``self._rules`` where it would silently
+        auto-approve every target.  ``ASK_EVERY``/``DENY`` rules always
+        pass (a blanket deny is legitimate).  This closes the bypass where
+        a ``"*"`` rule written via DB restore / direct SQL / a pre-fix
+        version matched without ever being validated.
+        """
+        rules: list[PermissionRule] = []
+        for row in rows:
+            approval = ApprovalMode(str(row["approval"]))
+            pattern = str(row["pattern"])
+            try:
+                validate_rule_pattern(
+                    pattern, approval, source="PermissionEngine.load"
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "quarantining overbroad %s permission rule id=%s "
+                    "pattern=%r: %s", approval.value, row["id"], pattern, exc
+                )
+                continue
+            rules.append(
+                PermissionRule(
+                    id=int(row["id"]),
+                    pattern=pattern,
+                    permission_level=str(row["permission_level"]),
+                    approval=approval,
+                    mode=str(row["mode"]),
+                    granted_at=float(row["granted_at"] or 0),
+                    policy_digest=str(row["policy_digest"]),
+                    generation=int(row["generation"]),
+                )
             )
-            for row in rows
-        ]
+        return rules
 
     async def authorization_snapshot(self) -> int:
         """Return the current epoch after verifying this runtime's policy."""
@@ -406,6 +508,59 @@ class PermissionEngine:
     def _match_pattern(self, pattern: str, target: str) -> bool:
         """Match a normalized target with a glob pattern."""
         return fnmatch.fnmatch(target, pattern)
+
+
+def validate_rule_pattern(
+    pattern: str, approval: ApprovalMode, *, source: str = "grant_permission"
+) -> None:
+    """Reject permission-rule patterns that are unsafely overbroad.
+
+    Round-14 §3: a remembered rule is matched with ``fnmatch`` against
+    the normalized target.  A pattern with *no* fixed (non-glob) prefix
+    — e.g. ``"*"``, ``"**"``, ``"?"``, ``"*/**"``, ``"[a-z]*"`` —
+    matches every target for its ``permission_level`` and ``mode``.
+    Combined with ``ApprovalMode.AUTO_APPROVE`` that silently turns off
+    the approval gate for the whole level, voiding the ask-every
+    default (ADR-003).  Such a rule is almost always a mistake or a
+    social-engineering attack; reject it for any *relaxing* approval
+    mode (``AUTO_APPROVE`` / ``SUGGEST``).
+
+    ``ASK_EVERY`` and ``DENY`` never relax enforcement, so overbroad
+    patterns are permitted for them (a blanket ``DENY`` is legitimate).
+
+    A pattern is considered overbroad when it has fewer than
+    :data:`MIN_RULE_SPECIFICITY` leading fixed characters before the
+    first glob meta character (``*``, ``?``, ``[``).  This still allows
+    sensible broad rules like ``"/home/u/*"``, ``"terminal:git *"``,
+    ``"https://api.example.com/*"`` while catching ``"*"``,
+    ``"**"``, ``"/*"`` (single separator + glob) and character classes.
+    """
+    if approval in (ApprovalMode.ASK_EVERY, ApprovalMode.DENY):
+        return
+    if pattern is None:
+        raise ValueError(f"{source}: pattern must not be empty")
+    text = str(pattern).strip()
+    if not text:
+        raise ValueError(f"{source}: pattern must not be empty")
+    fixed_prefix = 0
+    for char in text:
+        if char in ("*", "?", "["):
+            break
+        fixed_prefix += 1
+    if fixed_prefix < MIN_RULE_SPECIFICITY:
+        raise ValueError(
+            f"{source}: auto-approve pattern {pattern!r} is too broad "
+            f"(needs at least {MIN_RULE_SPECIFICITY} non-glob leading "
+            f"characters); a '*' / '**' style rule would silently "
+            f"disable the approval gate for its permission level"
+        )
+
+
+# Minimum number of leading non-glob characters an AUTO_APPROVE /
+# SUGGEST rule pattern must carry before its first ``*`` / ``?`` / ``[``.
+# Tuned to reject ``"*"``, ``"**"``, ``"/*"``, ``"?*"``, ``"[a-z]*"``
+# while accepting concrete prefixes like ``"/home/u"`` or ``"terminal:"``.
+MIN_RULE_SPECIFICITY = 2
 
 
 def normalize_command_target(command: str) -> str:

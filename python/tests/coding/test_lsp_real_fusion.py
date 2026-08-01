@@ -135,6 +135,7 @@ async def test_real_python_lsp_definition_fusion(tmp_path: Path):
     manager = SimpleNamespace(
         get=lambda wid: workspace if wid == "workspace" else None,
         verify_git_identity=AsyncMock(),
+        verify_execution_root=AsyncMock(),
     )
 
     async def spawn(context, temporary_home):

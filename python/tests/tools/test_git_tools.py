@@ -36,6 +36,7 @@ def _ctx(repo, access_mode="vcs.write"):
             workspace if workspace_id == "workspace" else None
         ),
         verify_git_identity=AsyncMock(),
+        verify_execution_root=AsyncMock(),
     )
     service = ExecutionService(HostExecutionBackend(), manager)
     return {"task_id": "task", "workspace_id": "workspace", "access_mode": access_mode, "execution_service": service}
@@ -135,6 +136,7 @@ async def test_git_commit_stays_in_task_worktree_and_skips_hooks(tmp_path):
             workspace if workspace_id == "workspace" else None
         ),
         verify_git_identity=AsyncMock(),
+        verify_execution_root=AsyncMock(),
     )
     context = {
         "task_id": "task",

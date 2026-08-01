@@ -176,7 +176,7 @@ async def test_broker_injects_principal_engine_for_manage_tools():
     broker = registry.ToolInvocationBroker(reg)
 
     granted_rule = PermissionRule(
-        id=42, pattern="/**", permission_level="write",
+        id=42, pattern="/home/alice/*", permission_level="write",
         approval=ApprovalMode.AUTO_APPROVE, mode="all",
     )
     engine = MagicMock()
@@ -189,7 +189,7 @@ async def test_broker_injects_principal_engine_for_manage_tools():
     result = await broker.invoke(
         "grant_permission",
         mode="office",
-        pattern="/**",
+        pattern="/home/alice/*",
         permission_level="write",
         context={
             "principal_id": "api:alice",

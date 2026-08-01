@@ -192,6 +192,22 @@ class ExecutionService:
             backend = self.docker_backend
         if request.backend_hint == "docker" and resolved_context is None:
             raise PermissionError("Docker execution requires resolved TaskWorkspace context")
+        # Round-14 §1: revalidate the worktree root inode AND Git identity as
+        # the last step before the backend launches the subprocess.  ``require``
+        # (above) and ``verify_git_identity`` both ran earlier in this method,
+        # leaving a TOCTOU window in which a concurrent writer (e.g. a prior
+        # subprocess, or a hook fired by a git operation) could swap the
+        # worktree directory out from under the validated path.  This shrinks
+        # the window to the final await before ``create_subprocess_exec`` and
+        # turns a successful swap into a refusal (the post-exec re-verify below
+        # would otherwise only quarantine *after* the child has run).
+        if (
+            resolved_context is not None
+            and self.workspace_manager is not None
+            and request.task_id
+            and request.workspace_id
+        ):
+            await self.workspace_manager.verify_execution_root(request.workspace_id)
         try:
             if resolved_context is not None and hasattr(backend, "execute_resolved"):
                 self._active[resolved_context.correlation_id] = (
@@ -308,6 +324,12 @@ class ExecutionService:
         if workspace.state not in {WorkspaceState.READY, WorkspaceState.RUNNING, WorkspaceState.VERIFYING}:
             raise PermissionError("workspace is not available for managed process")
         await self.workspace_manager.verify_git_identity(request.workspace_id)
+        # Round-15 A-3: the managed-process (LSP) path also launches a
+        # subprocess into the worktree and previously skipped the pre-exec
+        # inode + git-identity re-validation that the foreground execute()
+        # path performs.  Run the same check here so a worktree/.git swap is
+        # refused before the long-lived child is launched.
+        await self.workspace_manager.verify_execution_root(request.workspace_id)
         root = workspace.worktree_path.expanduser().resolve()
         cwd = request.cwd.expanduser().resolve()
         if cwd != root and root not in cwd.parents:

@@ -99,17 +99,42 @@ async def test_wechat_xml_and_bad_signature():
     handler = WebhookHandler(
         ChannelType.WECHAT, secret, messages.append, now=lambda: now
     )
+    # Round-15 B-1: the body is part of the signed material, so a captured
+    # (timestamp, nonce) cannot be reused with a different body.
     query = {
         "timestamp": timestamp,
         "nonce": nonce,
         "signature": hashlib.sha1(
-            "".join(sorted((secret, timestamp, nonce))).encode()
+            "".join(sorted((secret, timestamp, nonce, body.decode()))).encode()
         ).hexdigest(),
     }
     assert (await handler.handle({}, body, {**query, "signature": "bad"}))["status"] == "signature_error"
     assert (await handler.handle({}, body, query))["message_id"] == "8"
     assert (await handler.handle({}, body, query))["status"] == "replay_error"
     assert messages[0].text == "hello"
+
+
+@pytest.mark.asyncio
+async def test_wechat_signature_rejects_body_substitution():
+    """Round-15 B-1: a signature computed for one body must NOT verify for a
+    different body.  Pre-fix, the signature excluded the body so an attacker
+    who captured one valid (timestamp, nonce, signature) could inject any
+    message text."""
+    now = 1_700_000_000
+    timestamp, nonce, secret = str(now), "nonce-evil", "token"
+    original_body = b"<xml><MsgId>1</MsgId><Content><![CDATA[benign]]></Content></xml>"
+    injected_body = b"<xml><MsgId>2</MsgId><Content><![CDATA[evil]]></Content></xml>"
+    handler = WebhookHandler(
+        ChannelType.WECHAT, secret, lambda _m: None, now=lambda: now
+    )
+    signature = hashlib.sha1(
+        "".join(sorted((secret, timestamp, nonce, original_body.decode()))).encode()
+    ).hexdigest()
+    result = await handler.handle(
+        {}, injected_body,
+        {"timestamp": timestamp, "nonce": nonce, "signature": signature},
+    )
+    assert result["status"] == "signature_error"
 
 
 @pytest.mark.asyncio
@@ -123,18 +148,18 @@ async def test_wechat_image_and_location_types():
         ChannelType.WECHAT, secret, messages.append, now=lambda: now
     )
 
-    def query(nonce: str) -> dict[str, str]:
+    def query(nonce: str, body: bytes) -> dict[str, str]:
         timestamp = str(now)
         return {
             "timestamp": timestamp,
             "nonce": nonce,
             "signature": hashlib.sha1(
-                "".join(sorted((secret, timestamp, nonce))).encode()
+                "".join(sorted((secret, timestamp, nonce, body.decode()))).encode()
             ).hexdigest(),
         }
 
-    await handler.handle({}, image, query("image"))
-    await handler.handle({}, location, query("location"))
+    await handler.handle({}, image, query("image", image))
+    await handler.handle({}, location, query("location", location))
     assert messages[0].content_type == ContentType.IMAGE
     assert messages[0].attachments[0].url == "https://img"
     assert messages[1].text == "Shanghai"

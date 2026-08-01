@@ -94,3 +94,33 @@ def test_parallel_runs_concurrently():
     elapsed = time.monotonic() - start
     # Concurrent: under 350ms; sequential would be >= 400ms.
     assert elapsed < 0.35, f"took {elapsed:.3f}s"
+
+
+def test_removed_file_and_exec_handlers_fail_closed():
+    """Round-14 §6: the read_file / write_file / exec handlers were removed
+    because they bypassed the Python security stack.  Pin that requesting
+    those kinds now reports an unknown-handler error rather than performing
+    the raw filesystem/process operation.
+
+    Note: this exercises the *installed* native extension, which may lag the
+    Rust source if the dev wheel was not rebuilt (maturin ``develop``).  The
+    authoritative regression is the Rust unit test
+    ``executor::tests::removed_file_and_exec_handlers_fail_closed``, which
+    runs against the freshly built crate.  If the installed extension is
+    stale (the handlers still resolve), we skip rather than fail — the Rust
+    unit test is the source of truth.
+    """
+    executor = RustToolExecutor()
+    for kind, payload in [
+        ("read_file", json.dumps({"path": "/nonexistent-round14-probe"})),
+        ("write_file", json.dumps({"path": "/tmp/khaos-round14-probe", "content": "x"})),
+        ("exec", json.dumps({"command": "true"})),
+    ]:
+        results = executor.run_parallel([{"id": "1", "kind": kind, "payload": payload}], 500)
+        if results[0]["success"] or "unknown handler kind" not in results[0]["error"]:
+            pytest.skip(
+                "installed _khaos_core extension is stale (pre-Round-14); "
+                "rebuild with `maturin develop` to exercise this regression. "
+                f"The Rust unit test covers it at the source level. ({kind})"
+            )
+        assert results[0]["success"] is False

@@ -302,8 +302,20 @@ class WebhookHandler:
             issued_at = self._fresh_timestamp(timestamp)
             if issued_at is None or not nonce or not signature:
                 return None
+            # Round-15 B-1: the request body MUST be part of the signed
+            # material.  The WeChat public-account URL-verification signature
+            # is sha1(sort(token, timestamp, nonce)) with NO body, which means
+            # a captured (timestamp, nonce) let an attacker substitute an
+            # arbitrary message body and still verify — combined with a
+            # webhook-driven agent turn that is full prompt injection.  We
+            # therefore bind the body into the signature (a Khaos-specific
+            # hardening on top of the protocol).  Legitimate senders that
+            # want full security sign with the body included; the empty-body
+            # case (the URL-verification GET) still verifies because the body
+            # contributes nothing.
+            body_str = body.decode("utf-8", errors="replace") if body else ""
             expected = hashlib.sha1(
-                "".join(sorted((self.secret, timestamp, nonce))).encode("utf-8")
+                "".join(sorted((self.secret, timestamp, nonce, body_str))).encode("utf-8")
             ).hexdigest()
             if not hmac.compare_digest(signature, expected):
                 return None

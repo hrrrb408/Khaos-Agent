@@ -100,6 +100,48 @@ async def test_git_pointer_inode_replacement_is_rejected(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_verify_execution_root_detects_worktree_swap(tmp_path: Path):
+    """Round-14 §1: ``verify_execution_root`` re-checks the worktree root
+    ``(dev, ino)`` immediately before subprocess launch, closing the TOCTOU
+    window between ``require``/``verify_git_identity`` (early) and
+    ``create_subprocess_exec`` (deep in the backend).  A swap that replaces
+    the directory with a different inode must be detected here, before exec.
+    """
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-swap")
+    original = workspace.worktree_path
+
+    # Sanity: the pinned identity matches the live directory.
+    await manager.verify_execution_root(workspace.id)
+
+    # Swap the worktree directory for a freshly-created one (different inode).
+    # macOS refuses ``os.replace`` over a non-empty directory, so do a
+    # two-step rename: move the original aside, then move a fresh directory
+    # into its path.  The path now resolves to a different inode.
+    parent = original.parent
+    moved_aside = parent / "moved-aside-swap"
+    os.rename(original, moved_aside)
+    staging = parent / "staging-swap"
+    staging.mkdir()
+    os.rename(staging, original)
+
+    with pytest.raises(WorkspaceError, match="drifted"):
+        await manager.verify_execution_root(workspace.id)
+
+
+@pytest.mark.asyncio
+async def test_verify_execution_root_passes_for_stable_worktree(tmp_path: Path):
+    """Round-14 §1: positive case — an unchanged worktree passes the
+    pre-exec root-inode revalidation."""
+    repository = _repo(tmp_path / "repo")
+    manager = WorkspaceManager(tmp_path / "worktrees")
+    workspace = await manager.create(repository, "task-stable")
+    # No mutation between create and verify → must not raise.
+    await manager.verify_execution_root(workspace.id)
+
+
+@pytest.mark.asyncio
 async def test_workspace_commit_disables_repository_hooks(tmp_path: Path):
     repository = _repo(tmp_path / "repo")
     marker = tmp_path / "hook-ran"
