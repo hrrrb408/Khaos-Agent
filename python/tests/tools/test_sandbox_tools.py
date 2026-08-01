@@ -97,6 +97,7 @@ def _service(tmp_path, *, task_id="task", state=WorkspaceState.RUNNING, docker_b
             workspace if workspace_id == "workspace" else None
         ),
         verify_git_identity=AsyncMock(),
+        verify_execution_root=AsyncMock(),
     )
     backend = docker_backend or _FakeDockerBackend()
     return ExecutionService(HostExecutionBackend(), manager, backend), workspace, backend
@@ -518,6 +519,7 @@ async def test_real_docker_workspace_isolation_e2e(tmp_path):
             workspace if workspace_id == "workspace" else None
         ),
         verify_git_identity=AsyncMock(),
+        verify_execution_root=AsyncMock(),
     )
     service = ExecutionService(
         HostExecutionBackend(), manager,
@@ -604,6 +606,7 @@ async def test_real_docker_lifecycle_cleanup_e2e(tmp_path, action):
             workspace if workspace_id == "workspace" else None
         ),
         verify_git_identity=AsyncMock(),
+        verify_execution_root=AsyncMock(),
     )
     backend = DockerBackend(allowed_images={DEFAULT_DOCKER_IMAGE})
     service = ExecutionService(HostExecutionBackend(), manager, backend)

@@ -67,6 +67,7 @@ def _runtime(tmp_path: Path, *, state=WorkspaceState.RUNNING):
             workspace if workspace_id == "workspace" else None
         ),
         verify_git_identity=AsyncMock(),
+        verify_execution_root=AsyncMock(),
     )
     captured = []
 
