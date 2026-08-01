@@ -539,3 +539,112 @@ async def test_scheduler_timeout_returns_failure(tmp_path):
 
     assert not results[0].success
     await db.close()
+
+
+async def test_dispatch_refuses_when_arguments_drift_after_approval(tmp_path):
+    """Round-14 §5: arguments approved at confirmation must match arguments
+    used at dispatch.  A caller that tampers the arguments between approval
+    and dispatch is caught by recomputing the digest and refusing dispatch.
+    """
+    from khaos.tools.scheduler import _canonical_digest
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
+    broker = ApprovalBroker()
+    context = _approval_context()
+    context["approval_broker"] = broker
+    context["coding_workspace_enforced"] = False
+
+    def approve(request):
+        return {"approved": True, "remember": False}
+
+    scheduler = ToolScheduler(_registry(), PermissionEngine(db))
+    # Approve value="original"; capture the binding's arguments digest.
+    results = await scheduler.execute_batch(
+        [{"id": "call-drift", "name": "write", "arguments": {"value": "original"}}],
+        mode="coding",
+        session_id="test-session",
+        confirm_callback=approve,
+        tool_context=context,
+    )
+    assert results[0].success
+
+    # Craft a dispatch call that claims the original approval (its digest)
+    # but whose live arguments have been tampered.  Acquire a reservation the
+    # same way the scheduler does, then invoke the dispatch boundary.  The
+    # call must carry the current authorization epoch so the epoch check
+    # passes and the arguments-digest check is the one that fires.
+    current_epoch = await scheduler.permission_engine.authorization_snapshot()
+    original_digest = _canonical_digest({"value": "original"})
+    tampered_call = {
+        "id": "call-drift",
+        "name": "write",
+        "arguments": {"value": "tampered"},
+        "_authorization_epoch": current_epoch,
+        "_approval_arguments_digest": original_digest,
+    }
+    reservation = await scheduler.budget.reserve(parallel=False)
+    assert reservation is not None
+    result = await scheduler._execute_one(
+        tampered_call,
+        session_id="test-session",
+        mode="coding",
+        tool_context=context,
+        reservation=reservation,
+    )
+    assert not result.success
+    assert "arguments changed before dispatch" in result.error
+    await db.close()
+
+
+async def test_dispatch_allows_when_arguments_match_approval(tmp_path):
+    """Round-14 §5: symmetric positive case — identical arguments produce the
+    same digest and dispatch proceeds normally (no false rejection)."""
+    from khaos.tools.scheduler import _canonical_digest
+
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
+    broker = ApprovalBroker()
+    context = _approval_context()
+    context["approval_broker"] = broker
+    context["coding_workspace_enforced"] = False
+
+    def approve(request):
+        return {"approved": True, "remember": False}
+
+    scheduler = ToolScheduler(_registry(), PermissionEngine(db))
+    results = await scheduler.execute_batch(
+        [{"id": "call-match", "name": "write", "arguments": {"value": "ok"}}],
+        mode="coding",
+        session_id="test-session",
+        confirm_callback=approve,
+        tool_context=context,
+    )
+    assert results[0].success
+
+    # Identical arguments → identical digest → dispatch allowed.  Carry the
+    # current epoch so the epoch check passes and we reach the handler.
+    current_epoch = await scheduler.permission_engine.authorization_snapshot()
+    matching_digest = _canonical_digest({"value": "ok"})
+    matching_call = {
+        "id": "call-match",
+        "name": "write",
+        "arguments": {"value": "ok"},
+        "_authorization_epoch": current_epoch,
+        "_approval_arguments_digest": matching_digest,
+    }
+    reservation = await scheduler.budget.reserve(parallel=False)
+    assert reservation is not None
+    result = await scheduler._execute_one(
+        matching_call,
+        session_id="test-session",
+        mode="coding",
+        tool_context=context,
+        reservation=reservation,
+    )
+    assert result.success
+    await db.close()

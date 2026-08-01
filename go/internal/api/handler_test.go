@@ -362,8 +362,29 @@ func TestConfigToolsSessionsHealth(t *testing.T) {
 			t.Fatalf("%s status=%d", path, rec.Code)
 		}
 	}
-	if rec := serve(handler, http.MethodPut, "/api/config", `{"mode":"coding"}`, ""); rec.Code != http.StatusOK {
+	// Round-15 B-4: config PUT is restricted to a loopback caller.  The
+	// test httptest.NewRequest leaves RemoteAddr empty, so set a loopback
+	// address to exercise the legitimate operator path.
+	req := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewBufferString(`{"mode":"coding"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Khaos-Key", testAPIKey)
+	req.Host = "127.0.0.1:8080"
+	req.RemoteAddr = "127.0.0.1:1234"
+	rec := httptest.NewRecorder()
+	handler.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
 		t.Fatalf("config put status=%d", rec.Code)
+	}
+	// A non-loopback caller must be refused.
+	req2 := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewBufferString(`{"mode":"office"}`))
+	req2.Header.Set("Content-Type", "application/json")
+	req2.Header.Set("X-Khaos-Key", testAPIKey)
+	req2.Host = "127.0.0.1:8080"
+	req2.RemoteAddr = "10.0.0.5:1234"
+	rec2 := httptest.NewRecorder()
+	handler.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusForbidden {
+		t.Fatalf("non-loopback config put should be 403, got %d", rec2.Code)
 	}
 }
 

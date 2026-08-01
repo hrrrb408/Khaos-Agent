@@ -169,14 +169,34 @@ async def backfill_table(
             "(use compute_project_id(project_root))"
         )
     conn = await db._require_writer_conn()
-    cursor = await conn.execute(
-        f"UPDATE {table} SET project_id = ? WHERE project_id = ''",
-        (project_id,),
-    )
-    if commit:
-        await conn.commit()
-    rowcount = int(cursor.rowcount or 0)
-    await cursor.close()
+    # Round-14 §4: audit_log is append-only (BEFORE UPDATE trigger) to make
+    # it tamper-resistant.  The project_id backfill is a trusted one-time
+    # migration tool that legitimately must UPDATE legacy rows, so the
+    # append-only guard is dropped around this operation and re-created
+    # immediately after.  This keeps the trigger in force for all normal
+    # operation while allowing the backfill to stamp legacy rows.
+    drop_append_guard = table == "audit_log"
+    if drop_append_guard:
+        await conn.execute("DROP TRIGGER IF EXISTS trg_audit_log_append_only_update")
+    try:
+        cursor = await conn.execute(
+            f"UPDATE {table} SET project_id = ? WHERE project_id = ''",
+            (project_id,),
+        )
+        if commit:
+            await conn.commit()
+        rowcount = int(cursor.rowcount or 0)
+        await cursor.close()
+    finally:
+        if drop_append_guard:
+            await conn.execute(
+                "CREATE TRIGGER IF NOT EXISTS trg_audit_log_append_only_update "
+                "BEFORE UPDATE ON audit_log BEGIN "
+                "SELECT RAISE(ABORT, 'audit_log is append-only: rows cannot be updated'); "
+                "END"
+            )
+            if commit:
+                await conn.commit()
     return rowcount
 
 

@@ -115,15 +115,33 @@ async def grant_permission(
         return principal_error
     if permission_engine is None:
         return {"ok": False, "error": "Permission engine not initialized"}
-    from khaos.permissions.engine import ApprovalMode, PermissionRule
+    from khaos.permissions.engine import (
+        ApprovalMode,
+        PermissionRule,
+        validate_rule_pattern,
+    )
 
+    # Round-14 §3: reject overbroad auto-approve / suggest patterns
+    # (``"*"``, ``"**"``, …) before they reach the engine.  A blanket
+    # pattern silently disables the approval gate for the whole
+    # permission level, voiding the ask-every default (ADR-003).
+    try:
+        approval_mode = ApprovalMode(approval)
+    except ValueError as exc:
+        return {"ok": False, "error": f"invalid approval mode: {exc}"}
+    try:
+        validate_rule_pattern(
+            pattern, approval_mode, source="grant_permission"
+        )
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     try:
         rule = await permission_engine.grant_rule(
             PermissionRule(
                 id=None,
                 pattern=pattern,
                 permission_level=permission_level,
-                approval=ApprovalMode(approval),
+                approval=approval_mode,
                 mode=mode,
             )
         )

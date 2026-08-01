@@ -700,6 +700,24 @@ func webhookSourceIdentity(r *http.Request) string {
 	return r.RemoteAddr
 }
 
+// isLoopbackCaller reports whether the request originated from the local
+// machine.  Round-15 B-4: operator-only endpoints (gateway config mutation)
+// are restricted to loopback so a remote authenticated principal cannot
+// rewrite the gateway configuration, which may carry security-relevant
+// keys.  The Go gateway is normally deployed behind a local Python agent
+// control plane, so legitimate operator access comes from loopback.
+func isLoopbackCaller(r *http.Request) bool {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	ip := net.ParseIP(host)
+	if ip != nil {
+		return ip.IsLoopback()
+	}
+	return host == "127.0.0.1" || host == "::1" || host == "localhost"
+}
+
 func (h *Handler) requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
@@ -1152,10 +1170,30 @@ func (h *Handler) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleConfigGet(w http.ResponseWriter, r *http.Request) {
+	// Round-15 B-4: config may carry security-relevant values; require an
+	// authenticated principal (the route is already behind auth.Middleware,
+	// but fail closed if the middleware's principal extraction failed).
+	if _, authenticated := auth.PrincipalFromContext(r.Context()); !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
 	writeJSON(w, http.StatusOK, h.config.Get())
 }
 
 func (h *Handler) handleConfigSet(w http.ResponseWriter, r *http.Request) {
+	// Round-15 B-4: gateway config is operator-level privileged state (it
+	// may carry security-relevant keys); restrict mutation to a loopback
+	// caller.  Any authenticated remote principal could otherwise overwrite
+	// the whole config map.  Legitimate operator access comes from the
+	// local control plane.
+	if _, authenticated := auth.PrincipalFromContext(r.Context()); !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return
+	}
+	if !isLoopbackCaller(r) {
+		writeError(w, http.StatusForbidden, "config mutation is restricted to a loopback caller")
+		return
+	}
 	var cfg map[string]any
 	if err := decodeJSON(r, &cfg); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid request")

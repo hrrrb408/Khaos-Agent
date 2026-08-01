@@ -442,6 +442,47 @@ class WorkspaceManager:
         except GitIdentityError as exc:
             raise WorkspaceError(str(exc)) from exc
 
+    async def verify_execution_root(self, workspace_id: str) -> None:
+        """Revalidate the worktree root inode AND Git identity before launch.
+
+        Round-14 §1 / Round-15 A-3: ``require`` validates the root
+        ``(dev, ino)`` early in ``ExecutionService.execute``, and
+        ``verify_git_identity`` validates the ``.git`` pointer/admin dir —
+        but both ran *before* the subprocess was actually launched
+        (``create_subprocess_exec`` deep in the backend), leaving a TOCTOU
+        window in which a concurrent writer (a prior subprocess, a hook
+        fired by a git operation) could swap the worktree directory or the
+        ``.git`` pointer out from under the validated path.  This helper
+        re-runs BOTH the root-inode check and the git-identity check as
+        close to dispatch as the caller can place it.  It is the pre-exec
+        sibling of the post-exec ``_verify_or_quarantine_git_identity``
+        detection in ExecutionService — turning a successful swap into a
+        refusal before the child runs, not a quarantine after.
+        """
+        workspace = self._workspaces.get(workspace_id)
+        if workspace is None:
+            raise WorkspaceError("TaskWorkspace is unavailable")
+        try:
+            current = workspace.worktree_path.resolve(strict=True).stat()
+        except OSError as exc:
+            raise WorkspaceError("TaskWorkspace root is unavailable") from exc
+        if (
+            workspace.root_device != int(current.st_dev)
+            or workspace.root_inode != int(current.st_ino)
+        ):
+            raise WorkspaceError("TaskWorkspace root identity drifted before execution")
+        # Round-15 A-3: also re-verify the Git pointer/admin-dir identity.
+        # The Round-14 version only checked the inode; a ``.git`` swap was
+        # only caught post-exec.  Re-run the same pinned-identity check the
+        # post-exec path uses, so a swap is refused before the child runs.
+        if workspace.git_identity is not None:
+            try:
+                await asyncio.to_thread(
+                    verify_git_worktree_identity, workspace.git_identity
+                )
+            except GitIdentityError as exc:
+                raise WorkspaceError(str(exc)) from exc
+
     async def mutate_with_storage_authority(
         self,
         workspace_id: str,

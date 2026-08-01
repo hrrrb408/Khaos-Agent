@@ -567,6 +567,15 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     # check is the sole authority.  CLI / tests that don't set
     # ``cfg.project_id`` fall back to recompute.
     project_id = cfg.project_id or compute_project_id(root)
+    # Round-14 §7: derive the exec-tool name set from the live registry so
+    # the commands_require_approval gate covers every exec-style tool
+    # (permission_level == "execute"), not a hard-coded literal.  Built once
+    # here and reused for the scheduler registry below.
+    if cfg.tool_allowlist is not None:
+        runtime_registry = create_runtime_registry().prune(cfg.tool_allowlist)
+    else:
+        runtime_registry = create_runtime_registry()
+    exec_tool_names = runtime_registry.exec_tool_names()
     permission_engine = PermissionEngine(
         cfg.db,
         commands_require_approval=effective_policy.commands_require_approval,
@@ -574,6 +583,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         project_id=project_id,
         policy_digest=effective_policy.digest,
         runtime_id=cfg.runtime_id,
+        exec_tool_names=exec_tool_names,
     )
     await permission_engine.load_rules()
     memory_manager = cfg.memory_manager or MemoryManager(
@@ -683,10 +693,9 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # NetworkGuard / AuditLogger as the main runtime — closing the
         # parallel-scheduler bypass where a subagent ran without any
         # security stack at all.
-        if cfg.tool_allowlist is not None:
-            registry = create_runtime_registry().prune(cfg.tool_allowlist)
-        else:
-            registry = create_runtime_registry()
+        # Round-14 §7: reuse the registry already built for exec_tool_names
+        # derivation above, instead of constructing a second identical one.
+        registry = runtime_registry
         # M1: construct an AuditLogger from the EffectivePolicy when the
         # caller didn't inject one.  Previously only the gRPC server path
         # built an AuditLogger; CLI / TUI / tests passed ``None``, so

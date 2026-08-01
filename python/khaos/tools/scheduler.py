@@ -423,6 +423,10 @@ class ToolScheduler:
                 permission_level=tool.permission_level,
                 mode=mode,
                 resource=resource,
+                # Round-15 B-2: gate the read-only terminal auto-approve
+                # shortcut on an interactive transport so an unattended
+                # webhook/cron/rpc turn cannot auto-approve ``cat ~/.ssh/id_rsa``.
+                source_transport=str(tool_context.get("source_transport") or ""),
             )
             if decision.approved == ApprovalMode.DENY:
                 await self.permission_engine.audit(
@@ -581,6 +585,14 @@ class ToolScheduler:
                 normalized["_approval_schema_digest"] = binding.tool_schema_digest
                 normalized["_approval_policy_digest"] = binding.policy_digest
                 normalized["_approval_authorization_epoch"] = binding.authorization_epoch
+                # Round-14 §5: stash the approved arguments digest so dispatch
+                # can recompute the live arguments digest and refuse to run if
+                # they diverge.  Previously this digest was computed and stored
+                # on the binding/PermissionRequest but never re-verified at
+                # dispatch (unlike schema/policy/resource digests), so a caller
+                # able to mutate the arguments between approval and dispatch
+                # would not be caught by an arguments-digest mismatch.
+                normalized["_approval_arguments_digest"] = binding.arguments_digest
                 request = PermissionRequest(
                     tool_call_id=normalized["id"],
                     name=tool.name,
@@ -761,6 +773,18 @@ class ToolScheduler:
                 raise PermissionDeniedError(
                     "Policy changed before dispatch; re-approval required"
                 )
+            # Round-14 §5: recompute the live arguments digest and refuse
+            # dispatch if it differs from the approved one.  This closes the
+            # asymmetry where schema/policy/resource digests were re-verified
+            # at dispatch but the arguments digest (the payload most directly
+            # controlled by the model) was only stored, never re-checked.
+            expected_arguments = call.get("_approval_arguments_digest")
+            if expected_arguments:
+                live_arguments = _canonical_digest(call.get("arguments", {}))
+                if live_arguments != expected_arguments:
+                    raise PermissionDeniedError(
+                        "Tool arguments changed before dispatch; re-approval required"
+                    )
             expected_approval_epoch = call.get("_approval_authorization_epoch")
             if expected_approval_epoch is not None:
                 await self.permission_engine.validate_dispatch_epoch(

@@ -257,6 +257,19 @@ class ToolRegistry:
         """Return registered model-visible tool names in stable order."""
         return tuple(sorted(self._tools))
 
+    def exec_tool_names(self) -> frozenset[str]:
+        """Return the names of tools that can invoke a shell command.
+
+        Round-14 §7: derived from ``permission_level == "execute"`` so the
+        ``PermissionEngine`` commands_require_approval gate covers every
+        exec-style tool the registry knows about, not a hard-coded literal
+        that silently misses newly registered ones.
+        """
+        return frozenset(
+            name for name, tool in self._tools.items()
+            if tool.permission_level == "execute"
+        )
+
     def list_by_mode(self, mode: str) -> list[ToolDefinition]:
         """List tools available to a mode."""
         return [

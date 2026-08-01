@@ -35,7 +35,8 @@ async def test_real_main_19a2b538_database_upgrades_without_rewriting_provenance
         ledger = raw.execute(
             "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
         ).fetchall()
-        assert ledger[-1][0] == 7
+        # Round-15 A-2: v9 (audit_log INSERT genesis guard) is now the chain tip.
+        assert ledger[-1][0] == 9
         assert ledger[5] == (
             6,
             "round6_batch64_immutable_migration_chain",

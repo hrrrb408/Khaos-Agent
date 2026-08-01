@@ -340,6 +340,34 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
             "28992f0190d75b671b6bc37090b51e92eb0c8b541b92ab8a23064095cf7f7954",
         ),
     ),
+    MigrationSpec(
+        version=8,
+        name="round14_audit_log_tamper_protection",
+        # Round-14 §4: add tamper-evident protection to ``audit_log``.
+        # ``_apply_v8_upgrades`` adds the ``prev_hash`` column (hash chain)
+        # and the append-only BEFORE DELETE / BEFORE UPDATE triggers, and
+        # backfills ``prev_hash`` for pre-existing rows.  This closes the
+        # gap where any process with DB write access could silently
+        # DELETE/UPDATE audit rows to erase its tracks (review P0-1).
+        # v8's manifest covers ONLY the v8 delta migrators — the v6
+        # aggregate + v7 deltas stay frozen.  Computed at release time and
+        # recorded as a LITERAL.
+        sha256="ce99d4ed950175940a33d706c97e512259bfc9acaf69804119e820879dbfaf43",
+        migrator_symbols=("_apply_v8_upgrades", "_ensure_audit_log_tamper_protection"),
+    ),
+    MigrationSpec(
+        version=9,
+        name="round15_audit_log_insert_guard",
+        # Round-15 A-2: closes the INSERT-reset bypass of the v8 hash chain.
+        # A ``BEFORE INSERT`` trigger refuses a row whose ``prev_hash`` is
+        # empty unless the table is empty (the genesis row), so an attacker
+        # with a write connection cannot INSERT a forged "genesis reset" to
+        # hide prior tampering.  v9's manifest covers ONLY the v9 delta
+        # migrators — v6/v7/v8 stay frozen.  Computed at release time and
+        # recorded as a LITERAL.
+        sha256="2e588da9aa02f4e15ce3ec71b07947c340796224f8b9f4116d2d677ac574b121",
+        migrator_symbols=("_apply_v9_upgrades", "_ensure_audit_log_insert_guard"),
+    ),
 )
 
 

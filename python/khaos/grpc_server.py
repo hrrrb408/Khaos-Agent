@@ -1459,19 +1459,28 @@ class AgentService:
         return {"current_mode": mode.value}
 
     async def confirm_permission(self, ctx: RequestContext, request: ConfirmRequest) -> dict:
-        # M4 batch 3.1.16A-4-1: ctx is the authoritative principal.
-        # ConfirmRequest.principal_id is still populated by the
-        # dispatcher (backward compat) but ctx.principal_id is the
-        # verified transport principal.  A-4-2 will switch the
-        # ApprovalBroker call to use ctx.principal_id directly.
-        if not request.principal_id or not request.binding_digest:
+        # Round-14 §2: ctx.principal_id is the sole authority for the
+        # resolving principal.  ConfirmRequest.principal_id is a payload
+        # field and must never be trusted for authorization — a payload
+        # value that disagrees with the transport principal is a forged
+        # approval attempt.  Previously this passed ``request.principal_id``
+        # through to ``ApprovalBroker.resolve``, relying on the dispatcher
+        # overwrite (grpc_server.py ``if "principal_id" in payload``) to
+        # mask the hole; any path that constructs a ConfirmRequest without
+        # that overwrite would have become a forging primitive.
+        if not ctx.principal_id or not request.binding_digest:
             return {"ok": False, "error": "approval principal/binding required"}
+        if request.principal_id and request.principal_id != ctx.principal_id:
+            return {
+                "ok": False,
+                "error": "payload principal_id does not match transport principal",
+            }
         return {
             "ok": await self.approval_broker.resolve(
                 request.tool_call_id,
                 request.approved,
                 request.remember,
-                principal_id=request.principal_id,
+                principal_id=ctx.principal_id,
                 session_id=request.session_id,
                 binding_digest=request.binding_digest,
             )
@@ -2084,17 +2093,23 @@ class TaskService:
     ) -> dict:
         from khaos.coding.task_manager import TaskStatus, TransitionResult
 
-        # M4 batch 3.1.16A-4-2: a compromised Gateway could forge the
-        # payload's ``principal_id`` to match the task's pending
-        # approval principal.  The transport ``ctx.principal_id`` is
-        # the authority — reject if the payload principal disagrees.
-        # Also hide cross-principal tasks (treat as not found).
+        # Round-14 §2: bind the resolving principal to the transport
+        # authority unconditionally.  ``principal_id`` is a payload field
+        # and is only trusted when it agrees with ``ctx.principal_id``;
+        # an empty payload principal previously skipped the guard and
+        # fell through to downstream principal comparisons on the empty
+        # string.  Reject an empty transport principal outright so the
+        # approval cannot be attributed to nobody.  Also hide
+        # cross-principal tasks (treat as not found).
+        if not ctx.principal_id:
+            return {"ok": False, "error": "transport principal is required", "task_id": task_id}
         if principal_id and principal_id != ctx.principal_id:
             return {
                 "ok": False,
                 "error": "payload principal_id does not match transport principal",
                 "task_id": task_id,
             }
+        principal_id = ctx.principal_id
         manager = await self._manager(ctx)
         task = await manager.get(task_id)
         if task is None or task.principal_id != ctx.principal_id:
@@ -2148,15 +2163,17 @@ class TaskService:
     ) -> dict:
         from khaos.coding.task_manager import TaskStatus, TransitionResult
 
-        # M4 batch 3.1.16A-4-2: see ``approve`` — payload principal
-        # must agree with transport principal, and cross-principal
-        # tasks are hidden.
+        # Round-14 §2: see ``approve`` — bind the resolving principal to
+        # the transport authority unconditionally.
+        if not ctx.principal_id:
+            return {"ok": False, "error": "transport principal is required", "task_id": task_id}
         if principal_id and principal_id != ctx.principal_id:
             return {
                 "ok": False,
                 "error": "payload principal_id does not match transport principal",
                 "task_id": task_id,
             }
+        principal_id = ctx.principal_id
         manager = await self._manager(ctx)
         task = await manager.get(task_id)
         if task is None or task.principal_id != ctx.principal_id:
@@ -2476,11 +2493,33 @@ async def serve_json_lines(
                 # unconditionally.  SubAgent handlers get their
                 # principal stamped inside ``_handle_optional_subagent``
                 # so they don't depend on this branch.
-                ctx = RequestContext.for_rpc(
-                    principal_id,
-                    project_id=agent._bound_project_id,
-                    policy_digest=agent._effective_policy.digest,
-                )
+                if principal_id:
+                    ctx = RequestContext.for_rpc(
+                        principal_id,
+                        project_id=agent._bound_project_id,
+                        policy_digest=agent._effective_policy.digest,
+                    )
+                elif method == "AgentService.HandleWebhook":
+                    # Round-15 B-3: the Go gateway forwards inbound platform
+                    # webhooks with ``principal_id=""`` (the webhook has no
+                    # API-key principal; ``handle_webhook`` derives its own
+                    # ``webhook:<channel>:<platform>:<sender>`` principal for
+                    # the resulting turn).  ``for_rpc`` rejects an empty
+                    # principal, which previously made the production webhook
+                    # path die at context construction.  Use the local-uid
+                    # context for the webhook handler only — it does not use
+                    # ``ctx.principal_id`` for authorization (the platform
+                    # signature is verified inside ``handle_webhook``).
+                    ctx = RequestContext.for_cli(
+                        project_id=agent._bound_project_id,
+                        policy_digest=agent._effective_policy.digest,
+                    )
+                else:
+                    writer.write((json.dumps({
+                        "error": "unauthenticated", "message": "principal_id is required",
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
                 if "principal_id" in payload:
                     payload["principal_id"] = ctx.principal_id
                 # M4 batch 3.1.16A-5-1b (CRITICAL): project identity

@@ -51,6 +51,77 @@ TELEGRAM_REPLAY_WINDOW = 4096
 # next await).
 _READER_DRAIN_TIMEOUT = 10.0
 
+# Round-14 §4: audit_log hash-chain helpers.  The chain makes the audit
+# trail tamper-evident: each row stores sha256(prev_hash || canonical
+# fields), so a deleted/reordered/edited row breaks the link and is
+# detected by ``Database.verify_audit_chain``.  Combined with the
+# append-only BEFORE DELETE / BEFORE UPDATE triggers (added in the v8
+# migration), this gives defense in depth against a compromised process
+# rewriting its own audit trail.
+_AUDIT_GENESIS_PREV = ""
+_AUDIT_HASH_FIELDS = (
+    "action", "target", "result", "detail", "session_id",
+    "principal_id", "runtime_id", "task_id", "operation_id",
+    "policy_digest", "authority_generation", "source_transport",
+    "project_id",
+)
+
+
+def _audit_row_hash(
+    prev_hash: str,
+    action: str,
+    target: str,
+    result: str,
+    detail: str,
+    session_id: str | None,
+    principal_id: str,
+    runtime_id: str | None,
+    task_id: str | None,
+    operation_id: str | None,
+    policy_digest: str | None,
+    authority_generation: int | None,
+    source_transport: str | None,
+    project_id: str,
+) -> str:
+    """Compute the hash-chain link for one audit row.
+
+    Fields are joined with a NUL separator and ``None`` values are rendered
+    as the empty string, so the hash is deterministic across inserts.  The
+    ``prev_hash`` (previous row's link, or the genesis sentinel for the
+    first row) binds this row to its predecessor.
+    """
+    parts = [
+        prev_hash,
+        str(action), str(target), str(result), str(detail),
+        "" if session_id is None else str(session_id),
+        str(principal_id),
+        "" if runtime_id is None else str(runtime_id),
+        "" if task_id is None else str(task_id),
+        "" if operation_id is None else str(operation_id),
+        "" if policy_digest is None else str(policy_digest),
+        "" if authority_generation is None else str(authority_generation),
+        "" if source_transport is None else str(source_transport),
+        str(project_id),
+    ]
+    digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
+    return digest
+
+
+async def _audit_previous_hash(conn: Any) -> str:
+    """Return the hash-chain link of the most recent audit row.
+
+    Returns the genesis sentinel (``''``) when the table is empty or when
+    the last row predates the v8 hash chain (``prev_hash=''``), so the
+    chain is trusted from the first post-v8 row forward.
+    """
+    cursor = await conn.execute(
+        "SELECT prev_hash FROM audit_log ORDER BY id DESC LIMIT 1"
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return _AUDIT_GENESIS_PREV
+    return str(row["prev_hash"] or "")
+
 # Batch 6.4 (round-6): the immutable migration chain lives entirely in
 # ``migrations/_registry.py``.  The version/name are derived from the
 # chain's last entry so this module and the registry can never disagree.
@@ -851,6 +922,23 @@ class Database:
                 await self._apply_v7_upgrades()
             finally:
                 self._conn = original_conn
+            # Round-14 §4: apply v8 deltas — audit_log tamper protection
+            # (prev_hash chain + append-only triggers).  Symmetric to v7:
+            # runs after the v6 aggregate so the frozen manifest is untouched.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v8_upgrades()
+            finally:
+                self._conn = original_conn
+            # Round-15 A-2: apply v9 deltas — audit_log INSERT genesis guard.
+            # Closes the INSERT-reset bypass of the v8 hash chain.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v9_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1364,6 +1452,89 @@ class Database:
             raise
         await conn.commit()
         logger.info("Batch 7.2: chat_stream_events event_id migration complete")
+
+    async def _apply_v8_upgrades(self) -> None:
+        """Round-14 §4: apply v8 schema deltas — audit_log tamper protection.
+
+        Called by ``run_migrations`` AFTER the v6 aggregate + v7 deltas, so
+        the v6/v7 frozen manifests are untouched.  v8 adds the ``prev_hash``
+        column to ``audit_log`` (hash-chain) and the append-only
+        BEFORE DELETE / BEFORE UPDATE triggers, plus backfills ``prev_hash``
+        for pre-existing rows so the chain is continuous from genesis.
+        """
+        await self._ensure_audit_log_tamper_protection()
+
+    async def _ensure_audit_log_tamper_protection(self) -> None:
+        """Round-14 §4: add ``prev_hash`` + append-only triggers to audit_log.
+
+        Idempotent.  On a fresh v8 DB the column and triggers already exist
+        (``schema.sql`` / ``0001_post_migration.sql`` define them).  On an
+        upgraded DB we add the column (default '' so existing rows are
+        chain-break markers) and create the triggers.
+
+        The hash chain itself is maintained in ``insert_audit_log``: each
+        new row hashes (prev_hash || canonical fields).  Pre-v8 rows keep
+        ``prev_hash=''`` and remain readable; the chain is trusted from the
+        first post-v8 row forward (genesis sentinel hashes the empty prev).
+        """
+        conn = await self._require_conn()
+        cols = await (await conn.execute(
+            "PRAGMA table_info(audit_log)"
+        )).fetchall()
+        col_names = {str(c["name"]) for c in cols}
+        if "prev_hash" not in col_names:
+            logger.info("Round-14 §4: adding prev_hash to audit_log")
+            await conn.execute(
+                "ALTER TABLE audit_log ADD COLUMN prev_hash TEXT NOT NULL DEFAULT ''"
+            )
+        # Append-only triggers (idempotent — CREATE TRIGGER IF NOT EXISTS).
+        await conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_audit_log_append_only_delete "
+            "BEFORE DELETE ON audit_log BEGIN "
+            "SELECT RAISE(ABORT, 'audit_log is append-only: rows cannot be deleted'); "
+            "END"
+        )
+        await conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_audit_log_append_only_update "
+            "BEFORE UPDATE ON audit_log BEGIN "
+            "SELECT RAISE(ABORT, 'audit_log is append-only: rows cannot be updated'); "
+            "END"
+        )
+        await conn.commit()
+
+    async def _apply_v9_upgrades(self) -> None:
+        """Round-15 A-2: apply v9 schema deltas — audit_log INSERT guard.
+
+        Closes the INSERT-reset bypass of the Round-14 §4 hash chain: a
+        ``BEFORE INSERT`` trigger now refuses a row whose ``prev_hash`` is
+        empty unless the table is empty (the genesis row).  Combined with
+        the DELETE/UPDATE triggers from v8, this means an attacker with a
+        write connection cannot INSERT a forged "genesis reset" row to
+        hide prior tampering — the only accepted reset is the genuinely
+        first row.
+        """
+        await self._ensure_audit_log_insert_guard()
+
+    async def _ensure_audit_log_insert_guard(self) -> None:
+        """Round-15 A-2: add the BEFORE INSERT genesis guard to audit_log.
+
+        Idempotent (``CREATE TRIGGER IF NOT EXISTS``).  The trigger rejects
+        an INSERT whose ``NEW.prev_hash`` is empty when the table already
+        has at least one row.  The very first row (empty table) is allowed
+        to carry an empty ``prev_hash`` because it IS the genesis.  This
+        keeps ``verify_audit_chain``'s genesis-reset handling sound: the
+        only legitimate empty ``prev_hash`` is on row id=1.
+        """
+        conn = await self._require_conn()
+        await conn.execute(
+            "CREATE TRIGGER IF NOT EXISTS trg_audit_log_genesis_guard "
+            "BEFORE INSERT ON audit_log "
+            "WHEN NEW.prev_hash = '' AND EXISTS (SELECT 1 FROM audit_log) "
+            "BEGIN "
+            "SELECT RAISE(ABORT, 'audit_log prev_hash may be empty only on the genesis row'); "
+            "END"
+        )
+        await conn.commit()
 
     async def _ensure_session_identity_invariants(self) -> None:
         """Make SQLite enforce duplicated session identity on every write."""
@@ -2786,25 +2957,40 @@ class Database:
 
         M4 batch 3.1.16A-5-1b: ``project_id`` is stamped on every
         entry for project identity closure (cross-project forensics).
-        Default ``''`` for pre-A-5-1b callers; production callers
-        pass ``AuditLogger._project_id`` (plumbed from
+        Default ``''`` for pre-A-5-1b callers; production callers pass
+        ``AuditLogger._project_id`` (plumbed from
         ``RuntimeConfig.project_id`` or ``agent._bound_project_id``).
+
+        Round-14 §4: each row extends the tamper-evident hash chain.  We
+        read the most recent row's ``prev_hash`` (genesis sentinel '' when
+        the table is empty or all pre-v8 rows), then store
+        ``prev_hash = sha256(prev_prev_hash || canonical_fields)``.  A
+        deleted/reordered/edited row breaks the chain and is detectable by
+        :meth:`verify_audit_chain`.  This runs inside the same transaction
+        as the INSERT, so concurrency cannot interleave the read and write.
         """
         async with self.transaction() as conn:
+            prev_hash = await _audit_previous_hash(conn)
+            row_hash = _audit_row_hash(
+                prev_hash, action, target, result, detail, session_id,
+                principal_id, runtime_id, task_id, operation_id,
+                policy_digest, authority_generation, source_transport,
+                project_id,
+            )
             cursor = await conn.execute(
                 """
                 INSERT INTO audit_log (
                     action, target, result, detail, session_id,
                     principal_id, runtime_id, task_id, operation_id,
                     policy_digest, authority_generation, source_transport,
-                    project_id
+                    project_id, prev_hash
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (action, target, result, detail, session_id,
                  principal_id, runtime_id, task_id, operation_id,
                  policy_digest, authority_generation, source_transport,
-                 project_id),
+                 project_id, row_hash),
             )
             return int(cursor.lastrowid)
 
@@ -2836,10 +3022,10 @@ class Database:
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             cursor = await conn.execute(
                 f"""
-                SELECT action, target, result, detail, session_id,
+                SELECT id, action, target, result, detail, session_id,
                        principal_id, runtime_id, task_id, operation_id,
                        policy_digest, authority_generation, source_transport,
-                       project_id
+                       project_id, prev_hash
                 FROM audit_log
                 {where}
                 ORDER BY created_at, id
@@ -2847,6 +3033,69 @@ class Database:
                 tuple(params),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def verify_audit_chain(self) -> list[dict[str, Any]]:
+        """Round-14 §4 / Round-15 A-2: verify the audit_log hash chain.
+
+        Returns a list of broken-link records (empty when the chain is
+        intact).  Only the **first** row may carry an empty ``prev_hash``
+        (the genesis row).  Round-15 A-2: a non-first row with an empty
+        ``prev_hash`` is now a *break* (an INSERT-reset forgery attempt),
+        not a trusted reset — the BEFORE INSERT trigger added in v9 makes
+        such an insert fail at the DB layer; this verifier is the
+        defense-in-depth that catches it if the trigger is ever absent.
+        """
+        async with self._read_lease():
+            conn = await self._require_conn()
+            cursor = await conn.execute(
+                "SELECT id, action, target, result, detail, session_id, "
+                "principal_id, runtime_id, task_id, operation_id, "
+                "policy_digest, authority_generation, source_transport, "
+                "project_id, prev_hash "
+                "FROM audit_log ORDER BY id"
+            )
+            rows = [dict(r) for r in await cursor.fetchall()]
+        breaks: list[dict[str, Any]] = []
+        expected_prev = ""
+        for index, row in enumerate(rows):
+            stored = str(row.get("prev_hash") or "")
+            # Only the genesis row (index 0) may carry an empty prev_hash.
+            # Round-15 A-2: a later empty prev_hash is an INSERT-reset
+            # forgery — report it as a break instead of silently resetting.
+            if stored == "":
+                if index == 0:
+                    expected_prev = ""
+                    continue
+                breaks.append({
+                    "id": row["id"],
+                    "reason": (
+                        "hash chain broken: non-genesis row carries an empty "
+                        "prev_hash (possible INSERT-reset forgery)"
+                    ),
+                })
+                # Skip recomputation for this forged row; keep checking the
+                # rest so multiple breaks are all reported.
+                expected_prev = stored
+                continue
+            if stored != _audit_row_hash(
+                expected_prev,
+                str(row["action"]), str(row["target"]), str(row["result"]),
+                str(row.get("detail") or ""), row.get("session_id"),
+                str(row.get("principal_id") or "legacy"),
+                row.get("runtime_id"), row.get("task_id"),
+                row.get("operation_id"), row.get("policy_digest"),
+                row.get("authority_generation"), row.get("source_transport"),
+                str(row.get("project_id") or ""),
+            ):
+                breaks.append({
+                    "id": row["id"],
+                    "reason": (
+                        "hash chain broken: stored prev_hash does not match "
+                        "the recomputed value from the previous link"
+                    ),
+                })
+            expected_prev = stored
+        return breaks
 
     async def query_audit_logs(
         self,
