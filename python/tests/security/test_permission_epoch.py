@@ -91,7 +91,7 @@ async def test_permission_query_is_bound_to_digest_and_epoch(tmp_path) -> None:
     engine = _engine(db, "policy-a")
     await engine.load_rules()
     rule = await engine.grant_rule(
-        PermissionRule(None, "*", "read", ApprovalMode.AUTO_APPROVE, "all")
+        PermissionRule(None, "/tmp/test/*", "read", ApprovalMode.AUTO_APPROVE, "all")
     )
     rows = await db.list_permission_rules(
         principal_id="api:alice",
@@ -116,7 +116,7 @@ async def test_revoke_between_check_and_dispatch_invalidates_snapshot(tmp_path) 
     runtime = _engine(db, "policy-a")
     await runtime.load_rules()
     rule = await runtime.grant_rule(
-        PermissionRule(None, "*", "write", ApprovalMode.AUTO_APPROVE, "all")
+        PermissionRule(None, "/tmp/test/*", "write", ApprovalMode.AUTO_APPROVE, "all")
     )
     snapshot = await runtime.authorization_snapshot()
     await runtime.revoke_rule(rule.id or 0)
