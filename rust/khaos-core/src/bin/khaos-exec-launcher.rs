@@ -286,26 +286,22 @@ mod unix {
                 start = fd as u32 + 1;
             }
             if supported {
-                if start <= u32::MAX {
-                    let result = unsafe {
-                        libc::syscall(
-                            libc::SYS_close_range,
-                            start as libc::c_uint,
-                            u32::MAX as libc::c_uint,
-                            0 as libc::c_uint,
-                        )
-                    };
-                    if result == 0 {
-                        return Ok(());
-                    }
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(libc::ENOSYS)
-                        && error.raw_os_error() != Some(libc::EINVAL)
-                    {
-                        return Err(error);
-                    }
-                } else {
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_close_range,
+                        start as libc::c_uint,
+                        u32::MAX as libc::c_uint,
+                        0 as libc::c_uint,
+                    )
+                };
+                if result == 0 {
                     return Ok(());
+                }
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ENOSYS)
+                    && error.raw_os_error() != Some(libc::EINVAL)
+                {
+                    return Err(error);
                 }
             }
         }
