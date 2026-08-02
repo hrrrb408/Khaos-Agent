@@ -345,9 +345,14 @@ async def test_supervisor_enforces_synthetic_home_entry_budget(tmp_path: Path):
     result = await supervisor.run(request, tmp_root=synthetic_home)
 
     assert result.status == "resource-exhausted"
-    assert result.diagnostics["resource_violation"] == {
-        "kind": "filesystem-entries", "observed": 12, "limit": 10,
-    }
+    violation = result.diagnostics["resource_violation"]
+    assert violation["kind"] == "filesystem-entries"
+    assert violation["limit"] == 10
+    # The watchdog is intentionally allowed to terminate as soon as it sees
+    # the budget exceeded.  Filesystem enumeration races the child creation
+    # loop, so Windows can observe 11 entries while POSIX often observes all
+    # 12; both prove the same fail-closed limit enforcement.
+    assert 10 < violation["observed"] <= 12
 
 
 @pytest.mark.asyncio
