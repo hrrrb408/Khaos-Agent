@@ -50,7 +50,7 @@
 - `python/khaos/audit/anchor.py`: `fe9b45af4965716c253ee1e1f7028ccb75b78385147f53e01322df30a036ee82`
 - `python/khaos/channels/webhook.py`: `713c620566d4fb10da9e064e3cd119e99d822bf43a80ba3732197448ffd48c7d`
 - `python/khaos/permissions/engine.py`: `b8ae875970821df29563bda3bc201e0154e6d77e6e9462f933e57366dbb0cfee`
-- `python/khaos/permissions/rules.py`: `b99f1da0873c80f96b6da042fd446f2fc5b6deba31d831284c5ffb4a8c989446`
+- `python/khaos/permissions/rules.py`: `accca104dd6ba757d5b5353610453d4731cc58a4535944ecaf858287e5d5ef49`
 - `python/khaos/coding/execution/service.py`: `697fbdee21c1e4269f621889affbd6b7d1460682f5bb1a2187b1e027b0f1bfd0`
 - `python/khaos/coding/execution/binding.py`: `77f4ef67140f758ea8fd8b6e367519e8529d7f51e1cbfc2db175978e6f9b261d`
 - `python/khaos/coding/execution/supervisor.py`: `46bb9d8811f4490c87cdbce46063ce0119e4298924fad9e12701029a475c95df`
