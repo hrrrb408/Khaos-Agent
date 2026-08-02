@@ -28,10 +28,15 @@ history edits, but a remote WORM audit sink and independent human review are
 external release controls and are not implemented by this repository.
 
 Runtime retention is explicit rather than an implicit delete-on-start policy:
-terminal chat/turn journals and terminal tool-operation claims are pruned only
-after their configured replay windows, the audit JSONL side trail rotates into
-trusted segments without deletion, and maintenance performs a passive WAL
-checkpoint. Export/archive evidence before reducing any window.
+terminal chat/turn journals and no-effect tool-operation claims are pruned only
+after their configured replay windows. Applied/partial/unknown operation rows
+remain replay-suppression tombstones. The audit JSONL side trail rotates into
+trusted segments, enforces a disk ceiling, and requires an explicit signed
+archive/tombstone workflow before source segments are removed. Maintenance
+also performs a passive WAL checkpoint. The SQLite audit chain has an explicit
+signed gzip export/tombstone workflow, but rows are never deleted implicitly;
+any database rotation must be a separately approved administrative action.
+Export/archive evidence before reducing any window.
 
 ## Release checklist
 

@@ -39,11 +39,33 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from khaos.tools.scheduler import (
+    EFFECT_APPLIED,
+    EFFECT_NOT_APPLIED,
+    ToolExecutionOutcome,
+)
+
 logger = logging.getLogger(__name__)
 
 
-def _require_principal(principal_id: str) -> dict[str, Any] | None:
-    """Return an ``ok=false`` error dict if ``principal_id`` is empty,
+def _failure(payload: dict[str, Any]) -> ToolExecutionOutcome:
+    error = str(payload.get("error") or "permission tool failed")
+    return ToolExecutionOutcome(
+        ok=False,
+        output=payload,
+        error=error,
+        error_code=str(payload.get("error_code") or "PERMISSION_ERROR"),
+        effect_status=EFFECT_NOT_APPLIED,
+        retry_safe=True,
+    )
+
+
+def _success(payload: dict[str, Any]) -> ToolExecutionOutcome:
+    return ToolExecutionOutcome(output=payload, effect_status=EFFECT_APPLIED)
+
+
+def _require_principal(principal_id: str) -> ToolExecutionOutcome | None:
+    """Return a typed failure if ``principal_id`` is empty,
     else ``None``.
 
     M4 batch 3.1.16A-4-4-1 (CRITICAL): permission tools must not fail
@@ -53,7 +75,7 @@ def _require_principal(principal_id: str) -> dict[str, Any] | None:
     principal is rejected (mirrors ``cron_tools._require_principal``).
     """
     if not principal_id:
-        return {"ok": False, "error": "principal_id is required"}
+        return _failure({"ok": False, "error": "principal_id is required"})
     return None
 
 
@@ -116,7 +138,7 @@ async def grant_permission(
     resource_type: str = "",
     resource_spec: dict[str, Any] | None = None,
     **kwargs: Any,
-) -> dict[str, Any]:
+) -> ToolExecutionOutcome:
     """Grant a permission rule bound to the caller's principal.
 
     The rule is persisted with ``principal_id`` stamped by the engine
@@ -128,7 +150,7 @@ async def grant_permission(
     if principal_error is not None:
         return principal_error
     if permission_engine is None:
-        return {"ok": False, "error": "Permission engine not initialized"}
+        return _failure({"ok": False, "error": "Permission engine not initialized"})
     from khaos.permissions import is_interactive_transport
 
     # A model-visible permission-management tool cannot mint a project-wide
@@ -136,10 +158,10 @@ async def grant_permission(
     # interactive grant; other transports must use an explicit administrative
     # control plane rather than inheriting an interactive remember rule.
     if not is_interactive_transport(source_transport):
-        return {
+        return _failure({
             "ok": False,
             "error": "permission grants require an explicit interactive CLI/TUI transport",
-        }
+        })
     from khaos.permissions.engine import (
         ApprovalMode,
         PermissionRule,
@@ -151,20 +173,20 @@ async def grant_permission(
     try:
         approval_mode = ApprovalMode(approval)
     except ValueError as exc:
-        return {"ok": False, "error": f"invalid approval mode: {exc}"}
+        return _failure({"ok": False, "error": f"invalid approval mode: {exc}"})
     if approval_mode in {ApprovalMode.AUTO_APPROVE, ApprovalMode.SUGGEST}:
         if not resource_type or not isinstance(resource_spec, dict):
-            return {
+            return _failure({
                 "ok": False,
                 "error": "auto-approve/suggest grants require a typed resource_type and resource_spec",
-            }
+            })
     elif not resource_type:
         try:
             validate_rule_pattern(
                 pattern, approval_mode, source="grant_permission"
             )
         except ValueError as exc:
-            return {"ok": False, "error": str(exc)}
+            return _failure({"ok": False, "error": str(exc)})
     try:
         rule = await permission_engine.grant_rule(
             PermissionRule(
@@ -184,8 +206,8 @@ async def grant_permission(
             )
         )
     except Exception as exc:  # noqa: BLE001 - tool API returns a structured failure
-        return {"ok": False, "error": str(exc)}
-    return {
+        return _failure({"ok": False, "error": str(exc)})
+    return _success({
         "ok": True,
         "rule": {
             "id": rule.id,
@@ -196,7 +218,7 @@ async def grant_permission(
             "resource_type": rule.resource_type,
             "resource_spec": rule.resource_spec,
         },
-    }
+    })
 
 
 async def revoke_permission(
@@ -205,7 +227,7 @@ async def revoke_permission(
     principal_id: str = "",
     permission_engine: Any = None,
     **kwargs: Any,
-) -> dict[str, Any]:
+) -> ToolExecutionOutcome:
     """Revoke a permission rule owned by the caller's principal.
 
     The engine refuses to revoke a rule that does not belong to
@@ -216,12 +238,12 @@ async def revoke_permission(
     if principal_error is not None:
         return principal_error
     if permission_engine is None:
-        return {"ok": False, "error": "Permission engine not initialized"}
+        return _failure({"ok": False, "error": "Permission engine not initialized"})
     try:
         await permission_engine.revoke_rule(rule_id)
     except Exception as exc:  # noqa: BLE001 - tool API returns a structured failure
-        return {"ok": False, "error": str(exc)}
-    return {"ok": True, "revoked": rule_id}
+        return _failure({"ok": False, "error": str(exc)})
+    return _success({"ok": True, "revoked": rule_id})
 
 
 async def query_audit_logs(

@@ -176,7 +176,10 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /api/config", h.handleConfigGet)
 	mux.HandleFunc("PUT /api/config", h.handleConfigSet)
 	mux.HandleFunc("GET /api/audit", h.handleAudit)
+	mux.HandleFunc("GET /api/live", h.handleLive)
+	mux.HandleFunc("GET /api/ready", h.handleReady)
 	mux.HandleFunc("GET /api/health", h.handleHealth)
+	mux.HandleFunc("GET /api/health/details", h.handleHealthDetails)
 	mux.HandleFunc("POST /api/webhook/{platform}", h.handleWebhook)
 	mux.HandleFunc("GET /api/channels", h.handleChannelsList)
 	mux.HandleFunc("GET /api/channels/health", h.handleChannelsList)
@@ -206,7 +209,7 @@ func (h *Handler) Routes() http.Handler {
 	root := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Health is intentionally the only anonymous Khaos endpoint. Platform
 		// webhooks use their own signature authentication in the Python service.
-		if r.URL.Path == "/api/health" {
+		if r.URL.Path == "/api/health" || r.URL.Path == "/api/live" || r.URL.Path == "/api/ready" {
 			health.ServeHTTP(w, r)
 			return
 		}
@@ -1302,10 +1305,73 @@ func (h *Handler) handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, r *http.Request) {
+	h.handleLive(w, r)
+}
+
+func (h *Handler) handleLive(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status": "ok",
 		"uptime": int(time.Since(h.startedAt).Seconds()),
 	})
+}
+
+func (h *Handler) handleReady(w http.ResponseWriter, r *http.Request) {
+	checks := h.healthChecks(r.Context(), false)
+	status := http.StatusOK
+	if !checks["ready"].(bool) {
+		status = http.StatusServiceUnavailable
+	}
+	writeJSON(w, status, checks)
+}
+
+func (h *Handler) handleHealthDetails(w http.ResponseWriter, r *http.Request) {
+	// This endpoint is intentionally authenticated by Routes().  It exposes
+	// dependency presence for operators without making database/policy/helper
+	// internals an anonymous probe oracle.
+	writeJSON(w, http.StatusOK, h.healthChecks(r.Context(), true))
+}
+
+func (h *Handler) healthChecks(ctx context.Context, detailed bool) map[string]any {
+	checks := map[string]any{
+		"agent_rpc":    h.agent != nil,
+		"config_store": h.config != nil,
+		"audit_client": h.audit != nil,
+		"started":      !h.startedAt.IsZero(),
+	}
+	agentRPC, pythonReady := h.agent != nil, true
+	pythonHealthChecked := false
+	if probe, ok := h.agent.(HealthProbe); ok {
+		pythonHealthChecked = true
+		probeContext, cancel := context.WithTimeout(ctx, 2*time.Second)
+		pythonHealth, err := probe.Health(probeContext)
+		cancel()
+		if err != nil {
+			agentRPC = false
+			pythonReady = false
+			if detailed {
+				checks["agent_error"] = err.Error()
+			}
+		} else {
+			var present bool
+			pythonReady, present = pythonHealth["ready"].(bool)
+			if !present {
+				pythonReady = false
+			}
+			if detailed {
+				checks["python_health"] = pythonHealth
+			}
+		}
+	}
+	checks["agent_rpc"] = agentRPC
+	if pythonHealthChecked {
+		checks["python_ready"] = pythonReady
+	}
+	ready := agentRPC && checks["config_store"].(bool) &&
+		(!pythonHealthChecked || pythonReady)
+	checks["ready"] = ready
+	checks["status"] = map[bool]string{true: "ready", false: "not_ready"}[ready]
+	checks["uptime"] = int(time.Since(h.startedAt).Seconds())
+	return checks
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

@@ -56,20 +56,30 @@ services:
     cap_add:
       - NET_ADMIN
       - SYS_ADMIN
+    cap_drop:
+      - ALL
+    pids_limit: 64
+    mem_limit: 256m
+    cpus: "1.0"
     security_opt:
       - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
     environment:
       - KHAOS_BROWSER_KERNEL_HELPER_UID=10001
       - KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID=1
       - KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
       - KHAOS_BROWSER_HELPER_SECRET_FILE=/var/lib/khaos/browser-helper.secret
       - KHAOS_BROWSER_HELPER_JOURNAL_ROOT=/run/khaos-helper/journal
+      - KHAOS_BROWSER_HELPER_NETNS_ROOT=/run/khaos-helper/netns
+      - KHAOS_BROWSER_HELPER_CGROUP_ROOT=/run/khaos-helper/cgroup
     secrets:
       - khaos_browser_helper_secret
     volumes:
       - khaos-helper-runtime:/run/khaos-helper
-      - /sys/fs/cgroup:/sys/fs/cgroup:rw
-      - /run/netns:/run/netns:rshared
+      - "${KHAOS_BROWSER_HELPER_CGROUP_SOURCE:-/sys/fs/cgroup/khaos-browser}:/run/khaos-helper/cgroup:rw"
+      - khaos-helper-netns:/run/khaos-helper/netns
     depends_on:
       khaos-agent:
         condition: service_started
@@ -139,6 +149,7 @@ volumes:
   khaos-state:
   khaos-runtime:
   khaos-helper-runtime:
+  khaos-helper-netns:
 
 secrets:
   khaos_python_capability:

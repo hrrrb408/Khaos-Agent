@@ -4,7 +4,6 @@ from pathlib import Path
 
 import yaml
 
-
 ROOT = Path(__file__).resolve().parents[3]
 
 
@@ -79,9 +78,27 @@ def test_compose_routes_kernel_authority_to_dedicated_root_sidecar() -> None:
     assert helper["user"] == "0:0"
     assert helper["pid"] == "service:khaos-agent"
     assert set(helper["cap_add"]) == {"NET_ADMIN", "SYS_ADMIN"}
+    assert helper["cap_drop"] == ["ALL"]
+    assert helper["read_only"] is True
+    assert helper["pids_limit"] == 64
+    assert helper["mem_limit"] == "256m"
+    assert helper["cpus"] == "1.0"
     assert "KHAOS_BROWSER_KERNEL_HELPER_UID=10001" in helper["environment"]
     assert "KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID=1" in helper["environment"]
-    assert any("/sys/fs/cgroup" in volume and volume.endswith(":rw") for volume in helper["volumes"])
+    assert "KHAOS_BROWSER_HELPER_NETNS_ROOT=/run/khaos-helper/netns" in helper[
+        "environment"
+    ]
+    assert "KHAOS_BROWSER_HELPER_CGROUP_ROOT=/run/khaos-helper/cgroup" in helper[
+        "environment"
+    ]
+    assert any(
+        volume.endswith(":/run/khaos-helper/cgroup:rw")
+        and "/sys/fs/cgroup" in volume
+        for volume in helper["volumes"]
+    )
+    assert not any("/sys/fs/cgroup:/sys/fs/cgroup" in volume for volume in helper["volumes"])
+    assert "khaos-helper-netns:/run/khaos-helper/netns" in helper["volumes"]
+    assert not any("/run/netns" in volume for volume in helper["volumes"])
 
 
 def test_default_compose_is_loopback_only_and_uses_secret_files() -> None:
@@ -147,7 +164,12 @@ def test_systemd_units_deprivilege_python_and_pin_helper_client_pid() -> None:
     assert "User=root" in helper
     assert "systemctl show --property MainPID" in helper
     assert "KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID" in helper
+    assert "KHAOS_BROWSER_HELPER_NETNS_ROOT=/run/khaos-helper/netns" in helper
+    assert "KHAOS_BROWSER_HELPER_CGROUP_ROOT=/sys/fs/cgroup/khaos-browser" in helper
     assert "CAP_NET_ADMIN CAP_SYS_ADMIN" in helper
+    assert "sha256sum" in helper
+    assert ".sha256" in helper
+    assert "/run/netns" not in helper
 
 
 def test_installer_never_grants_kernel_capabilities_to_python() -> None:
@@ -155,6 +177,7 @@ def test_installer_never_grants_kernel_capabilities_to_python() -> None:
 
     assert "setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher" in installer
     assert "khaos-browser-kernel-helper" in installer
+    assert "khaos-browser-kernel-helper.sha256" in installer
     assert "setcap" not in "\n".join(
         line for line in installer.splitlines() if "python" in line.lower()
     )
@@ -169,4 +192,7 @@ def test_kernel_helper_reaps_journaled_orphans_before_accepting_requests() -> No
     assert "recover(&state)?;" in helper
     assert "process_start_time(record.identity.client_pid)" in helper
     assert ".with_extension(\"quarantine\")" in helper
+    assert "KHAOS_BROWSER_HELPER_CGROUP_ROOT" in helper
+    assert "validate_cgroup_root(&cgroup_root)?;" in helper
+    assert "validate_managed_cgroup_path(&state.cgroup_root" in helper
     assert helper.index("recover(&state)?;") < helper.index("UnixListener::bind")

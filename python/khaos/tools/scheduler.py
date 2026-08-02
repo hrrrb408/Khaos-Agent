@@ -130,19 +130,71 @@ def _normalize_confirmation(value: object) -> dict[str, Any]:
 
 
 @dataclass
-class EffectOutcome:
-    """Explicit post-dispatch effect classification.
+class ToolExecutionOutcome:
+    """Complete handler outcome used at the scheduler boundary.
 
-    The scheduler never derives this from a permission level.  Tool
-    definitions declare the normal outcome, while exceptions/cancellation
-    downgrade side-effecting operations to ``unknown`` and retain the
-    reconciliation hint.
+    A normal Python value is still treated as a successful payload for
+    backwards compatibility.  Mutation handlers that can report a handled
+    business failure must return this type instead of an error-shaped dict;
+    otherwise the scheduler cannot distinguish ``forbidden`` from a
+    successful mutation response.
+    """
+
+    ok: bool = True
+    output: Any = ""
+    error: str = ""
+    error_code: str = ""
+    effect_status: str = ""
+    effect_id: str = ""
+    reconciliation_hint: str = ""
+    retry_safe: bool = True
+
+    def _legacy_payload(self) -> dict[str, Any]:
+        """Expose the old JSON-shaped payload to direct tool callers.
+
+        Handlers are migrated independently of callers that invoke them in
+        tests or integrations without a Scheduler.  Mapping-like access
+        keeps that compatibility while the scheduler consumes the typed
+        fields above.
+        """
+        payload = dict(self.output) if isinstance(self.output, dict) else {}
+        payload.setdefault("ok", self.ok)
+        if self.error:
+            payload.setdefault("error", self.error)
+        return payload
+
+    def __getitem__(self, key: str) -> Any:
+        return self._legacy_payload()[key]
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._legacy_payload().get(key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return key in self._legacy_payload()
+
+    def __eq__(self, other: object) -> bool:
+        if isinstance(other, dict):
+            return self._legacy_payload() == other
+        return super().__eq__(other)
+
+
+@dataclass
+class EffectOutcome:
+    """Backward-compatible effect-only outcome.
+
+    Existing handlers use ``status=...``.  New handlers should prefer
+    :class:`ToolExecutionOutcome`, which also carries explicit business
+    failure state and an error code.
     """
 
     status: str
     effect_id: str = ""
     reconciliation_hint: str = ""
     output: Any = ""
+    ok: bool = True
+    error: str = ""
+    error_code: str = ""
+    retry_safe: bool = True
 
 
 @dataclass
@@ -154,6 +206,7 @@ class ToolResult:
     success: bool
     output: Any = ""
     error: str = ""
+    error_code: str = ""
     duration_ms: int = 0
     arguments: dict[str, Any] | None = None
     # Effect and delivery are deliberately separate.  A handler may have
@@ -441,10 +494,9 @@ class ToolScheduler:
         # H1: optional shared OfficeMutationAuthority. Set by the runtime
         # factory so Office copy/move are fenced against cancellation/timeout.
         self.office_authority: Any = None
-        # Idempotency is intentionally explicit and runtime-scoped.  Model
-        # tool-call IDs are not stable authority, so callers that need
-        # at-most-once replay semantics must provide a separate
-        # ``idempotency_key`` at the tool-call envelope level.
+        # Idempotency is server-owned and runtime-scoped.  Model tool-call
+        # IDs are only one input to the server binding; a model or plugin
+        # supplied top-level ``idempotency_key`` is never trusted.
         self._idempotency_lock = asyncio.Lock()
         self._idempotency_results: dict[str, _IdempotencyRecord] = {}
         # A durable row is the authority; these maps only coordinate
@@ -457,6 +509,44 @@ class ToolScheduler:
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
         self.office_authority = authority
+
+    def bind_server_operation_key(
+        self,
+        call: dict[str, Any],
+        *,
+        session_id: str | None,
+        turn_id: str,
+        attempt_id: str,
+        tool_context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Bind a model tool call to a server-owned durable operation key.
+
+        The model never supplies this value.  The key is derived from the
+        authenticated execution scope and the durable turn/attempt identity;
+        arguments are deliberately excluded and are stored separately as the
+        operation conflict digest.
+        """
+        prepared = dict(call)
+        prepared.pop("idempotency_key", None)
+        prepared.pop("_idempotency_key", None)
+        name = str(prepared.get("name") or "")
+        tool = self.registry.get(name)
+        if self._declared_effect_status(tool) != EFFECT_NOT_APPLIED:
+            context = dict(tool_context or {})
+            prepared["_idempotency_key"] = server_operation_key(
+                principal_id=str(context.get("principal_id") or ""),
+                project_id=str(context.get("project_id") or ""),
+                session_id=str(session_id or context.get("session_id") or ""),
+                turn_id=str(turn_id or ""),
+                attempt_id=str(attempt_id or ""),
+                tool_call_id=str(
+                    prepared.get("id") or prepared.get("tool_call_id") or ""
+                ),
+                tool_name=name,
+                workspace_id=str(context.get("workspace_id") or ""),
+            )
+            prepared["_server_operation_key"] = True
+        return prepared
 
     async def execute_batch(
         self,
@@ -539,6 +629,26 @@ class ToolScheduler:
         for call in tool_calls:
             normalized = self._normalize_call(call)
             tool = self.registry.get(normalized["name"])
+            # Production AgentLoop calls are already bound to a server key.
+            # Generate one here as a defense-in-depth boundary for direct
+            # scheduler callers that do not provide an explicit key.  The
+            # model-visible tool_call_id is not used as the key by itself.
+            if (
+                self._declared_effect_status(tool) != EFFECT_NOT_APPLIED
+                and not self._idempotency_key(normalized)
+            ):
+                normalized["_idempotency_key"] = server_operation_key(
+                    principal_id=str(tool_context.get("principal_id") or ""),
+                    project_id=str(tool_context.get("project_id") or ""),
+                    session_id=str(session_id or tool_context.get("session_id") or ""),
+                    turn_id=str(
+                        tool_context.get("turn_id") or f"session:{session_id or ''}"
+                    ),
+                    attempt_id=str(tool_context.get("attempt_id") or "legacy"),
+                    tool_call_id=normalized["id"],
+                    tool_name=tool.name,
+                    workspace_id=str(tool_context.get("workspace_id") or ""),
+                )
             if not self.registry.validate_call(tool.name, normalized["arguments"]):
                 yield SchedulerEvent(
                     event="tool_result",
@@ -1034,6 +1144,10 @@ class ToolScheduler:
             )
 
         handler_started = False
+        handler_ok = True
+        handler_error = ""
+        handler_error_code = ""
+        handler_retry_safe = True
         effect_id = ""
         effect_status = EFFECT_NOT_STARTED
         reconciliation_hint = str(getattr(tool, "reconciliation_hint", "") or "")
@@ -1145,6 +1259,8 @@ class ToolScheduler:
                     operation_claim,
                     call=call,
                     tool=tool,
+                    session_id=session_id,
+                    tool_context=tool_context,
                     timeout=float(tool.timeout) + 5.0,
                 )
                 return replace(
@@ -1183,14 +1299,20 @@ class ToolScheduler:
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
                 timeout=tool.timeout,
             )
-            output, effect_status, effect_id, reconciliation_hint = (
-                self._normalize_effect_outcome(
-                    output,
-                    default_status=self._declared_effect_status(tool),
-                    default_effect_id=effect_id,
-                    default_reconciliation_hint=reconciliation_hint,
-                )
+            outcome = self._normalize_effect_outcome(
+                output,
+                default_status=self._declared_effect_status(tool),
+                default_effect_id=effect_id,
+                default_reconciliation_hint=reconciliation_hint,
             )
+            output = outcome.output
+            handler_ok = outcome.ok
+            handler_error = outcome.error
+            handler_error_code = outcome.error_code
+            handler_retry_safe = outcome.retry_safe
+            effect_status = outcome.effect_status
+            effect_id = outcome.effect_id
+            reconciliation_hint = outcome.reconciliation_hint
             if operation_claim is not None:
                 await self._update_operation_effect_id(operation_claim, effect_id)
         except asyncio.CancelledError:
@@ -1213,6 +1335,7 @@ class ToolScheduler:
                     tool_call_id=call["id"],
                     name=tool.name,
                     success=False,
+                    error_code="TOOL_CANCELLED",
                     error="tool execution cancelled after dispatch",
                     duration_ms=int((time.monotonic() - start) * 1000),
                     arguments=call["arguments"],
@@ -1230,7 +1353,7 @@ class ToolScheduler:
                     reconciliation_hint=reconciliation_hint,
                     retry_safe=False,
                 )
-                await self._finish_operation(
+                result = await self._finish_operation(
                     operation_claim,
                     result,
                     terminal_status="unknown",
@@ -1283,6 +1406,7 @@ class ToolScheduler:
                 name=tool.name,
                 success=False,
                 error=str(exc),
+                error_code=type(exc).__name__.upper(),
                 duration_ms=int((time.monotonic() - start) * 1000),
                 arguments=call["arguments"],
                 effect_status=effect_status,
@@ -1294,7 +1418,7 @@ class ToolScheduler:
                 reconciliation_hint=reconciliation_hint,
                 retry_safe=not handler_started,
             )
-            await self._finish_operation(
+            result = await self._finish_operation(
                 operation_claim,
                 result,
                 terminal_status=(
@@ -1307,6 +1431,70 @@ class ToolScheduler:
                 await self._store_idempotent_result(
                     call, session_id=session_id, tool_context=tool_context, result=result
                 )
+            return result
+
+        if not handler_ok:
+            # A handled business failure is not an infrastructure exception.
+            # Preserve its structured error and classify the operation as
+            # ``not_applied`` unless the handler explicitly reported a
+            # partial/unknown external effect.
+            await self._release_best_effort(reservation)
+            safe_output = output
+            delivery_status = DELIVERY_COMPLETE
+            warning = ""
+            try:
+                _measure_tool_output(safe_output, reservation.output_limit)
+                _secret_scan, safe_output = await self.security_middleware.post_check(
+                    tool.name, safe_output
+                )
+            except Exception as exc:  # noqa: BLE001 - error projection is best effort
+                safe_output = ""
+                delivery_status = DELIVERY_DEGRADED
+                warning = f"error result delivery failed: {exc}"
+            detail = {
+                "tool_call_id": call["id"],
+                "error": handler_error or "tool handler reported failure",
+                "error_code": handler_error_code or "TOOL_REPORTED_FAILURE",
+                "effect_id": effect_id,
+                "effect_status": effect_status,
+                "reconciliation_hint": reconciliation_hint,
+            }
+            audit_error = await self._audit_best_effort(
+                tool.name, target, "failure", detail, session_id
+            )
+            if audit_error:
+                delivery_status = DELIVERY_AUDIT_DEGRADED
+                warning = (
+                    f"{warning}; " if warning else ""
+                ) + f"audit persistence failed: {audit_error}"
+            result = ToolResult(
+                tool_call_id=call["id"],
+                name=tool.name,
+                success=False,
+                output=safe_output,
+                error=handler_error or "tool handler reported failure",
+                error_code=handler_error_code or "TOOL_REPORTED_FAILURE",
+                duration_ms=int((time.monotonic() - start) * 1000),
+                arguments=call["arguments"],
+                effect_status=effect_status,
+                delivery_status=delivery_status,
+                warning=warning,
+                effect_id=effect_id,
+                reconciliation_hint=reconciliation_hint,
+                retry_safe=handler_retry_safe and effect_status == EFFECT_NOT_APPLIED,
+            )
+            result = await self._finish_operation(
+                operation_claim,
+                result,
+                terminal_status=(
+                    "unknown"
+                    if effect_status in {EFFECT_UNKNOWN, EFFECT_PARTIAL}
+                    else "completed"
+                ),
+            )
+            await self._store_idempotent_result(
+                call, session_id=session_id, tool_context=tool_context, result=result
+            )
             return result
 
         # From this point onward the handler has returned.  Any failure is a
@@ -1364,7 +1552,7 @@ class ToolScheduler:
                 reconciliation_hint=reconciliation_hint,
                 retry_safe=effect_status == EFFECT_NOT_APPLIED,
             )
-            await self._finish_operation(
+            result = await self._finish_operation(
                 operation_claim,
                 result,
                 terminal_status=(
@@ -1442,7 +1630,7 @@ class ToolScheduler:
             reconciliation_hint=reconciliation_hint,
             retry_safe=effect_status == EFFECT_NOT_APPLIED,
         )
-        await self._finish_operation(
+        result = await self._finish_operation(
             operation_claim,
             result,
             terminal_status=(
@@ -1484,40 +1672,114 @@ class ToolScheduler:
         default_status: str,
         default_effect_id: str,
         default_reconciliation_hint: str,
-    ) -> tuple[Any, str, str, str]:
-        """Accept an explicit handler outcome without guessing its effect.
+    ) -> ToolExecutionOutcome:
+        """Normalize explicit outcomes and legacy error-shaped payloads.
 
         Legacy handlers may still return their payload directly and use the
         registered normal effect declaration.  New mutation handlers can
-        return ``EffectOutcome`` to report a more precise status after the
-        external operation has actually run.
+        return ``ToolExecutionOutcome`` to report business failure without
+        abusing exceptions.  During migration, common structured error
+        dictionaries are also converted so ``forbidden``/``not_found`` can
+        never be reported as a successful mutation.
         """
-        if not isinstance(value, EffectOutcome):
-            return (
-                value,
-                default_status,
-                default_effect_id,
-                default_reconciliation_hint,
+        if isinstance(value, ToolExecutionOutcome):
+            ok = bool(value.ok)
+            status = str(value.effect_status or "")
+            output = value.output
+            error = str(value.error or "")
+            error_code = str(value.error_code or "")
+            effect_id = str(value.effect_id or default_effect_id)
+            reconciliation_hint = str(
+                value.reconciliation_hint or default_reconciliation_hint
             )
-        status = str(value.status or EFFECT_UNKNOWN)
+            retry_safe = bool(value.retry_safe)
+        elif isinstance(value, EffectOutcome):
+            ok = bool(value.ok)
+            status = str(value.status or "")
+            output = value.output
+            error = str(value.error or "")
+            error_code = str(value.error_code or "")
+            effect_id = str(value.effect_id or default_effect_id)
+            reconciliation_hint = str(
+                value.reconciliation_hint or default_reconciliation_hint
+            )
+            retry_safe = bool(value.retry_safe)
+        else:
+            output = value
+            legacy_payload = value
+            if isinstance(value, str):
+                # GitHub and a few older remote adapters serialized their
+                # result dictionaries before returning them.  Decode only a
+                # JSON object for failure classification; preserve the
+                # original string as the user-visible output.
+                try:
+                    decoded = json.loads(value)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    decoded = None
+                if isinstance(decoded, dict):
+                    legacy_payload = decoded
+            status_marker = (
+                str(legacy_payload.get("status") or "").strip().lower()
+                if isinstance(legacy_payload, dict)
+                else ""
+            )
+            failure_markers = {
+                "error", "failed", "failure", "forbidden", "invalid",
+                "invalid_state", "not_found", "not_initialized", "unavailable",
+            }
+            handled_failure = isinstance(legacy_payload, dict) and (
+                legacy_payload.get("ok") is False
+                or legacy_payload.get("success") is False
+                or status_marker in failure_markers
+                or bool(legacy_payload.get("error"))
+                or legacy_payload.get("created") is False
+            )
+            ok = not handled_failure
+            status = EFFECT_NOT_APPLIED if handled_failure else default_status
+            error = ""
+            error_code = ""
+            if handled_failure:
+                error = str(
+                    legacy_payload.get("error")
+                    or legacy_payload.get("message")
+                    or status_marker
+                    or "tool handler reported failure"
+                )
+                error_code = str(
+                    legacy_payload.get("error_code")
+                    or legacy_payload.get("code")
+                    or (status_marker.upper() if status_marker else "TOOL_REPORTED_FAILURE")
+                )
+            effect_id = default_effect_id
+            reconciliation_hint = default_reconciliation_hint
+            retry_safe = handled_failure
+        if not status:
+            status = EFFECT_NOT_APPLIED if not ok else default_status
+        if not ok and status == EFFECT_UNKNOWN and not effect_id:
+            status = EFFECT_NOT_APPLIED
         if status not in {
             EFFECT_NOT_APPLIED,
             EFFECT_APPLIED,
             EFFECT_PARTIAL,
             EFFECT_UNKNOWN,
         }:
-            raise ValueError(f"invalid EffectOutcome status: {status!r}")
-        effect_id = str(value.effect_id or default_effect_id)
+            raise ValueError(f"invalid ToolExecutionOutcome effect status: {status!r}")
         if len(effect_id) > 256 or any(char in effect_id for char in "\x00\r\n"):
-            raise ValueError("invalid EffectOutcome effect_id")
-        reconciliation_hint = str(
-            value.reconciliation_hint or default_reconciliation_hint
-        )
+            raise ValueError("invalid ToolExecutionOutcome effect_id")
         if len(reconciliation_hint) > 4096 or any(
             char in reconciliation_hint for char in "\x00\r\n"
         ):
-            raise ValueError("invalid EffectOutcome reconciliation_hint")
-        return value.output, status, effect_id, reconciliation_hint
+            raise ValueError("invalid ToolExecutionOutcome reconciliation_hint")
+        return ToolExecutionOutcome(
+            ok=ok,
+            output=output,
+            error=error,
+            error_code=error_code,
+            effect_status=status,
+            effect_id=effect_id,
+            reconciliation_hint=reconciliation_hint,
+            retry_safe=retry_safe,
+        )
 
     @staticmethod
     def _serialize_operation_result(result: ToolResult) -> str:
@@ -1543,6 +1805,7 @@ class ToolScheduler:
                         success=bool(values.get("success", False)),
                         output=values.get("output", ""),
                         error=str(values.get("error") or ""),
+                        error_code=str(values.get("error_code") or ""),
                         duration_ms=int(values.get("duration_ms") or 0),
                         arguments=values.get("arguments") or call.get("arguments", {}),
                         effect_status=str(
@@ -1619,6 +1882,25 @@ class ToolScheduler:
         if not operation_id:
             return None
         arguments_digest = _canonical_digest(call.get("arguments", {}))
+        # The in-process result cache is authoritative for callers that are
+        # already in this runtime, even when durable completion failed.  A
+        # database row may still be ``running`` in that case; consulting it
+        # first would misclassify a known completed effect as an orphan and
+        # make the second caller lose the original effect facts.
+        async with self._idempotency_lock:
+            record = self._idempotency_results.get(operation_id)
+            if record is not None:
+                if record.arguments_digest != arguments_digest:
+                    raise PermissionDeniedError(
+                        "idempotency key was reused with different tool arguments"
+                    )
+                return _OperationClaim(
+                    operation_id=operation_id,
+                    owner_token="",
+                    effect_id=record.result.effect_id,
+                    arguments_digest=arguments_digest,
+                    result=record.result,
+                )
         active_event = self._operation_events.get(operation_id)
         if active_event is not None:
             active_claim = self._operation_claims.get(operation_id)
@@ -1656,7 +1938,10 @@ class ToolScheduler:
             )
             if row.get("state") == "conflict":
                 raise PermissionDeniedError(
-                    "idempotency key was reused with different tool arguments"
+                    str(
+                        row.get("conflict_reason")
+                        or "idempotency operation identity conflict"
+                    )
                 )
             if row.get("state") == "claimed":
                 event = asyncio.Event()
@@ -1763,6 +2048,8 @@ class ToolScheduler:
         *,
         call: dict,
         tool: Any,
+        session_id: str | None,
+        tool_context: dict[str, Any],
         timeout: float,
     ) -> ToolResult:
         """Wait for an in-process owner, then disclose if it did not finish."""
@@ -1797,6 +2084,11 @@ class ToolScheduler:
                 arguments_digest=_canonical_digest(call.get("arguments", {})),
                 effect_id=uuid.uuid4().hex,
                 owner_token=uuid.uuid4().hex,
+                principal_id=str(tool_context.get("principal_id") or ""),
+                project_id=str(tool_context.get("project_id") or ""),
+                session_id=str(session_id or tool_context.get("session_id") or ""),
+                task_id=str(tool_context.get("task_id") or ""),
+                workspace_id=str(tool_context.get("workspace_id") or ""),
             )
             if row.get("status") != "running":
                 return self._deserialize_operation_result(row, call=call, tool=tool)
@@ -1820,44 +2112,104 @@ class ToolScheduler:
         result: ToolResult,
         *,
         terminal_status: str,
-    ) -> None:
-        """Persist a terminal result and wake duplicate callers."""
+    ) -> ToolResult:
+        """Persist a terminal result and wake duplicate callers.
+
+        Finalization is a second failure boundary.  A handler may already
+        have changed an external system when SQLite, audit storage, or a
+        commit callback fails.  In that case the result is cached and all
+        in-process waiters are released with a degraded, non-retryable
+        result; the scheduler must never turn a journal failure into a blind
+        second dispatch.
+        """
         if claim is None:
-            return
+            return result
+        journal_error = ""
         db = getattr(self.permission_engine, "db", None)
         complete_method = getattr(db, "complete_tool_operation", None)
         if callable(complete_method) and claim.owner_token:
-            updated = await complete_method(
-                operation_id=claim.operation_id,
-                owner_token=claim.owner_token,
-                status=terminal_status,
-                effect_status=result.effect_status,
-                reconciliation_hint=result.reconciliation_hint,
-                result_json=self._serialize_operation_result(result),
-            )
-            if not updated:
-                logger.error(
-                    "durable tool operation lost ownership before finalize: %s",
+            try:
+                result_json = self._serialize_operation_result(result)
+                updated = await complete_method(
+                    operation_id=claim.operation_id,
+                    owner_token=claim.owner_token,
+                    status=terminal_status,
+                    effect_status=result.effect_status,
+                    reconciliation_hint=result.reconciliation_hint,
+                    result_json=result_json,
+                )
+                if not updated:
+                    journal_error = "durable tool operation lost ownership before finalize"
+            except Exception as exc:
+                journal_error = f"durable operation finalization failed: {exc}"
+                logger.exception(
+                    "durable tool operation finalization failed: operation_id=%s",
                     claim.operation_id,
                 )
-        async with self._idempotency_lock:
-            if (
-                claim.operation_id not in self._idempotency_results
-                and len(self._idempotency_results) >= _IDEMPOTENCY_CACHE_LIMIT
-            ):
-                oldest = min(
-                    self._idempotency_results,
-                    key=lambda item: self._idempotency_results[item].stored_at,
+        try:
+            async with self._idempotency_lock:
+                if (
+                    claim.operation_id not in self._idempotency_results
+                    and len(self._idempotency_results) >= _IDEMPOTENCY_CACHE_LIMIT
+                ):
+                    oldest = min(
+                        self._idempotency_results,
+                        key=lambda item: self._idempotency_results[item].stored_at,
+                    )
+                    self._idempotency_results.pop(oldest, None)
+                cached_result = result
+                if journal_error:
+                    hint = result.reconciliation_hint or (
+                        "durable operation finalization failed; reconcile effect_id "
+                        "before retry"
+                    )
+                    warning = result.warning
+                    warning = f"{warning}; " if warning else ""
+                    warning += journal_error
+                    cached_result = replace(
+                        result,
+                        delivery_status=(
+                            result.delivery_status
+                            if result.delivery_status == DELIVERY_AUDIT_DEGRADED
+                            else DELIVERY_DEGRADED
+                        ),
+                        warning=warning,
+                        reconciliation_hint=hint,
+                        retry_safe=False,
+                    )
+                self._idempotency_results[claim.operation_id] = _IdempotencyRecord(
+                    arguments_digest=_canonical_digest(
+                        cached_result.arguments or {}
+                    ),
+                    result=cached_result,
                 )
-                self._idempotency_results.pop(oldest, None)
-            self._idempotency_results[claim.operation_id] = _IdempotencyRecord(
-                arguments_digest=_canonical_digest(result.arguments or {}),
-                result=result,
+                event = self._operation_events.pop(claim.operation_id, None)
+                self._operation_claims.pop(claim.operation_id, None)
+                if event is not None:
+                    event.set()
+                return cached_result
+        except Exception as exc:
+            logger.exception(
+                "in-process operation finalization failed: operation_id=%s",
+                claim.operation_id,
             )
-            event = self._operation_events.pop(claim.operation_id, None)
-            self._operation_claims.pop(claim.operation_id, None)
-            if event is not None:
-                event.set()
+            warning = result.warning
+            warning = f"{warning}; " if warning else ""
+            warning += f"in-process operation finalization failed: {exc}"
+            return replace(
+                result,
+                delivery_status=(
+                    result.delivery_status
+                    if result.delivery_status == DELIVERY_AUDIT_DEGRADED
+                    else DELIVERY_DEGRADED
+                ),
+                warning=warning,
+                reconciliation_hint=(
+                    result.reconciliation_hint
+                    or "operation finalization failed; reconcile effect_id before retry"
+                ),
+                retry_safe=False,
+            )
 
     async def _update_operation_effect_id(
         self, claim: _OperationClaim, effect_id: str
@@ -2115,9 +2467,14 @@ class ToolScheduler:
             "name": str(call["name"]),
             "arguments": dict(call.get("arguments") or {}),
         }
-        idempotency_key = call.get("idempotency_key") or call.get("_idempotency_key")
-        if idempotency_key:
-            normalized["_idempotency_key"] = str(idempotency_key)
+        # Only the server-side binding path may carry an operation key.
+        # A top-level value supplied by a model, gateway caller, or plugin is
+        # untrusted input and must not become durable idempotency authority.
+        if call.get("_server_operation_key") is True:
+            idempotency_key = call.get("_idempotency_key")
+            if idempotency_key:
+                normalized["_idempotency_key"] = str(idempotency_key)
+                normalized["_server_operation_key"] = True
         return normalized
 
 
@@ -2126,3 +2483,35 @@ def _canonical_digest(value: object) -> str:
         value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def server_operation_key(
+    *,
+    principal_id: str,
+    project_id: str,
+    session_id: str,
+    turn_id: str,
+    attempt_id: str,
+    tool_call_id: str,
+    tool_name: str,
+    workspace_id: str,
+) -> str:
+    """Return a stable server-owned identity for one tool operation.
+
+    This is an identity digest, not an argument digest.  Keeping the two
+    independent lets the database reject accidental or malicious reuse of an
+    operation identity with different arguments while preserving replay
+    semantics for the original durable turn/attempt.
+    """
+    return "srv-op-" + _canonical_digest(
+        {
+            "principal_id": principal_id,
+            "project_id": project_id,
+            "session_id": session_id,
+            "turn_id": turn_id,
+            "attempt_id": attempt_id,
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "workspace_id": workspace_id,
+        }
+    )

@@ -23,6 +23,10 @@ def main(argv: list[str]) -> int:
         )
     if "cwd_fd" in options:
         os.fchdir(int(options["cwd_fd"]))
+    # Directory descriptors are authority capabilities, not child-process
+    # resources.  The explicit-development launcher mirrors the Rust
+    # launcher's stdio-only inheritance policy before exec.
+    _close_inherited_fds()
     _set_limit("RLIMIT_FSIZE", options)
     _set_limit("RLIMIT_NOFILE", options)
     _set_limit("RLIMIT_CPU", options)
@@ -92,6 +96,19 @@ def _set_limit(name: str, options: dict[str, int | bool]) -> None:
     _soft, hard = resource.getrlimit(resource_id)
     effective = requested if hard == resource.RLIM_INFINITY else min(requested, hard)
     resource.setrlimit(resource_id, (effective, effective))
+
+
+def _close_inherited_fds() -> None:
+    """Close all inherited descriptors except the standard streams."""
+    try:
+        maximum = int(os.sysconf("SC_OPEN_MAX"))
+    except (AttributeError, OSError, ValueError):
+        maximum = 1024
+    for fd in range(3, max(3, maximum)):
+        try:
+            os.close(fd)
+        except OSError:
+            continue
 
 
 if __name__ == "__main__":

@@ -363,13 +363,36 @@ class AgentLoop:
                                 stop_reason = StopReason.MAX_BUDGET.value
                                 break
                         if chunk.tool_calls:
-                            tool_calls.extend(chunk.tool_calls)
-                            for tool_call in chunk.tool_calls:
+                            for raw_tool_call in chunk.tool_calls:
+                                tool_call = dict(raw_tool_call)
+                                bind_operation = getattr(
+                                    self.tool_scheduler,
+                                    "bind_server_operation_key",
+                                    None,
+                                )
+                                if callable(bind_operation):
+                                    tool_call = bind_operation(
+                                        tool_call,
+                                        session_id=session_id,
+                                        turn_id=turn.turn_id,
+                                        attempt_id=turn.attempt_id,
+                                        tool_context={
+                                            "principal_id": self.principal_id,
+                                            "project_id": self.project_id,
+                                            "workspace_id": getattr(
+                                                self.active_workspace, "id", None
+                                            ),
+                                        },
+                                    )
+                                tool_calls.append(tool_call)
                                 turn_event = await turn.emit(
                                     "tool.call",
                                     {
                                         "tool_call_id": str(tool_call.get("id") or ""),
                                         "name": str(tool_call.get("name") or ""),
+                                        "operation_id": str(
+                                            tool_call.get("_idempotency_key") or ""
+                                        ),
                                     },
                                 )
                                 yield Message(
@@ -479,7 +502,8 @@ class AgentLoop:
                         # every row in the spawn chain scoped to the same
                         # (principal, project) pair as the parent runtime.
                         "project_id": self.project_id,
-                        "turn_id": f"{session_id}:{turn_count}",
+                        "turn_id": turn.turn_id,
+                        "attempt_id": turn.attempt_id,
                         # H5: pass session_id + runtime_id so browser tools
                         # key their BrowserContext by (principal, session,
                         # runtime) — concurrent local sessions under the
@@ -602,6 +626,7 @@ class AgentLoop:
                                 "success": result.success,
                                 "output": result.output,
                                 "error": result.error,
+                                "error_code": result.error_code,
                                 "effect_status": result.effect_status,
                                 "delivery_status": result.delivery_status,
                                 "warning": result.warning,
@@ -622,12 +647,14 @@ class AgentLoop:
                                 "success": result.success,
                                 "output": result.output,
                                 "error": result.error,
+                                "error_code": result.error_code,
                                 "duration_ms": result.duration_ms,
                                 "arguments": result.arguments or {},
                                 "effect_status": result.effect_status,
                                 "delivery_status": result.delivery_status,
                                 "warning": result.warning,
                                 "effect_id": result.effect_id,
+                                "reconciliation_hint": result.reconciliation_hint,
                                 "retry_safe": result.retry_safe,
                             },
                             created_at=time.time(),
@@ -643,6 +670,7 @@ class AgentLoop:
                                 "effect_status": result.effect_status,
                                 "delivery_status": result.delivery_status,
                                 "effect_id": result.effect_id,
+                                "reconciliation_hint": result.reconciliation_hint,
                                 "retry_safe": result.retry_safe,
                             },
                         )

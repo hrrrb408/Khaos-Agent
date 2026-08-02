@@ -2,13 +2,13 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 import os
 from pathlib import Path
 
-import pytest
-
 import khaos.audit.logger as logger_module
+import pytest
 from khaos.audit import AuditLogger, resolve_safe_audit_log_path
 from khaos.config import set_user_config_value
 from khaos.db import Database
@@ -208,6 +208,82 @@ async def test_file_audit_rotates_into_trusted_segments(tmp_path, monkeypatch):
     assert '"target": "second"' in (
         trusted / "events.jsonl"
     ).read_text(encoding="utf-8")
+    await db.close()
+
+
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd,
+    reason="platform has no dirfd-relative open/mkdir support",
+)
+async def test_file_audit_archive_is_explicit_signed_and_tombstoned(
+    tmp_path, monkeypatch
+):
+    """Rotated evidence can be archived without silent source deletion."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    trusted = home / ".khaos" / "audit"
+    monkeypatch.setattr(logger_module, "AUDIT_LOG_TRUSTED_DIR", trusted)
+    monkeypatch.setattr(logger_module, "AUDIT_FILE_SEGMENT_BYTES", 128)
+    db = await _db(tmp_path)
+
+    audit = AuditLogger(db, log_path="events.jsonl", project_id="project")
+    await audit.log("terminal", "first", "success", {"payload": "x" * 100})
+    await audit.log("terminal", "second", "success", {"payload": "y" * 100})
+    segment = next(trusted.glob("events.jsonl.segment-*"))
+    archive_root = tmp_path / "archive"
+
+    result = await audit.archive_segments(
+        archive_root, signing_key=b"test-signing-key", remove_source=True
+    )
+
+    assert result["source_deleted"] is True
+    assert not segment.exists()
+    manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+    assert manifest["format"] == "khaos-audit-archive-v1"
+    assert manifest["manifest_sha256"] == result["manifest_sha256"]
+    assert manifest["manifest_hmac_sha256"]
+    archived = next(Path(result["archive_directory"]).glob("*.gz"))
+    with gzip.open(archived, "rt", encoding="utf-8") as archived_stream:
+        assert '"target": "first"' in archived_stream.read()
+    tombstone = trusted / logger_module.AUDIT_ARCHIVE_TOMBSTONE
+    assert result["archive_id"] in tombstone.read_text(encoding="utf-8")
+    audit.close()
+    await db.close()
+
+
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd,
+    reason="platform has no dirfd-relative open/mkdir support",
+)
+async def test_sqlite_audit_chain_archive_is_signed_without_deletion(
+    tmp_path, monkeypatch
+):
+    """SQLite evidence is exportable, but never silently deleted."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    trusted = home / ".khaos" / "audit"
+    monkeypatch.setattr(logger_module, "AUDIT_LOG_TRUSTED_DIR", trusted)
+    db = await _db(tmp_path)
+    audit = AuditLogger(db, log_path="events.jsonl", project_id="project")
+    await audit.log("terminal", "first", "success", {"payload": "x"})
+    await audit.log("terminal", "second", "success", {"payload": "y"})
+
+    result = await audit.archive_audit_chain(
+        tmp_path / "sqlite-archive", signing_key=b"test-signing-key"
+    )
+
+    assert result["source_deleted"] is False
+    assert result["row_count"] == 2
+    manifest = json.loads(Path(result["manifest"]).read_text(encoding="utf-8"))
+    assert manifest["format"] == "khaos-sqlite-audit-archive-v1"
+    assert manifest["manifest_hmac_sha256"]
+    archived = Path(result["archive_directory"]) / "audit-chain.jsonl.gz"
+    with gzip.open(archived, "rt", encoding="utf-8") as archived_stream:
+        assert '"target":"first"' in archived_stream.read()
+    assert len(await db.list_audit_logs()) == 2
+    tombstone = trusted / logger_module.AUDIT_ARCHIVE_TOMBSTONE
+    assert result["archive_id"] in tombstone.read_text(encoding="utf-8")
+    audit.close()
     await db.close()
 
 

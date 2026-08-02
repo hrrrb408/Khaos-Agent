@@ -61,6 +61,12 @@ mod unix {
                 return Err(io::Error::last_os_error());
             }
         }
+        // The directory descriptors are authority capabilities used only for
+        // identity verification and fchdir.  They must not remain available
+        // to the executed command (or to any child it creates).  The native
+        // launcher has no protocol descriptors beyond stdio, so the inherited
+        // descriptor policy is an explicit whitelist of 0/1/2.
+        close_authority_fds(options.root_fd, options.cwd_fd);
         apply_limit(libc::RLIMIT_FSIZE, options.rlimit_fsize)?;
         apply_limit(libc::RLIMIT_NOFILE, options.rlimit_nofile)?;
         apply_limit(libc::RLIMIT_CPU, options.rlimit_cpu)?;
@@ -68,6 +74,8 @@ mod unix {
         apply_limit(libc::RLIMIT_AS, options.rlimit_as)?;
         #[cfg(target_os = "macos")]
         let _ = options.rlimit_as;
+
+        close_inherited_fds()?;
 
         let mut child = Command::new(&command[0]);
         child.args(&command[1..]);
@@ -193,6 +201,55 @@ mod unix {
                 io::ErrorKind::PermissionDenied,
                 format!("{label} identity changed before exec"),
             ));
+        }
+        Ok(())
+    }
+
+    fn close_authority_fds(root_fd: Option<RawFd>, cwd_fd: Option<RawFd>) {
+        let mut closed = [RawFd::MIN; 2];
+        let mut count = 0;
+        for fd in [root_fd, cwd_fd].into_iter().flatten() {
+            if fd > 2 && !closed[..count].contains(&fd) {
+                unsafe { libc::close(fd) };
+                closed[count] = fd;
+                count += 1;
+            }
+        }
+    }
+
+    /// Close every descriptor except stdin/stdout/stderr before exec.
+    ///
+    /// Linux uses the atomic close_range syscall when available.  The
+    /// bounded fallback is retained for older kernels and macOS; neither
+    /// path preserves arbitrary inherited descriptors.
+    fn close_inherited_fds() -> io::Result<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_close_range,
+                    3 as libc::c_uint,
+                    u32::MAX as libc::c_uint,
+                    0 as libc::c_uint,
+                )
+            };
+            if result == 0 {
+                return Ok(());
+            }
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ENOSYS)
+                && error.raw_os_error() != Some(libc::EINVAL)
+            {
+                return Err(error);
+            }
+        }
+
+        let maximum = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
+        if maximum <= 3 {
+            return Ok(());
+        }
+        for fd in 3..maximum {
+            unsafe { libc::close(fd as RawFd) };
         }
         Ok(())
     }

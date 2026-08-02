@@ -215,8 +215,9 @@ class MaintenanceService:
         except Exception as exc:  # noqa: BLE001
             logger.error("maintenance: prune_terminal_agent_turns failed: %s", exc)
 
-        # 5. Bound completed/unknown idempotency rows. Unknown rows remain
-        # replay-safe until this explicit reconciliation window expires.
+        # 5. Bound only no-effect idempotency rows. Applied/partial/unknown
+        # rows remain replay-suppression tombstones until an explicit archive
+        # and reconciliation workflow handles them.
         try:
             pruned_operations = await self._db.prune_tool_operations(
                 older_than_seconds=self._tool_operation_retention,

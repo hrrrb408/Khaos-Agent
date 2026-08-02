@@ -150,7 +150,13 @@ def _find_launcher() -> str | None:
 
 
 def _is_secure_executable(path: Path) -> bool:
-    """Reject symlinks and writable binary/parent paths in production."""
+    """Reject symlinks and group/world-writable binary/parent paths.
+
+    The loader accepts a root-owned or current-EUID-owned executable so local
+    development builds remain usable; production packaging must additionally
+    provide a root-owned, read-only launcher (or an equivalent digest gate).
+    Owner-writable files are therefore not treated as production trust proof.
+    """
     try:
         info = path.lstat()
     except OSError:

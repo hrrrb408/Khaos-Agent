@@ -19,6 +19,7 @@ mod linux {
     use std::fs::{self, File, OpenOptions};
     use std::io::{self, Read, Write};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+    use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
@@ -36,6 +37,8 @@ mod linux {
     const DEFAULT_SOCKET: &str = "/run/khaos/browser-kernel-helper.sock";
     const DEFAULT_SECRET: &str = "/var/lib/khaos/browser-helper.secret";
     const DEFAULT_JOURNAL: &str = "/run/khaos/browser-helper";
+    const DEFAULT_NETNS_ROOT: &str = "/var/run/netns";
+    const DEFAULT_CGROUP_ROOT: &str = "/sys/fs/cgroup/khaos-browser";
     const IP_PATH: &str = "/usr/sbin/ip";
     const NFT_PATH: &str = "/usr/sbin/nft";
 
@@ -94,6 +97,8 @@ mod linux {
         secret: Vec<u8>,
         boot_id: String,
         journal_root: PathBuf,
+        netns_root: PathBuf,
+        cgroup_root: PathBuf,
         resources: Mutex<HashMap<String, ResourceRecord>>,
         replay: Mutex<(HashSet<String>, VecDeque<String>)>,
         subnet_leases: Mutex<HashMap<u32, String>>,
@@ -130,7 +135,7 @@ mod linux {
                 veth_host: format!("kh{}", &key[..12]),
                 veth_peer: format!("kn{}", &key[..12]),
                 nft_table: format!("khaos_browser_{}", &key[..32]),
-                cgroup: Path::new("/sys/fs/cgroup/khaos-browser").join(&key[..32]),
+                cgroup: self.cgroup_root.join(&key[..32]),
                 host_ip,
                 namespace_ip,
                 subnet,
@@ -624,7 +629,7 @@ mod linux {
             record.status.quarantined = true;
             return Err(error);
         }
-        let namespace = match open_managed_netns(&record.names.netns) {
+        let namespace = match open_managed_netns(&state.netns_root, &record.names.netns) {
             Ok(namespace) => namespace,
             Err(error) => {
                 record.status.quarantined = true;
@@ -773,6 +778,42 @@ mod linux {
         Ok(())
     }
 
+    fn validate_cgroup_root(path: &Path) -> io::Result<()> {
+        let metadata = fs::symlink_metadata(path)?;
+        if !metadata.is_dir() || metadata.file_type().is_symlink() || metadata.uid() != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "browser helper cgroup root must be a root-owned non-symlink directory",
+            ));
+        }
+        for controller_file in ["cgroup.controllers", "cgroup.procs"] {
+            if !path.join(controller_file).exists() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "browser helper cgroup root is not a cgroup v2 subtree: {controller_file}"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_managed_cgroup_path(root: &Path, path: &Path) -> io::Result<()> {
+        let valid_leaf = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(|value| value.len() == 32 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+            .unwrap_or(false);
+        if path.parent() != Some(root) || !valid_leaf {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "browser helper cgroup path escapes the configured subtree",
+            ));
+        }
+        Ok(())
+    }
+
     fn remove_cgroup(path: &Path) -> io::Result<()> {
         if !path.exists() {
             return Ok(());
@@ -818,9 +859,9 @@ mod linux {
         run_nft(state, &["-f", "-"], Some(script.as_bytes()))
     }
 
-    fn open_managed_netns(name: &str) -> io::Result<OwnedFd> {
+    fn open_managed_netns(root: &Path, name: &str) -> io::Result<OwnedFd> {
         validate_netns_name(name)?;
-        let authority = CString::new("/var/run/netns").map_err(io::Error::other)?;
+        let authority = CString::new(root.as_os_str().as_bytes()).map_err(io::Error::other)?;
         let directory = unsafe {
             libc::open(
                 authority.as_ptr(),
@@ -884,7 +925,8 @@ mod linux {
     }
 
     fn run_ip(state: &State, args: &[&str]) -> io::Result<()> {
-        run_trusted(&state.ip, args, None)
+        run_trusted_capture_with_env(&state.ip, args, None, Some(state.netns_root.as_os_str()))
+            .map(|_| ())
     }
     fn run_nft(state: &State, args: &[&str], stdin: Option<&[u8]>) -> io::Result<()> {
         run_trusted(&state.nft, args, stdin)
@@ -905,6 +947,15 @@ mod linux {
         args: &[&str],
         stdin: Option<&[u8]>,
     ) -> io::Result<Vec<u8>> {
+        run_trusted_capture_with_env(binary, args, stdin, None)
+    }
+
+    fn run_trusted_capture_with_env(
+        binary: &TrustedBinary,
+        args: &[&str],
+        stdin: Option<&[u8]>,
+        netns_root: Option<&std::ffi::OsStr>,
+    ) -> io::Result<Vec<u8>> {
         let executable = binary.open_for_exec()?;
         let executable_path = format!("/proc/self/fd/{}", executable.as_raw_fd());
         let mut command = Command::new(&executable_path);
@@ -912,6 +963,9 @@ mod linux {
             .args(args)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(root) = netns_root {
+            command.env("IP_NETNS_DIR", root);
+        }
         if stdin.is_some() {
             command.stdin(Stdio::piped());
         }
@@ -1407,7 +1461,10 @@ mod linux {
             }
             let names = envelope.names;
             let expected_key = state.derive_key(&envelope.identity)?;
-            if names.key != expected_key || !(1..=SUBNET_POOL_SIZE).contains(&names.subnet) {
+            if names.key != expected_key
+                || !(1..=SUBNET_POOL_SIZE).contains(&names.subnet)
+                || validate_managed_cgroup_path(&state.cgroup_root, &names.cgroup).is_err()
+            {
                 fs::rename(entry.path(), entry.path().with_extension("quarantine"))?;
                 continue;
             }
@@ -1478,7 +1535,8 @@ mod linux {
                 "journal owner process identity is no longer authorized",
             ));
         }
-        let _namespace = open_managed_netns(&record.names.netns)?;
+        validate_managed_cgroup_path(&state.cgroup_root, &record.names.cgroup)?;
+        let _namespace = open_managed_netns(&state.netns_root, &record.names.netns)?;
         run_ip(state, &["link", "show", "dev", &record.names.veth_host])?;
         run_ip(
             state,
@@ -1585,12 +1643,44 @@ mod linux {
             std::env::var("KHAOS_BROWSER_HELPER_JOURNAL_ROOT")
                 .unwrap_or_else(|_| DEFAULT_JOURNAL.to_owned()),
         );
+        let netns_root = PathBuf::from(
+            std::env::var("KHAOS_BROWSER_HELPER_NETNS_ROOT")
+                .unwrap_or_else(|_| DEFAULT_NETNS_ROOT.to_owned()),
+        );
+        if !netns_root.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "browser helper netns root must be absolute",
+            ));
+        }
+        fs::create_dir_all(&netns_root)?;
+        let netns_metadata = fs::symlink_metadata(&netns_root)?;
+        if !netns_metadata.is_dir() || netns_metadata.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "browser helper netns root must be a non-symlink directory",
+            ));
+        }
+        fs::set_permissions(&netns_root, fs::Permissions::from_mode(0o700))?;
+        let cgroup_root = PathBuf::from(
+            std::env::var("KHAOS_BROWSER_HELPER_CGROUP_ROOT")
+                .unwrap_or_else(|_| DEFAULT_CGROUP_ROOT.to_owned()),
+        );
+        if !cgroup_root.is_absolute() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "browser helper cgroup root must be absolute",
+            ));
+        }
+        validate_cgroup_root(&cgroup_root)?;
         let state = Arc::new(State {
             secret: read_secret(&secret_path)?,
             boot_id: fs::read_to_string("/proc/sys/kernel/random/boot_id")?
                 .trim()
                 .to_owned(),
             journal_root,
+            netns_root,
+            cgroup_root,
             resources: Mutex::new(HashMap::new()),
             replay: Mutex::new((HashSet::new(), VecDeque::new())),
             subnet_leases: Mutex::new(HashMap::new()),

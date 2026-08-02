@@ -24,6 +24,10 @@ install -o root -g root -m 0755 \
 install -o root -g root -m 0755 \
   rust/khaos-core/target/release/khaos-browser-kernel-helper \
   /usr/local/sbin/khaos-browser-kernel-helper
+sha256sum /usr/local/sbin/khaos-browser-kernel-helper \
+  > /usr/local/sbin/khaos-browser-kernel-helper.sha256
+chown root:root /usr/local/sbin/khaos-browser-kernel-helper.sha256
+chmod 0444 /usr/local/sbin/khaos-browser-kernel-helper.sha256
 setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher
 
 install -d -o root -g root -m 0755 /var/lib/khaos

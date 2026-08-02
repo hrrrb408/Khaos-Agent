@@ -30,10 +30,15 @@ entire lifetime.
 
 from __future__ import annotations
 
+import asyncio
+import gzip
+import hashlib
+import hmac
 import json
 import logging
 import os
 import stat as _stat
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -67,6 +72,11 @@ AUDIT_LOG_TRUSTED_DIR = Path.home() / ".khaos" / "audit"
 # blob; segments are retained in the same trusted directory for export/archive
 # and are never deleted by the logger.
 AUDIT_FILE_SEGMENT_BYTES = 64 * 1024 * 1024
+# A secondary file trail must not grow without an operator action.  Reaching
+# this limit fails only the secondary append (SQLite remains authoritative)
+# and tells the operator to run ``archive_segments`` explicitly.
+AUDIT_FILE_MAX_BYTES = 512 * 1024 * 1024
+AUDIT_ARCHIVE_TOMBSTONE = "audit-archive-tombstones.jsonl"
 
 
 def resolve_safe_audit_log_path(
@@ -236,6 +246,7 @@ class AuditLogger:
         self._fd: int | None = None
         self._audit_dir_fd: int | None = None
         self._log_filename: str | None = None
+        self._file_lock = threading.RLock()
         if log_path is not None:
             self._open_log_fd(log_path)
         self._anchor: AuditChainAnchor | None = None
@@ -493,18 +504,19 @@ class AuditLogger:
 
     def close(self) -> None:
         """Close the held audit log fd (idempotent)."""
-        if self._fd is not None:
-            try:
-                os.close(self._fd)
-            except OSError:
-                pass
-            self._fd = None
-        if self._audit_dir_fd is not None:
-            try:
-                os.close(self._audit_dir_fd)
-            except OSError:
-                pass
-            self._audit_dir_fd = None
+        with self._file_lock:
+            if self._fd is not None:
+                try:
+                    os.close(self._fd)
+                except OSError:
+                    pass
+                self._fd = None
+            if self._audit_dir_fd is not None:
+                try:
+                    os.close(self._audit_dir_fd)
+                except OSError:
+                    pass
+                self._audit_dir_fd = None
         if self._anchor is not None:
             self._anchor.close()
 
@@ -662,18 +674,394 @@ class AuditLogger:
         line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode(
             "utf-8"
         )
-        try:
-            self._rotate_file_if_needed(len(line))
-            view = memoryview(line)
-            while view:
-                written = os.write(self._fd, view)
-                if written <= 0:
-                    raise OSError("audit log write made no progress")
-                view = view[written:]
-        except OSError:
-            logger.debug(
-                "audit log fd write failed (fd=%s)", self._fd, exc_info=True
+        with self._file_lock:
+            try:
+                self._enforce_file_storage_limit(len(line))
+                self._rotate_file_if_needed(len(line))
+                view = memoryview(line)
+                while view:
+                    written = os.write(self._fd, view)
+                    if written <= 0:
+                        raise OSError("audit log write made no progress")
+                    view = view[written:]
+            except OSError as exc:
+                if "storage limit" in str(exc):
+                    logger.error("%s", exc)
+                else:
+                    logger.debug(
+                        "audit log fd write failed (fd=%s)", self._fd, exc_info=True
+                    )
+
+    def _segment_files(self) -> list[tuple[str, int]]:
+        """Return trusted rotated segment names and sizes."""
+        if self._audit_dir_fd is None or self._log_filename is None:
+            return []
+        prefix = f"{self._log_filename}.segment-"
+        entries: list[tuple[str, int]] = []
+        for name in os.listdir(self._audit_dir_fd):
+            if not name.startswith(prefix) or "/" in name:
+                continue
+            try:
+                stat_result = os.stat(
+                    name, dir_fd=self._audit_dir_fd, follow_symlinks=False
+                )
+            except OSError:
+                continue
+            if _stat.S_ISREG(stat_result.st_mode):
+                entries.append((name, int(stat_result.st_size)))
+        return sorted(entries)
+
+    def _enforce_file_storage_limit(self, incoming_bytes: int) -> None:
+        """Reject secondary writes that exceed the explicit disk budget."""
+        if AUDIT_FILE_MAX_BYTES <= 0 or self._fd is None:
+            return
+        current = int(os.fstat(self._fd).st_size)
+        rotated = sum(size for _, size in self._segment_files())
+        if rotated + current + incoming_bytes > AUDIT_FILE_MAX_BYTES:
+            raise OSError(
+                "audit file storage limit reached; run explicit archive_segments"
             )
+
+    async def archive_segments(
+        self,
+        destination: str | os.PathLike[str],
+        *,
+        signing_key: bytes,
+        remove_source: bool = False,
+    ) -> dict[str, Any]:
+        """Explicitly archive rotated JSONL segments.
+
+        The logger never deletes segments during rotation or maintenance.
+        An operator may call this method with an out-of-band signing key to
+        create gzip members plus a signed manifest.  A tombstone is appended
+        to the trusted audit directory before optional source removal, so a
+        later audit can distinguish an explicit archive from silent loss.
+        The active JSONL file is never archived or removed by this method.
+        """
+        if not isinstance(signing_key, bytes) or len(signing_key) < 16:
+            raise ValueError("archive signing_key must contain at least 16 bytes")
+        return await asyncio.to_thread(
+            self._archive_segments_sync,
+            Path(destination),
+            signing_key,
+            remove_source,
+        )
+
+    async def archive_audit_chain(
+        self,
+        destination: str | os.PathLike[str],
+        *,
+        signing_key: bytes,
+    ) -> dict[str, Any]:
+        """Export the SQLite audit chain as signed compressed evidence.
+
+        This is an explicit operator action.  It verifies the complete chain
+        first, writes an immutable gzip export plus an HMAC manifest, and
+        records a trusted tombstone.  It deliberately does not delete rows:
+        the SQLite table and its independent anchor remain authoritative until
+        an operator performs a separately approved database rotation.
+        """
+        if not isinstance(signing_key, bytes) or len(signing_key) < 16:
+            raise ValueError("archive signing_key must contain at least 16 bytes")
+        if self._audit_dir_fd is None:
+            raise RuntimeError(
+                "SQLite audit archive requires the trusted file-audit directory"
+            )
+        breaks = await self.db.verify_audit_chain()
+        if breaks:
+            raise AuditAnchorError(
+                "cannot archive a broken SQLite audit chain: "
+                + ", ".join(str(item.get("id")) for item in breaks)
+            )
+        if self._anchor is not None:
+            await self._anchor.verify(self.db)
+        rows = await self.db.list_audit_logs()
+        return await asyncio.to_thread(
+            self._archive_audit_chain_sync,
+            Path(destination),
+            signing_key,
+            rows,
+        )
+
+    def _archive_audit_chain_sync(
+        self,
+        destination: Path,
+        signing_key: bytes,
+        rows: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        with self._file_lock:
+            if self._audit_dir_fd is None:
+                raise RuntimeError("trusted audit directory is closed")
+            destination = destination.expanduser()
+            destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+            destination_stat = destination.stat()
+            if not _stat.S_ISDIR(destination_stat.st_mode):
+                raise ValueError("archive destination is not a directory")
+            if destination_stat.st_uid != os.getuid():
+                raise PermissionError("archive destination is not owned by current UID")
+            if destination_stat.st_mode & 0o077:
+                destination.chmod(0o700)
+            archive_id = f"{os.getpid()}-{time.time_ns()}"
+            archive_dir = destination / f"sqlite-audit.archive-{archive_id}"
+            archive_dir.mkdir(mode=0o700)
+            ordered_rows = sorted(rows, key=lambda row: int(row.get("id") or 0))
+            archive_path = archive_dir / "audit-chain.jsonl.gz"
+            source_hash = hashlib.sha256()
+            with open(archive_path, "xb") as raw_target:
+                with gzip.GzipFile(
+                    filename=archive_path.name,
+                    mode="wb",
+                    fileobj=raw_target,
+                    mtime=0,
+                ) as compressed:
+                    for row in ordered_rows:
+                        line = (
+                            json.dumps(
+                                row,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                                separators=(",", ":"),
+                            )
+                            + "\n"
+                        ).encode("utf-8")
+                        source_hash.update(line)
+                        compressed.write(line)
+                raw_target.flush()
+                os.fsync(raw_target.fileno())
+            compressed_hash = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+            first_id = int(ordered_rows[0]["id"]) if ordered_rows else 0
+            last_id = int(ordered_rows[-1]["id"]) if ordered_rows else 0
+            head_hash = str(ordered_rows[-1].get("prev_hash") or "") if ordered_rows else ""
+            body: dict[str, Any] = {
+                "format": "khaos-sqlite-audit-archive-v1",
+                "archive_id": archive_id,
+                "created_at": utc_now_naive().isoformat(),
+                "project_id": self._project_id,
+                "database_id": hashlib.sha256(
+                    str(Path(getattr(self.db, "path", "")).expanduser().resolve())
+                    .encode("utf-8")
+                ).hexdigest(),
+                "first_id": first_id,
+                "last_id": last_id,
+                "row_count": len(ordered_rows),
+                "head_hash": head_hash,
+                "source_sha256": source_hash.hexdigest(),
+                "archive_name": archive_path.name,
+                "archive_bytes": archive_path.stat().st_size,
+                "archive_sha256": compressed_hash,
+                "source_delete_requested": False,
+            }
+            body_bytes = json.dumps(
+                body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            ).encode("utf-8")
+            manifest_hash = hashlib.sha256(body_bytes).hexdigest()
+            manifest = {
+                **body,
+                "manifest_sha256": manifest_hash,
+                "manifest_hmac_sha256": hmac.new(
+                    signing_key, body_bytes, hashlib.sha256
+                ).hexdigest(),
+            }
+            manifest_path = archive_dir / "manifest.json"
+            with open(manifest_path, "xb") as manifest_file:
+                manifest_file.write(
+                    (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n")
+                    .encode("utf-8")
+                )
+                manifest_file.flush()
+                os.fsync(manifest_file.fileno())
+            manifest_path.chmod(0o600)
+            tombstone = {
+                "format": "khaos-audit-archive-tombstone-v1",
+                "archive_id": archive_id,
+                "created_at": body["created_at"],
+                "source": "sqlite:audit_log",
+                "manifest_sha256": manifest_hash,
+                "first_id": first_id,
+                "last_id": last_id,
+                "row_count": len(ordered_rows),
+                "source_delete_requested": False,
+            }
+            tombstone_line = (
+                json.dumps(tombstone, ensure_ascii=False, sort_keys=True) + "\n"
+            ).encode("utf-8")
+            tombstone_fd = os.open(
+                AUDIT_ARCHIVE_TOMBSTONE,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_APPEND
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=self._audit_dir_fd,
+            )
+            try:
+                view = memoryview(tombstone_line)
+                while view:
+                    written = os.write(tombstone_fd, view)
+                    if written <= 0:
+                        raise OSError("audit archive tombstone write made no progress")
+                    view = view[written:]
+                os.fsync(tombstone_fd)
+            finally:
+                os.close(tombstone_fd)
+            return {
+                "archive_id": archive_id,
+                "archive_directory": str(archive_dir),
+                "manifest": str(manifest_path),
+                "manifest_sha256": manifest_hash,
+                "row_count": len(ordered_rows),
+                "source_deleted": False,
+            }
+
+    def _archive_segments_sync(
+        self,
+        destination: Path,
+        signing_key: bytes,
+        remove_source: bool,
+    ) -> dict[str, Any]:
+        with self._file_lock:
+            return self._archive_segments_locked(
+                destination, signing_key, remove_source
+            )
+
+    def _archive_segments_locked(
+        self,
+        destination: Path,
+        signing_key: bytes,
+        remove_source: bool,
+    ) -> dict[str, Any]:
+        if self._audit_dir_fd is None or self._log_filename is None:
+            raise RuntimeError("file audit is not enabled")
+        destination = destination.expanduser()
+        destination.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination_stat = destination.stat()
+        if not _stat.S_ISDIR(destination_stat.st_mode):
+            raise ValueError("archive destination is not a directory")
+        if destination_stat.st_uid != os.getuid():
+            raise PermissionError("archive destination is not owned by current UID")
+        if destination_stat.st_mode & 0o077:
+            destination.chmod(0o700)
+
+        source_entries = self._segment_files()
+        archive_id = f"{os.getpid()}-{time.time_ns()}"
+        archive_dir = destination / f"{self._log_filename}.archive-{archive_id}"
+        archive_dir.mkdir(mode=0o700)
+        entries: list[dict[str, Any]] = []
+        for source_name, source_size in source_entries:
+            target = archive_dir / f"{source_name}.gz"
+            source_hash = hashlib.sha256()
+            source_fd = os.open(
+                source_name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._audit_dir_fd,
+            )
+            try:
+                with os.fdopen(source_fd, "rb", closefd=True) as source, open(
+                    target, "xb"
+                ) as raw_target:
+                    with gzip.GzipFile(
+                        filename=target.name,
+                        mode="wb",
+                        fileobj=raw_target,
+                        mtime=0,
+                    ) as compressed:
+                        while True:
+                            chunk = source.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            source_hash.update(chunk)
+                            compressed.write(chunk)
+                    raw_target.flush()
+                    os.fsync(raw_target.fileno())
+            except Exception:
+                try:
+                    os.close(source_fd)
+                except OSError:
+                    pass
+                raise
+            compressed_hash = hashlib.sha256(target.read_bytes()).hexdigest()
+            entries.append({
+                "source_name": source_name,
+                "source_bytes": source_size,
+                "source_sha256": source_hash.hexdigest(),
+                "archive_name": target.name,
+                "archive_bytes": target.stat().st_size,
+                "archive_sha256": compressed_hash,
+            })
+
+        body: dict[str, Any] = {
+            "format": "khaos-audit-archive-v1",
+            "archive_id": archive_id,
+            "created_at": utc_now_naive().isoformat(),
+            "log_filename": self._log_filename,
+            "project_id": self._project_id,
+            "entries": entries,
+            "source_delete_requested": remove_source,
+        }
+        body_bytes = json.dumps(
+            body, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+        manifest_hash = hashlib.sha256(body_bytes).hexdigest()
+        signature = hmac.new(signing_key, body_bytes, hashlib.sha256).hexdigest()
+        manifest = {
+            **body,
+            "manifest_sha256": manifest_hash,
+            "manifest_hmac_sha256": signature,
+        }
+        manifest_path = archive_dir / "manifest.json"
+        with open(manifest_path, "xb") as manifest_file:
+            manifest_file.write(
+                (json.dumps(manifest, ensure_ascii=False, sort_keys=True) + "\n")
+                .encode("utf-8")
+            )
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        manifest_path.chmod(0o600)
+
+        tombstone = {
+            "format": "khaos-audit-archive-tombstone-v1",
+            "archive_id": archive_id,
+            "created_at": body["created_at"],
+            "manifest_sha256": manifest_hash,
+            "segments": [name for name, _ in source_entries],
+            "source_delete_requested": remove_source,
+        }
+        tombstone_line = (
+            json.dumps(tombstone, ensure_ascii=False, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        tombstone_fd = os.open(
+            AUDIT_ARCHIVE_TOMBSTONE,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_APPEND
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+            dir_fd=self._audit_dir_fd,
+        )
+        try:
+            view = memoryview(tombstone_line)
+            while view:
+                written = os.write(tombstone_fd, view)
+                if written <= 0:
+                    raise OSError("audit archive tombstone write made no progress")
+                view = view[written:]
+            os.fsync(tombstone_fd)
+        finally:
+            os.close(tombstone_fd)
+
+        if remove_source:
+            for source_name, _ in source_entries:
+                os.unlink(source_name, dir_fd=self._audit_dir_fd)
+            os.fsync(self._audit_dir_fd)
+
+        return {
+            "archive_id": archive_id,
+            "archive_directory": str(archive_dir),
+            "manifest": str(manifest_path),
+            "manifest_sha256": manifest_hash,
+            "segments": [name for name, _ in source_entries],
+            "source_deleted": remove_source,
+        }
 
     def _rotate_file_if_needed(self, incoming_bytes: int) -> None:
         """Rotate the secondary trail under the already-pinned directory fd."""

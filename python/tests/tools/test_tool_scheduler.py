@@ -1,11 +1,13 @@
 import asyncio
+import json
 import time
 
 import pytest
-
 from khaos.agent.approval import ApprovalBroker
 from khaos.db import Database
 from khaos.permissions import ApprovalMode, PermissionEngine
+from khaos.security.middleware import SecurityMiddleware
+from khaos.security.sandbox import Sandbox, SandboxMode
 from khaos.tools.registry import ToolDefinition, ToolRegistry
 from khaos.tools.scheduler import (
     EFFECT_APPLIED,
@@ -13,11 +15,10 @@ from khaos.tools.scheduler import (
     EffectOutcome,
     PermissionRequest,
     ToolBudget,
+    ToolExecutionOutcome,
     ToolScheduler,
     _canonical_digest,
 )
-from khaos.security.middleware import SecurityMiddleware
-from khaos.security.sandbox import Sandbox, SandboxMode
 
 
 async def test_tool_budget_atomic_reservations_do_not_oversubscribe() -> None:
@@ -828,6 +829,198 @@ async def test_scheduler_accepts_explicit_effect_outcome(tmp_path):
     await db.close()
 
 
+async def test_scheduler_reports_structured_handler_failure(tmp_path):
+    async def reject(value: str) -> ToolExecutionOutcome:
+        return ToolExecutionOutcome(
+            ok=False,
+            output={"status": "forbidden", "value": value},
+            error="principal is not allowed to mutate this resource",
+            error_code="FORBIDDEN",
+            effect_status="not_applied",
+            retry_safe=True,
+        )
+
+    db = Database(tmp_path / "structured-failure.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(reject),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+
+    result = (
+        await scheduler.execute_batch(
+            [{"id": "reject-1", "name": "effect", "arguments": {"value": "x"}}],
+            mode="coding",
+        )
+    )[0]
+
+    assert result.success is False
+    assert result.error_code == "FORBIDDEN"
+    assert result.effect_status == "not_applied"
+    assert result.retry_safe is True
+    assert result.output["status"] == "forbidden"
+    await db.close()
+
+
+async def test_scheduler_converts_legacy_error_payload_to_failure(tmp_path):
+    async def reject(value: str) -> dict:
+        return {"status": "forbidden", "error": "denied", "value": value}
+
+    db = Database(tmp_path / "legacy-failure.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(reject),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+
+    result = (
+        await scheduler.execute_batch(
+            [{"id": "reject-1", "name": "effect", "arguments": {"value": "x"}}],
+            mode="coding",
+        )
+    )[0]
+
+    assert result.success is False
+    assert result.error_code == "FORBIDDEN"
+    assert result.effect_status == "not_applied"
+    await db.close()
+
+
+async def test_scheduler_converts_serialized_remote_failure_to_failure(tmp_path):
+    async def reject(value: str) -> str:
+        return json.dumps({"created": False, "error": "remote rejected", "value": value})
+
+    db = Database(tmp_path / "serialized-failure.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(reject),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+
+    result = (
+        await scheduler.execute_batch(
+            [{"id": "reject-1", "name": "effect", "arguments": {"value": "x"}}],
+            mode="coding",
+        )
+    )[0]
+
+    assert result.success is False
+    assert result.error == "remote rejected"
+    assert result.effect_status == "not_applied"
+    await db.close()
+
+
+async def test_scheduler_does_not_accept_model_idempotency_key(tmp_path):
+    calls = 0
+
+    async def write(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return value
+
+    db = Database(tmp_path / "server-key.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(write),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+    context = {
+        "principal_id": "principal",
+        "project_id": "project",
+        "task_id": "task",
+        "workspace_id": "workspace",
+        "turn_id": "turn-1",
+        "attempt_id": "attempt-1",
+    }
+    call = {
+        "id": "call-1",
+        "name": "effect",
+        "arguments": {"value": "once"},
+        "idempotency_key": "model-chosen-key",
+    }
+
+    first, second = (
+        await scheduler.execute_batch(
+            [call], mode="coding", session_id="session", tool_context=context
+        )
+    )[0], (
+        await scheduler.execute_batch(
+            [call], mode="coding", session_id="session", tool_context=context
+        )
+    )[0]
+
+    assert calls == 1
+    assert first.success and second.success
+    assert first.effect_id == second.effect_id
+    await db.close()
+
+
+async def test_scheduler_keeps_effect_facts_when_operation_finalization_fails(
+    tmp_path, monkeypatch
+):
+    calls = 0
+
+    async def write(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return value
+
+    db = Database(tmp_path / "finalization-fault.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session(
+        "session", mode="coding", principal_id="principal", project_id="project"
+    )
+
+    async def fail_complete(**_kwargs):
+        raise RuntimeError("database commit unavailable")
+
+    monkeypatch.setattr(db, "complete_tool_operation", fail_complete)
+    scheduler = ToolScheduler(
+        _effect_registry(write),
+        PermissionEngine(
+            db,
+            default_mode=ApprovalMode.AUTO_APPROVE,
+            principal_id="principal",
+            project_id="project",
+        ),
+    )
+    context = {
+        "principal_id": "principal",
+        "project_id": "project",
+        "task_id": "task",
+        "workspace_id": "workspace",
+        "turn_id": "turn-1",
+        "attempt_id": "attempt-1",
+    }
+    call = {"id": "call-1", "name": "effect", "arguments": {"value": "x"}}
+
+    first = (
+        await scheduler.execute_batch(
+            [call], mode="coding", session_id="session", tool_context=context
+        )
+    )[0]
+    second = (
+        await scheduler.execute_batch(
+            [call], mode="coding", session_id="session", tool_context=context
+        )
+    )[0]
+
+    assert calls == 1
+    assert first.success and second.success
+    assert first.effect_status == EFFECT_APPLIED
+    assert first.effect_id
+    assert first.delivery_status == "degraded"
+    assert first.retry_safe is False
+    assert "finalization failed" in first.warning
+    assert second.effect_id == first.effect_id
+    await db.close()
+
+
 async def test_scheduler_does_not_redeliver_unprojected_mutation(tmp_path, monkeypatch):
     calls = 0
 
@@ -920,31 +1113,30 @@ async def test_scheduler_replays_explicit_idempotency_key_without_reinvoking_han
         "workspace_id": "workspace",
     }
 
+    bound = scheduler.bind_server_operation_key(
+        {
+            "id": "call-1",
+            "name": "effect",
+            "arguments": {"value": "once"},
+        },
+        session_id="session",
+        turn_id="turn-1",
+        attempt_id="attempt-1",
+        tool_context=context,
+    )
     first = (
         await scheduler.execute_batch(
-            [
-                {
-                    "id": "call-1",
-                    "name": "effect",
-                    "arguments": {"value": "once"},
-                    "idempotency_key": "effect-key-1",
-                }
-            ],
+            [bound],
             mode="coding",
+            session_id="session",
             tool_context=context,
         )
     )[0]
     second = (
         await scheduler.execute_batch(
-            [
-                {
-                    "id": "call-2",
-                    "name": "effect",
-                    "arguments": {"value": "once"},
-                    "idempotency_key": "effect-key-1",
-                }
-            ],
+            [bound],
             mode="coding",
+            session_id="session",
             tool_context=context,
         )
     )[0]
@@ -952,7 +1144,7 @@ async def test_scheduler_replays_explicit_idempotency_key_without_reinvoking_han
     assert calls == 1
     assert first.success and second.success
     assert first.effect_id == second.effect_id
-    assert second.tool_call_id == "call-2"
+    assert second.tool_call_id == "call-1"
     await db.close()
 
 
@@ -984,12 +1176,18 @@ async def test_scheduler_serializes_concurrent_idempotent_dispatches(tmp_path):
     call = {
         "name": "effect",
         "arguments": {"value": "once"},
-        "idempotency_key": "concurrent-effect",
     }
+    bound = scheduler.bind_server_operation_key(
+        {**call, "id": "call-1"},
+        session_id="session",
+        turn_id="turn-1",
+        attempt_id="attempt-1",
+        tool_context=context,
+    )
 
     first_task = asyncio.create_task(
         scheduler.execute_batch(
-            [{**call, "id": "call-1"}],
+            [bound],
             mode="coding",
             session_id="session",
             tool_context=context,
@@ -998,7 +1196,7 @@ async def test_scheduler_serializes_concurrent_idempotent_dispatches(tmp_path):
     await started.wait()
     second_task = asyncio.create_task(
         scheduler.execute_batch(
-            [{**call, "id": "call-2"}],
+            [bound],
             mode="coding",
             session_id="session",
             tool_context=context,
@@ -1011,7 +1209,7 @@ async def test_scheduler_serializes_concurrent_idempotent_dispatches(tmp_path):
     assert calls == 1
     assert first.success and second.success
     assert first.effect_id == second.effect_id
-    assert second.tool_call_id == "call-2"
+    assert second.tool_call_id == "call-1"
     await db.close()
 
 
@@ -1040,14 +1238,31 @@ async def test_scheduler_rejects_concurrent_idempotency_argument_reuse(tmp_path)
         "task_id": "task",
         "workspace_id": "workspace",
     }
+    first_call = scheduler.bind_server_operation_key(
+        {
+            "id": "call-1",
+            "name": "effect",
+            "arguments": {"value": "first"},
+        },
+        session_id="session",
+        turn_id="turn-1",
+        attempt_id="attempt-1",
+        tool_context=context,
+    )
+    second_call = scheduler.bind_server_operation_key(
+        {
+            "id": "call-1",
+            "name": "effect",
+            "arguments": {"value": "different"},
+        },
+        session_id="session",
+        turn_id="turn-1",
+        attempt_id="attempt-1",
+        tool_context=context,
+    )
     first_task = asyncio.create_task(
         scheduler.execute_batch(
-            [{
-                "id": "call-1",
-                "name": "effect",
-                "arguments": {"value": "first"},
-                "idempotency_key": "concurrent-conflict",
-            }],
+            [first_call],
             mode="coding",
             session_id="session",
             tool_context=context,
@@ -1056,12 +1271,7 @@ async def test_scheduler_rejects_concurrent_idempotency_argument_reuse(tmp_path)
     await started.wait()
     second_task = asyncio.create_task(
         scheduler.execute_batch(
-            [{
-                "id": "call-2",
-                "name": "effect",
-                "arguments": {"value": "different"},
-                "idempotency_key": "concurrent-conflict",
-            }],
+            [second_call],
             mode="coding",
             session_id="session",
             tool_context=context,
@@ -1101,9 +1311,15 @@ async def test_scheduler_does_not_replay_orphaned_running_operation(tmp_path):
         "id": "call-restart",
         "name": "effect",
         "arguments": {"value": "once"},
-        "idempotency_key": "orphaned-effect",
     }
-    normalized = {**call, "_idempotency_key": call["idempotency_key"]}
+    bound = scheduler.bind_server_operation_key(
+        call,
+        session_id="session",
+        turn_id="turn-1",
+        attempt_id="attempt-1",
+        tool_context=context,
+    )
+    normalized = bound
     operation_id = scheduler._idempotency_scope(
         normalized, session_id="session", tool_context=context
     )
@@ -1124,7 +1340,7 @@ async def test_scheduler_does_not_replay_orphaned_running_operation(tmp_path):
 
     result = (
         await scheduler.execute_batch(
-            [call],
+            [bound],
             mode="coding",
             session_id="session",
             tool_context=context,
