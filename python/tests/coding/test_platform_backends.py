@@ -1,3 +1,4 @@
+import asyncio
 import os
 import shutil
 import subprocess
@@ -7,7 +8,6 @@ import uuid
 from pathlib import Path
 
 import pytest
-
 from khaos.coding.execution import (
     ExecutionRequest,
     FileSystemAccess,
@@ -185,7 +185,10 @@ def test_macos_profile_uses_positive_read_allowlist(tmp_path: Path):
     profile = MacOSSandboxBackend().profile(workspace)
 
     assert "(deny default)" in profile
+    assert '(allow file-read-data (literal "/"))' in profile
     assert '(allow file-read-metadata (literal "/"))' in profile
+    assert '(deny file-read* (subpath "/private/tmp"))' in profile
+    assert '(deny file-read* (subpath "/tmp"))' in profile
     assert '(allow file-read* (literal "/"))' not in profile
     assert '(allow file-read* (subpath "/"))' not in profile
     assert "(allow file-read*)" not in profile
@@ -399,8 +402,12 @@ async def test_real_bwrap_enforces_full_isolation_matrix(tmp_path: Path, request
 
     # 8. No residual processes — the background sleep must have been killed
     # when the bwrap PID namespace was torn down.
-    ps = subprocess.run(
-        ["pgrep", "-f", "sleep 3"], capture_output=True, text=True,
+    ps = await asyncio.to_thread(
+        subprocess.run,
+        ["pgrep", "-f", "sleep 3"],
+        capture_output=True,
+        text=True,
+        check=False,
     )
     assert ps.stdout.strip() == "", f"residual process survived bwrap teardown: {ps.stdout}"
 

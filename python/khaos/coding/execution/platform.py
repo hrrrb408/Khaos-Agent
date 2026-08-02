@@ -300,6 +300,10 @@ class MacOSSandboxBackend:
                 workspace / name for name in sorted(PROTECTED_WORKSPACE_NAMES)
             )
         )
+        protected_read_rules = (
+            '(deny file-read* (subpath "/private/tmp"))'
+            '(deny file-read* (subpath "/tmp"))'
+        )
         mach_lookup_rules = "".join(
             f'(allow mach-lookup (global-name "{service}"))'
             for service in _macos_runtime_mach_services()
@@ -320,12 +324,15 @@ class MacOSSandboxBackend:
             '(allow file-read* (literal "/dev/random"))'
             '(allow file-read* (literal "/dev/urandom"))'
             # Seatbelt needs metadata for the filesystem root while resolving
-            # an allowlisted executable.  Metadata alone does not expose
-            # directory entries or file contents outside the roots above.
+            # an allowlisted executable.  On macOS 26, it also needs data
+            # access to the root directory entry itself; this is narrower
+            # than allowing file-read* on "/" and does not expose recursive
+            # contents outside the roots above.
+            '(allow file-read-data (literal "/"))'
             '(allow file-read-metadata (literal "/"))'
             f"{metadata_rules}{read_rules}{literal_reads}"
             f"{executable_map_rules}{write_rules}"
-            f"{protected_write_rules}{mach_lookup_rules}"
+            f"{protected_write_rules}{protected_read_rules}{mach_lookup_rules}"
             "(deny network*)"
         )
 
