@@ -12,6 +12,7 @@
 | `Platform Sandbox Security E2E / macos-sandbox-security` | macOS hosted runner | sandbox-exec workspace-write、`.git`/case alias write denial、外部写拒绝、禁网、secret root、pasteboard/Keychain IPC、whole-HOME 与 TaskWorkspace 相对 byte budget 拒绝 | Linux namespace |
 | `Platform Sandbox Security E2E / windows-fail-closed-security` | Windows hosted runner | 未实现 native backend 时明确 Unsupported，执行和 dirfd mutation 都拒绝 | Windows 可执行 sandbox；当前产品不宣称支持 |
 | `Docker Security E2E / docker-isolation` | Ubuntu + Docker | digest-pinned image、network none、read-only root、非 root、`.git` readonly mount、deleted-open-file PID namespace watchdog、资源限制、timeout/cancel/shutdown cleanup、Trusted Verification secret/output 边界 | 非容器宿主策略 |
+| `Docker Security E2E / compose-deployment` | Ubuntu + Docker | clean-checkout Compose startup、loopback-only development HTTP、production TLS/API-key/Host allowlist、secret-file wiring、authenticated health smoke | 非 Docker 宿主策略、长期证书轮换 |
 | `Security Closure Gate` | reusable workflow 聚合 | 上述真实平台矩阵、Python security、Go race、Rust test/clippy、供应链、schema fuzz、authorization drift、process lifecycle、event-loop starvation 全部成功，并生成 commit-bound Security Evidence Artifact | 绝对安全；未支持平台的功能可用性 |
 
 Windows 当前的安全承诺是 **fail closed**，不是功能可用。没有 AppContainer/Job Object 等经

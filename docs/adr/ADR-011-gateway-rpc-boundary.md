@@ -2,7 +2,7 @@
 
 ## 状态
 
-接受并实施（2026-07-16）。
+接受并实施（2026-08-01，RPC v2 增量）。
 
 ## 决策
 
@@ -14,6 +14,11 @@ Gateway 为所有 REST、SSE 与 NDJSON 响应发送 `X-Khaos-Protocol-Version: 
 后续 stream、confirm、mode、task get/cancel/approve/reject/events/artifacts 必须匹配 owner；
 客户端 JSON 内的 principal 不具有权威性。Gateway 重启后无法证明 owner 的既有资源在
 认证态下拒绝访问，不以“未知等于允许”恢复服务。
+
+Python UDS 控制面使用内部 RPC v2：顶层 `protocol_version=2` 参与 HMAC 签名，
+`Bootstrap.GetPolicyDigest` 是唯一不携带部署 claim 的初始化请求；其余生产请求必须携带
+非空且与 Python 绑定值一致的 `project_id` 与 `policy_digest`。v1 只在显式
+`KHAOS_DEV_MODE=1` 下供测试/迁移适配器使用，生产端不得通过缺省字段静默降级。
 
 Task SSE 使用持久化 `sequence` 作为 SSE `id`，客户端可通过 `Last-Event-ID` 跳过已经
 消费的事件。HTTP client 断线或取消时，stream handler 立即退出，并让同一个 request
@@ -35,6 +40,8 @@ Python UDS 在验证 peer UID 后还必须取得 kernel peer PID。由 CLI 托�
 - 断线不允许 handler 永久阻塞在上游 channel。
 - 已认证 Gateway PID 外的同 UID 进程不得 dispatch RPC；peer PID 不可用时 fail closed。
 - 一个 method 的派生 MAC 不得重放到另一 method。
+- 生产 RPC 缺少 v2、`project_id` 或 `policy_digest` 时，在任何 service method 前拒绝；
+  claim 漂移也必须在 service dispatch 前拒绝。
 - 只有 Telegram、Discord、Slack、WeChat 这类已实现平台签名校验的 webhook 路径可
   绕过 Gateway API key；generic 与未知平台必须先通过 Gateway API key。
 - Generic webhook 必须配置至少 32 字符 secret，并验证 timestamp、one-shot message ID、
@@ -44,9 +51,10 @@ Python UDS 在验证 peer UID 后还必须取得 kernel peer PID。由 CLI 托�
   SQLite 唯一约束一次性消费，进程重启不得恢复窗口内 replay authority。
 - Webhook session 与 principal 必须同时绑定 Khaos channel ID、platform、authenticated
   sender 与 target；不得回退到本地 UID principal 或跨 channel 复用 session。
-- 认证 API 限流按 principal 隔离；匿名签名平台 ingress 按 RemoteAddr source IP 隔离；
-  health 使用独立 bucket；签名成功后 Python 再按 platform + channel 限流。无效签名、
-  source-IP flood 或 health probe 均不能消耗 authenticated API bucket。
+- 认证 API 限流按 principal 隔离；匿名签名平台 ingress 的 Gateway bucket 按
+  RemoteAddr source IP + platform + channel 隔离；签名成功后 Python 再按 platform +
+  channel 限流。health 使用独立 bucket。无效签名、source-IP flood 或 health probe 均不能
+  消耗 authenticated API bucket，且同一 NAT 下的一个 Channel 不能饿死其他 Channel。
 - 同平台 integration secret/public-key fingerprint 只能绑定一个启用 Channel。Telegram
   replay 使用持久化 high-water mark 与有限乱序窗口，不能永久追加一行一事件。
 

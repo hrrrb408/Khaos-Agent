@@ -6,16 +6,25 @@ import asyncio
 import hashlib
 import inspect
 import json
+import logging
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
-from khaos.permissions import ApprovalMode, PermissionRule
+from khaos.permissions import (
+    ApprovalMode,
+    GrantLifetime,
+    PermissionRule,
+    TransportClass,
+    is_interactive_transport,
+)
 from khaos.permissions.resource import (
     AuthorizationResource,
     resolve_authorization_resource,
 )
+from khaos.permissions.rules import typed_rule_from_authorization_resource
 from khaos.agent.approval import ApprovalBinding
 from khaos.exceptions import PermissionDeniedError
 from khaos.security.middleware import SecurityMiddleware
@@ -24,6 +33,96 @@ from khaos.tools.terminal_tools import BackgroundProcessAuthority
 
 
 ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
+
+logger = logging.getLogger(__name__)
+
+EFFECT_NOT_STARTED = "not_started"
+EFFECT_NOT_APPLIED = "not_applied"
+EFFECT_APPLIED = "applied"
+EFFECT_UNKNOWN = "unknown"
+
+DELIVERY_COMPLETE = "complete"
+DELIVERY_DEGRADED = "degraded"
+DELIVERY_AUDIT_DEGRADED = "audit_degraded"
+
+_IDEMPOTENCY_CACHE_LIMIT = 1024
+_CONFIRM_ALLOWED_KEYS = frozenset({
+    "approved", "remember", "pattern", "reason",
+})
+_CONFIRM_PATTERN_MAX_LENGTH = 4096
+_CONFIRM_REASON_MAX_LENGTH = 1024
+
+
+def _normalize_confirmation(value: object) -> dict[str, Any]:
+    """Normalize an untrusted approval-adapter result fail-closed.
+
+    Confirmation adapters sit outside the scheduler's trust boundary (UI,
+    gateway, or an integration plugin).  Treating ``dict(value)`` as a valid
+    response used to let strings, lists, non-bool values, and unexpected
+    fields reach the approval broker.  The scheduler now accepts one strict
+    schema and converts every malformed response into an explicit denial.
+    """
+    if type(value) is bool:
+        return {"approved": value}
+    if type(value) is not dict:
+        return {
+            "approved": False,
+            "remember": False,
+            "reason": "invalid_confirmation_response",
+        }
+    unknown = set(value) - _CONFIRM_ALLOWED_KEYS
+    if unknown:
+        return {
+            "approved": False,
+            "remember": False,
+            "reason": "invalid_confirmation_response",
+        }
+    if type(value.get("approved")) is not bool:
+        return {
+            "approved": False,
+            "remember": False,
+            "reason": "invalid_confirmation_response",
+        }
+    remember = value.get("remember", False)
+    if type(remember) is not bool:
+        return {
+            "approved": False,
+            "remember": False,
+            "reason": "invalid_confirmation_response",
+        }
+    pattern = value.get("pattern")
+    if pattern is not None and (
+        type(pattern) is not str
+        or not pattern
+        or len(pattern) > _CONFIRM_PATTERN_MAX_LENGTH
+        or any(char in pattern for char in "\x00\r\n")
+    ):
+        return {
+            "approved": False,
+            "remember": False,
+            "reason": "invalid_confirmation_response",
+        }
+    reason = value.get("reason")
+    if reason is not None and (
+        type(reason) is not str
+        or len(reason) > _CONFIRM_REASON_MAX_LENGTH
+        or any(char in reason for char in "\x00\r\n")
+    ):
+        return {
+            "approved": False,
+            "remember": False,
+            "reason": "invalid_confirmation_response",
+        }
+    normalized: dict[str, Any] = {
+        "approved": value["approved"],
+    }
+    if "remember" in value:
+        normalized["remember"] = remember
+    if pattern is not None:
+        normalized["pattern"] = pattern
+    if reason is not None:
+        normalized["reason"] = reason
+    return normalized
 
 
 @dataclass
@@ -37,6 +136,24 @@ class ToolResult:
     error: str = ""
     duration_ms: int = 0
     arguments: dict[str, Any] | None = None
+    # Effect and delivery are deliberately separate.  A handler may have
+    # completed a mutation even when projection, auditing, budget accounting,
+    # or remember-rule persistence fails afterwards.  Callers must not turn
+    # such a result into an ordinary retryable failure.
+    effect_status: str = EFFECT_NOT_STARTED
+    delivery_status: str = DELIVERY_COMPLETE
+    warning: str = ""
+    effect_id: str = ""
+    retry_safe: bool = True
+
+
+@dataclass
+class _IdempotencyRecord:
+    """Runtime-scoped result retained for an explicit idempotency key."""
+
+    arguments_digest: str
+    result: ToolResult
+    stored_at: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -63,6 +180,7 @@ class PermissionRequest:
     authorization_epoch: int = 0
     policy_digest: str = ""
     tool_schema_digest: str = ""
+    approval_id: str = ""
 
 
 @dataclass
@@ -290,6 +408,12 @@ class ToolScheduler:
         # H1: optional shared OfficeMutationAuthority. Set by the runtime
         # factory so Office copy/move are fenced against cancellation/timeout.
         self.office_authority: Any = None
+        # Idempotency is intentionally explicit and runtime-scoped.  Model
+        # tool-call IDs are not stable authority, so callers that need
+        # at-most-once replay semantics must provide a separate
+        # ``idempotency_key`` at the tool-call envelope level.
+        self._idempotency_lock = asyncio.Lock()
+        self._idempotency_results: dict[str, _IdempotencyRecord] = {}
 
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
@@ -417,6 +541,47 @@ class ToolScheduler:
                     continue
                 normalized["_authorization_resource"] = resource
 
+            execution_error = self._execution_preflight_error(
+                tool.name, mode, tool_context
+            )
+            if execution_error:
+                target = self._resolve_target(
+                    tool.name, normalized["arguments"], resource
+                )
+                audit_error = await self._audit_best_effort(
+                    tool.name,
+                    target,
+                    "denied",
+                    {
+                        "tool_call_id": normalized["id"],
+                        "reason": execution_error,
+                        "check_type": "execution_backend",
+                    },
+                    session_id,
+                )
+                yield SchedulerEvent(
+                    event="tool_result",
+                    result=ToolResult(
+                        tool_call_id=normalized["id"],
+                        name=tool.name,
+                        success=False,
+                        error=execution_error,
+                        arguments=normalized["arguments"],
+                        delivery_status=(
+                            DELIVERY_AUDIT_DEGRADED
+                            if audit_error
+                            else DELIVERY_COMPLETE
+                        ),
+                        warning=(
+                            f"audit persistence failed: {audit_error}"
+                            if audit_error
+                            else ""
+                        ),
+                    ),
+                )
+                continue
+
+            source_transport = str(tool_context.get("source_transport") or "")
             decision = await self.permission_engine.check(
                 tool_name=tool.name,
                 params=normalized["arguments"],
@@ -426,10 +591,13 @@ class ToolScheduler:
                 # Round-15 B-2: gate the read-only terminal auto-approve
                 # shortcut on an interactive transport so an unattended
                 # webhook/cron/rpc turn cannot auto-approve ``cat ~/.ssh/id_rsa``.
-                source_transport=str(tool_context.get("source_transport") or ""),
+                source_transport=source_transport,
+                session_id=str(tool_context.get("session_id") or session_id or ""),
+                task_id=str(tool_context.get("task_id") or ""),
+                workspace_id=str(tool_context.get("workspace_id") or ""),
             )
             if decision.approved == ApprovalMode.DENY:
-                await self.permission_engine.audit(
+                await self._audit_best_effort(
                     tool.name,
                     decision.target,
                     "denied",
@@ -581,7 +749,11 @@ class ToolScheduler:
                         ),
                     )
                     continue
-                binding_digest = await broker.register_tool_approval(binding)
+                approval_handle = await broker.register_tool_approval(binding)
+                binding_digest = str(approval_handle)
+                normalized["_approval_id"] = getattr(
+                    approval_handle, "approval_id", ""
+                )
                 normalized["_approval_schema_digest"] = binding.tool_schema_digest
                 normalized["_approval_policy_digest"] = binding.policy_digest
                 normalized["_approval_authorization_epoch"] = binding.authorization_epoch
@@ -595,6 +767,7 @@ class ToolScheduler:
                 normalized["_approval_arguments_digest"] = binding.arguments_digest
                 request = PermissionRequest(
                     tool_call_id=normalized["id"],
+                    approval_id=normalized.get("_approval_id", ""),
                     name=tool.name,
                     arguments=normalized["arguments"],
                     level=tool.permission_level,
@@ -628,7 +801,7 @@ class ToolScheduler:
                 if not confirmation.get("approved", False):
                     if destructive_context is not None:
                         await destructive_context["approval_broker"].cancel_operation(normalized["id"])
-                    await self.permission_engine.audit(
+                    await self._audit_best_effort(
                         tool.name,
                         decision.target,
                         "denied",
@@ -664,13 +837,45 @@ class ToolScheduler:
                         )
                         continue
                     normalized["_approval_context"] = destructive_context
-                if confirmation.get("remember"):
-                    normalized["_remember_rule"] = PermissionRule(
-                        id=None,
-                        pattern=confirmation.get("pattern", decision.target),
-                        permission_level=tool.permission_level,
-                        approval=ApprovalMode.AUTO_APPROVE,
-                        mode=mode,
+                if confirmation.get("remember") and is_interactive_transport(
+                    source_transport
+                ):
+                    try:
+                        if resource is not None:
+                            resource_type, resource_spec = (
+                                typed_rule_from_authorization_resource(
+                                    resource, tool.permission_level
+                                )
+                            )
+                            remember_pattern = decision.target
+                        else:
+                            resource_type, resource_spec = "", None
+                            remember_pattern = confirmation.get(
+                                "pattern", decision.target
+                            )
+                        normalized["_remember_rule"] = PermissionRule(
+                            id=None,
+                            pattern=remember_pattern,
+                            permission_level=tool.permission_level,
+                            approval=ApprovalMode.AUTO_APPROVE,
+                            mode=mode,
+                            transport_class=TransportClass.INTERACTIVE.value,
+                            grant_lifetime=GrantLifetime.PROJECT_INTERACTIVE.value,
+                            session_id=session_id or "",
+                            task_id=str(tool_context.get("task_id") or ""),
+                            workspace_id=str(tool_context.get("workspace_id") or ""),
+                            created_by=f"approval:{source_transport}",
+                            resource_type=resource_type,
+                            resource_spec=resource_spec,
+                        )
+                    except (TypeError, ValueError) as exc:
+                        normalized["_remember_warning"] = (
+                            f"remember-rule rejected: typed resource invalid ({exc})"
+                        )
+                elif confirmation.get("remember"):
+                    normalized["_remember_warning"] = (
+                        "remember request ignored for unattended or unknown "
+                        "transport"
                     )
             approved_calls.append(normalized)
 
@@ -699,6 +904,7 @@ class ToolScheduler:
         parallel_calls, serial_calls = self.registry.get_parallel_tools(approved_calls)
         if parallel_calls:
             tasks = []
+            task_calls: list[dict] = []
             for call in parallel_calls:
                 reservation = await self.budget.reserve(parallel=True)
                 if reservation is None:
@@ -716,7 +922,34 @@ class ToolScheduler:
                         call, session_id, mode, tool_context or {}, reservation
                     )
                 )
-            for result in await asyncio.gather(*tasks):
+                task_calls.append(call)
+            gathered = await asyncio.gather(*tasks, return_exceptions=True)
+            for call, result in zip(task_calls, gathered):
+                if isinstance(result, BaseException):
+                    # _execute_one normally converts failures into a
+                    # ToolResult.  Keep the batch isolated even if an
+                    # adapter/extension raises outside that boundary.
+                    logger.error(
+                        "parallel tool task escaped scheduler: tool=%s error=%s",
+                        call["name"],
+                        result,
+                        exc_info=(type(result), result, result.__traceback__),
+                    )
+                    yield SchedulerEvent(
+                        event="tool_result",
+                        result=ToolResult(
+                            tool_call_id=call["id"],
+                            name=call["name"],
+                            success=False,
+                            error=str(result),
+                            arguments=call["arguments"],
+                            effect_status=EFFECT_UNKNOWN,
+                            delivery_status=DELIVERY_DEGRADED,
+                            warning="parallel scheduler task escaped its result boundary",
+                            retry_safe=False,
+                        ),
+                    )
+                    continue
                 yield SchedulerEvent(event="tool_result", result=result)
         for call in serial_calls:
             reservation = await self.budget.reserve(parallel=False)
@@ -750,8 +983,9 @@ class ToolScheduler:
         start = time.monotonic()
         tool = self.registry.get(call["name"])
         resource: AuthorizationResource | None = call.get("_authorization_resource")
+        target = self._resolve_target(tool.name, call.get("arguments", {}), resource)
         if tool.handler is None:
-            await reservation.release()
+            await self._release_best_effort(reservation)
             return ToolResult(
                 tool_call_id=call["id"],
                 name=call["name"],
@@ -759,6 +993,10 @@ class ToolScheduler:
                 error="Tool has no handler",
                 arguments=call["arguments"],
             )
+
+        handler_started = False
+        effect_id = ""
+        effect_status = EFFECT_NOT_STARTED
         try:
             await self.permission_engine.validate_dispatch_epoch(
                 int(call.get("_authorization_epoch", 0))
@@ -811,14 +1049,8 @@ class ToolScheduler:
                 call.get("arguments", {}),
             )
             if not security.allowed:
-                target = (
-                    resource.canonical_target
-                    if resource is not None
-                    else self.permission_engine.normalize_target(
-                        tool.name, call.get("arguments", {})
-                    )
-                )
-                await self.permission_engine.audit(
+                await self._release_best_effort(reservation)
+                audit_error = await self._audit_best_effort(
                     tool.name,
                     target,
                     "denied",
@@ -830,7 +1062,14 @@ class ToolScheduler:
                     },
                     session_id,
                 )
-                await reservation.release()
+                warning = (
+                    f"security check blocked: {security.reason}"
+                    if not audit_error
+                    else (
+                        f"security check blocked: {security.reason}; "
+                        f"audit persistence failed: {audit_error}"
+                    )
+                )
                 return ToolResult(
                     tool_call_id=call["id"],
                     name=tool.name,
@@ -838,7 +1077,31 @@ class ToolScheduler:
                     error=f"Security check blocked: {security.reason}",
                     duration_ms=int((time.monotonic() - start) * 1000),
                     arguments=call["arguments"],
+                    delivery_status=(
+                        DELIVERY_AUDIT_DEGRADED if audit_error else DELIVERY_COMPLETE
+                    ),
+                    warning=warning if audit_error else "",
                 )
+
+            cached = await self._get_idempotent_result(
+                call, session_id=session_id, tool_context=tool_context
+            )
+            if cached is not None:
+                await self._release_best_effort(reservation)
+                return replace(
+                    cached,
+                    tool_call_id=call["id"],
+                    name=tool.name,
+                    arguments=call["arguments"],
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
+
+            # The effect ID is allocated immediately before entering the
+            # handler.  If the handler times out or raises after a partial
+            # mutation, the caller still receives an identifier that must not
+            # be treated as a retryable ordinary failure.
+            effect_id = uuid.uuid4().hex
+            handler_started = True
             invocation_context = dict(tool_context)
             invocation_context["process_authority"] = self.process_authority
             sandbox = self.security_middleware.sandbox
@@ -856,68 +1119,357 @@ class ToolScheduler:
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
                 timeout=tool.timeout,
             )
-            target = (
-                resource.canonical_target
-                if resource is not None
-                else self.permission_engine.normalize_target(tool.name, call.get("arguments", {}))
+            effect_status = (
+                EFFECT_NOT_APPLIED
+                if tool.permission_level == "read"
+                else EFFECT_APPLIED
             )
-            # Bound the structure before secret scanning.  This traversal
-            # stops as soon as the reservation is consumed and never calls an
-            # arbitrary result object's __str__/__repr__ method.
-            _measure_tool_output(output, reservation.output_limit)
-            secret_scan, output = await self.security_middleware.post_check(tool.name, output)
-            # Redaction can change length, so commit the post-redaction size.
-            output_chars = _measure_tool_output(output, reservation.output_limit)
-            detail: dict[str, Any] = {"tool_call_id": call["id"]}
-            if resource is not None:
-                detail["authorization_resource_digest"] = resource.digest()
-            if secret_scan.has_secrets:
-                detail["secrets_detected"] = True
-                detail["secret_categories"] = [
-                    secret.category for secret in secret_scan.secrets
-                ]
-            await self.permission_engine.audit(
-                tool.name,
-                target,
-                "success",
-                detail,
-                session_id,
-            )
-            await reservation.commit(output_chars)
-            remember_rule = call.get("_remember_rule")
-            if remember_rule is not None:
-                await self.permission_engine.grant_rule(remember_rule)
-            return ToolResult(
-                tool_call_id=call["id"],
-                name=tool.name,
-                success=True,
-                output=output,
-                duration_ms=int((time.monotonic() - start) * 1000),
-                arguments=call["arguments"],
-            )
-        except Exception as exc:
-            await reservation.release()
-            target = (
-                resource.canonical_target
-                if resource is not None
-                else self.permission_engine.normalize_target(
-                    tool.name, call.get("arguments", {})
+        except asyncio.CancelledError:
+            await self._release_best_effort(reservation)
+            if handler_started:
+                await self._audit_best_effort(
+                    tool.name,
+                    target,
+                    "cancelled",
+                    {
+                        "tool_call_id": call["id"],
+                        "effect_id": effect_id,
+                        "effect_status": EFFECT_UNKNOWN,
+                    },
+                    session_id,
                 )
-            )
-            await self.permission_engine.audit(
+                logger.error(
+                    "tool execution cancelled after handler dispatch: tool=%s effect_id=%s",
+                    tool.name,
+                    effect_id,
+                )
+            raise
+        except Exception as exc:
+            await self._release_best_effort(reservation)
+            if handler_started:
+                effect_status = EFFECT_UNKNOWN
+            audit_error = await self._audit_best_effort(
                 tool.name,
                 target,
                 "error",
-                {"error": str(exc), "tool_call_id": call["id"]},
+                {
+                    "error": str(exc),
+                    "tool_call_id": call["id"],
+                    "effect_id": effect_id,
+                    "effect_status": effect_status,
+                },
                 session_id,
             )
-            return ToolResult(
+            warning = (
+                f"error audit persistence failed: {audit_error}"
+                if audit_error
+                else ""
+            )
+            result = ToolResult(
                 tool_call_id=call["id"],
                 name=tool.name,
                 success=False,
                 error=str(exc),
                 duration_ms=int((time.monotonic() - start) * 1000),
                 arguments=call["arguments"],
+                effect_status=effect_status,
+                delivery_status=(
+                    DELIVERY_AUDIT_DEGRADED if audit_error else DELIVERY_COMPLETE
+                ),
+                warning=warning,
+                effect_id=effect_id,
+                retry_safe=not handler_started,
+            )
+            if handler_started:
+                await self._store_idempotent_result(
+                    call, session_id=session_id, tool_context=tool_context, result=result
+                )
+            return result
+
+        # From this point onward the handler has returned.  Any failure is a
+        # delivery/recording failure, not an execution failure: the effect
+        # status must remain visible and the result must not invite a blind
+        # replay of a mutation.
+        try:
+            # Bound the structure before secret scanning.  This traversal
+            # stops as soon as the reservation is consumed and never calls an
+            # arbitrary result object's __str__/__repr__ method.
+            _measure_tool_output(output, reservation.output_limit)
+            secret_scan, output = await self.security_middleware.post_check(
+                tool.name, output
+            )
+            # Redaction can change length, so commit the post-redaction size.
+            output_chars = _measure_tool_output(output, reservation.output_limit)
+        except Exception as exc:
+            await self._release_best_effort(reservation)
+            delivery_status = DELIVERY_DEGRADED
+            warning = f"effect completed but result delivery failed: {exc}"
+            audit_error = await self._audit_best_effort(
+                tool.name,
+                target,
+                "success_degraded",
+                {
+                    "tool_call_id": call["id"],
+                    "effect_id": effect_id,
+                    "effect_status": effect_status,
+                    "delivery_status": delivery_status,
+                },
+                session_id,
+            )
+            if audit_error:
+                delivery_status = DELIVERY_AUDIT_DEGRADED
+                warning += f"; audit persistence failed: {audit_error}"
+            effect_applied = effect_status != EFFECT_NOT_APPLIED
+            result = ToolResult(
+                tool_call_id=call["id"],
+                name=tool.name,
+                # A read-only handler has no external effect to preserve, so
+                # keep the historical failure contract for an unprojectable
+                # result.  A completed mutation remains successful from the
+                # caller's perspective and carries the degraded delivery
+                # state instead of inviting a blind replay.
+                success=effect_applied,
+                output="",
+                error="" if effect_applied else str(exc),
+                duration_ms=int((time.monotonic() - start) * 1000),
+                arguments=call["arguments"],
+                effect_status=effect_status,
+                delivery_status=delivery_status,
+                warning=warning,
+                effect_id=effect_id,
+                retry_safe=effect_status == EFFECT_NOT_APPLIED,
+            )
+            await self._store_idempotent_result(
+                call, session_id=session_id, tool_context=tool_context, result=result
+            )
+            return result
+
+        detail: dict[str, Any] = {
+            "tool_call_id": call["id"],
+            "effect_id": effect_id,
+            "effect_status": effect_status,
+            "delivery_status": DELIVERY_COMPLETE,
+        }
+        if resource is not None:
+            detail["authorization_resource_digest"] = resource.digest()
+        if secret_scan.has_secrets:
+            detail["secrets_detected"] = True
+            detail["secret_categories"] = [
+                secret.category for secret in secret_scan.secrets
+            ]
+
+        warnings: list[str] = []
+        delivery_status = DELIVERY_COMPLETE
+        if call.get("_remember_warning"):
+            warnings.append(str(call["_remember_warning"]))
+        try:
+            await reservation.commit(output_chars)
+        except Exception as exc:
+            await self._release_best_effort(reservation)
+            delivery_status = DELIVERY_DEGRADED
+            warnings.append(f"budget accounting failed: {exc}")
+
+        detail["delivery_status"] = delivery_status
+        audit_error = await self._audit_best_effort(
+            tool.name,
+            target,
+            "success",
+            detail,
+            session_id,
+        )
+        if audit_error:
+            delivery_status = DELIVERY_AUDIT_DEGRADED
+            warnings.append(f"audit persistence failed: {audit_error}")
+
+        remember_rule = call.get("_remember_rule")
+        if remember_rule is not None:
+            try:
+                await self.permission_engine.grant_rule(remember_rule)
+            except Exception as exc:
+                delivery_status = (
+                    DELIVERY_AUDIT_DEGRADED
+                    if delivery_status == DELIVERY_AUDIT_DEGRADED
+                    else DELIVERY_DEGRADED
+                )
+                warnings.append(f"remember-rule persistence failed: {exc}")
+
+        result = ToolResult(
+            tool_call_id=call["id"],
+            name=tool.name,
+            success=True,
+            output=output,
+            duration_ms=int((time.monotonic() - start) * 1000),
+            arguments=call["arguments"],
+            effect_status=effect_status,
+            delivery_status=delivery_status,
+            warning="; ".join(warnings),
+            effect_id=effect_id,
+            retry_safe=effect_status == EFFECT_NOT_APPLIED,
+        )
+        await self._store_idempotent_result(
+            call, session_id=session_id, tool_context=tool_context, result=result
+        )
+        return result
+
+    def _resolve_target(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        resource: AuthorizationResource | None,
+    ) -> str:
+        if resource is not None:
+            return resource.canonical_target
+        try:
+            return str(self.permission_engine.normalize_target(tool_name, arguments))
+        except Exception:
+            return tool_name
+
+    @staticmethod
+    def _execution_preflight_error(
+        tool_name: str, mode: str, tool_context: dict[str, Any]
+    ) -> str:
+        """Reject coding execution before approval when no safe backend exists."""
+        if mode != "coding" or tool_name not in {
+            "terminal",
+            "terminal_argv",
+            "terminal_shell",
+            "test_run",
+        }:
+            return ""
+        # Small library/test schedulers may intentionally provide a recording
+        # handler without an AgentLoop execution authority.  Enforce this
+        # preflight only when the runtime has supplied the authority slot;
+        # the production AgentLoop always supplies it, including its explicit
+        # UnsupportedBackend fail-closed sentinel.
+        if "execution_service" not in tool_context:
+            return ""
+        execution_service = tool_context.get("execution_service")
+        if execution_service is None:
+            return (
+                "ExecutionService unavailable: Coding mode requires sandboxed "
+                "execution; direct subprocess fallback is disabled"
+            )
+        backend = getattr(execution_service, "backend", None)
+        if backend is not None and backend.__class__.__name__ == "UnsupportedBackend":
+            reason = str(getattr(backend, "reason", "no supported sandbox backend"))
+            return (
+                "execution refused: no safe execution backend "
+                f"(infrastructure unsupported: {reason})"
+            )
+        if (
+            backend is None
+            and getattr(execution_service, "backend_selector", None) is None
+            and getattr(execution_service, "docker_backend", None) is None
+        ):
+            return "execution refused: no execution backend configured"
+        return ""
+
+    async def _audit_best_effort(
+        self,
+        tool_name: str,
+        target: str,
+        result: str,
+        detail: dict[str, Any],
+        session_id: str | None,
+    ) -> str:
+        """Attempt an audit without converting a completed effect to failure."""
+        try:
+            await self.permission_engine.audit(
+                tool_name,
+                target,
+                result,
+                detail,
+                session_id,
+            )
+        except Exception as exc:
+            logger.error(
+                "tool audit persistence failed: tool=%s result=%s error=%s",
+                tool_name,
+                result,
+                exc,
+                exc_info=True,
+            )
+            return str(exc)
+        return ""
+
+    async def _release_best_effort(self, reservation: ToolBudgetReservation) -> None:
+        try:
+            await reservation.release()
+        except Exception as exc:
+            logger.error("tool budget release failed: %s", exc, exc_info=True)
+
+    @staticmethod
+    def _idempotency_key(call: dict) -> str:
+        return str(call.get("_idempotency_key") or "").strip()
+
+    def _idempotency_scope(
+        self,
+        call: dict,
+        *,
+        session_id: str | None,
+        tool_context: dict[str, Any],
+    ) -> str:
+        key = self._idempotency_key(call)
+        if not key:
+            return ""
+        return _canonical_digest(
+            {
+                "idempotency_key": key,
+                "tool_name": call["name"],
+                "principal_id": str(tool_context.get("principal_id") or ""),
+                "project_id": str(tool_context.get("project_id") or ""),
+                "session_id": str(session_id or tool_context.get("session_id") or ""),
+                "task_id": str(tool_context.get("task_id") or ""),
+                "workspace_id": str(tool_context.get("workspace_id") or ""),
+            }
+        )
+
+    async def _get_idempotent_result(
+        self,
+        call: dict,
+        *,
+        session_id: str | None,
+        tool_context: dict[str, Any],
+    ) -> ToolResult | None:
+        scope = self._idempotency_scope(
+            call, session_id=session_id, tool_context=tool_context
+        )
+        if not scope:
+            return None
+        arguments_digest = _canonical_digest(call.get("arguments", {}))
+        async with self._idempotency_lock:
+            record = self._idempotency_results.get(scope)
+            if record is None:
+                return None
+            if record.arguments_digest != arguments_digest:
+                raise PermissionDeniedError(
+                    "idempotency key was reused with different tool arguments"
+                )
+            return record.result
+
+    async def _store_idempotent_result(
+        self,
+        call: dict,
+        *,
+        session_id: str | None,
+        tool_context: dict[str, Any],
+        result: ToolResult,
+    ) -> None:
+        scope = self._idempotency_scope(
+            call, session_id=session_id, tool_context=tool_context
+        )
+        if not scope:
+            return
+        async with self._idempotency_lock:
+            if len(self._idempotency_results) >= _IDEMPOTENCY_CACHE_LIMIT:
+                oldest = min(
+                    self._idempotency_results,
+                    key=lambda item: self._idempotency_results[item].stored_at,
+                )
+                self._idempotency_results.pop(oldest, None)
+            self._idempotency_results[scope] = _IdempotencyRecord(
+                arguments_digest=_canonical_digest(call.get("arguments", {})),
+                result=result,
             )
 
     async def _confirm(
@@ -980,9 +1532,12 @@ class ToolScheduler:
                 value = await asyncio.wait_for(value, timeout=remaining)
             except asyncio.TimeoutError:
                 return {"approved": False, "reason": "approval_callback_timeout"}
-        if isinstance(value, bool):
-            return {"approved": value}
-        return dict(value)
+        normalized = _normalize_confirmation(value)
+        if normalized.get("reason") == "invalid_confirmation_response":
+            logger.warning(
+                "approval callback returned a malformed response; denying request"
+            )
+        return normalized
 
     async def aclose(self) -> None:
         """Close every runtime-owned background process handle."""
@@ -990,11 +1545,15 @@ class ToolScheduler:
 
     @staticmethod
     def _normalize_call(call: dict) -> dict:
-        return {
+        normalized = {
             "id": str(call.get("id") or call.get("tool_call_id") or call.get("name")),
             "name": str(call["name"]),
             "arguments": dict(call.get("arguments") or {}),
         }
+        idempotency_key = call.get("idempotency_key") or call.get("_idempotency_key")
+        if idempotency_key:
+            normalized["_idempotency_key"] = str(idempotency_key)
+        return normalized
 
 
 def _canonical_digest(value: object) -> str:

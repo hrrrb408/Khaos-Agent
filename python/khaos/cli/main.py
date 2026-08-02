@@ -178,6 +178,12 @@ def build_command_parser() -> argparse.ArgumentParser:
         default=None,
         help="SQLite database path (default: ~/.khaos/state/<project-id>/state.db)",
     )
+    start_parser.add_argument(
+        "--gateway-uid",
+        type=int,
+        default=None,
+        help="Expected UID of the Gateway peer (container deployments set this explicitly)",
+    )
     start_parser.add_argument("--config", default="config.yaml")
     start_parser.add_argument("--gateway", action="store_true", help="Also start Go gateway")
 
@@ -313,6 +319,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 project_root=Path.cwd(),
                 config_path=Path(args.config),
                 gateway_capability=gateway_capability,
+                gateway_uid=args.gateway_uid,
                 gateway_pid=gateway_pid,
             )
         )

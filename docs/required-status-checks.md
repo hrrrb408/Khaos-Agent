@@ -77,6 +77,7 @@ PR checks UI), grouped by workflow.
 | Check name | Proves |
 |---|---|
 | `docker-isolation` | real Docker daemon sandbox isolation |
+| `compose-deployment` | clean-checkout Compose startup, loopback-only development HTTP, and TLS/API-key/Host-allowlisted production HTTPS health checks |
 
 ### `Supply Chain Audit` (`.github/workflows/supply-chain-audit.yml`)
 

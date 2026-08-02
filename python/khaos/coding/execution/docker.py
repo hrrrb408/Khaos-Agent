@@ -193,10 +193,13 @@ class DockerBackend:
                 cwd=context.cwd,
                 permission_profile=context.permission_profile,
                 correlation_id=execution_id,
+                workspace_root_identity=context.workspace_root_identity,
+                workspace_cwd_identity=context.workspace_cwd_identity,
             )
             result = await self.supervisor.run(
                 docker_request,
                 cwd=context.cwd,
+                execution_root=context.worktree_path,
                 env={"PATH": os.environ.get("PATH", "")},
                 # The Docker daemon enforces the request's pids/CPU/memory/
                 # tmpfs limits on the container. Applying the payload's

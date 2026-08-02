@@ -1,6 +1,19 @@
-version: "3.8"
-
 services:
+  khaos-agent-init:
+    build:
+      context: .
+      target: python-agent
+    container_name: khaos-agent-init
+    user: "0:0"
+    entrypoint: ["python", "/usr/local/sbin/khaos-agent-secret-init.py"]
+    environment:
+      - KHAOS_PYTHON_CAPABILITY_FILE=/run/secrets/khaos_python_capability
+    secrets:
+      - khaos_python_capability
+    volumes:
+      - khaos-state:/var/lib/khaos
+    restart: "no"
+
   khaos-agent:
     build:
       context: .
@@ -8,17 +21,20 @@ services:
     container_name: khaos-agent
     volumes:
       - khaos-data:/app/data
+      - khaos-state:/var/lib/khaos
       - khaos-runtime:/run/khaos
       - khaos-helper-runtime:/run/khaos-helper:ro
       - ./config.yaml:/app/config.yaml:ro
     environment:
       - KHAOS_MODE=office
       - KHAOS_DEV_MODE=0
+      - KHAOS_PROJECT_ROOT=/app
       - KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
       - KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
-      - KHAOS_PYTHON_CAPABILITY_FILE=/run/secrets/khaos_python_capability
-    secrets:
-      - khaos_python_capability
+      - KHAOS_PYTHON_CAPABILITY_FILE=/var/lib/khaos/rpc-capability
+    depends_on:
+      khaos-agent-init:
+        condition: service_completed_successfully
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/khaos/agent.sock'); s.close()"]
@@ -61,29 +77,48 @@ services:
       context: .
       target: gateway
     container_name: khaos-gateway
-    ports:
-      - "8080:8080"
+    # The default Compose path is local development.  Host networking lets
+    # the Gateway bind to loopback inside its namespace while still sharing
+    # the Agent's Unix-socket volume; publishing 0.0.0.0 would contradict the
+    # Gateway's no-TLS-on-non-loopback security contract.
+    network_mode: host
+    command: ["khaos-gateway", "--addr", "127.0.0.1:8080", "--project-root", "/app"]
     depends_on:
       khaos-agent:
         condition: service_healthy
     pid: "service:khaos-agent"
     environment:
       - KHAOS_PYTHON_AGENT=/run/khaos/agent.sock
-      - KHAOS_API_KEY=${KHAOS_API_KEY:-}
+      - KHAOS_API_KEY_FILE=/run/secrets/khaos_api_key
+      - KHAOS_PROJECT_ROOT=/app
       - KHAOS_PYTHON_CAPABILITY_FILE=/run/secrets/khaos_python_capability
     secrets:
-      - khaos_python_capability
+      - source: khaos_python_capability
+        target: khaos_python_capability
+        mode: "0400"
+      - source: khaos_api_key
+        target: khaos_api_key
+        mode: "0400"
     volumes:
       - khaos-runtime:/run/khaos
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
 
 volumes:
   khaos-data:
+  khaos-state:
   khaos-runtime:
   khaos-helper-runtime:
 
 secrets:
   khaos_python_capability:
-    environment: KHAOS_PYTHON_CAPABILITY
+    file: ${KHAOS_PYTHON_CAPABILITY_FILE:-.secrets/python-capability}
   khaos_browser_helper_secret:
-    environment: KHAOS_BROWSER_HELPER_SECRET
+    file: ${KHAOS_BROWSER_HELPER_SECRET_FILE:-.secrets/browser-helper-secret}
+  khaos_api_key:
+    file: ${KHAOS_API_KEY_FILE:-.secrets/gateway-api-key}

@@ -37,7 +37,10 @@ class HostExecutionBackend:
     async def execute(self, request: ExecutionRequest) -> ExecutionResult:
         if not request.argv or any(not isinstance(arg, str) for arg in request.argv):
             raise ValueError("argv must contain at least one string")
-        cwd = request.cwd.expanduser().resolve()
+        # The service has already canonicalized and bound production cwd
+        # identity.  Keep this backend path lexical; the supervisor opens the
+        # validated directory by FD immediately before spawn.
+        cwd = request.cwd.expanduser().absolute()
         if not cwd.is_dir():
             raise ExecutionDenied(f"cwd is not a directory: {cwd}")
         profile = request.permission_profile
@@ -68,6 +71,7 @@ class HostExecutionBackend:
         return await self._get_supervisor().run(
             request,
             cwd=cwd,
+            execution_root=roots[0] if roots else None,
             env=env,
             workspace_root=workspace_root,
             workspace_baseline=request.workspace_baseline,

@@ -39,7 +39,8 @@ async def test_cross_runtime_grant_and_revoke_refresh_before_next_check(tmp_path
         )
     )
     granted = await runtime_b.check(
-        "web_fetch", {"url": "https://example.com/a"}, "network", "office"
+        "web_fetch", {"url": "https://example.com/a"}, "network", "office",
+        source_transport="cli",
     )
     assert granted.approved is ApprovalMode.AUTO_APPROVE
     assert granted.matched_rule is not None

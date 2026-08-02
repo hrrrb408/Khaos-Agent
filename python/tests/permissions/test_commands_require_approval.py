@@ -53,10 +53,12 @@ async def test_policy_requires_approval_overrides_auto_approve_rule(tmp_path):
         tmp_path,
         approval_list=frozenset({"rm"}),
         # A user previously chose "always allow rm".
-        auto_approve_command="rm*",
+        # A concrete subcommand prefix gives the remembered grant something
+        # to match while avoiding the unsafe whole-executable ``rm*`` form.
+        auto_approve_command="rm -i*",
     )
     decision = await engine.check(
-        "terminal", {"command": "rm oldfile"}, "write", "coding"
+        "terminal", {"command": "rm -i oldfile"}, "write", "coding"
     )
     assert decision.requires_user_confirm is True, (
         "policy commands_require_approval must override persistent auto-approve"
@@ -69,7 +71,8 @@ async def test_unlisted_command_unaffected(tmp_path):
         tmp_path, approval_list=frozenset({"rm"})
     )
     decision = await engine.check(
-        "terminal", {"command": "ls -la"}, "write", "coding"
+        "terminal", {"command": "ls -la"}, "write", "coding",
+        source_transport="cli",
     )
     # ls is not on the approval list; falls through to default ask-every.
     assert "Policy requires approval" not in decision.reason
@@ -145,7 +148,8 @@ async def test_unlisted_read_only_command_still_auto_approved(tmp_path):
         tmp_path, approval_list=frozenset({"cat"})
     )
     decision = await engine.check(
-        "terminal", {"command": "ls -la"}, "write", "coding"
+        "terminal", {"command": "ls -la"}, "write", "coding",
+        source_transport="cli",
     )
     # ls is read-only AND not on the approval list → shortcut still applies.
     assert decision.approved is ApprovalMode.AUTO_APPROVE

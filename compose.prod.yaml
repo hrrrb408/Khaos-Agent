@@ -1,0 +1,145 @@
+# Explicit network/production profile.  Use this file by itself, or as an
+# override with the same project name, only after supplying all secret/cert
+# files and a concrete KHAOS_ALLOWED_HOSTS value.
+services:
+  khaos-agent-init:
+    build:
+      context: .
+      target: python-agent
+    container_name: khaos-agent-init
+    user: "0:0"
+    entrypoint: ["python", "/usr/local/sbin/khaos-agent-secret-init.py"]
+    environment:
+      - KHAOS_PYTHON_CAPABILITY_FILE=/run/secrets/khaos_python_capability
+    secrets:
+      - khaos_python_capability
+    volumes:
+      - khaos-state:/var/lib/khaos
+    restart: "no"
+
+  khaos-agent:
+    build:
+      context: .
+      target: python-agent
+    container_name: khaos-agent
+    volumes:
+      - khaos-data:/app/data
+      - khaos-state:/var/lib/khaos
+      - khaos-runtime:/run/khaos
+      - khaos-helper-runtime:/run/khaos-helper:ro
+      - ./config.yaml:/app/config.yaml:ro
+    environment:
+      - KHAOS_MODE=office
+      - KHAOS_DEV_MODE=0
+      - KHAOS_PROJECT_ROOT=/app
+      - KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
+      - KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
+      - KHAOS_PYTHON_CAPABILITY_FILE=/var/lib/khaos/rpc-capability
+    depends_on:
+      khaos-agent-init:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(socket.AF_UNIX); s.connect('/run/khaos/agent.sock'); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  khaos-kernel-helper:
+    build:
+      context: .
+      target: kernel-helper
+    container_name: khaos-kernel-helper
+    user: "0:0"
+    pid: "service:khaos-agent"
+    network_mode: "service:khaos-agent"
+    cap_add:
+      - NET_ADMIN
+      - SYS_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      - KHAOS_BROWSER_KERNEL_HELPER_UID=10001
+      - KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID=1
+      - KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
+      - KHAOS_BROWSER_HELPER_SECRET_FILE=/var/lib/khaos/browser-helper.secret
+      - KHAOS_BROWSER_HELPER_JOURNAL_ROOT=/run/khaos-helper/journal
+    secrets:
+      - khaos_browser_helper_secret
+    volumes:
+      - khaos-helper-runtime:/run/khaos-helper
+      - /sys/fs/cgroup:/sys/fs/cgroup:rw
+      - /run/netns:/run/netns:rshared
+    depends_on:
+      khaos-agent:
+        condition: service_started
+    restart: unless-stopped
+
+  khaos-gateway:
+    build:
+      context: .
+      target: gateway
+    container_name: khaos-gateway
+    ports:
+      - "8443:8443"
+    command:
+      - khaos-gateway
+      - --addr
+      - 0.0.0.0:8443
+      - --project-root
+      - /app
+      - --tls-cert
+      - /run/secrets/khaos_tls_cert
+      - --tls-key
+      - /run/secrets/khaos_tls_key
+      - --allowed-hosts
+      - ${KHAOS_ALLOWED_HOSTS:?KHAOS_ALLOWED_HOSTS must list the trusted HTTP Host names}
+    depends_on:
+      khaos-agent:
+        condition: service_healthy
+    pid: "service:khaos-agent"
+    environment:
+      - KHAOS_PYTHON_AGENT=/run/khaos/agent.sock
+      - KHAOS_API_KEY_FILE=/run/secrets/khaos_api_key
+      - KHAOS_PROJECT_ROOT=/app
+      - KHAOS_PYTHON_CAPABILITY_FILE=/run/secrets/khaos_python_capability
+    secrets:
+      - source: khaos_python_capability
+        target: khaos_python_capability
+        mode: "0400"
+      - source: khaos_api_key
+        target: khaos_api_key
+        mode: "0400"
+      - source: khaos_tls_cert
+        target: khaos_tls_cert
+        mode: "0444"
+      - source: khaos_tls_key
+        target: khaos_tls_key
+        mode: "0400"
+    volumes:
+      - khaos-runtime:/run/khaos
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-check-certificate -q -O /dev/null https://127.0.0.1:8443/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+
+volumes:
+  khaos-data:
+  khaos-state:
+  khaos-runtime:
+  khaos-helper-runtime:
+
+secrets:
+  khaos_python_capability:
+    file: ${KHAOS_PYTHON_CAPABILITY_FILE:-.secrets/python-capability}
+  khaos_browser_helper_secret:
+    file: ${KHAOS_BROWSER_HELPER_SECRET_FILE:-.secrets/browser-helper-secret}
+  khaos_api_key:
+    file: ${KHAOS_API_KEY_FILE:-.secrets/gateway-api-key}
+  khaos_tls_cert:
+    file: ${KHAOS_TLS_CERT_FILE:?KHAOS_TLS_CERT_FILE must point to a PEM certificate}
+  khaos_tls_key:
+    file: ${KHAOS_TLS_KEY_FILE:?KHAOS_TLS_KEY_FILE must point to a PEM private key}

@@ -86,6 +86,14 @@ async def list_permission_rules(
                 "level": rule.permission_level,
                 "approval": rule.approval.value,
                 "mode": rule.mode,
+                "transport_class": rule.transport_class,
+                "grant_lifetime": rule.grant_lifetime,
+                "session_id": rule.session_id,
+                "task_id": rule.task_id,
+                "workspace_id": rule.workspace_id,
+                "expires_at": rule.expires_at,
+                "resource_type": rule.resource_type,
+                "resource_spec": rule.resource_spec,
             }
             for rule in rules
         ],
@@ -101,6 +109,12 @@ async def grant_permission(
     *,
     principal_id: str = "",
     permission_engine: Any = None,
+    source_transport: str | None = None,
+    session_id: str = "",
+    task_id: str = "",
+    workspace_id: str = "",
+    resource_type: str = "",
+    resource_spec: dict[str, Any] | None = None,
     **kwargs: Any,
 ) -> dict[str, Any]:
     """Grant a permission rule bound to the caller's principal.
@@ -115,26 +129,42 @@ async def grant_permission(
         return principal_error
     if permission_engine is None:
         return {"ok": False, "error": "Permission engine not initialized"}
+    from khaos.permissions import is_interactive_transport
+
+    # A model-visible permission-management tool cannot mint a project-wide
+    # unattended grant. The trusted local CLI/TUI can create a project
+    # interactive grant; other transports must use an explicit administrative
+    # control plane rather than inheriting an interactive remember rule.
+    if not is_interactive_transport(source_transport):
+        return {
+            "ok": False,
+            "error": "permission grants require an explicit interactive CLI/TUI transport",
+        }
     from khaos.permissions.engine import (
         ApprovalMode,
         PermissionRule,
         validate_rule_pattern,
     )
 
-    # Round-14 §3: reject overbroad auto-approve / suggest patterns
-    # (``"*"``, ``"**"``, …) before they reach the engine.  A blanket
-    # pattern silently disables the approval gate for the whole
-    # permission level, voiding the ask-every default (ADR-003).
+    # P1-4: relaxing grants must use the typed resource DSL.  DENY and
+    # ASK_EVERY may keep a generic glob because they cannot widen authority.
     try:
         approval_mode = ApprovalMode(approval)
     except ValueError as exc:
         return {"ok": False, "error": f"invalid approval mode: {exc}"}
-    try:
-        validate_rule_pattern(
-            pattern, approval_mode, source="grant_permission"
-        )
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}
+    if approval_mode in {ApprovalMode.AUTO_APPROVE, ApprovalMode.SUGGEST}:
+        if not resource_type or not isinstance(resource_spec, dict):
+            return {
+                "ok": False,
+                "error": "auto-approve/suggest grants require a typed resource_type and resource_spec",
+            }
+    elif not resource_type:
+        try:
+            validate_rule_pattern(
+                pattern, approval_mode, source="grant_permission"
+            )
+        except ValueError as exc:
+            return {"ok": False, "error": str(exc)}
     try:
         rule = await permission_engine.grant_rule(
             PermissionRule(
@@ -143,6 +173,14 @@ async def grant_permission(
                 permission_level=permission_level,
                 approval=approval_mode,
                 mode=mode,
+                transport_class="interactive",
+                grant_lifetime="project_interactive",
+                session_id="",
+                task_id=task_id,
+                workspace_id=workspace_id,
+                created_by=f"permission-tool:{source_transport}",
+                resource_type=resource_type,
+                resource_spec=resource_spec,
             )
         )
     except Exception as exc:
@@ -155,6 +193,8 @@ async def grant_permission(
             "level": rule.permission_level,
             "approval": rule.approval.value,
             "mode": rule.mode,
+            "resource_type": rule.resource_type,
+            "resource_spec": rule.resource_spec,
         },
     }
 

@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from khaos.db.database import Database
+from khaos.db.database import Database, SCHEMA_MIGRATION_VERSION
 
 
 OLD_V6_CHECKSUM = "7bd6cb4e51936c81d3c29ab9b8902f04203374d80d588732e97157b265de8038"
@@ -35,8 +35,8 @@ async def test_real_main_19a2b538_database_upgrades_without_rewriting_provenance
         ledger = raw.execute(
             "SELECT version,name,checksum FROM schema_migrations ORDER BY version"
         ).fetchall()
-        # Round-15 A-2: v9 (audit_log INSERT genesis guard) is now the chain tip.
-        assert ledger[-1][0] == 9
+        # The fixture must upgrade all the way to the current chain tip.
+        assert ledger[-1][0] == SCHEMA_MIGRATION_VERSION
         assert ledger[5] == (
             6,
             "round6_batch64_immutable_migration_chain",

@@ -16,12 +16,28 @@ from khaos.permissions.engine import (
     MIN_RULE_SPECIFICITY,
     validate_rule_pattern,
 )
+from khaos.permissions.rules import legacy_pattern_to_typed
 
 
 @pytest.mark.parametrize("pattern", ["*", "**", "?", "?*", "/*", "[a-z]*", " * "])
 def test_overbroad_auto_approve_patterns_rejected(pattern: str) -> None:
     with pytest.raises(ValueError, match="too broad"):
         validate_rule_pattern(pattern, ApprovalMode.AUTO_APPROVE)
+
+
+@pytest.mark.parametrize("pattern", ["rm*", "terminal:rm*", "process:cp*"])
+def test_short_command_prefixes_are_rejected(pattern: str) -> None:
+    """A short executable wildcard must not become a whole-command grant."""
+    with pytest.raises(ValueError, match="too broad"):
+        validate_rule_pattern(pattern, ApprovalMode.AUTO_APPROVE)
+
+
+@pytest.mark.parametrize("pattern", ["rm*", "terminal:git *"])
+def test_legacy_command_wildcards_cannot_become_empty_argv_prefix(pattern: str) -> None:
+    with pytest.raises(ValueError, match="argv prefix|too broad"):
+        legacy_pattern_to_typed(
+            pattern, "execute", ApprovalMode.AUTO_APPROVE
+        )
 
 
 def test_overbroad_suggest_patterns_rejected() -> None:

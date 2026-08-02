@@ -240,13 +240,30 @@ CREATE TABLE IF NOT EXISTS permissions (
     principal_id     TEXT NOT NULL DEFAULT 'legacy',
     project_id       TEXT NOT NULL DEFAULT '',
     policy_digest    TEXT NOT NULL DEFAULT '',
-    generation       INTEGER NOT NULL DEFAULT 0
+    generation       INTEGER NOT NULL DEFAULT 0,
+    -- Phase-1 authority scope: a remembered interactive grant must not
+    -- silently apply to unattended transports or another session/task.
+    transport_class  TEXT NOT NULL DEFAULT 'interactive',
+    grant_lifetime    TEXT NOT NULL DEFAULT 'project_interactive',
+    session_id       TEXT NOT NULL DEFAULT '',
+    task_id          TEXT NOT NULL DEFAULT '',
+    workspace_id     TEXT NOT NULL DEFAULT '',
+    expires_at       REAL,
+    created_by       TEXT NOT NULL DEFAULT '',
+    resource_type    TEXT NOT NULL DEFAULT '',
+    resource_spec    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE INDEX IF NOT EXISTS idx_permissions_level ON permissions(permission_level, mode);
 -- M4 batch 3.1.16A-2: principal-scoped lookup index.
 CREATE INDEX IF NOT EXISTS idx_permissions_principal
     ON permissions(principal_id, project_id, policy_digest, generation, mode, permission_level);
+CREATE INDEX IF NOT EXISTS idx_permissions_scope
+    ON permissions(principal_id, project_id, policy_digest, generation,
+                   transport_class, grant_lifetime, session_id, task_id);
+CREATE INDEX IF NOT EXISTS idx_permissions_resource
+    ON permissions(principal_id, project_id, policy_digest, generation,
+                   resource_type, permission_level);
 
 CREATE TABLE IF NOT EXISTS authorization_contexts (
     principal_id  TEXT NOT NULL,

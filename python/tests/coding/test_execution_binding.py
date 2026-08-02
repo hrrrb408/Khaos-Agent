@@ -10,6 +10,9 @@ from khaos.coding.execution import (
     ExecutionService,
     HostExecutionBackend,
 )
+from khaos.coding.execution.binding import open_execution_directory_binding
+from khaos.coding.execution.supervisor import execution_binding_preexec
+from khaos.coding.execution.supervisor import ProcessSupervisor
 from khaos.coding.workspace.manager import WorkspaceManager
 
 
@@ -71,6 +74,69 @@ def test_execution_service_cannot_be_rebound_to_another_runtime():
         service.bind_runtime_authority(
             principal_id="alice", project_id="project-a", runtime_id="runtime-b"
         )
+
+
+def test_child_preexec_rejects_worktree_identity_swap(tmp_path: Path):
+    """The final child-side check must fail before a swapped path can exec."""
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    expected = worktree.stat()
+    expected_identity = (int(expected.st_dev), int(expected.st_ino))
+
+    moved = tmp_path / "moved-aside"
+    worktree.rename(moved)
+    worktree.mkdir()
+
+    hook = execution_binding_preexec(
+        root_path=worktree,
+        root_identity=expected_identity,
+        cwd_path=worktree,
+        cwd_identity=expected_identity,
+    )
+    assert hook is not None
+    with pytest.raises(PermissionError, match="identity changed"):
+        hook()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_uses_pinned_directory_fd_for_child_cwd(tmp_path: Path):
+    root = tmp_path / "worktree"
+    cwd = root / "src"
+    cwd.mkdir(parents=True)
+    root_info = root.stat()
+    cwd_info = cwd.stat()
+    request = ExecutionRequest(
+        (
+            sys.executable,
+            "-c",
+            "import os; print(os.getcwd())",
+        ),
+        cwd,
+        access_mode="workspace-write",
+        workspace_root_identity=(int(root_info.st_dev), int(root_info.st_ino)),
+        workspace_cwd_identity=(int(cwd_info.st_dev), int(cwd_info.st_ino)),
+    )
+
+    result = await ProcessSupervisor().run(
+        request,
+        cwd=cwd,
+        execution_root=root,
+        enforce_resource_limits=False,
+    )
+
+    assert result.status == "passed"
+    assert result.stdout.strip() == str(cwd)
+
+
+def test_directory_binding_rejects_symlinked_cwd_component(tmp_path: Path):
+    root = tmp_path / "worktree"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (root / "linked").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(PermissionError):
+        open_execution_directory_binding(root, root / "linked")
 
 
 @pytest.mark.asyncio

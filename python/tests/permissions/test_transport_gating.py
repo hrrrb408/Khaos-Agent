@@ -4,8 +4,8 @@ interactive transport.
 An unattended transport (webhook / cron / rpc) must NOT auto-approve even
 read-only shell — a malicious inbound message could otherwise drive
 ``cat ~/.ssh/id_rsa`` / ``grep AKIA .`` with no human in the loop and
-exfiltrate the output.  Only interactive transports (cli / tui / unknown)
-keep the convenience shortcut.
+exfiltrate the output. Only explicit interactive transports (cli / tui) keep
+the convenience shortcut.
 """
 
 import pytest
@@ -37,7 +37,7 @@ async def test_unattended_transport_does_not_auto_approve_read_only_shell(
     await db.close()
 
 
-@pytest.mark.parametrize("transport", ["cli", "tui", ""])
+@pytest.mark.parametrize("transport", ["cli", "tui"])
 async def test_interactive_transport_keeps_read_only_auto_approve(
     tmp_path, transport: str
 ) -> None:
@@ -78,18 +78,23 @@ async def test_webhook_transport_dangerous_command_still_ask_every(tmp_path) -> 
     await db.close()
 
 
-async def test_default_source_transport_is_interactive_for_backward_compat(
-    tmp_path,
+@pytest.mark.parametrize("transport", [None, "", "unknown", "future-transport"])
+async def test_missing_or_unknown_source_transport_is_fail_closed(
+    tmp_path, transport: str | None
 ) -> None:
-    """Callers that don't pass ``source_transport`` (legacy/default) are
-    treated as interactive so existing behavior is preserved."""
+    """Missing/unknown security context must not obtain interactive access."""
     db = Database(tmp_path / "khaos.db")
     await db.connect()
     await db.run_migrations()
     engine = PermissionEngine(db)
     await engine.load_rules()
     decision = await engine.check(
-        "terminal", {"command": "cat /etc/hosts"}, "execute", "coding"
+        "terminal",
+        {"command": "cat /etc/hosts"},
+        "execute",
+        "coding",
+        source_transport=transport,
     )
-    assert decision.approved is ApprovalMode.AUTO_APPROVE
+    assert decision.approved is ApprovalMode.ASK_EVERY
+    assert decision.requires_user_confirm is True
     await db.close()

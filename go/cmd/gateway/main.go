@@ -63,6 +63,7 @@ func main() {
 	defaultAPIKeyFile := os.Getenv("KHAOS_API_KEY_FILE")
 	defaultAllowedOrigins := os.Getenv("KHAOS_CORS_ORIGINS")
 	defaultAllowedHosts := os.Getenv("KHAOS_ALLOWED_HOSTS")
+	defaultConfigAdmins := os.Getenv("KHAOS_CONFIG_ADMIN_PRINCIPALS")
 	defaultTLSCert := os.Getenv("KHAOS_TLS_CERT")
 	defaultTLSKey := os.Getenv("KHAOS_TLS_KEY")
 	defaultPythonAgent := os.Getenv("KHAOS_PYTHON_AGENT")
@@ -74,6 +75,7 @@ func main() {
 	apiKeyFile := flag.String("api-key-file", defaultAPIKeyFile, "path to the mode-0600 local gateway token")
 	allowedOrigins := flag.String("cors-origins", defaultAllowedOrigins, "comma-separated exact browser origins")
 	allowedHosts := flag.String("allowed-hosts", defaultAllowedHosts, "comma-separated HTTP Host names")
+	configAdmins := flag.String("config-admin-principals", defaultConfigAdmins, "comma-separated principals allowed to read/write /api/config")
 	tlsCert := flag.String("tls-cert", defaultTLSCert, "TLS certificate PEM (required for non-loopback listen)")
 	tlsKey := flag.String("tls-key", defaultTLSKey, "TLS private key PEM (required for non-loopback listen)")
 	pythonAddr := flag.String("python-agent", defaultPythonAgent, "Python AgentService Unix socket path")
@@ -119,8 +121,9 @@ func main() {
 		agent = mockAgentClient{}
 	} else {
 		initial := platform.PythonClient{
-			Address:    *pythonAddr,
-			Capability: pythonCapability,
+			Address:            *pythonAddr,
+			Capability:         pythonCapability,
+			RequireNegotiation: true,
 		}
 		resolved, resolveErr := resolvePythonClient(initial, *projectRoot, initial.BootstrapPolicyDigest)
 		if resolveErr != nil {
@@ -153,6 +156,7 @@ func main() {
 	)
 	handler = handler.WithAllowedOrigins(splitCSV(*allowedOrigins)...)
 	handler = handler.WithAllowedHosts(allowedHostnames(*addr, splitCSV(*allowedHosts))...)
+	handler = handler.WithConfigAdminPrincipals(splitCSV(*configAdmins)...)
 	// When talking to a real Python agent, also forward audit queries. The mock
 	// agent path leaves audit unconfigured (GET /api/audit returns []).
 	// C-2-1: all interfaces receive the SAME pythonClient (which is also

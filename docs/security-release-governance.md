@@ -1,0 +1,37 @@
+# Security Release Governance
+
+This repository has one declared maintainer, so repository ownership and
+independent review are separate controls.  A security-sensitive change is not
+release-ready merely because the maintainer can approve it.
+
+## Required controls
+
+1. Protect `main` against force-push and deletion.
+2. Require the `Security Closure Gate` on the exact pull-request head.
+3. Require at least one approving review from a reviewer who is not the
+   author of the change for paths covered by `.github/CODEOWNERS`.
+4. Require signed release tags and retain the commit-bound Security Evidence
+   Artifact with the release record.
+5. Keep GitHub Actions pinned to immutable commit SHAs; the generated
+   inventory check must fail if an unpinned action is introduced.
+6. Do not merge Docker, lockfile, workflow, permission, audit, RPC, or native
+   helper changes while the corresponding real-kernel or supply-chain job is
+   skipped, cancelled, or unavailable.
+
+## Evidence boundary
+
+Local Python/Go/Rust tests prove source-level contracts only.  Linux namespace,
+cgroup, nftables, Docker Compose, and native helper acceptance remain CI-only
+on this macOS workstation.  Windows is a fail-closed unsupported platform,
+not a parity claim.  The local audit chain anchor detects database rollback or
+history edits, but a remote WORM audit sink and independent human review are
+external release controls and are not implemented by this repository.
+
+## Release checklist
+
+- `python scripts/generate_security_inventory.py --check`
+- `python scripts/generate_browser_kernel_protocol.py --check`
+- `git diff --check`
+- Security Closure Gate passed for the release commit.
+- Evidence artifact, reviewer identity, signed tag, and any CI-only skips are
+  recorded together.

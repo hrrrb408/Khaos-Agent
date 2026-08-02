@@ -1,0 +1,15 @@
+# Security-critical ownership.  Repository rules must require an independent
+# approval for these paths; CODEOWNERS alone is not a substitute for branch
+# protection or a second human reviewer.
+
+/python/khaos/security/ @hrrrb408
+/python/khaos/permissions/ @hrrrb408
+/python/khaos/audit/ @hrrrb408
+/python/khaos/grpc_server.py @hrrrb408
+/python/khaos/db/ @hrrrb408
+/go/internal/platform/ @hrrrb408
+/rust/khaos-core/src/bin/ @hrrrb408
+/Dockerfile @hrrrb408
+/*compose*.yml @hrrrb408
+/.github/workflows/ @hrrrb408
+/scripts/generate_security_inventory.py @hrrrb408

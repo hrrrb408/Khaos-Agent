@@ -39,7 +39,11 @@ except ImportError:  # pragma: no cover — Windows
     _fcntl = None
 
 from khaos.agent.approval import ApprovalBroker
-from khaos.audit import AuditLogger, resolve_safe_audit_log_path
+from khaos.audit import (
+    AuditLogger,
+    resolve_safe_audit_anchor_path,
+    resolve_safe_audit_log_path,
+)
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.channels import (
@@ -76,6 +80,42 @@ logger = logging.getLogger(__name__)
 
 RPC_MAX_REQUEST_BYTES = 1024 * 1024
 RPC_AUTH_WINDOW_SECONDS = 30
+# Internal Gateway RPC v2 makes the protocol version and deployment binding
+# explicit. Version 1 remains available only under the explicit development
+# mode test contract; production must never silently downgrade to a request
+# that omits project/policy claims.
+RPC_PROTOCOL_VERSION = 2
+RPC_PROTOCOL_MIN_VERSION = 2
+RPC_PROTOCOL_MAX_VERSION = 2
+RPC_SCHEMA_VERSION = 1
+RPC_METHOD_SCHEMA_VERSION = 1
+RPC_INITIALIZE_METHOD = "RPC.Initialize"
+RPC_FEATURES = (
+    "hmac-v2",
+    "project-policy-claims",
+    "method-schema-v1",
+    "typed-error-codes",
+    "unknown-fields-reject",
+)
+RPC_REQUIRED_SECURITY_FIELDS = (
+    "principal_id",
+    "payload_digest",
+    "project_id",
+    "policy_digest",
+)
+RPC_ERROR_CODES = (
+    "invalid_json",
+    "unauthenticated",
+    "rpc_negotiation_required",
+    "rpc_protocol_unsupported",
+    "rpc_schema_unsupported",
+    "rpc_feature_mismatch",
+    "rpc_unknown_field",
+    "rpc_claim_missing",
+    "project_drift",
+    "policy_drift",
+    "unknown_method",
+)
 # M2: bounded shutdown deadlines so a stuck handler / chat / detached
 # subagent task cannot wedge server teardown.  These are fail-safe
 # ceilings — the underlying close/orphan-drain phases still enforce the
@@ -613,10 +653,16 @@ def _load_rpc_capability() -> str:
         entry = path.lstat()
         if stat.S_ISLNK(entry.st_mode):
             raise PermissionError("RPC capability file must not be a symlink")
-        if not stat.S_ISREG(entry.st_mode) or entry.st_uid != os.getuid():
+        if not stat.S_ISREG(entry.st_mode):
             raise PermissionError("RPC capability file must be an owner-held regular file")
         mode = stat.S_IMODE(entry.st_mode)
         is_container_secret = str(path).startswith("/run/secrets/")
+        # Docker Compose file-backed secrets are mounted root-owned and the
+        # local Docker Desktop engine ignores the long-syntax uid/gid fields.
+        # The container-secret contract is therefore non-writable rather than
+        # current-UID-owned; ordinary host files remain owner-held below.
+        if not is_container_secret and entry.st_uid != os.getuid():
+            raise PermissionError("RPC capability file must be an owner-held regular file")
         if (is_container_secret and mode & 0o222) or (
             not is_container_secret and mode & 0o077
         ):
@@ -655,7 +701,12 @@ def _load_rpc_capability() -> str:
 
 
 class GatewayRPCAuthenticator:
-    """Verify peer UID and one-shot, method-scoped Gateway capabilities."""
+    """Verify peer UID and one-shot, method-scoped Gateway capabilities.
+
+    Protocol v1 is retained only for explicit ``KHAOS_DEV_MODE=1`` callers so
+    old unit/integration adapters can be migrated without widening the
+    production socket contract. Production callers must send v2.
+    """
 
     def __init__(
         self,
@@ -663,12 +714,20 @@ class GatewayRPCAuthenticator:
         *,
         expected_uid: int | None = None,
         expected_pid: int | None = None,
+        require_protocol_v2: bool | None = None,
+        require_protocol_metadata: bool = False,
     ) -> None:
         if len(capability) < 32:
             raise ValueError("Gateway RPC capability must contain at least 32 characters")
         self._key = capability.encode("utf-8")
         self._expected_uid = os.getuid() if expected_uid is None else expected_uid
         self._expected_pid = expected_pid
+        self._require_protocol_v2 = (
+            os.environ.get("KHAOS_DEV_MODE") != "1"
+            if require_protocol_v2 is None
+            else require_protocol_v2
+        )
+        self._require_protocol_metadata = require_protocol_metadata
         self._bound_pid: int | None = None
         self._used_nonces: dict[str, float] = {}
 
@@ -735,6 +794,17 @@ class GatewayRPCAuthenticator:
         auth = request.get("auth")
         if not isinstance(auth, dict) or not isinstance(payload, dict):
             raise PermissionError("RPC authentication envelope is required")
+        try:
+            protocol_version = int(request.get("protocol_version", 1))
+        except (TypeError, ValueError) as exc:
+            raise PermissionError("RPC protocol_version is invalid") from exc
+        if protocol_version not in (1, RPC_PROTOCOL_VERSION):
+            raise PermissionError("RPC protocol_version is unsupported")
+        if self._require_protocol_v2 and protocol_version != RPC_PROTOCOL_VERSION:
+            raise PermissionError("RPC protocol version 2 is required")
+        protocol_metadata = _rpc_protocol_metadata(
+            request, require=self._require_protocol_metadata,
+        )
         nonce = str(auth.get("nonce") or "")
         principal_id = str(auth.get("principal_id") or "")
         payload_digest = str(auth.get("payload_digest") or "")
@@ -754,12 +824,31 @@ class GatewayRPCAuthenticator:
         expected_digest = hashlib.sha256(canonical_payload).hexdigest()
         if not hmac.compare_digest(payload_digest, expected_digest):
             raise PermissionError("RPC payload digest mismatch")
-        signed = (
-            f"{method}\n{nonce}\n{issued_at}\n{principal_id}\n{payload_digest}"
-        ).encode("utf-8")
+        if protocol_version == RPC_PROTOCOL_VERSION:
+            signed_text = (
+                f"{protocol_version}\n{method}\n{nonce}\n{issued_at}\n"
+                f"{principal_id}\n{payload_digest}"
+            )
+            if protocol_metadata is not None:
+                signed_text += (
+                    f"\n{protocol_metadata['min_version']}"
+                    f"\n{protocol_metadata['max_version']}"
+                    f"\n{protocol_metadata['schema_version']}"
+                    f"\n{protocol_metadata['method_schema_version']}"
+                    f"\n{protocol_metadata['feature_digest']}"
+                )
+        else:
+            # Legacy v1 signature layout. This branch is reachable only in
+            # explicit development mode; it is intentionally not accepted by
+            # a production authenticator.
+            signed_text = (
+                f"{method}\n{nonce}\n{issued_at}\n{principal_id}\n"
+                f"{payload_digest}"
+            )
+        signed = signed_text.encode("utf-8")
         method_key = hmac.new(
             self._key,
-            f"khaos-rpc-method-v1\n{method}".encode("utf-8"),
+            f"khaos-rpc-method-v{protocol_version}\n{method}".encode("utf-8"),
             hashlib.sha256,
         ).digest()
         expected_mac = hmac.new(method_key, signed, hashlib.sha256).hexdigest()
@@ -780,6 +869,217 @@ class GatewayRPCAuthenticator:
             if value >= cutoff
         }
         return principal_id
+
+
+def _rpc_binding_claim_error(
+    payload: dict,
+    *,
+    bound_project_id: str,
+    bound_policy_digest: str,
+    require_claims: bool,
+) -> tuple[str, str] | None:
+    """Return a stable error for missing or drifting RPC deployment claims."""
+    claimed_project_id = payload.get("project_id")
+    claimed_policy_digest = payload.get("policy_digest")
+    if require_claims:
+        if not isinstance(claimed_project_id, str) or not claimed_project_id.strip():
+            return (
+                "rpc_claim_missing",
+                "project_id claim is required for production RPC v2",
+            )
+        if not isinstance(claimed_policy_digest, str) or not claimed_policy_digest.strip():
+            return (
+                "rpc_claim_missing",
+                "policy_digest claim is required for production RPC v2",
+            )
+    if claimed_project_id and claimed_project_id != bound_project_id:
+        return (
+            "project_drift",
+            f"payload project_id {claimed_project_id!r} does not match "
+            f"server-bound project_id {bound_project_id!r}",
+        )
+    if claimed_policy_digest and claimed_policy_digest != bound_policy_digest:
+        return (
+            "policy_drift",
+            f"payload policy_digest {claimed_policy_digest!r} does not match "
+            f"server-bound policy_digest {bound_policy_digest!r}",
+        )
+    return None
+
+
+class RPCProtocolError(PermissionError):
+    """Structured protocol error used during RPC envelope negotiation."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def _rpc_feature_digest(features: list[str] | tuple[str, ...]) -> str:
+    """Hash the canonical feature list that is bound into the HMAC."""
+    canonical = json.dumps(
+        sorted(features), ensure_ascii=False, separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def _rpc_protocol_metadata(
+    request: dict, *, require: bool,
+) -> dict[str, Any] | None:
+    """Validate the negotiated protocol metadata on one request."""
+    metadata = request.get("protocol")
+    if metadata is None and not require:
+        return None
+    if not isinstance(metadata, dict):
+        raise RPCProtocolError(
+            "rpc_schema_unsupported",
+            "RPC protocol metadata is required",
+        )
+    allowed = {
+        "min_version", "max_version", "schema_version",
+        "method_schema_version", "features", "feature_digest",
+        "unknown_field_policy",
+    }
+    unknown = set(metadata) - allowed
+    if unknown:
+        raise RPCProtocolError(
+            "rpc_unknown_field",
+            "RPC protocol metadata contains unknown fields",
+        )
+    min_version = metadata.get("min_version")
+    max_version = metadata.get("max_version")
+    schema_version = metadata.get("schema_version")
+    method_schema_version = metadata.get("method_schema_version")
+    if any(
+        type(value) is not int
+        for value in (min_version, max_version, schema_version, method_schema_version)
+    ):
+        raise RPCProtocolError(
+            "rpc_schema_unsupported",
+            "RPC protocol versions must be integers",
+        )
+    if not (
+        min_version <= RPC_PROTOCOL_VERSION <= max_version
+        and min_version <= max_version
+    ):
+        raise RPCProtocolError(
+            "rpc_protocol_unsupported",
+            "RPC protocol version is outside the supported negotiation window",
+        )
+    if schema_version != RPC_SCHEMA_VERSION:
+        raise RPCProtocolError(
+            "rpc_schema_unsupported",
+            "RPC envelope schema version is unsupported",
+        )
+    if method_schema_version != RPC_METHOD_SCHEMA_VERSION:
+        raise RPCProtocolError(
+            "rpc_schema_unsupported",
+            "RPC method schema version is unsupported",
+        )
+    features = metadata.get("features")
+    if (
+        not isinstance(features, list)
+        or any(type(feature) is not str for feature in features)
+        or len(set(features)) != len(features)
+    ):
+        raise RPCProtocolError(
+            "rpc_feature_mismatch",
+            "RPC feature capability list is invalid",
+        )
+    feature_digest = metadata.get("feature_digest")
+    if type(feature_digest) is not str or not hmac.compare_digest(
+        feature_digest, _rpc_feature_digest(features)
+    ):
+        raise RPCProtocolError(
+            "rpc_feature_mismatch",
+            "RPC feature capability digest is invalid",
+        )
+    if metadata.get("unknown_field_policy") != "reject":
+        raise RPCProtocolError(
+            "rpc_unknown_field",
+            "RPC unknown-field policy must be reject",
+        )
+    missing = set(RPC_FEATURES) - set(features)
+    if missing:
+        raise RPCProtocolError(
+            "rpc_feature_mismatch",
+            "RPC client omitted required security features",
+        )
+    return metadata
+
+
+def _rpc_initialize_response(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate an initialize payload and return the selected contract."""
+    allowed = {
+        "min_protocol_version", "max_protocol_version", "schema_version",
+        "method_schema_version", "features", "project_id", "policy_digest",
+    }
+    unknown = set(payload) - allowed
+    if unknown:
+        raise RPCProtocolError(
+            "rpc_unknown_field",
+            "RPC initialize payload contains unknown fields",
+        )
+    min_version = payload.get("min_protocol_version")
+    max_version = payload.get("max_protocol_version")
+    schema_version = payload.get("schema_version")
+    method_schema_version = payload.get("method_schema_version")
+    if any(
+        type(value) is not int
+        for value in (min_version, max_version, schema_version, method_schema_version)
+    ):
+        raise RPCProtocolError(
+            "rpc_schema_unsupported",
+            "RPC initialize versions must be integers",
+        )
+    if not (
+        min_version <= RPC_PROTOCOL_VERSION <= max_version
+        and min_version <= max_version
+    ):
+        raise RPCProtocolError(
+            "rpc_protocol_unsupported",
+            "RPC initialize version range is unsupported",
+        )
+    if schema_version != RPC_SCHEMA_VERSION:
+        raise RPCProtocolError(
+            "rpc_schema_unsupported",
+            "RPC initialize schema version is unsupported",
+        )
+    if method_schema_version != RPC_METHOD_SCHEMA_VERSION:
+        raise RPCProtocolError(
+            "rpc_schema_unsupported",
+            "RPC initialize method schema version is unsupported",
+        )
+    features = payload.get("features")
+    if (
+        not isinstance(features, list)
+        or any(type(feature) is not str for feature in features)
+        or len(set(features)) != len(features)
+    ):
+        raise RPCProtocolError(
+            "rpc_feature_mismatch",
+            "RPC initialize feature capability list is invalid",
+        )
+    missing = set(RPC_FEATURES) - set(features)
+    if missing:
+        raise RPCProtocolError(
+            "rpc_feature_mismatch",
+            "RPC client omitted required security features",
+        )
+    return {
+        "ok": True,
+        "protocol": {
+            "selected_version": RPC_PROTOCOL_VERSION,
+            "min_supported_version": RPC_PROTOCOL_MIN_VERSION,
+            "max_supported_version": RPC_PROTOCOL_MAX_VERSION,
+            "schema_version": RPC_SCHEMA_VERSION,
+            "method_schema_version": RPC_METHOD_SCHEMA_VERSION,
+            "features": list(RPC_FEATURES),
+            "required_security_fields": list(RPC_REQUIRED_SECURITY_FIELDS),
+            "unknown_field_policy": "reject",
+            "error_codes": list(RPC_ERROR_CODES),
+        },
+    }
 
 
 @dataclass
@@ -876,6 +1176,11 @@ class AgentService:
                 log_path=resolve_safe_audit_log_path(
                     self._effective_policy.audit_log_path
                 ),
+                anchor_path=(
+                    resolve_safe_audit_anchor_path(_bound_project_id)
+                    if os.environ.get("KHAOS_DEV_MODE") != "1"
+                    else None
+                ),
                 # A2-6: bind the server-lifecycle AuditLogger to the
                 # local-uid principal (matching MemoryService / ModeManager
                 # above) and stamp the effective policy digest on every row
@@ -963,6 +1268,8 @@ class AgentService:
 
     async def start(self) -> None:
         """Start process-scoped background services."""
+        if self._audit_logger is not None:
+            await self._audit_logger.verify_anchor()
         # C-1-5a: ``TaskService`` now lazily constructs per-principal
         # TaskManagers on first use (``_manager(ctx)``), so there's no
         # server-level ``task_manager.load()`` at startup.
@@ -2289,7 +2596,10 @@ async def serve_json_lines(
     uds_path = Path(socket_path).expanduser().resolve()
     capability = gateway_capability or _load_rpc_capability()
     authenticator = GatewayRPCAuthenticator(
-        capability, expected_uid=gateway_uid, expected_pid=gateway_pid
+        capability,
+        expected_uid=gateway_uid,
+        expected_pid=gateway_pid,
+        require_protocol_metadata=os.environ.get("KHAOS_DEV_MODE") != "1",
     )
     uds_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     parent_stat = uds_path.parent.stat()
@@ -2445,6 +2755,12 @@ async def serve_json_lines(
                     return
                 try:
                     principal_id = authenticator.authenticate(request, peer_pid=peer_pid)
+                except RPCProtocolError as exc:
+                    writer.write((json.dumps({
+                        "error": exc.code, "message": str(exc),
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
                 except PermissionError as exc:
                     writer.write((json.dumps({
                         "error": "unauthenticated", "message": str(exc),
@@ -2453,6 +2769,70 @@ async def serve_json_lines(
                     return
                 method = request.get("method")
                 payload = request.get("payload", {})
+                require_initialize = os.environ.get("KHAOS_DEV_MODE") != "1"
+                if require_initialize and method != RPC_INITIALIZE_METHOD:
+                    writer.write((json.dumps({
+                        "error": "rpc_negotiation_required",
+                        "message": (
+                            "RPC.Initialize must complete before service requests"
+                        ),
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
+                if method == RPC_INITIALIZE_METHOD:
+                    try:
+                        if not isinstance(payload, dict):
+                            raise RPCProtocolError(
+                                "rpc_schema_unsupported",
+                                "RPC initialize payload must be an object",
+                            )
+                        initialize_response = _rpc_initialize_response(payload)
+                    except RPCProtocolError as exc:
+                        writer.write((json.dumps({
+                            "error": exc.code,
+                            "message": str(exc),
+                        }) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        return
+                    writer.write(
+                        (json.dumps(initialize_response, ensure_ascii=False) + "\n")
+                        .encode("utf-8")
+                    )
+                    await writer.drain()
+                    # Production clients reuse the negotiated connection for
+                    # exactly one authenticated service request.  The
+                    # initialize frame is never treated as a service call.
+                    line = await reader.readline()
+                    if not line:
+                        return
+                    try:
+                        request = _parse_json_line(line)
+                    except ValueError as exc:
+                        writer.write((json.dumps({
+                            "error": "invalid_json",
+                            "message": str(exc),
+                        }) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        return
+                    try:
+                        principal_id = authenticator.authenticate(
+                            request, peer_pid=peer_pid,
+                        )
+                    except RPCProtocolError as exc:
+                        writer.write((json.dumps({
+                            "error": exc.code,
+                            "message": str(exc),
+                        }) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        return
+                    except PermissionError as exc:
+                        writer.write((json.dumps({
+                            "error": "unauthenticated", "message": str(exc),
+                        }) + "\n").encode("utf-8"))
+                        await writer.drain()
+                        return
+                    method = request.get("method")
+                    payload = request.get("payload", {})
                 # C-1-4: Bootstrap.GetPolicyDigest — Gateway startup
                 # handshake.  Returns the server-bound policy_digest so
                 # the Gateway can stamp it on all subsequent RPC payloads
@@ -2464,6 +2844,25 @@ async def serve_json_lines(
                 if method == "Bootstrap.GetPolicyDigest":
                     writer.write((json.dumps({
                         "policy_digest": agent._effective_policy.digest,
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
+                # Internal RPC v2 is the production contract. The Gateway
+                # must complete the bootstrap handshake and carry both
+                # server-bound claims on every non-bootstrap request. Empty
+                # claims remain available only under the explicit test/dev
+                # mode, never as a production compatibility default.
+                claim_error = _rpc_binding_claim_error(
+                    payload,
+                    bound_project_id=agent._bound_project_id,
+                    bound_policy_digest=agent._effective_policy.digest,
+                    require_claims=os.environ.get("KHAOS_DEV_MODE") != "1",
+                )
+                if claim_error is not None:
+                    error_code, error_message = claim_error
+                    writer.write((json.dumps({
+                        "error": error_code,
+                        "message": error_message,
                     }) + "\n").encode("utf-8"))
                     await writer.drain()
                     return
@@ -2533,25 +2932,10 @@ async def serve_json_lines(
                 # attempt to cross-contaminate project state (e.g.
                 # write audit rows / memories / coding tasks attributed
                 # to the wrong project).  Fail-closed: reject before
-                # any service method runs.  An empty claim (Go side
-                # didn't send ``project_id``) is accepted — backward
-                # compat with older Gateways — and ``ctx.project_id``
-                # remains the server-bound value.
-                claimed_project_id = payload.get("project_id", "")
-                if (
-                    claimed_project_id
-                    and claimed_project_id != agent._bound_project_id
-                ):
-                    writer.write((json.dumps({
-                        "error": "project_drift",
-                        "message": (
-                            f"payload project_id {claimed_project_id!r} "
-                            f"does not match server-bound project_id "
-                            f"{agent._bound_project_id!r}"
-                        ),
-                    }) + "\n").encode("utf-8"))
-                    await writer.drain()
-                    return
+                # any service method runs. Empty claims are accepted only
+                # under explicit development mode; production v2 rejects
+                # them before this point, and ``ctx.project_id`` remains
+                # the server-bound value.
                 # Pop ``project_id`` from the payload so downstream
                 # ``ChatRequest(**payload)`` / ``ConfirmRequest(**payload)``
                 # etc. don't receive an unexpected keyword.  The
@@ -2570,26 +2954,11 @@ async def serve_json_lines(
                 # A, then routed a request to a Python server with
                 # policy B — either a restart with a different
                 # khaos_policy.yaml, or a misconfigured multi-server
-                # deployment.  Fail-closed: reject before any service
-                # method runs.  An empty claim (Go side didn't send
-                # ``policy_digest``, e.g. older Gateway or bootstrap
-                # handshake failed) is accepted — backward compat — and
-                # ``ctx.policy_digest`` remains the server-bound value.
-                claimed_policy_digest = payload.get("policy_digest", "")
-                if (
-                    claimed_policy_digest
-                    and claimed_policy_digest != agent._effective_policy.digest
-                ):
-                    writer.write((json.dumps({
-                        "error": "policy_drift",
-                        "message": (
-                            f"payload policy_digest {claimed_policy_digest!r} "
-                            f"does not match server-bound policy_digest "
-                            f"{agent._effective_policy.digest!r}"
-                        ),
-                    }) + "\n").encode("utf-8"))
-                    await writer.drain()
-                    return
+                # deployment. Fail-closed: reject before any service
+                # method runs. Empty claims are accepted only under
+                # explicit development mode; production v2 rejects them
+                # before this point, and ``ctx.policy_digest`` remains
+                # the server-bound value.
                 # Pop ``policy_digest`` from the payload so downstream
                 # ``ChatRequest(**payload)`` / ``ConfirmRequest(**payload)``
                 # etc. don't receive an unexpected keyword.  The
@@ -2723,7 +3092,10 @@ async def serve_json_lines(
                     response = await _handle_optional_subagent(subagent_service, "status", ctx, payload)
                     writer.write((json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8"))
                 else:
-                    writer.write(json.dumps({"error": "unknown method"}).encode("utf-8") + b"\n")
+                    writer.write(json.dumps({
+                        "error": "unknown_method",
+                        "message": "unknown method",
+                    }).encode("utf-8") + b"\n")
                 await writer.drain()
             except Exception as exc:
                 # A service-level miss or validation error must remain a

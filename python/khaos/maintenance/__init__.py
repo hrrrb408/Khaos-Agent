@@ -18,9 +18,13 @@ Calling recovery periodically was the C-05 bug: hourly maintenance
 terminated active chats that were waiting on long tool calls because
 their lease had expired between heartbeat renewals.
 
+Privileged browser cgroup/netns/nft orphan recovery is owned by the
+root-only Rust kernel helper, which replays and authenticates its journal
+before binding the helper socket. The Python maintenance loop must not scan
+or mutate those kernel resources as an unprivileged process.
+
 Future tasks (deferred to a later batch):
   - prune idle task managers
-  - cleanup stale cgroups/netns/wrappers
 """
 
 from __future__ import annotations
@@ -71,7 +75,9 @@ class MaintenanceService:
     ``boot_id`` to avoid recovering the current process's own active
     streams).  See the module docstring for the rationale.
 
-    The service is best-effort: if a GC cycle raises, the error is
+    Privileged browser resource recovery is deliberately outside this class;
+    the root-only kernel helper performs that startup reaper before it accepts
+    requests. The service is best-effort: if a GC cycle raises, the error is
     logged and the next cycle proceeds normally.  It never crashes the
     host process.
     """
@@ -184,4 +190,3 @@ class MaintenanceService:
             logger.error("maintenance: prune_approval_ledger failed: %s", exc)
 
         return counts
-

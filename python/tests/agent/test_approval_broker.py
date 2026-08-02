@@ -110,10 +110,12 @@ async def test_tool_approval_timeout_is_one_shot():
     ) is False
 
 
-async def test_tool_call_id_cannot_be_rebound_across_scope_or_arguments():
+async def test_tool_call_id_reuse_isolated_by_server_approval_id():
     broker = ApprovalBroker()
     binding = _binding("call-rebind")
-    await broker.register_tool_approval(binding)
+    first = await broker.register_tool_approval(binding)
+    same = await broker.register_tool_approval(binding)
+    assert same.approval_id == first.approval_id
 
     for mutated in (
         replace(binding, principal_id="other-principal"),
@@ -122,8 +124,74 @@ async def test_tool_call_id_cannot_be_rebound_across_scope_or_arguments():
         replace(binding, arguments_digest="c" * 64),
         replace(binding, profile_digest="d" * 64),
     ):
-        with pytest.raises(PermissionError, match="already bound"):
-            await broker.register_tool_approval(mutated)
+        registration = await broker.register_tool_approval(mutated)
+        assert registration.approval_id != first.approval_id
+        assert registration != first
+
+
+async def test_same_model_call_id_can_be_approved_in_two_sessions():
+    broker = ApprovalBroker()
+    first_binding = _binding("same-model-id")
+    second_binding = replace(
+        first_binding,
+        principal_id="other-principal",
+        session_id="other-session",
+        task_id="other-task",
+        nonce="f" * 64,
+    )
+    first = await broker.register_tool_approval(first_binding)
+    second = await broker.register_tool_approval(second_binding)
+
+    assert first.approval_id != second.approval_id
+    assert await broker.resolve(
+        "same-model-id",
+        True,
+        principal_id="principal",
+        session_id="session",
+        binding_digest=first,
+    ) is True
+    assert await broker.resolve(
+        "same-model-id",
+        True,
+        principal_id="other-principal",
+        session_id="other-session",
+        binding_digest=second,
+    ) is True
+
+
+async def test_pending_approval_quotas_are_scoped_and_expired_records_do_not_count():
+    broker = ApprovalBroker(max_pending_per_principal_session=2, max_pending_per_turn=1)
+    first_binding = _binding("quota-first")
+    await broker.register_tool_approval(first_binding)
+
+    with pytest.raises(PermissionError, match="quota exceeded for turn"):
+        await broker.register_tool_approval(_binding("quota-second"))
+
+    other_turn = replace(first_binding, tool_call_id="quota-other-turn", turn_id="turn-2")
+    await broker.register_tool_approval(other_turn)
+    with pytest.raises(PermissionError, match="quota exceeded for principal/session"):
+        await broker.register_tool_approval(
+            replace(first_binding, tool_call_id="quota-third", turn_id="turn-3")
+        )
+
+    other_principal = replace(
+        first_binding,
+        principal_id="other-principal",
+        tool_call_id="quota-other-principal",
+    )
+    await broker.register_tool_approval(other_principal)
+
+    expired = replace(
+        first_binding,
+        tool_call_id="quota-expired",
+        turn_id="turn-expired",
+        expires_at=time.time() - 1,
+    )
+    expired_broker = ApprovalBroker(max_pending_per_principal_session=1, max_pending_per_turn=1)
+    await expired_broker.register_tool_approval(expired)
+    await expired_broker.register_tool_approval(
+        replace(expired, tool_call_id="quota-after-expired", expires_at=time.time() + 60)
+    )
 
 
 async def test_operation_approval_is_bound_and_single_use():
