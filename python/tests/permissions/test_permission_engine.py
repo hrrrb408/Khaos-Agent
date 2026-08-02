@@ -83,12 +83,24 @@ async def test_revoke_rule(tmp_path):
     # Round-14 §3: use a specific pattern; a bare "*" auto-approve rule is
     # now rejected by validate_rule_pattern (it would void the approval
     # gate).  The revoke path under test is pattern-independent.
+    specific_root = tmp_path / "specific"
     rule = await engine.grant_rule(
-        PermissionRule(None, "/tmp/specific/*", "read", ApprovalMode.AUTO_APPROVE, "all")
+        PermissionRule(
+            None,
+            str(specific_root / "*"),
+            "read",
+            ApprovalMode.AUTO_APPROVE,
+            "all",
+        )
     )
 
     await engine.revoke_rule(rule.id or 0)
-    decision = await engine.check("read_file", {"path": "/tmp/specific/a.txt"}, "read", "coding")
+    decision = await engine.check(
+        "read_file",
+        {"path": specific_root / "a.txt"},
+        "read",
+        "coding",
+    )
 
     assert decision.approved is ApprovalMode.ASK_EVERY
     await db.close()

@@ -69,7 +69,7 @@ def _require_absolute_path(value: str, *, name: str, source: str) -> str:
     if _has_glob_meta(value):
         raise ValueError(f"{source}: typed resource field {name!r} must not contain glob syntax")
     normalized = os.path.normpath(value)
-    if not normalized.startswith(os.path.sep):
+    if not os.path.isabs(normalized):
         raise ValueError(f"{source}: typed resource field {name!r} is not a valid path")
     return normalized
 
@@ -453,7 +453,11 @@ def legacy_pattern_to_typed(
         )
 
     path_pattern = _split_path_pattern(text)
-    if text.startswith(os.path.sep) or (not _has_glob_meta(text) and "/" in text):
+    # ``os.path.sep`` only catches rooted paths on the current platform.  A
+    # Windows drive-qualified path (``C:\\workspace\\file``) is absolute but
+    # does not start with ``\\``; use the platform-aware predicate so legacy
+    # path grants are materialized as filesystem rules on every supported OS.
+    if os.path.isabs(text) or (not _has_glob_meta(text) and "/" in text):
         if path_pattern is not None:
             root, _ = path_pattern
             spec = {"path": root, "recursive": True}
