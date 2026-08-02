@@ -23,6 +23,7 @@ mod unix {
     #[derive(Default)]
     struct Options {
         new_session: bool,
+        preserve_directory_fds: bool,
         root_fd: Option<RawFd>,
         root_device: Option<u64>,
         root_inode: Option<u64>,
@@ -62,11 +63,21 @@ mod unix {
             }
         }
         // The directory descriptors are authority capabilities used only for
-        // identity verification and fchdir.  They must not remain available
-        // to the executed command (or to any child it creates).  The native
-        // launcher has no protocol descriptors beyond stdio, so the inherited
-        // descriptor policy is an explicit whitelist of 0/1/2.
-        close_authority_fds(options.root_fd, options.cwd_fd);
+        // identity verification and fchdir.  Ordinary commands must not
+        // retain them.  Bubblewrap is an explicit protocol exception: it
+        // resolves the already-validated workspace source through
+        // /proc/self/fd before constructing its mount namespace.
+        // Default policy: explicit whitelist of 0/1/2; only that protocol can
+        // extend it with bound directory FDs.
+        let preserved = if options.preserve_directory_fds {
+            vec![options.root_fd, options.cwd_fd]
+                .into_iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        } else {
+            close_authority_fds(options.root_fd, options.cwd_fd);
+            Vec::new()
+        };
         apply_limit(libc::RLIMIT_FSIZE, options.rlimit_fsize)?;
         apply_limit(libc::RLIMIT_NOFILE, options.rlimit_nofile)?;
         apply_limit(libc::RLIMIT_CPU, options.rlimit_cpu)?;
@@ -75,7 +86,7 @@ mod unix {
         #[cfg(target_os = "macos")]
         let _ = options.rlimit_as;
 
-        close_inherited_fds()?;
+        close_inherited_fds_except(&preserved)?;
 
         let mut child = Command::new(&command[0]);
         child.args(&command[1..]);
@@ -104,6 +115,14 @@ mod unix {
                     return Err(invalid("duplicate --new-session"));
                 }
                 options.new_session = true;
+                index += 1;
+                continue;
+            }
+            if values[index] == "--preserve-directory-fds" {
+                if options.preserve_directory_fds {
+                    return Err(invalid("duplicate --preserve-directory-fds"));
+                }
+                options.preserve_directory_fds = true;
                 index += 1;
                 continue;
             }
@@ -148,6 +167,12 @@ mod unix {
             if fd.is_some() != (device.is_some() && inode.is_some()) {
                 return Err(invalid(&format!("incomplete {label} identity")));
             }
+        }
+        if options.preserve_directory_fds && (options.root_fd.is_none() || options.cwd_fd.is_none())
+        {
+            return Err(invalid(
+                "preserving directory descriptors requires root and cwd bindings",
+            ));
         }
         Ok(())
     }
@@ -217,30 +242,71 @@ mod unix {
         }
     }
 
-    /// Close every descriptor except stdin/stdout/stderr before exec.
+    /// Close every descriptor except stdin/stdout/stderr and explicit protocol FDs.
     ///
     /// Linux uses the atomic close_range syscall when available.  The
     /// bounded fallback is retained for older kernels and macOS; neither
     /// path preserves arbitrary inherited descriptors.
-    fn close_inherited_fds() -> io::Result<()> {
+    fn close_inherited_fds_except(preserved: &[RawFd]) -> io::Result<()> {
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            let result = unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    3 as libc::c_uint,
-                    u32::MAX as libc::c_uint,
-                    0 as libc::c_uint,
-                )
-            };
-            if result == 0 {
-                return Ok(());
+            let mut fds = preserved
+                .iter()
+                .copied()
+                .filter(|fd| *fd > 2)
+                .collect::<Vec<_>>();
+            fds.sort_unstable();
+            fds.dedup();
+            let mut start = 3_u32;
+            let mut supported = true;
+            for fd in fds {
+                let end = fd as u32 - 1;
+                if start > end {
+                    start = fd as u32 + 1;
+                    continue;
+                }
+                let result = unsafe {
+                    libc::syscall(
+                        libc::SYS_close_range,
+                        start as libc::c_uint,
+                        end as libc::c_uint,
+                        0 as libc::c_uint,
+                    )
+                };
+                if result != 0 {
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() == Some(libc::ENOSYS)
+                        || error.raw_os_error() == Some(libc::EINVAL)
+                    {
+                        supported = false;
+                        break;
+                    }
+                    return Err(error);
+                }
+                start = fd as u32 + 1;
             }
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ENOSYS)
-                && error.raw_os_error() != Some(libc::EINVAL)
-            {
-                return Err(error);
+            if supported {
+                if start <= u32::MAX {
+                    let result = unsafe {
+                        libc::syscall(
+                            libc::SYS_close_range,
+                            start as libc::c_uint,
+                            u32::MAX as libc::c_uint,
+                            0 as libc::c_uint,
+                        )
+                    };
+                    if result == 0 {
+                        return Ok(());
+                    }
+                    let error = io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ENOSYS)
+                        && error.raw_os_error() != Some(libc::EINVAL)
+                    {
+                        return Err(error);
+                    }
+                } else {
+                    return Ok(());
+                }
             }
         }
 
@@ -249,6 +315,9 @@ mod unix {
             return Ok(());
         }
         for fd in 3..maximum {
+            if preserved.contains(&(fd as RawFd)) {
+                continue;
+            }
             unsafe { libc::close(fd as RawFd) };
         }
         Ok(())

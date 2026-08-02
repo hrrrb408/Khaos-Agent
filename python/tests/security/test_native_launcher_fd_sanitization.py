@@ -19,6 +19,8 @@ def test_rust_launcher_has_stdio_only_fd_policy() -> None:
     ).read_text(encoding="utf-8")
 
     assert "close_authority_fds(options.root_fd, options.cwd_fd)" in source
+    assert "--preserve-directory-fds" in source
+    assert "close_inherited_fds_except" in source
     assert "SYS_close_range" in source
     assert "for fd in 3..maximum" in source
     assert "explicit whitelist of 0/1/2" in source
@@ -80,6 +82,64 @@ def test_python_development_launcher_closes_authority_fds(tmp_path) -> None:
     assert completed.returncode == 0, completed.stderr
     inherited = json.loads(completed.stdout.strip())
     assert all(fd <= 2 for fd in inherited)
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="child FD inspection requires /proc/self/fd",
+)
+def test_python_development_launcher_preserves_only_bound_directory_fds(tmp_path) -> None:
+    root = tmp_path / "root"
+    root.mkdir()
+    cwd = root / "cwd"
+    cwd.mkdir()
+    root_fd = os.open(root, os.O_RDONLY)
+    cwd_fd = os.open(cwd, os.O_RDONLY)
+    extra_fd = os.open(root / "extra", os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        root_stat = os.fstat(root_fd)
+        cwd_stat = os.fstat(cwd_fd)
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "khaos.coding.execution.native_launcher_runtime",
+                "--root-fd",
+                str(root_fd),
+                "--root-device",
+                str(root_stat.st_dev),
+                "--root-inode",
+                str(root_stat.st_ino),
+                "--cwd-fd",
+                str(cwd_fd),
+                "--cwd-device",
+                str(cwd_stat.st_dev),
+                "--cwd-inode",
+                str(cwd_stat.st_ino),
+                "--preserve-directory-fds",
+                "--",
+                sys.executable,
+                "-c",
+                "import json, os; print(json.dumps(sorted(int(x) for x in os.listdir('/proc/self/fd') if x.isdigit())))",
+            ],
+            pass_fds=(root_fd, cwd_fd, extra_fd),
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**os.environ, "PYTHONPATH": str(ROOT / "python")},
+        )
+    finally:
+        for fd in (root_fd, cwd_fd, extra_fd):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    assert completed.returncode == 0, completed.stderr
+    inherited = json.loads(completed.stdout.strip())
+    assert root_fd in inherited
+    assert cwd_fd in inherited
+    assert extra_fd not in inherited
 
 
 @pytest.mark.skipif(

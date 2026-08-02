@@ -646,6 +646,7 @@ class LinuxBubblewrapBackend:
                         workspace_root=worktree if writable else None,
                         workspace_baseline=request.workspace_baseline,
                         directory_binding=directory_binding,
+                        preserve_directory_fds=True,
                     )
                 except (OSError, PermissionError):
                     self._capability_cache = None

@@ -23,10 +23,26 @@ def main(argv: list[str]) -> int:
         )
     if "cwd_fd" in options:
         os.fchdir(int(options["cwd_fd"]))
+    preserve_directory_fds = bool(options.get("preserve_directory_fds"))
+    if preserve_directory_fds and (
+        options.get("root_fd") is None or options.get("cwd_fd") is None
+    ):
+        raise ValueError(
+            "preserving directory descriptors requires root and cwd bindings"
+        )
+    preserved = tuple(
+        dict.fromkeys(
+            int(options[key])
+            for key in ("root_fd", "cwd_fd")
+            if options.get(key) is not None
+        )
+    ) if preserve_directory_fds else ()
     # Directory descriptors are authority capabilities, not child-process
     # resources.  The explicit-development launcher mirrors the Rust
-    # launcher's stdio-only inheritance policy before exec.
-    _close_inherited_fds()
+    # launcher's stdio-only inheritance policy before exec.  Bubblewrap is
+    # the one explicit protocol exception: it resolves a validated workspace
+    # source through /proc/self/fd before constructing its mount namespace.
+    _close_inherited_fds(preserved)
     _set_limit("RLIMIT_FSIZE", options)
     _set_limit("RLIMIT_NOFILE", options)
     _set_limit("RLIMIT_CPU", options)
@@ -49,6 +65,12 @@ def _parse(argv: list[str]) -> tuple[dict[str, int | bool], list[str]]:
             if options.get("new_session"):
                 raise ValueError("duplicate --new-session")
             options["new_session"] = True
+            index += 1
+            continue
+        if value == "--preserve-directory-fds":
+            if options.get("preserve_directory_fds"):
+                raise ValueError("duplicate --preserve-directory-fds")
+            options["preserve_directory_fds"] = True
             index += 1
             continue
         if not value.startswith("--") or index + 1 >= len(argv):
@@ -98,13 +120,16 @@ def _set_limit(name: str, options: dict[str, int | bool]) -> None:
     resource.setrlimit(resource_id, (effective, effective))
 
 
-def _close_inherited_fds() -> None:
-    """Close all inherited descriptors except the standard streams."""
+def _close_inherited_fds(preserved: tuple[int, ...] = ()) -> None:
+    """Close inherited descriptors except stdio and explicit protocol FDs."""
+    preserved_fds = set(preserved)
     try:
         maximum = int(os.sysconf("SC_OPEN_MAX"))
     except (AttributeError, OSError, ValueError):
         maximum = 1024
     for fd in range(3, max(3, maximum)):
+        if fd in preserved_fds:
+            continue
         try:
             os.close(fd)
         except OSError:
