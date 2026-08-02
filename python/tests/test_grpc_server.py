@@ -1,9 +1,11 @@
 import asyncio
-import subprocess
-import os
 import hashlib
 import hmac
 import json
+import os
+import socket
+import struct
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -1170,6 +1172,29 @@ def test_rpc_authentication_binds_first_valid_gateway_pid():
     second = _signed_rpc_request("TaskService.List", {}, nonce="q" * 32)
     with pytest.raises(PermissionError, match="bound Gateway"):
         authenticator.authenticate(second, peer_pid=1002)
+
+
+def test_rpc_peer_uid_is_sufficient_when_container_pid_is_unavailable(monkeypatch):
+    class PeerSocket:
+        def getsockopt(self, *_args):
+            return struct.pack("3i", 0, 10002, 0)
+
+    class Writer:
+        def get_extra_info(self, name):
+            assert name == "socket"
+            return PeerSocket()
+
+    monkeypatch.delattr(socket, "LOCAL_PEERCRED", raising=False)
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+
+    authenticator = GatewayRPCAuthenticator("c" * 48, expected_uid=10002)
+    assert authenticator.verify_peer(Writer()) is None
+
+    bound = GatewayRPCAuthenticator(
+        "c" * 48, expected_uid=10002, expected_pid=1234
+    )
+    with pytest.raises(PermissionError, match="PID is unavailable"):
+        bound.verify_peer(Writer())
 
 
 def test_rpc_capability_loads_protected_file_and_rejects_default_env(tmp_path, monkeypatch):

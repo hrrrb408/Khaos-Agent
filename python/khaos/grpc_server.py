@@ -732,7 +732,7 @@ class GatewayRPCAuthenticator:
         self._bound_pid: int | None = None
         self._used_nonces: dict[str, float] = {}
 
-    def verify_peer(self, writer: asyncio.StreamWriter) -> int:
+    def verify_peer(self, writer: asyncio.StreamWriter) -> int | None:
         peer = writer.get_extra_info("socket")
         if peer is None:
             raise PermissionError("RPC peer socket identity is unavailable")
@@ -783,7 +783,13 @@ class GatewayRPCAuthenticator:
             ) from exc
         if peer_uid != self._expected_uid:
             raise PermissionError("RPC peer UID is not the configured Gateway UID")
+        # A UDS shared between containers can preserve the peer UID while
+        # omitting a meaningful PID across PID namespaces.  The production
+        # capability and UID checks still bind the caller in that topology;
+        # require a PID only when the caller explicitly configured one.
         if peer_pid is None or peer_pid <= 0:
+            if self._expected_pid is None:
+                return None
             raise PermissionError("RPC peer PID is unavailable")
         if self._expected_pid is not None and peer_pid != self._expected_pid:
             raise PermissionError("RPC peer PID is not the configured Gateway PID")
@@ -2746,7 +2752,8 @@ async def serve_json_lines(
             try:
                 try:
                     peer_pid = authenticator.verify_peer(writer)
-                except PermissionError:
+                except PermissionError as exc:
+                    logger.warning("RPC peer rejected before request framing: %s", exc)
                     return
                 line = await reader.readline()
                 if not line:

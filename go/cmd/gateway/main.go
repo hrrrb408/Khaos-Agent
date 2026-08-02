@@ -422,20 +422,29 @@ func loadOrCreateAPIKey(configured, configuredPath string) (string, string, erro
 			return "", "", errors.New("Windows gateway token must be inside the current user config directory")
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
-		return "", "", fmt.Errorf("create gateway token directory: %w", err)
+	secretMount := isContainerSecretPath(absolute)
+	if !secretMount {
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
+			return "", "", fmt.Errorf("create gateway token directory: %w", err)
+		}
 	}
 	directoryInfo, err := os.Lstat(filepath.Dir(absolute))
 	if err != nil || !directoryInfo.IsDir() || directoryInfo.Mode()&os.ModeSymlink != 0 {
 		return "", "", errors.New("gateway token parent must be a real directory")
 	}
-	if err := os.Chmod(filepath.Dir(absolute), 0o700); err != nil {
+	if secretMount {
+		if runtime.GOOS != "windows" && directoryInfo.Mode().Perm()&0o022 != 0 {
+			return "", "", errors.New("gateway token secret parent must not be writable by group or others")
+		}
+	} else if err := os.Chmod(filepath.Dir(absolute), 0o700); err != nil {
 		return "", "", fmt.Errorf("protect gateway token directory: %w", err)
 	}
-	if key, err := readProtectedToken(absolute); err == nil {
+	if key, err := readProtectedToken(absolute, secretMount); err == nil {
 		return key, absolute, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", "", err
+	} else if secretMount {
+		return "", "", fmt.Errorf("gateway token secret is missing: %w", err)
 	}
 	random := make([]byte, 32)
 	if _, err := rand.Read(random); err != nil {
@@ -444,7 +453,7 @@ func loadOrCreateAPIKey(configured, configuredPath string) (string, string, erro
 	key := base64.RawURLEncoding.EncodeToString(random)
 	file, err := os.OpenFile(absolute, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
-		loaded, loadErr := readProtectedToken(absolute)
+		loaded, loadErr := readProtectedToken(absolute, secretMount)
 		return loaded, absolute, loadErr
 	}
 	if err != nil {
@@ -465,13 +474,28 @@ func loadOrCreateAPIKey(configured, configuredPath string) (string, string, erro
 	return key, absolute, nil
 }
 
-func readProtectedToken(path string) (string, error) {
+func isContainerSecretPath(path string) bool {
+	const secretRoot = "/run/secrets"
+	clean := filepath.Clean(path)
+	return filepath.Dir(clean) == secretRoot && filepath.Base(clean) != "."
+}
+
+func readProtectedToken(path string, containerSecret bool) (string, error) {
 	entryInfo, err := os.Lstat(path)
 	if err != nil {
 		return "", err
 	}
-	if !entryInfo.Mode().IsRegular() || (runtime.GOOS != "windows" && entryInfo.Mode().Perm()&0o077 != 0) {
-		return "", errors.New("gateway token must be a regular file inaccessible to group and others")
+	if !entryInfo.Mode().IsRegular() {
+		return "", errors.New("gateway token must be a regular file")
+	}
+	if runtime.GOOS != "windows" {
+		unsafeMode := entryInfo.Mode().Perm() & 0o077
+		if containerSecret {
+			unsafeMode = entryInfo.Mode().Perm() & 0o022
+		}
+		if unsafeMode != 0 {
+			return "", errors.New("gateway token has unsafe group/other permissions")
+		}
 	}
 	file, err := os.Open(path)
 	if err != nil {
