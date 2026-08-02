@@ -54,9 +54,9 @@
 - `python/khaos/coding/execution/service.py`: `02e2c44a4d227ebdd94154bf293a68ccc584b24b4fc2e476bf6ec0ed3b7b109a`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `cd2fd041601e05effcdeb43396b008772a15f3f7557ff6fbffec516f40392787`
-- `python/khaos/grpc_server.py`: `a086601291af8a2cbcd94e56d214d05e0e27bd9ad141eb3528f7554d5291611d`
+- `python/khaos/grpc_server.py`: `4206e317aa42a701663e29f7651f3e9534e01c688b5769b55588947c80ac7a0f`
 - `go/internal/api/handler.go`: `5c8be560dc037bb49c553115213c0bb5a285a601da201c8361844980b7661719`
-- `go/cmd/gateway/main.go`: `ace650ab109416722b91c9af206e7261eee40e4f0ed973ad7c97ef6c17f5b509`
+- `go/cmd/gateway/main.go`: `919157cb7304aff7d790260ffb195621aa5a82bdf5137d5e63ed86c2128bc9fe`
 - `go/internal/platform/python_client.go`: `0d040b26828864662e872c17fb8371d0cb81dcdfd49d682d449df1754bc08d0d`
 
 ## Required release gates

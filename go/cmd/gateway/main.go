@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -493,10 +494,13 @@ func loadOrCreateAPIKey(configured, configuredPath string) (string, string, erro
 	return key, absolute, nil
 }
 
-func isContainerSecretPath(path string) bool {
+func isContainerSecretPath(filePath string) bool {
 	const secretRoot = "/run/secrets"
-	clean := filepath.Clean(path)
-	return filepath.Dir(clean) == secretRoot && filepath.Base(clean) != "."
+	// /run/secrets is a POSIX path inside the container even when the
+	// Gateway binary is compiled or unit-tested on Windows. Do not use the
+	// host filepath separator rules for this virtual container path.
+	clean := pathpkg.Clean(filePath)
+	return pathpkg.Dir(clean) == secretRoot && pathpkg.Base(clean) != "."
 }
 
 func readProtectedToken(path string, containerSecret bool) (string, error) {
