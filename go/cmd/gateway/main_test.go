@@ -68,6 +68,27 @@ func TestReadProtectedTokenContainerSecretAllowsReadOnlyGroupMode(t *testing.T) 
 	}
 }
 
+func TestProtectedFileModeForContainerSecretRejectsWritesOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		mode os.FileMode
+		want bool
+	}{
+		{"host strict", "/tmp/tls-key.pem", 0o440, true},
+		{"container read-only group", "/run/secrets/khaos_tls_key", 0o440, false},
+		{"container read-only other", "/run/secrets/khaos_tls_key", 0o444, false},
+		{"container group-write", "/run/secrets/khaos_tls_key", 0o460, true},
+		{"container other-write", "/run/secrets/khaos_tls_key", 0o402, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := protectedFileModeUnsafe(tc.path, tc.mode); got != tc.want {
+				t.Fatalf("protectedFileModeUnsafe(%q, %o) = %v, want %v", tc.path, tc.mode, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestC_2_1_ResolvePythonClient_RejectsEmptyProjectRoot verifies that
 // production mode is fail-closed on empty --project-root.  C-2-1
 // CRITICAL fix: drift detection cannot be silently disabled.
