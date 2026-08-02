@@ -16,7 +16,7 @@ import ipaddress
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 from urllib.parse import urljoin, urlparse
 
 from khaos.security.host_network import (
@@ -118,7 +118,7 @@ class HTMLToMarkdown:
     BR = re.compile(r"<br\s*/?>", re.IGNORECASE)
 
     # HTML 实体解码
-    ENTITIES = {
+    ENTITIES: ClassVar[dict[str, str]] = {
         "&amp;": "&",
         "&lt;": "<",
         "&gt;": ">",
@@ -199,10 +199,7 @@ class HTMLToMarkdown:
         def _replace_numeric(match: re.Match[str]) -> str:
             raw = match.group(1)
             try:
-                if raw.lower().startswith("x"):
-                    code = int(raw[1:], 16)
-                else:
-                    code = int(raw, 10)
+                code = int(raw[1:], 16) if raw.lower().startswith("x") else int(raw, 10)
                 return chr(code)
             except (ValueError, OverflowError):
                 return match.group(0)
@@ -309,7 +306,7 @@ def extract_metadata(html: str, url: str) -> dict[str, Any]:
             break
         raw = match.group(1)
         normalized = raw.strip()
-        if not normalized or normalized.startswith("#") or normalized.startswith("javascript:"):
+        if not normalized or normalized.startswith(("#", "javascript:")):
             continue
         absolute = urljoin(url, normalized) if url else normalized
         if absolute not in seen_links:
@@ -554,7 +551,7 @@ class _PinnedNetworkBackend:
                     local_address=local_address,
                     socket_options=socket_options,
                 )
-            except Exception as exc:  # network backend errors vary by runtime
+            except Exception as exc:  # noqa: BLE001 - network backend errors vary by runtime
                 last_error = exc
         if last_error is not None:
             raise last_error
@@ -634,22 +631,21 @@ async def _request_httpx(
                 trust_env=False,
                 timeout=httpx.Timeout(timeout),
                 headers={"User-Agent": "KhaosWebFetcher/1.0"},
-            ) as client:
-                async with client.stream(method, current) as response:
-                    status_code = response.status_code
-                    headers = dict(response.headers)
-                    if status_code not in {301, 302, 303, 307, 308}:
-                        content = (
-                            b""
-                            if method == "HEAD"
-                            else await _read_bounded_response(response, body_limit)
-                        )
-                        return _BufferedResponse(
-                            status_code=status_code,
-                            headers=headers,
-                            content=content,
-                            encoding=getattr(response, "encoding", None) or "utf-8",
-                        )
+            ) as client, client.stream(method, current) as response:
+                status_code = response.status_code
+                headers = dict(response.headers)
+                if status_code not in {301, 302, 303, 307, 308}:
+                    content = (
+                        b""
+                        if method == "HEAD"
+                        else await _read_bounded_response(response, body_limit)
+                    )
+                    return _BufferedResponse(
+                        status_code=status_code,
+                        headers=headers,
+                        content=content,
+                        encoding=getattr(response, "encoding", None) or "utf-8",
+                    )
         except httpx.TimeoutException as exc:
             raise TimeoutError(f"Timeout after {timeout}s") from exc
         except httpx.HTTPError as exc:
@@ -672,16 +668,13 @@ async def _fetch_html_httpx(
     *,
     network_guard: _EgressAuthority | None = None,
 ) -> tuple[str, str]:
-    try:
-        response = await _request_httpx(
-            "GET",
-            url,
-            timeout,
-            network_guard=network_guard,
-            body_limit=_MAX_HTML_BYTES,
-        )
-    except HostNetworkDeniedError:
-        raise
+    response = await _request_httpx(
+        "GET",
+        url,
+        timeout,
+        network_guard=network_guard,
+        body_limit=_MAX_HTML_BYTES,
+    )
 
     if response.status_code >= 400:
         raise _HTTPError(response.status_code)
@@ -717,24 +710,21 @@ async def _fetch_head(
     """
     body_limit = _MAX_METADATA_BYTES
     if _HAS_HTTPX:
-        try:
-            # Keep HEAD for status/protocol coverage, then use a separately
-            # validated and pinned GET for the body prefix.
-            await _request_httpx(
-                "HEAD", url, timeout, network_guard=network_guard, body_limit=0
-            )
-            get_resp = await _request_httpx(
-                "GET",
-                url,
-                timeout,
-                network_guard=network_guard,
-                body_limit=body_limit,
-            )
-            if get_resp.status_code >= 400:
-                raise _HTTPError(get_resp.status_code)
-            return dict(get_resp.headers), get_resp.text
-        except HostNetworkDeniedError:
-            raise
+        # Keep HEAD for status/protocol coverage, then use a separately
+        # validated and pinned GET for the body prefix.
+        await _request_httpx(
+            "HEAD", url, timeout, network_guard=network_guard, body_limit=0
+        )
+        get_resp = await _request_httpx(
+            "GET",
+            url,
+            timeout,
+            network_guard=network_guard,
+            body_limit=body_limit,
+        )
+        if get_resp.status_code >= 400:
+            raise _HTTPError(get_resp.status_code)
+        return dict(get_resp.headers), get_resp.text
     raise ConnectionError(
         "secure host fetching requires httpx/httpcore; refusing insecure fallback"
     )

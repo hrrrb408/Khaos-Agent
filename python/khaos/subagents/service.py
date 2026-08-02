@@ -98,7 +98,7 @@ class SubAgentService:
                     "error": result.error or "aborted",
                 }
             return {"ok": True, "task_id": result.id, "status": result.status}
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - RPC handler returns a structured failure
             logger.warning("subagent spawn failed: %s", exc)
             return {"ok": False, "error": str(exc)}
 
@@ -139,7 +139,7 @@ class SubAgentService:
                 "completed": completed,
                 "failed": failed,
             }
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - RPC handler returns a structured failure
             logger.warning("subagent collect failed: %s", exc)
             return {"ok": False, "error": str(exc)}
 

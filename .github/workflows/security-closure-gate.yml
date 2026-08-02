@@ -58,6 +58,12 @@ jobs:
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Build native execution launcher
+        run: |
+          cargo build --locked --release --no-default-features \
+            --bin khaos-exec-launcher \
+            --manifest-path rust/khaos-core/Cargo.toml
+          echo "KHAOS_EXEC_LAUNCHER=$GITHUB_WORKSPACE/rust/khaos-core/target/release/khaos-exec-launcher" >> "$GITHUB_ENV"
       - name: Schema Fuzz
         run: |
           python scripts/generate_security_inventory.py --check
@@ -137,6 +143,11 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
+      - name: Attest the exact gate commit
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          mkdir -p security-evidence
+          printf '%s\n' "$GITHUB_SHA" > security-evidence/commit-attestation.txt
       - name: Download mandatory browser evidence
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
@@ -164,5 +175,5 @@ jobs:
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: security-evidence-${{ github.sha }}
-          path: security-evidence/security-evidence.json
+          path: security-evidence/
           if-no-files-found: error

@@ -167,7 +167,7 @@ def _resolve_within_workspace(path: Path, workspace_root: Path) -> Path:
 
     try:
         resolved_prefix = existing.resolve(strict=True)
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError):
         # If strict resolution fails (broken symlink, permission), fall
         # back to a lexical resolution — the boundary check below will
         # catch any escape.

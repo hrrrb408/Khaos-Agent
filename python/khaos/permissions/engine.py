@@ -10,9 +10,10 @@ import shlex
 import time
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import urlparse
 
+from khaos.audit.logger import AuditLogger
 from khaos.exceptions import PermissionDeniedError
 from khaos.permissions.resource import AuthorizationResource
 from khaos.permissions.rules import (
@@ -128,7 +129,7 @@ def _transport_class(source_transport: str | None) -> str:
 class PermissionRule:
     """Persistent permission rule."""
 
-    id: Optional[int]
+    id: int | None
     pattern: str
     permission_level: str
     approval: ApprovalMode
@@ -162,7 +163,7 @@ class PermissionDecision:
     approved: ApprovalMode
     reason: str
     target: str
-    matched_rule: Optional[PermissionRule] = None
+    matched_rule: PermissionRule | None = None
     requires_user_confirm: bool = False
 
 
@@ -191,14 +192,19 @@ class PermissionEngine:
         db,
         default_mode: ApprovalMode = ApprovalMode.ASK_EVERY,
         *,
-        commands_require_approval: "frozenset[str] | None" = None,
+        commands_require_approval: frozenset[str] | None = None,
         principal_id: str = "legacy",
         project_id: str = "",
         policy_digest: str = "",
         runtime_id: str = "",
-        exec_tool_names: "frozenset[str] | None" = None,
+        exec_tool_names: frozenset[str] | None = None,
+        audit_logger: AuditLogger | None = None,
     ):
         self.db = db
+        # AuditLogger is the sole production audit repository.  Keeping the
+        # writer on the engine prevents permission paths from bypassing the
+        # independent chain anchor and the runtime attribution fields.
+        self._audit_logger = audit_logger
         self._default_mode = default_mode
         self._rules: list[PermissionRule] = []
         # H3: policy-level command approval list.  Checked BEFORE persistent
@@ -625,7 +631,7 @@ class PermissionEngine:
         operation_id: str | None = None,
         authority_generation: int | None = None,
         source_transport: str | None = None,
-    ) -> None:
+    ) -> int:
         """Write a tool permission/execution audit log.
 
         ``risk_level`` (new, optional) tags the severity of the audited
@@ -643,21 +649,33 @@ class PermissionEngine:
         enriched = dict(detail or {})
         if risk_level and "risk_level" not in enriched:
             enriched["risk_level"] = risk_level
-        await self.db.insert_audit_log(
+        audit_logger = self._audit_logger
+        if audit_logger is None:
+            # Library/test callers may construct an engine directly.  Keep
+            # that path usable, but still route it through the same writer
+            # abstraction instead of reaching into Database directly.
+            audit_logger = AuditLogger(
+                self.db,
+                principal_id=self._principal_id,
+                runtime_id=self._runtime_id,
+                policy_digest=self._policy_digest,
+                project_id=self._project_id,
+            )
+            self._audit_logger = audit_logger
+        row_id = await audit_logger.log(
             action=tool_name,
             target=target,
             result=result,
-            detail=json.dumps(enriched, ensure_ascii=False),
+            detail=enriched,
             session_id=session_id,
-            principal_id=self._principal_id,
-            runtime_id=self._runtime_id,
             task_id=task_id,
             operation_id=operation_id,
-            policy_digest=self._policy_digest,
             authority_generation=authority_generation,
             source_transport=source_transport,
-            project_id=self._project_id,
         )
+        if row_id < 0:
+            raise RuntimeError("audit log write was rejected")
+        return row_id
 
     def normalize_target(self, tool_name: str, params: dict) -> str:
         """Normalize a file path, command, URL, or generic call target."""
@@ -709,19 +727,19 @@ def validate_rule_pattern(
     text = str(pattern).strip()
     if not text:
         raise ValueError(f"{source}: pattern must not be empty")
-    fixed_prefix = 0
-    for char in text:
+    fixed_prefix = len(text)
+    for index, char in enumerate(text):
         if char in ("*", "?", "["):
+            fixed_prefix = index
             break
-        fixed_prefix += 1
     required_specificity = MIN_RULE_SPECIFICITY
     command_pattern = _legacy_command_pattern_body(text)
     if command_pattern is not None:
-        command_fixed_prefix = 0
-        for char in command_pattern:
+        command_fixed_prefix = len(command_pattern)
+        for index, char in enumerate(command_pattern):
             if char in ("*", "?", "["):
+                command_fixed_prefix = index
                 break
-            command_fixed_prefix += 1
         # A command pattern is a higher-impact selector than a path prefix.
         # In particular, ``rm*`` becomes an argv-prefix rule with no argv
         # arguments and would therefore match every invocation of ``rm``.
@@ -973,7 +991,7 @@ def _command_text(params: dict) -> str:
     return str(params.get("script") or params.get("command") or params.get("id") or "")
 
 
-def _matches_required_approval(command_text: str, approval_list: "frozenset[str]") -> bool:
+def _matches_required_approval(command_text: str, approval_list: frozenset[str]) -> bool:
     """Whether any segment of ``command_text`` triggers required approval.
 
     Each shell segment is normalized to ``base_cmd args`` and matched against

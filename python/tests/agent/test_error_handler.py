@@ -1,12 +1,11 @@
-import asyncio
 import os
 
-import pytest
 import httpx
-
+import pytest
 from khaos.agent import ErrorCode, ErrorEvent, ErrorHandler, Message
 from khaos.agent.error_handler import ModelContextTooLongError, ModelRateLimitError
 from khaos.db import Database
+from khaos.exceptions import CompressionCircuitOpenError
 
 
 def test_error_event_to_message():
@@ -19,11 +18,12 @@ def test_error_event_to_message():
 def test_classify_errors():
     handler = ErrorHandler()
 
-    assert handler.classify(asyncio.TimeoutError()) is ErrorCode.MODEL_TIMEOUT
+    assert handler.classify(TimeoutError()) is ErrorCode.MODEL_TIMEOUT
     assert handler.classify(httpx.ConnectError("network down")) is ErrorCode.MODEL_UNAVAILABLE
     assert handler.classify(ModelRateLimitError()) is ErrorCode.MODEL_RATE_LIMITED
     assert handler.classify(ModelContextTooLongError()) is ErrorCode.MODEL_CONTEXT_TOO_LONG
     assert handler.classify(PermissionError()) is ErrorCode.PERMISSION_DENIED
+    assert handler.classify(CompressionCircuitOpenError()) is ErrorCode.COMPRESSION_CIRCUIT_OPEN
 
 
 async def test_handle_uses_exception_type_when_message_is_empty(tmp_path):
@@ -49,7 +49,7 @@ async def test_handle_audits_error(tmp_path):
     await db.create_session("s1", principal_id=principal_id)
     handler = ErrorHandler(db=db, principal_id=principal_id)
 
-    event = await handler.handle(asyncio.TimeoutError("slow"), "s1")
+    event = await handler.handle(TimeoutError("slow"), "s1")
     logs = await db.list_audit_logs()
 
     assert event.code is ErrorCode.MODEL_TIMEOUT
@@ -108,7 +108,7 @@ async def test_agent_loop_error_handler_integration(tmp_path):
 
     class FailingRouter:
         async def call(self, function, messages):
-            raise asyncio.TimeoutError("model slow")
+            raise TimeoutError("model slow")
             yield
 
     (tmp_path / "prompts").mkdir()

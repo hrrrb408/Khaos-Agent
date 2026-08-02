@@ -10,12 +10,15 @@ build: build-rust
 
 build-rust:
 	@if [ -d rust/khaos-core ] && command -v cargo >/dev/null 2>&1; then \
-	  cd rust/khaos-core && PYO3_PYTHON=$$(command -v python3.11 || command -v python3) cargo build --release; \
+	  cd rust/khaos-core && PYO3_PYTHON=$$(command -v python3.11 || command -v python3) cargo build --locked --release --bin khaos-exec-launcher; \
 	else echo "rust: toolchain or crate not present, skipping"; fi
 
 test: test-python test-go test-rust
 
 test-python:
+	@if command -v cargo >/dev/null 2>&1 && [ -d rust/khaos-core ]; then \
+	  cargo build --locked --release --no-default-features --bin khaos-exec-launcher --manifest-path rust/khaos-core/Cargo.toml; \
+	else echo "rust: native execution launcher unavailable; Python tests may fail closed"; fi
 	PYTHONPATH=python $(PYTHON) -m pytest python/tests
 
 test-go:

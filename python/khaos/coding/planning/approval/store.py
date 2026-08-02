@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import secrets
+import logging
 import sqlite3
 import time
 import uuid
@@ -47,12 +47,10 @@ from khaos.coding.planning.approval.models import (
     PlanApprovalRequest,
     PlanApprovalStatus,
     PlanExecutionAuthorization,
-    generate_nonce,
-    hash_nonce,
     verify_nonce,
-    verify_receipt_token,
 )
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Schema (also mirrored in khaos/db/schema.sql)
@@ -587,8 +585,8 @@ class PlanApprovalStore:
         try:
             for verifier in self.load_receipt_verifiers():
                 self.__receipt_verifiers[verifier.key_id] = verifier
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("could not load persisted receipt verifiers", exc_info=exc)
 
     def _install_runtime_receipt_writer(
         self, writer: Any, *, runtime_token: object, runtime_capability: Any = None
@@ -1048,9 +1046,9 @@ class PlanApprovalStore:
             # token_hash + matching fields, they cannot produce a valid
             # Ed25519 signature without the broker's private key. Old unsigned
             # receipts (broker_signature="") are rejected fail-closed.
-            row_sig = str(receipt_row["broker_signature"]) if "broker_signature" in receipt_row.keys() else ""
-            row_signer_key_id = str(receipt_row["signer_key_id"]) if "signer_key_id" in receipt_row.keys() else ""
-            row_payload_digest = str(receipt_row["canonical_payload_digest"]) if "canonical_payload_digest" in receipt_row.keys() else ""
+            row_sig = str(receipt_row["broker_signature"]) if "broker_signature" in receipt_row.keys() else ""  # noqa: SIM118 - sqlite3.Row exposes keys explicitly
+            row_signer_key_id = str(receipt_row["signer_key_id"]) if "signer_key_id" in receipt_row.keys() else ""  # noqa: SIM118 - sqlite3.Row exposes keys explicitly
+            row_payload_digest = str(receipt_row["canonical_payload_digest"]) if "canonical_payload_digest" in receipt_row.keys() else ""  # noqa: SIM118 - sqlite3.Row exposes keys explicitly
             if not row_sig or not row_signer_key_id or not row_payload_digest:
                 # Unsigned receipt — fail closed.
                 self._conn.rollback()
@@ -2414,7 +2412,7 @@ class PlanApprovalStore:
         head_sha: str,
         repository_generation: int,
         evidence_digest: str,
-        audit_event: "PlanApprovalAuditEvent | None",
+        audit_event: PlanApprovalAuditEvent | None,
         now: float,
     ) -> bool:
         """Lease-first atomic consume: ONE ``BEGIN IMMEDIATE`` does ALL of:
@@ -2868,10 +2866,12 @@ class PlanApprovalStore:
     def begin_or_resume_rollback(
         self, execution_run_id: str, *, failure_code: str,
         now: float | None = None,
-    ) -> "RollbackResumeState":
+    ) -> RollbackResumeState:
         """Atomically begin or resume rollback without overwriting its reason."""
         from khaos.coding.planning.execution_models import (
-            ExecutionRunStatus, RollbackResumeDisposition, RollbackResumeState,
+            ExecutionRunStatus,
+            RollbackResumeDisposition,
+            RollbackResumeState,
         )
 
         timestamp = time.time() if now is None else float(now)
@@ -3089,15 +3089,19 @@ class PlanApprovalStore:
                     raise RuntimeError("applied object identity evidence missing")
                 if row["operation"] == "rename" and not stored_destination_identity:
                     raise RuntimeError("rename destination identity evidence missing")
-            if target_phase == DurableEditPhase.ROLLED_BACK.value:
-                if expected_phase == DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value:
-                    if (int(row["identity_version"]) != 3
-                            or not row["rollback_identity_digest"]
-                            or not row["rollback_parent_identity_digest"]
-                            or int(row["rollback_sync_mask"]) not in {1, 3}
-                            or not row["rollback_directory_sync_digest"]
-                            or row["rollback_synced_at"] is None):
-                        raise RuntimeError("rollback directory sync evidence missing")
+            if (
+                target_phase == DurableEditPhase.ROLLED_BACK.value
+                and expected_phase == DurableEditPhase.ROLLBACK_DIRECTORY_SYNCED.value
+                and (
+                    int(row["identity_version"]) != 3
+                    or not row["rollback_identity_digest"]
+                    or not row["rollback_parent_identity_digest"]
+                    or int(row["rollback_sync_mask"]) not in {1, 3}
+                    or not row["rollback_directory_sync_digest"]
+                    or row["rollback_synced_at"] is None
+                )
+            ):
+                raise RuntimeError("rollback directory sync evidence missing")
             next_version = int(row["phase_version"]) + (target_phase != expected_phase)
             next_identity_version = int(row["identity_version"])
             if target_phase == DurableEditPhase.FILESYSTEM_APPLIED.value:
@@ -3452,7 +3456,9 @@ class PlanApprovalStore:
         if row is None:
             return None
         from khaos.coding.planning.execution_models import (
-            InitialApprovedEdit, InitialPathState, InitialWorkspaceAttestation,
+            InitialApprovedEdit,
+            InitialPathState,
+            InitialWorkspaceAttestation,
             PlannedEditOperation,
         )
         try:
@@ -3482,7 +3488,8 @@ class PlanApprovalStore:
         if row is None:
             return None
         from khaos.coding.planning.execution_models import (
-            AttestedPathState, FinalMutationAttestation,
+            AttestedPathState,
+            FinalMutationAttestation,
         )
         try:
             payload = json.loads(row["canonical_json"])
@@ -3540,7 +3547,8 @@ class PlanApprovalStore:
         if row is None:
             return None
         from khaos.coding.planning.execution_models import (
-            AttestedPathState, RollbackFinalAttestation,
+            AttestedPathState,
+            RollbackFinalAttestation,
         )
         try:
             payload = json.loads(row["canonical_json"])
@@ -3750,7 +3758,8 @@ class PlanApprovalStore:
     @staticmethod
     def _row_to_execution_run(row: sqlite3.Row) -> Any:
         from khaos.coding.planning.execution_models import (
-            ExecutionRunStatus, PlanExecutionRun,
+            ExecutionRunStatus,
+            PlanExecutionRun,
         )
         return PlanExecutionRun(
             execution_run_id=row["execution_run_id"], plan_id=row["plan_id"],

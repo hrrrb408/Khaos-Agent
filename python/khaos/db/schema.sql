@@ -512,6 +512,33 @@ CREATE INDEX IF NOT EXISTS idx_scheduler_journal_task
     ON scheduler_operation_journal(task_id, seq);
 -- M4 batch 3.1.16A-5-1: project-scoped index created by migration helper.
 
+-- Security closure: durable idempotent tool-operation journal.  A running
+-- row is never replayed automatically after a restart; it is disclosed as
+-- UNKNOWN until an operator reconciles the external effect.
+CREATE TABLE IF NOT EXISTS tool_operations (
+    operation_id       TEXT PRIMARY KEY,
+    tool_name          TEXT NOT NULL,
+    arguments_digest   TEXT NOT NULL,
+    status             TEXT NOT NULL
+        CHECK (status IN ('running', 'completed', 'unknown')),
+    effect_id          TEXT NOT NULL,
+    effect_status      TEXT NOT NULL,
+    reconciliation_hint TEXT NOT NULL DEFAULT '',
+    result_json        TEXT NOT NULL DEFAULT '',
+    owner_token        TEXT NOT NULL,
+    principal_id       TEXT NOT NULL DEFAULT '',
+    project_id         TEXT NOT NULL DEFAULT '',
+    session_id         TEXT NOT NULL DEFAULT '',
+    task_id            TEXT NOT NULL DEFAULT '',
+    workspace_id       TEXT NOT NULL DEFAULT '',
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_tool_operations_status
+    ON tool_operations(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_tool_operations_owner
+    ON tool_operations(principal_id, project_id, session_id);
+
 CREATE TABLE IF NOT EXISTS coding_tasks (
     id             TEXT PRIMARY KEY,
     goal           TEXT NOT NULL,

@@ -109,7 +109,9 @@ def validate_typed_rule(
     if resource_type not in _RESOURCE_TYPES:
         raise ValueError(f"{source}: unknown typed resource type {resource_type!r}")
     if not isinstance(resource_spec, dict):
-        raise ValueError(f"{source}: typed resource spec must be an object")
+        raise ValueError(  # noqa: TRY004 - validation API preserves ValueError
+            f"{source}: typed resource spec must be an object"
+        )
 
     allowed: dict[str, set[str]] = {
         PermissionResourceType.FILESYSTEM.value: {
@@ -117,7 +119,7 @@ def validate_typed_rule(
         },
         PermissionResourceType.EXEC.value: {
             "operation", "tool", "executable", "argv_prefix", "argv_exact", "cwd",
-            "cwd_scope", "allow_shell", "shell", "script_digest",
+            "workspace_root", "cwd_scope", "allow_shell", "shell", "script_digest",
         },
         PermissionResourceType.NETWORK.value: {
             "operation", "tool", "scheme", "host", "port", "path_prefix",
@@ -185,6 +187,14 @@ def validate_typed_rule(
             raise ValueError(f"{source}: cwd_scope must be exact, workspace, or any")
         if cwd_scope == "exact" and "cwd" not in spec:
             raise ValueError(f"{source}: exact cwd_scope requires cwd")
+        if "workspace_root" in spec:
+            spec["workspace_root"] = _require_absolute_path(
+                str(spec["workspace_root"]), name="workspace_root", source=source
+            )
+        if cwd_scope == "workspace" and "workspace_root" not in spec:
+            raise ValueError(
+                f"{source}: workspace cwd_scope requires workspace_root"
+            )
         spec["cwd_scope"] = cwd_scope
         allow_shell = spec.get("allow_shell", False)
         if not isinstance(allow_shell, bool):
@@ -281,7 +291,7 @@ def _typed_observation_from_resource(
     except (TypeError, ValueError) as exc:
         raise ValueError("authorization resource target is not canonical JSON") from exc
     if not isinstance(decoded, dict):
-        raise ValueError("authorization resource target must be an object")
+        raise ValueError("authorization resource target must be an object")  # noqa: TRY004 - parser compatibility
 
     if kind is AuthorizationResourceKind.WORKSPACE_PATH:
         return PermissionResourceType.FILESYSTEM.value, {
@@ -304,6 +314,7 @@ def _typed_observation_from_resource(
             "executable": argv[0] if isinstance(argv, list) and argv else "",
             "argv": argv if isinstance(argv, list) else [],
             "cwd": decoded.get("cwd", ""),
+            "workspace_root": resource.workspace_root,
             "is_shell": False,
         }
     if kind is AuthorizationResourceKind.PROCESS_SHELL:
@@ -321,6 +332,7 @@ def _typed_observation_from_resource(
             "executable": executable,
             "argv": argv,
             "cwd": decoded.get("cwd", ""),
+            "workspace_root": resource.workspace_root,
             "is_shell": True,
             "shell": decoded.get("shell", ""),
             "script_digest": decoded.get("script_digest", ""),
@@ -362,6 +374,7 @@ def typed_rule_from_authorization_resource(
                 "shell": observation["shell"] or "/bin/sh",
                 "script_digest": observation["script_digest"],
                 "cwd": observation["cwd"],
+                "workspace_root": observation["workspace_root"],
             }
         else:
             argv = observation["argv"]
@@ -373,6 +386,7 @@ def typed_rule_from_authorization_resource(
                 "argv_exact": True,
                 "allow_shell": False,
                 "cwd": observation["cwd"],
+                "workspace_root": observation["workspace_root"],
             }
     elif resource_type == PermissionResourceType.NETWORK.value:
         spec = {
@@ -549,6 +563,10 @@ def request_observation(
             "executable": argv[0] if argv else "",
             "argv": argv,
             "cwd": os.path.realpath(str(params.get("cwd", "."))),
+            "workspace_root": (
+                os.path.realpath(str(params["workspace_root"]))
+                if params.get("workspace_root") else ""
+            ),
             "is_shell": False,
             "shell": "",
             "script_digest": "",
@@ -625,13 +643,20 @@ def match_typed_rule(
             return False
         if resource_spec.get("cwd_scope") == "exact" and resource_spec.get("cwd") != observed.get("cwd"):
             return False
-        if resource_spec.get("cwd_scope") == "workspace" and not observed.get("cwd"):
-            return False
+        if resource_spec.get("cwd_scope") == "workspace":
+            workspace_root = str(resource_spec.get("workspace_root") or "")
+            observed_root = str(observed.get("workspace_root") or "")
+            cwd = str(observed.get("cwd") or "")
+            if (
+                not workspace_root
+                or observed_root != workspace_root
+                or not cwd
+                or not _path_contains(workspace_root, cwd)
+            ):
+                return False
         if resource_spec.get("shell") and resource_spec["shell"] != observed.get("shell"):
             return False
-        if resource_spec.get("script_digest") and resource_spec["script_digest"] != observed.get("script_digest"):
-            return False
-        return True
+        return not (resource_spec.get("script_digest") and resource_spec["script_digest"] != observed.get("script_digest"))
     if resource_type == PermissionResourceType.NETWORK.value:
         for name in ("scheme", "host", "port"):
             if name in resource_spec and resource_spec[name] != observed.get(name):

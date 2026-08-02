@@ -1,6 +1,5 @@
 """Read-only implementation planning contracts and deterministic service."""
-from khaos.coding.planning.contracts import *  # noqa: F403
-from khaos.coding.planning.service import DeterministicPlanningService
+from khaos.coding.planning.contracts import *
 from khaos.coding.planning.execution_models import (
     ExecutionRunStatus,
     PlanExecutionRun,
@@ -9,6 +8,7 @@ from khaos.coding.planning.execution_models import (
     PlannedFileEdit,
     WorkspaceMutationResult,
 )
+from khaos.coding.planning.service import DeterministicPlanningService
 from khaos.coding.planning.verification_execution_models import (
     TrustedVerificationCommand,
     VerificationExecutionRun,
@@ -26,7 +26,6 @@ __all__ = [
     "PlannedEditBundle",
     "PlannedEditOperation",
     "PlannedFileEdit",
-    "WorkspaceMutationResult",
     "TrustedVerificationCommand",
     "VerificationExecutionRun",
     "VerificationPhaseContext",
@@ -34,4 +33,5 @@ __all__ = [
     "VerificationRunStatus",
     "VerificationStepRun",
     "VerificationStepStatus",
+    "WorkspaceMutationResult",
 ]

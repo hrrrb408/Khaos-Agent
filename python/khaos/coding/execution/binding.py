@@ -15,7 +15,7 @@ import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
-
+from typing import Self
 
 FileIdentity = tuple[int, int]
 
@@ -57,7 +57,7 @@ class ExecutionDirectoryBinding:
             except OSError:
                 pass
 
-    def __enter__(self) -> "ExecutionDirectoryBinding":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, _type, _value, _traceback) -> None:

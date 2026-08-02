@@ -30,16 +30,25 @@ type keyedBucket struct {
 // The bounded key table prevents a source-address spray from growing memory
 // without limit.
 type KeyedBuckets struct {
-	mu      sync.Mutex
-	rate    int
-	burst   int
-	maxKeys int
-	idleTTL time.Duration
-	buckets map[string]*keyedBucket
+	mu            sync.Mutex
+	rate          int
+	burst         int
+	maxKeys       int
+	idleTTL       time.Duration
+	rejectNewKeys bool
+	buckets       map[string]*keyedBucket
 }
 
 // NewKeyedBuckets creates a bounded collection of independent token buckets.
 func NewKeyedBuckets(ratePerMinute int, burst int, maxKeys int, idleTTL time.Duration) *KeyedBuckets {
+	return NewKeyedBucketsWithAdmission(ratePerMinute, burst, maxKeys, idleTTL, false)
+}
+
+// NewKeyedBucketsWithAdmission creates bounded buckets with an explicit
+// admission policy.  Security-sensitive unauthenticated ingress can reject a
+// new identity once the table is full instead of evicting an older identity
+// and allowing an attacker to reset its bucket by spraying keys.
+func NewKeyedBucketsWithAdmission(ratePerMinute int, burst int, maxKeys int, idleTTL time.Duration, rejectNewKeys bool) *KeyedBuckets {
 	if ratePerMinute <= 0 {
 		ratePerMinute = 60
 	}
@@ -54,7 +63,8 @@ func NewKeyedBuckets(ratePerMinute int, burst int, maxKeys int, idleTTL time.Dur
 	}
 	return &KeyedBuckets{
 		rate: ratePerMinute, burst: burst, maxKeys: maxKeys, idleTTL: idleTTL,
-		buckets: make(map[string]*keyedBucket),
+		rejectNewKeys: rejectNewKeys,
+		buckets:       make(map[string]*keyedBucket),
 	}
 }
 
@@ -75,6 +85,10 @@ func (b *KeyedBuckets) Allow(key string) bool {
 			}
 		}
 		if len(b.buckets) >= b.maxKeys {
+			if b.rejectNewKeys {
+				b.mu.Unlock()
+				return false
+			}
 			oldestKey := ""
 			var oldest time.Time
 			for existing, candidate := range b.buckets {

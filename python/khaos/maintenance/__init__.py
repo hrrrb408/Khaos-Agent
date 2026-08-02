@@ -53,6 +53,11 @@ _DEFAULT_APPROVAL_TTL_SECONDS = 3600.0
 # own pruning or they grow without bound.  7 days keeps recently-resolved
 # approvals auditable while bounding storage.
 _DEFAULT_APPROVAL_LEDGER_RETENTION_SECONDS = 7 * 24 * 3600
+# Replayable terminal turn and tool-operation journals are bounded separately
+# from the chat stream retention window. Callers should export/archive before
+# changing these windows.
+_DEFAULT_TURN_RETENTION_SECONDS = 7 * 24 * 3600
+_DEFAULT_TOOL_OPERATION_RETENTION_SECONDS = 30 * 24 * 3600
 
 
 class MaintenanceService:
@@ -86,11 +91,13 @@ class MaintenanceService:
         self,
         db: Database,
         *,
-        approval_broker: "ApprovalBroker | None" = None,
+        approval_broker: ApprovalBroker | None = None,
         interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
         retention_seconds: float = _DEFAULT_RETENTION_SECONDS,
         approval_ttl_seconds: float = _DEFAULT_APPROVAL_TTL_SECONDS,
         approval_ledger_retention_seconds: float = _DEFAULT_APPROVAL_LEDGER_RETENTION_SECONDS,
+        turn_retention_seconds: float = _DEFAULT_TURN_RETENTION_SECONDS,
+        tool_operation_retention_seconds: float = _DEFAULT_TOOL_OPERATION_RETENTION_SECONDS,
     ) -> None:
         self._db = db
         self._approval_broker = approval_broker
@@ -98,6 +105,8 @@ class MaintenanceService:
         self._retention = retention_seconds
         self._approval_ttl = approval_ttl_seconds
         self._approval_ledger_retention = approval_ledger_retention_seconds
+        self._turn_retention = turn_retention_seconds
+        self._tool_operation_retention = tool_operation_retention_seconds
         self._task: asyncio.Task[None] | None = None
         self._running = False
 
@@ -188,5 +197,47 @@ class MaintenanceService:
                 )
         except Exception as exc:  # noqa: BLE001
             logger.error("maintenance: prune_approval_ledger failed: %s", exc)
+
+        # 4. Bound terminal turn journals. Running turns are never touched;
+        # callers should export old turn history before shortening retention.
+        try:
+            pruned_turns = await self._db.prune_terminal_agent_turns(
+                older_than_seconds=self._turn_retention,
+                now=now,
+            )
+            total_turns = sum(pruned_turns.values())
+            if total_turns > 0:
+                counts["turn_history_pruned"] = total_turns
+                logger.info(
+                    "maintenance: pruned terminal turn history: %s",
+                    pruned_turns,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("maintenance: prune_terminal_agent_turns failed: %s", exc)
+
+        # 5. Bound completed/unknown idempotency rows. Unknown rows remain
+        # replay-safe until this explicit reconciliation window expires.
+        try:
+            pruned_operations = await self._db.prune_tool_operations(
+                older_than_seconds=self._tool_operation_retention,
+                now=now,
+            )
+            if pruned_operations > 0:
+                counts["tool_operations_pruned"] = pruned_operations
+                logger.info(
+                    "maintenance: pruned %d tool operations",
+                    pruned_operations,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("maintenance: prune_tool_operations failed: %s", exc)
+
+        # 6. Keep SQLite WAL growth bounded without blocking active readers.
+        try:
+            checkpoint = await self._db.checkpoint_wal()
+            counts["wal_checkpoint_runs"] = 1
+            if checkpoint.get("busy"):
+                logger.debug("maintenance: WAL checkpoint deferred: %s", checkpoint)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("maintenance: WAL checkpoint failed: %s", exc)
 
         return counts

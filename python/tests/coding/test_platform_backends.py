@@ -185,6 +185,9 @@ def test_macos_profile_uses_positive_read_allowlist(tmp_path: Path):
     profile = MacOSSandboxBackend().profile(workspace)
 
     assert "(deny default)" in profile
+    assert '(allow file-read-metadata (literal "/"))' in profile
+    assert '(allow file-read* (literal "/"))' not in profile
+    assert '(allow file-read* (subpath "/"))' not in profile
     assert "(allow file-read*)" not in profile
     assert str(workspace.resolve()) in profile
     assert str(Path.home()) not in profile

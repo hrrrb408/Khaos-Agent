@@ -39,7 +39,7 @@ def resolve_javascript_imports(
         names: tuple[str, ...] = tuple(imp.get("imported_names", ()))
         alias: str | None = imp.get("alias")
         metadata: dict[str, Any] = imp.get("metadata", {})
-        is_relative = module.startswith(".") or module.startswith("/")
+        is_relative = module.startswith((".", "/"))
         # Preserve semantic re-export evidence from the adapter.
         is_reexport = bool(metadata.get("reexport") or metadata.get("import_kind") == "reexport")
         reexport_meta = {"reexport": True, "import_kind": "reexport"} if is_reexport else {}

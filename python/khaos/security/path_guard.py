@@ -7,7 +7,6 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +61,7 @@ class PathGuard:
     def __init__(
         self,
         allow_writes_to_home: bool = True,
-        project_root: Optional[str] = None,
+        project_root: str | None = None,
         extra_protected: frozenset[str] | None = None,
     ):
         self.allow_writes_to_home = allow_writes_to_home
@@ -99,14 +98,20 @@ class PathGuard:
                 reason="writes to protected system directories are blocked",
                 normalized_path=str(normalized),
             )
-        if self.project_root is not None and not _is_relative_to(normalized, self.project_root):
-            if not self.allow_writes_to_home or not _is_relative_to(normalized, Path.home()):
-                return PathCheckResult(
-                    safe=False,
-                    risk_level="protected",
-                    reason="write path escapes the project root",
-                    normalized_path=str(normalized),
-                )
+        if (
+            self.project_root is not None
+            and not _is_relative_to(normalized, self.project_root)
+            and (
+                not self.allow_writes_to_home
+                or not _is_relative_to(normalized, Path.home())
+            )
+        ):
+            return PathCheckResult(
+                safe=False,
+                risk_level="protected",
+                reason="write path escapes the project root",
+                normalized_path=str(normalized),
+            )
         if raw_path.is_symlink() and self._is_symlink_escape(raw_path, normalized):
             return PathCheckResult(
                 safe=False,

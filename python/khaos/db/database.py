@@ -2,19 +2,20 @@
 
 from __future__ import annotations
 
-import json
 import asyncio
 import hashlib
+import json
 import logging
 import os
 import sqlite3
 import time
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 try:
     import aiosqlite
@@ -24,6 +25,10 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only in bare envs
 from khaos.agent.core import Message
 from khaos.time_utils import utc_now_naive
 
+# The release-pinned migration methods below are hashed byte-for-byte.  Keep
+# their released SQL spelling intact; source-integrity tests, rather than
+# formatter rewrites, are the authority for these frozen manifests.
+# ruff: noqa: ISC004,DTZ005
 
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 # F-03: split migration files.  ``0001_initial_schema.sql`` contains only
@@ -132,19 +137,29 @@ async def _audit_previous_hash(conn: Any) -> str:
 #   v4 = H-09 principal_modes project_id PK (historical)
 #   v5 = Batch 6.1 chat_streams keyed by stream_id (first manifest-checksummed)
 #   v6 = Batch 6.4 immutable migration chain + historical ledger backfill
-from khaos.db.migrations._registry import (  # noqa: E402
+from khaos.db.migrations._registry import (
     CURRENT_NAME as _CHAIN_CURRENT_NAME,
+)
+from khaos.db.migrations._registry import (
     CURRENT_VERSION as _CHAIN_CURRENT_VERSION,
+)
+from khaos.db.migrations._registry import (
+    MIGRATION_REGISTRY as _MIGRATION_REGISTRY,
+)
+from khaos.db.migrations._registry import (
     MIGRATIONS,
-    MIGRATION_REGISTRY,  # re-exported for backwards-compatible imports
     REGISTRY_BY_VERSION,
     is_historical,
+)
+from khaos.db.migrations._registry import (
     verify_source_integrity as _verify_migrator_source_integrity,
 )
 
 SCHEMA_MIGRATION_VERSION = _CHAIN_CURRENT_VERSION
 SCHEMA_MIGRATION_NAME = _CHAIN_CURRENT_NAME
 SCHEMA_MIGRATION_APP_VERSION = "0.1.0"
+# Backwards-compatible public import for migration integrity tooling.
+MIGRATION_REGISTRY = _MIGRATION_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -443,13 +458,13 @@ class Database:
                 if reader is not None:
                     try:
                         await reader.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as exc:
+                        logger.debug("failed to close partial reader connection", exc_info=exc)
                 if writer is not None:
                     try:
                         await writer.close()
-                    except Exception:  # noqa: BLE001
-                        pass
+                    except Exception as exc:
+                        logger.debug("failed to close partial writer connection", exc_info=exc)
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[Any]:
@@ -568,10 +583,10 @@ class Database:
                 )
                 try:
                     await conn.rollback()
-                except Exception:
+                except Exception as rollback_exc:
                     # If rollback itself fails the connection is wedged;
                     # let the original BEGIN error surface below.
-                    pass
+                    logger.debug("failed to roll back stale transaction", exc_info=rollback_exc)
                 await conn.execute("BEGIN IMMEDIATE")
             try:
                 yield conn
@@ -635,8 +650,7 @@ class Database:
         # WRITE first (wait for in-flight transactions), then LIFECYCLE
         # (block concurrent connect).  Both must be held while we bump
         # the generation and tear down the connections.
-        async with self._write_transaction_lock:
-            async with self._connection_lifecycle_lock:
+        async with self._write_transaction_lock, self._connection_lifecycle_lock:
                 # Batch 7.6 §二十: set the admission fence FIRST so new
                 # ``_read_lease()`` entrants are rejected while we drain.
                 self._closing = True
@@ -712,7 +726,7 @@ class Database:
             await asyncio.wait_for(
                 self._readers_idle.wait(), timeout=_READER_DRAIN_TIMEOUT
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "close: %d reader(s) still in flight after %.1fs drain "
                 "timeout; closing reader connection anyway (stuck reads "
@@ -952,6 +966,16 @@ class Database:
             self._conn = _MigrationConnection(conn)
             try:
                 await self._apply_v11_upgrades()
+            finally:
+                self._conn = original_conn
+            # Security closure: create the durable tool-operation journal
+            # before any scheduler can dispatch a side effect.  This is a
+            # v12 delta so existing v11 databases upgrade without modifying
+            # the frozen historical schema manifests.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v12_upgrades()
             finally:
                 self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
@@ -1537,6 +1561,46 @@ class Database:
     async def _apply_v11_upgrades(self) -> None:
         """P1-4: add typed resource fields to persistent permissions."""
         await self._ensure_permission_resource_columns()
+
+    async def _apply_v12_upgrades(self) -> None:
+        """Security closure: add the durable tool-operation journal."""
+        await self._ensure_tool_operations_table()
+
+    async def _ensure_tool_operations_table(self) -> None:
+        """Create the crash/replay-safe tool operation journal."""
+        conn = await self._require_conn()
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tool_operations (
+                operation_id       TEXT PRIMARY KEY,
+                tool_name          TEXT NOT NULL,
+                arguments_digest   TEXT NOT NULL,
+                status             TEXT NOT NULL
+                    CHECK (status IN ('running', 'completed', 'unknown')),
+                effect_id          TEXT NOT NULL,
+                effect_status      TEXT NOT NULL,
+                reconciliation_hint TEXT NOT NULL DEFAULT '',
+                result_json        TEXT NOT NULL DEFAULT '',
+                owner_token        TEXT NOT NULL,
+                principal_id       TEXT NOT NULL DEFAULT '',
+                project_id         TEXT NOT NULL DEFAULT '',
+                session_id         TEXT NOT NULL DEFAULT '',
+                task_id            TEXT NOT NULL DEFAULT '',
+                workspace_id       TEXT NOT NULL DEFAULT '',
+                created_at         TEXT NOT NULL,
+                updated_at         TEXT NOT NULL
+            )
+            """
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_operations_status "
+            "ON tool_operations(status, updated_at)"
+        )
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tool_operations_owner "
+            "ON tool_operations(principal_id, project_id, session_id)"
+        )
+        await conn.commit()
 
     async def _ensure_audit_log_insert_guard(self) -> None:
         """Round-15 A-2: add the BEFORE INSERT genesis guard to audit_log.
@@ -2866,40 +2930,39 @@ class Database:
             )
         else:
             resource_spec_value = str(resource_spec or "")
-        async with self._authorization_lock:
-            async with self.transaction() as conn:
-                row = await self._authorization_context_row(
-                    conn, principal_id, project_id
-                )
-                if row is None:
-                    epoch = 1
-                    await conn.execute(
-                        "INSERT INTO authorization_contexts "
-                        "(principal_id, project_id, policy_digest, epoch) "
-                        "VALUES (?, ?, ?, ?)",
-                        (principal_id, project_id, policy_digest, epoch),
-                    )
-                else:
-                    if str(row["policy_digest"]) != policy_digest:
-                        raise ValueError(
-                            "permission grant policy digest does not match the "
-                            "authoritative authorization context"
-                        )
-                    epoch = int(row["epoch"]) + 1
-                    await conn.execute(
-                        "UPDATE authorization_contexts SET epoch = ?, "
-                        "updated_at = datetime('now') "
-                        "WHERE principal_id = ? AND project_id = ?",
-                        (epoch, principal_id, project_id),
-                    )
+        async with self._authorization_lock, self.transaction() as conn:
+            row = await self._authorization_context_row(
+                conn, principal_id, project_id
+            )
+            if row is None:
+                epoch = 1
                 await conn.execute(
-                    "UPDATE permissions SET generation = ? "
-                    "WHERE principal_id = ? AND project_id = ? "
-                    "AND policy_digest = ?",
-                    (epoch, principal_id, project_id, policy_digest),
+                    "INSERT INTO authorization_contexts "
+                    "(principal_id, project_id, policy_digest, epoch) "
+                    "VALUES (?, ?, ?, ?)",
+                    (principal_id, project_id, policy_digest, epoch),
                 )
-                cursor = await conn.execute(
-                    """
+            else:
+                if str(row["policy_digest"]) != policy_digest:
+                    raise ValueError(
+                        "permission grant policy digest does not match the "
+                        "authoritative authorization context"
+                    )
+                epoch = int(row["epoch"]) + 1
+                await conn.execute(
+                    "UPDATE authorization_contexts SET epoch = ?, "
+                    "updated_at = datetime('now') "
+                    "WHERE principal_id = ? AND project_id = ?",
+                    (epoch, principal_id, project_id),
+                )
+            await conn.execute(
+                "UPDATE permissions SET generation = ? "
+                "WHERE principal_id = ? AND project_id = ? "
+                "AND policy_digest = ?",
+                (epoch, principal_id, project_id, policy_digest),
+            )
+            cursor = await conn.execute(
+                """
                     INSERT INTO permissions (
                         pattern, permission_level, approval, mode,
                         principal_id, project_id, policy_digest, generation,
@@ -2909,13 +2972,13 @@ class Database:
                     )
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    (pattern, permission_level, approval, mode,
-                     principal_id, project_id, policy_digest, epoch,
-                     transport_class, grant_lifetime, session_id, task_id,
-                     workspace_id, expires_at, created_by,
-                     resource_type, resource_spec_value),
-                )
-                return int(cursor.lastrowid)
+                (pattern, permission_level, approval, mode,
+                 principal_id, project_id, policy_digest, epoch,
+                 transport_class, grant_lifetime, session_id, task_id,
+                 workspace_id, expires_at, created_by,
+                 resource_type, resource_spec_value),
+            )
+            return int(cursor.lastrowid)
 
     async def list_permission_rules(
         self,
@@ -2992,63 +3055,61 @@ class Database:
                         (rule_id, principal_id) if principal_id is not None else (rule_id,),
                     )
                     return cursor.rowcount or 0
-            async with self._authorization_lock:
-                async with self.transaction() as conn:
-                    row = await self._authorization_context_row(
-                        conn, principal_id, project_id
-                    )
-                    if row is None or str(row["policy_digest"]) != policy_digest:
-                        return 0
-                    cursor = await conn.execute(
-                        "DELETE FROM permissions WHERE id = ? AND principal_id = ? "
-                        "AND project_id = ? AND policy_digest = ?",
-                        (rule_id, principal_id, project_id, policy_digest),
-                    )
-                    if not (cursor.rowcount or 0):
-                        return 0
-                    epoch = int(row["epoch"]) + 1
-                    await conn.execute(
-                        "UPDATE authorization_contexts SET epoch = ?, "
-                        "updated_at = datetime('now') "
-                        "WHERE principal_id = ? AND project_id = ?",
-                        (epoch, principal_id, project_id),
-                    )
-                    await conn.execute(
-                        "UPDATE permissions SET generation = ? "
-                        "WHERE principal_id = ? AND project_id = ? "
-                        "AND policy_digest = ?",
-                        (epoch, principal_id, project_id, policy_digest),
-                    )
-                    return cursor.rowcount or 0
+            async with self._authorization_lock, self.transaction() as conn:
+                row = await self._authorization_context_row(
+                    conn, principal_id, project_id
+                )
+                if row is None or str(row["policy_digest"]) != policy_digest:
+                    return 0
+                cursor = await conn.execute(
+                    "DELETE FROM permissions WHERE id = ? AND principal_id = ? "
+                    "AND project_id = ? AND policy_digest = ?",
+                    (rule_id, principal_id, project_id, policy_digest),
+                )
+                if not (cursor.rowcount or 0):
+                    return 0
+                epoch = int(row["epoch"]) + 1
+                await conn.execute(
+                    "UPDATE authorization_contexts SET epoch = ?, "
+                    "updated_at = datetime('now') "
+                    "WHERE principal_id = ? AND project_id = ?",
+                    (epoch, principal_id, project_id),
+                )
+                await conn.execute(
+                    "UPDATE permissions SET generation = ? "
+                    "WHERE principal_id = ? AND project_id = ? "
+                    "AND policy_digest = ?",
+                    (epoch, principal_id, project_id, policy_digest),
+                )
+                return cursor.rowcount or 0
 
     async def bind_authorization_context(
         self, principal_id: str, project_id: str, policy_digest: str
     ) -> int:
         """Bind the current policy, bumping epoch when the digest changes."""
-        async with self._authorization_lock:
-            async with self.transaction() as conn:
-                row = await self._authorization_context_row(
-                    conn, principal_id, project_id
+        async with self._authorization_lock, self.transaction() as conn:
+            row = await self._authorization_context_row(
+                conn, principal_id, project_id
+            )
+            if row is None:
+                epoch = 1
+                await conn.execute(
+                    "INSERT INTO authorization_contexts "
+                    "(principal_id, project_id, policy_digest, epoch) "
+                    "VALUES (?, ?, ?, ?)",
+                    (principal_id, project_id, policy_digest, epoch),
                 )
-                if row is None:
-                    epoch = 1
-                    await conn.execute(
-                        "INSERT INTO authorization_contexts "
-                        "(principal_id, project_id, policy_digest, epoch) "
-                        "VALUES (?, ?, ?, ?)",
-                        (principal_id, project_id, policy_digest, epoch),
-                    )
-                elif str(row["policy_digest"]) == policy_digest:
-                    epoch = int(row["epoch"])
-                else:
-                    epoch = int(row["epoch"]) + 1
-                    await conn.execute(
-                        "UPDATE authorization_contexts SET policy_digest = ?, "
-                        "epoch = ?, updated_at = datetime('now') "
-                        "WHERE principal_id = ? AND project_id = ?",
-                        (policy_digest, epoch, principal_id, project_id),
-                    )
-                return epoch
+            elif str(row["policy_digest"]) == policy_digest:
+                epoch = int(row["epoch"])
+            else:
+                epoch = int(row["epoch"]) + 1
+                await conn.execute(
+                    "UPDATE authorization_contexts SET policy_digest = ?, "
+                    "epoch = ?, updated_at = datetime('now') "
+                    "WHERE principal_id = ? AND project_id = ?",
+                    (policy_digest, epoch, principal_id, project_id),
+                )
+            return epoch
 
     async def get_authorization_context(
         self, principal_id: str, project_id: str
@@ -3231,6 +3292,63 @@ class Database:
             ),
             "prev_hash": previous,
         }
+
+    async def verify_audit_chain_since(self, row_id: int) -> list[dict[str, Any]]:
+        """Verify the chain from an anchored row through the current head.
+
+        Startup performs a complete replay.  Once the anchor is trusted,
+        writes only need to replay the suffix since the last anchored row;
+        this keeps per-event verification bounded while still checking every
+        newly appended link before the independent head advances.
+        """
+        async with self._read_lease():
+            conn = await self._require_conn()
+            previous_cursor = await conn.execute(
+                "SELECT id, action, target, result, detail, session_id, "
+                "principal_id, runtime_id, task_id, operation_id, "
+                "policy_digest, authority_generation, source_transport, "
+                "project_id, prev_hash FROM audit_log "
+                "WHERE id < ? ORDER BY id DESC LIMIT 1",
+                (row_id,),
+            )
+            previous_row = await previous_cursor.fetchone()
+            cursor = await conn.execute(
+                "SELECT id, action, target, result, detail, session_id, "
+                "principal_id, runtime_id, task_id, operation_id, "
+                "policy_digest, authority_generation, source_transport, "
+                "project_id, prev_hash FROM audit_log WHERE id >= ? ORDER BY id",
+                (row_id,),
+            )
+            rows = [dict(row) for row in await cursor.fetchall()]
+        if previous_row is None:
+            expected_prev = ""
+        else:
+            previous = dict(previous_row)
+            # ``prev_hash`` stores the computed link for that row (despite
+            # the historical column name), so it is the expected input to
+            # the anchored row. Recomputing it here would hash the previous
+            # row twice and reject every anchor after the first row.
+            expected_prev = str(previous.get("prev_hash") or "")
+        breaks: list[dict[str, Any]] = []
+        for index, row in enumerate(rows):
+            stored = str(row.get("prev_hash") or "")
+            expected = _audit_row_hash(
+                expected_prev,
+                str(row["action"]), str(row["target"]), str(row["result"]),
+                str(row.get("detail") or ""), row.get("session_id"),
+                str(row.get("principal_id") or "legacy"),
+                row.get("runtime_id"), row.get("task_id"),
+                row.get("operation_id"), row.get("policy_digest"),
+                row.get("authority_generation"), row.get("source_transport"),
+                str(row.get("project_id") or ""),
+            )
+            if not stored or stored != expected:
+                breaks.append({
+                    "id": row["id"],
+                    "reason": "hash chain suffix link does not match",
+                })
+            expected_prev = stored
+        return breaks
 
     async def verify_audit_chain(self) -> list[dict[str, Any]]:
         """Round-14 §4 / Round-15 A-2: verify the audit_log hash chain.
@@ -4023,7 +4141,7 @@ class Database:
         与 summary 共存于一个 JSON metadata 字段中，结构：
         ``{"summary": "...", "changed_files": ["path1", "path2"]}``
         """
-        async with self.transaction() as conn:
+        async with self.transaction():
             await self._merge_session_metadata(session_id, {"changed_files": list(files)})
 
     async def get_session_changes(self, session_id: str) -> list[str]:
@@ -4738,6 +4856,190 @@ class Database:
             return cursor.rowcount
 
     # ------------------------------------------------------------------
+    # Durable tool-operation journal (security closure)
+    # ------------------------------------------------------------------
+
+    async def claim_tool_operation(
+        self,
+        *,
+        operation_id: str,
+        tool_name: str,
+        arguments_digest: str,
+        effect_id: str,
+        owner_token: str,
+        principal_id: str = "",
+        project_id: str = "",
+        session_id: str = "",
+        task_id: str = "",
+        workspace_id: str = "",
+    ) -> dict[str, Any]:
+        """Atomically claim or replay one durable idempotent operation.
+
+        ``operation_id`` is the scheduler's scope digest, not a model
+        supplied identifier.  A different argument digest is always a
+        conflict.  Existing terminal rows are returned for replay; a
+        ``running`` row is returned to the caller so the scheduler can either
+        wait for its in-process owner or disclose an orphaned operation after
+        restart without invoking the handler again.
+        """
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT operation_id, tool_name, arguments_digest, status, "
+                "effect_id, effect_status, reconciliation_hint, result_json, "
+                "owner_token, principal_id, project_id, session_id, task_id, "
+                "workspace_id, created_at, updated_at "
+                "FROM tool_operations WHERE operation_id = ?",
+                (operation_id,),
+            )
+            row = await cursor.fetchone()
+            if row is not None:
+                values = dict(row)
+                if (
+                    values["tool_name"] != tool_name
+                    or values["arguments_digest"] != arguments_digest
+                ):
+                    return {"state": "conflict", **values}
+                return {"state": "existing", **values}
+            now = utc_now_naive().isoformat()
+            await conn.execute(
+                """
+                INSERT INTO tool_operations (
+                    operation_id, tool_name, arguments_digest, status,
+                    effect_id, effect_status, reconciliation_hint, result_json,
+                    owner_token, principal_id, project_id, session_id, task_id,
+                    workspace_id, created_at, updated_at
+                ) VALUES (?, ?, ?, 'running', ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    operation_id, tool_name, arguments_digest, effect_id,
+                    "not_started", owner_token, principal_id, project_id,
+                    session_id, task_id, workspace_id, now, now,
+                ),
+            )
+            return {
+                "state": "claimed",
+                "operation_id": operation_id,
+                "tool_name": tool_name,
+                "arguments_digest": arguments_digest,
+                "status": "running",
+                "effect_id": effect_id,
+                "effect_status": "not_started",
+                "reconciliation_hint": "",
+                "result_json": "",
+                "owner_token": owner_token,
+            }
+
+    async def complete_tool_operation(
+        self,
+        *,
+        operation_id: str,
+        owner_token: str,
+        status: str,
+        effect_status: str,
+        reconciliation_hint: str = "",
+        result_json: str = "",
+    ) -> int:
+        """Finalize a claimed operation only for its original owner."""
+        if status not in {"completed", "unknown"}:
+            raise ValueError(f"invalid tool operation terminal status: {status}")
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE tool_operations
+                SET status = ?, effect_status = ?, reconciliation_hint = ?,
+                    result_json = ?, updated_at = ?
+                WHERE operation_id = ? AND owner_token = ? AND status = 'running'
+                """,
+                (
+                    status, effect_status, reconciliation_hint, result_json,
+                    utc_now_naive().isoformat(), operation_id, owner_token,
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def update_tool_operation_effect_id(
+        self, *, operation_id: str, owner_token: str, effect_id: str
+    ) -> int:
+        """Persist a handler's external effect identifier while it owns a row."""
+        if not effect_id or len(effect_id) > 256 or any(
+            char in effect_id for char in "\x00\r\n"
+        ):
+            raise ValueError("invalid tool operation effect_id")
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE tool_operations
+                SET effect_id = ?, updated_at = ?
+                WHERE operation_id = ? AND owner_token = ? AND status = 'running'
+                """,
+                (
+                    effect_id, utc_now_naive().isoformat(), operation_id, owner_token
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def mark_tool_operation_unknown(
+        self,
+        *,
+        operation_id: str,
+        reconciliation_hint: str,
+        result_json: str,
+    ) -> int:
+        """Quarantine an orphaned running operation without replaying it."""
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                """
+                UPDATE tool_operations
+                SET status = 'unknown', effect_status = 'unknown',
+                    reconciliation_hint = ?, result_json = ?, updated_at = ?
+                WHERE operation_id = ? AND status = 'running'
+                """,
+                (
+                    reconciliation_hint, result_json, utc_now_naive().isoformat(),
+                    operation_id,
+                ),
+            )
+            return int(cursor.rowcount or 0)
+
+    async def prune_tool_operations(
+        self, *, older_than_seconds: float, now: float, limit: int = 256
+    ) -> int:
+        """Expire terminal idempotency rows after an explicit replay window."""
+        cutoff = datetime.fromtimestamp(
+            now - max(0.0, older_than_seconds), UTC
+        ).replace(tzinfo=None).isoformat()
+        async with self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT operation_id FROM tool_operations "
+                "WHERE status IN ('completed','unknown') AND updated_at < ? "
+                "ORDER BY updated_at LIMIT ?",
+                (cutoff, max(1, min(limit, 10_000))),
+            )
+            operation_ids = [str(row["operation_id"]) for row in await cursor.fetchall()]
+            if not operation_ids:
+                return 0
+            placeholders = ",".join("?" for _ in operation_ids)
+            deleted = await conn.execute(
+                f"DELETE FROM tool_operations WHERE operation_id IN ({placeholders})",
+                tuple(operation_ids),
+            )
+            return int(deleted.rowcount or 0)
+
+    async def checkpoint_wal(self) -> dict[str, int]:
+        """Run a bounded passive WAL checkpoint under the writer lock."""
+        async with self._write_transaction_lock:
+            conn = await self._require_writer_conn_locked()
+            cursor = await conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+            row = await cursor.fetchone()
+            if row is None:
+                return {"busy": 0, "log_pages": 0, "checkpointed_pages": 0}
+            return {
+                "busy": int(row[0]),
+                "log_pages": int(row[1]),
+                "checkpointed_pages": int(row[2]),
+            }
+
+    # ------------------------------------------------------------------
     # M4 batch 3.1.16B-5: scheduler operation journal (durable intent)
     # ------------------------------------------------------------------
 
@@ -5368,37 +5670,36 @@ class Database:
         created_at: float,
     ) -> None:
         """Persist an immutable destructive-operation approval challenge."""
-        async with self._operation_approval_lock:
-            async with self.transaction() as conn:
-                cursor = await conn.execute(
-                    "SELECT binding_digest FROM operation_approvals WHERE approval_id = ?",
-                    (approval_id,),
-                )
-                existing = await cursor.fetchone()
-                if existing is not None:
-                    if str(existing["binding_digest"]) != binding_digest:
-                        raise PermissionError(
-                            "operation approval id is already bound to another operation"
-                        )
-                    return
-                await conn.execute(
-                    """
+        async with self._operation_approval_lock, self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT binding_digest FROM operation_approvals WHERE approval_id = ?",
+                (approval_id,),
+            )
+            existing = await cursor.fetchone()
+            if existing is not None:
+                if str(existing["binding_digest"]) != binding_digest:
+                    raise PermissionError(
+                        "operation approval id is already bound to another operation"
+                    )
+                return
+            await conn.execute(
+                """
                     INSERT INTO operation_approvals (
                         approval_id, binding_digest, binding_json, principal_id,
                         session_id, task_id, workspace_id, operation, nonce_hash,
                         expires_at, status, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
                     """,
-                    (
-                        approval_id, binding_digest, binding_json, principal_id,
-                        session_id, task_id, workspace_id, operation, nonce_hash,
-                        expires_at, created_at,
-                    ),
-                )
-                await self._insert_operation_event(
-                    conn, approval_id, "registered", binding_digest,
-                    principal_id, session_id, {}, created_at,
-                )
+                (
+                    approval_id, binding_digest, binding_json, principal_id,
+                    session_id, task_id, workspace_id, operation, nonce_hash,
+                    expires_at, created_at,
+                ),
+            )
+            await self._insert_operation_event(
+                conn, approval_id, "registered", binding_digest,
+                principal_id, session_id, {}, created_at,
+            )
 
     async def start_agent_turn(
         self,
@@ -5426,18 +5727,17 @@ class Database:
         ``principal_id``); per-project visibility is enforced by
         ``list_agent_turn_events`` callers.
         """
-        async with self._turn_event_lock:
-            async with self.transaction() as conn:
-                await conn.execute(
-                    "INSERT INTO agent_turns(turn_id,attempt_id,session_id,task_id,"
-                    "status,last_sequence,started_at,principal_id,project_id) "
-                    "VALUES(?,?,?,?, 'running',1,?,?,?)",
-                    (turn_id, attempt_id, session_id, task_id, now, principal_id, project_id),
-                )
-                await conn.execute(
-                    "INSERT INTO agent_turn_events VALUES(?,1,'turn.started',?,?)",
-                    (turn_id, json.dumps(payload, sort_keys=True), now),
-                )
+        async with self._turn_event_lock, self.transaction() as conn:
+            await conn.execute(
+                "INSERT INTO agent_turns(turn_id,attempt_id,session_id,task_id,"
+                "status,last_sequence,started_at,principal_id,project_id) "
+                "VALUES(?,?,?,?, 'running',1,?,?,?)",
+                (turn_id, attempt_id, session_id, task_id, now, principal_id, project_id),
+            )
+            await conn.execute(
+                "INSERT INTO agent_turn_events VALUES(?,1,'turn.started',?,?)",
+                (turn_id, json.dumps(payload, sort_keys=True), now),
+            )
 
     async def append_agent_turn_event(
         self,
@@ -5451,48 +5751,47 @@ class Database:
         error_code: str | None = None,
     ) -> int:
         """Append in sequence; terminal status and event commit together."""
-        async with self._turn_event_lock:
-            async with self.transaction() as conn:
-                cursor = await conn.execute(
-                    "SELECT status,last_sequence FROM agent_turns WHERE turn_id=?",
-                    (turn_id,),
+        async with self._turn_event_lock, self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT status,last_sequence FROM agent_turns WHERE turn_id=?",
+                (turn_id,),
+            )
+            row = await cursor.fetchone()
+            if (
+                row is None
+                or row["status"] != "running"
+                or int(row["last_sequence"]) != expected_sequence
+            ):
+                raise PermissionError(
+                    "turn event is late, replayed, or out of sequence"
                 )
-                row = await cursor.fetchone()
-                if (
-                    row is None
-                    or row["status"] != "running"
-                    or int(row["last_sequence"]) != expected_sequence
-                ):
-                    raise PermissionError(
-                        "turn event is late, replayed, or out of sequence"
-                    )
-                sequence = expected_sequence + 1
+            sequence = expected_sequence + 1
+            await conn.execute(
+                "INSERT INTO agent_turn_events VALUES(?,?,?,?,?)",
+                (
+                    turn_id, sequence, event_type,
+                    json.dumps(payload, sort_keys=True), now,
+                ),
+            )
+            if terminal_status is None:
                 await conn.execute(
-                    "INSERT INTO agent_turn_events VALUES(?,?,?,?,?)",
+                    "UPDATE agent_turns SET last_sequence=? WHERE turn_id=? "
+                    "AND status='running' AND last_sequence=?",
+                    (sequence, turn_id, expected_sequence),
+                )
+            else:
+                if terminal_status not in {"completed", "interrupted", "failed"}:
+                    raise ValueError("invalid terminal turn status")
+                await conn.execute(
+                    "UPDATE agent_turns SET status=?,last_sequence=?,error_code=?,"
+                    "finished_at=? WHERE turn_id=? AND status='running' "
+                    "AND last_sequence=?",
                     (
-                        turn_id, sequence, event_type,
-                        json.dumps(payload, sort_keys=True), now,
+                        terminal_status, sequence, error_code, now,
+                        turn_id, expected_sequence,
                     ),
                 )
-                if terminal_status is None:
-                    await conn.execute(
-                        "UPDATE agent_turns SET last_sequence=? WHERE turn_id=? "
-                        "AND status='running' AND last_sequence=?",
-                        (sequence, turn_id, expected_sequence),
-                    )
-                else:
-                    if terminal_status not in {"completed", "interrupted", "failed"}:
-                        raise ValueError("invalid terminal turn status")
-                    await conn.execute(
-                        "UPDATE agent_turns SET status=?,last_sequence=?,error_code=?,"
-                        "finished_at=? WHERE turn_id=? AND status='running' "
-                        "AND last_sequence=?",
-                        (
-                            terminal_status, sequence, error_code, now,
-                            turn_id, expected_sequence,
-                        ),
-                    )
-                return sequence
+            return sequence
 
     async def append_chat_stream_event(
         self,
@@ -5528,122 +5827,120 @@ class Database:
           - A session can have many streams (one per chat RPC); the
             Terminal invariant is per-stream, not per-session.
         """
-        async with self._chat_event_lock:
-            async with self.transaction() as conn:
-                is_terminal = event_type in {"done", "error", "interrupted"}
+        async with self._chat_event_lock, self.transaction() as conn:
+            is_terminal = event_type in {"done", "error", "interrupted"}
 
-                # C-05/6.1: lazily create the chat_streams main-table row,
-                # keyed by stream_id.  INSERT OR IGNORE is safe: if a row
-                # already exists (from a previous append or a crashed
-                # process), it's a no-op.
+            # C-05/6.1: lazily create the chat_streams main-table row,
+            # keyed by stream_id.  INSERT OR IGNORE is safe: if a row
+            # already exists (from a previous append or a crashed
+            # process), it's a no-op.
+            await conn.execute(
+                "INSERT OR IGNORE INTO chat_streams ("
+                "stream_id,session_id,turn_id,attempt_id,"
+                "principal_id,project_id,status,boot_id,"
+                "runtime_id,lease_until,last_sequence,terminal_event_type,"
+                "started_at,terminal_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,NULL,0,NULL,?,NULL)",
+                (
+                    stream_id, session_id, turn_id, attempt_id,
+                    principal_id, project_id,
+                    "running", boot_id, runtime_id, now,
+                ),
+            )
+
+            # Batch 7.2 (round-7 §十五): OWNER VERIFICATION.  Read back
+            # the stream row and confirm the caller's
+            # (session_id, principal_id, project_id) match the row's
+            # owner.  Without this, a caller that knows (or guesses) a
+            # foreign stream_id could insert events under its own
+            # owner partition while mutating the victim's state-machine
+            # row (INSERT OR IGNORE is a silent no-op on an existing
+            # foreign row, then the SELECT below read the VICTIM's row).
+            cursor = await conn.execute(
+                "SELECT status, session_id, principal_id, project_id "
+                "FROM chat_streams WHERE stream_id = ?",
+                (stream_id,),
+            )
+            row = await cursor.fetchone()
+            current_status = str(row["status"]) if row else "running"
+            if row is not None and (
+                str(row["session_id"]) != session_id
+                or str(row["principal_id"]) != principal_id
+                or str(row["project_id"]) != project_id
+            ):
+                raise ChatStreamOwnerMismatchError(
+                    f"chat stream {stream_id} is owned by a "
+                    f"different (session/principal/project); "
+                    f"append refused"
+                )
+            # C-05/6.1: terminal shield — reject append if already
+            # terminal.  Keyed by stream_id, NOT session_id.
+            if current_status != "running":
+                raise ChatStreamTerminalError(
+                    f"chat stream {stream_id} is already terminal "
+                    f"(status={current_status}); cannot append "
+                    f"'{event_type}'"
+                )
+
+            cursor = await conn.execute(
+                "SELECT COALESCE(MAX(sequence), 0) FROM chat_stream_events "
+                "WHERE stream_id = ?",
+                (stream_id,),
+            )
+            row = await cursor.fetchone()
+            sequence = int(row[0]) + 1
+            await conn.execute(
+                "INSERT INTO chat_stream_events ("
+                "stream_id,session_id,principal_id,project_id,sequence,"
+                "event_type,data_json,is_terminal,created_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    stream_id,
+                    session_id,
+                    principal_id,
+                    project_id,
+                    sequence,
+                    event_type,
+                    json.dumps(data, ensure_ascii=False, sort_keys=True),
+                    int(is_terminal),
+                    now,
+                ),
+            )
+
+            # Update chat_streams state machine (keyed by stream_id).
+            # Batch 7.2 (round-7 §十五): every UPDATE carries the full
+            # owner predicate so a foreign caller cannot drive another
+            # principal's stream to terminal or renew its lease.
+            if is_terminal:
+                # CAS: running → terminal (exactly one terminal).
                 await conn.execute(
-                    "INSERT OR IGNORE INTO chat_streams ("
-                    "stream_id,session_id,turn_id,attempt_id,"
-                    "principal_id,project_id,status,boot_id,"
-                    "runtime_id,lease_until,last_sequence,terminal_event_type,"
-                    "started_at,terminal_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,NULL,0,NULL,?,NULL)",
-                    (
-                        stream_id, session_id, turn_id, attempt_id,
-                        principal_id, project_id,
-                        "running", boot_id, runtime_id, now,
-                    ),
+                    "UPDATE chat_streams SET status=?, "
+                    "terminal_event_type=?, terminal_at=?, "
+                    "last_sequence=? "
+                    "WHERE stream_id=? AND session_id=? AND "
+                    "principal_id=? AND project_id=? AND status='running'",
+                    (event_type, event_type, now, sequence,
+                     stream_id, session_id, principal_id, project_id),
                 )
-
-                # Batch 7.2 (round-7 §十五): OWNER VERIFICATION.  Read back
-                # the stream row and confirm the caller's
-                # (session_id, principal_id, project_id) match the row's
-                # owner.  Without this, a caller that knows (or guesses) a
-                # foreign stream_id could insert events under its own
-                # owner partition while mutating the victim's state-machine
-                # row (INSERT OR IGNORE is a silent no-op on an existing
-                # foreign row, then the SELECT below read the VICTIM's row).
-                cursor = await conn.execute(
-                    "SELECT status, session_id, principal_id, project_id "
-                    "FROM chat_streams WHERE stream_id = ?",
-                    (stream_id,),
-                )
-                row = await cursor.fetchone()
-                current_status = str(row["status"]) if row else "running"
-                if row is not None:
-                    if (
-                        str(row["session_id"]) != session_id
-                        or str(row["principal_id"]) != principal_id
-                        or str(row["project_id"]) != project_id
-                    ):
-                        raise ChatStreamOwnerMismatchError(
-                            f"chat stream {stream_id} is owned by a "
-                            f"different (session/principal/project); "
-                            f"append refused"
-                        )
-                # C-05/6.1: terminal shield — reject append if already
-                # terminal.  Keyed by stream_id, NOT session_id.
-                if current_status != "running":
-                    raise ChatStreamTerminalError(
-                        f"chat stream {stream_id} is already terminal "
-                        f"(status={current_status}); cannot append "
-                        f"'{event_type}'"
-                    )
-
-                cursor = await conn.execute(
-                    "SELECT COALESCE(MAX(sequence), 0) FROM chat_stream_events "
-                    "WHERE stream_id = ?",
-                    (stream_id,),
-                )
-                row = await cursor.fetchone()
-                sequence = int(row[0]) + 1
-                await conn.execute(
-                    "INSERT INTO chat_stream_events ("
-                    "stream_id,session_id,principal_id,project_id,sequence,"
-                    "event_type,data_json,is_terminal,created_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?)",
-                    (
-                        stream_id,
-                        session_id,
-                        principal_id,
-                        project_id,
-                        sequence,
-                        event_type,
-                        json.dumps(data, ensure_ascii=False, sort_keys=True),
-                        int(is_terminal),
-                        now,
-                    ),
-                )
-
-                # Update chat_streams state machine (keyed by stream_id).
-                # Batch 7.2 (round-7 §十五): every UPDATE carries the full
-                # owner predicate so a foreign caller cannot drive another
-                # principal's stream to terminal or renew its lease.
-                if is_terminal:
-                    # CAS: running → terminal (exactly one terminal).
+            else:
+                # Renew lease + update last_sequence for running streams.
+                if lease_until is not None:
                     await conn.execute(
-                        "UPDATE chat_streams SET status=?, "
-                        "terminal_event_type=?, terminal_at=?, "
-                        "last_sequence=? "
-                        "WHERE stream_id=? AND session_id=? AND "
-                        "principal_id=? AND project_id=? AND status='running'",
-                        (event_type, event_type, now, sequence,
-                         stream_id, session_id, principal_id, project_id),
+                        "UPDATE chat_streams SET last_sequence=?, "
+                        "lease_until=? WHERE stream_id=? AND session_id=? "
+                        "AND principal_id=? AND project_id=?",
+                        (sequence, lease_until, stream_id,
+                         session_id, principal_id, project_id),
                     )
                 else:
-                    # Renew lease + update last_sequence for running streams.
-                    if lease_until is not None:
-                        await conn.execute(
-                            "UPDATE chat_streams SET last_sequence=?, "
-                            "lease_until=? WHERE stream_id=? AND session_id=? "
-                            "AND principal_id=? AND project_id=?",
-                            (sequence, lease_until, stream_id,
-                             session_id, principal_id, project_id),
-                        )
-                    else:
-                        await conn.execute(
-                            "UPDATE chat_streams SET last_sequence=? "
-                            "WHERE stream_id=? AND session_id=? "
-                            "AND principal_id=? AND project_id=?",
-                            (sequence, stream_id,
-                             session_id, principal_id, project_id),
-                        )
-                return sequence
+                    await conn.execute(
+                        "UPDATE chat_streams SET last_sequence=? "
+                        "WHERE stream_id=? AND session_id=? "
+                        "AND principal_id=? AND project_id=?",
+                        (sequence, stream_id,
+                         session_id, principal_id, project_id),
+                    )
+            return sequence
 
     async def list_chat_stream_events(
         self,
@@ -5746,23 +6043,22 @@ class Database:
         Round-6 Batch 6.1: deletes ALL streams for the session (a
         session can now have many streams).
         """
-        async with self._chat_event_lock:
-            async with self.transaction() as conn:
-                cursor = await conn.execute(
-                    "DELETE FROM chat_stream_events "
-                    "WHERE session_id=? AND principal_id=? AND project_id=?",
-                    (session_id, principal_id, project_id),
-                )
-                deleted = cursor.rowcount or 0
-                await cursor.close()
-                # C-05/6.1: cascade-delete ALL state-machine rows for
-                # this session (there may be many streams).
-                await conn.execute(
-                    "DELETE FROM chat_streams "
-                    "WHERE session_id=? AND principal_id=? AND project_id=?",
-                    (session_id, principal_id, project_id),
-                )
-                return deleted
+        async with self._chat_event_lock, self.transaction() as conn:
+            cursor = await conn.execute(
+                "DELETE FROM chat_stream_events "
+                "WHERE session_id=? AND principal_id=? AND project_id=?",
+                (session_id, principal_id, project_id),
+            )
+            deleted = cursor.rowcount or 0
+            await cursor.close()
+            # C-05/6.1: cascade-delete ALL state-machine rows for
+            # this session (there may be many streams).
+            await conn.execute(
+                "DELETE FROM chat_streams "
+                "WHERE session_id=? AND principal_id=? AND project_id=?",
+                (session_id, principal_id, project_id),
+            )
+            return deleted
 
     async def prune_terminal_chat_streams(
         self,
@@ -5792,12 +6088,11 @@ class Database:
         Round-6 Batch 6.1: prune is now per-stream (stream_id), not
         per-session.
         """
-        async with self._chat_event_lock:
-            async with self.transaction() as conn:
-                # C-05/6.1: first compute the stream_ids that will be
-                # pruned so we can cascade-delete their chat_streams rows.
-                cursor = await conn.execute(
-                    """
+        async with self._chat_event_lock, self.transaction() as conn:
+            # C-05/6.1: first compute the stream_ids that will be
+            # pruned so we can cascade-delete their chat_streams rows.
+            cursor = await conn.execute(
+                """
                     SELECT latest.stream_id AS stream_id
                     FROM (
                         SELECT stream_id, MAX(sequence) AS sequence
@@ -5810,28 +6105,28 @@ class Database:
                         AND e.created_at < ?
                     LIMIT ?
                     """,
-                    (now - older_than_seconds, max(1, min(limit, 10_000))),
-                )
-                rows = await cursor.fetchall()
-                await cursor.close()
-                if not rows:
-                    return 0
-                stream_ids = [str(r["stream_id"]) for r in rows]
-                placeholders = ",".join("?" * len(stream_ids))
-                cursor = await conn.execute(
-                    f"DELETE FROM chat_stream_events "
-                    f"WHERE stream_id IN ({placeholders})",
-                    stream_ids,
-                )
-                deleted = cursor.rowcount or 0
-                await cursor.close()
-                # C-05/6.1: cascade-delete the state-machine rows.
-                await conn.execute(
-                    f"DELETE FROM chat_streams "
-                    f"WHERE stream_id IN ({placeholders})",
-                    stream_ids,
-                )
-                return deleted
+                (now - older_than_seconds, max(1, min(limit, 10_000))),
+            )
+            rows = await cursor.fetchall()
+            await cursor.close()
+            if not rows:
+                return 0
+            stream_ids = [str(r["stream_id"]) for r in rows]
+            placeholders = ",".join("?" * len(stream_ids))
+            cursor = await conn.execute(
+                f"DELETE FROM chat_stream_events "
+                f"WHERE stream_id IN ({placeholders})",
+                stream_ids,
+            )
+            deleted = cursor.rowcount or 0
+            await cursor.close()
+            # C-05/6.1: cascade-delete the state-machine rows.
+            await conn.execute(
+                f"DELETE FROM chat_streams "
+                f"WHERE stream_id IN ({placeholders})",
+                stream_ids,
+            )
+            return deleted
 
     async def recover_inflight_chat_streams(
         self, *, now: float, boot_id: str | None = None,
@@ -5856,12 +6151,11 @@ class Database:
         per-session.  Each non-terminal stream gets its own error
         terminal event.
         """
-        async with self._chat_event_lock:
-            async with self.transaction() as conn:
-                if boot_id is None:
-                    # Legacy mode: recover all non-terminal streams.
-                    cursor = await conn.execute(
-                        """
+        async with self._chat_event_lock, self.transaction() as conn:
+            if boot_id is None:
+                # Legacy mode: recover all non-terminal streams.
+                cursor = await conn.execute(
+                    """
                         SELECT e.stream_id,e.session_id,e.principal_id,
                                e.project_id,e.sequence
                         FROM chat_stream_events e
@@ -5872,11 +6166,11 @@ class Database:
                             AND latest.sequence=e.sequence
                         WHERE e.is_terminal=0
                         """
-                    )
-                else:
-                    # C-05: only recover OTHER-boot or expired-lease streams.
-                    cursor = await conn.execute(
-                        """
+                )
+            else:
+                # C-05: only recover OTHER-boot or expired-lease streams.
+                cursor = await conn.execute(
+                    """
                         SELECT e.stream_id,e.session_id,e.principal_id,
                                e.project_id,e.sequence
                         FROM chat_stream_events e
@@ -5896,69 +6190,68 @@ class Database:
                                 AND cs.lease_until < ?)
                           )
                         """,
-                        (boot_id, boot_id, now),
-                    )
-                rows = await cursor.fetchall()
-                for row in rows:
-                    await conn.execute(
-                        "INSERT INTO chat_stream_events ("
-                        "stream_id,session_id,principal_id,project_id,sequence,"
-                        "event_type,data_json,is_terminal,created_at) "
-                        "VALUES(?,?,?,?,?,?,?,1,?)",
-                        (
-                            row["stream_id"],
-                            row["session_id"],
-                            row["principal_id"],
-                            row["project_id"],
-                            int(row["sequence"]) + 1,
-                            "error",
-                            json.dumps({
-                                "code": "PROCESS_RESTART",
-                                "message": "chat interrupted by process restart",
-                                "recoverable": True,
-                            }, sort_keys=True),
-                            now,
-                        ),
-                    )
-                    # C-05/6.1: CAS the chat_streams row to terminal too.
-                    await conn.execute(
-                        "UPDATE chat_streams SET status='error', "
-                        "terminal_event_type='error', terminal_at=?, "
-                        "last_sequence=? "
-                        "WHERE stream_id=? AND status='running'",
-                        (
-                            now,
-                            int(row["sequence"]) + 1,
-                            row["stream_id"],
-                        ),
-                    )
-                return len(rows)
+                    (boot_id, boot_id, now),
+                )
+            rows = await cursor.fetchall()
+            for row in rows:
+                await conn.execute(
+                    "INSERT INTO chat_stream_events ("
+                    "stream_id,session_id,principal_id,project_id,sequence,"
+                    "event_type,data_json,is_terminal,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,1,?)",
+                    (
+                        row["stream_id"],
+                        row["session_id"],
+                        row["principal_id"],
+                        row["project_id"],
+                        int(row["sequence"]) + 1,
+                        "error",
+                        json.dumps({
+                            "code": "PROCESS_RESTART",
+                            "message": "chat interrupted by process restart",
+                            "recoverable": True,
+                        }, sort_keys=True),
+                        now,
+                    ),
+                )
+                # C-05/6.1: CAS the chat_streams row to terminal too.
+                await conn.execute(
+                    "UPDATE chat_streams SET status='error', "
+                    "terminal_event_type='error', terminal_at=?, "
+                    "last_sequence=? "
+                    "WHERE stream_id=? AND status='running'",
+                    (
+                        now,
+                        int(row["sequence"]) + 1,
+                        row["stream_id"],
+                    ),
+                )
+            return len(rows)
 
     async def recover_inflight_agent_turns(self, *, now: float) -> int:
         """Mark crash-left running turns interrupted without inventing success."""
-        async with self._turn_event_lock:
-            async with self.transaction() as conn:
-                cursor = await conn.execute(
-                    "SELECT turn_id,last_sequence FROM agent_turns "
-                    "WHERE status='running' ORDER BY started_at"
+        async with self._turn_event_lock, self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT turn_id,last_sequence FROM agent_turns "
+                "WHERE status='running' ORDER BY started_at"
+            )
+            rows = await cursor.fetchall()
+            for row in rows:
+                sequence = int(row["last_sequence"]) + 1
+                await conn.execute(
+                    "INSERT INTO agent_turn_events VALUES(?,?,?,?,?)",
+                    (
+                        row["turn_id"], sequence, "turn.interrupted",
+                        json.dumps({"reason": "process-restart"}), now,
+                    ),
                 )
-                rows = await cursor.fetchall()
-                for row in rows:
-                    sequence = int(row["last_sequence"]) + 1
-                    await conn.execute(
-                        "INSERT INTO agent_turn_events VALUES(?,?,?,?,?)",
-                        (
-                            row["turn_id"], sequence, "turn.interrupted",
-                            json.dumps({"reason": "process-restart"}), now,
-                        ),
-                    )
-                    await conn.execute(
-                        "UPDATE agent_turns SET status='interrupted',last_sequence=?,"
-                        "error_code='PROCESS_RESTART',finished_at=? WHERE turn_id=? "
-                        "AND status='running'",
-                        (sequence, now, row["turn_id"]),
-                    )
-                return len(rows)
+                await conn.execute(
+                    "UPDATE agent_turns SET status='interrupted',last_sequence=?,"
+                    "error_code='PROCESS_RESTART',finished_at=? WHERE turn_id=? "
+                    "AND status='running'",
+                    (sequence, now, row["turn_id"]),
+                )
+            return len(rows)
 
     async def list_agent_turn_events(
         self, turn_id: str
@@ -5971,6 +6264,35 @@ class Database:
             )
             return [dict(row) for row in await cursor.fetchall()]
 
+    async def prune_terminal_agent_turns(
+        self, *, older_than_seconds: float, now: float, limit: int = 256
+    ) -> dict[str, int]:
+        """Bound completed turn journals while retaining live turns."""
+        cutoff = now - max(0.0, older_than_seconds)
+        async with self._turn_event_lock, self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT turn_id FROM agent_turns "
+                "WHERE status != 'running' AND finished_at IS NOT NULL "
+                "AND finished_at < ? ORDER BY finished_at LIMIT ?",
+                (cutoff, max(1, min(limit, 10_000))),
+            )
+            turn_ids = [str(row["turn_id"]) for row in await cursor.fetchall()]
+            if not turn_ids:
+                return {"agent_turn_events": 0, "agent_turns": 0}
+            placeholders = ",".join("?" for _ in turn_ids)
+            events = await conn.execute(
+                f"DELETE FROM agent_turn_events WHERE turn_id IN ({placeholders})",
+                tuple(turn_ids),
+            )
+            turns = await conn.execute(
+                f"DELETE FROM agent_turns WHERE turn_id IN ({placeholders})",
+                tuple(turn_ids),
+            )
+            return {
+                "agent_turn_events": int(events.rowcount or 0),
+                "agent_turns": int(turns.rowcount or 0),
+            }
+
     async def approve_operation_approval(
         self,
         approval_id: str,
@@ -5979,34 +6301,33 @@ class Database:
         session_id: str,
         now: float,
     ) -> bool:
-        async with self._operation_approval_lock:
-            async with self.transaction() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM operation_approvals WHERE approval_id = ?",
-                    (approval_id,),
+        async with self._operation_approval_lock, self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT * FROM operation_approvals WHERE approval_id = ?",
+                (approval_id,),
+            )
+            row = await cursor.fetchone()
+            success = bool(
+                row is not None
+                and row["status"] == "pending"
+                and float(row["expires_at"]) > now
+                and row["principal_id"] == principal_id
+                and row["session_id"] == session_id
+            )
+            if success:
+                await conn.execute(
+                    "UPDATE operation_approvals SET status='approved', approved_at=? "
+                    "WHERE approval_id=? AND status='pending'",
+                    (now, approval_id),
                 )
-                row = await cursor.fetchone()
-                success = bool(
-                    row is not None
-                    and row["status"] == "pending"
-                    and float(row["expires_at"]) > now
-                    and row["principal_id"] == principal_id
-                    and row["session_id"] == session_id
+            if row is not None:
+                await self._insert_operation_event(
+                    conn, approval_id,
+                    "approved" if success else "approve-rejected",
+                    str(row["binding_digest"]), principal_id, session_id,
+                    {}, now,
                 )
-                if success:
-                    await conn.execute(
-                        "UPDATE operation_approvals SET status='approved', approved_at=? "
-                        "WHERE approval_id=? AND status='pending'",
-                        (now, approval_id),
-                    )
-                if row is not None:
-                    await self._insert_operation_event(
-                        conn, approval_id,
-                        "approved" if success else "approve-rejected",
-                        str(row["binding_digest"]), principal_id, session_id,
-                        {}, now,
-                    )
-                return success
+            return success
 
     async def consume_operation_approval(
         self,
@@ -6018,61 +6339,59 @@ class Database:
         now: float,
     ) -> bool:
         """Consume once; a mismatch burns any pending/approved capability."""
-        async with self._operation_approval_lock:
-            async with self.transaction() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM operation_approvals WHERE approval_id = ?",
-                    (approval_id,),
+        async with self._operation_approval_lock, self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT * FROM operation_approvals WHERE approval_id = ?",
+                (approval_id,),
+            )
+            row = await cursor.fetchone()
+            active = bool(
+                row is not None
+                and row["status"] in {"pending", "approved"}
+            )
+            success = bool(
+                active
+                and row["status"] == "approved"
+                and float(row["expires_at"]) > now
+                and row["binding_digest"] == binding_digest
+                and row["principal_id"] == principal_id
+                and row["session_id"] == session_id
+            )
+            if active:
+                await conn.execute(
+                    "UPDATE operation_approvals SET status='consumed', consumed_at=? "
+                    "WHERE approval_id=? AND status IN ('pending','approved')",
+                    (now, approval_id),
                 )
-                row = await cursor.fetchone()
-                active = bool(
-                    row is not None
-                    and row["status"] in {"pending", "approved"}
+            if row is not None:
+                await self._insert_operation_event(
+                    conn, approval_id,
+                    "consumed" if success else "consume-rejected",
+                    binding_digest, principal_id, session_id,
+                    {"previous_status": str(row["status"])}, now,
                 )
-                success = bool(
-                    active
-                    and row["status"] == "approved"
-                    and float(row["expires_at"]) > now
-                    and row["binding_digest"] == binding_digest
-                    and row["principal_id"] == principal_id
-                    and row["session_id"] == session_id
-                )
-                if active:
-                    await conn.execute(
-                        "UPDATE operation_approvals SET status='consumed', consumed_at=? "
-                        "WHERE approval_id=? AND status IN ('pending','approved')",
-                        (now, approval_id),
-                    )
-                if row is not None:
-                    await self._insert_operation_event(
-                        conn, approval_id,
-                        "consumed" if success else "consume-rejected",
-                        binding_digest, principal_id, session_id,
-                        {"previous_status": str(row["status"])}, now,
-                    )
-                return success
+            return success
 
     async def cancel_operation_approval(
         self, approval_id: str, *, now: float
     ) -> None:
-        async with self._operation_approval_lock:
-            async with self.transaction() as conn:
-                cursor = await conn.execute(
-                    "SELECT * FROM operation_approvals WHERE approval_id = ?",
-                    (approval_id,),
+        async with self._operation_approval_lock, self.transaction() as conn:
+            cursor = await conn.execute(
+                "SELECT * FROM operation_approvals WHERE approval_id = ?",
+                (approval_id,),
+            )
+            row = await cursor.fetchone()
+            if row is not None and row["status"] in {"pending", "approved"}:
+                await conn.execute(
+                    "UPDATE operation_approvals SET status='cancelled', consumed_at=? "
+                    "WHERE approval_id=? AND status IN ('pending','approved')",
+                    (now, approval_id),
                 )
-                row = await cursor.fetchone()
-                if row is not None and row["status"] in {"pending", "approved"}:
-                    await conn.execute(
-                        "UPDATE operation_approvals SET status='cancelled', consumed_at=? "
-                        "WHERE approval_id=? AND status IN ('pending','approved')",
-                        (now, approval_id),
-                    )
-                    await self._insert_operation_event(
-                        conn, approval_id, "cancelled",
-                        str(row["binding_digest"]), str(row["principal_id"]),
-                        str(row["session_id"]), {}, now,
-                    )
+                await self._insert_operation_event(
+                    conn, approval_id, "cancelled",
+                    str(row["binding_digest"]), str(row["principal_id"]),
+                    str(row["session_id"]), {}, now,
+                )
 
     async def list_operation_approval_events(
         self, approval_id: str
@@ -6130,8 +6449,7 @@ class Database:
         This is a WRITE and runs under ``transaction()`` so the prune is
         atomic.  The Maintenance loop calls it hourly.
         """
-        if retention_seconds < 0:
-            retention_seconds = 0
+        retention_seconds = max(retention_seconds, 0)
         cutoff = time.time() - retention_seconds
         deleted_op = 0
         deleted_ev = 0

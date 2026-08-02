@@ -27,6 +27,12 @@ not a parity claim.  The local audit chain anchor detects database rollback or
 history edits, but a remote WORM audit sink and independent human review are
 external release controls and are not implemented by this repository.
 
+Runtime retention is explicit rather than an implicit delete-on-start policy:
+terminal chat/turn journals and terminal tool-operation claims are pruned only
+after their configured replay windows, the audit JSONL side trail rotates into
+trusted segments without deletion, and maintenance performs a passive WAL
+checkpoint. Export/archive evidence before reducing any window.
+
 ## Release checklist
 
 - `python scripts/generate_security_inventory.py --check`

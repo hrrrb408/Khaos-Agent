@@ -13,12 +13,12 @@ from khaos.skills.skill import Skill, SkillParseError
 
 __all__ = [
     "Skill",
+    "SkillCandidate",
+    "SkillGenerator",
+    "SkillLoader",
+    "SkillManager",
     "SkillParseError",
     "SkillRegistry",
-    "SkillManager",
-    "SkillLoader",
-    "SkillGenerator",
-    "SkillCandidate",
     "TaskTrace",
     "ToolTrace",
 ]

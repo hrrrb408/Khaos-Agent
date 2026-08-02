@@ -1,17 +1,19 @@
 """Dirfd-anchored, no-follow workspace mutation primitives."""
 from __future__ import annotations
 
-import errno
 import ctypes
+import errno
 import hashlib
 import os
 import secrets
 import stat
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Callable
+
 from khaos.coding.planning.safe_identifiers import (
-    SafeWorkspaceRelativePath, UnsafePersistedIdentifier,
+    SafeWorkspaceRelativePath,
+    UnsafePersistedIdentifier,
 )
 
 

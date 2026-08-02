@@ -9,7 +9,6 @@ import json
 import os
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 REQUIRED_TESTS = (
     "workspace_escape",

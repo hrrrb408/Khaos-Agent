@@ -52,7 +52,7 @@ async def todo_update(todo_id: str, status: str) -> str:
 
 def _todo_write_sync(append: bool, todos: list[dict]) -> str:
     if not isinstance(append, bool):
-        raise ValueError("append must be a boolean")
+        raise ValueError("append must be a boolean")  # noqa: TRY004 - tool API compatibility
     normalized = [_normalize_todo(todo) for todo in todos]
     current = _load_todos() if append else []
     updated = [*current, *normalized]
@@ -89,7 +89,7 @@ def _todo_update_sync(todo_id: str, status: str) -> str:
 
 def _normalize_todo(todo: dict) -> dict[str, Any]:
     if not isinstance(todo, dict):
-        raise ValueError("todo must be an object")
+        raise ValueError("todo must be an object")  # noqa: TRY004 - tool API compatibility
     content = todo.get("content")
     if not isinstance(content, str) or not content.strip():
         raise ValueError("todo content is required")
@@ -98,7 +98,7 @@ def _normalize_todo(todo: dict) -> dict[str, Any]:
         raise ValueError(f"invalid status: {status}")
     todo_id = todo.get("id") or str(uuid4())
     if not isinstance(todo_id, str):
-        raise ValueError("todo id must be a string")
+        raise ValueError("todo id must be a string")  # noqa: TRY004 - tool API compatibility
     return {"id": todo_id, "content": content, "status": status}
 
 

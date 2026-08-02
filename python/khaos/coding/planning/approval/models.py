@@ -31,9 +31,10 @@ from __future__ import annotations
 import hashlib
 import hmac
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from khaos.coding.planning.contracts import ImplementationPlan
@@ -191,7 +192,7 @@ def _extract_config_fingerprint(evidence: tuple[Any, ...]) -> str:
 
 
 def compute_plan_binding_digest(
-    plan: "ImplementationPlan",
+    plan: ImplementationPlan,
     *,
     approved_verification_plan_digest: str = "",
 ) -> str:

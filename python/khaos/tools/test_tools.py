@@ -111,7 +111,14 @@ async def test_run(
 
     output = f"{result.stdout}{result.stderr}"
     exit_code = int(result.return_code or 0)
-    if exit_code == 127:
+    if exit_code in {126, 127}:
+        diagnostic = output.strip()
+        if "no such file or directory" in diagnostic.lower():
+            summary = f"command not found: {diagnostic}" if diagnostic else "command not found"
+        elif diagnostic:
+            summary = diagnostic
+        else:
+            summary = "command not found" if exit_code == 127 else "command could not be executed"
         return json.dumps(
             {
                 "success": False,
@@ -120,7 +127,7 @@ async def test_run(
                 "errors": 0,
                 "exit_code": exit_code,
                 "failed_cases": [],
-                "summary": output.strip() or "command not found",
+                "summary": summary,
             },
             ensure_ascii=False,
         )
@@ -144,10 +151,7 @@ def _parse_result(command: str, output: str, exit_code: int) -> dict[str, Any]:
         "go": _parse_go,
     }.get(framework)
 
-    if parser is not None:
-        parsed = parser(output)
-    else:
-        parsed = _parse_generic(output)
+    parsed = parser(output) if parser is not None else _parse_generic(output)
 
     # Backstop: a runner-specific parse that found nothing while the process
     # clearly failed is almost always a format we don't recognise yet — fall

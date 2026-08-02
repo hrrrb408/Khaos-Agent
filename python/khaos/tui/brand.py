@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from rich.text import Text
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from PIL import Image
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 _BRAND_IMAGE = _PROJECT_ROOT / "assets" / "brand" / "khaos-feiyuan.png"
@@ -118,7 +122,7 @@ def _is_visible_pixel(rgb: tuple[int, int, int]) -> bool:
     return brightness > 30 or (red > 18 and red_signal > 8)
 
 
-def _crop_visible_brand(image: "Image.Image") -> "Image.Image":
+def _crop_visible_brand(image: Image.Image) -> Image.Image:
     """Crop black padding so the terminal render spends cells on the mark."""
     pixels = image.load()
     width, height = image.size

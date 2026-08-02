@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from khaos.channels.models import ChannelType, DeliveryResult, Message
@@ -36,7 +37,7 @@ class WebSocketChannel(Channel):
                     channel="websocket",
                     target=message.target,
                 )
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - channel backends report delivery failure
                 return DeliveryResult(
                     success=False,
                     channel="websocket",
@@ -65,21 +66,25 @@ class LogFileChannel(Channel):
     async def send(self, message: Message) -> DeliveryResult:
         path = self._log_dir / f"{message.target or 'default'}.log"
         try:
-            with open(path, "a", encoding="utf-8") as f:
-                ts = utc_now_naive().isoformat()
-                f.write(f"[{ts}] {message.content}\n")
+            await asyncio.to_thread(_append_log_line, path, message.content)
             return DeliveryResult(
                 success=True,
                 channel="log_file",
                 target=str(path),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - file delivery must return a result
             return DeliveryResult(
                 success=False,
                 channel="log_file",
                 target=str(path),
                 error=str(exc),
             )
+
+
+def _append_log_line(path, content: str) -> None:
+    with path.open("a", encoding="utf-8") as file:
+        ts = utc_now_naive().isoformat()
+        file.write(f"[{ts}] {content}\n")
 
 
 class MemoryChannel(Channel):
@@ -114,7 +119,7 @@ class MemoryChannel(Channel):
                 channel="memory",
                 target=message.target,
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - memory adapters report delivery failure
             return DeliveryResult(
                 success=False,
                 channel="memory",

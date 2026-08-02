@@ -342,7 +342,7 @@ class WebhookHandler:
             signed = (
                 f"v2\n{self.platform.value}\n{self.channel_id}\n{timestamp}\n"
                 f"{message_id}\n{body_digest}"
-            ).encode("utf-8")
+            ).encode()
             expected = "v2=" + hmac.new(
                 self.secret.encode("utf-8"), signed, hashlib.sha256
             ).hexdigest()

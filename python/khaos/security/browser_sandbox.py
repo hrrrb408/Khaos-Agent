@@ -86,6 +86,7 @@ import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import Self
 
 from khaos.security.kernel_helper_client import (
     KernelAuthorityClient,
@@ -472,9 +473,7 @@ def _is_valid_derived_name(
         return False
     if veth and not _VETH_RE.match(veth):
         return False
-    if nft_table and not _NFT_TABLE_RE.match(nft_table):
-        return False
-    return True
+    return not (nft_table and not _NFT_TABLE_RE.match(nft_table))
 
 
 # Creation-stage state machine (§七).  The registry records the current
@@ -660,20 +659,19 @@ class BrowserNetworkSandbox:
         self._production_authority = (
             require_os_sandbox and os.environ.get("KHAOS_DEV_MODE") != "1"
         )
-        if self._production_authority:
-            if self._kernel_authority is None:
-                if not project_id or not runtime_id or not principal_id or not task_id:
-                    raise BrowserSandboxError(
-                        "production browser sandbox requires principal, project, "
-                        "task, and runtime identity"
-                    )
-                self._kernel_authority = KernelAuthorityClient(
-                    project_id=project_id,
-                    runtime_id=runtime_id,
-                    principal_id=principal_id,
-                    task_id=task_id,
-                    sandbox_token=self._token,
+        if self._production_authority and self._kernel_authority is None:
+            if not project_id or not runtime_id or not principal_id or not task_id:
+                raise BrowserSandboxError(
+                    "production browser sandbox requires principal, project, "
+                    "task, and runtime identity"
                 )
+            self._kernel_authority = KernelAuthorityClient(
+                project_id=project_id,
+                runtime_id=runtime_id,
+                principal_id=principal_id,
+                task_id=task_id,
+                sandbox_token=self._token,
+            )
         self._netns_name: str | None = None
         self._veth_host: str | None = None
         self._veth_ns: str | None = None
@@ -878,7 +876,7 @@ class BrowserNetworkSandbox:
         )
         for argv, exact_name, list_probe in probes:
             result = subprocess.run(
-                argv, capture_output=True, text=True, timeout=5,
+                argv, capture_output=True, text=True, timeout=5, check=False,
             )
             collision = (
                 any(line.split()[0] == exact_name for line in result.stdout.splitlines())
@@ -1132,6 +1130,7 @@ class BrowserNetworkSandbox:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
             if check.returncode != 0:
                 raise OSError(
@@ -1145,6 +1144,7 @@ class BrowserNetworkSandbox:
                 capture_output=True,
                 text=True,
                 timeout=10,
+                check=False,
             )
             if result.returncode != 0:
                 raise OSError(
@@ -1744,6 +1744,7 @@ class BrowserNetworkSandbox:
                 capture_output=True,
                 text=True,
                 timeout=15,
+                check=False,
             )
         except subprocess.TimeoutExpired as exc:
             raise BrowserSandboxError(
@@ -2107,7 +2108,7 @@ def validate_production_python_privileges() -> None:
 class _suppress_oserrors:
     """Context manager that swallows OSError (for best-effort cleanup)."""
 
-    def __enter__(self) -> "_suppress_oserrors":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -2142,13 +2143,13 @@ def _has_net_admin(*, validate: bool = False) -> bool:
     try:
         result = subprocess.run(
             [ip_path, "netns", "add", probe],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
         if result.returncode != 0:
             return False
         subprocess.run(
             [ip_path, "netns", "del", probe],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, timeout=5, check=False,
         )
         return True
     except (OSError, subprocess.TimeoutExpired):
@@ -2171,7 +2172,7 @@ def _run_command(argv: list[str], description: str, *, validate: bool = False) -
     if argv and argv[0] in ("ip", "nft"):
         argv = [_resolve_tcb_tool(argv[0], validate=validate), *argv[1:]]
     result = subprocess.run(
-        argv, capture_output=True, text=True, timeout=10,
+        argv, capture_output=True, text=True, timeout=10, check=False,
     )
     if result.returncode != 0:
         raise OSError(
@@ -2275,10 +2276,8 @@ def _is_process_alive(pid: int, expected_start_time: float) -> bool:
     if not Path(f"/proc/{pid}").exists():
         return False
     current_start = _get_process_start_time(pid)
-    if expected_start_time > 0 and current_start != expected_start_time:
-        # PID was reused by a different process.
-        return False
-    return True
+    # PID was reused by a different process when the recorded start time differs.
+    return not (expected_start_time > 0 and current_start != expected_start_time)
 
 
 def _find_orphaned_resources() -> list[dict]:

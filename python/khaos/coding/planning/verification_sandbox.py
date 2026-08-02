@@ -15,23 +15,26 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
+import logging
 import re
 import secrets
 import shutil
-import signal
 import time
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Protocol
+from typing import Any, ClassVar, Protocol
 
 from khaos.coding.planning.trusted_verification import (
-    DisposableVerificationWorkspace, SandboxProfile, TrustedToolchain,
+    DisposableVerificationWorkspace,
+    SandboxProfile,
+    TrustedToolchain,
 )
-from khaos.coding.planning.verification_execution_models import TrustedVerificationCommand
-from khaos.coding.planning.verification_sandbox_instance import (
-    SandboxInstanceState, VerificationSandboxInstance,
+from khaos.coding.planning.verification_execution_models import (
+    TrustedVerificationCommand,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -479,16 +482,19 @@ class DockerVerificationSandboxBackend:
                 )
         # Verify manifest digest label.
         actual_manifest = container_labels.get("khaos.manifest-digest", "")
-        if expected_manifest_digest and actual_manifest:
-            if actual_manifest != expected_manifest_digest[:63]:
-                await self._safe_delete_owned_container(
-                    container_id_or_name, container_id,
-                    reason="manifest-label-mismatch",
-                )
-                raise RuntimeError(
-                    f"manifest digest label mismatch: expected="
-                    f"{expected_manifest_digest[:63]} actual={actual_manifest}"
-                )
+        if (
+            expected_manifest_digest
+            and actual_manifest
+            and actual_manifest != expected_manifest_digest[:63]
+        ):
+            await self._safe_delete_owned_container(
+                container_id_or_name, container_id,
+                reason="manifest-label-mismatch",
+            )
+            raise RuntimeError(
+                f"manifest digest label mismatch: expected="
+                f"{expected_manifest_digest[:63]} actual={actual_manifest}"
+            )
         # Batch 3.1.4 §4: bind the ContainerAttestation to the approved
         # ImageAttestation content digest.  This enters the Approval binding.
         image_attestation_digest = ""
@@ -530,9 +536,9 @@ class DockerVerificationSandboxBackend:
             await self.terminate_and_remove_instance(
                 container_id or container_id_or_name,
             )
-        except Exception:
+        except Exception as exc:
             # Best-effort cleanup — the mismatch error is the real signal.
-            pass
+            logger.debug("failed to clean up pre-launch mismatch container", exc_info=exc)
 
     async def start_instance(self, container_id_or_name: str) -> None:
         """Batch 3.1.2 §1: ``docker start`` the created container.
@@ -621,7 +627,7 @@ class DockerVerificationSandboxBackend:
             "--format", "{{json .}}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        stdout, _stderr = await process.communicate()
         if process.returncode != 0:
             return None
         try:
@@ -636,7 +642,7 @@ class DockerVerificationSandboxBackend:
             "--format", "{{.Id}}",
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        stdout, _stderr = await process.communicate()
         if process.returncode != 0:
             return None
         return stdout.decode("utf-8", "replace").strip() or None
@@ -1012,7 +1018,7 @@ class DockerVerificationSandboxBackend:
     # Fixed version argv per executable_id — never trust catalog argv for
     # attestation.  The argv and output format are part of the trusted
     # toolchain contract, not the verification catalog.
-    _VERSION_ARGV: dict[str, tuple[str, ...]] = {
+    _VERSION_ARGV: ClassVar[dict[str, tuple[str, ...]]] = {
         "python": ("--version",),
         "npm": ("--version",),
         "go": ("version",),
@@ -1092,8 +1098,10 @@ class DockerVerificationSandboxBackend:
             # Batch 3.1.5 §3: persist PREPARED row BEFORE docker create.
             import secrets as _sec
             import time as _time
+
             from khaos.coding.planning.verification_sandbox_instance import (
-                SandboxInstanceState, VerificationSandboxInstance,
+                SandboxInstanceState,
+                VerificationSandboxInstance,
             )
             sandbox_instance_id = f"vsi_{_sec.token_hex(12)}"
             labels = self.build_toolchain_attestation_labels(
@@ -1170,10 +1178,10 @@ class DockerVerificationSandboxBackend:
             # Batch 3.1.5 §3: inspect image/labels → durable actual container
             # ID → CREATED_ATTESTED.  Verify the container's image matches the
             # approved local_config_image_id and all expected labels are present.
+
             from khaos.coding.planning.verification_sandbox_instance import (
                 SandboxInstanceState,
             )
-            import time as _t
             try:
                 info = await self.inspect_instance(container_id)
                 if info is None:
@@ -1197,8 +1205,8 @@ class DockerVerificationSandboxBackend:
                 # Inspect failed — clean up via persistent lifecycle.
                 try:
                     await self.terminate_and_remove_instance(container_id)
-                except Exception:
-                    pass
+                except Exception as cleanup_exc:
+                    logger.debug("failed to clean up attestation container", exc_info=cleanup_exc)
                 store.update_sandbox_instance(
                     sandbox_instance_id,
                     state=SandboxInstanceState.CLEANUP_FAILED,
@@ -1220,10 +1228,11 @@ class DockerVerificationSandboxBackend:
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         if use_persistent:
+            import time as _t2
+
             from khaos.coding.planning.verification_sandbox_instance import (
                 SandboxInstanceState,
             )
-            import time as _t2
             store.update_sandbox_instance(
                 sandbox_instance_id,
                 state=SandboxInstanceState.RUNNING,
@@ -1234,7 +1243,7 @@ class DockerVerificationSandboxBackend:
                 attach_proc.communicate(), timeout=timeout_seconds,
             )
             exit_code = attach_proc.returncode
-        except asyncio.TimeoutError:
+        except TimeoutError:
             try:
                 attach_proc.kill()
             except ProcessLookupError:
@@ -1242,10 +1251,11 @@ class DockerVerificationSandboxBackend:
             # Batch 3.1.4 §5: terminate and remove the container on timeout.
             _, removed_ok = await self.terminate_and_remove_instance(container_id)
             if use_persistent:
+                import time as _t3
+
                 from khaos.coding.planning.verification_sandbox_instance import (
                     SandboxInstanceState,
                 )
-                import time as _t3
                 if removed_ok:
                     store.update_sandbox_instance(
                         sandbox_instance_id,
@@ -1267,10 +1277,11 @@ class DockerVerificationSandboxBackend:
         # output is captured.  No --rm containers — persistent lifecycle.
         _, removed_ok = await self.terminate_and_remove_instance(container_id)
         if use_persistent:
+            import time as _t4
+
             from khaos.coding.planning.verification_sandbox_instance import (
                 SandboxInstanceState,
             )
-            import time as _t4
             # Batch 3.1.5 §3: absence proof — only persist TERMINATED after
             # terminate_and_remove_instance confirms the container is gone.
             if removed_ok:
@@ -1284,7 +1295,7 @@ class DockerVerificationSandboxBackend:
                 # Absence proof failed — try confirm_instance_gone as fallback.
                 try:
                     gone = await self.confirm_instance_gone(container_id)
-                except Exception:
+                except Exception:  # noqa: BLE001 - backend absence proof fails closed
                     gone = False
                 if gone:
                     store.update_sandbox_instance(

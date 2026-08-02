@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Optional
 
 
 class Mode(Enum):
@@ -168,7 +167,7 @@ class ModeManager:
         )
         return self._current_mode
 
-    async def detect_and_suggest(self, user_input: str) -> Optional[Mode]:
+    async def detect_and_suggest(self, user_input: str) -> Mode | None:
         """Suggest a mode without switching automatically."""
         text = user_input.lower()
         coding_markers = (".py", ".go", ".rs", "git ", "def ", "class ", "func ", "cargo ", "pytest")

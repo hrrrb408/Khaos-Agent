@@ -28,6 +28,7 @@ from typing import Any
 
 from khaos.scheduler.models import ScheduleConfig
 
+
 def _require_principal(principal_id: str) -> dict[str, Any] | None:
     """M4 batch 3.1.10 (CRITICAL): return an ``ok=false`` error dict if
     ``principal_id`` is empty, else ``None``.

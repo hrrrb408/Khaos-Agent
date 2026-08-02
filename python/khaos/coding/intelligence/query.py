@@ -14,15 +14,17 @@ from typing import Any
 from khaos.coding.intelligence.index import IndexStore
 from khaos.coding.intelligence.resolution.persistence import (
     call_edges_for_file,
-    callers_of_symbol,
     callees_of_symbol,
-    dependency_files as _dependency_files,
+    callers_of_symbol,
     reference_edges_for_file,
     references_to_symbol,
     resolved_imports_for_file,
+    reverse_dependency_files,
     symbol_targets,
     unresolved_candidates_for_file,
-    reverse_dependency_files,
+)
+from khaos.coding.intelligence.resolution.persistence import (
+    dependency_files as _dependency_files,
 )
 
 
@@ -141,7 +143,7 @@ class CodeQueryService:
         max_results: int = 50,
         max_sql_queries: int = 10,
         max_indexed_rows: int = 200,
-    ) -> "tuple":
+    ) -> tuple:
         """Bounded test-file association lookup — never scans the whole repository.
 
         Uses a SINGLE remaining budget shared across ALL query sources:

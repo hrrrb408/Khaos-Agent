@@ -150,6 +150,7 @@ class VerificationSnapshotProvider:
     def compute_snapshot(self, plan: Any) -> Any:
         """Compute, persist, and return the ApprovedVerificationPlanSnapshot."""
         import uuid as _uuid
+
         from khaos.coding.planning.approval.models import compute_verification_digest
         from khaos.coding.planning.verification_catalog import VerificationCatalog
         from khaos.coding.planning.verification_execution_models import (
@@ -335,8 +336,13 @@ class ApprovalRuntime:
             for name, dependency in (("TaskManager",self._task_manager),("WorkspaceManager",self._workspace_manager),("RepositoryIndexer",self._repository_indexer)):
                 if dependency is None or not callable(getattr(dependency,"set_mutation_fence",None)):
                     raise TypeError(f"execution-ready ApprovalRuntime requires {name}")
-            from khaos.coding.planning.approval.mutation_fence import WorkspaceMutationFence, PlannedHeadMutationAdapter
-            from khaos.coding.planning.approval.execution_contract import PlannedExecutionGuard
+            from khaos.coding.planning.approval.execution_contract import (
+                PlannedExecutionGuard,
+            )
+            from khaos.coding.planning.approval.mutation_fence import (
+                PlannedHeadMutationAdapter,
+                WorkspaceMutationFence,
+            )
             self._mutation_fence=WorkspaceMutationFence()
             self._store.reconcile_terminal_run_poison_scopes()
             for poisoned_workspace, poison_reason in self._store.list_poisoned_workspaces():
@@ -468,12 +474,12 @@ class ApprovalRuntime:
         if failed_state.value >= RuntimeState.RECEIPT_BOUND.value:
             try:
                 self._broker._reset_runtime_receipt_writer()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to reset broker receipt writer", exc_info=exc)
             try:
                 self._store._reset_runtime_receipt_writer()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to reset store receipt writer", exc_info=exc)
 
         # Invalidate all auth/leases for the failed boot_id (if epoch was rotated).
         if failed_state.value >= RuntimeState.ROTATING.value and self.boot_context is not None:
@@ -482,8 +488,8 @@ class ApprovalRuntime:
                     boot_id=self.boot_context.boot_id,
                     reason="runtime-init-failed",
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to invalidate failed-boot execution scope", exc_info=exc)
 
         self.boot_context = None
         self._verification_storage_registry.revoke_runtime(
@@ -578,6 +584,7 @@ class ApprovalRuntime:
         """Issue opaque boot-scoped storage IDs from trusted runtime roots."""
         self.require_ready()
         from pathlib import Path as _Path
+
         from khaos.coding.planning.verification_sandbox import (
             ProductionVerificationConfig,
         )
@@ -624,8 +631,10 @@ class ApprovalRuntime:
         ``ProductionVerificationAuthority.sign`` verifies before signing.
         """
         from pathlib import Path as _Path
+
         from khaos.coding.planning.verification_sandbox import (
-            DockerVerificationSandboxBackend, ProductionVerificationAuthority,
+            DockerVerificationSandboxBackend,
+            ProductionVerificationAuthority,
         )
         docker_path = _Path(self._verification_docker_executable).resolve(strict=True)
         # Construct the exact backend — no caller object.
@@ -657,9 +666,6 @@ class ApprovalRuntime:
         backends without the factory marker.
         """
         self.require_ready()
-        from khaos.coding.planning.verification_sandbox import (
-            ProductionVerificationAuthority,
-        )
         # Batch 3.1.4 §2: sign with a test-only authority (no factory marker).
         # The runner must accept this via the _unsafe_test_only flag.
         object.__setattr__(backend, "_production_authority", "khaos-production-v1")
@@ -687,10 +693,11 @@ class ApprovalRuntime:
         snapshot_capability: Any = None,
     ) -> None:
         """Internal configuration shared by production and unsafe paths."""
-        import asyncio as _asyncio
-        from khaos.coding.planning.trusted_verification_runner import TrustedVerificationRunner
+        from khaos.coding.planning.trusted_verification_runner import (
+            TrustedVerificationRunner,
+        )
         from khaos.coding.planning.verification_sandbox import (
-            DockerVerificationSandboxBackend, ProductionVerificationAuthority,
+            DockerVerificationSandboxBackend,
         )
         from khaos.coding.planning.verification_store import VerificationExecutionStore
 
@@ -777,16 +784,14 @@ class ApprovalRuntime:
             # is persisted through the full PREPARED → CREATED_ATTESTED →
             # RUNNING → TERMINATED lifecycle with absence proof.
             try:
-                setattr(backend, "_verification_store", self._verification_store)
-                setattr(backend, "_boot_context", self.boot_context)
-                setattr(
-                    backend, "_image_attestation", self._verification_image_attestation,
-                )
-            except Exception:
-                pass
+                backend._verification_store = self._verification_store
+                backend._boot_context = self.boot_context
+                backend._image_attestation = self._verification_image_attestation
+            except Exception as exc:
+                logger.debug("verification backend wiring was unavailable", exc_info=exc)
             try:
-                import concurrent.futures as _cf_tc
                 import asyncio as _aio_tc
+                import concurrent.futures as _cf_tc
                 with _cf_tc.ThreadPoolExecutor(max_workers=1) as pool_tc:
                     attestations = pool_tc.submit(lambda: _aio_tc.run(
                         attest_toolchains(
@@ -855,11 +860,12 @@ class ApprovalRuntime:
         # DO NOT mark all as ORPHANED first — reconcile each record
         # individually, then update state + run + execution atomically.
         # Current Boot ID is NOT a filter — old boot records must be cleaned.
+        import asyncio as _aio2
+        import concurrent.futures as _cf2
+
         from khaos.coding.planning.verification_sandbox_instance import (
             SandboxInstanceState,
         )
-        import concurrent.futures as _cf2
-        import asyncio as _aio2
         non_terminal = self._verification_store.list_active_sandbox_instances()
         reconcile_by_record = getattr(backend, "reconcile_instance_by_record", None)
         if non_terminal:
@@ -893,7 +899,7 @@ class ApprovalRuntime:
                     }
                 try:
                     with _cf2.ThreadPoolExecutor(max_workers=1) as pool2:
-                        report = pool2.submit(lambda: _aio2.run(
+                        report = pool2.submit(lambda instance=instance, expected_labels=expected_labels: _aio2.run(
                             reconcile_by_record(
                                 container_id=instance.container_id,
                                 instance_name=instance.backend_instance_name,
@@ -1075,7 +1081,9 @@ class ApprovalRuntime:
             self._mutation_fence.transfer_owner(
                 run.workspace_id, f"verification-lease:{lease_id}",
             )
-            from khaos.coding.planning.verification_execution_models import VerificationPhaseContext
+            from khaos.coding.planning.verification_execution_models import (
+                VerificationPhaseContext,
+            )
             context = VerificationPhaseContext(
                 verification_context_id=f"vctx_{uuid.uuid4().hex}",
                 phase_lease_id=lease_id, execution_run_id=execution_run_id,
@@ -1154,12 +1162,12 @@ class ApprovalRuntime:
             # Clear runtime writer bindings; public verifiers are durable.
             try:
                 self._broker._reset_runtime_receipt_writer()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to reset broker receipt writer", exc_info=exc)
             try:
                 self._store._reset_runtime_receipt_writer()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to reset store receipt writer", exc_info=exc)
             self.ready = False
             self.gate = None
             self.service = None

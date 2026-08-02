@@ -27,7 +27,11 @@ import time
 from collections import OrderedDict
 from threading import RLock
 
-from khaos.coding.intelligence.lsp.evidence import EvidenceCacheEntry, EvidenceCacheKey, SemanticEvidence
+from khaos.coding.intelligence.lsp.evidence import (
+    EvidenceCacheEntry,
+    EvidenceCacheKey,
+    SemanticEvidence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -165,16 +169,14 @@ class EvidenceCache:
         entry = self._entries.pop(key, None)
         if entry is not None:
             self._total_bytes -= _estimate_bytes(entry.evidence)
-            if self._total_bytes < 0:
-                self._total_bytes = 0
+            self._total_bytes = max(self._total_bytes, 0)
 
     def _evict_lru(self) -> None:
         if not self._entries:
             return
-        key, entry = self._entries.popitem(last=False)
+        _key, entry = self._entries.popitem(last=False)
         self._total_bytes -= _estimate_bytes(entry.evidence)
-        if self._total_bytes < 0:
-            self._total_bytes = 0
+        self._total_bytes = max(self._total_bytes, 0)
         self._stats["evictions"] += 1
 
 

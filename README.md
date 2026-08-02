@@ -47,11 +47,14 @@ khaos start
 loopback、仍强制 API key、project root 和 Python capability。生产入口必须使用
 `compose.prod.yaml`，它绑定 `0.0.0.0:8443`、强制 TLS、API key、精确 Host allowlist
 和 Docker secret 文件；不要通过修改 Gateway 参数关闭这些检查。Docker 中 Python
-固定为 UID 10001 且没有 kernel capability；root helper 是 netns/veth/nft/cgroup
+固定为 UID 10001 且没有 kernel capability；Gateway 固定为 UID 10002、只读根文件系统、
+只读 Agent runtime volume、无 capability 且不共享 Agent 的 PID namespace；Agent UDS
+通过 root-group setgid 父目录与显式 Gateway UID/GID 校验提供最小 RPC 通道；root helper 是 netns/veth/nft/cgroup
 的唯一 authority，并通过独立只读 socket volume 与 agent 通信。Linux 原生部署先
 审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用 systemd 服务。不支持的
 Windows sandbox 路径明确拒绝执行，不回退 Host，也不报告 isolated。详细边界见
-`docs/browser-threat-model.md` 和 `docs/platform-security-guarantees.md`。
+`docs/browser-threat-model.md`、`docs/platform-security-guarantees.md` 和
+`docs/security-platform-support.md`。当前 API key 是单实例本地控制面认证，不是多租户隔离。
 
 ## 开发
 

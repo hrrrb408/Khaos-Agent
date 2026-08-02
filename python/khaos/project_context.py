@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +51,7 @@ _ROOT_KEY = "__root__"
 class ProjectContextLoader:
     """加载层级式项目约定文件（KHAOS.md / AGENTS.md）。"""
 
-    def __init__(self, project_root: Optional[str | Path] = None):
+    def __init__(self, project_root: str | Path | None = None):
         self.project_root = (
             Path(project_root).expanduser().resolve() if project_root else None
         )

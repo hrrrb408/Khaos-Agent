@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 from khaos.subagents.spawner import SubAgentTask
 
@@ -37,7 +36,7 @@ class TaskPlanner:
     """
 
     @staticmethod
-    def from_json(plan_json: str, parent_session_id: str = "root") -> Optional[SubTaskPlan]:
+    def from_json(plan_json: str, parent_session_id: str = "root") -> SubTaskPlan | None:
         """从 JSON 字符串解析任务计划。
 
         JSON 格式：
@@ -294,8 +293,7 @@ class TaskPlanner:
                     to_spawn.append(task)
 
             # 并行 spawn 当前层
-            for task in to_spawn:
-                seen.append(task)
+            seen.extend(to_spawn)
             spawned: list[SubAgentTask] = []
             for task in to_spawn:
                 try:

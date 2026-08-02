@@ -8,8 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy, ResourceBudget
-
+from khaos.coding.execution.models import (
+    ExecutionRequest,
+    NetworkPolicy,
+    ResourceBudget,
+)
 
 _MAX_MESSAGE_BYTES = 8 * 1024 * 1024
 
@@ -84,7 +87,7 @@ class LspClient:
             await self.notify("initialized", {})
             self._started = True
             return {"ok": True, "capabilities": response.get("capabilities", {})}
-        except (OSError, asyncio.TimeoutError, RuntimeError, PermissionError, ValueError) as exc:
+        except (TimeoutError, OSError, RuntimeError, PermissionError, ValueError) as exc:
             await self.close()
             return {"ok": False, "diagnostic": LspDiagnostic("server-unavailable", str(exc))}
 
@@ -126,11 +129,11 @@ class LspClient:
                     await self._request_during_close("shutdown", {})
                     await _write_message(process, {"jsonrpc": "2.0", "method": "exit", "params": {}})
                     await asyncio.wait_for(process.wait(), self.timeout)
-                except (OSError, asyncio.TimeoutError, RuntimeError):
+                except (TimeoutError, OSError, RuntimeError):
                     await process.terminate()
                     try:
                         await asyncio.wait_for(process.wait(), 2.0)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         await process.kill()
                         await process.wait()
         finally:
@@ -222,5 +225,5 @@ async def _read_message(reader: asyncio.StreamReader) -> dict:
     payload = await reader.readexactly(length)
     decoded = json.loads(payload.decode("utf-8"))
     if not isinstance(decoded, dict):
-        raise ValueError("LSP payload must be an object")
+        raise ValueError("LSP payload must be an object")  # noqa: TRY004 - parser compatibility
     return decoded

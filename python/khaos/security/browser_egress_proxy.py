@@ -170,7 +170,7 @@ class BrowserEgressProxy:
             await asyncio.wait_for(
                 self._connection_semaphore.acquire(), timeout=_CONNECT_TIMEOUT,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "browser egress rejected: connection quota exhausted "
                 "(%d/%d concurrent)",
@@ -406,7 +406,7 @@ async def _copy_stream(
     while True:
         try:
             data = await asyncio.wait_for(reader.read(64 * 1024), timeout=idle_timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(
                 "browser egress idle timeout (%.0fs) on %s (%s)",
                 idle_timeout, direction, stats.summary(),

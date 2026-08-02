@@ -497,7 +497,7 @@ func TestWebhookAndChannelEndpoints(t *testing.T) {
 	}
 }
 
-func TestWebhookRateLimitIsScopedByPlatformAndChannel(t *testing.T) {
+func TestWebhookRateLimitUsesSourceAdmissionBeforePythonVerifiedChannel(t *testing.T) {
 	agent := &mockChannelAgent{}
 	handler := NewHandler(
 		agent,
@@ -523,11 +523,11 @@ func TestWebhookRateLimitIsScopedByPlatformAndChannel(t *testing.T) {
 	if same := request("/api/webhook/telegram?channel_id=alpha"); same.Code != http.StatusTooManyRequests {
 		t.Fatalf("same channel should be rate limited, status=%d", same.Code)
 	}
-	if otherChannel := request("/api/webhook/telegram?channel_id=beta"); otherChannel.Code != http.StatusOK {
-		t.Fatalf("different channel should have an independent bucket, status=%d body=%s", otherChannel.Code, otherChannel.Body.String())
+	if otherChannel := request("/api/webhook/telegram?channel_id=beta"); otherChannel.Code != http.StatusTooManyRequests {
+		t.Fatalf("rotating an untrusted channel id must not evade source admission, status=%d body=%s", otherChannel.Code, otherChannel.Body.String())
 	}
-	if otherPlatform := request("/api/webhook/slack?channel_id=alpha"); otherPlatform.Code != http.StatusOK {
-		t.Fatalf("different platform should have an independent bucket, status=%d body=%s", otherPlatform.Code, otherPlatform.Body.String())
+	if otherPlatform := request("/api/webhook/slack?channel_id=alpha"); otherPlatform.Code != http.StatusTooManyRequests {
+		t.Fatalf("rotating an untrusted platform must not evade source admission, status=%d body=%s", otherPlatform.Code, otherPlatform.Body.String())
 	}
 }
 

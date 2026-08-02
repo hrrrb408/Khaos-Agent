@@ -19,13 +19,15 @@ from khaos.coding.execution.models import (
     PermissionProfile,
     ResolvedExecutionContext,
 )
+from khaos.coding.execution.native_launcher import build_process_launch
 from khaos.coding.execution.supervisor import (
     ProcessSupervisor,
-    execution_binding_preexec,
 )
 from khaos.coding.workspace.models import WorkspaceState
-from khaos.coding.workspace.storage import capture_workspace_snapshot
-from khaos.coding.workspace.storage import WorkspaceStorageLimits
+from khaos.coding.workspace.storage import (
+    WorkspaceStorageLimits,
+    capture_workspace_snapshot,
+)
 
 
 class ExecutionService:
@@ -139,7 +141,7 @@ class ExecutionService:
                 storage_baseline = await asyncio.to_thread(
                     capture_workspace_snapshot, root
                 )
-                setattr(workspace, "storage_baseline", storage_baseline)
+                workspace.storage_baseline = storage_baseline
             if not storage_baseline.complete:
                 raise PermissionError(
                     "TaskWorkspace storage baseline is incomplete"
@@ -297,7 +299,7 @@ class ExecutionService:
                 else "failed"
             )
             result.diagnostics["workspace_cleanup"] = transition.value
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - quarantine failures are recorded in the result
             result.diagnostics["workspace_cleanup"] = "failed"
             result.diagnostics["workspace_cleanup_error"] = type(exc).__name__
 
@@ -397,26 +399,22 @@ class ExecutionService:
                 )
                 try:
                     argv = self._managed_argv(resolved, backend, temporary_home)
+                    launch = build_process_launch(
+                        argv,
+                        cwd=cwd,
+                        directory_binding=directory_binding,
+                        budget=request.budget,
+                        enforce_resource_limits=True,
+                    )
                     process = await asyncio.create_subprocess_exec(
-                        *argv,
-                        # The child selects the validated cwd with fchdir;
-                        # no second string-path cwd lookup is performed.
-                        cwd=None,
+                        *launch.argv,
+                        cwd=launch.cwd,
                         env=environment,
                         stdin=asyncio.subprocess.PIPE,
                         stdout=asyncio.subprocess.PIPE,
                         stderr=asyncio.subprocess.PIPE,
-                        start_new_session=True,
-                        pass_fds=directory_binding.pass_fds,
-                        preexec_fn=execution_binding_preexec(
-                            request.budget,
-                            root_path=directory_binding.root_path,
-                            root_identity=directory_binding.root_identity,
-                            root_fd=directory_binding.root_fd,
-                            cwd_path=directory_binding.cwd_path,
-                            cwd_identity=directory_binding.cwd_identity,
-                            cwd_fd=directory_binding.cwd_fd,
-                        ),
+                        start_new_session=launch.start_new_session,
+                        pass_fds=launch.pass_fds,
                     )
                 finally:
                     directory_binding.close()

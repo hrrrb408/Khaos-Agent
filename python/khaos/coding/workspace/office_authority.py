@@ -36,7 +36,7 @@ import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Generic, TypeVar
+from typing import TypeVar
 
 from khaos.coding.workspace.boundary import MutationCancelled
 from khaos.coding.workspace.storage import (

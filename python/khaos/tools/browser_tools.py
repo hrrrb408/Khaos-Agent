@@ -39,14 +39,14 @@ import base64
 import logging
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any
 from urllib.parse import urlparse
 
 from khaos.security.browser_egress_proxy import BrowserEgressProxy
-from khaos.security.browser_sandbox import BrowserNetworkSandbox
-from khaos.security.browser_sandbox import BrowserSandboxError
+from khaos.security.browser_sandbox import BrowserNetworkSandbox, BrowserSandboxError
 
 logger = logging.getLogger(__name__)
 
@@ -128,7 +128,7 @@ class BrowserManager:
 
     def __init__(self):
         self._playwright = None
-        self._browser: Optional[Browser] = None
+        self._browser: Browser | None = None
         self._headless: bool = True
         self._browser_type: str = "chromium"  # chromium / firefox / webkit
         # H5: per-session context+page pairs with reference counting.
@@ -211,8 +211,8 @@ class BrowserManager:
             if entry.get("page"):
                 try:
                     return entry["page"].url
-                except Exception:  # noqa: BLE001 — page may be torn down
-                    pass
+                except Exception as exc:
+                    logger.debug("browser page was already torn down", exc_info=exc)
         return _MOCK_STATE.url
 
     async def launch(
@@ -851,7 +851,7 @@ class BrowserManager:
         runtime_id: str = "",
         project_id: str = "",
         network_guard: Any = None,
-    ) -> Optional[Page]:
+    ) -> Page | None:
         """确保浏览器已启动，未启动则自动启动（chromium, headless）。
 
         H1: returns the ``Page`` for ``principal_id``'s dedicated
@@ -911,7 +911,7 @@ class BrowserManager:
         project_id: str = "",
         runtime_id: str,
         network_guard: Any,
-    ) -> Optional[Page]:
+    ) -> Page | None:
         """Create or reuse a page while ``_lifecycle_lock`` is held.
 
         H1 (round-3): the closed-state check uses ``_closing_requested``
@@ -1276,7 +1276,7 @@ class BrowserManager:
         # placeholder that pages can navigate to freely.
         _ALLOWED_SCHEMES = frozenset({"http", "https", "blob", "data"})
 
-        async def _route_handler(route: "Route", request: "Request") -> None:
+        async def _route_handler(route: Route, request: Request) -> None:
             try:
                 url = request.url
                 # H2: scheme allowlist.  ``file:`` and custom / unknown
@@ -1322,8 +1322,8 @@ class BrowserManager:
                 # Fail closed: abort on handler error.
                 try:
                     await route.abort("failed")
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as abort_exc:
+                    logger.debug("failed to abort guarded route", exc_info=abort_exc)
 
         # H2: do NOT catch exceptions — if ``context.route(...)`` fails
         # to register the handler, the exception propagates to
@@ -1364,7 +1364,7 @@ class BrowserManager:
                 # anything else (defensive — Playwright should never
                 # surface a non-ws URL here).
                 lower_url = url.lower()
-                if not (lower_url.startswith("ws://") or lower_url.startswith("wss://")):
+                if not (lower_url.startswith(("ws://", "wss://"))):
                     await ws_route.close(code=1008, reason="blocked by guard")
                     return
                 parsed = urlparse(url)
@@ -1386,8 +1386,8 @@ class BrowserManager:
                 logger.warning("B2 ws route guard error: %s", exc)
                 try:
                     await ws_route.close(code=1011, reason="guard error")
-                except Exception:  # noqa: BLE001
-                    pass
+                except Exception as close_exc:
+                    logger.debug("failed to close guarded websocket route", exc_info=close_exc)
 
         await context.route_web_socket("**/*", _ws_handler)
 
@@ -1489,7 +1489,7 @@ _FORBIDDEN_JS_PATTERNS = (
 )
 
 
-def _is_expression_blocked(expression: str) -> Optional[str]:
+def _is_expression_blocked(expression: str) -> str | None:
     """返回命中规则的可读说明，未命中返回 None。"""
     for pattern in _FORBIDDEN_JS_PATTERNS:
         if pattern.search(expression):
@@ -1622,8 +1622,8 @@ def _make_click_real(selector: str):
         await page.click(selector, timeout=10000)
         try:
             await page.wait_for_load_state("domcontentloaded", timeout=5000)
-        except Exception:  # noqa: BLE001 — 点击可能不触发导航，忽略超时
-            pass
+        except Exception as exc:
+            logger.debug("click did not trigger a navigation", exc_info=exc)
         return {"ok": True, "selector": selector, "url": page.url}
     return _run
 
@@ -1935,7 +1935,7 @@ _UPLOAD_MAX_BYTES = 10 * 1024 * 1024
 
 def _read_upload_bytes(
     file_path: str, workspace_root: str
-) -> "tuple[bytes, str] | dict[str, Any]":
+) -> tuple[bytes, str] | dict[str, Any]:
     """M1: read one Workspace file through a fixed no-follow dirfd chain.
 
     The previous flow (``_materialize_upload``) copied the bytes into a

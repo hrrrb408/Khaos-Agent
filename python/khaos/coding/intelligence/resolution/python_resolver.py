@@ -141,7 +141,6 @@ def resolve_python_calls(
     for ri in resolved_imports:
         if ri.status not in (ResolutionStatus.RESOLVED, ResolutionStatus.AMBIGUOUS):
             continue
-        key = ri.alias or ri.imported_name or ri.import_module.split(".")[-1]
         if ri.imported_name and ri.imported_name != "*":
             import_map[ri.alias or ri.imported_name] = (ri.target_file, ri.target_symbol_id)
         elif ri.alias:
@@ -206,7 +205,6 @@ def resolve_python_calls(
                         None, None, 0.85, "external-module-attribute", None, metadata))
                     continue
                 # Find the attribute in the target file
-                attr_name = callee.split(".")[-1] if "." in callee else callee
                 # The callee for member calls is the full "receiver.method"
                 member_name = callee.split(".", 1)[-1] if "." in callee else callee
                 target_symbols = [s for s in table.symbols_by_file(target_file) if s.name == member_name]
@@ -315,7 +313,7 @@ def _resolve_python_module_path(module: str, source_file: str, table: Repository
 
 def _resolve_python_submodule(parent_module: str, name: str, source_file: str, table: RepositorySymbolTable, *, relative: bool = False) -> str | None:
     """Resolve `from parent_module import name` where name is a submodule."""
-    full_module = f"{parent_module}.{name}" if not parent_module.startswith(".") else f"{parent_module}.{name}"
+    full_module = f"{parent_module}.{name}"
     # Strip leading dots for path resolution
     clean = full_module.lstrip(".")
     direct = table.module_to_file(clean)
@@ -345,10 +343,7 @@ def _resolve_relative_python_module(module: str, source_file: str, table: Reposi
     for _ in range(level - 1):
         if base_parts:
             base_parts.pop()
-    if remaining:
-        full_parts = base_parts + remaining.split(".")
-    else:
-        full_parts = base_parts
+    full_parts = base_parts + remaining.split(".") if remaining else base_parts
     # Try as module
     module_name = ".".join(p.removesuffix(".py").removesuffix("/__init__") for p in full_parts)
     direct = table.module_to_file(module_name)

@@ -49,8 +49,8 @@ jobs:
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
-      - name: Build inner seccomp launcher
-        run: cargo build --release --no-default-features --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
+      - name: Build native execution and inner seccomp launchers
+        run: cargo build --locked --release --no-default-features --bin khaos-exec-launcher --bin khaos-sandbox-launcher --manifest-path rust/khaos-core/Cargo.toml
       - name: Delegate cgroup v2 subtree
         run: |
           test -f /sys/fs/cgroup/cgroup.controllers
@@ -121,6 +121,7 @@ jobs:
       - name: Run real bwrap isolation E2E
         env:
           KHAOS_DEV_MODE: "0"
+          KHAOS_EXEC_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-exec-launcher
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos/workloads
           KHAOS_SANDBOX_LAUNCHER: ${{ github.workspace }}/rust/khaos-core/target/release/khaos-sandbox-launcher
         run: |
@@ -328,7 +329,8 @@ jobs:
           test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.subtree_control
       - name: Build browser kernel TCB (Rust)
         run: |
-          cargo build --release --no-default-features \
+          cargo build --locked --release --no-default-features \
+            --bin khaos-exec-launcher \
             --bin khaos-sandbox-launcher \
             --bin khaos-browser-kernel-helper \
             --manifest-path rust/khaos-core/Cargo.toml

@@ -60,6 +60,106 @@ async def test_agent_loop_streams_and_persists_messages(tmp_path):
     await db.close()
 
 
+async def test_agent_loop_enforces_budget_before_provider_call(tmp_path):
+    class CountingRouter:
+        def __init__(self):
+            self.calls = 0
+
+        async def call(self, function, messages):
+            self.calls += 1
+            yield Message(role="assistant", content="should not run")
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    router = CountingRouter()
+    loop = AgentLoop(
+        AgentConfig(max_budget_tokens=1),
+        ModeManager(db, project_root=tmp_path),
+        router,
+        db,
+    )
+
+    events = [message async for message in loop.run("over budget", "s1")]
+
+    assert router.calls == 0
+    assert events[-1].event == "done"
+    assert events[-1].stop_reason == "max_budget"
+    assert events[-1].token_count == 2
+    await db.close()
+
+
+async def test_agent_loop_enforces_budget_during_stream(tmp_path):
+    class SingleResponseRouter:
+        def __init__(self):
+            self.calls = 0
+
+        async def call(self, function, messages):
+            self.calls += 1
+            yield Message(role="assistant", content="too many tokens")
+            yield Message(role="assistant", content="", stop_reason="end_turn")
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    router = SingleResponseRouter()
+    loop = AgentLoop(
+        AgentConfig(max_budget_tokens=2),
+        ModeManager(db, project_root=tmp_path),
+        router,
+        db,
+    )
+
+    events = [message async for message in loop.run("hello", "s1")]
+
+    assert router.calls == 1
+    assert events[-1].event == "done"
+    assert events[-1].stop_reason == "max_budget"
+    assert not any(message.event == "error" for message in events)
+    await db.close()
+
+
+async def test_agent_loop_reports_compression_circuit_open(tmp_path):
+    class CircuitOpenCompressor:
+        async def compress(self, messages, threshold):
+            from khaos.exceptions import CompressionCircuitOpenError
+
+            raise CompressionCircuitOpenError("compression circuit open")
+
+    (tmp_path / "prompts").mkdir()
+    (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")
+    (tmp_path / "prompts" / "coding.md").write_text("coding prompt", encoding="utf-8")
+    db = Database(tmp_path / "khaos.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("s1")
+    loop = AgentLoop(
+        AgentConfig(compression_threshold=1),
+        ModeManager(db, project_root=tmp_path),
+        create_default_router(),
+        db,
+        context_compressor=CircuitOpenCompressor(),
+    )
+    await db.insert_message("s1", Message(role="user", content="old " * 20, token_count=20))
+
+    events = [message async for message in loop.run("new", "s1")]
+
+    assert events[-1].event == "error"
+    assert events[-1].metadata["code"] == "COMPRESSION_CIRCUIT_OPEN"
+    turn_id = events[-1].metadata["turn_id"]
+    turn_events = await db.list_agent_turn_events(turn_id)
+    assert turn_events[-1]["event_type"] == "turn.failed"
+    await db.close()
+
+
 async def test_agent_loop_uses_coding_route(tmp_path):
     (tmp_path / "prompts").mkdir()
     (tmp_path / "prompts" / "office.md").write_text("office prompt", encoding="utf-8")

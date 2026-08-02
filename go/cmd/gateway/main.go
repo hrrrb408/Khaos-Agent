@@ -185,9 +185,12 @@ func main() {
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      2 * time.Minute,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// Streaming handlers own their write deadlines and send heartbeats;
+		// a server-wide write timeout would terminate long-running SSE/NDJSON
+		// tasks while they are still making durable progress.
+		WriteTimeout:   0,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 	if strings.TrimSpace(*tlsCert) != "" {
 		// Batch 11.8 (round-11 §十五.1): load the cert/key via the

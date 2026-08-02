@@ -8,7 +8,6 @@ import json
 import subprocess
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SCHEMA = ROOT / "security" / "browser-kernel-protocol-v1.json"
 PYTHON = ROOT / "python" / "khaos" / "security" / "browser_kernel_protocol_generated.py"

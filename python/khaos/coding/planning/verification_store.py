@@ -2,26 +2,28 @@
 from __future__ import annotations
 
 import json
-import hashlib
 import sqlite3
 import time
 import uuid
 from contextlib import nullcontext
 from typing import Any
 
-from khaos.coding.planning.verification_execution_models import (
-    DisposableWorkspaceRecord, DisposableWorkspaceState,
-    VerificationExecutionRun, VerificationRunStatus, VerificationStepRun,
-    VerificationStepStatus,
-)
-from khaos.coding.planning.verification_sandbox_instance import (
-    SandboxInstanceState, VerificationSandboxInstance,
-)
 from khaos.coding.planning.verification_authority import (
     canonical_success_payload_digest,
     require_canonical_success,
 )
-
+from khaos.coding.planning.verification_execution_models import (
+    DisposableWorkspaceRecord,
+    DisposableWorkspaceState,
+    VerificationExecutionRun,
+    VerificationRunStatus,
+    VerificationStepRun,
+    VerificationStepStatus,
+)
+from khaos.coding.planning.verification_sandbox_instance import (
+    SandboxInstanceState,
+    VerificationSandboxInstance,
+)
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS plan_verification_runs (
@@ -648,7 +650,6 @@ class VerificationExecutionStore:
 
     def stage_step_for_finalization(self, step: VerificationStepRun) -> None:
         """Durably save the last successful result before Run→FINALIZING."""
-        now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             cur = self._conn.execute(
@@ -1639,6 +1640,7 @@ class VerificationExecutionStore:
         queries this row and verifies it inside BEGIN IMMEDIATE.
         """
         import uuid as _uuid
+
         from khaos.coding.planning.verification_execution_models import (
             compute_cleanup_digest,
         )
@@ -2345,7 +2347,6 @@ class VerificationExecutionStore:
         self, workspace_id: str, *, failure_code: str = "cleanup-failed",
     ) -> None:
         """Mark a workspace as cleanup-failed (fail-closed, not cleaned)."""
-        now = time.time()
         self._conn.execute("BEGIN IMMEDIATE")
         try:
             self._conn.execute(

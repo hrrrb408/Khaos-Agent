@@ -6,9 +6,14 @@ import hashlib
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from khaos.coding.intelligence.adapters import AdapterAvailability, LegacyRegexAdapter, ParseAdapter, PythonAstAdapter, TreeSitterAdapter
+from khaos.coding.intelligence.adapters import (
+    AdapterAvailability,
+    LegacyRegexAdapter,
+    ParseAdapter,
+    PythonAstAdapter,
+    TreeSitterAdapter,
+)
 from khaos.coding.intelligence.models import ParseDiagnostic, ParseResult, ParseState
-
 
 EXTENSIONS = {".py": "python", ".js": "javascript", ".jsx": "javascript", ".ts": "typescript", ".tsx": "typescript", ".go": "go", ".rs": "rust"}
 
@@ -23,7 +28,7 @@ class LanguageResolution:
 
 class _LegacyAdapterView:
     """Old positional ``parse(Path, bytes)`` facade over registry fallback."""
-    def __init__(self, registry: "LanguageRegistry", language: str, extensions: frozenset[str]) -> None:
+    def __init__(self, registry: LanguageRegistry, language: str, extensions: frozenset[str]) -> None:
         self._registry = registry
         self.language_id = language
         self.language = language

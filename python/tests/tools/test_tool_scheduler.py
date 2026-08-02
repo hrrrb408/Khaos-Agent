@@ -10,9 +10,11 @@ from khaos.tools.registry import ToolDefinition, ToolRegistry
 from khaos.tools.scheduler import (
     EFFECT_APPLIED,
     EFFECT_UNKNOWN,
+    EffectOutcome,
     PermissionRequest,
     ToolBudget,
     ToolScheduler,
+    _canonical_digest,
 )
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.sandbox import Sandbox, SandboxMode
@@ -752,6 +754,7 @@ def _effect_registry(handler, *, name="effect", permission_level="write"):
             permission_level=permission_level,
             parallel=False,
             handler=handler,
+            effect_status="applied",
         )
     )
     return registry
@@ -789,6 +792,39 @@ async def test_scheduler_reports_applied_effect_when_audit_fails(tmp_path, monke
     assert result.retry_safe is False
     assert result.effect_id
     assert "audit persistence failed" in result.warning
+    await db.close()
+
+
+async def test_scheduler_accepts_explicit_effect_outcome(tmp_path):
+    async def write(value: str) -> EffectOutcome:
+        return EffectOutcome(
+            status="partial",
+            effect_id="external-effect-42",
+            reconciliation_hint="inspect the remote write before retry",
+            output={"value": value},
+        )
+
+    db = Database(tmp_path / "explicit-effect.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(write),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+
+    result = (
+        await scheduler.execute_batch(
+            [{"id": "write-1", "name": "effect", "arguments": {"value": "ok"}}],
+            mode="coding",
+        )
+    )[0]
+
+    assert result.success is True
+    assert result.output == {"value": "ok"}
+    assert result.effect_status == "partial"
+    assert result.effect_id == "external-effect-42"
+    assert result.reconciliation_hint == "inspect the remote write before retry"
+    assert result.retry_safe is False
     await db.close()
 
 
@@ -917,4 +953,190 @@ async def test_scheduler_replays_explicit_idempotency_key_without_reinvoking_han
     assert first.success and second.success
     assert first.effect_id == second.effect_id
     assert second.tool_call_id == "call-2"
+    await db.close()
+
+
+async def test_scheduler_serializes_concurrent_idempotent_dispatches(tmp_path):
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def write(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return value
+
+    db = Database(tmp_path / "idempotency-concurrent.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(write),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+    context = {
+        "principal_id": "principal",
+        "project_id": "project",
+        "task_id": "task",
+        "workspace_id": "workspace",
+    }
+    call = {
+        "name": "effect",
+        "arguments": {"value": "once"},
+        "idempotency_key": "concurrent-effect",
+    }
+
+    first_task = asyncio.create_task(
+        scheduler.execute_batch(
+            [{**call, "id": "call-1"}],
+            mode="coding",
+            session_id="session",
+            tool_context=context,
+        )
+    )
+    await started.wait()
+    second_task = asyncio.create_task(
+        scheduler.execute_batch(
+            [{**call, "id": "call-2"}],
+            mode="coding",
+            session_id="session",
+            tool_context=context,
+        )
+    )
+    await asyncio.sleep(0)
+    release.set()
+    first, second = (await first_task)[0], (await second_task)[0]
+
+    assert calls == 1
+    assert first.success and second.success
+    assert first.effect_id == second.effect_id
+    assert second.tool_call_id == "call-2"
+    await db.close()
+
+
+async def test_scheduler_rejects_concurrent_idempotency_argument_reuse(tmp_path):
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def write(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return value
+
+    db = Database(tmp_path / "idempotency-concurrent-conflict.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(write),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+    context = {
+        "principal_id": "principal",
+        "project_id": "project",
+        "task_id": "task",
+        "workspace_id": "workspace",
+    }
+    first_task = asyncio.create_task(
+        scheduler.execute_batch(
+            [{
+                "id": "call-1",
+                "name": "effect",
+                "arguments": {"value": "first"},
+                "idempotency_key": "concurrent-conflict",
+            }],
+            mode="coding",
+            session_id="session",
+            tool_context=context,
+        )
+    )
+    await started.wait()
+    second_task = asyncio.create_task(
+        scheduler.execute_batch(
+            [{
+                "id": "call-2",
+                "name": "effect",
+                "arguments": {"value": "different"},
+                "idempotency_key": "concurrent-conflict",
+            }],
+            mode="coding",
+            session_id="session",
+            tool_context=context,
+        )
+    )
+    await asyncio.sleep(0)
+    release.set()
+    first, second = (await first_task)[0], (await second_task)[0]
+
+    assert calls == 1
+    assert first.success is True
+    assert second.success is False
+    assert "different tool arguments" in second.error
+    await db.close()
+
+
+async def test_scheduler_does_not_replay_orphaned_running_operation(tmp_path):
+    calls = 0
+
+    async def write(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return value
+
+    db = Database(tmp_path / "idempotency-restart.db")
+    await db.connect()
+    await db.run_migrations()
+    engine = PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE)
+    scheduler = ToolScheduler(_effect_registry(write), engine)
+    context = {
+        "principal_id": "principal",
+        "project_id": "project",
+        "task_id": "task",
+        "workspace_id": "workspace",
+    }
+    call = {
+        "id": "call-restart",
+        "name": "effect",
+        "arguments": {"value": "once"},
+        "idempotency_key": "orphaned-effect",
+    }
+    normalized = {**call, "_idempotency_key": call["idempotency_key"]}
+    operation_id = scheduler._idempotency_scope(
+        normalized, session_id="session", tool_context=context
+    )
+    arguments_digest = _canonical_digest(call["arguments"])
+    claimed = await db.claim_tool_operation(
+        operation_id=operation_id,
+        tool_name="effect",
+        arguments_digest=arguments_digest,
+        effect_id="remote-effect-1",
+        owner_token="crashed-owner",
+        principal_id="principal",
+        project_id="project",
+        session_id="session",
+        task_id="task",
+        workspace_id="workspace",
+    )
+    assert claimed["state"] == "claimed"
+
+    result = (
+        await scheduler.execute_batch(
+            [call],
+            mode="coding",
+            session_id="session",
+            tool_context=context,
+        )
+    )[0]
+
+    assert calls == 0
+    assert result.success is False
+    assert result.effect_status == EFFECT_UNKNOWN
+    assert result.effect_id == "remote-effect-1"
+    assert result.retry_safe is False
+    assert "reconcile" in (
+        result.reconciliation_hint + result.warning + result.error
+    ).lower()
     await db.close()

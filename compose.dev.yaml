@@ -84,7 +84,6 @@ services:
     depends_on:
       khaos-agent:
         condition: service_healthy
-    pid: "service:khaos-agent"
     environment:
       - KHAOS_PYTHON_AGENT=/run/khaos/agent.sock
       - KHAOS_API_KEY_FILE=/run/secrets/khaos_api_key
@@ -93,12 +92,21 @@ services:
     secrets:
       - source: khaos_python_capability
         target: khaos_python_capability
-        mode: "0400"
+        mode: "0440"
       - source: khaos_api_key
         target: khaos_api_key
-        mode: "0400"
+        mode: "0440"
     volumes:
-      - khaos-runtime:/run/khaos
+      - khaos-runtime:/run/khaos:ro
+    group_add:
+      - "0"
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/api/health"]

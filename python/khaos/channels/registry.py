@@ -200,5 +200,5 @@ class ChannelRegistry:
 
 
 def _integration_fingerprint(config: ChannelConfig) -> str:
-    encoded = f"{config.channel_type.value}\0{config.secret}".encode("utf-8")
+    encoded = f"{config.channel_type.value}\0{config.secret}".encode()
     return hashlib.sha256(encoded).hexdigest()

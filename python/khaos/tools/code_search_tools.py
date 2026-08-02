@@ -41,6 +41,7 @@ def _safe_code_search_sync(
     workspace_root: Path, root: str, query: str, glob: str, limit: int
 ) -> dict[str, Any]:
     from fnmatch import fnmatch
+
     from khaos.coding.workspace.boundary import SafeWorkspaceFS
 
     with SafeWorkspaceFS(workspace_root) as filesystem:

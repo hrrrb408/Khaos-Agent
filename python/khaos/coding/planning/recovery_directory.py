@@ -7,8 +7,12 @@ import os
 import stat
 import uuid
 from pathlib import Path
+from typing import Self
+
 from khaos.coding.planning.safe_identifiers import (
-    SafeRecoveryArtifactName, SafeRecoveryRunId, SafeSealTombstoneName,
+    SafeRecoveryArtifactName,
+    SafeRecoveryRunId,
+    SafeSealTombstoneName,
     UnsafePersistedIdentifier,
 )
 
@@ -304,7 +308,7 @@ class RecoveryDirectory:
                 os.close(fd)
                 setattr(self, name, -1)
 
-    def __enter__(self) -> "RecoveryDirectory":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_args: object) -> None:

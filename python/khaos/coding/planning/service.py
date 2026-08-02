@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from khaos.coding.intelligence.query import CodeQueryService
-from khaos.coding.planning.contracts import *  # noqa: F403
+from khaos.coding.planning.contracts import *
 from khaos.coding.planning.dag import validate_steps
 from khaos.coding.planning.risk import RiskEvaluator
 from khaos.coding.planning.verification import TrustedVerificationSelector
@@ -300,7 +300,6 @@ class DeterministicPlanningService:
         parsed = resolved.parsed
         diagnostics.extend(resolved.diagnostics)
         token = parsed.raw_token
-        candidates = list(resolved.symbol_candidates)
         evidence: list[PlanEvidence] = []
         symbols: list[AffectedSymbol] = []
         files: list[AffectedFile] = []

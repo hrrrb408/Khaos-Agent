@@ -16,8 +16,9 @@ mod linux {
     use std::os::unix::net::UnixStream;
     use std::path::{Path, PathBuf};
 
+    #[cfg(target_arch = "x86_64")]
     const AUDIT_ARCH_X86_64: u32 = 0xc000_003e;
-    #[allow(dead_code)] // only used on aarch64 targets
+    #[cfg(target_arch = "aarch64")]
     const AUDIT_ARCH_AARCH64: u32 = 0xc000_00b7;
     const SECCOMP_RET_KILL_PROCESS: u32 = 0x8000_0000;
     const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;

@@ -31,7 +31,8 @@ type Handler struct {
 	sessionClient        SessionClient
 	config               ConfigStore
 	authenticatedLimiter *rate.KeyedBuckets
-	webhookLimiter       *rate.KeyedBuckets
+	webhookSourceLimiter *rate.KeyedBuckets
+	webhookConcurrency   chan struct{}
 	healthLimiter        *rate.TokenBucket
 	metrics              *metrics.Collector
 	apiKey               string
@@ -44,9 +45,12 @@ type Handler struct {
 }
 
 const (
-	protocolVersion           = "1"
-	maxRequestBodyBytes int64 = 1 << 20
-	maxWebhookBodyBytes int64 = 2 << 20
+	protocolVersion               = "1"
+	maxRequestBodyBytes     int64 = 1 << 20
+	maxWebhookBodyBytes     int64 = 2 << 20
+	maxWebhookConcurrency         = 64
+	streamHeartbeatInterval       = 15 * time.Second
+	streamWriteTimeout            = 30 * time.Second
 )
 
 var signatureAuthenticatedWebhookPlatforms = map[string]struct{}{
@@ -83,7 +87,8 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 		memory:               memory,
 		config:               config,
 		authenticatedLimiter: rate.NewKeyedBuckets(ratePerMinute, burst, 4096, 10*time.Minute),
-		webhookLimiter:       rate.NewKeyedBuckets(ratePerMinute, burst, 4096, 10*time.Minute),
+		webhookSourceLimiter: rate.NewKeyedBucketsWithAdmission(ratePerMinute, burst, 4096, 10*time.Minute, true),
+		webhookConcurrency:   make(chan struct{}, maxWebhookConcurrency),
 		healthLimiter:        limiter,
 		metrics:              metrics.NewCollector(),
 		apiKey:               apiKey,
@@ -187,8 +192,12 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("GET /v1/tasks/{id}/artifacts", h.handleTaskArtifacts)
 	common := h.requestLog(h.metricsMiddleware(mux))
 	health := h.rateLimit(h.healthLimiter, common)
+	// Source admission is the only pre-auth Gateway bucket.  The channel
+	// bucket is deliberately applied by Python after signature verification;
+	// using query/path channel identifiers here would let an unauthenticated
+	// caller manufacture an unbounded set of pre-auth identities.
 	webhookIngress := h.keyedRateLimit(
-		h.webhookLimiter, webhookRateLimitIdentity, common,
+		h.webhookSourceLimiter, webhookSourceIdentity, common,
 	)
 	authenticated := h.keyedRateLimit(
 		h.authenticatedLimiter, authenticatedPrincipalIdentity, common,
@@ -418,10 +427,18 @@ func (h *Handler) handleTaskEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lastSequence, _ := strconv.ParseUint(r.Header.Get("Last-Event-ID"), 10, 64)
+	heartbeat := time.NewTicker(streamHeartbeatInterval)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-heartbeat.C:
+			armStreamWriteDeadline(w)
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			flusher.Flush()
 		case event, open := <-events:
 			if !open {
 				return
@@ -431,6 +448,7 @@ func (h *Handler) handleTaskEvents(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			data, _ := json.Marshal(event)
+			armStreamWriteDeadline(w)
 			if sequence > 0 {
 				fmt.Fprintf(w, "id: %d\n", sequence)
 			}
@@ -469,6 +487,15 @@ func (h *Handler) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	client, ok := h.channelClient(w)
 	if !ok {
 		return
+	}
+	if h.webhookConcurrency != nil {
+		select {
+		case h.webhookConcurrency <- struct{}{}:
+			defer func() { <-h.webhookConcurrency }()
+		default:
+			writeError(w, http.StatusTooManyRequests, "webhook concurrency limited")
+			return
+		}
 	}
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, 2<<20))
 	if err != nil {
@@ -716,33 +743,6 @@ func webhookSourceIdentity(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// webhookRateLimitIdentity keeps the source-IP partition while adding the
-// platform/channel partition required by the ingress contract.  A noisy
-// channel must not consume the bucket for another configured channel behind
-// the same NAT or load balancer, and a caller must not be able to evade a
-// channel's bucket merely by rotating source addresses.
-func webhookRateLimitIdentity(r *http.Request) string {
-	platform := strings.ToLower(strings.TrimSpace(r.PathValue("platform")))
-	// The rate-limit middleware runs before ServeMux has matched the route,
-	// so PathValue is not populated yet on the ingress path.  Parse the
-	// already-validated route prefix as a fallback; otherwise every platform
-	// would collapse into the same "unknown" bucket.
-	if platform == "" {
-		const prefix = "/api/webhook/"
-		if strings.HasPrefix(r.URL.Path, prefix) {
-			platform = strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/")
-		}
-	}
-	channelID := strings.TrimSpace(r.URL.Query().Get("channel_id"))
-	if platform == "" {
-		platform = "unknown"
-	}
-	if channelID == "" {
-		channelID = "unknown"
-	}
-	return webhookSourceIdentity(r) + "|platform=" + platform + "|channel=" + channelID
-}
-
 func (h *Handler) requestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		recorder := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
@@ -775,6 +775,17 @@ func (h *Handler) metricsMiddleware(next http.Handler) http.Handler {
 type statusRecorder struct {
 	http.ResponseWriter
 	status int
+}
+
+// Unwrap lets http.ResponseController reach the server writer through the
+// metrics/request-log wrappers so streaming routes can apply an idle write
+// deadline without a global request timeout.
+func (r *statusRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
+
+func armStreamWriteDeadline(w http.ResponseWriter) {
+	_ = http.NewResponseController(w).SetWriteDeadline(
+		time.Now().Add(streamWriteTimeout),
+	)
 }
 
 func (r *statusRecorder) WriteHeader(status int) {
@@ -855,10 +866,20 @@ func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	flusher, _ := w.(http.Flusher)
+	heartbeat := time.NewTicker(streamHeartbeatInterval)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-heartbeat.C:
+			armStreamWriteDeadline(w)
+			if _, err := fmt.Fprint(w, ": keep-alive\n\n"); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
 		case event, open := <-stream:
 			if !open {
 				return
@@ -871,8 +892,10 @@ func (h *Handler) handleChatStream(w http.ResponseWriter, r *http.Request) {
 				cursor = event.Sequence
 			}
 			if cursor > 0 {
+				armStreamWriteDeadline(w)
 				fmt.Fprintf(w, "id: %d\n", cursor)
 			}
+			armStreamWriteDeadline(w)
 			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event.Event, payload)
 			if flusher != nil {
 				flusher.Flush()
@@ -913,14 +936,25 @@ func (h *Handler) handleChatNDJSONStream(w http.ResponseWriter, r *http.Request)
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
 	encoder := json.NewEncoder(w)
+	heartbeat := time.NewTicker(streamHeartbeatInterval)
+	defer heartbeat.Stop()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
+		case <-heartbeat.C:
+			armStreamWriteDeadline(w)
+			if err := encoder.Encode(ChatEvent{Event: "heartbeat", Data: map[string]any{"timestamp": time.Now().UTC().Format(time.RFC3339)}}); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
 		case event, open := <-stream:
 			if !open {
 				return
 			}
+			armStreamWriteDeadline(w)
 			if err := encoder.Encode(event); err != nil {
 				return
 			}

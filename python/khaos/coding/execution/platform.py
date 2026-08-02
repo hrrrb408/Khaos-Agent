@@ -5,25 +5,31 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import shutil
 import secrets
+import shutil
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
 from khaos.coding.execution.binding import open_execution_directory_binding
-from khaos.coding.execution.models import ResourceBudget
-from khaos.coding.execution.supervisor import ProcessSupervisor
 from khaos.coding.execution.capability import (
     BackendAvailability,
-    CapabilityEvidence as CapabilityEvidence,
-    _CapabilityCacheEntry,
     _cached_availability,
     _capability_evidence,
+    _CapabilityCacheEntry,
 )
+from khaos.coding.execution.capability import (
+    CapabilityEvidence as _CapabilityEvidence,
+)
+from khaos.coding.execution.models import ResourceBudget
+from khaos.coding.execution.supervisor import ProcessSupervisor
 
 logger = logging.getLogger(__name__)
+
+# Backwards-compatible public import for callers that historically imported
+# the evidence model from this module instead of ``capability``.
+CapabilityEvidence = _CapabilityEvidence
 
 
 class UnsupportedBackend:
@@ -61,7 +67,7 @@ class BackendSelector:
             backend = MacOSSandboxBackend(self.supervisor)
             try:
                 availability = backend.probe_capability()
-            except Exception:
+            except Exception:  # noqa: BLE001 - unavailable sandbox probes fail closed
                 availability = BackendAvailability(
                     backend.name,
                     False,
@@ -74,7 +80,7 @@ class BackendSelector:
             backend = LinuxBubblewrapBackend(self.supervisor)
             try:
                 availability = backend.probe_capability()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - unavailable sandbox probes fail closed
                 availability = BackendAvailability(
                     backend.name,
                     False,
@@ -161,8 +167,8 @@ class MacOSSandboxBackend:
                         "try: socket.create_connection(('1.1.1.1', 53), timeout=0.2)",
                         "except OSError: pass",
                         "else: raise SystemExit('network allowed')",
-                        "for command in (('/usr/bin/pbpaste',), "
-                        "('/usr/bin/security', 'list-keychains')):",
+                        ("for command in (('/usr/bin/pbpaste',), "
+                         "('/usr/bin/security', 'list-keychains')):"),
                         "    result = subprocess.run(command, capture_output=True)",
                         "    if result.returncode == 0:",
                         "        raise SystemExit(f'host IPC allowed: {command[0]}')",
@@ -185,6 +191,7 @@ class MacOSSandboxBackend:
                     cwd=workspace,
                     capture_output=True,
                     timeout=5,
+                    check=False,
                 )
                 passed = (
                     completed.returncode == 0
@@ -301,21 +308,26 @@ class MacOSSandboxBackend:
         # deny-default plus the positive allowlist makes all non-runtime host
         # paths invisible, including credential roots not known in advance.
         _ = unreadable_roots
-        return "".join((
-            "(version 1)(deny default)(allow process-exec process-fork)",
-            "(allow signal (target same-sandbox))",
-            "(allow process-info* (target same-sandbox))",
-            "(allow sysctl-read)",
-            '(allow file-read* (literal "/"))',
-            '(allow file-read* file-write-data (literal "/dev/null"))',
-            '(allow file-read* (literal "/dev/random"))',
-            '(allow file-read* (literal "/dev/urandom"))',
-            metadata_rules, read_rules, literal_reads,
-            executable_map_rules, write_rules,
-            protected_write_rules,
-            mach_lookup_rules,
-            "(deny network*)",
-        ))
+        return (
+            "(version 1)(deny default)(allow process-exec process-fork)"
+            "(allow signal (target same-sandbox))"
+            "(allow process-info* (target same-sandbox))"
+            "(allow sysctl-read)"
+            # Do not grant a root-level file-read rule: on Seatbelt this
+            # makes unrelated host paths such as /private/tmp traversable and
+            # defeats the positive read-root allowlist below.
+            '(allow file-read* file-write-data (literal "/dev/null"))'
+            '(allow file-read* (literal "/dev/random"))'
+            '(allow file-read* (literal "/dev/urandom"))'
+            # Seatbelt needs metadata for the filesystem root while resolving
+            # an allowlisted executable.  Metadata alone does not expose
+            # directory entries or file contents outside the roots above.
+            '(allow file-read-metadata (literal "/"))'
+            f"{metadata_rules}{read_rules}{literal_reads}"
+            f"{executable_map_rules}{write_rules}"
+            f"{protected_write_rules}{mach_lookup_rules}"
+            "(deny network*)"
+        )
 
     async def execute(self, request):
         from dataclasses import replace
@@ -434,6 +446,7 @@ class LinuxBubblewrapBackend:
                     ),
                     capture_output=True,
                     timeout=10,
+                    check=False,
                 )
         except (OSError, subprocess.SubprocessError) as exc:
             availability = BackendAvailability(
@@ -648,7 +661,7 @@ def _resolve_bwrap_path() -> str:
     canonical-path, owner/mode, parent-chain checks. A bare PATH lookup is
     permitted only under explicit ``KHAOS_DEV_MODE=1``.
     """
-    from khaos.security.browser_sandbox import _validate_tcb_binary, BrowserSandboxError
+    from khaos.security.browser_sandbox import BrowserSandboxError, _validate_tcb_binary
     require = not _development_mode()
     located = shutil.which("bwrap")
     if located is None:
@@ -695,7 +708,10 @@ def _linux_sandbox_launcher() -> Path | None:
         if not (canonical.is_file() and os.access(canonical, os.X_OK)):
             continue
         if require:
-            from khaos.security.browser_sandbox import _validate_tcb_binary, BrowserSandboxError
+            from khaos.security.browser_sandbox import (
+                BrowserSandboxError,
+                _validate_tcb_binary,
+            )
             try:
                 validated = _validate_tcb_binary(str(canonical), label="coding launcher")
                 return Path(validated)
@@ -930,6 +946,11 @@ def _macos_literal_read_files() -> tuple[Path, ...]:
         path for path in (
             Path("/etc/hosts"), Path("/etc/passwd"), Path("/etc/group"),
             Path("/etc/localtime"),
+            # /etc is a symlink to /private/etc on macOS. Seatbelt matches
+            # the canonical path for these libc inputs, so allow only the
+            # concrete files instead of a broad /private read rule.
+            Path("/private/etc/hosts"), Path("/private/etc/passwd"),
+            Path("/private/etc/group"), Path("/private/etc/localtime"),
         ) if path.exists()
     )
 

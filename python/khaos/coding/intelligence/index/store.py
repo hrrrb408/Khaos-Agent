@@ -12,7 +12,6 @@ from typing import Any
 from khaos.coding.intelligence.models import ParseResult
 from khaos.coding.intelligence.registry import LanguageRegistry
 
-
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS code_files (project_id TEXT NOT NULL, path TEXT NOT NULL,
  language TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
@@ -201,9 +200,9 @@ def _classify_path_role(path: str) -> str:
         if part in ("tests", "test", "spec", "__tests__", "specs", "__tests__"):
             return "test"
     # Test file prefixes/suffixes: test_*, *_test.*, *_spec.*, *_test.*
-    if stem.startswith("test_") or stem.startswith("test-"):
+    if stem.startswith(("test_", "test-")):
         return "test"
-    if stem.endswith("_test") or stem.endswith("-test") or stem.endswith("_spec") or stem.endswith("-spec") or stem.endswith("Test") or stem.endswith("Spec"):
+    if stem.endswith(("_test", "-test", "_spec", "-spec", "Test", "Spec")):
         return "test"
     # Go test files: *_test.go (already caught by suffix, but be explicit)
     if filename.endswith("_test.go"):
@@ -248,7 +247,7 @@ def _compute_test_subject_key(path: str) -> str:
         return stem[:-5]
     # Go: foo_test.go → foo
     if filename.endswith("_test.go"):
-        return stem[:-5] if stem.endswith("_test") else stem
+        return stem.removesuffix("_test")
     # Not a test file — no subject key
     return ""
 

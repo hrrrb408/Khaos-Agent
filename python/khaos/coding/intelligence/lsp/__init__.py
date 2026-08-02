@@ -18,8 +18,8 @@ from khaos.coding.intelligence.lsp.evidence import (
     EvidenceCacheKey,
     EvidenceSource,
     EvidenceType,
-    FusionRule,
     FusedResolution,
+    FusionRule,
     SemanticEvidence,
 )
 from khaos.coding.intelligence.lsp.fusion import (
@@ -29,58 +29,58 @@ from khaos.coding.intelligence.lsp.fusion import (
     compute_server_identity,
 )
 from khaos.coding.intelligence.lsp.positions import (
-    PositionMapping,
     PositionConversionError,
+    PositionMapping,
     byte_offset_to_lsp_position,
     lsp_position_to_offsets,
     lsp_range_to_byte_offsets,
 )
 from khaos.coding.intelligence.lsp.uri import (
+    NonFileUriError,
     SymlinkEscapeError,
     UriMappingError,
     WorkspaceEscapeError,
-    NonFileUriError,
     map_lsp_uri_to_workspace_path,
     path_to_file_uri,
 )
 
 __all__ = [
+    "DEFAULT_CONFIG",
+    "DiskWorkspaceDocumentProvider",
+    # Cache
+    "EvidenceCache",
+    "EvidenceCacheEntry",
+    "EvidenceCacheKey",
+    "EvidenceSource",
+    "EvidenceType",
+    "FusedResolution",
+    "FusionContext",
+    "FusionRule",
     # Client
     "LspClient",
     "LspDiagnostic",
+    # Fusion service
+    "LspEvidenceFusionService",
     # Config
     "LspFusionConfig",
-    "DEFAULT_CONFIG",
+    "NonFileUriError",
+    "PositionConversionError",
+    # Position conversion
+    "PositionMapping",
+    # Evidence models
+    "SemanticEvidence",
+    "SymlinkEscapeError",
+    "UriMappingError",
     # Document provider
     "WorkspaceDocument",
     "WorkspaceDocumentProvider",
-    "DiskWorkspaceDocumentProvider",
-    # Evidence models
-    "SemanticEvidence",
-    "FusedResolution",
-    "EvidenceSource",
-    "EvidenceType",
-    "FusionRule",
-    "EvidenceCacheKey",
-    "EvidenceCacheEntry",
-    # Cache
-    "EvidenceCache",
-    # Fusion service
-    "LspEvidenceFusionService",
-    "FusionContext",
-    "compute_server_identity",
+    "WorkspaceEscapeError",
+    "byte_offset_to_lsp_position",
     "compute_content_hash",
+    "compute_server_identity",
+    "lsp_position_to_offsets",
+    "lsp_range_to_byte_offsets",
     # URI mapping
     "map_lsp_uri_to_workspace_path",
     "path_to_file_uri",
-    "UriMappingError",
-    "NonFileUriError",
-    "WorkspaceEscapeError",
-    "SymlinkEscapeError",
-    # Position conversion
-    "PositionMapping",
-    "PositionConversionError",
-    "lsp_position_to_offsets",
-    "byte_offset_to_lsp_position",
-    "lsp_range_to_byte_offsets",
 ]

@@ -4,7 +4,6 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
-import os
 import secrets
 import time
 import uuid
@@ -16,23 +15,31 @@ from khaos.coding.planning.approval.models import compute_verification_digest
 from khaos.coding.planning.execution_models import ExecutionRunStatus
 from khaos.coding.planning.git_state import GitStateInspector
 from khaos.coding.planning.trusted_verification import (
-    ArtifactRootCapability, DisposableStorageRootCapability,
-    SandboxProfile, TrustedCommandFactory, VerificationWorkspaceFactory,
+    ArtifactRootCapability,
+    DisposableStorageRootCapability,
+    SandboxProfile,
+    TrustedCommandFactory,
+    VerificationWorkspaceFactory,
 )
 from khaos.coding.planning.verification_catalog import VerificationCatalog
 from khaos.coding.planning.verification_execution_models import (
-    DisposableWorkspaceRecord, DisposableWorkspaceState,
-    VerificationExecutionRun, VerificationPhaseContext, VerificationResult,
-    VerificationRunStatus, VerificationStepRun, VerificationStepStatus,
+    DisposableWorkspaceRecord,
+    DisposableWorkspaceState,
+    VerificationExecutionRun,
+    VerificationPhaseContext,
+    VerificationResult,
+    VerificationRunStatus,
+    VerificationStepRun,
+    VerificationStepStatus,
     compute_image_toolchain_policy_fingerprint,
     verification_plan_digest,
 )
 from khaos.coding.planning.verification_sandbox import VerificationSandboxBackend
 from khaos.coding.planning.verification_sandbox_instance import (
-    SandboxInstanceState, VerificationSandboxInstance,
+    SandboxInstanceState,
+    VerificationSandboxInstance,
 )
 from khaos.coding.planning.verification_store import VerificationExecutionStore
-
 
 # Batch 3.1.2 §8: conservative default for files verification may generate.
 # These are cache/build byproducts that don't affect verification integrity.
@@ -216,10 +223,10 @@ class TrustedVerificationRunner:
             )
             return
         try:
-            terminated_ok, removed_ok = (
+            _terminated_ok, removed_ok = (
                 await self._backend.terminate_and_remove_instance(container_id_or_name)
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - cleanup failure is persisted for reconciliation
             removed_ok = False
         if removed_ok:
             self._store.update_sandbox_instance(
@@ -232,7 +239,7 @@ class TrustedVerificationRunner:
             # Best-effort: try to confirm gone via inspect.
             try:
                 gone = await self._backend.confirm_instance_gone(container_id_or_name)
-            except Exception:
+            except Exception:  # noqa: BLE001 - inspect failure keeps cleanup fail-closed
                 gone = False
             if gone:
                 self._store.update_sandbox_instance(
@@ -271,10 +278,11 @@ class TrustedVerificationRunner:
           - SEALED/MOUNTED state → attempt destroy with manifest.
           - Failure → mark CLEANUP_FAILED + poison workspace scope.
         """
+
         from khaos.coding.planning.trusted_verification import (
-            DisposableVerificationWorkspace, ManifestEntry,
+            DisposableVerificationWorkspace,
+            ManifestEntry,
         )
-        import stat as _stat
         factory_root = self._workspace_factory._root
         for record in self._store.list_active_disposable_workspaces():
             root = factory_root / record.instance_id
@@ -285,7 +293,7 @@ class TrustedVerificationRunner:
                 try:
                     self._safe_destroy_prepared(root)
                     self._store.mark_disposable_workspace_cleaned(record.workspace_id)
-                except Exception:
+                except Exception:  # noqa: BLE001 - cleanup failure is persisted for reconciliation
                     self._store.mark_disposable_workspace_cleanup_failed(
                         record.workspace_id, failure_code="prepared-cleanup-failed",
                     )
@@ -324,7 +332,7 @@ class TrustedVerificationRunner:
             )
             try:
                 self._workspace_factory.destroy(workspace)
-            except Exception:
+            except Exception:  # noqa: BLE001 - cleanup failure poisons the workspace
                 self._store.mark_disposable_workspace_cleanup_failed(
                     record.workspace_id, failure_code="reconcile-cleanup-failed",
                 )
@@ -503,7 +511,7 @@ class TrustedVerificationRunner:
                     workspace_id=proof.disposable_workspace_id,
                     cleanup_proof=proof,
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - finalization recovery must fail closed
                 self._store.transition_run(
                     run.verification_run_id,
                     expected=(VerificationRunStatus.FINALIZING,),
@@ -525,7 +533,6 @@ class TrustedVerificationRunner:
         The instance root is ``rmdir``'d last, and its absence is confirmed.
         """
         import os as _os
-        import stat as _stat
         if not root.exists():
             try:
                 _os.stat(str(root))
@@ -648,7 +655,7 @@ class TrustedVerificationRunner:
                 self._store.quarantine_artifact(
                     artifact_id, reason="reserved-no-file",
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - artifact quarantine failure is retained
                 cleanup_failures.append(artifact_id)
         # RESERVED artifacts with only a temp file — partial write.
         for artifact_id in report["reserved_temp"]:
@@ -659,7 +666,7 @@ class TrustedVerificationRunner:
                 self._store.quarantine_artifact(
                     artifact_id, reason="reserved-temp-only",
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - artifact quarantine failure is retained
                 cleanup_failures.append(artifact_id)
         # RESERVED artifacts with a final file — link succeeded but seal
         # faulted.  Cannot verify without a digest, so quarantine.
@@ -668,7 +675,7 @@ class TrustedVerificationRunner:
                 self._store.quarantine_artifact(
                     artifact_id, reason="reserved-final-without-seal",
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - artifact quarantine failure is retained
                 cleanup_failures.append(artifact_id)
         # SEALED artifacts whose final file is missing — deleted after sealing.
         for artifact_id in report["sealed_missing"]:
@@ -676,7 +683,7 @@ class TrustedVerificationRunner:
                 self._store.quarantine_artifact(
                     artifact_id, reason="sealed-file-missing",
                 )
-            except Exception:
+            except Exception:  # noqa: BLE001 - artifact quarantine failure is retained
                 cleanup_failures.append(artifact_id)
         # Unknown files in the root — orphan files with no DB row.
         for name in report["unknown_files"]:
@@ -698,7 +705,7 @@ class TrustedVerificationRunner:
                     self._store.quarantine_artifact(
                         artifact_id, reason="sealed-no-digest",
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - artifact quarantine failure is retained
                     cleanup_failures.append(artifact_id)
                 continue
             if not self._artifact_capability.verify_sealed_artifact(
@@ -716,7 +723,7 @@ class TrustedVerificationRunner:
                     self._store.quarantine_artifact(
                         artifact_id, reason="sealed-digest-mismatch",
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - artifact quarantine failure is retained
                     cleanup_failures.append(artifact_id)
         # Poison verification runs that own artifacts we could not clean up.
         if cleanup_failures:
@@ -810,7 +817,6 @@ class TrustedVerificationRunner:
         )
         disposable = None
         workspace_id = ""
-        last_step: VerificationStepRun | None = None
         # Batch 3.1.3 §8: track cleanup state so the terminal transition
         # is deferred until cleanup succeeds.  ``cleanup_done`` prevents
         # double-cleanup in the ``finally`` block when the success path
@@ -919,7 +925,6 @@ class TrustedVerificationRunner:
                     failure_code = "cancelled"
                     break
                 self._store.mark_step_running(step.step_run_id)
-                last_step = step
                 started = time.time()
                 # §5: re-bind toolchain attestation digest before execution.
                 # If the binary was replaced after configuration, the
@@ -1075,10 +1080,10 @@ class TrustedVerificationRunner:
                     terminated_at=time.time(),
                 )
                 try:
-                    terminated_ok, removed_ok = (
+                    _terminated_ok, removed_ok = (
                         await self._backend.terminate_and_remove_instance(container_id)
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - cleanup failure is retained for recovery
                     # Cleanup failed — mark CLEANUP_PENDING, attempt best-effort.
                     self._store.update_sandbox_instance(
                         sandbox_instance_id,
@@ -1088,7 +1093,7 @@ class TrustedVerificationRunner:
                     try:
                         await self._backend.terminate_and_remove_instance(container_id)
                         gone = await self._backend.confirm_instance_gone(container_id)
-                    except Exception:
+                    except Exception:  # noqa: BLE001 - retry cleanup remains fail-closed
                         gone = False
                     if gone:
                         self._store.update_sandbox_instance(
@@ -1711,7 +1716,8 @@ class TrustedVerificationRunner:
         if disposable is None or not workspace_id:
             raise RuntimeError("cleanup proof requires a disposable workspace")
         from khaos.coding.planning.verification_execution_models import (
-            VerificationCleanupProof, compute_cleanup_digest,
+            VerificationCleanupProof,
+            compute_cleanup_digest,
         )
         # Load the persisted disposable workspace record (post-cleanup).
         record = self._store.get_disposable_workspace(workspace_id)

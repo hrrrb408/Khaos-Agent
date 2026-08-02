@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import os
 import shlex
-from dataclasses import dataclass, field
-from typing import Any, Callable, Awaitable
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import Any
 
 from khaos.skills import SkillManager
 
@@ -246,7 +247,7 @@ def _cmd_tools(args: list[str], ctx: TuiContext) -> CommandResult:
     mode = args[0] if args else _current_mode_value(ctx)
     try:
         tools = ctx.registry.list_by_mode(mode)
-    except Exception:
+    except Exception:  # noqa: BLE001 - unavailable registry falls back to all tools
         tools = ctx.registry.list_by_mode("all")
     if not tools:
         return CommandResult(handled=True, message=f"no tools for mode {mode!r}.")
@@ -448,9 +449,9 @@ def _current_mode_value(ctx: TuiContext) -> str:
 
 
 __all__ = [
-    "TuiContext",
-    "CommandResult",
     "HELP_TEXT",
+    "CommandResult",
+    "TuiContext",
     "handle_command",
     "is_command",
 ]

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
 
@@ -63,13 +63,25 @@ class ImpactTraversalBudget:
     """
 
     __slots__ = (
-        "max_depth", "max_nodes", "max_edges", "max_files", "max_symbols",
-        "max_reverse_imports", "max_test_candidates",
-        "_visited_nodes", "_inspected_edges", "_inspected_file_candidates",
-        "_inspected_test_candidates", "_inspected_reverse_imports",
-        "_sql_rows_returned", "_sql_queries_issued", "_indexed_edge_rows_fetched",
-        "_affected_files", "_affected_symbols",
-        "_truncated", "_limit_code",
+        "_affected_files",
+        "_affected_symbols",
+        "_indexed_edge_rows_fetched",
+        "_inspected_edges",
+        "_inspected_file_candidates",
+        "_inspected_reverse_imports",
+        "_inspected_test_candidates",
+        "_limit_code",
+        "_sql_queries_issued",
+        "_sql_rows_returned",
+        "_truncated",
+        "_visited_nodes",
+        "max_depth",
+        "max_edges",
+        "max_files",
+        "max_nodes",
+        "max_reverse_imports",
+        "max_symbols",
+        "max_test_candidates",
     )
 
     def __init__(self, *, max_depth: int = 3, max_nodes: int = 200, max_edges: int = 500,

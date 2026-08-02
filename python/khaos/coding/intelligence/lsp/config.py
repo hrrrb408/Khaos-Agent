@@ -37,7 +37,7 @@ class LspFusionConfig:
     trusted_servers: tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
-    def from_dict(cls, data: dict) -> "LspFusionConfig":
+    def from_dict(cls, data: dict) -> LspFusionConfig:
         """Build config from a parsed ``config.yaml`` fragment.
 
         Unknown keys are ignored. Missing keys fall back to defaults.

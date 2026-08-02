@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from enum import Enum
-from pathlib import Path
 
 from khaos.coding.workspace.manager import WorkspaceError, WorkspaceManager
 from khaos.coding.workspace.models import ChangeSet

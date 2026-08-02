@@ -87,12 +87,12 @@ class SecurityMiddleware:
         path_guard: PathGuard | None = None,
         secret_scanner: SecretScanner | None = None,
         enabled: bool = True,
-        policy: "SandboxPolicy | None" = None,
-        sandbox: "Sandbox | None" = None,
-        network_guard: "NetworkGuard | None" = None,
-        audit_logger: "AuditLogger | None" = None,
+        policy: SandboxPolicy | None = None,
+        sandbox: Sandbox | None = None,
+        network_guard: NetworkGuard | None = None,
+        audit_logger: AuditLogger | None = None,
         *,
-        effective_policy: "EffectiveSecurityPolicy | None" = None,
+        effective_policy: EffectiveSecurityPolicy | None = None,
     ):
         self.command_guard = command_guard or CommandGuard()
         self.path_guard = path_guard or PathGuard()
@@ -163,7 +163,7 @@ class SecurityMiddleware:
             return self.effective_policy.digest
         return ""
 
-    def _merge_source_policy(self) -> "SandboxPolicy | None":
+    def _merge_source_policy(self) -> SandboxPolicy | None:
         """Return the policy whose denied_paths / commands_blocked to merge.
 
         B1: when an effective policy is present, we synthesise a lightweight
@@ -198,7 +198,7 @@ class SecurityMiddleware:
             )
         return self.policy
 
-    def _apply_policy(self, policy: "SandboxPolicy") -> None:
+    def _apply_policy(self, policy: SandboxPolicy) -> None:
         """Merge policy lists into the existing guards (additive, instance-level)."""
         # Extend PathGuard's protected set with policy-denied paths.
         if policy.denied_paths:
@@ -430,7 +430,7 @@ class SecurityMiddleware:
 
     def _scan_arguments_for_secrets(
         self, tool_name: str, arguments: dict
-    ) -> "SecurityCheckResult | None":
+    ) -> SecurityCheckResult | None:
         """M1: scan tool arguments for secrets before execution.
 
         Returns a blocking ``SecurityCheckResult`` if a secret is found in
@@ -489,9 +489,7 @@ def _is_env_dump_command(command: str) -> bool:
     if base in _ENV_DUMP_SUBCOMMANDS and len(parts) == 1:
         return True
     # ``export -p`` / ``declare -p`` / ``declare -xp`` → print exported.
-    if base in {"export", "declare"} and len(parts) == 2 and parts[1] in {"-p", "-xp", "-px"}:
-        return True
-    return False
+    return bool(base in {"export", "declare"} and len(parts) == 2 and parts[1] in {"-p", "-xp", "-px"})
 
 
 def _command_text(arguments: dict) -> str:

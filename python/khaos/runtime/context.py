@@ -69,7 +69,7 @@ class RequestContext:
         *,
         project_id: str = "",
         policy_digest: str = "",
-    ) -> "RequestContext":
+    ) -> RequestContext:
         """Build a context for an RPC call authenticated by the
         Gateway's auth envelope.
 
@@ -93,7 +93,7 @@ class RequestContext:
         *,
         project_id: str = "",
         policy_digest: str = "",
-    ) -> "RequestContext":
+    ) -> RequestContext:
         """Build a context for a CLI invocation (single-user, local).
 
         The principal is the OS uid — same as the legacy ``local-uid``
@@ -124,7 +124,7 @@ class RequestContext:
         *,
         project_id: str = "",
         policy_digest: str = "",
-    ) -> "RequestContext":
+    ) -> RequestContext:
         """Build a context for a webhook-triggered chat turn.
 
         ``principal_id`` is the derived webhook principal
@@ -146,7 +146,7 @@ class RequestContext:
         *,
         project_id: str = "",
         policy_digest: str = "",
-    ) -> "RequestContext":
+    ) -> RequestContext:
         """Build a context for a cron-triggered chat turn.
 
         ``principal_id`` is the principal bound to the scheduled task
@@ -161,7 +161,7 @@ class RequestContext:
             policy_digest=policy_digest,
         )
 
-    def with_session(self, session_id: str) -> "RequestContext":
+    def with_session(self, session_id: str) -> RequestContext:
         """Return a copy of this context with ``session_id`` set.
 
         Used by ``AgentService.chat`` to bind the request's session_id
@@ -176,7 +176,7 @@ class RequestContext:
             policy_digest=self.policy_digest,
         )
 
-    def with_runtime_id(self, runtime_id: str) -> "RequestContext":
+    def with_runtime_id(self, runtime_id: str) -> RequestContext:
         """Return a copy of this context with ``runtime_id`` set.
 
         Used by ``build_runtime`` to stamp the new runtime's UUID into

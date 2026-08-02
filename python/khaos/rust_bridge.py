@@ -15,7 +15,6 @@ import importlib.util
 import json
 import logging
 from pathlib import Path
-from typing import Optional
 
 from khaos.agent.core import SimpleTokenEngine
 
@@ -158,7 +157,7 @@ def get_token_engine(encoding: str = "cl100k_base") -> SimpleTokenEngine:
         return SimpleTokenEngine()
 
 
-def execute_parallel(calls: list[dict], timeout_ms: int) -> Optional[list[dict]]:
+def execute_parallel(calls: list[dict], timeout_ms: int) -> list[dict] | None:
     """Run calls on the Rust executor, or return None when unavailable.
 
     Only pure-compute handler kinds (echo / sleep / sum / fail) are accepted
@@ -173,8 +172,8 @@ def execute_parallel(calls: list[dict], timeout_ms: int) -> Optional[list[dict]]
 __all__ = [
     "RustTokenizer",
     "RustToolExecutor",
-    "rust_available",
-    "load_rust_module",
-    "get_token_engine",
     "execute_parallel",
+    "get_token_engine",
+    "load_rust_module",
+    "rust_available",
 ]

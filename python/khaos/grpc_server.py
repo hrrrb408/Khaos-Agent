@@ -19,9 +19,10 @@ import struct
 import sys
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 # M4 batch 3.1.13 (CRITICAL-3): fcntl-based process-level exclusive
 # lock to enforce the single-instance model.  Without this, a second
@@ -44,8 +45,6 @@ from khaos.audit import (
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
 )
-from khaos.coding.task_manager import TaskManager
-from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.channels import (
     ChannelRegistry,
     ChannelType,
@@ -54,6 +53,8 @@ from khaos.channels import (
     WebhookRateLimiter,
     WebhookReplayGuard,
 )
+from khaos.coding.task_manager import TaskManager
+from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db import Database
 from khaos.db.database import SessionBusyError
 from khaos.exceptions import ServiceShutdownError
@@ -65,14 +66,19 @@ from khaos.memory import (
     MemoryStore,
 )
 from khaos.modes import ModeManager
-from khaos.rust_bridge import get_token_engine
-from khaos.routing.router import create_default_router
 from khaos.routing import ModelRouter
+from khaos.routing.router import create_default_router
 from khaos.runtime import RequestContext
+from khaos.rust_bridge import get_token_engine
 from khaos.scheduler import CronEngine
 from khaos.security.middleware import SecurityMiddleware
 from khaos.skills import SkillManager
-from khaos.subagents import SubAgentConfig, SubAgentRunner, SubAgentService, SubAgentSpawner
+from khaos.subagents import (
+    SubAgentConfig,
+    SubAgentRunner,
+    SubAgentService,
+    SubAgentSpawner,
+)
 from khaos.tools import create_runtime_registry
 
 logger = logging.getLogger(__name__)
@@ -379,15 +385,14 @@ def _acquire_instance_lock_via_dir_fd(
                 f"0600) — refusing to truncate (CRITICAL-2: "
                 f"lockfile safety)"
             )
-        if pre_lstat is not None:
-            if (fstat_info.st_dev, fstat_info.st_ino) != (
-                pre_lstat.st_dev, pre_lstat.st_ino,
-            ):
-                raise PermissionError(
-                    f"lockfile {lockfile_path} changed identity "
-                    f"between lstat and open (TOCTOU race; "
-                    f"CRITICAL-2: lockfile safety)"
-                )
+        if pre_lstat is not None and (fstat_info.st_dev, fstat_info.st_ino) != (
+            pre_lstat.st_dev, pre_lstat.st_ino,
+        ):
+            raise PermissionError(
+                f"lockfile {lockfile_path} changed identity "
+                f"between lstat and open (TOCTOU race; "
+                f"CRITICAL-2: lockfile safety)"
+            )
         # All checks passed — acquire the flock.
         try:
             _fcntl.flock(fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
@@ -442,7 +447,7 @@ def _acquire_instance_lock_via_dir_fd(
     # the flock is the authoritative lock).
     try:
         os.ftruncate(fd, 0)
-        os.write(fd, f"{os.getpid()}\n".encode("utf-8"))
+        os.write(fd, f"{os.getpid()}\n".encode())
         os.fsync(fd)
     except OSError:
         pass  # non-fatal — the lock itself is what matters
@@ -519,7 +524,7 @@ async def _emergency_instance_cleanup(
     agent: AgentService | None,
     db: Database | None,
     subagent_service: SubAgentService | None,
-    maintenance: "MaintenanceService | None" = None,
+    maintenance: MaintenanceService | None = None,
 ) -> bool:
     """M4 batch 3.1.15 (CRITICAL-1 + HIGH-1): attempt to clean up
     partially-initialized or partially-torn-down resources.
@@ -568,10 +573,9 @@ async def _emergency_instance_cleanup(
     if maintenance is not None:
         try:
             await maintenance.stop()
-        except Exception:  # noqa: BLE001 — best-effort cleanup
-            logger.error(
+        except Exception:
+            logger.exception(
                 "emergency cleanup: maintenance.stop() failed",
-                exc_info=True,
             )
             ok = False
     # Batch 6.5 (round-6 §十六): FAIL-STOP dependency chain.  The shutdown
@@ -595,12 +599,11 @@ async def _emergency_instance_cleanup(
     if subagent_service is not None:
         try:
             await subagent_service.shutdown(timeout=SUBAGENT_SHUTDOWN_TIMEOUT)
-        except Exception:  # noqa: BLE001 — best-effort cleanup
-            logger.error(
+        except Exception:
+            logger.exception(
                 "emergency cleanup: subagent_service.shutdown() failed; "
                 "live subagent owners may remain — NOT shutting down "
                 "agent/db (Subagent borrows Agent's Office/Browser/Audit)",
-                exc_info=True,
             )
             ok = False
     if not ok:
@@ -613,11 +616,10 @@ async def _emergency_instance_cleanup(
     if agent is not None:
         try:
             await agent.shutdown()
-        except Exception:  # noqa: BLE001 — best-effort cleanup
-            logger.error(
+        except Exception:
+            logger.exception(
                 "emergency cleanup: agent.shutdown() failed; live cron "
                 "executors or chat owners may remain",
-                exc_info=True,
             )
             ok = False
     # Round-5 Batch 5.4 (Shutdown Quarantine): only close the DB when
@@ -635,10 +637,9 @@ async def _emergency_instance_cleanup(
     if db is not None:
         try:
             await db.close()
-        except Exception:  # noqa: BLE001 — best-effort cleanup
-            logger.error(
+        except Exception:
+            logger.exception(
                 "emergency cleanup: db.close() failed",
-                exc_info=True,
             )
             ok = False
     return ok
@@ -848,7 +849,7 @@ class GatewayRPCAuthenticator:
         signed = signed_text.encode("utf-8")
         method_key = hmac.new(
             self._key,
-            f"khaos-rpc-method-v{protocol_version}\n{method}".encode("utf-8"),
+            f"khaos-rpc-method-v{protocol_version}\n{method}".encode(),
             hashlib.sha256,
         ).digest()
         expected_mac = hmac.new(method_key, signed, hashlib.sha256).hexdigest()
@@ -895,14 +896,14 @@ def _rpc_binding_claim_error(
     if claimed_project_id and claimed_project_id != bound_project_id:
         return (
             "project_drift",
-            f"payload project_id {claimed_project_id!r} does not match "
-            f"server-bound project_id {bound_project_id!r}",
+            (f"payload project_id {claimed_project_id!r} does not match "
+             f"server-bound project_id {bound_project_id!r}"),
         )
     if claimed_policy_digest and claimed_policy_digest != bound_policy_digest:
         return (
             "policy_drift",
-            f"payload policy_digest {claimed_policy_digest!r} does not match "
-            f"server-bound policy_digest {bound_policy_digest!r}",
+            (f"payload policy_digest {claimed_policy_digest!r} does not match "
+             f"server-bound policy_digest {bound_policy_digest!r}"),
         )
     return None
 
@@ -1322,7 +1323,7 @@ class AgentService:
             # refuse teardown by raising ``ServiceShutdownError``.  The
             # residual runtime is still registered in ``_active_runtimes``
             # and will be closed or quarantined by the next owner.
-            done, pending = await asyncio.wait(
+            _done, pending = await asyncio.wait(
                 active_tasks, timeout=CHAT_DRAIN_TIMEOUT,
             )
             if pending:
@@ -1348,7 +1349,7 @@ class AgentService:
             except Exception:
                 # close_runtime_or_register already quarantines terminal
                 # failures.  Continue so drain can retry all retained owners.
-                logger.error("active runtime teardown failed", exc_info=True)
+                logger.exception("active runtime teardown failed")
 
         remaining = await self.runtime_cleanup_authority.drain(
             timeout_seconds=5.0
@@ -1389,7 +1390,7 @@ class AgentService:
                 )
                 self._office_shutdown_task = None
                 return
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 # The shielded task still owns the mutation fence.  Do not
                 # start a concurrent retry or tear down audit/database state.
                 last_error = exc
@@ -2244,7 +2245,7 @@ class TaskService:
         # cache is bounded by ``_MAX_MANAGERS`` (default 32).  When the
         # limit is reached, the least-recently-used entry is evicted.
         from collections import OrderedDict
-        self._managers: "OrderedDict[tuple[str, str], TaskManager]" = OrderedDict()
+        self._managers: OrderedDict[tuple[str, str], TaskManager] = OrderedDict()
         self._MAX_MANAGERS = 32
         # Batch 6.5 (round-6 §十七): service-level cache lock.  Without
         # it, two concurrent ``_manager()`` calls for the same key both
@@ -2564,8 +2565,9 @@ async def serve_json_lines(
     gateway_capability: str | None = None,
     gateway_uid: int | None = None,
     gateway_pid: int | None = None,
+    gateway_gid: int | None = None,
 ) -> None:
-    """Serve the privileged JSON-line control plane over a mode-0600 UDS.
+    """Serve the privileged JSON-line control plane over a protected UDS.
 
     M4 batch 3.1.13 (CRITICAL-3): the server now enforces the
     single-instance model with a process-level exclusive lock
@@ -2595,16 +2597,33 @@ async def serve_json_lines(
     """
     uds_path = Path(socket_path).expanduser().resolve()
     capability = gateway_capability or _load_rpc_capability()
+    if gateway_gid is not None and gateway_gid < 0:
+        raise ValueError("gateway GID must be non-negative")
+    if gateway_gid is not None and gateway_uid is None:
+        raise ValueError("gateway GID requires an explicit gateway UID")
+    parent_mode = 0o2750 if gateway_gid is not None else 0o700
+    socket_mode = 0o660 if gateway_gid is not None else 0o600
     authenticator = GatewayRPCAuthenticator(
         capability,
         expected_uid=gateway_uid,
         expected_pid=gateway_pid,
         require_protocol_metadata=os.environ.get("KHAOS_DEV_MODE") != "1",
     )
-    uds_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    uds_path.parent.mkdir(mode=parent_mode, parents=True, exist_ok=True)
     parent_stat = uds_path.parent.stat()
-    if parent_stat.st_uid != os.getuid() or stat.S_IMODE(parent_stat.st_mode) != 0o700:
-        raise PermissionError("RPC socket parent must be owned by Runtime and mode 0700")
+    if parent_stat.st_uid != os.getuid():
+        raise PermissionError("RPC socket parent must be owned by Runtime")
+    if gateway_gid is None:
+        if stat.S_IMODE(parent_stat.st_mode) != 0o700:
+            raise PermissionError("RPC socket parent must have mode 0700")
+    elif (
+        parent_stat.st_gid != gateway_gid
+        or stat.S_IMODE(parent_stat.st_mode) != 0o2750
+    ):
+        raise PermissionError(
+            "RPC socket parent must be a Runtime-owned setgid directory "
+            f"with group {gateway_gid} and mode 02750"
+        )
     # M4 batch 3.1.13 (CRITICAL-3): acquire the process-level
     # exclusive lock BEFORE touching the UDS socket or the DB.  This
     # must happen BEFORE the liveness probe below — even if the probe
@@ -2970,7 +2989,7 @@ async def serve_json_lines(
                         async for event in agent.chat(ctx, ChatRequest(**payload)):
                             writer.write((json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8"))
                             await writer.drain()
-                    except Exception as exc:
+                    except Exception as exc:  # noqa: BLE001 - RPC errors must be framed
                         writer.write(
                             (
                                 json.dumps(
@@ -3097,7 +3116,7 @@ async def serve_json_lines(
                         "message": "unknown method",
                     }).encode("utf-8") + b"\n")
                 await writer.drain()
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - service errors must be framed
                 # A service-level miss or validation error must remain a
                 # framed RPC response. Letting it escape silently closes the
                 # one-request UDS connection, producing an empty JSON line and
@@ -3114,7 +3133,7 @@ async def serve_json_lines(
                 writer.close()
                 try:
                     await asyncio.wait_for(writer.wait_closed(), timeout=1.0)
-                except (asyncio.TimeoutError, ConnectionError, OSError):
+                except (TimeoutError, ConnectionError, OSError):
                     pass
 
         # ``asyncio.start_unix_server`` otherwise creates handler tasks without
@@ -3134,10 +3153,17 @@ async def serve_json_lines(
             server = await asyncio.start_unix_server(
                 accept_connection, path=str(uds_path), limit=RPC_MAX_REQUEST_BYTES,
             )
-            os.chmod(uds_path, 0o600)
+            os.chmod(uds_path, socket_mode)
             socket_stat = uds_path.lstat()
             if socket_stat.st_uid != os.getuid() or not stat.S_ISSOCK(socket_stat.st_mode):
                 raise PermissionError("RPC socket inode ownership/type validation failed")
+            if gateway_gid is not None and (
+                socket_stat.st_gid != gateway_gid
+                or stat.S_IMODE(socket_stat.st_mode) != socket_mode
+            ):
+                raise PermissionError(
+                    "RPC socket inode did not inherit the configured Gateway group"
+                )
             # Wait until the owner cancels this service.  Do not use
             # ``Server.serve_forever()`` here: on Python 3.13 its cancellation
             # path waits for active client connections before returning, while
@@ -3277,7 +3303,7 @@ def _parse_json_line(line: bytes) -> dict:
     except json.JSONDecodeError as exc:
         raise ValueError("request must be a JSON object line") from exc
     if not isinstance(request, dict):
-        raise ValueError("request must be a JSON object")
+        raise ValueError("request must be a JSON object")  # noqa: TRY004 - wire compatibility
     return request
 
 

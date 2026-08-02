@@ -135,14 +135,11 @@ def resolve_rust_calls(
         if key:
             import_map[key] = (ri.target_file, ri.target_symbol_id)
 
-    source_dir = str(PurePosixPath(source_file).parent)
-
     for call in calls:
         callee: str = call.get("callee", "")
         caller: str | None = call.get("caller")
         metadata: dict[str, Any] = call.get("metadata", {})
         callee_form: str = metadata.get("callee_form", "identifier")
-        call_kind: str = metadata.get("call_kind", "call")
         location = call.get("location", {})
         byte_start = location.get("byte_start", 0)
         byte_end = location.get("byte_end", 0)
