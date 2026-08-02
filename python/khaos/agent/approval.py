@@ -93,11 +93,66 @@ class ApprovalBinding:
 class _ToolApprovalRecord:
     binding: ApprovalBinding
     binding_digest: str
+    approval_id: str
     decision: ApprovalDecision | None = None
     used: bool = False
     dispatched: bool = False
     # Round-4 review Batch 4 (§13.1): timestamp for TTL-based eviction.
     created_at: float = field(default_factory=time.time)
+
+
+class ToolApprovalHandle(str):
+    """Server-generated approval identity with legacy digest compatibility.
+
+    The string value remains the binding digest for existing callers that
+    persist/pass ``binding_digest``. ``approval_id`` is a separate random
+    server identity and is the Broker's internal primary key.
+    """
+
+    def __new__(
+        cls, binding_digest: str, approval_id: str
+    ) -> "ToolApprovalHandle":
+        instance = super().__new__(cls, binding_digest)
+        instance.approval_id = approval_id
+        instance.binding_digest = binding_digest
+        return instance
+
+
+class _ToolApprovalStore(dict[str, _ToolApprovalRecord]):
+    """Primary approval-id store with a read-only legacy call-id view.
+
+    Existing diagnostics/tests may inspect ``broker._tool_approvals[call_id]``.
+    That compatibility lookup is intentionally ambiguous-safe and is never
+    used by authorization methods; the real store keys remain server IDs.
+    """
+
+    def _legacy_lookup(self, key: object) -> _ToolApprovalRecord | None:
+        matches = [
+            record
+            for record in dict.values(self)
+            if record.binding.tool_call_id == key
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def __contains__(self, key: object) -> bool:
+        return dict.__contains__(self, key) or self._legacy_lookup(key) is not None
+
+    def __getitem__(self, key: str) -> _ToolApprovalRecord:
+        try:
+            return dict.__getitem__(self, key)
+        except KeyError:
+            record = self._legacy_lookup(key)
+            if record is None:
+                raise
+            return record
+
+    def get(
+        self, key: str, default: _ToolApprovalRecord | None = None
+    ) -> _ToolApprovalRecord | None:
+        record = dict.get(self, key)
+        if record is not None:
+            return record
+        return self._legacy_lookup(key) or default
 
 
 @dataclass
@@ -128,12 +183,30 @@ class PlanApprovalOutcome:
 
 
 class ApprovalBroker:
-    """One await/resolve channel keyed by tool call id."""
+    """Approval channels keyed internally by server-generated approval IDs."""
 
-    def __init__(self, authenticator=None, db=None) -> None:
+    def __init__(
+        self,
+        authenticator=None,
+        db=None,
+        *,
+        max_pending_per_principal_session: int = 128,
+        max_pending_per_turn: int = 16,
+    ) -> None:
+        if max_pending_per_principal_session <= 0 or max_pending_per_turn <= 0:
+            raise ValueError("approval pending quotas must be positive")
         self._pending: dict[str, asyncio.Future[ApprovalDecision]] = {}
-        self._tool_approvals: dict[str, _ToolApprovalRecord] = {}
+        # P1-3: model/tool call IDs are not global identities. The server
+        # generates a fresh approval_id for every immutable binding, so two
+        # sessions may legitimately reuse the same model call ID.
+        self._tool_approvals: _ToolApprovalStore = _ToolApprovalStore()
         self._operation_approvals: dict[str, dict] = {}
+        # Bound attacker-controlled approval fan-out before a user can be
+        # asked to resolve an unbounded number of challenges. These quotas
+        # are scoped by the server-verified principal/session and turn, not
+        # by the model-provided tool_call_id.
+        self._max_pending_per_principal_session = max_pending_per_principal_session
+        self._max_pending_per_turn = max_pending_per_turn
         # Namespaced plan-execution approvals (disjoint key space).
         self._plan_approvals: dict[str, PlanApprovalRecord] = {}
         self._lock = asyncio.Lock()
@@ -261,21 +334,76 @@ class ApprovalBroker:
 
     async def register_tool_approval(
         self, binding: ApprovalBinding
-    ) -> str:
-        """Register one immutable, principal-bound tool challenge."""
+    ) -> ToolApprovalHandle:
+        """Register one immutable, principal-bound tool challenge.
+
+        Registration is idempotent for the exact binding digest. A repeated
+        model ``tool_call_id`` with a different binding creates a separate
+        server approval rather than colliding with an existing session.
+        """
         digest = binding.digest()
         async with self._lock:
-            existing = self._tool_approvals.get(binding.tool_call_id)
-            if existing is not None:
-                if existing.binding_digest != digest:
-                    raise PermissionError(
-                        "tool call id is already bound to another approval"
-                    )
-                return digest
-            self._tool_approvals[binding.tool_call_id] = _ToolApprovalRecord(
-                binding=binding, binding_digest=digest
+            for existing in self._tool_approvals.values():
+                if existing.binding_digest == digest:
+                    return ToolApprovalHandle(digest, existing.approval_id)
+            now = time.time()
+            active = [
+                existing
+                for existing in self._tool_approvals.values()
+                if not existing.used and existing.binding.expires_at > now
+            ]
+            principal_session_count = sum(
+                1
+                for existing in active
+                if existing.binding.principal_id == binding.principal_id
+                and existing.binding.session_id == binding.session_id
             )
-        return digest
+            if principal_session_count >= self._max_pending_per_principal_session:
+                raise PermissionError(
+                    "approval pending quota exceeded for principal/session"
+                )
+            turn_count = sum(
+                1
+                for existing in active
+                if existing.binding.principal_id == binding.principal_id
+                and existing.binding.session_id == binding.session_id
+                and existing.binding.turn_id == binding.turn_id
+            )
+            if turn_count >= self._max_pending_per_turn:
+                raise PermissionError("approval pending quota exceeded for turn")
+            approval_id = f"approval_{secrets.token_urlsafe(24)}"
+            while dict.__contains__(self._tool_approvals, approval_id):
+                approval_id = f"approval_{secrets.token_urlsafe(24)}"
+            self._tool_approvals[approval_id] = _ToolApprovalRecord(
+                binding=binding,
+                binding_digest=digest,
+                approval_id=approval_id,
+            )
+        return ToolApprovalHandle(digest, approval_id)
+
+    def _find_tool_approval_locked(
+        self,
+        tool_call_id: str,
+        binding_digest: str,
+        *,
+        principal_id: str | None = None,
+        session_id: str | None = None,
+    ) -> _ToolApprovalRecord | None:
+        """Find a record by its server-bound digest and authority scope."""
+        matches = [
+            record
+            for record in self._tool_approvals.values()
+            if record.binding_digest == str(binding_digest)
+            and record.binding.tool_call_id == tool_call_id
+            and (
+                principal_id is None
+                or record.binding.principal_id == principal_id
+            )
+            and (
+                session_id is None or record.binding.session_id == session_id
+            )
+        ]
+        return matches[0] if len(matches) == 1 else None
 
     async def wait(
         self,
@@ -285,7 +413,9 @@ class ApprovalBroker:
         binding_digest: str,
     ) -> dict:
         async with self._lock:
-            record = self._tool_approvals.get(tool_call_id)
+            record = self._find_tool_approval_locked(
+                tool_call_id, binding_digest
+            )
             if (
                 record is None
                 or record.used
@@ -293,7 +423,7 @@ class ApprovalBroker:
                 or time.time() >= record.binding.expires_at
             ):
                 return {"approved": False, "remember": False}
-            future = self._pending.get(tool_call_id)
+            future = self._pending.get(record.approval_id)
             if record.decision is not None:
                 record.used = True
                 return {
@@ -302,21 +432,25 @@ class ApprovalBroker:
                 }
             if future is None:
                 future = asyncio.get_running_loop().create_future()
-                self._pending[tool_call_id] = future
+                self._pending[record.approval_id] = future
         try:
             decision = await asyncio.wait_for(asyncio.shield(future), timeout) if timeout else await future
             return {"approved": decision.approved, "remember": decision.remember}
         except asyncio.TimeoutError:
             async with self._lock:
-                record = self._tool_approvals.get(tool_call_id)
+                record = self._find_tool_approval_locked(
+                    tool_call_id, binding_digest
+                )
                 if record is not None:
                     record.used = True
             return {"approved": False, "remember": False}
         finally:
             async with self._lock:
-                self._pending.pop(tool_call_id, None)
-                record = self._tool_approvals.get(tool_call_id)
+                record = self._find_tool_approval_locked(
+                    tool_call_id, binding_digest
+                )
                 if record is not None:
+                    self._pending.pop(record.approval_id, None)
                     record.used = True
 
     async def resolve(
@@ -330,7 +464,12 @@ class ApprovalBroker:
         binding_digest: str,
     ) -> bool:
         async with self._lock:
-            record = self._tool_approvals.get(tool_call_id)
+            record = self._find_tool_approval_locked(
+                tool_call_id,
+                binding_digest,
+                principal_id=principal_id,
+                session_id=session_id,
+            )
             if (
                 record is None
                 or record.used
@@ -343,7 +482,7 @@ class ApprovalBroker:
                 return False
             decision = ApprovalDecision(approved, remember)
             record.decision = decision
-            future = self._pending.get(tool_call_id)
+            future = self._pending.get(record.approval_id)
             if future is None:
                 return True
             if future.done():
@@ -368,7 +507,12 @@ class ApprovalBroker:
         are checked against the server-held immutable binding.
         """
         async with self._lock:
-            record = self._tool_approvals.get(tool_call_id)
+            record = self._find_tool_approval_locked(
+                tool_call_id,
+                binding_digest,
+                principal_id=principal_id,
+                session_id=session_id,
+            )
             if (
                 record is None
                 or record.dispatched
@@ -409,7 +553,12 @@ class ApprovalBroker:
         RUNNING task without a consumed approval.
         """
         async with self._lock:
-            record = self._tool_approvals.get(tool_call_id)
+            record = self._find_tool_approval_locked(
+                tool_call_id,
+                binding_digest,
+                principal_id=principal_id,
+                session_id=session_id,
+            )
             if (
                 record is None
                 or record.used
@@ -427,7 +576,7 @@ class ApprovalBroker:
             record.dispatched = True
             if not await commit():
                 return False
-            future = self._pending.get(tool_call_id)
+            future = self._pending.get(record.approval_id)
             if future is not None and not future.done():
                 future.set_result(decision)
             return True

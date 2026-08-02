@@ -1,18 +1,23 @@
 """Structured audit logging on top of the audit_log table."""
 
+from khaos.audit.anchor import AuditAnchorError, AuditChainAnchor
 from khaos.audit.logger import (
     AUDIT_LOG_TRUSTED_DIR,
     AuditEntry,
     AuditLogger,
     parse_detail,
+    resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
 )
 
 __all__ = [
     "AUDIT_LOG_TRUSTED_DIR",
+    "AuditAnchorError",
+    "AuditChainAnchor",
     "AuditEntry",
     "AuditLogger",
     "parse_detail",
+    "resolve_safe_audit_anchor_path",
     "resolve_safe_audit_log_path",
 ]
 

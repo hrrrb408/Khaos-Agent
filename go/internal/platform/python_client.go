@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"khaos/go/internal/api"
@@ -34,6 +35,22 @@ var (
 // 8 MiB comfortably fits the largest legitimate frame while still
 // bounding memory.
 const maxStreamFrameSize = 8 * 1024 * 1024
+
+const (
+	internalRPCProtocolVersion = 2
+	internalRPCMinVersion      = 2
+	internalRPCMaxVersion      = 2
+	internalRPCSchemaVersion   = 1
+	internalRPCMethodSchema    = 1
+)
+
+var internalRPCFeatures = []string{
+	"hmac-v2",
+	"project-policy-claims",
+	"method-schema-v1",
+	"typed-error-codes",
+	"unknown-fields-reject",
+}
 
 // CreateTask creates a persistent coding task.
 //
@@ -108,7 +125,7 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 		return nil, err
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
-	if err := c.writeRequest(conn, "TaskService.Events", map[string]any{"task_id": id}, principalID); err != nil {
+	if err := c.writeRPC(conn, "TaskService.Events", map[string]any{"task_id": id}, principalID); err != nil {
 		stopCancelWatch()
 		conn.Close()
 		return nil, err
@@ -163,9 +180,9 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 // (“sha256(realpath(project_root))[:32]“).  When non-empty it is
 // injected into every RPC payload so Python's dispatcher (A-5-1b)
 // can detect project drift (Gateway booted under project A routing
-// to a Python server booted under project B).  Empty means the
-// Gateway was not configured with a project root — Python accepts
-// the empty claim for backward compatibility.
+// to a Python server booted under project B). Production resolution rejects
+// an empty project root; only explicit development-mode Python servers may
+// accept the legacy omission while old adapters migrate.
 //
 // C-1-4: “PolicyDigest“ is the Gateway-level policy identity
 // (sha256 of the canonical EffectiveSecurityPolicy).  It is fetched
@@ -174,14 +191,17 @@ func (c PythonClient) TaskEvents(ctx context.Context, principalID string, id str
 // it independently.  When non-empty it is injected into every RPC
 // payload so Python's dispatcher can detect policy drift (Gateway
 // booted against a Python server with policy A, then routed to a
-// Python server with policy B).  Empty means the bootstrap handshake
-// failed or was skipped — Python accepts the empty claim for backward
-// compatibility with older Gateways.
+// Python server with policy B). Production RPC v2 requires the claim; only
+// explicit development-mode Python servers may accept the legacy omission.
 type PythonClient struct {
 	Address      string
 	Capability   string
 	ProjectID    string
 	PolicyDigest string
+	// RequireNegotiation is enabled by the production Gateway.  Unit-test
+	// adapters may leave it false to exercise the explicit development
+	// compatibility window without pretending that path is production-safe.
+	RequireNegotiation bool
 }
 
 // writeRequest serializes and signs one JSON-line RPC request.
@@ -202,8 +222,8 @@ type PythonClient struct {
 // into the payload before digest computation.  Python's dispatcher
 // (A-5-1b) compares “payload["project_id"]“ against
 // “agent._bound_project_id“; a mismatch is rejected as
-// “project_drift“ (fail-closed).  An empty “ProjectID“ is
-// accepted by Python (backward compat with older Gateways).  The
+// “project_drift“ (fail-closed).  An empty “ProjectID“ is accepted only by
+// an explicit development-mode Python server. The
 // injection happens before “canonicalJSON“ so “payload_digest“
 // covers the injected value — Python's digest check passes.
 //
@@ -212,9 +232,8 @@ type PythonClient struct {
 // computation.  Python's dispatcher compares
 // “payload["policy_digest"]“ against
 // “agent._effective_policy.digest“; a mismatch is rejected as
-// “policy_drift“ (fail-closed).  An empty “PolicyDigest“ is
-// accepted by Python (backward compat with older Gateways or when
-// the bootstrap handshake failed).  The injection happens before
+// “policy_drift“ (fail-closed).  An empty “PolicyDigest“ is accepted only by
+// an explicit development-mode Python server. The injection happens before
 // “canonicalJSON“ so “payload_digest“ covers the injected value.
 func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, principalID string) error {
 	if len(c.Capability) < 32 {
@@ -263,18 +282,127 @@ func (c PythonClient) writeRequest(conn net.Conn, method string, payload any, pr
 	nonce := hex.EncodeToString(nonceBytes)
 	issuedAt := time.Now().Unix()
 	payloadDigest := hex.EncodeToString(digest[:])
-	signed := fmt.Sprintf("%s\n%s\n%d\n%s\n%s", method, nonce, issuedAt, principalID, payloadDigest)
+	signed := fmt.Sprintf("%d\n%s\n%s\n%d\n%s\n%s", internalRPCProtocolVersion, method, nonce, issuedAt, principalID, payloadDigest)
+	protocolMetadata := map[string]any(nil)
+	if c.RequireNegotiation {
+		protocolMetadata = map[string]any{
+			"min_version":           internalRPCMinVersion,
+			"max_version":           internalRPCMaxVersion,
+			"schema_version":        internalRPCSchemaVersion,
+			"method_schema_version": internalRPCMethodSchema,
+			"features":              append([]string(nil), internalRPCFeatures...),
+			"feature_digest":        rpcFeatureDigest(),
+			"unknown_field_policy":  "reject",
+		}
+		signed += fmt.Sprintf("\n%d\n%d\n%d\n%d\n%s",
+			internalRPCMinVersion,
+			internalRPCMaxVersion,
+			internalRPCSchemaVersion,
+			internalRPCMethodSchema,
+			rpcFeatureDigest(),
+		)
+	}
 	methodKey := hmac.New(sha256.New, []byte(c.Capability))
-	_, _ = methodKey.Write([]byte("khaos-rpc-method-v1\n" + method))
+	_, _ = methodKey.Write([]byte(fmt.Sprintf("khaos-rpc-method-v%d\n%s", internalRPCProtocolVersion, method)))
 	mac := hmac.New(sha256.New, methodKey.Sum(nil))
 	_, _ = mac.Write([]byte(signed))
-	return json.NewEncoder(conn).Encode(map[string]any{
-		"method": method, "payload": normalized,
+	envelope := map[string]any{
+		"protocol_version": internalRPCProtocolVersion, "method": method, "payload": normalized,
 		"auth": map[string]any{
 			"nonce": nonce, "issued_at": issuedAt, "principal_id": principalID,
 			"payload_digest": payloadDigest, "mac": hex.EncodeToString(mac.Sum(nil)),
 		},
-	})
+	}
+	if protocolMetadata != nil {
+		envelope["protocol"] = protocolMetadata
+	}
+	return json.NewEncoder(conn).Encode(envelope)
+}
+
+func rpcFeatureDigest() string {
+	features := append([]string(nil), internalRPCFeatures...)
+	// The list is already deterministic; Python sorts before hashing, so sort
+	// here as well to make the cross-language binding explicit.
+	sort.Strings(features)
+	raw, _ := json.Marshal(features)
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
+}
+
+func (c PythonClient) negotiate(conn net.Conn) error {
+	if !c.RequireNegotiation {
+		return nil
+	}
+	if err := c.writeRequest(conn, "RPC.Initialize", map[string]any{
+		"min_protocol_version":  internalRPCMinVersion,
+		"max_protocol_version":  internalRPCMaxVersion,
+		"schema_version":        internalRPCSchemaVersion,
+		"method_schema_version": internalRPCMethodSchema,
+		"features":              append([]string(nil), internalRPCFeatures...),
+	}, ""); err != nil {
+		return err
+	}
+	var response map[string]any
+	if err := json.NewDecoder(conn).Decode(&response); err != nil {
+		return fmt.Errorf("RPC.Initialize response decode: %w", err)
+	}
+	if ok, _ := response["ok"].(bool); !ok {
+		return fmt.Errorf("RPC.Initialize rejected: %s", stringValue(response["error"]))
+	}
+	protocol, ok := response["protocol"].(map[string]any)
+	if !ok {
+		return fmt.Errorf("RPC.Initialize response missing protocol contract")
+	}
+	if intFromAny(protocol["selected_version"]) != internalRPCProtocolVersion ||
+		intFromAny(protocol["schema_version"]) != internalRPCSchemaVersion ||
+		intFromAny(protocol["method_schema_version"]) != internalRPCMethodSchema {
+		return fmt.Errorf("RPC.Initialize selected an unsupported protocol contract")
+	}
+	if stringValue(protocol["unknown_field_policy"]) != "reject" {
+		return fmt.Errorf("RPC.Initialize did not negotiate reject-unknown-fields")
+	}
+	features, ok := protocol["features"].([]any)
+	if !ok {
+		return fmt.Errorf("RPC.Initialize response features are invalid")
+	}
+	selected := make(map[string]bool, len(features))
+	for _, feature := range features {
+		name, ok := feature.(string)
+		if !ok {
+			return fmt.Errorf("RPC.Initialize response contains a non-string feature")
+		}
+		selected[name] = true
+	}
+	for _, required := range internalRPCFeatures {
+		if !selected[required] {
+			return fmt.Errorf("RPC.Initialize omitted required feature %q", required)
+		}
+	}
+	requiredFields, ok := protocol["required_security_fields"].([]any)
+	if !ok {
+		return fmt.Errorf("RPC.Initialize response required_security_fields are invalid")
+	}
+	required := make(map[string]bool, len(requiredFields))
+	for _, field := range requiredFields {
+		name, ok := field.(string)
+		if !ok {
+			return fmt.Errorf("RPC.Initialize response contains a non-string security field")
+		}
+		required[name] = true
+	}
+	for _, field := range []string{"principal_id", "payload_digest", "project_id", "policy_digest"} {
+		if !required[field] {
+			return fmt.Errorf("RPC.Initialize omitted required security field %q", field)
+		}
+	}
+	return nil
+}
+
+func (c PythonClient) writeRPC(conn net.Conn, method string, payload any, principalID string) error {
+	if err := c.negotiate(conn); err != nil {
+		return err
+	}
+	return c.writeRequest(conn, method, payload, principalID)
 }
 
 func canonicalJSON(value any) ([]byte, error) {
@@ -535,7 +663,7 @@ func (c PythonClient) Chat(ctx context.Context, req api.ChatRequest) (<-chan api
 		return nil, err
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
-	if err := c.writeRequest(conn, "AgentService.Chat", req, req.PrincipalID); err != nil {
+	if err := c.writeRPC(conn, "AgentService.Chat", req, req.PrincipalID); err != nil {
 		stopCancelWatch()
 		conn.Close()
 		return nil, err
@@ -591,7 +719,7 @@ func (c PythonClient) ChatEvents(ctx context.Context, principalID string, sessio
 		return nil, err
 	}
 	stopCancelWatch := closeOnContextDone(ctx, conn)
-	if err := c.writeRequest(conn, "AgentService.ChatEvents", map[string]any{
+	if err := c.writeRPC(conn, "AgentService.ChatEvents", map[string]any{
 		"session_id": sessionID, "after_event_id": afterEventID,
 	}, principalID); err != nil {
 		stopCancelWatch()
@@ -650,7 +778,7 @@ func (c PythonClient) ConfirmPermission(ctx context.Context, principalID string,
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	return c.writeRequest(conn, "AgentService.ConfirmPermission", map[string]any{
+	return c.writeRPC(conn, "AgentService.ConfirmPermission", map[string]any{
 		"session_id":     sessionID,
 		"principal_id":   principalID,
 		"tool_call_id":   toolCallID,
@@ -668,7 +796,7 @@ func (c PythonClient) SwitchMode(ctx context.Context, principalID string, sessio
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	if err := c.writeRequest(conn, "AgentService.SwitchMode", map[string]any{
+	if err := c.writeRPC(conn, "AgentService.SwitchMode", map[string]any{
 		"session_id": sessionID, "target_mode": targetMode,
 	}, principalID); err != nil {
 		return "", err
@@ -703,7 +831,7 @@ func (c PythonClient) Query(ctx context.Context, principalID string, action, res
 	if until != "" {
 		payload["until"] = until
 	}
-	if err := c.writeRequest(conn, "AuditService.Query", payload, principalID); err != nil {
+	if err := c.writeRPC(conn, "AuditService.Query", payload, principalID); err != nil {
 		return nil, err
 	}
 	var entries []api.AuditEntry
@@ -762,7 +890,7 @@ func (c PythonClient) callMap(ctx context.Context, method string, payload map[st
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	if err := c.writeRequest(conn, method, payload, principalID); err != nil {
+	if err := c.writeRPC(conn, method, payload, principalID); err != nil {
 		return nil, err
 	}
 	var response map[string]any
@@ -779,7 +907,7 @@ func (c PythonClient) callList(ctx context.Context, method string, payload map[s
 	}
 	defer conn.Close()
 	defer closeOnContextDone(ctx, conn)()
-	if err := c.writeRequest(conn, method, payload, principalID); err != nil {
+	if err := c.writeRPC(conn, method, payload, principalID); err != nil {
 		return nil, err
 	}
 	var response []map[string]any

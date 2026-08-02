@@ -939,6 +939,21 @@ class Database:
                 await self._apply_v9_upgrades()
             finally:
                 self._conn = original_conn
+            # Phase-1 Authority Scope Closure: bind persistent permission
+            # grants to transport/lifetime/session/task/workspace scope.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v10_upgrades()
+            finally:
+                self._conn = original_conn
+            # P1-4: typed resource DSL for relaxing permission grants.
+            original_conn = self._conn
+            self._conn = _MigrationConnection(conn)
+            try:
+                await self._apply_v11_upgrades()
+            finally:
+                self._conn = original_conn
             # Batch 6.4 §10.4: backfill the historical ledger rows (v1–v5)
             # so the chain is complete from this point on.  Idempotent —
             # uses INSERT OR IGNORE keyed on the version PK.
@@ -1515,6 +1530,14 @@ class Database:
         """
         await self._ensure_audit_log_insert_guard()
 
+    async def _apply_v10_upgrades(self) -> None:
+        """Phase-1 Authority Scope Closure for persistent permissions."""
+        await self._ensure_permissions_scope_columns()
+
+    async def _apply_v11_upgrades(self) -> None:
+        """P1-4: add typed resource fields to persistent permissions."""
+        await self._ensure_permission_resource_columns()
+
     async def _ensure_audit_log_insert_guard(self) -> None:
         """Round-15 A-2: add the BEFORE INSERT genesis guard to audit_log.
 
@@ -1760,6 +1783,97 @@ class Database:
             "CREATE INDEX idx_permissions_principal "
             "ON permissions(principal_id, project_id, policy_digest, "
             "generation, mode, permission_level)"
+        )
+        await conn.commit()
+
+    async def _ensure_permissions_scope_columns(self) -> None:
+        """Add transport/lifetime scope columns for permission grants.
+
+        Phase-1 Authority Scope Closure: existing permission rows are
+        deliberately migrated to the restrictive interactive-project scope.
+        They must be explicitly re-granted if an administrator intends them
+        to apply to unattended transports; a schema upgrade must not widen an
+        existing approval authority.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(permissions)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        additions = (
+            (
+                "transport_class",
+                "ALTER TABLE permissions ADD COLUMN transport_class "
+                "TEXT NOT NULL DEFAULT 'interactive'",
+            ),
+            (
+                "grant_lifetime",
+                "ALTER TABLE permissions ADD COLUMN grant_lifetime "
+                "TEXT NOT NULL DEFAULT 'project_interactive'",
+            ),
+            (
+                "session_id",
+                "ALTER TABLE permissions ADD COLUMN session_id "
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "task_id",
+                "ALTER TABLE permissions ADD COLUMN task_id "
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "workspace_id",
+                "ALTER TABLE permissions ADD COLUMN workspace_id "
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "expires_at",
+                "ALTER TABLE permissions ADD COLUMN expires_at REAL",
+            ),
+            (
+                "created_by",
+                "ALTER TABLE permissions ADD COLUMN created_by "
+                "TEXT NOT NULL DEFAULT 'migration:legacy'",
+            ),
+        )
+        for name, statement in additions:
+            if name not in columns:
+                await conn.execute(statement)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_permissions_scope "
+            "ON permissions(principal_id, project_id, policy_digest, "
+            "generation, transport_class, grant_lifetime, session_id, task_id)"
+        )
+        await conn.commit()
+
+    async def _ensure_permission_resource_columns(self) -> None:
+        """Add typed resource fields without widening legacy authority.
+
+        Existing rows remain empty and are interpreted by the permission
+        engine: non-relaxing legacy globs remain enforcement rules, while
+        relaxing rows are converted only when their syntax is unambiguous.
+        Ambiguous legacy relaxing rows are quarantined on load.
+        """
+        conn = await self._require_conn()
+        cursor = await conn.execute("PRAGMA table_info(permissions)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        additions = (
+            (
+                "resource_type",
+                "ALTER TABLE permissions ADD COLUMN resource_type "
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+            (
+                "resource_spec",
+                "ALTER TABLE permissions ADD COLUMN resource_spec "
+                "TEXT NOT NULL DEFAULT ''",
+            ),
+        )
+        for name, statement in additions:
+            if name not in columns:
+                await conn.execute(statement)
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_permissions_resource "
+            "ON permissions(principal_id, project_id, policy_digest, "
+            "generation, resource_type, permission_level)"
         )
         await conn.commit()
 
@@ -2723,15 +2837,35 @@ class Database:
         project_id: str = "",
         policy_digest: str = "",
         generation: int = 0,
+        transport_class: str = "interactive",
+        grant_lifetime: str = "project_interactive",
+        session_id: str = "",
+        task_id: str = "",
+        workspace_id: str = "",
+        expires_at: float | None = None,
+        created_by: str = "",
+        resource_type: str = "",
+        resource_spec: dict[str, Any] | str | None = None,
     ) -> int:
         """Persist a permission rule and return its row id.
 
         M4 batch 3.1.16A-2: ``principal_id``, ``project_id``,
         ``policy_digest`` and ``generation`` scope the rule to a
-        specific principal/project/policy.  Legacy callers that omit
-        them get ``principal_id='legacy'`` — the rule is stored but
-        never matched by authenticated principals.
+        specific principal/project/policy. Phase-1 scope fields further
+        bind the grant to a transport class and optional session/task/
+        workspace lifetime. Legacy callers that omit them get the safe
+        interactive-project default and are never matched by authenticated
+        principals when ``principal_id='legacy'``.
         """
+        if isinstance(resource_spec, dict):
+            resource_spec_value = json.dumps(
+                resource_spec,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+            )
+        else:
+            resource_spec_value = str(resource_spec or "")
         async with self._authorization_lock:
             async with self.transaction() as conn:
                 row = await self._authorization_context_row(
@@ -2768,12 +2902,18 @@ class Database:
                     """
                     INSERT INTO permissions (
                         pattern, permission_level, approval, mode,
-                        principal_id, project_id, policy_digest, generation
+                        principal_id, project_id, policy_digest, generation,
+                        transport_class, grant_lifetime, session_id, task_id,
+                        workspace_id, expires_at, created_by,
+                        resource_type, resource_spec
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (pattern, permission_level, approval, mode,
-                     principal_id, project_id, policy_digest, epoch),
+                     principal_id, project_id, policy_digest, epoch,
+                     transport_class, grant_lifetime, session_id, task_id,
+                     workspace_id, expires_at, created_by,
+                     resource_type, resource_spec_value),
                 )
                 return int(cursor.lastrowid)
 
@@ -2814,7 +2954,10 @@ class Database:
                 f"""
                 SELECT id, pattern, permission_level, approval, mode,
                        strftime('%s', granted_at) AS granted_at,
-                       principal_id, project_id, policy_digest, generation
+                       principal_id, project_id, policy_digest, generation,
+                       transport_class, grant_lifetime, session_id, task_id,
+                       workspace_id, expires_at, created_by,
+                       resource_type, resource_spec
                 FROM permissions
                 {where}
                 ORDER BY granted_at DESC, id DESC
@@ -3033,6 +3176,61 @@ class Database:
                 tuple(params),
             )
             return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_audit_chain_head(
+        self, row_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a recomputed audit-chain link for one row or the head.
+
+        The local audit anchor uses this narrow read to compare its persisted
+        chain head with SQLite without trusting a stored hash value.  The
+        full :meth:`verify_audit_chain` replay remains the authoritative
+        consistency check before an anchor is advanced.
+        """
+        async with self._read_lease():
+            conn = await self._require_conn()
+            if row_id is None:
+                cursor = await conn.execute(
+                    "SELECT id, action, target, result, detail, session_id, "
+                    "principal_id, runtime_id, task_id, operation_id, "
+                    "policy_digest, authority_generation, source_transport, "
+                    "project_id, prev_hash "
+                    "FROM audit_log ORDER BY id DESC LIMIT 1"
+                )
+            else:
+                cursor = await conn.execute(
+                    "SELECT id, action, target, result, detail, session_id, "
+                    "principal_id, runtime_id, task_id, operation_id, "
+                    "policy_digest, authority_generation, source_transport, "
+                    "project_id, prev_hash "
+                    "FROM audit_log WHERE id = ?",
+                    (row_id,),
+                )
+            row = await cursor.fetchone()
+        if row is None:
+            return None
+        values = dict(row)
+        previous = str(values.get("prev_hash") or "")
+        return {
+            "id": int(values["id"]),
+            "hash": _audit_row_hash(
+                previous,
+                str(values["action"]),
+                str(values["target"]),
+                str(values["result"]),
+                str(values.get("detail") or ""),
+                values.get("session_id"),
+                str(values.get("principal_id") or "legacy"),
+                values.get("runtime_id"),
+                values.get("task_id"),
+                values.get("operation_id"),
+                values.get("policy_digest"),
+                values.get("authority_generation"),
+                values.get("source_transport"),
+                str(values.get("project_id") or ""),
+            ),
+            "prev_hash": previous,
+        }
 
     async def verify_audit_chain(self) -> list[dict[str, Any]]:
         """Round-14 §4 / Round-15 A-2: verify the audit_log hash chain.

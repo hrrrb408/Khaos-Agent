@@ -39,6 +39,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from khaos.audit.anchor import AuditAnchorError, AuditChainAnchor, anchor_filename
 from khaos.time_utils import utc_now_naive
 
 
@@ -106,6 +107,11 @@ def resolve_safe_audit_log_path(
         )
         return None
     return Path(filename)
+
+
+def resolve_safe_audit_anchor_path(project_id: str) -> Path:
+    """Return the trusted basename used by the local audit chain anchor."""
+    return anchor_filename(project_id)
 
 
 @dataclass
@@ -199,6 +205,7 @@ class AuditLogger:
         db,
         *,
         log_path: str | os.PathLike[str] | None = None,
+        anchor_path: str | os.PathLike[str] | None = None,
         principal_id: str = "legacy",
         runtime_id: str | None = None,
         policy_digest: str | None = None,
@@ -224,6 +231,21 @@ class AuditLogger:
         self._fd: int | None = None
         if log_path is not None:
             self._open_log_fd(log_path)
+        self._anchor: AuditChainAnchor | None = None
+        if anchor_path is not None:
+            try:
+                self._anchor = AuditChainAnchor(
+                    anchor_path,
+                    project_id=self._project_id,
+                    database_path=str(getattr(db, "path", "")),
+                    trusted_dir=AUDIT_LOG_TRUSTED_DIR.expanduser(),
+                )
+            except AuditAnchorError:
+                # An enabled production anchor must not silently downgrade to
+                # SQLite-only evidence.  Construction fails closed so the
+                # caller can refuse to start the runtime.
+                logger.error("failed to open audit chain anchor", exc_info=True)
+                raise
 
     def _open_log_fd(self, log_path: str | os.PathLike[str]) -> None:
         """H1: open and validate the audit log file via an ``openat``
@@ -473,6 +495,13 @@ class AuditLogger:
             except OSError:
                 pass
             self._fd = None
+        if self._anchor is not None:
+            self._anchor.close()
+
+    async def verify_anchor(self) -> None:
+        """Replay the SQLite audit chain against the independent anchor."""
+        if self._anchor is not None:
+            await self._anchor.verify(self.db)
 
     async def log(
         self,
@@ -507,6 +536,18 @@ class AuditLogger:
         logger's construction — it is a runtime property, not per-event.
         """
         detail_json = json.dumps(detail or {}, ensure_ascii=False, sort_keys=True)
+        if self._anchor is not None:
+            try:
+                # Verify before accepting a new event, so a database that was
+                # edited after startup cannot advance the trusted head.
+                await self._anchor.verify(self.db)
+            except AuditAnchorError:
+                logger.error(
+                    "audit chain anchor verification failed; refusing to "
+                    "record a trusted audit event",
+                    exc_info=True,
+                )
+                return -1
         # M1: append a copy to the configured file path (best-effort).
         if self.log_path is not None:
             try:
@@ -528,7 +569,7 @@ class AuditLogger:
                     exc_info=True,
                 )
         try:
-            return await self.db.insert_audit_log(
+            row_id = await self.db.insert_audit_log(
                 action=action,
                 target=target,
                 result=result,
@@ -543,6 +584,17 @@ class AuditLogger:
                 source_transport=source_transport,
                 project_id=self._project_id,
             )
+            if self._anchor is not None:
+                try:
+                    await self._anchor.observe(self.db)
+                except AuditAnchorError:
+                    logger.error(
+                        "audit chain anchor update failed after row %s",
+                        row_id,
+                        exc_info=True,
+                    )
+                    return -1
+            return row_id
         except Exception:
             # Audit must never break the calling flow; log and continue.
             logger.exception("audit log write failed for action=%s", action)

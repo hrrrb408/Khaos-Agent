@@ -14,7 +14,11 @@ from typing import Any
 from khaos.agent import AgentConfig, AgentLoop
 from khaos.agent.compressor import ContextCompressor
 from khaos.agent.error_handler import ErrorHandler
-from khaos.audit import AuditLogger, resolve_safe_audit_log_path
+from khaos.audit import (
+    AuditLogger,
+    resolve_safe_audit_anchor_path,
+    resolve_safe_audit_log_path,
+)
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
@@ -709,6 +713,11 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
                 log_path=resolve_safe_audit_log_path(
                     effective_policy.audit_log_path
                 ),
+                anchor_path=(
+                    resolve_safe_audit_anchor_path(project_id)
+                    if os.environ.get("KHAOS_DEV_MODE") != "1"
+                    else None
+                ),
                 principal_id=cfg.principal_id,
                 runtime_id=cfg.runtime_id,
                 policy_digest=effective_policy.digest,
@@ -717,6 +726,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
                 # to the project that produced them.
                 project_id=project_id,
             )
+            await audit_logger.verify_anchor()
         scheduler = ToolScheduler(
             registry, permission_engine,
             security_middleware=SecurityMiddleware(

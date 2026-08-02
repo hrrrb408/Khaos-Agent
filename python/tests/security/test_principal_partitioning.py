@@ -90,6 +90,7 @@ async def test_permission_rules_are_principal_scoped(tmp_path):
     # through to the default (ASK_EVERY) because he has no matching rule.
     alice_decision = await alice.check(
         "read_file", {"path": "/safe/file"}, "safe", "office",
+        source_transport="cli",
     )
     bob_decision = await bob.check(
         "read_file", {"path": "/safe/file"}, "safe", "office",

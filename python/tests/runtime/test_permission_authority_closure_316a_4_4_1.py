@@ -191,10 +191,13 @@ async def test_broker_injects_principal_engine_for_manage_tools():
         mode="office",
         pattern="/home/alice/*",
         permission_level="write",
+        resource_type="filesystem",
+        resource_spec={"root": "/home/alice", "recursive": True},
         context={
             "principal_id": "api:alice",
             "permission_engine": engine,
             "audit_logger": _make_audit([]),
+            "source_transport": "cli",
         },
     )
 

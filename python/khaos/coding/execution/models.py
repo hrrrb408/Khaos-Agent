@@ -208,6 +208,11 @@ class ExecutionRequest:
     correlation_id: str | None = None
     permission_profile: PermissionProfile | None = None
     workspace_baseline: WorkspaceStorageSnapshot | None = None
+    # Final pre-exec identity binding for production TaskWorkspace launches.
+    # The supervisor checks these again in the forked child so a path swap
+    # after the async workspace check fails closed.
+    workspace_root_identity: tuple[int, int] | None = None
+    workspace_cwd_identity: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
@@ -250,6 +255,8 @@ class ResolvedExecutionContext:
     correlation_id: str
     permission_profile: PermissionProfile | None = None
     workspace_baseline: WorkspaceStorageSnapshot | None = None
+    workspace_root_identity: tuple[int, int] | None = None
+    workspace_cwd_identity: tuple[int, int] | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(

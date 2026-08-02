@@ -3,6 +3,8 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -147,7 +149,13 @@ func newTestHandler(apiKey string) (http.Handler, *mockAgent) {
 	}
 	agent := &mockAgent{}
 	handler := NewHandler(agent, NewMemoryMap(), NewMapConfig(map[string]any{"mode": "office"}), apiKey, rate.NewTokenBucket(1000, 100))
+	handler.WithConfigAdminPrincipals(configAdminPrincipal(apiKey))
 	return handler.Routes(), agent
+}
+
+func configAdminPrincipal(apiKey string) string {
+	digest := sha256.Sum256([]byte(apiKey))
+	return "api-key:" + hex.EncodeToString(digest[:])
 }
 
 func serve(handler http.Handler, method string, path string, body string, key string) *httptest.ResponseRecorder {
@@ -362,29 +370,50 @@ func TestConfigToolsSessionsHealth(t *testing.T) {
 			t.Fatalf("%s status=%d", path, rec.Code)
 		}
 	}
-	// Round-15 B-4: config PUT is restricted to a loopback caller.  The
-	// test httptest.NewRequest leaves RemoteAddr empty, so set a loopback
-	// address to exercise the legitimate operator path.
+	// Round-15 B-4: an authenticated principal must also be in the explicit
+	// config-admin allowlist.  The allowlist is installed by newTestHandler.
 	req := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewBufferString(`{"mode":"coding"}`))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Khaos-Key", testAPIKey)
 	req.Host = "127.0.0.1:8080"
-	req.RemoteAddr = "127.0.0.1:1234"
+	req.RemoteAddr = "10.0.0.5:1234"
 	rec := httptest.NewRecorder()
 	handler.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("config put status=%d", rec.Code)
 	}
-	// A non-loopback caller must be refused.
+	// Authentication without the config-admin grant must be refused, even
+	// from loopback.
+	nonAdmin := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10))
+	nonAdmin.WithConfigAdminPrincipals("api-key:someone-else")
 	req2 := httptest.NewRequest(http.MethodPut, "/api/config", bytes.NewBufferString(`{"mode":"office"}`))
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("X-Khaos-Key", testAPIKey)
 	req2.Host = "127.0.0.1:8080"
-	req2.RemoteAddr = "10.0.0.5:1234"
+	req2.RemoteAddr = "127.0.0.1:1234"
 	rec2 := httptest.NewRecorder()
-	handler.ServeHTTP(rec2, req2)
+	nonAdmin.Routes().ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusForbidden {
-		t.Fatalf("non-loopback config put should be 403, got %d", rec2.Code)
+		t.Fatalf("non-admin config put should be 403, got %d", rec2.Code)
+	}
+	if rec := serve(nonAdmin.Routes(), http.MethodGet, "/api/config", "", testAPIKey); rec.Code != http.StatusForbidden {
+		t.Fatalf("non-admin config get should be 403, got %d", rec.Code)
+	}
+}
+
+func TestConfigFailsClosedWithoutExplicitAdminGrant(t *testing.T) {
+	handler := NewHandler(
+		&mockAgent{},
+		NewMemoryMap(),
+		NewMapConfig(map[string]any{"mode": "office"}),
+		testAPIKey,
+		rate.NewTokenBucket(100, 10),
+	).Routes()
+	if rec := serve(handler, http.MethodGet, "/api/config", "", testAPIKey); rec.Code != http.StatusForbidden {
+		t.Fatalf("config get without admin grant should be 403, got %d", rec.Code)
+	}
+	if rec := serveUnauthenticated(handler, http.MethodPut, "/api/config", `{"mode":"coding"}`); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unauthenticated config put should be 401, got %d", rec.Code)
 	}
 }
 
@@ -406,7 +435,7 @@ func TestAnonymousWebhookCannotExhaustAuthenticatedOrHealthBuckets(t *testing.T)
 		NewMapConfig(map[string]any{}),
 		testAPIKey,
 		rate.NewTokenBucket(1, 1),
-	).Routes()
+	).WithConfigAdminPrincipals(configAdminPrincipal(testAPIKey)).Routes()
 
 	first := serveUnauthenticated(
 		handler, http.MethodPost, "/api/webhook/slack?channel_id=slack-a", `{}`,
@@ -465,6 +494,40 @@ func TestWebhookAndChannelEndpoints(t *testing.T) {
 	}
 	if rec := serve(handler, http.MethodPost, "/api/channels/tg/enable", "", "gateway-key"); rec.Code != http.StatusOK || !agent.enabled {
 		t.Fatalf("enable status=%d enabled=%v", rec.Code, agent.enabled)
+	}
+}
+
+func TestWebhookRateLimitIsScopedByPlatformAndChannel(t *testing.T) {
+	agent := &mockChannelAgent{}
+	handler := NewHandler(
+		agent,
+		NewMemoryMap(),
+		NewMapConfig(nil),
+		testAPIKey,
+		rate.NewTokenBucket(1, 1),
+	).Routes()
+
+	request := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{}`))
+		req.Host = "127.0.0.1:8080"
+		req.RemoteAddr = "192.0.2.10:1234"
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	if first := request("/api/webhook/telegram?channel_id=alpha"); first.Code != http.StatusOK {
+		t.Fatalf("first channel request status=%d body=%s", first.Code, first.Body.String())
+	}
+	if same := request("/api/webhook/telegram?channel_id=alpha"); same.Code != http.StatusTooManyRequests {
+		t.Fatalf("same channel should be rate limited, status=%d", same.Code)
+	}
+	if otherChannel := request("/api/webhook/telegram?channel_id=beta"); otherChannel.Code != http.StatusOK {
+		t.Fatalf("different channel should have an independent bucket, status=%d body=%s", otherChannel.Code, otherChannel.Body.String())
+	}
+	if otherPlatform := request("/api/webhook/slack?channel_id=alpha"); otherPlatform.Code != http.StatusOK {
+		t.Fatalf("different platform should have an independent bucket, status=%d body=%s", otherPlatform.Code, otherPlatform.Body.String())
 	}
 }
 

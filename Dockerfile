@@ -1,5 +1,5 @@
 # Stage 0: native security TCB
-FROM rust:1.82-bookworm AS rust-tcb-builder
+FROM rust:1.82-bookworm@sha256:d9c3c6f1264a547d84560e06ffd79ed7a799ce0bff0980b26cf10d29af888377 AS rust-tcb-builder
 
 WORKDIR /build
 COPY rust/khaos-core/ rust/khaos-core/
@@ -9,47 +9,61 @@ RUN cargo build --release --no-default-features \
     --bin khaos-browser-kernel-helper
 
 # Stage 1: Python agent
-FROM python:3.11-slim AS python-agent
+FROM python:3.11-slim-bookworm@sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba AS python-agent
 
 WORKDIR /app
 
 # System dependencies.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get -o Acquire::Retries=5 update \
+    && apt-get -o Acquire::Retries=5 install -y --no-install-recommends \
     gcc \
     bubblewrap \
     libcap2-bin \
     && rm -rf /var/lib/apt/lists/*
 
-# Python dependencies and source package.
-COPY pyproject.toml ./
+# Python dependencies come only from the repository's frozen resolution.  The
+# bootstrap wheel is hash-locked, and ``uv sync --frozen`` refuses to resolve
+# anything that is not already present in uv.lock.  The source tree is kept on
+# PYTHONPATH so this image does not perform a second, floating build-isolation
+# install of the project itself.
+COPY pyproject.toml uv.lock ./
+COPY python/bootstrap-requirements.txt /tmp/khaos-bootstrap-requirements.txt
+RUN python -m pip install --no-cache-dir --require-hashes \
+    -r /tmp/khaos-bootstrap-requirements.txt \
+    && UV_PROJECT_ENVIRONMENT=/usr/local uv sync --frozen --no-dev --no-install-project \
+    && python -m pip uninstall -y uv
 COPY python/ python/
-RUN pip install --no-cache-dir -e .
 
 # Runtime project files.
 COPY prompts/ prompts/
 COPY AGENTS.md KHAOS.md config.yaml ./
 COPY --from=rust-tcb-builder /build/rust/khaos-core/target/release/khaos-sandbox-launcher /usr/local/bin/khaos-sandbox-launcher
+COPY packaging/docker/agent-secret-init.py /usr/local/sbin/khaos-agent-secret-init.py
 
 # Data directories.
 RUN useradd --system --uid 10001 --home-dir /nonexistent --shell /usr/sbin/nologin khaos \
     && chown root:root /usr/local/bin/khaos-sandbox-launcher \
     && chmod 0755 /usr/local/bin/khaos-sandbox-launcher \
     && setcap cap_sys_admin=ep /usr/local/bin/khaos-sandbox-launcher \
-    && mkdir -p /app/data /app/skills /run/khaos /run/khaos-helper \
-    && chown -R khaos:khaos /app/data /app/skills /run/khaos \
+    && chown root:root /usr/local/sbin/khaos-agent-secret-init.py \
+    && chmod 0755 /usr/local/sbin/khaos-agent-secret-init.py \
+    && mkdir -p /app/data /app/skills /run/khaos /run/khaos-helper /var/lib/khaos \
+    && chown -R khaos:khaos /app/data /app/skills /run/khaos /var/lib/khaos \
     && chown root:root /run/khaos-helper \
     && chmod 0700 /run/khaos \
     && chmod 0755 /run/khaos-helper
 
-ENV KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher
+ENV KHAOS_SANDBOX_LAUNCHER=/usr/local/bin/khaos-sandbox-launcher \
+    HOME=/var/lib/khaos \
+    PYTHONPATH=/app/python
 
 USER 10001:10001
 
-CMD ["python", "-m", "khaos.cli", "start", "--socket", "/run/khaos/agent.sock", "--db", "/app/data/khaos.db"]
+CMD ["python", "-m", "khaos.cli", "start", "--socket", "/run/khaos/agent.sock", "--gateway-uid", "0"]
 
 # Stage 1b: root-only browser kernel helper sidecar. It owns all netns, veth,
 # nftables and browser cgroup operations; the Python image contains no ip/nft.
-FROM debian:bookworm-slim AS kernel-helper
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS kernel-helper
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 nftables ca-certificates \
@@ -62,13 +76,13 @@ RUN chown root:root /usr/local/sbin/khaos-browser-kernel-helper /usr/local/sbin/
 ENTRYPOINT ["/usr/local/sbin/kernel-helper-entrypoint"]
 
 # Stage 2: Go gateway
-FROM golang:1.22-alpine AS go-builder
+FROM golang:1.22-alpine@sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052 AS go-builder
 
 WORKDIR /build
 COPY go/ go/
 RUN cd go && CGO_ENABLED=0 go build -o /gateway ./cmd/gateway/
 
-FROM alpine:3.19 AS gateway
+FROM alpine:3.19@sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1 AS gateway
 
 RUN apk add --no-cache ca-certificates
 COPY --from=go-builder /gateway /usr/local/bin/khaos-gateway

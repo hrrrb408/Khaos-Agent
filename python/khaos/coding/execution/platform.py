@@ -12,6 +12,7 @@ import sys
 import tempfile
 from pathlib import Path
 
+from khaos.coding.execution.binding import open_execution_directory_binding
 from khaos.coding.execution.models import ResourceBudget
 from khaos.coding.execution.supervisor import ProcessSupervisor
 from khaos.coding.execution.capability import (
@@ -229,16 +230,22 @@ class MacOSSandboxBackend:
         runtime_roots: tuple[Path, ...] = (),
         synthetic_home: Path | None = None,
         synthetic_tmp: Path | None = None,
+        preserve_workspace_path: bool = False,
     ) -> str:
-        workspace = worktree.resolve()
+        workspace = (
+            worktree.expanduser().absolute()
+            if preserve_workspace_path
+            else worktree.expanduser().resolve()
+        )
         read_roots = _deduplicate_paths(
             (
                 workspace,
                 *_macos_system_read_roots(),
                 *runtime_roots,
-                *(() if synthetic_home is None else (synthetic_home.resolve(),)),
-                *(() if synthetic_tmp is None else (synthetic_tmp.resolve(),)),
-            )
+                *(() if synthetic_home is None else (synthetic_home.expanduser().absolute(),)),
+                *(() if synthetic_tmp is None else (synthetic_tmp.expanduser().absolute(),)),
+            ),
+            preserve_paths=(workspace,) if preserve_workspace_path else (),
         )
         read_rules = "".join(
             f'(allow file-read* (subpath "{_seatbelt_escape(path)}"))'
@@ -254,7 +261,8 @@ class MacOSSandboxBackend:
                 for path in read_roots
                 for ancestor in reversed(path.parents)
                 if ancestor != Path("/")
-            ))
+            )),
+            preserve_paths=(workspace,) if preserve_workspace_path else (),
         )
         metadata_rules = "".join(
             '(allow file-read-metadata '
@@ -268,8 +276,8 @@ class MacOSSandboxBackend:
         write_roots = tuple(
             path for path in (
                 workspace if writable else None,
-                synthetic_home.resolve() if synthetic_home else None,
-                synthetic_tmp.resolve() if synthetic_tmp else None,
+                synthetic_home.expanduser().absolute() if synthetic_home else None,
+                synthetic_tmp.expanduser().absolute() if synthetic_tmp else None,
             ) if path is not None
         )
         write_rules = "".join(
@@ -329,6 +337,7 @@ class MacOSSandboxBackend:
                 runtime_roots=_runtime_read_roots(request.argv, worktree),
                 synthetic_home=home,
                 synthetic_tmp=sandbox_tmp,
+                preserve_workspace_path=request.workspace_root_identity is not None,
             )
             sandboxed = replace(
                 request,
@@ -346,7 +355,8 @@ class MacOSSandboxBackend:
             try:
                 return await supervisor.run(
                     sandboxed,
-                    cwd=request.cwd.resolve(),
+                    cwd=request.cwd.expanduser().absolute(),
+                    execution_root=worktree,
                     env=environment,
                     tmp_root=home,
                     workspace_root=worktree if writable else None,
@@ -476,9 +486,10 @@ class LinuxBubblewrapBackend:
         resources: ResourceBudget | None = None,
         command: tuple[str, ...] = (),
         environment: dict[str, str] | None = None,
+        workspace_source: str | None = None,
     ) -> tuple[str, ...]:
-        canonical_worktree = worktree.expanduser().resolve()
-        canonical_cwd = (cwd or canonical_worktree).expanduser().resolve()
+        canonical_worktree = worktree.expanduser().absolute()
+        canonical_cwd = (cwd or canonical_worktree).expanduser().absolute()
         if (
             canonical_cwd != canonical_worktree
             and canonical_worktree not in canonical_cwd.parents
@@ -487,8 +498,9 @@ class LinuxBubblewrapBackend:
         relative_cwd = canonical_cwd.relative_to(canonical_worktree)
         sandbox_cwd = Path(self.SANDBOX_WORKDIR) / relative_cwd
         budget = resources or ResourceBudget()
-        home = (synthetic_home or canonical_worktree / ".khaos-home").resolve()
+        home = (synthetic_home or canonical_worktree / ".khaos-home").expanduser().absolute()
         home.mkdir(mode=0o700, parents=True, exist_ok=True)
+        workspace_mount = workspace_source or str(canonical_worktree)
         prefix = [
             _resolve_bwrap_path(),  # P1-1: validated absolute path, not bare PATH
             "--tmpfs", "/",
@@ -500,7 +512,7 @@ class LinuxBubblewrapBackend:
             "--tmpfs", "/home/khaos",
             "--size", str(budget.tmpfs_bytes),
             "--tmpfs", "/tmp",
-            "--bind" if writable else "--ro-bind", str(canonical_worktree), self.SANDBOX_WORKDIR,
+            "--bind" if writable else "--ro-bind", workspace_mount, self.SANDBOX_WORKDIR,
         ]
         if writable:
             from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
@@ -511,7 +523,11 @@ class LinuxBubblewrapBackend:
                     prefix.extend(
                         (
                             "--ro-bind",
-                            str(metadata.resolve()),
+                            (
+                                f"{workspace_source}/{name}"
+                                if workspace_source is not None
+                                else str(metadata)
+                            ),
                             f"{self.SANDBOX_WORKDIR}/{name}",
                         )
                     )
@@ -557,18 +573,39 @@ class LinuxBubblewrapBackend:
                 raise PermissionError(
                     f"execution refused: delegated cgroup v2 limits unavailable: {exc}"
                 ) from exc
-            prefix = self.argv_prefix(
+            directory_binding = open_execution_directory_binding(
                 worktree,
-                cwd=request.cwd,
-                writable=writable,
-                unreadable_roots=profile.unreadable_roots,
-                synthetic_home=Path(home_value),
-                resources=profile.resources,
-                command=request.argv,
-                environment=request.environment,
+                request.cwd,
+                expected_root_identity=request.workspace_root_identity,
+                expected_cwd_identity=request.workspace_cwd_identity,
             )
+            try:
+                workspace_source = (
+                    directory_binding.proc_path(directory_binding.root_fd)
+                    if sys.platform.startswith("linux")
+                    else None
+                )
+                prefix = self.argv_prefix(
+                    worktree,
+                    cwd=request.cwd,
+                    writable=writable,
+                    unreadable_roots=profile.unreadable_roots,
+                    synthetic_home=Path(home_value),
+                    resources=profile.resources,
+                    command=request.argv,
+                    environment=request.environment,
+                    # bwrap resolves bind sources in the launching mount
+                    # namespace.  An inherited proc-fd keeps that source tied
+                    # to the already-validated directory inode.
+                    workspace_source=workspace_source,
+                )
+            except Exception:
+                directory_binding.close()
+                raise
             launcher = _linux_sandbox_launcher()
             if launcher is None:
+                directory_binding.close()
+                await asyncio.to_thread(_remove_linux_cgroup, cgroup)
                 raise PermissionError(
                     "execution refused: no_new_privs/seccomp launcher unavailable"
                 )
@@ -583,15 +620,20 @@ class LinuxBubblewrapBackend:
                 try:
                     return await supervisor.run(
                         sandboxed,
-                        cwd=request.cwd.resolve(),
+                        cwd=request.cwd.expanduser().absolute(),
+                        execution_root=worktree,
                         sandbox_storage_paths=("/home/khaos", "/tmp"),
                         workspace_root=worktree if writable else None,
                         workspace_baseline=request.workspace_baseline,
+                        directory_binding=directory_binding,
                     )
                 except (OSError, PermissionError):
                     self._capability_cache = None
                     raise
             finally:
+                # ProcessSupervisor closes the binding after spawn; this is
+                # idempotent and also covers failures before supervisor.run.
+                directory_binding.close()
                 await asyncio.to_thread(_remove_linux_cgroup, cgroup)
 
     async def terminate(self, execution_id: str) -> None:
@@ -804,11 +846,17 @@ def _seatbelt_escape(path: Path) -> str:
     return str(path).replace("\\", "\\\\").replace('"', '\\"')
 
 
-def _deduplicate_paths(paths: tuple[Path, ...]) -> tuple[Path, ...]:
+def _deduplicate_paths(
+    paths: tuple[Path, ...],
+    *,
+    preserve_paths: tuple[Path, ...] = (),
+) -> tuple[Path, ...]:
     result: list[Path] = []
     seen: set[Path] = set()
+    preserved = set(preserve_paths)
     for path in paths:
-        canonical = path.expanduser().resolve()
+        lexical = path.expanduser().absolute()
+        canonical = lexical if lexical in preserved else lexical.resolve()
         if canonical not in seen:
             result.append(canonical)
             seen.add(canonical)
@@ -827,7 +875,7 @@ def _runtime_read_roots(
         return ()
     lexical = Path(located).expanduser().absolute()
     resolved = Path(located).expanduser().resolve()
-    canonical_workspace = workspace.expanduser().resolve()
+    canonical_workspace = workspace.expanduser().absolute()
     venv_roots: tuple[Path, ...] = ()
     if len(lexical.parents) >= 2:
         possible_venv = lexical.parents[1]

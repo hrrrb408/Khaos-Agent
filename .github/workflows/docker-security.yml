@@ -41,3 +41,13 @@ jobs:
         env:
           KHAOS_RUN_PRODUCTION_SANDBOX: "1"
         run: python -m pytest python/tests/tools/test_sandbox_tools.py python/tests/coding/test_m4_batch3_1_trusted_verification.py -q -m docker_sandbox_real -v
+
+  compose-deployment:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Run Compose development and production E2E
+        run: bash scripts/compose-security-e2e.sh

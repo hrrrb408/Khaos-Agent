@@ -37,6 +37,7 @@ type Handler struct {
 	apiKey               string
 	allowedHosts         map[string]struct{}
 	allowedOrigins       map[string]struct{}
+	configAdmins         map[string]struct{}
 	startedAt            time.Time
 	mu                   sync.Mutex
 	tools                []map[string]any
@@ -90,6 +91,7 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 			"localhost": {}, "127.0.0.1": {}, "::1": {},
 		},
 		allowedOrigins: map[string]struct{}{},
+		configAdmins:   map[string]struct{}{},
 		startedAt:      time.Now(),
 		tools: []map[string]any{
 			{"name": "read_file", "modes": []string{"all"}, "permission_level": "read"},
@@ -101,6 +103,20 @@ func NewHandler(agent AgentClient, memory MemoryClient, config ConfigStore, apiK
 		handler.chatEvents = events
 	}
 	return handler
+}
+
+// WithConfigAdminPrincipals installs the immutable allowlist for the
+// operator-level /api/config endpoint.  An empty allowlist is intentional:
+// configuration access then fails closed until an administrator is explicitly
+// configured by the host deployment.
+func (h *Handler) WithConfigAdminPrincipals(principals ...string) *Handler {
+	h.configAdmins = map[string]struct{}{}
+	for _, principal := range principals {
+		if normalized := strings.TrimSpace(principal); normalized != "" {
+			h.configAdmins[normalized] = struct{}{}
+		}
+	}
+	return h
 }
 
 // WithAllowedHosts replaces the HTTP Host allowlist used to prevent DNS
@@ -172,7 +188,7 @@ func (h *Handler) Routes() http.Handler {
 	common := h.requestLog(h.metricsMiddleware(mux))
 	health := h.rateLimit(h.healthLimiter, common)
 	webhookIngress := h.keyedRateLimit(
-		h.webhookLimiter, webhookSourceIdentity, common,
+		h.webhookLimiter, webhookRateLimitIdentity, common,
 	)
 	authenticated := h.keyedRateLimit(
 		h.authenticatedLimiter, authenticatedPrincipalIdentity, common,
@@ -700,22 +716,31 @@ func webhookSourceIdentity(r *http.Request) string {
 	return r.RemoteAddr
 }
 
-// isLoopbackCaller reports whether the request originated from the local
-// machine.  Round-15 B-4: operator-only endpoints (gateway config mutation)
-// are restricted to loopback so a remote authenticated principal cannot
-// rewrite the gateway configuration, which may carry security-relevant
-// keys.  The Go gateway is normally deployed behind a local Python agent
-// control plane, so legitimate operator access comes from loopback.
-func isLoopbackCaller(r *http.Request) bool {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
+// webhookRateLimitIdentity keeps the source-IP partition while adding the
+// platform/channel partition required by the ingress contract.  A noisy
+// channel must not consume the bucket for another configured channel behind
+// the same NAT or load balancer, and a caller must not be able to evade a
+// channel's bucket merely by rotating source addresses.
+func webhookRateLimitIdentity(r *http.Request) string {
+	platform := strings.ToLower(strings.TrimSpace(r.PathValue("platform")))
+	// The rate-limit middleware runs before ServeMux has matched the route,
+	// so PathValue is not populated yet on the ingress path.  Parse the
+	// already-validated route prefix as a fallback; otherwise every platform
+	// would collapse into the same "unknown" bucket.
+	if platform == "" {
+		const prefix = "/api/webhook/"
+		if strings.HasPrefix(r.URL.Path, prefix) {
+			platform = strings.Trim(strings.TrimPrefix(r.URL.Path, prefix), "/")
+		}
 	}
-	ip := net.ParseIP(host)
-	if ip != nil {
-		return ip.IsLoopback()
+	channelID := strings.TrimSpace(r.URL.Query().Get("channel_id"))
+	if platform == "" {
+		platform = "unknown"
 	}
-	return host == "127.0.0.1" || host == "::1" || host == "localhost"
+	if channelID == "" {
+		channelID = "unknown"
+	}
+	return webhookSourceIdentity(r) + "|platform=" + platform + "|channel=" + channelID
 }
 
 func (h *Handler) requestLog(next http.Handler) http.Handler {
@@ -1170,28 +1195,20 @@ func (h *Handler) handleSessionDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) handleConfigGet(w http.ResponseWriter, r *http.Request) {
-	// Round-15 B-4: config may carry security-relevant values; require an
-	// authenticated principal (the route is already behind auth.Middleware,
-	// but fail closed if the middleware's principal extraction failed).
-	if _, authenticated := auth.PrincipalFromContext(r.Context()); !authenticated {
-		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+	// Round-15 B-4: configuration is operator-level state and may contain
+	// security-relevant values.  Authentication alone is insufficient; the
+	// caller must be present in the host-configured admin allowlist.
+	if !h.requireConfigAdmin(w, r) {
 		return
 	}
 	writeJSON(w, http.StatusOK, h.config.Get())
 }
 
 func (h *Handler) handleConfigSet(w http.ResponseWriter, r *http.Request) {
-	// Round-15 B-4: gateway config is operator-level privileged state (it
-	// may carry security-relevant keys); restrict mutation to a loopback
-	// caller.  Any authenticated remote principal could otherwise overwrite
-	// the whole config map.  Legitimate operator access comes from the
-	// local control plane.
-	if _, authenticated := auth.PrincipalFromContext(r.Context()); !authenticated {
-		writeError(w, http.StatusUnauthorized, "authenticated principal required")
-		return
-	}
-	if !isLoopbackCaller(r) {
-		writeError(w, http.StatusForbidden, "config mutation is restricted to a loopback caller")
+	// The same admin gate applies to reads and writes.  Loopback is not used
+	// as an authorization substitute: a local unprivileged principal must not
+	// gain operator access merely by connecting through 127.0.0.1.
+	if !h.requireConfigAdmin(w, r) {
 		return
 	}
 	var cfg map[string]any
@@ -1201,6 +1218,19 @@ func (h *Handler) handleConfigSet(w http.ResponseWriter, r *http.Request) {
 	}
 	h.config.Set(cfg)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (h *Handler) requireConfigAdmin(w http.ResponseWriter, r *http.Request) bool {
+	principal, authenticated := auth.PrincipalFromContext(r.Context())
+	if !authenticated {
+		writeError(w, http.StatusUnauthorized, "authenticated principal required")
+		return false
+	}
+	if _, admin := h.configAdmins[principal]; !admin {
+		writeError(w, http.StatusForbidden, "principal is not a config administrator")
+		return false
+	}
+	return true
 }
 
 func (h *Handler) handleAudit(w http.ResponseWriter, r *http.Request) {

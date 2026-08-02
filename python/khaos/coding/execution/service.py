@@ -9,6 +9,7 @@ import uuid
 from dataclasses import replace
 from pathlib import Path
 
+from khaos.coding.execution.binding import open_execution_directory_binding
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.models import (
     ExecutionRequest,
@@ -20,7 +21,7 @@ from khaos.coding.execution.models import (
 )
 from khaos.coding.execution.supervisor import (
     ProcessSupervisor,
-    resource_limit_preexec,
+    execution_binding_preexec,
 )
 from khaos.coding.workspace.models import WorkspaceState
 from khaos.coding.workspace.storage import capture_workspace_snapshot
@@ -117,11 +118,19 @@ class ExecutionService:
             }:
                 raise PermissionError("workspace is not executable")
             await self.workspace_manager.verify_git_identity(request.workspace_id)
-            root = workspace.worktree_path.resolve()
-            cwd = request.cwd.expanduser().resolve()
+            # Keep the workspace/cwd paths lexical after the authority check.
+            # The final backend launch pins both directories with O_NOFOLLOW
+            # directory handles; resolving here would create another
+            # symlink-following lookup in the TOCTOU window.
+            root = workspace.worktree_path.expanduser().absolute()
+            cwd = request.cwd.expanduser().absolute()
+            root_info = os.stat(root, follow_symlinks=False)
+            cwd_info = os.stat(cwd, follow_symlinks=False)
+            root_identity = (int(root_info.st_dev), int(root_info.st_ino))
+            cwd_identity = (int(cwd_info.st_dev), int(cwd_info.st_ino))
             if cwd != root and root not in cwd.parents:
                 raise PermissionError("cwd is outside the task workspace")
-            repository_root = workspace.repository_root.expanduser().resolve()
+            repository_root = workspace.repository_root.expanduser().absolute()
             storage_limits = getattr(
                 workspace, "storage_limits", WorkspaceStorageLimits()
             )
@@ -165,6 +174,8 @@ class ExecutionService:
                 correlation_id=correlation_id,
                 permission_profile=profile,
                 workspace_baseline=storage_baseline,
+                workspace_root_identity=root_identity,
+                workspace_cwd_identity=cwd_identity,
             )
             resolved_context = ResolvedExecutionContext(
                 request.task_id, request.workspace_id, workspace.state.value,
@@ -172,7 +183,7 @@ class ExecutionService:
                 profile.writable_roots, profile.filesystem.value,
                 profile.network, profile.resources, request.environment,
                 profile.environment_keys, request.argv, correlation_id, profile,
-                storage_baseline,
+                storage_baseline, root_identity, cwd_identity,
             )
         if self.backend_selector is not None:
             backend = await self.backend_selector.select_async(
@@ -330,8 +341,12 @@ class ExecutionService:
         # path performs.  Run the same check here so a worktree/.git swap is
         # refused before the long-lived child is launched.
         await self.workspace_manager.verify_execution_root(request.workspace_id)
-        root = workspace.worktree_path.expanduser().resolve()
-        cwd = request.cwd.expanduser().resolve()
+        root = workspace.worktree_path.expanduser().absolute()
+        cwd = request.cwd.expanduser().absolute()
+        root_info = os.stat(root, follow_symlinks=False)
+        cwd_info = os.stat(cwd, follow_symlinks=False)
+        root_identity = (int(root_info.st_dev), int(root_info.st_ino))
+        cwd_identity = (int(cwd_info.st_dev), int(cwd_info.st_ino))
         if cwd != root and root not in cwd.parents:
             raise PermissionError("managed process cwd is outside the task workspace")
         if not (root / ".git").is_file():
@@ -358,7 +373,7 @@ class ExecutionService:
         }
         resolved = ResolvedExecutionContext(
             request.task_id, request.workspace_id, workspace.state.value,
-            workspace.repository_root.expanduser().resolve(), root, cwd, (),
+            workspace.repository_root.expanduser().absolute(), root, cwd, (),
             "read-only", NetworkPolicy.NONE, request.budget, environment,
             frozenset(environment), request.argv, execution_id,
             PermissionProfile(
@@ -367,18 +382,44 @@ class ExecutionService:
                 environment_keys=frozenset(environment),
                 resources=request.budget,
             ).bind_workspace(root),
+            workspace_root_identity=root_identity,
+            workspace_cwd_identity=cwd_identity,
         )
         try:
             if self.managed_process_factory is not None:
                 handle = await self.managed_process_factory(resolved, temporary_home)
             else:
-                argv = self._managed_argv(resolved, backend, temporary_home)
-                process = await asyncio.create_subprocess_exec(
-                    *argv, cwd=str(cwd), env=environment,
-                    stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE, start_new_session=True,
-                    preexec_fn=resource_limit_preexec(request.budget),
+                directory_binding = open_execution_directory_binding(
+                    root,
+                    cwd,
+                    expected_root_identity=root_identity,
+                    expected_cwd_identity=cwd_identity,
                 )
+                try:
+                    argv = self._managed_argv(resolved, backend, temporary_home)
+                    process = await asyncio.create_subprocess_exec(
+                        *argv,
+                        # The child selects the validated cwd with fchdir;
+                        # no second string-path cwd lookup is performed.
+                        cwd=None,
+                        env=environment,
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                        start_new_session=True,
+                        pass_fds=directory_binding.pass_fds,
+                        preexec_fn=execution_binding_preexec(
+                            request.budget,
+                            root_path=directory_binding.root_path,
+                            root_identity=directory_binding.root_identity,
+                            root_fd=directory_binding.root_fd,
+                            cwd_path=directory_binding.cwd_path,
+                            cwd_identity=directory_binding.cwd_identity,
+                            cwd_fd=directory_binding.cwd_fd,
+                        ),
+                    )
+                finally:
+                    directory_binding.close()
                 watchdog = await self.process_supervisor.register_process(
                     execution_id,
                     process,
@@ -425,6 +466,7 @@ class ExecutionService:
                 ),
                 synthetic_home=temporary_home,
                 synthetic_tmp=temporary_home / "tmp",
+                preserve_workspace_path=context.workspace_root_identity is not None,
             )
             return (
                 "/usr/bin/sandbox-exec",

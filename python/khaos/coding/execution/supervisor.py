@@ -13,6 +13,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from khaos.coding.execution.binding import (
+    ExecutionDirectoryBinding,
+    open_execution_directory_binding,
+)
 from khaos.coding.execution.models import ExecutionRequest, ExecutionResult
 from khaos.coding.workspace.storage import (
     WorkspaceStorageAuthority,
@@ -55,6 +59,7 @@ class ProcessSupervisor:
         request: ExecutionRequest,
         *,
         cwd: Path | None = None,
+        execution_root: Path | None = None,
         env: dict[str, str] | None = None,
         enforce_resource_limits: bool = True,
         enforce_resource_watchdog: bool | None = None,
@@ -63,6 +68,7 @@ class ProcessSupervisor:
         workspace_root: Path | None = None,
         workspace_baseline: WorkspaceStorageSnapshot | None = None,
         workspace_limits: WorkspaceStorageLimits | None = None,
+        directory_binding: ExecutionDirectoryBinding | None = None,
     ) -> ExecutionResult:
         """Run one foreground process with bounded, fairly split output."""
         execution_id = request.correlation_id
@@ -84,19 +90,72 @@ class ProcessSupervisor:
                 request.permission_profile.resources.workspace_bytes,
                 request.permission_profile.resources.workspace_entries,
             )
-        started = time.monotonic()
-        process = await asyncio.create_subprocess_exec(
-            *request.argv,
-            cwd=str(cwd or request.cwd),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=True,
-            preexec_fn=(
-                resource_limit_preexec(request.permission_profile.resources)
-                if enforce_resource_limits else None
-            ),
-        )
+        if directory_binding is None and (
+            execution_root is not None
+            or request.workspace_root_identity is not None
+            or request.workspace_cwd_identity is not None
+        ):
+            directory_binding = open_execution_directory_binding(
+                execution_root or workspace_root or request.cwd,
+                cwd or request.cwd,
+                expected_root_identity=request.workspace_root_identity,
+                expected_cwd_identity=request.workspace_cwd_identity,
+            )
+        try:
+            started = time.monotonic()
+            process = await asyncio.create_subprocess_exec(
+                *request.argv,
+                # A validated directory FD is the authoritative cwd.  Passing
+                # a string here would give the kernel a second path lookup
+                # after the workspace was already checked.
+                cwd=(None if directory_binding is not None else str(cwd or request.cwd)),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
+                pass_fds=(
+                    directory_binding.pass_fds
+                    if directory_binding is not None and os.name == "posix"
+                    else ()
+                ),
+                preexec_fn=execution_binding_preexec(
+                    request.permission_profile.resources
+                    if enforce_resource_limits else None,
+                    root_path=(
+                        directory_binding.root_path
+                        if directory_binding is not None
+                        else execution_root or workspace_root
+                    ),
+                    root_identity=(
+                        directory_binding.root_identity
+                        if directory_binding is not None
+                        else request.workspace_root_identity
+                    ),
+                    root_fd=(
+                        directory_binding.root_fd
+                        if directory_binding is not None
+                        else None
+                    ),
+                    cwd_path=(
+                        directory_binding.cwd_path
+                        if directory_binding is not None
+                        else cwd or request.cwd
+                    ),
+                    cwd_identity=(
+                        directory_binding.cwd_identity
+                        if directory_binding is not None
+                        else request.workspace_cwd_identity
+                    ),
+                    cwd_fd=(
+                        directory_binding.cwd_fd
+                        if directory_binding is not None
+                        else None
+                    ),
+                ),
+            )
+        finally:
+            if directory_binding is not None:
+                directory_binding.close()
         active = _ActiveProcess(process)
         await self._register(execution_id, active)
         storage_roots = _storage_roots(
@@ -402,6 +461,72 @@ def resource_limit_preexec(budget):
             resource.setrlimit(resource_id, (effective, effective))
 
     return apply_limits
+
+
+def execution_binding_preexec(
+    budget=None,
+    *,
+    root_path: Path | None = None,
+    root_identity: tuple[int, int] | None = None,
+    root_fd: int | None = None,
+    cwd_path: Path | None = None,
+    cwd_identity: tuple[int, int] | None = None,
+    cwd_fd: int | None = None,
+):
+    """Build the last child-side identity check before subprocess exec.
+
+    ``WorkspaceManager.verify_execution_root`` runs asynchronously before a
+    backend constructs its command line.  The preferred path passes pinned
+    directory descriptors: the child verifies their identities and calls
+    ``fchdir`` so the final cwd selection performs no path lookup.  The path
+    arguments remain a compatibility fallback for trusted legacy callers.
+    """
+    resource_hook = resource_limit_preexec(budget) if budget is not None else None
+    if not any((root_identity, cwd_identity, root_fd, cwd_fd, resource_hook)):
+        return None
+
+    def verify_and_limit() -> None:
+        for label, path, descriptor, expected in (
+            ("workspace root", root_path, root_fd, root_identity),
+            ("execution cwd", cwd_path, cwd_fd, cwd_identity),
+        ):
+            if expected is None and descriptor is None:
+                continue
+            if descriptor is not None:
+                try:
+                    current = os.fstat(descriptor)
+                except OSError as exc:
+                    raise PermissionError(
+                        f"{label} descriptor is unavailable before subprocess exec"
+                    ) from exc
+                actual = (int(current.st_dev), int(current.st_ino))
+            else:
+                if path is None:
+                    raise PermissionError(f"{label} path is unavailable before subprocess exec")
+                try:
+                    current = os.stat(path, follow_symlinks=False)
+                except OSError as exc:
+                    raise PermissionError(
+                        f"{label} is unavailable before subprocess exec"
+                    ) from exc
+                actual = (int(current.st_dev), int(current.st_ino))
+            if expected is None:
+                expected = actual
+            if actual != tuple(expected):
+                raise PermissionError(
+                    f"{label} identity changed before subprocess exec"
+                )
+        if cwd_fd is not None:
+            try:
+                os.fchdir(cwd_fd)
+            except OSError as exc:
+                raise PermissionError(
+                    "execution cwd cannot be selected by directory descriptor"
+                ) from exc
+        if resource_hook is not None:
+            resource_hook()
+
+    return verify_and_limit
 
 
 def _resource_limit_diagnostics(budget) -> dict[str, object]:

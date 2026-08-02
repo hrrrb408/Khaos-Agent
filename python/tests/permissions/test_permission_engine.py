@@ -36,7 +36,10 @@ async def test_grant_rule_persists_and_matches(tmp_path):
     )
     await engine.load_rules()
 
-    decision = await engine.check("read_file", {"path": tmp_path / "a.txt"}, "read", "coding")
+    decision = await engine.check(
+        "read_file", {"path": tmp_path / "a.txt"}, "read", "coding",
+        source_transport="cli",
+    )
 
     assert decision.approved is ApprovalMode.AUTO_APPROVE
     assert not decision.requires_user_confirm

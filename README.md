@@ -22,22 +22,35 @@
 ## 快速开始
 
 ```bash
-# Docker
-export KHAOS_PYTHON_CAPABILITY="$(openssl rand -hex 32)"
-export KHAOS_BROWSER_HELPER_SECRET="$(openssl rand -hex 32)"
-docker compose up -d
+# Docker（本机开发：只绑定 127.0.0.1，不提供跨主机 HTTP）
+cp .env.example .env
+mkdir -p .secrets
+openssl rand -hex 32 > .secrets/python-capability
+openssl rand -hex 32 > .secrets/browser-helper-secret
+openssl rand -hex 32 > .secrets/gateway-api-key
+chmod 0400 .secrets/*
+docker compose -f compose.dev.yaml up --build --wait
+
+# 查看本机健康状态（健康端点匿名，但仍使用 API key 验证认证链路）
+curl -H "X-Khaos-Key: $(cat .secrets/gateway-api-key)" http://127.0.0.1:8080/api/health
+
+# 局域网/生产 smoke：这里生成短期自签名证书；真实生产请换成受信任证书
+bash scripts/generate-dev-cert.sh
+docker compose -f compose.prod.yaml up --build --wait
 
 # 本地
 pip install -e .
 khaos start
 ```
 
-普通启动采用 secure production behavior；只有显式 `KHAOS_DEV_MODE=1` 才允许开发
-fallback。Docker 中 Python 固定为 UID 10001 且没有 kernel capability；root helper
-是 netns/veth/nft/cgroup 的唯一 authority，并通过独立只读 socket volume 与 agent
-通信。Linux 原生部署先审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用
-`khaos-agent.service` 和 `khaos-browser-kernel-helper.service`。不支持的 Windows
-sandbox 路径明确拒绝执行，不回退 Host，也不报告 isolated。详细边界见
+`docker-compose.yml` 与 `compose.dev.yaml` 是等价的本机开发入口；默认只使用
+loopback、仍强制 API key、project root 和 Python capability。生产入口必须使用
+`compose.prod.yaml`，它绑定 `0.0.0.0:8443`、强制 TLS、API key、精确 Host allowlist
+和 Docker secret 文件；不要通过修改 Gateway 参数关闭这些检查。Docker 中 Python
+固定为 UID 10001 且没有 kernel capability；root helper 是 netns/veth/nft/cgroup
+的唯一 authority，并通过独立只读 socket volume 与 agent 通信。Linux 原生部署先
+审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用 systemd 服务。不支持的
+Windows sandbox 路径明确拒绝执行，不回退 Host，也不报告 isolated。详细边界见
 `docs/browser-threat-model.md` 和 `docs/platform-security-guarantees.md`。
 
 ## 开发

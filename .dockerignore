@@ -9,4 +9,9 @@ node_modules
 *.db
 data/
 *.egg-info
-target/
+**/target/
+.cache/
+web/
+assets/
+review/
+.zcode/

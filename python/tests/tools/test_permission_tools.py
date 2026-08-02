@@ -100,6 +100,7 @@ async def test_grant_permission():
     result = await permission_tools.grant_permission(
         "/var/tmp/*", "write", "ask-every", "office",
         principal_id="api:alice", permission_engine=engine,
+        source_transport="cli",
     )
 
     assert result["ok"] is True
@@ -108,6 +109,27 @@ async def test_grant_permission():
     assert result["rule"]["level"] == "write"
     assert result["rule"]["approval"] == "ask-every"
     assert result["rule"]["mode"] == "office"
+
+
+async def test_grant_auto_permission_requires_typed_resource():
+    engine = FakePermissionEngine()
+
+    legacy = await permission_tools.grant_permission(
+        "/var/tmp/*", "write", "auto-approve", "office",
+        principal_id="api:alice", permission_engine=engine,
+        source_transport="cli",
+    )
+    assert legacy["ok"] is False
+    assert "typed" in legacy["error"]
+
+    typed = await permission_tools.grant_permission(
+        "/var/tmp/*", "write", "auto-approve", "office",
+        principal_id="api:alice", permission_engine=engine,
+        source_transport="cli",
+        resource_type="filesystem",
+        resource_spec={"root": "/var/tmp", "recursive": True},
+    )
+    assert typed["ok"] is True
 
 
 async def test_revoke_permission():

@@ -48,9 +48,13 @@ func TestPythonClientSignsMethodPrincipalAndPayload(t *testing.T) {
 	if auth["payload_digest"] != payloadDigest {
 		t.Fatal("payload digest mismatch")
 	}
-	signed := fmt.Sprintf("%s\n%s\n%d\n%s\n%s", request["method"], auth["nonce"], int64(auth["issued_at"].(float64)), auth["principal_id"], payloadDigest)
+	protocolVersion := int(request["protocol_version"].(float64))
+	if protocolVersion != 2 {
+		t.Fatalf("protocol_version = %d, want 2", protocolVersion)
+	}
+	signed := fmt.Sprintf("%d\n%s\n%s\n%d\n%s\n%s", protocolVersion, request["method"], auth["nonce"], int64(auth["issued_at"].(float64)), auth["principal_id"], payloadDigest)
 	methodKey := hmac.New(sha256.New, []byte(client.Capability))
-	_, _ = methodKey.Write([]byte("khaos-rpc-method-v1\nTaskService.Approve"))
+	_, _ = methodKey.Write([]byte("khaos-rpc-method-v2\nTaskService.Approve"))
 	mac := hmac.New(sha256.New, methodKey.Sum(nil))
 	_, _ = mac.Write([]byte(signed))
 	if auth["mac"] != hex.EncodeToString(mac.Sum(nil)) {

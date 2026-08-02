@@ -585,6 +585,11 @@ class AgentLoop:
                                 "success": result.success,
                                 "output": result.output,
                                 "error": result.error,
+                                "effect_status": result.effect_status,
+                                "delivery_status": result.delivery_status,
+                                "warning": result.warning,
+                                "effect_id": result.effect_id,
+                                "retry_safe": result.retry_safe,
                             },
                             ensure_ascii=False,
                         )
@@ -602,6 +607,11 @@ class AgentLoop:
                                 "error": result.error,
                                 "duration_ms": result.duration_ms,
                                 "arguments": result.arguments or {},
+                                "effect_status": result.effect_status,
+                                "delivery_status": result.delivery_status,
+                                "warning": result.warning,
+                                "effect_id": result.effect_id,
+                                "retry_safe": result.retry_safe,
                             },
                             created_at=time.time(),
                         )
@@ -613,6 +623,10 @@ class AgentLoop:
                                 "tool_call_id": result.tool_call_id,
                                 "name": result.name,
                                 "success": result.success,
+                                "effect_status": result.effect_status,
+                                "delivery_status": result.delivery_status,
+                                "effect_id": result.effect_id,
+                                "retry_safe": result.retry_safe,
                             },
                         )
                         tool_msg.metadata.update({

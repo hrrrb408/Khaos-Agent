@@ -11,6 +11,12 @@ The supply-chain workflow regenerates the export from `uv.lock`, fails on any
 diff, and runs `pip-audit --require-hashes` against that exact export. This
 prevents CI from resolving a graph different from the graph being audited.
 
+The production Python image consumes the same authority directly: its
+hash-locked bootstrap installs `uv`, then `UV_PROJECT_ENVIRONMENT=/usr/local uv
+sync --frozen --no-dev --no-install-project` installs only the default runtime graph from
+`uv.lock`. The application source is placed on `PYTHONPATH`, so the image does
+not run a second floating or build-isolation project install.
+
 ## Audit tool pins
 
 The workflow pins its bootstrap tools rather than installing floating latest

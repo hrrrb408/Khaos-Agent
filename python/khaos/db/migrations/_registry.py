@@ -368,6 +368,31 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
         sha256="2e588da9aa02f4e15ce3ec71b07947c340796224f8b9f4116d2d677ac574b121",
         migrator_symbols=("_apply_v9_upgrades", "_ensure_audit_log_insert_guard"),
     ),
+    MigrationSpec(
+        version=10,
+        name="round16_permission_rule_scope_closure",
+        # Phase-1 Authority Scope Closure: persistent permission grants carry
+        # explicit transport/lifetime/session/task/workspace fields. The
+        # checksum is filled from the release-time manifest after this
+        # migrator is finalized.
+        sha256="e113a2177c9996412416aa28702eaea9f145ed8f75b590711b14104c36982d1b",
+        migrator_symbols=(
+            "_apply_v10_upgrades",
+            "_ensure_permissions_scope_columns",
+        ),
+    ),
+    MigrationSpec(
+        version=11,
+        name="round17_typed_permission_resource_rules",
+        # P1-4: relaxing permission rules carry a typed resource family and
+        # canonical JSON spec; ambiguous legacy globs are quarantined.
+        # Filled from the release-time manifest after the migrator is final.
+        sha256="571f42922d0b2044606c064a492d54e99b0c0efeea163135712d637280e72d22",
+        migrator_symbols=(
+            "_apply_v11_upgrades",
+            "_ensure_permission_resource_columns",
+        ),
+    ),
 )
 
 

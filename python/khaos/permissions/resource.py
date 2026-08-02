@@ -207,7 +207,13 @@ def resolve_process_control(
 def resolve_network_origin(
     tool_name: str, arguments: dict[str, Any], root: Path
 ) -> tuple[str, AuthorizationResourceKind]:
-    """Resolve the origin that a network-capable tool will contact."""
+    """Resolve the canonical network URL used by typed permission rules.
+
+    The previous target intentionally kept only the origin.  Typed network
+    rules need the path as well so a grant for ``/repos`` cannot silently
+    become a grant for every endpoint on the same host.  Query and fragment
+    are excluded because they are request data, not an authority boundary.
+    """
     parsed = urlsplit(str(arguments.get("url", "")))
     if not parsed.scheme or not parsed.hostname:
         raise PermissionError("network target is invalid")
@@ -215,7 +221,7 @@ def resolve_network_origin(
     port = f":{parsed.port}" if parsed.port is not None else ""
     authority = f"{host}{port}"
     return (
-        urlunsplit((parsed.scheme.lower(), authority, "", "", "")),
+        urlunsplit((parsed.scheme.lower(), authority, parsed.path or "/", "", "")),
         AuthorizationResourceKind.NETWORK_ORIGIN,
     )
 

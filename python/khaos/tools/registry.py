@@ -499,6 +499,10 @@ class ToolInvocationBroker:
             handler_params["principal_id"] = context.get("principal_id", "")
             handler_params["permission_engine"] = context.get("permission_engine")
             handler_params["audit_logger"] = context.get("audit_logger")
+            handler_params["source_transport"] = context.get("source_transport")
+            handler_params["session_id"] = context.get("session_id", "")
+            handler_params["task_id"] = context.get("task_id", "")
+            handler_params["workspace_id"] = context.get("workspace_id", "")
         # M4 batch 3.1.16A-4-4-2: the three history tools declare
         # ``history.read`` so the broker injects the caller's
         # ``principal_id`` + ``db`` from ``tool_context``.  The handler
@@ -1907,7 +1911,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
             name="list_permission_rules",
-            description="List all permission rules (patterns, approval modes, scopes).",
+            description="List all permission rules (typed resources, approval modes, scopes).",
             parameters={"type": "object", "properties": {}},
             modes=["office"],
             permission_level="read",
@@ -1918,13 +1922,22 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
     registry.register(
         ToolDefinition(
             name="grant_permission",
-            description="Grant a permission rule to auto-approve or deny a tool pattern.",
+            description="Grant a typed resource permission; generic patterns are restricted to deny/ask rules.",
             parameters={
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern (e.g. /home/user/**)",
+                        "description": "Legacy glob for deny/ask rules or display text for typed rules",
+                    },
+                    "resource_type": {
+                        "type": "string",
+                        "enum": ["filesystem", "exec", "network", "process", "workspace"],
+                        "description": "Typed resource family for auto-approve/suggest",
+                    },
+                    "resource_spec": {
+                        "type": "object",
+                        "description": "Canonical typed resource selector",
                     },
                     "permission_level": {
                         "type": "string",

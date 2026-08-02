@@ -1,11 +1,19 @@
 import asyncio
 import time
 
+import pytest
+
 from khaos.agent.approval import ApprovalBroker
 from khaos.db import Database
 from khaos.permissions import ApprovalMode, PermissionEngine
 from khaos.tools.registry import ToolDefinition, ToolRegistry
-from khaos.tools.scheduler import PermissionRequest, ToolBudget, ToolScheduler
+from khaos.tools.scheduler import (
+    EFFECT_APPLIED,
+    EFFECT_UNKNOWN,
+    PermissionRequest,
+    ToolBudget,
+    ToolScheduler,
+)
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.sandbox import Sandbox, SandboxMode
 
@@ -81,6 +89,7 @@ def _approval_context() -> dict:
     return {
         "approval_broker": ApprovalBroker(),
         "principal_id": "test-principal",
+        "source_transport": "cli",
         "task_id": "test-task",
         "workspace_id": "test-workspace",
         "turn_id": "test-turn",
@@ -206,6 +215,84 @@ async def test_scheduler_confirm_with_remember_creates_rule(tmp_path):
 
     assert results[0].success
     assert rules[0]["approval"] == "auto-approve"
+    assert rules[0]["transport_class"] == "interactive"
+    assert rules[0]["grant_lifetime"] == "project_interactive"
+    await db.close()
+
+
+@pytest.mark.parametrize(
+    "adapter_result",
+    [
+        None,
+        "approved",
+        1,
+        [],
+        {"approved": "yes"},
+        {"approved": True, "remember": "yes"},
+        {"approved": True, "unexpected": False},
+        {"approved": True, "pattern": "bad\npattern"},
+    ],
+)
+async def test_scheduler_malformed_confirmation_denies_fail_closed(adapter_result):
+    scheduler = ToolScheduler(_registry(), object())
+    request = PermissionRequest(
+        tool_call_id="call-1",
+        name="write",
+        arguments={"value": "safe"},
+        level="write",
+        target="write:safe",
+        reason="ask-every",
+        expires_at=time.time() + 1,
+    )
+
+    result = await scheduler._confirm(
+        request, lambda _request: adapter_result,
+    )
+
+    assert result["approved"] is False
+    assert result["remember"] is False
+    assert result["reason"] == "invalid_confirmation_response"
+
+
+async def test_scheduler_boolean_confirmation_is_normalized():
+    scheduler = ToolScheduler(_registry(), object())
+    request = PermissionRequest(
+        tool_call_id="call-1",
+        name="write",
+        arguments={"value": "safe"},
+        level="write",
+        target="write:safe",
+        reason="ask-every",
+        expires_at=time.time() + 1,
+    )
+
+    assert await scheduler._confirm(request, lambda _request: True) == {
+        "approved": True,
+    }
+
+
+async def test_scheduler_ignores_remember_for_unattended_transport(tmp_path):
+    db = Database(tmp_path / "unattended-remember.db")
+    await db.connect()
+    await db.run_migrations()
+    await db.create_session("test-session", mode="coding")
+    engine = PermissionEngine(db)
+    scheduler = ToolScheduler(_registry(), engine)
+    context = _approval_context()
+    context["source_transport"] = "webhook"
+
+    results = await scheduler.execute_batch(
+        [{"id": "1", "name": "write", "arguments": {"value": "b"}}],
+        mode="coding",
+        session_id="test-session",
+        confirm_callback=lambda request: {"approved": True, "remember": True},
+        tool_context=context,
+    )
+    rules = await db.list_permission_rules()
+
+    assert results[0].success
+    assert rules == []
+    assert "remember request ignored" in results[0].warning
     await db.close()
 
 
@@ -647,4 +734,187 @@ async def test_dispatch_allows_when_arguments_match_approval(tmp_path):
         reservation=reservation,
     )
     assert result.success
+    await db.close()
+
+
+def _effect_registry(handler, *, name="effect", permission_level="write"):
+    registry = ToolRegistry()
+    registry.register(
+        ToolDefinition(
+            name=name,
+            description=name,
+            parameters={
+                "type": "object",
+                "properties": {"value": {"type": "string"}},
+                "required": ["value"],
+            },
+            modes=["coding"],
+            permission_level=permission_level,
+            parallel=False,
+            handler=handler,
+        )
+    )
+    return registry
+
+
+async def test_scheduler_reports_applied_effect_when_audit_fails(tmp_path, monkeypatch):
+    target = tmp_path / "written.txt"
+
+    async def write(value: str) -> dict:
+        target.write_text(value, encoding="utf-8")
+        return {"path": str(target), "written": True}
+
+    db = Database(tmp_path / "audit-fault.db")
+    await db.connect()
+    await db.run_migrations()
+    engine = PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE)
+
+    async def fail_audit(*_args, **_kwargs):
+        raise RuntimeError("audit locked")
+
+    monkeypatch.setattr(engine, "audit", fail_audit)
+    scheduler = ToolScheduler(_effect_registry(write), engine)
+
+    result = (
+        await scheduler.execute_batch(
+            [{"id": "write-1", "name": "effect", "arguments": {"value": "ok"}}],
+            mode="coding",
+        )
+    )[0]
+
+    assert target.read_text(encoding="utf-8") == "ok"
+    assert result.success is True
+    assert result.effect_status == EFFECT_APPLIED
+    assert result.delivery_status == "audit_degraded"
+    assert result.retry_safe is False
+    assert result.effect_id
+    assert "audit persistence failed" in result.warning
+    await db.close()
+
+
+async def test_scheduler_does_not_redeliver_unprojected_mutation(tmp_path, monkeypatch):
+    calls = 0
+
+    async def write(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return value
+
+    db = Database(tmp_path / "projection-fault.db")
+    await db.connect()
+    await db.run_migrations()
+    middleware = SecurityMiddleware()
+
+    async def fail_post_check(*_args, **_kwargs):
+        raise RuntimeError("secret scanner unavailable")
+
+    monkeypatch.setattr(middleware, "post_check", fail_post_check)
+    scheduler = ToolScheduler(
+        _effect_registry(write),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+        security_middleware=middleware,
+    )
+
+    result = (
+        await scheduler.execute_batch(
+            [{"id": "write-1", "name": "effect", "arguments": {"value": "ok"}}],
+            mode="coding",
+        )
+    )[0]
+
+    assert calls == 1
+    assert result.success is True
+    assert result.output == ""
+    assert result.effect_status == EFFECT_APPLIED
+    assert result.retry_safe is False
+    assert result.delivery_status == "degraded"
+    assert "result delivery failed" in result.warning
+    await db.close()
+
+
+async def test_scheduler_isolates_parallel_error_audit_failure(tmp_path, monkeypatch):
+    db = Database(tmp_path / "parallel-audit-fault.db")
+    await db.connect()
+    await db.run_migrations()
+    engine = PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE)
+
+    async def fail_audit(*_args, **_kwargs):
+        raise RuntimeError("audit unavailable")
+
+    monkeypatch.setattr(engine, "audit", fail_audit)
+    scheduler = ToolScheduler(_registry(), engine)
+
+    results = await scheduler.execute_batch(
+        [
+            {"id": "error", "name": "fail", "arguments": {}},
+            {"id": "read", "name": "read", "arguments": {"value": "ok"}},
+        ],
+        mode="coding",
+    )
+
+    by_id = {result.tool_call_id: result for result in results}
+    assert by_id["error"].success is False
+    assert by_id["error"].effect_status == EFFECT_UNKNOWN
+    assert by_id["error"].retry_safe is False
+    assert by_id["read"].success is True
+    await db.close()
+
+
+async def test_scheduler_replays_explicit_idempotency_key_without_reinvoking_handler(
+    tmp_path,
+):
+    calls = 0
+
+    async def write(value: str) -> str:
+        nonlocal calls
+        calls += 1
+        return value
+
+    db = Database(tmp_path / "idempotency.db")
+    await db.connect()
+    await db.run_migrations()
+    scheduler = ToolScheduler(
+        _effect_registry(write),
+        PermissionEngine(db, default_mode=ApprovalMode.AUTO_APPROVE),
+    )
+    context = {
+        "principal_id": "principal",
+        "project_id": "project",
+        "task_id": "task",
+        "workspace_id": "workspace",
+    }
+
+    first = (
+        await scheduler.execute_batch(
+            [
+                {
+                    "id": "call-1",
+                    "name": "effect",
+                    "arguments": {"value": "once"},
+                    "idempotency_key": "effect-key-1",
+                }
+            ],
+            mode="coding",
+            tool_context=context,
+        )
+    )[0]
+    second = (
+        await scheduler.execute_batch(
+            [
+                {
+                    "id": "call-2",
+                    "name": "effect",
+                    "arguments": {"value": "once"},
+                    "idempotency_key": "effect-key-1",
+                }
+            ],
+            mode="coding",
+            tool_context=context,
+        )
+    )[0]
+
+    assert calls == 1
+    assert first.success and second.success
+    assert first.effect_id == second.effect_id
+    assert second.tool_call_id == "call-2"
     await db.close()

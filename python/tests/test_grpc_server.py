@@ -21,6 +21,7 @@ from khaos.grpc_server import (
     GatewayRPCAuthenticator,
     _load_rpc_capability,
     _parse_json_line,
+    _rpc_binding_claim_error,
     load_router_from_config,
     MemoryService,
     serve_json_lines,
@@ -1056,7 +1057,13 @@ async def test_json_line_server_authenticates_real_peer_credentials(tmp_path):
             socket_parent.rmdir()
 
 
-def _signed_rpc_request(method: str, payload: dict, *, nonce: str = "n" * 32):
+def _signed_rpc_request(
+    method: str,
+    payload: dict,
+    *,
+    nonce: str = "n" * 32,
+    protocol_version: int = 1,
+):
     capability = "c" * 48
     issued_at = int(time.time())
     canonical = json.dumps(
@@ -1064,13 +1071,20 @@ def _signed_rpc_request(method: str, payload: dict, *, nonce: str = "n" * 32):
     ).encode("utf-8")
     digest = hashlib.sha256(canonical).hexdigest()
     principal = str(payload.get("principal_id") or "gateway")
-    signed = f"{method}\n{nonce}\n{issued_at}\n{principal}\n{digest}".encode()
+    if protocol_version == 2:
+        signed = (
+            f"{protocol_version}\n{method}\n{nonce}\n{issued_at}\n"
+            f"{principal}\n{digest}"
+        ).encode()
+    else:
+        signed = f"{method}\n{nonce}\n{issued_at}\n{principal}\n{digest}".encode()
     method_key = hmac.new(
         capability.encode(),
-        f"khaos-rpc-method-v1\n{method}".encode(),
+        f"khaos-rpc-method-v{protocol_version}\n{method}".encode(),
         hashlib.sha256,
     ).digest()
     return {
+        "protocol_version": protocol_version,
         "method": method, "payload": payload,
         "auth": {
             "nonce": nonce, "issued_at": issued_at,
@@ -1104,6 +1118,49 @@ def test_rpc_capability_is_method_payload_principal_and_nonce_bound():
     wrong_method["method"] = "MemoryService.SetMemory"
     with pytest.raises(PermissionError, match="method capability"):
         authenticator.authenticate(wrong_method)
+
+
+def test_production_rpc_rejects_legacy_protocol_and_accepts_bound_v2(monkeypatch):
+    monkeypatch.setenv("KHAOS_DEV_MODE", "0")
+    authenticator = GatewayRPCAuthenticator("c" * 48)
+
+    legacy = _signed_rpc_request(
+        "TaskService.List", {}, nonce="l" * 32, protocol_version=1
+    )
+    with pytest.raises(PermissionError, match="protocol version 2"):
+        authenticator.authenticate(legacy)
+
+    current = _signed_rpc_request(
+        "TaskService.List", {}, nonce="v" * 32, protocol_version=2
+    )
+    assert authenticator.authenticate(current) == "gateway"
+
+
+def test_production_rpc_claims_are_required_and_scope_bound():
+    kwargs = {
+        "bound_project_id": "project-a",
+        "bound_policy_digest": "policy-a",
+        "require_claims": True,
+    }
+    assert _rpc_binding_claim_error({}, **kwargs) == (
+        "rpc_claim_missing",
+        "project_id claim is required for production RPC v2",
+    )
+    assert _rpc_binding_claim_error(
+        {"project_id": "project-a"}, **kwargs
+    ) == (
+        "rpc_claim_missing",
+        "policy_digest claim is required for production RPC v2",
+    )
+    assert _rpc_binding_claim_error(
+        {"project_id": "project-b", "policy_digest": "policy-a"}, **kwargs
+    )[0] == "project_drift"
+    assert _rpc_binding_claim_error(
+        {"project_id": "project-a", "policy_digest": "policy-b"}, **kwargs
+    )[0] == "policy_drift"
+    assert _rpc_binding_claim_error(
+        {"project_id": "project-a", "policy_digest": "policy-a"}, **kwargs
+    ) is None
 
 
 def test_rpc_authentication_binds_first_valid_gateway_pid():
