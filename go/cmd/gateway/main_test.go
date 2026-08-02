@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -56,8 +57,10 @@ func TestReadProtectedTokenContainerSecretAllowsReadOnlyGroupMode(t *testing.T) 
 	if err := os.WriteFile(path, []byte("01234567890123456789012345678901\n"), 0o440); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := readProtectedToken(path, false); err == nil {
-		t.Fatal("host token unexpectedly accepted group-readable permissions")
+	if runtime.GOOS != "windows" {
+		if _, err := readProtectedToken(path, false); err == nil {
+			t.Fatal("host token unexpectedly accepted group-readable permissions")
+		}
 	}
 	key, err := readProtectedToken(path, true)
 	if err != nil {
