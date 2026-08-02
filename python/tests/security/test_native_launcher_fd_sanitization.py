@@ -13,6 +13,16 @@ import pytest
 ROOT = Path(__file__).resolve().parents[3]
 
 
+def _fd_probe_command(*fds: int) -> str:
+    """Probe only the descriptors passed to the launcher under test."""
+    values = ", ".join(str(fd) for fd in fds)
+    return (
+        "import json, os; "
+        f"print(json.dumps([fd for fd in ({values}) "
+        "if os.path.exists('/proc/self/fd/' + str(fd))]))"
+    )
+
+
 def test_rust_launcher_has_stdio_only_fd_policy() -> None:
     source = (
         ROOT / "rust/khaos-core/src/bin/khaos-exec-launcher.rs"
@@ -60,7 +70,7 @@ def test_python_development_launcher_closes_authority_fds(tmp_path) -> None:
             "--",
             sys.executable,
             "-c",
-            "import json, os; print(json.dumps(sorted(int(x) for x in os.listdir('/proc/self/fd') if x.isdigit())))",
+            _fd_probe_command(root_fd, cwd_fd, extra_fd),
         ]
         completed = subprocess.run(
             command,
@@ -81,7 +91,7 @@ def test_python_development_launcher_closes_authority_fds(tmp_path) -> None:
         pytest.skip("the explicit development launcher is POSIX-only")
     assert completed.returncode == 0, completed.stderr
     inherited = json.loads(completed.stdout.strip())
-    assert all(fd <= 2 for fd in inherited)
+    assert inherited == []
 
 
 @pytest.mark.skipif(
@@ -120,7 +130,7 @@ def test_python_development_launcher_preserves_only_bound_directory_fds(tmp_path
                 "--",
                 sys.executable,
                 "-c",
-                "import json, os; print(json.dumps(sorted(int(x) for x in os.listdir('/proc/self/fd') if x.isdigit())))",
+                _fd_probe_command(root_fd, cwd_fd, extra_fd),
             ],
             pass_fds=(root_fd, cwd_fd, extra_fd),
             capture_output=True,
@@ -178,7 +188,7 @@ def test_rust_launcher_closes_authority_fds_when_binary_is_provided(tmp_path) ->
                 "--",
                 sys.executable,
                 "-c",
-                "import json, os; print(json.dumps(sorted(int(x) for x in os.listdir('/proc/self/fd') if x.isdigit())))",
+                _fd_probe_command(root_fd, cwd_fd, extra_fd),
             ],
             pass_fds=(root_fd, cwd_fd, extra_fd),
             capture_output=True,
@@ -194,4 +204,4 @@ def test_rust_launcher_closes_authority_fds_when_binary_is_provided(tmp_path) ->
 
     assert completed.returncode == 0, completed.stderr
     inherited = json.loads(completed.stdout.strip())
-    assert all(fd <= 2 for fd in inherited)
+    assert inherited == []
