@@ -60,11 +60,24 @@ run_profile() {
         --project-directory "$repo_root" \
         --file "$repo_root/$compose_file" \
         config --quiet
-    docker compose \
+    if ! docker compose \
         --project-name "$project_name" \
         --project-directory "$repo_root" \
         --file "$repo_root/$compose_file" \
-        up --build --wait
+        up --build --wait; then
+        printf '%s\n' "Compose profile $compose_file failed; collecting service diagnostics"
+        docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            ps || true
+        docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            logs --no-color --tail=200 khaos-gateway khaos-agent || true
+        return 1
+    fi
 
     curl "${curl_options[@]}" "$health_url"
 
