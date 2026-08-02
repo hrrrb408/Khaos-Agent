@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import stat as _stat
+import time
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -41,7 +42,6 @@ from typing import Any
 
 from khaos.audit.anchor import AuditAnchorError, AuditChainAnchor, anchor_filename
 from khaos.time_utils import utc_now_naive
-
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +62,11 @@ RESULT_EXPIRED = "expired"
 # is allowed to set ``audit.log_path``; the effective policy compiler drops
 # the project layer's ``audit_log_path`` entirely.
 AUDIT_LOG_TRUSTED_DIR = Path.home() / ".khaos" / "audit"
+# The SQLite hash chain remains the authoritative ordered record.  The file
+# trail is segmented before it becomes an operationally dangerous append-only
+# blob; segments are retained in the same trusted directory for export/archive
+# and are never deleted by the logger.
+AUDIT_FILE_SEGMENT_BYTES = 64 * 1024 * 1024
 
 
 def resolve_safe_audit_log_path(
@@ -136,7 +141,7 @@ class AuditEntry:
     source_transport: str | None = None
 
     @classmethod
-    def from_row(cls, row: dict[str, Any]) -> "AuditEntry":
+    def from_row(cls, row: dict[str, Any]) -> AuditEntry:
         return cls(
             id=int(row["id"]) if row.get("id") is not None else None,
             action=str(row.get("action", "")),
@@ -229,6 +234,8 @@ class AuditLogger:
         # H3: long-lived fd opened at construction; None when file audit
         # is disabled or the path failed safety validation.
         self._fd: int | None = None
+        self._audit_dir_fd: int | None = None
+        self._log_filename: str | None = None
         if log_path is not None:
             self._open_log_fd(log_path)
         self._anchor: AuditChainAnchor | None = None
@@ -244,7 +251,7 @@ class AuditLogger:
                 # An enabled production anchor must not silently downgrade to
                 # SQLite-only evidence.  Construction fails closed so the
                 # caller can refuse to start the runtime.
-                logger.error("failed to open audit chain anchor", exc_info=True)
+                logger.exception("failed to open audit chain anchor")
                 raise
 
     def _open_log_fd(self, log_path: str | os.PathLike[str]) -> None:
@@ -343,48 +350,19 @@ class AuditLogger:
 
             # 4. Open the log file relative to the audit dirfd.
             try:
-                fd = os.open(
-                    filename,
-                    os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
-                    0o600,
-                    dir_fd=audit_fd,
-                )
+                fd = self._open_regular_log_fd(audit_fd, filename)
             except OSError:
                 logger.warning(
                     "failed to open audit log file %s; db-only audit",
                     filename, exc_info=True,
                 )
                 return
-            try:
-                st = os.fstat(fd)
-                if not _stat.S_ISREG(st.st_mode):
-                    logger.warning(
-                        "audit log file %s is not a regular file; db-only audit",
-                        filename,
-                    )
-                    os.close(fd)
-                    return
-                if st.st_uid != os.getuid():
-                    logger.warning(
-                        "audit log file %s not owned by current UID; db-only audit",
-                        filename,
-                    )
-                    os.close(fd)
-                    return
-                if st.st_mode & 0o077:
-                    logger.warning(
-                        "audit log file %s has unsafe mode %o; db-only audit",
-                        filename, _stat.S_IMODE(st.st_mode),
-                    )
-                    os.close(fd)
-                    return
-            except OSError:
-                os.close(fd)
-                return
             # Success — hold the fd for the logger's lifetime.  Reconstruct
             # ``log_path`` as the audit dir + filename for logging / display
             # (the original input may have been an absolute path).
             self._fd = fd
+            self._audit_dir_fd = audit_fd
+            self._log_filename = filename
             self.log_path = AUDIT_LOG_TRUSTED_DIR.expanduser() / filename
             logger.info("audit log file opened (fd=%d): %s", fd, self.log_path)
         finally:
@@ -392,6 +370,8 @@ class AuditLogger:
             # (``self._fd``) is NOT closed here — it is held for the
             # logger's lifetime and closed in ``close()``.
             for dfd in reversed(dirfds):
+                if dfd == self._audit_dir_fd:
+                    continue
                 try:
                     os.close(dfd)
                 except OSError:
@@ -487,6 +467,30 @@ class AuditLogger:
                 return None
         return fd
 
+    def _open_regular_log_fd(self, directory_fd: int, filename: str) -> int:
+        """Open one trusted JSONL segment and validate its inode."""
+        fd = os.open(
+            filename,
+            os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            st = os.fstat(fd)
+            if not _stat.S_ISREG(st.st_mode):
+                raise OSError("audit log segment is not a regular file")
+            if st.st_uid != os.getuid():
+                raise OSError("audit log segment is not owned by current UID")
+            if st.st_mode & 0o077:
+                raise OSError("audit log segment has unsafe permissions")
+            return fd
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+
     def close(self) -> None:
         """Close the held audit log fd (idempotent)."""
         if self._fd is not None:
@@ -495,6 +499,12 @@ class AuditLogger:
             except OSError:
                 pass
             self._fd = None
+        if self._audit_dir_fd is not None:
+            try:
+                os.close(self._audit_dir_fd)
+            except OSError:
+                pass
+            self._audit_dir_fd = None
         if self._anchor is not None:
             self._anchor.close()
 
@@ -542,10 +552,9 @@ class AuditLogger:
                 # edited after startup cannot advance the trusted head.
                 await self._anchor.verify(self.db)
             except AuditAnchorError:
-                logger.error(
+                logger.exception(
                     "audit chain anchor verification failed; refusing to "
-                    "record a trusted audit event",
-                    exc_info=True,
+                    "record a trusted audit event"
                 )
                 return -1
         # M1: append a copy to the configured file path (best-effort).
@@ -588,10 +597,9 @@ class AuditLogger:
                 try:
                     await self._anchor.observe(self.db)
                 except AuditAnchorError:
-                    logger.error(
+                    logger.exception(
                         "audit chain anchor update failed after row %s",
-                        row_id,
-                        exc_info=True,
+                        row_id
                     )
                     return -1
             return row_id
@@ -651,13 +659,81 @@ class AuditLogger:
             record["authority_generation"] = authority_generation
         if source_transport is not None:
             record["source_transport"] = source_transport
-        line = json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n"
+        line = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode(
+            "utf-8"
+        )
         try:
-            os.write(self._fd, line.encode("utf-8"))
+            self._rotate_file_if_needed(len(line))
+            view = memoryview(line)
+            while view:
+                written = os.write(self._fd, view)
+                if written <= 0:
+                    raise OSError("audit log write made no progress")
+                view = view[written:]
         except OSError:
             logger.debug(
                 "audit log fd write failed (fd=%s)", self._fd, exc_info=True
             )
+
+    def _rotate_file_if_needed(self, incoming_bytes: int) -> None:
+        """Rotate the secondary trail under the already-pinned directory fd."""
+        if (
+            self._fd is None
+            or self._audit_dir_fd is None
+            or self._log_filename is None
+            or AUDIT_FILE_SEGMENT_BYTES <= 0
+        ):
+            return
+        current = os.fstat(self._fd)
+        if current.st_size == 0 or current.st_size + incoming_bytes <= AUDIT_FILE_SEGMENT_BYTES:
+            return
+        segment_name = self._next_segment_name()
+        os.fsync(self._fd)
+        os.close(self._fd)
+        self._fd = None
+        try:
+            os.rename(
+                self._log_filename,
+                segment_name,
+                src_dir_fd=self._audit_dir_fd,
+                dst_dir_fd=self._audit_dir_fd,
+            )
+            # Persist the directory entry update before accepting new rows;
+            # otherwise a power loss could lose the segment rename even
+            # though the old file contents were already fsynced.
+            os.fsync(self._audit_dir_fd)
+            self._fd = self._open_regular_log_fd(
+                self._audit_dir_fd, self._log_filename
+            )
+            logger.info("rotated audit log segment to %s", segment_name)
+        except Exception:
+            # Reopen the base file if rotation failed.  The DB audit row still
+            # remains authoritative; file append is deliberately best-effort.
+            try:
+                self._fd = self._open_regular_log_fd(
+                    self._audit_dir_fd, self._log_filename
+                )
+            except OSError:
+                self._fd = None
+            raise
+
+    def _next_segment_name(self) -> str:
+        """Return a collision-resistant basename inside the trusted directory."""
+        if self._log_filename is None:
+            raise OSError("audit log filename is unavailable")
+        stem = f"{self._log_filename}.segment-{os.getpid()}-{time.time_ns()}"
+        candidate = stem
+        counter = 0
+        while self._audit_dir_fd is not None:
+            try:
+                os.stat(candidate, dir_fd=self._audit_dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                return candidate
+            except OSError:
+                raise
+            counter += 1
+            candidate = f"{stem}-{counter}"
+        raise OSError("audit directory fd is unavailable")
 
     async def log_permission(
         self,

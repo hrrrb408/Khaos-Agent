@@ -6,8 +6,8 @@ import asyncio
 import json
 import logging
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Optional
 
 from khaos.exceptions import ServiceShutdownError, SubAgentLimitError, ToolNotFoundError
 
@@ -46,8 +46,8 @@ class SubAgentTask:
     tools: list[str]
     timeout: int = 300
     status: str = "pending"
-    result: Optional[str] = None
-    error: Optional[str] = None
+    result: str | None = None
+    error: str | None = None
     parent_session_id: str = "root"
     depth: int = 1
     # B1: the principal that owns this task.  Set by the service from
@@ -351,12 +351,12 @@ class SubAgentSpawner:
         if aborted:
             try:
                 await self._persist_terminal(task)
-            except Exception:  # noqa: BLE001 — reconcile will retry
-                logger.error(
+            except Exception:
+                logger.exception(
                     "spawn: could not persist cancelled terminal state for "
                     "task %s (DB work raced with shutdown); will retry on "
                     "next shutdown reconcile",
-                    task.id, exc_info=True,
+                    task.id,
                 )
         return task
 
@@ -564,11 +564,11 @@ class SubAgentSpawner:
             subtask.error = "cancelled"
             try:
                 await self._persist_terminal(subtask)
-            except Exception:  # noqa: BLE001 — reconcile will retry
-                logger.error(
+            except Exception:
+                logger.exception(
                     "cancel: could not persist terminal state for task %s; "
                     "will retry on next shutdown reconcile",
-                    task_id, exc_info=True,
+                    task_id
                 )
 
     async def shutdown(self, *, timeout: float = 30.0) -> None:
@@ -676,9 +676,12 @@ class SubAgentSpawner:
         # tests where spawn's owner registration didn't run).
         for tid in snapshot_ids:
             subtask = self._tasks.get(tid)
-            if subtask is not None and subtask.status == "initializing":
-                if tid not in snapshot_init_owners:
-                    done_ids.add(tid)
+            if (
+                subtask is not None
+                and subtask.status == "initializing"
+                and tid not in snapshot_init_owners
+            ):
+                done_ids.add(tid)
         # H2 (round-5): a previous shutdown's reconcile may have flipped
         # a task's memory status to terminal but failed the DB write
         # (it's in ``_pending_persistence``).  Such tasks are NOT in the
@@ -826,7 +829,7 @@ class SubAgentSpawner:
                         sorted(tids), exc, exc_info=exc,
                     )
             reconcile_task.add_done_callback(_read_owner_exception)
-            done_reconcile, pending_reconcile = await asyncio.wait(
+            _done_reconcile, pending_reconcile = await asyncio.wait(
                 {reconcile_task}, timeout=remaining,
             )
             if pending_reconcile:
@@ -927,19 +930,18 @@ class SubAgentSpawner:
                 subtask.error = "cancelled"
             try:
                 await self._persist_terminal(subtask)
-            except Exception:  # noqa: BLE001 — surface as shutdown failure
+            except Exception:
                 # M2 (round-4): do NOT swallow.  Silently logging would let
                 # shutdown close the DB while a row is still ``running``,
                 # which is exactly the durability gap this reconcile pass
                 # exists to close.  Record the failure and raise after the
                 # loop so the caller observes it.  _pending_persistence
                 # retains the task for the next shutdown's retry.
-                logger.error(
+                logger.exception(
                     "subagent shutdown: could not persist terminal state "
                     "for task %s — durability gap, refusing to continue "
                     "teardown",
-                    task_id,
-                    exc_info=True,
+                    task_id
                 )
                 failures.append(task_id)
         if failures:
@@ -999,9 +1001,9 @@ class SubAgentSpawner:
             except BaseException:
                 # Cancellation may propagate through the DB write;
                 # _pending_persistence is already set so reconcile retries.
-                logger.error(
+                logger.exception(
                     "subagent task %s cancelled but could not persist terminal state",
-                    task.id, exc_info=True,
+                    task.id
                 )
             raise
         except Exception as exc:
@@ -1016,11 +1018,11 @@ class SubAgentSpawner:
         # retried.
         try:
             await self._persist_terminal(task)
-        except Exception:  # noqa: BLE001 — reconcile will retry
-            logger.error(
+        except Exception:
+            logger.exception(
                 "subagent task %s terminal state could not be persisted; "
                 "will retry on next shutdown reconcile",
-                task.id, exc_info=True,
+                task.id
             )
 
     async def _default_runner(self, task: SubAgentTask) -> str:

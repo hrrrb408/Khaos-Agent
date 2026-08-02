@@ -28,7 +28,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from khaos.coding.planning.approval.models import (
     AuthorizationStatus,
@@ -39,7 +39,10 @@ from khaos.coding.planning.approval.models import (
     generate_nonce,
     hash_nonce,
 )
-from khaos.coding.planning.approval.repository import PersistedPlanRepository, PlanRepository, PlanSnapshotStore
+from khaos.coding.planning.approval.repository import (
+    PersistedPlanRepository,
+    PlanRepository,
+)
 from khaos.coding.planning.approval.store import (
     PlanApprovalStore,
     new_authorization_id,
@@ -47,14 +50,17 @@ from khaos.coding.planning.approval.store import (
 )
 from khaos.coding.planning.approval.validator import (
     PlanLiveValidator,
+)
+from khaos.coding.planning.approval.validator import (
     PlanNotRequestableError as _ValidatorNotRequestable,
+)
+from khaos.coding.planning.approval.validator import (
     PlanStaleError as _ValidatorStale,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from khaos.coding.planning.approval.models import Clock
+    from khaos.coding.planning.approval.models import WorkspaceExecutionLease
     from khaos.coding.planning.approval.service import ContextProvider
-    from khaos.coding.planning.contracts import ImplementationPlan
 
 logger = logging.getLogger(__name__)
 
@@ -106,7 +112,7 @@ class PlanExecutionGate:
     def __init__(
         self,
         store: PlanApprovalStore,
-        context_provider: "ContextProvider",
+        context_provider: ContextProvider,
         *,
         runtime_capability: Any = None,
         lease_authority: object | None = None,
@@ -234,7 +240,7 @@ class PlanExecutionGate:
 
         # Validate the plan live (HEAD/generation/task/workspace/file/symbol).
         try:
-            ctx = self._validator.validate_plan(
+            self._validator.validate_plan(
                 plan, approved_verification_plan_digest=avp_digest,
             )
         except _ValidatorStale as exc:
@@ -419,7 +425,7 @@ class PlanExecutionGate:
         expected_repository_id: str,
         owner_execution_id: str,
         _lease_authority: object | None = None,
-    ) -> tuple[PlanExecutionAuthorization, "WorkspaceExecutionLease"]:
+    ) -> tuple[PlanExecutionAuthorization, WorkspaceExecutionLease]:
         """Lease-first atomic consume: the ONLY public execution entry point.
 
         Batch 2.3 §1: ONE ``BEGIN IMMEDIATE`` (via

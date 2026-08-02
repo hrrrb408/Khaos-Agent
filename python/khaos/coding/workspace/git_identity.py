@@ -8,7 +8,6 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-
 _MAX_GIT_POINTER_BYTES = 4096
 
 

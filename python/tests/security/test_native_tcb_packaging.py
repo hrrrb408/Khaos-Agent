@@ -27,7 +27,9 @@ def test_python_container_is_non_root_and_contains_no_kernel_cli() -> None:
     assert "USER 10001:10001" in python_stage
     assert "khaos-sandbox-launcher" in python_stage
     assert "HOME=/var/lib/khaos" in python_stage
-    assert 'CMD ["python", "-m", "khaos.cli", "start", "--socket", "/run/khaos/agent.sock", "--gateway-uid", "0"]' in python_stage
+    assert 'CMD ["python", "-m", "khaos.cli", "start", "--socket", "/run/khaos/agent.sock", "--gateway-uid", "10002", "--gateway-gid", "0"]' in python_stage
+    assert "chown khaos:root /run/khaos" in python_stage
+    assert "chmod 02750 /run/khaos" in python_stage
     assert '"--db", "/app/data/khaos.db"' not in python_stage
     secret_init = (ROOT / "packaging/docker/agent-secret-init.py").read_text(encoding="utf-8")
     assert "os.getuid() != 0" in secret_init
@@ -101,6 +103,7 @@ def test_default_compose_is_loopback_only_and_uses_secret_files() -> None:
     assert "khaos_api_key" in compose["secrets"]
     assert "file" in compose["secrets"]["khaos_api_key"]
     assert "healthcheck" in gateway
+    assert "khaos-runtime:/run/khaos:ro" in gateway["volumes"]
 
 
 def test_explicit_dev_compose_matches_loopback_contract() -> None:
@@ -126,6 +129,7 @@ def test_production_compose_requires_tls_and_host_allowlist() -> None:
     assert {"khaos_tls_cert", "khaos_tls_key"}.issubset(compose["secrets"])
     assert "file" in compose["secrets"]["khaos_tls_cert"]
     assert "file" in compose["secrets"]["khaos_tls_key"]
+    assert "khaos-runtime:/run/khaos:ro" in gateway["volumes"]
 
 
 def test_systemd_units_deprivilege_python_and_pin_helper_client_pid() -> None:

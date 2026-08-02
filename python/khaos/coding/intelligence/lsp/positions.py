@@ -202,8 +202,7 @@ def byte_offset_to_lsp_position(text: str, byte_offset: int) -> tuple[int, int]:
         line_end_byte = line_start_byte + line_byte_length
         if byte_offset <= line_end_byte or line_idx == len(lines) - 1:
             byte_offset_in_line = byte_offset - line_start_byte
-            if byte_offset_in_line < 0:
-                byte_offset_in_line = 0
+            byte_offset_in_line = max(byte_offset_in_line, 0)
             # Convert byte offset within line to UTF-16 character offset.
             char_utf16 = _byte_offset_in_line_to_utf16(line_content, byte_offset_in_line)
             return line_idx, char_utf16

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
-from typing import Any
 
 import httpx
 
@@ -16,7 +15,6 @@ from khaos.routing.provider import ModelSpec, ProviderConfig
 class ProviderError(KhaosError):
     """Raised when a provider cannot serve a request (auth, network, format)."""
 
-    pass
 
 
 class BaseProvider(ABC):
@@ -95,6 +93,6 @@ __all__ = [
     "BaseProvider",
     "ProviderError",
     "build_provider",
-    "register_provider_type",
     "known_provider_types",
+    "register_provider_type",
 ]

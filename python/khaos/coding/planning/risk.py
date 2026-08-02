@@ -1,6 +1,11 @@
 """Deterministic implementation-plan risk propagation."""
 from __future__ import annotations
-from khaos.coding.planning.contracts import ImpactAnalysis, PlanOperation, RiskAssessment
+
+from khaos.coding.planning.contracts import (
+    ImpactAnalysis,
+    PlanOperation,
+    RiskAssessment,
+)
 
 _LEVELS=("low","medium","high","critical")
 class RiskEvaluator:

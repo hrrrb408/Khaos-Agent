@@ -9,8 +9,8 @@ import mimetypes
 import os
 import stat
 import tempfile
+from datetime import UTC, datetime
 from difflib import SequenceMatcher
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -147,15 +147,17 @@ async def multi_edit(path: str, edits: list[dict], workspace_manager=None, task_
 
 def _normalize_multi_edits(edits: list[dict]) -> list[dict[str, str]]:
     if not isinstance(edits, list):
-        raise ValueError("edits must be a list")
+        raise ValueError("edits must be a list")  # noqa: TRY004 - tool API compatibility
     normalized: list[dict[str, str]] = []
     for index, edit in enumerate(edits):
         if not isinstance(edit, dict):
-            raise ValueError(f"edit at index {index} must be an object")
+            raise ValueError(f"edit at index {index} must be an object")  # noqa: TRY004 - tool API compatibility
         old_text = edit.get("old_text")
         new_text = edit.get("new_text")
         if not isinstance(old_text, str) or not isinstance(new_text, str):
-            raise ValueError(f"edit at index {index} must include string old_text and new_text")
+            raise ValueError(  # noqa: TRY004 - tool API compatibility
+                f"edit at index {index} must include string old_text and new_text"
+            )
         if old_text == "":
             raise ValueError(f"edit at index {index} old_text must not be empty")
         normalized.append({"old_text": old_text, "new_text": new_text})
@@ -556,7 +558,7 @@ def _office_copy_mutation(
     # H4: identity was captured in the same dirfd critical section as the
     # publish — no re-open window.  ``None`` (empty list) means the publish
     # did not actually land; rollback then becomes a no-op.
-    published_identity: "tuple[int, int, int] | None" = (
+    published_identity: tuple[int, int, int] | None = (
         identity_out[0] if identity_out else None
     )
 
@@ -602,7 +604,7 @@ def _office_move_mutation(
     source_relative = _destination_relative(root, source)
     destination_relative = _destination_relative(root, destination)
 
-    published_identity: "tuple[int, int, int] | None" = (
+    published_identity: tuple[int, int, int] | None = (
         identity_out[0] if identity_out else None
     )
 
@@ -858,7 +860,7 @@ def _workspace_list_sync(
             path, max_depth=2
         ):
             display = relative[len(base) + 1:] if base else relative
-            first, separator, remainder = display.partition("/")
+            first, separator, _remainder = display.partition("/")
             if not include_hidden and first.startswith("."):
                 continue
             if separator:
@@ -898,7 +900,7 @@ def _workspace_info_sync(workspace_root: Path, path: str) -> dict[str, Any]:
             stat_result = filesystem.stat(path)
         is_directory = stat.S_ISDIR(stat_result.st_mode)
         modified = datetime.fromtimestamp(
-            stat_result.st_mtime, tz=timezone.utc
+            stat_result.st_mtime, tz=UTC
         ).isoformat()
         return {
             "ok": True,
@@ -1277,7 +1279,7 @@ def _find_fuzzy_block(content: str, old: str) -> tuple[int, int, float] | None:
     for line in content_lines:
         cursor_offsets.append(cursor)
         cursor += len(line)
-    for index in range(0, max(len(plain_lines) - window_size + 1, 0)):
+    for index in range(max(len(plain_lines) - window_size + 1, 0)):
         candidate = "\n".join(plain_lines[index : index + window_size])
         score = SequenceMatcher(None, old, candidate).ratio()
         if best is None or score > best[2]:

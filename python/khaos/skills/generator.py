@@ -180,7 +180,7 @@ class SkillGenerator:
             cmd = args.get("command", "?")[:60]
             return f"执行: {cmd}"
         if name == "test_run":
-            return f"运行测试"
+            return "运行测试"
         return f"{name}"
 
     def _generate_name(self, goal: str) -> str:
@@ -212,18 +212,18 @@ class SkillGenerator:
     ) -> str:
         """格式化技能 body。"""
         sections = [
-            f"## 目标",
+            "## 目标",
             f"{goal}",
-            f"",
-            f"## 步骤",
-            f"",
+            "",
+            "## 步骤",
+            "",
         ]
         for i, step in enumerate(steps, 1):
             sections.append(f"{i}. {step}")
         if files_modified:
-            sections.append(f"")
-            sections.append(f"## 涉及文件")
-            sections.append(f"")
+            sections.append("")
+            sections.append("## 涉及文件")
+            sections.append("")
             for f in files_modified:
                 sections.append(f"- {f}")
         return "\n".join(sections)

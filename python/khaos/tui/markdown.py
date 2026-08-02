@@ -8,7 +8,6 @@ to unit-test.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 from typing import Any
 
@@ -167,7 +166,7 @@ def _rich_style(style: str) -> str:
 
 __all__ = [
     "RenderedLine",
+    "markdown_to_rich",
     "render_message",
     "to_rich",
-    "markdown_to_rich",
 ]

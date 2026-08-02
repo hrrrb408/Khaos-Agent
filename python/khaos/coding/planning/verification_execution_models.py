@@ -108,7 +108,7 @@ class TrustedVerificationCommand:
             "image_attestation_digest": self.image_attestation_digest,
         }
 
-    def normalized(self) -> "TrustedVerificationCommand":
+    def normalized(self) -> TrustedVerificationCommand:
         candidate = replace(self, command_digest="")
         return replace(candidate, command_digest=_digest(candidate.canonical()))
 

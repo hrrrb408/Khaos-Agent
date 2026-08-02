@@ -99,7 +99,7 @@ class SandboxPolicy:
     channel_admins: list[str] | None = None
 
     @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "SandboxPolicy":
+    def from_dict(cls, data: dict[str, Any]) -> SandboxPolicy:
         """从字典构建策略。
 
         H3: unknown top-level / section keys raise ``ValueError`` so a typo in
@@ -110,7 +110,7 @@ class SandboxPolicy:
         ``ValueError`` instead of silently returning the default policy.
         """
         if not isinstance(data, dict):
-            raise ValueError(
+            raise ValueError(  # noqa: TRY004 - policy parser preserves ValueError
                 "policy must be a mapping at the top level, "
                 f"got {type(data).__name__}"
             )

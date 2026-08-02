@@ -6,8 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from rich.align import Align
-from rich.console import Console, ConsoleOptions, RenderResult
-from rich.console import Group
+from rich.console import Console, ConsoleOptions, Group, RenderResult
 from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
@@ -227,7 +226,7 @@ def build_diff_renderable(file_path: str, diff_text: str) -> Group:
     for raw_line in diff_text.splitlines():
         if raw_line.startswith("@@"):
             lines.append(Text(raw_line, style="yellow"))
-        elif raw_line.startswith("+++") or raw_line.startswith("---"):
+        elif raw_line.startswith(("+++", "---")):
             # File header (e.g. ``+++ b/note.txt``) — not an
             # addition/deletion line.
             lines.append(Text(raw_line))

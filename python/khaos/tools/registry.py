@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import os
 import hashlib
 import json
+import os
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 from khaos.exceptions import ToolNotFoundError
 from khaos.permissions.resource import (
@@ -21,7 +22,6 @@ from khaos.permissions.resource import (
     resolve_workspace_root,
 )
 from khaos.tools import schema as tool_schema
-
 
 _WORKSPACE_FILE_TOOLS = frozenset({
     "read_file", "search_files", "list_directory", "file_info", "tree_view",
@@ -44,6 +44,41 @@ _INJECTED_CAPABILITY_FIELDS = frozenset({
     "credential_context", "process_supervisor", "process_authority",
     "browser_manager", "cron_engine",
 })
+
+# Effect classification is an explicit reviewed declaration, never derived
+# from ``permission_level``.  Tools omitted from these sets remain
+# ``unknown`` and therefore cannot invite a blind retry after a handler has
+# started.  This map is intentionally kept here, next to the tool contracts,
+# so adding a side-effecting tool requires an explicit security decision.
+_EFFECT_NOT_APPLIED = "not_applied"
+_EFFECT_APPLIED = "applied"
+_EFFECT_UNKNOWN = "unknown"
+_EFFECT_PARTIAL = "partial"
+_BUILTIN_EFFECT_STATUS: dict[str, str] = {
+    **{
+        name: _EFFECT_NOT_APPLIED
+        for name in (
+            "channel_list", "channel_health", "github_read_issue",
+            "read_file", "search_files", "list_directory", "file_info",
+            "tree_view", "file_search_content", "search_notes", "list_notes",
+            "markdown_to_text", "extract_headings", "count_words",
+            "format_markdown_table", "clipboard_read", "git_diff", "git_log",
+            "git_status", "git_pr_body", "todo_read", "history_browse",
+            "history_read",
+        )
+    },
+    **{
+        name: _EFFECT_APPLIED
+        for name in (
+            "channel_enable", "channel_disable", "github_create_pr",
+            "github_comment_issue", "github_request_review", "write_file",
+            "multi_edit", "patch", "copy_file", "move_file", "quick_note",
+            "delete_note", "clipboard_write", "sandbox_build", "git_commit",
+            "git_branch", "git_status_write", "git_smart_commit", "git_undo",
+            "git_create_branch", "git_push", "todo_write", "todo_update",
+        )
+    },
+}
 
 class CapabilityName(str, Enum):
     COMPUTE_LOCAL = "compute.local"
@@ -144,11 +179,11 @@ _BUILTIN_CAPABILITY_MANIFEST: dict[str, tuple[ToolCapability, ...]] = {
 # production tools must declare their own resolver and cannot silently fall
 # back to a name/argument heuristic in the scheduler.
 _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
-    **{name: resolve_single_workspace_path for name in {
+    **{name: resolve_single_workspace_path for name in (
         "read_file", "search_files", "list_directory", "file_info", "tree_view",
         "file_search_content", "write_file", "patch", "multi_edit", "code_search",
         "code_symbols",
-    }},
+    )},
     "copy_file": resolve_copy_or_move,
     "move_file": resolve_copy_or_move,
     "terminal_argv": resolve_terminal_argv,
@@ -156,20 +191,20 @@ _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
     "terminal": resolve_terminal_shell,
     "process": resolve_process_control,
     "test_run": resolve_terminal_shell,
-    **{name: resolve_workspace_root for name in {
+    **{name: resolve_workspace_root for name in (
         "git_diff", "git_log", "git_status", "git_pr_body", "git_commit",
         "git_branch", "git_smart_commit", "git_undo", "git_create_branch",
         "git_push", "github_create_pr", "github_read_issue", "github_comment_issue",
         "github_request_review",
-    }},
-    **{name: resolve_network_origin for name in {
+    )},
+    **{name: resolve_network_origin for name in (
         "browser_navigate", "web_fetch", "web_extract_tables", "web_metadata",
-    }},
-    **{name: resolve_workspace_root for name in {
+    )},
+    **{name: resolve_workspace_root for name in (
         "sandbox_exec", "browser_launch", "browser_close", "browser_click",
         "browser_snapshot", "browser_screenshot", "browser_scroll", "browser_vision",
         "browser_type", "browser_evaluate",
-    }},
+    )},
     "browser_file_upload": resolve_single_workspace_path,
 }
 
@@ -188,6 +223,8 @@ class ToolDefinition:
     handler: Callable[..., Awaitable[Any]] | None = None
     capabilities: tuple[ToolCapability, ...] = ()
     resource_resolver: ResourceResolver | None = None
+    effect_status: str = ""
+    reconciliation_hint: str = ""
 
     @property
     def schema_digest(self) -> str:
@@ -219,6 +256,20 @@ class ToolRegistry:
         """Register a tool definition."""
         if definition.name in self._tools:
             raise ValueError(f"tool already registered: {definition.name}")
+        if not definition.effect_status:
+            definition.effect_status = _BUILTIN_EFFECT_STATUS.get(
+                definition.name, _EFFECT_UNKNOWN
+            )
+        if definition.effect_status not in {
+            _EFFECT_NOT_APPLIED,
+            _EFFECT_APPLIED,
+            _EFFECT_UNKNOWN,
+            _EFFECT_PARTIAL,
+        }:
+            raise ValueError(
+                f"tool {definition.name} has invalid effect_status "
+                f"{definition.effect_status!r}"
+            )
         if self.enforce_capabilities and not definition.capabilities:
             declared = self._capability_manifest.get(definition.name)
             if not declared:
@@ -300,7 +351,7 @@ class ToolRegistry:
     def capabilities_for(self, name: str) -> tuple[ToolCapability, ...]:
         return self.get(name).capabilities
 
-    def prune(self, tool_names: list[str]) -> "ToolRegistry":
+    def prune(self, tool_names: list[str]) -> ToolRegistry:
         """Return a new registry containing only ``tool_names``.
 
         B1: SubAgent tasks declare a tool subset (``task.tools``); the
@@ -347,24 +398,26 @@ class ToolInvocationBroker:
                 service = context.get("execution_service")
                 if service is None:
                     raise PermissionError("process.execute requires ExecutionService")
-            if capability.name == "filesystem.write" and mode == "coding":
-                if (
+            if (
+                capability.name == "filesystem.write"
+                and mode == "coding"
+                and (
                     context.get("workspace_id") is None
                     or context.get("task_id") is None
                     or context.get("workspace_manager") is None
-                ):
-                    raise PermissionError("filesystem.write requires active TaskWorkspace")
+                )
+            ):
+                raise PermissionError("filesystem.write requires active TaskWorkspace")
             if (
                 capability.name == "filesystem.read"
                 and mode == "coding"
                 and name in _WORKSPACE_FILE_TOOLS
+            ) and (
+                context.get("workspace_id") is None
+                or context.get("task_id") is None
+                or context.get("workspace_manager") is None
             ):
-                if (
-                    context.get("workspace_id") is None
-                    or context.get("task_id") is None
-                    or context.get("workspace_manager") is None
-                ):
-                    raise PermissionError("filesystem.read requires active TaskWorkspace")
+                raise PermissionError("filesystem.read requires active TaskWorkspace")
             if capability.name == "network.access" and context.get("network_policy") != "unrestricted-with-approval":
                 raise PermissionError("network.access requires server-authorized network policy")
             if capability.name == "host.integration" and mode == "coding":

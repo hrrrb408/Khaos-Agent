@@ -108,7 +108,7 @@ class PermissionProfile:
         roots: tuple[Path, ...],
         environment_keys: frozenset[str],
         resources: ResourceBudget,
-    ) -> "PermissionProfile":
+    ) -> PermissionProfile:
         filesystem = FileSystemAccess(access_mode)
         canonical_roots = _canonical_roots(roots)
         return cls(
@@ -125,7 +125,7 @@ class PermissionProfile:
             resources=resources,
         )
 
-    def bind_workspace(self, root: Path) -> "PermissionProfile":
+    def bind_workspace(self, root: Path) -> PermissionProfile:
         """Return a profile bound to exactly one canonical TaskWorkspace."""
         canonical = root.expanduser().resolve()
         return PermissionProfile(

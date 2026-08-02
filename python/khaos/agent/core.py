@@ -7,10 +7,11 @@ import inspect
 import json
 import logging
 import time
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, AsyncIterator, Optional
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from khaos.coding.cost_tracker import CostTracker
@@ -18,6 +19,8 @@ if TYPE_CHECKING:
     from khaos.coding.task_manager import TaskManager
     from khaos.coding.verify_fix import VerifyFixLoop
     from khaos.project_context import ProjectContextLoader
+
+from khaos.exceptions import CompressionCircuitOpenError
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +55,7 @@ class Message:
     role: str
     content: str
     tool_calls: list[dict] = field(default_factory=list)
-    tool_call_id: Optional[str] = None
+    tool_call_id: str | None = None
     token_count: int = 0
     created_at: float = 0.0
     stop_reason: str | None = None
@@ -86,12 +89,12 @@ class AgentLoop:
         skill_manager=None,
         project_root=None,
         coding_context_builder=None,
-        project_context_loader: "Optional[ProjectContextLoader]" = None,
-        file_fingerprint_cache: "Optional[FileFingerprintCache]" = None,
-        cost_tracker: "Optional[CostTracker]" = None,
-        verify_fix_loop: "Optional[VerifyFixLoop]" = None,
+        project_context_loader: ProjectContextLoader | None = None,
+        file_fingerprint_cache: FileFingerprintCache | None = None,
+        cost_tracker: CostTracker | None = None,
+        verify_fix_loop: VerifyFixLoop | None = None,
         verify_fix_factory=None,
-        task_manager: "Optional[TaskManager]" = None,
+        task_manager: TaskManager | None = None,
         task_id: str | None = None,
         skill_generator=None,
         workspace_manager=None,
@@ -114,7 +117,7 @@ class AgentLoop:
         # ``channel.read`` / ``channel.manage`` broker injection.  Without
         # these the handlers fail-closed (``unavailable`` / ``forbidden``).
         channel_registry=None,
-        channel_admins: "frozenset[str] | None" = None,
+        channel_admins: frozenset[str] | None = None,
         cron_engine=None,
         browser_manager=None,
         subagent_spawner=None,
@@ -284,6 +287,8 @@ class AgentLoop:
             active_task_id
         )
         total_tokens = 0
+        budget_exhausted = False
+        stop_reason: str | None = None
         try:
             messages = await self._build_context(session_id, user_input)
             user_msg = Message(
@@ -299,25 +304,28 @@ class AgentLoop:
             turn_count = 0
 
             while turn_count < self.config.max_turns:
+                if self._budget_exceeded(total_tokens):
+                    budget_exhausted = True
+                    stop_reason = StopReason.MAX_BUDGET.value
+                    break
                 empty_response_retries = 0
-                if await self._check_compression(messages):
-                    if self.compressor is not None:
-                        result = await self.compressor.compress(
-                            messages,
-                            self.config.compression_threshold,
-                        )
-                        messages = result.messages
-                        await turn.emit(
-                            "context.compacted",
-                            {
-                                "level": result.level.name,
-                                "window_id": result.window_id,
-                                "result_digest": result.result_digest,
-                                "original_tokens": result.original_tokens,
-                                "compressed_tokens": result.compressed_tokens,
-                                "replaced_message_count": result.replaced_message_count,
-                            },
-                        )
+                if await self._check_compression(messages) and self.compressor is not None:
+                    result = await self.compressor.compress(
+                        messages,
+                        self.config.compression_threshold,
+                    )
+                    messages = result.messages
+                    await turn.emit(
+                        "context.compacted",
+                        {
+                            "level": result.level.name,
+                            "window_id": result.window_id,
+                            "result_digest": result.result_digest,
+                            "original_tokens": result.original_tokens,
+                            "compressed_tokens": result.compressed_tokens,
+                            "replaced_message_count": result.replaced_message_count,
+                        },
+                    )
                 # Phase 6.3: 记录本轮的输入 token（整个上下文）。
                 if self.cost_tracker is not None:
                     input_tokens = sum(
@@ -350,6 +358,10 @@ class AgentLoop:
                             if self.cost_tracker is not None:
                                 self.cost_tracker.add_output_tokens(chunk.token_count)
                             yield chunk
+                            if self._budget_exceeded(total_tokens):
+                                budget_exhausted = True
+                                stop_reason = StopReason.MAX_BUDGET.value
+                                break
                         if chunk.tool_calls:
                             tool_calls.extend(chunk.tool_calls)
                             for tool_call in chunk.tool_calls:
@@ -376,6 +388,8 @@ class AgentLoop:
                         if chunk.stop_reason:
                             stop_reason = chunk.stop_reason
 
+                    if budget_exhausted:
+                        break
                     if assistant_content.strip() or tool_calls or stop_reason == StopReason.TOOL_USE.value:
                         break
                     if empty_response_retries >= 1:
@@ -416,6 +430,9 @@ class AgentLoop:
                 # Phase 6.3: 结束本轮 token / 费用统计（无论是否继续工具循环）。
                 if self.cost_tracker is not None:
                     self.cost_tracker.finish_turn()
+
+                if budget_exhausted:
+                    break
 
                 if stop_reason != StopReason.TOOL_USE.value:
                     break
@@ -636,6 +653,10 @@ class AgentLoop:
                         })
                         if self.cost_tracker is not None:
                             self.cost_tracker.add_tool_tokens(tool_msg.token_count)
+                        total_tokens += tool_msg.token_count
+                        if self._budget_exceeded(total_tokens):
+                            budget_exhausted = True
+                            stop_reason = StopReason.MAX_BUDGET.value
                         # Long-task observability: record what this turn touched.
                         await self._record_task_activity(result, active_task_id)
                         if result.name == "test_run" and self.task_manager is not None and active_task_id:
@@ -690,6 +711,9 @@ class AgentLoop:
                                         )
                         yield tool_msg
 
+                if budget_exhausted:
+                    break
+
             else:
                 stop_reason = StopReason.MAX_TURNS.value
 
@@ -711,22 +735,51 @@ class AgentLoop:
                         },
                         created_at=time.time(),
                     )
+            terminal_status = (
+                "failed"
+                if stop_reason == StopReason.MAX_BUDGET.value
+                and turn.active_tool_calls
+                else "completed"
+            )
             terminal = await turn.terminal(
-                "completed", reason=stop_reason or StopReason.END_TURN.value
+                terminal_status,
+                reason=stop_reason or StopReason.END_TURN.value,
+                error_code=("MAX_BUDGET" if terminal_status == "failed" else None),
             )
-            yield Message(
-                role="system",
-                content="done",
-                token_count=total_tokens,
-                stop_reason=stop_reason,
-                event="done",
-                metadata={
-                    "turn_id": turn.turn_id,
-                    "attempt_id": turn.attempt_id,
-                    "event_sequence": terminal.sequence,
-                },
-                created_at=time.time(),
-            )
+            if terminal_status == "failed":
+                yield Message(
+                    role="system",
+                    content=(
+                        "token budget exhausted; outstanding tool calls were not "
+                        "executed"
+                    ),
+                    stop_reason="error",
+                    event="error",
+                    metadata={
+                        "code": "MAX_BUDGET",
+                        "message": (
+                            "Token budget exhausted with outstanding tool calls."
+                        ),
+                        "turn_id": turn.turn_id,
+                        "attempt_id": turn.attempt_id,
+                        "event_sequence": terminal.sequence,
+                    },
+                    created_at=time.time(),
+                )
+            else:
+                yield Message(
+                    role="system",
+                    content="done",
+                    token_count=total_tokens,
+                    stop_reason=stop_reason,
+                    event="done",
+                    metadata={
+                        "turn_id": turn.turn_id,
+                        "attempt_id": turn.attempt_id,
+                        "event_sequence": terminal.sequence,
+                    },
+                    created_at=time.time(),
+                )
         except asyncio.CancelledError:
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "cancelled", error="task cancelled")
@@ -736,13 +789,18 @@ class AgentLoop:
                 )
             raise
         except Exception as exc:
-            logger.error("Agent loop error: %s", exc, exc_info=True)
+            logger.exception("Agent loop error")
             if self.task_manager is not None and active_task_id:
                 await self.task_manager.update_status(active_task_id, "failed", error=str(exc))
             terminal = None
+            error_code = (
+                "COMPRESSION_CIRCUIT_OPEN"
+                if isinstance(exc, CompressionCircuitOpenError)
+                else "INTERNAL_ERROR"
+            )
             if not turn.is_terminal:
                 terminal = await turn.terminal(
-                    "failed", reason=type(exc).__name__, error_code="INTERNAL_ERROR"
+                    "failed", reason=type(exc).__name__, error_code=error_code
                 )
             if self.error_handler is not None:
                 error_event = await self.error_handler.handle(exc, session_id)
@@ -761,7 +819,7 @@ class AgentLoop:
                     stop_reason="error",
                     event="error",
                     metadata={
-                        "code": "INTERNAL_ERROR",
+                        "code": error_code,
                         "message": str(exc),
                         "turn_id": turn.turn_id,
                         "attempt_id": turn.attempt_id,
@@ -779,9 +837,8 @@ class AgentLoop:
                         error_code="STREAM_CLOSED",
                     )
                 except Exception:
-                    logger.error(
-                        "failed to persist interrupted turn: %s", turn.turn_id,
-                        exc_info=True,
+                    logger.exception(
+                        "failed to persist interrupted turn: %s", turn.turn_id
                     )
 
     async def _persist_message(self, session_id: str, message: Message) -> None:
@@ -804,6 +861,17 @@ class AgentLoop:
         await self.db.insert_message_fts(
             session_id, message.role, message.content, message.token_count, rowid=rowid
         )
+
+    def _budget_exceeded(self, total_tokens: int) -> bool:
+        """Return whether the current turn has crossed its hard token budget."""
+        exceeded = total_tokens > self.config.max_budget_tokens
+        if exceeded:
+            logger.warning(
+                "agent token budget exhausted: used=%d budget=%d",
+                total_tokens,
+                self.config.max_budget_tokens,
+            )
+        return exceeded
 
     async def _analyze_task_skill(self, task_id: str) -> None:
         if self.skill_generator is None or self.task_manager is None:
@@ -834,6 +902,12 @@ class AgentLoop:
 
         if stop_reason == StopReason.MAX_TURNS.value:
             await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="max_turns exhausted without completion")
+        elif stop_reason == StopReason.MAX_BUDGET.value:
+            await self.task_manager.update_status(
+                task_id,
+                TaskStatus.FAILED,
+                error="token budget exhausted without completion",
+            )
         elif self.verify_fix_loop is not None and self.verify_fix_loop.is_loop_exhausted():
             await self.task_manager.update_status(task_id, TaskStatus.FAILED, error="verify-fix loop exhausted, tests still failing")
         else:

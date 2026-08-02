@@ -176,15 +176,15 @@ def build_symbol_table(conn: sqlite3.Connection, repository_id: str) -> Reposito
             "SELECT DISTINCT source_file, target_file FROM resolved_imports WHERE repository_id=? AND target_file IS NOT NULL",
             (repository_id,),
         ).fetchall():
-            source = row[0] if isinstance(row, sqlite3.Row) else row[0]
-            target = row[1] if isinstance(row, sqlite3.Row) else row[1]
+            source = row[0]
+            target = row[1]
             table.register_reverse_dep(source, target)
         for row in conn.execute(
             "SELECT DISTINCT source_file, target_file FROM resolved_call_edges WHERE repository_id=? AND target_file IS NOT NULL",
             (repository_id,),
         ).fetchall():
-            source = row[0] if isinstance(row, sqlite3.Row) else row[0]
-            target = row[1] if isinstance(row, sqlite3.Row) else row[1]
+            source = row[0]
+            target = row[1]
             table.register_reverse_dep(source, target)
     except sqlite3.OperationalError:
         pass  # resolution tables don't exist yet

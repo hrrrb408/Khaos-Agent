@@ -9,12 +9,22 @@ import importlib.resources
 import re
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from khaos.coding.intelligence.models import CallCandidate, ChangedRange, ImportReference, ParseDiagnostic, ParseResult, ParserMetadata, ParseState, ReferenceCandidate, SourceLocation, Symbol
-
+from khaos.coding.intelligence.models import (
+    CallCandidate,
+    ChangedRange,
+    ImportReference,
+    ParseDiagnostic,
+    ParseResult,
+    ParserMetadata,
+    ParseState,
+    ReferenceCandidate,
+    SourceLocation,
+    Symbol,
+)
 
 INCREMENTAL_STATE_VERSION = 1
 INCREMENTAL_MAX_CHANGED_RATIO = 0.50

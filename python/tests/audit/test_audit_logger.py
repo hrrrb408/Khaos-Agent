@@ -40,6 +40,26 @@ async def test_log_and_query_roundtrip(tmp_path):
     await db.close()
 
 
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd,
+    reason="platform has no dirfd-relative open/mkdir support",
+)
+async def test_anchor_verifies_incremental_suffix_after_multiple_rows(tmp_path, monkeypatch):
+    """Incremental anchor checks start from the previous row's computed hash."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    trusted = home / ".khaos" / "audit"
+    monkeypatch.setattr(logger_module, "AUDIT_LOG_TRUSTED_DIR", trusted)
+    db = await _db(tmp_path)
+
+    audit = AuditLogger(db, anchor_path="chain-head.json", project_id="project")
+    for index in range(4):
+        assert await audit.log("event", f"target-{index}", "success") > 0
+    await audit.verify_anchor()
+    audit.close()
+    await db.close()
+
+
 async def test_query_filters_by_action(tmp_path):
     db = await _db(tmp_path)
     audit = AuditLogger(db)
@@ -161,6 +181,33 @@ async def test_file_audit_uses_standard_cpython_dirfd_api(tmp_path, monkeypatch)
     record = json.loads((trusted / "events.jsonl").read_text().strip())
     assert record["action"] == "terminal"
     assert record["detail"] == {"bounded": True}
+    await db.close()
+
+
+@pytest.mark.skipif(
+    os.open not in os.supports_dir_fd or os.mkdir not in os.supports_dir_fd,
+    reason="platform has no dirfd-relative open/mkdir support",
+)
+async def test_file_audit_rotates_into_trusted_segments(tmp_path, monkeypatch):
+    """Secondary JSONL evidence is bounded without deleting old segments."""
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    trusted = home / ".khaos" / "audit"
+    monkeypatch.setattr(logger_module, "AUDIT_LOG_TRUSTED_DIR", trusted)
+    monkeypatch.setattr(logger_module, "AUDIT_FILE_SEGMENT_BYTES", 128)
+    db = await _db(tmp_path)
+
+    audit = AuditLogger(db, log_path="events.jsonl")
+    await audit.log("terminal", "first", "success", {"payload": "x" * 100})
+    await audit.log("terminal", "second", "success", {"payload": "y" * 100})
+    audit.close()
+
+    segments = list(trusted.glob("events.jsonl.segment-*"))
+    assert len(segments) == 1
+    assert '"target": "first"' in segments[0].read_text(encoding="utf-8")
+    assert '"target": "second"' in (
+        trusted / "events.jsonl"
+    ).read_text(encoding="utf-8")
     await db.close()
 
 

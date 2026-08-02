@@ -183,7 +183,7 @@ async def grant_permission(
                 resource_spec=resource_spec,
             )
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - tool API returns a structured failure
         return {"ok": False, "error": str(exc)}
     return {
         "ok": True,
@@ -219,7 +219,7 @@ async def revoke_permission(
         return {"ok": False, "error": "Permission engine not initialized"}
     try:
         await permission_engine.revoke_rule(rule_id)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - tool API returns a structured failure
         return {"ok": False, "error": str(exc)}
     return {"ok": True, "revoked": rule_id}
 

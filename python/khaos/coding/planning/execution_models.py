@@ -7,8 +7,11 @@ import unicodedata
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
+
 from khaos.coding.planning.safe_identifiers import (
-    SafeRecoveryArtifactName, SafeRecoveryRunId, SafeWorkspaceRelativePath,
+    SafeRecoveryArtifactName,
+    SafeRecoveryRunId,
+    SafeWorkspaceRelativePath,
 )
 
 
@@ -128,7 +131,7 @@ class PlannedFileEdit:
             "metadata": self.metadata,
         }
 
-    def normalized(self) -> "PlannedFileEdit":
+    def normalized(self) -> PlannedFileEdit:
         canonical = self.canonical()
         return replace(
             self,
@@ -153,7 +156,7 @@ class PlannedEditBundle:
     producer: str = "server"
     metadata: dict[str, Any] = field(default_factory=dict)
 
-    def normalized(self) -> "PlannedEditBundle":
+    def normalized(self) -> PlannedEditBundle:
         edits = tuple(edit.normalized() for edit in self.ordered_edits)
         payload = {
             "bundle_id": self.bundle_id,
@@ -250,7 +253,7 @@ class FinalMutationAttestation:
             "attested_at": self.attested_at,
         }
 
-    def normalized(self) -> "FinalMutationAttestation":
+    def normalized(self) -> FinalMutationAttestation:
         ordered = tuple(sorted(self.ordered_states, key=lambda state: state.path))
         path_payload = [state.canonical() for state in ordered]
         path_digest = hashlib.sha256(json.dumps(
@@ -280,7 +283,7 @@ class RollbackFinalAttestation(FinalMutationAttestation):
         })
         return value
 
-    def normalized(self) -> "RollbackFinalAttestation":
+    def normalized(self) -> RollbackFinalAttestation:
         ordered = tuple(sorted(self.ordered_states, key=lambda state: state.path))
         path_digest = hashlib.sha256(json.dumps(
             [state.canonical() for state in ordered], ensure_ascii=False,
@@ -308,7 +311,7 @@ class MutationSealTombstone:
     sealed_at: float
     tombstone_digest: str = ""
 
-    def normalized(self) -> "MutationSealTombstone":
+    def normalized(self) -> MutationSealTombstone:
         payload = {
             "execution_run_id": self.execution_run_id,
             "seal_kind": self.seal_kind,
@@ -378,7 +381,7 @@ class InitialWorkspaceAttestation:
     attestation_digest: str = ""
     approved_edits: tuple[InitialApprovedEdit, ...] = ()
 
-    def normalized(self) -> "InitialWorkspaceAttestation":
+    def normalized(self) -> InitialWorkspaceAttestation:
         states = tuple(sorted(self.declared_states, key=lambda item: item.path))
         workspace_states = tuple(sorted(self.workspace_states, key=lambda item: item.path))
         approved_edits = tuple(sorted(

@@ -9,27 +9,23 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from typing import ClassVar
 
+from rich.text import Text
 from textual import work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.widgets import Static
-from rich.text import Text
 
-from khaos.agent import AgentConfig, AgentLoop
-from khaos.agent.compressor import ContextCompressor
+from khaos.agent import AgentLoop
 from khaos.agent.core import Message
-from khaos.agent.error_handler import ErrorHandler
 from khaos.config import PROVIDER_DEFAULTS, check_needs_setup, write_provider_config
 from khaos.db import Database
 from khaos.db.state_root import project_id as compute_project_id
-from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
+from khaos.memory import MemoryManager
 from khaos.modes import ModeManager
-from khaos.permissions import PermissionEngine
-from khaos.routing.router import create_default_router
 from khaos.skills import SkillManager
 from khaos.tools import create_runtime_registry
-from khaos.tools.scheduler import ToolScheduler
 from khaos.tui.chat_panel import ChatPanel
 from khaos.tui.commands import TuiContext, handle_command, is_command
 from khaos.tui.input_panel import InputPanel
@@ -67,7 +63,7 @@ class KhaosApp(App):
     }
     """
 
-    BINDINGS = [
+    BINDINGS: ClassVar[list[Binding]] = [
         Binding("ctrl+c", "quit", "Quit", show=False, priority=True),
         Binding("ctrl+l", "clear_chat", "Clear"),
     ]
@@ -300,7 +296,7 @@ class KhaosApp(App):
                 self._render_message(message)
                 if _is_done_message(message):
                     turn_tokens = message.token_count
-        except Exception as exc:  # noqa: BLE001 — surface any error to the user
+        except Exception as exc:
             logger.exception("agent turn failed")
             chat.append_error(f"turn failed: {exc}")
         if turn_tokens > 0:
@@ -412,7 +408,7 @@ class KhaosApp(App):
     async def _finish_setup(self) -> None:
         try:
             await self._bootstrap_agent_runtime()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.exception("setup completed but runtime bootstrap failed")
             self.query_one(ChatPanel).append_error(f"配置已保存，但 Agent 初始化失败: {exc}")
             return
@@ -533,7 +529,7 @@ class KhaosApp(App):
         try:
             model = self._current_model_label()
             bar.set_model(model)
-        except Exception:
+        except Exception:  # noqa: BLE001 - unavailable model label falls back to mock
             bar.set_model("mock")
             model = "mock"
         self.query_one(HeaderBar).set_state(

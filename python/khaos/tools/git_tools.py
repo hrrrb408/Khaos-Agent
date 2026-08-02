@@ -9,10 +9,10 @@ import os
 import re
 import tempfile
 import time
-from urllib.parse import urlparse
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy
 from khaos.coding.workspace.models import WorkspaceState
@@ -120,10 +120,13 @@ async def git_status(cwd: str = ".", *, task_id: str | None = None, workspace_id
                 status["added"].append(path)
             if x == "D":
                 status["deleted"].append(path)
-            if y in {"M", "D", "R", "C"} and x != "?":
+            if (
+                y in {"M", "D", "R", "C"}
+                and x != "?"
+                and path not in status["modified"]
+            ):
                 # Worktree change on top of an already-indexed file.
-                if path not in status["modified"]:
-                    status["modified"].append(path)
+                status["modified"].append(path)
             status["staged"].append(path)
         status["is_clean"] = False
 
@@ -209,7 +212,7 @@ async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: 
 
     revision, sep, subject = log["stdout"].strip().partition("\t")
     if not sep:
-        revision, subject = revision, ""
+        subject = ""
 
     reset = await _git(["git", *_GIT_SAFE_CONFIG, "reset", "--soft", "HEAD~1"], cwd, destructive_ctx)
     if reset["returncode"] != 0:
@@ -1133,7 +1136,7 @@ def _validate_push_argv(args: list[str]) -> tuple[str, str, str]:
 
 
 def _remote_host(remote_url: str) -> str:
-    if remote_url.startswith("file://") or remote_url.startswith(('/', './', '../')):
+    if remote_url.startswith(("file://", '/', './', '../')):
         return "local"
     if re.match(r"^[^/@:]+@[^/:]+:", remote_url):
         return remote_url.split("@", 1)[1].split(":", 1)[0].lower()

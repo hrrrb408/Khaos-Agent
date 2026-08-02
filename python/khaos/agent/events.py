@@ -9,7 +9,6 @@ import weakref
 from dataclasses import dataclass
 from typing import Any
 
-
 _RECOVERY_TASKS: weakref.WeakKeyDictionary[Any, asyncio.Task[Any]] = (
     weakref.WeakKeyDictionary()
 )
@@ -46,7 +45,7 @@ class TurnCoordinator:
         task_id: str | None,
         principal_id: str,
         project_id: str = "",
-    ) -> "TurnCoordinator":
+    ) -> TurnCoordinator:
         await _recover_once(db)
         turn_id = uuid.uuid4().hex
         attempt_id = uuid.uuid4().hex
@@ -112,6 +111,11 @@ class TurnCoordinator:
     ) -> TurnEvent:
         if self._terminal:
             raise PermissionError("turn already has a terminal event")
+        if status == "completed" and self._active_tool_calls:
+            raise PermissionError(
+                "completed turn cannot have unmatched tool calls; "
+                "reconcile every active tool before terminalizing"
+            )
         event_type = f"turn.{status}"
         payload = {
             "reason": reason,
@@ -134,6 +138,11 @@ class TurnCoordinator:
     @property
     def is_terminal(self) -> bool:
         return self._terminal
+
+    @property
+    def active_tool_calls(self) -> tuple[str, ...]:
+        """Return tool calls that still need a result before completion."""
+        return tuple(sorted(self._active_tool_calls))
 
 
 async def _recover_once(db: Any) -> None:

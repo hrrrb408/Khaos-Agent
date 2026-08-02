@@ -4,13 +4,28 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC
 
 from khaos.agent.core import SimpleTokenEngine
-from khaos.memory.store import Memory, MemoryScope, MemoryStore, extract_memories_from_messages
+from khaos.memory.store import (
+    Memory,
+    MemoryScope,
+    MemoryStore,
+    extract_memories_from_messages,
+)
 from khaos.modes import Mode
 
 logger = logging.getLogger(__name__)
+
+
+def _memory_updated_timestamp(memory: Memory) -> float:
+    """Return a comparable UTC timestamp for legacy and current memories."""
+    updated_at = memory.updated_at
+    if updated_at is None:
+        return float("-inf")
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=UTC)
+    return updated_at.timestamp()
 
 
 @dataclass
@@ -59,7 +74,11 @@ class MemoryManager:
                 for memory in all_memories
                 if memory.scope not in {MemoryScope.GLOBAL, current_mode}
             ),
-            key=lambda m: (m.confidence.value, m.access_freq, m.updated_at or datetime.min),
+            key=lambda m: (
+                m.confidence.value,
+                m.access_freq,
+                _memory_updated_timestamp(m),
+            ),
             reverse=True,
         )
         sections = [
@@ -86,8 +105,10 @@ class MemoryManager:
         memories actually persisted (unresolved conflicts are skipped and
         logged).
         """
-        scope = MemoryScope(mode.value) if isinstance(mode, Mode) else MemoryScope.GLOBAL
-        candidates = extract_memories_from_messages(messages, scope=MemoryScope.GLOBAL)
+        del mode
+        candidates = extract_memories_from_messages(
+            messages, scope=MemoryScope.GLOBAL
+        )
         persisted: list[Memory] = []
         for memory in candidates:
             stored = await self.store.set(memory, on_conflict="resolve")
@@ -129,4 +150,3 @@ class MemoryManager:
         if len(words) <= max_tokens:
             return text
         return " ".join(words[:max_tokens])
-

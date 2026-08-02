@@ -1,6 +1,6 @@
 import pytest
-
 from khaos.agent import CompressionLevel, ContextCompressor, Message
+from khaos.exceptions import CompressionCircuitOpenError
 from khaos.routing.router import create_default_router
 
 
@@ -148,7 +148,10 @@ async def test_circuit_opens_after_three_l2_failures():
             yield
 
     compressor = ContextCompressor(FailingRouter())
-    for _ in range(3):
+    for _ in range(2):
+        await compressor.compress(_messages(8, words=40), threshold=20)
+
+    with pytest.raises(CompressionCircuitOpenError):
         await compressor.compress(_messages(8, words=40), threshold=20)
 
     assert compressor.is_circuit_open
@@ -167,9 +170,9 @@ async def test_open_circuit_skips_l2():
     compressor = ContextCompressor(router)
     compressor._consecutive_l2_failures = 3
 
-    result = await compressor.compress(_messages(8, words=40), threshold=20)
+    with pytest.raises(CompressionCircuitOpenError):
+        await compressor.compress(_messages(8, words=40), threshold=20)
 
-    assert result.level is CompressionLevel.CONTEXT_COLLAPSE
     assert router.calls == 0
 
 
@@ -196,7 +199,7 @@ async def test_no_middle_messages_returns_micro_result():
     assert result.messages == messages
 
 
-async def test_context_collapse_fallback_to_micro(monkeypatch):
+async def test_open_circuit_fails_closed_before_context_fallback(monkeypatch):
     compressor = ContextCompressor(create_default_router())
 
     async def fail(messages):
@@ -205,9 +208,8 @@ async def test_context_collapse_fallback_to_micro(monkeypatch):
     monkeypatch.setattr(compressor, "_context_collapse", fail)
     compressor._consecutive_l2_failures = 3
 
-    result = await compressor.compress(_messages(8, words=40), threshold=20)
-
-    assert result.level is CompressionLevel.MICRO_COMPACT
+    with pytest.raises(CompressionCircuitOpenError):
+        await compressor.compress(_messages(8, words=40), threshold=20)
 
 
 def test_extract_key_decisions_limits_empty_input():

@@ -59,10 +59,11 @@ from typing import Any
 
 from khaos.db.database import Database
 from khaos.db.state_root import (
-    StateRootError,
     open_state_db_safely,
-    project_id as compute_project_id,
     resolve_state_db_path,
+)
+from khaos.db.state_root import (
+    project_id as compute_project_id,
 )
 
 logger = logging.getLogger(__name__)

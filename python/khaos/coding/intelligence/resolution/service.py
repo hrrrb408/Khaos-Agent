@@ -26,10 +26,9 @@ from typing import Any
 
 from khaos.coding.intelligence.resolution.models import (
     FileResolutionResult,
+    RepositoryResolutionReport,
     ResolutionDiagnostic,
     ResolutionStatus,
-    RepositoryResolutionReport,
-    StaleResolutionResult,
 )
 from khaos.coding.intelligence.resolution.persistence import (
     apply_resolution_schema,
@@ -87,7 +86,9 @@ class ResolutionService:
         # Read Go module path if root is available
         go_module_path: str | None = None
         if root is not None:
-            from khaos.coding.intelligence.resolution.go_resolver import read_go_module_path
+            from khaos.coding.intelligence.resolution.go_resolver import (
+                read_go_module_path,
+            )
             go_module_path = read_go_module_path(root)
 
         # Determine which files to resolve

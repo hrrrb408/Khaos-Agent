@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
@@ -49,7 +49,7 @@ class TaskWorkspace:
     branch_name: str
     state: WorkspaceState = WorkspaceState.CREATING
     writable_roots: tuple[Path, ...] = ()
-    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     recovery_root: Path | None = None
     storage_baseline: WorkspaceStorageSnapshot | None = None
     storage_limits: WorkspaceStorageLimits = field(
@@ -108,9 +108,9 @@ class ChangeSet:
     created_at: datetime
 
     @classmethod
-    def create(cls, *, id: str, workspace_id: str, base_sha: str, head_sha: str | None, patch: str, diff_stat: str, changed_files: tuple[str, ...], risk_level: str = "low") -> "ChangeSet":
+    def create(cls, *, id: str, workspace_id: str, base_sha: str, head_sha: str | None, patch: str, diff_stat: str, changed_files: tuple[str, ...], risk_level: str = "low") -> ChangeSet:
         digest = hashlib.sha256(patch.encode("utf-8")).hexdigest()
-        return cls(id, workspace_id, base_sha, head_sha, patch, diff_stat, changed_files, risk_level, digest, datetime.now(timezone.utc))
+        return cls(id, workspace_id, base_sha, head_sha, patch, diff_stat, changed_files, risk_level, digest, datetime.now(UTC))
 
     def approval_key(self, operation: str) -> str:
         """Return an approval binding that cannot be reused for another diff."""

@@ -120,8 +120,7 @@ def _write_jsonl(output_path: str, records: list[dict[str, Any]]) -> int:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
-        for data in records:
-            handle.write(json.dumps(data, ensure_ascii=False) + "\n")
+        handle.writelines(json.dumps(data, ensure_ascii=False) + "\n" for data in records)
     return len(records)
 
 

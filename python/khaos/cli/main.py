@@ -13,9 +13,6 @@ from pathlib import Path
 
 import yaml
 
-from khaos.agent import AgentConfig, AgentLoop
-from khaos.agent.compressor import ContextCompressor
-from khaos.agent.error_handler import ErrorHandler
 from khaos.cli.skills_commands import handle_skills_command
 from khaos.cli.sse import encode_sse
 from khaos.config import (
@@ -29,16 +26,12 @@ from khaos.config import (
 from khaos.db import Database
 from khaos.db.state_root import (
     open_state_db_safely,
-    project_id as compute_project_id,
     resolve_state_db_path,
 )
-from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
+from khaos.db.state_root import (
+    project_id as compute_project_id,
+)
 from khaos.modes import ModeManager
-from khaos.permissions import PermissionEngine
-from khaos.routing.router import create_default_router
-from khaos.skills import SkillManager
-from khaos.tools import create_runtime_registry
-from khaos.tools.scheduler import ToolScheduler
 
 
 async def run_once(args: argparse.Namespace) -> int:
@@ -184,6 +177,15 @@ def build_command_parser() -> argparse.ArgumentParser:
         default=None,
         help="Expected UID of the Gateway peer (container deployments set this explicitly)",
     )
+    start_parser.add_argument(
+        "--gateway-gid",
+        type=int,
+        default=None,
+        help=(
+            "Expected GID of the Gateway peer and setgid socket parent "
+            "(container deployments set this explicitly)"
+        ),
+    )
     start_parser.add_argument("--config", default="config.yaml")
     start_parser.add_argument("--gateway", action="store_true", help="Also start Go gateway")
 
@@ -284,7 +286,7 @@ def cmd_start(args: argparse.Namespace) -> None:
             check=True,
         )
         read_fd, write_fd = os.pipe()
-        os.write(write_fd, f"{gateway_capability}\n".encode("utf-8"))
+        os.write(write_fd, f"{gateway_capability}\n".encode())
         os.close(write_fd)
         gateway_cmd = [str(gateway_binary)]
         gateway_environment = dict(os.environ)
@@ -320,6 +322,7 @@ def cmd_start(args: argparse.Namespace) -> None:
                 config_path=Path(args.config),
                 gateway_capability=gateway_capability,
                 gateway_uid=args.gateway_uid,
+                gateway_gid=args.gateway_gid,
                 gateway_pid=gateway_pid,
             )
         )
@@ -350,7 +353,9 @@ def cmd_test(args: argparse.Namespace) -> None:
         ]
         if args.verbose:
             cmd.append("-v")
-        result = subprocess.run(cmd, cwd=str(project_root), capture_output=True, text=True)
+        result = subprocess.run(
+            cmd, cwd=str(project_root), capture_output=True, text=True, check=False,
+        )
         print(result.stdout[-500:] if len(result.stdout) > 500 else result.stdout)
         if result.stderr:
             print(result.stderr[-200:])
@@ -363,6 +368,7 @@ def cmd_test(args: argparse.Namespace) -> None:
             cwd=str(project_root),
             capture_output=True,
             text=True,
+            check=False,
         )
         print(result.stdout[-500:] if len(result.stdout) > 500 else result.stdout)
         if result.stderr:

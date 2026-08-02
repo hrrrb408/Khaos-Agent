@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from khaos.exceptions import KhaosError
 
@@ -12,7 +11,6 @@ from khaos.exceptions import KhaosError
 class SkillParseError(KhaosError):
     """Raised when a skill file cannot be parsed or fails validation."""
 
-    pass
 
 
 @dataclass
@@ -39,7 +37,7 @@ class Skill:
     category: str = "general"
     triggers: list[str] = field(default_factory=list)
     body: str = ""
-    path: Optional[Path] = None
+    path: Path | None = None
     enabled: bool = True
 
     def __post_init__(self) -> None:

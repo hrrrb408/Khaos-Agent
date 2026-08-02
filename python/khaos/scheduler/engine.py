@@ -12,12 +12,16 @@ import json
 import logging
 import time
 import uuid
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta
-from typing import Any, Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Any
 
 from khaos.exceptions import ServiceShutdownError
 from khaos.scheduler.models import ScheduleConfig, ScheduledTask, TaskStatus
 from khaos.time_utils import utc_now_naive
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from khaos.audit.logger import AuditLogger
 
 logger = logging.getLogger(__name__)
 
@@ -149,7 +153,7 @@ class CronEngine:
         execution_lease_seconds: float = EXECUTION_LEASE_SECONDS,
         project_id: str = "",
         policy_digest: str = "",
-        audit_logger: "AuditLogger | None" = None,
+        audit_logger: AuditLogger | None = None,
     ):
         """
         参数：
@@ -374,12 +378,11 @@ class CronEngine:
         # → degraded mode (not silent empty state).
         try:
             await self._load_tasks()
-        except Exception:  # noqa: BLE001 — load failure is fatal
-            logger.error(
+        except Exception:
+            logger.exception(
                 "could not load scheduled tasks; entering DEGRADED "
                 "mode — new executions are refused until the DB is "
-                "recovered and the engine is restarted",
-                exc_info=True,
+                "recovered and the engine is restarted"
             )
             self._degraded = True
             self._loop_task = asyncio.create_task(self._tick_loop())
@@ -471,14 +474,13 @@ class CronEngine:
                     recovered_ids = set(running_ids) | set(expired_ids)
                     for tid in recovered_ids:
                         await self._reload_one_task_from_db(tid)
-            except Exception:  # noqa: BLE001 — recovery failure is fatal
-                logger.error(
+            except Exception:
+                logger.exception(
                     "could not recover running/expired tasks; "
                     "entering DEGRADED mode — new executions are "
                     "refused until the DB is recovered and the engine "
                     "is restarted.  Crashed tasks may be in an "
-                    "unknown state.",
-                    exc_info=True,
+                    "unknown state."
                 )
                 self._degraded = True
         # M4 batch 3.1.12 (HIGH-1): initialize the lease-sweep timer.
@@ -592,7 +594,7 @@ class CronEngine:
                     t.cancel()
                 if snapshot:
                     remaining = max(deadline - time.monotonic(), 0.0)
-                    done, pending = await asyncio.wait(
+                    _done, pending = await asyncio.wait(
                         snapshot, timeout=remaining,
                     )
                     if pending:
@@ -721,7 +723,7 @@ class CronEngine:
                             sorted(tids), exc, exc_info=exc,
                         )
                 reconcile_task.add_done_callback(_read_owner_exception)
-                done_rec, pending_rec = await asyncio.wait(
+                _done_rec, pending_rec = await asyncio.wait(
                     {reconcile_task}, timeout=remaining,
                 )
                 if pending_rec:
@@ -835,7 +837,7 @@ class CronEngine:
             lock = self._task_lock(task_id)
             try:
                 await asyncio.wait_for(lock.acquire(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # Couldn't get the lock — a concurrent op is holding
                 # it.  Skip this marker; stop() will retry.
                 logger.warning(
@@ -875,12 +877,12 @@ class CronEngine:
                     )
                 if not ok:
                     failures.append(task_id)
-            except Exception:  # noqa: BLE001 — collect and raise
-                logger.error(
+            except Exception:
+                logger.exception(
                     "cron engine: could not persist terminal state for "
                     "task %s — durability gap, refusing to continue "
                     "teardown",
-                    task_id, exc_info=True,
+                    task_id
                 )
                 failures.append(task_id)
             finally:
@@ -921,11 +923,11 @@ class CronEngine:
         """
         try:
             row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
-        except Exception:  # noqa: BLE001 — DB unreadable
-            logger.error(
+        except Exception:
+            logger.exception(
                 "cron task %s: reconcile could not read DB — "
                 "durability gap",
-                task_id, exc_info=True,
+                task_id
             )
             return False
         if row is None:
@@ -976,11 +978,11 @@ class CronEngine:
             # before raising.
             try:
                 row2 = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
-            except Exception:  # noqa: BLE001 — DB unreadable
-                logger.error(
+            except Exception:
+                logger.exception(
                     "cron task %s: reconcile CAS raised and read-back "
                     "failed — durability gap",
-                    task_id, exc_info=True,
+                    task_id
                 )
                 return False
             if (
@@ -997,10 +999,10 @@ class CronEngine:
                     task.lifecycle_version = marker.target_version
                     self._execution_epoch[task_id] = marker.target_version
                 return True
-            logger.error(
+            logger.exception(
                 "cron task %s: reconcile CAS raised and read-back "
                 "does not match target — durability gap",
-                task_id, exc_info=True,
+                task_id
             )
             return False
         if rowcount == 0:
@@ -1103,11 +1105,11 @@ class CronEngine:
                 expected_version=marker.expected_version,
                 operation_id=marker.operation_id,
             )
-        except Exception:  # noqa: BLE001 — DB error
-            logger.error(
+        except Exception:
+            logger.exception(
                 "cron task %s: executor reconcile CAS raised — "
                 "durability gap",
-                task_id, exc_info=True,
+                task_id
             )
             return False
         if ok:
@@ -1136,11 +1138,11 @@ class CronEngine:
         """
         try:
             row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
-        except Exception:  # noqa: BLE001 — DB unreadable
-            logger.error(
+        except Exception:
+            logger.exception(
                 "cron task %s: executor reconcile could not read "
                 "DB — durability gap; keeping marker",
-                task_id, exc_info=True,
+                task_id
             )
             # Re-place the marker if _finalize_task_state popped it.
             stored = self._pending_persistence.get(task_id)
@@ -1406,12 +1408,12 @@ class CronEngine:
                             operation_id=existing_marker.operation_id,
                             operation_type="pause",
                         )
-                    except Exception:  # noqa: BLE001 — stop() will retry
+                    except Exception:
                         persist_ok = False
-                        logger.error(
+                        logger.exception(
                             "cron task %s: could not persist paused "
                             "state on retry; will retry on stop()",
-                            task.name, exc_info=True,
+                            task.name,
                         )
                 # Prefer cancellation_pending (the live executor is
                 # the more dangerous failure — it's still producing
@@ -1446,11 +1448,11 @@ class CronEngine:
                     persist_ok = await self._persist_task_state(
                         task, operation_type="pause",
                     )
-                except Exception:  # noqa: BLE001 — stop() will retry
+                except Exception:
                     persist_ok = False
-                    logger.error(
+                    logger.exception(
                         "cron task %s: could not persist paused state; "
-                        "will retry on stop()", task.name, exc_info=True,
+                        "will retry on stop()", task.name,
                     )
             # H2 (round-10): return value reflects BOTH cancel and persist.
             if not cancel_ok:
@@ -1584,17 +1586,17 @@ class CronEngine:
                         next_run=new_next_run.isoformat()
                         if new_next_run else None,
                     )
-                except Exception:  # noqa: BLE001 — caller retries
+                except Exception:
                     # Could be commit-then-raise — read back to verify.
                     try:
                         row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
-                    except Exception:  # noqa: BLE001 — DB unreadable
-                        logger.error(
+                    except Exception:
+                        logger.exception(
                             "cron task %s: could not persist resumed "
                             "state AND could not read back; task "
                             "remains paused in memory; caller should "
                             "retry resume()",
-                            task.name, exc_info=True,
+                            task.name,
                         )
                         return "persistence_pending"
                     if (
@@ -1611,11 +1613,11 @@ class CronEngine:
                         )
                         rowcount = 1
                     else:
-                        logger.error(
+                        logger.exception(
                             "cron task %s: could not persist resumed "
                             "state; task remains paused in memory; "
                             "caller should retry resume()",
-                            task.name, exc_info=True,
+                            task.name,
                         )
                         return "persistence_pending"
                 if rowcount == 0:
@@ -1758,12 +1760,12 @@ class CronEngine:
                     persist_ok = await self._persist_task_state(
                         task, operation_type="remove",
                     )
-                except Exception:  # noqa: BLE001 — stop() will retry
+                except Exception:
                     persist_ok = False
-                    logger.error(
+                    logger.exception(
                         "cron task %s: could not persist cancelled state; "
                         "will retry on stop() — task retained in _tasks "
-                        "for reconcile", task.name, exc_info=True,
+                        "for reconcile", task.name,
                     )
             # Medium (round-10): do NOT pop if cancel failed — the
             # executor is still running.  Keep the tombstone (CANCELLED
@@ -1889,7 +1891,7 @@ class CronEngine:
             return
         try:
             await self.db.mark_scheduler_journal_applied(operation_id)
-        except Exception:  # noqa: BLE001 — stale NULL is harmless
+        except Exception:
             logger.warning(
                 "could not mark journal entry %s as applied — "
                 "next start() will re-scan and idempotently resolve",
@@ -1942,7 +1944,7 @@ class CronEngine:
             return
         try:
             entries = await self.db.list_pending_scheduler_journal_entries()
-        except Exception:  # noqa: BLE001 — journal unreadable
+        except Exception:
             logger.warning(
                 "cron engine start: could not read pending journal "
                 "entries — replay skipped; recovery will proceed",
@@ -1960,7 +1962,7 @@ class CronEngine:
             op_type = entry["operation_type"]
             try:
                 row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
-            except Exception:  # noqa: BLE001 — DB unreadable
+            except Exception:
                 logger.warning(
                     "cron engine start: could not read task %s for "
                     "journal replay of op %s — leaving entry pending",
@@ -2032,12 +2034,12 @@ class CronEngine:
                     operation_type=op_type,
                 )
                 replayed += 1
-            except Exception:  # noqa: BLE001 — replay failure
-                logger.error(
+            except Exception:
+                logger.exception(
                     "cron engine start: could not roll-forward journal "
                     "entry %s for task %s — leaving entry pending for "
                     "next start()",
-                    op_id, task_id, exc_info=True,
+                    op_id, task_id,
                 )
         if replayed or skipped_stale:
             logger.info(
@@ -2069,7 +2071,7 @@ class CronEngine:
             task.lifecycle_version = new_epoch
         return new_epoch
 
-    def _check_snapshot_drift(self, task: "ScheduledTask") -> str | None:
+    def _check_snapshot_drift(self, task: ScheduledTask) -> str | None:
         """M4 batch 3.1.16B-2 (CRITICAL): detect security-context drift.
 
         Compares the task's stored snapshot (``policy_digest`` +
@@ -2131,7 +2133,7 @@ class CronEngine:
             )
         return None
 
-    async def _quarantine_drifted_task(self, task: "ScheduledTask", reason: str) -> None:
+    async def _quarantine_drifted_task(self, task: ScheduledTask, reason: str) -> None:
         """M4 batch 3.1.16B-2 (CRITICAL): quarantine a drifted task.
 
         Marks the task as ``failed`` in memory and persists the state
@@ -2185,7 +2187,7 @@ class CronEngine:
                     task_id=task.id,
                     source_transport="cron-engine",
                 )
-            except Exception:  # noqa: BLE001 — audit must not block quarantine
+            except Exception:
                 logger.warning(
                     "cron task %s: audit log write failed for drift "
                     "quarantine — quarantine proceeds anyway",
@@ -2200,11 +2202,11 @@ class CronEngine:
                 await self._persist_task_state(
                     task, operation_type="quarantine",
                 )
-            except Exception:  # noqa: BLE001 — stop() will retry
-                logger.error(
+            except Exception:
+                logger.exception(
                     "cron task %s: could not persist FAILED state for "
                     "drifted task; will be retried by stop()",
-                    task.name, exc_info=True,
+                    task.name,
                 )
 
     @staticmethod
@@ -2299,7 +2301,7 @@ class CronEngine:
                 self._execute_tasks.pop(task_id, None)
             return True
         exec_task.cancel()
-        done, pending = await asyncio.wait(
+        done, _pending = await asyncio.wait(
             {exec_task}, timeout=_CANCEL_IN_FLIGHT_TIMEOUT,
         )
         if exec_task in done:
@@ -2484,11 +2486,10 @@ class CronEngine:
                                 # expired IDs in this iteration, and
                                 # do NOT fall through to due_candidates.
                                 break
-                except Exception:  # noqa: BLE001 — sweep failure is fatal
-                    logger.error(
+                except Exception:
+                    logger.exception(
                         "periodic lease sweep failed; entering "
-                        "DEGRADED mode",
-                        exc_info=True,
+                        "DEGRADED mode"
                     )
                     self._degraded = True
                     continue
@@ -2528,7 +2529,7 @@ class CronEngine:
                 lock = self._task_lock(task.id)
                 try:
                     await asyncio.wait_for(lock.acquire(), timeout=0.1)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     continue
                 try:
                     if task.status != TaskStatus.PENDING:
@@ -2651,11 +2652,11 @@ class CronEngine:
                     await self._persist_task_state(
                         task, operation_type="quarantine",
                     )
-                except Exception:  # noqa: BLE001 — stop() will retry
-                    logger.error(
+                except Exception:
+                    logger.exception(
                         "cron task %s: could not persist FAILED state "
                         "for unauthenticated-principal task",
-                        task.name, exc_info=True,
+                        task.name
                     )
             return
 
@@ -2710,24 +2711,24 @@ class CronEngine:
                         task.name,
                     )
                     return
-            except Exception:  # noqa: BLE001 — CRITICAL-1: fail-closed
+            except Exception:
                 # Claim raised — could be DB error OR commit-then-raise.
                 # Read back to verify whether the claim actually
                 # committed.  Only proceed if the DB shows EXACTLY our
                 # execution_id + RUNNING + expected version.
-                logger.error(
+                logger.exception(
                     "cron task %s: durable claim raised; verifying "
                     "whether the claim committed (commit-then-raise)",
-                    task.name, exc_info=True,
+                    task.name,
                 )
                 try:
                     row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
-                except Exception:  # noqa: BLE001 — DB unreadable
-                    logger.error(
+                except Exception:
+                    logger.exception(
                         "cron task %s: could not read back row after "
                         "claim exception; FAIL-CLOSED — refusing to "
                         "execute without confirmed lease",
-                        task.name, exc_info=True,
+                        task.name
                     )
                     return
                 if (
@@ -2795,9 +2796,7 @@ class CronEngine:
             task.run_count += 1
 
             # 检查是否是一次性任务或达到重复上限
-            if task.schedule.iso_time:
-                task.status = TaskStatus.COMPLETED
-            elif task.schedule.repeat and task.run_count >= task.schedule.repeat:
+            if task.schedule.iso_time or task.schedule.repeat and task.run_count >= task.schedule.repeat:
                 task.status = TaskStatus.COMPLETED
             else:
                 task.status = TaskStatus.PENDING
@@ -2829,15 +2828,15 @@ class CronEngine:
                     expected_version=version_at_start,
                     operation_id=execution_id,
                 )
-            except Exception:  # noqa: BLE001 — stop() will retry
-                logger.error(
+            except Exception:
+                logger.exception(
                     "cron task %s: could not finalize cancelled "
                     "terminal state; lease RETAINED for restart "
                     "recovery; will retry on stop()",
-                    task.name, exc_info=True,
+                    task.name,
                 )
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - terminal persistence failure is retained
             # H1 (round-9): epoch fence on the failure path too.
             if self._epoch_changed(task, epoch_at_start):
                 # M4 batch 3.1.12 (CRITICAL-2): control op won — do
@@ -2865,11 +2864,11 @@ class CronEngine:
                 expected_version=version_at_start,
                 operation_id=execution_id,
             )
-        except Exception:  # noqa: BLE001 — stop() will retry
-            logger.error(
+        except Exception:
+            logger.exception(
                 "cron task %s: could not finalize terminal state %s; "
                 "lease RETAINED for restart recovery; will retry on stop()",
-                task.name, task.status.value, exc_info=True,
+                task.name, task.status.value,
             )
             # M4 batch 3.1.11 (CRITICAL-2): DO NOT clear the lease
             # here — the terminal write failed, so the lease must
@@ -2898,7 +2897,7 @@ class CronEngine:
             await self.db.clear_scheduled_task_lease(
                 task.id, execution_id=execution_id,
             )
-        except Exception:  # noqa: BLE001 — lease cleanup is best-effort
+        except Exception:
             logger.debug(
                 "cron task %s: could not clear execution lease "
                 "(will expire naturally)",
@@ -3108,7 +3107,7 @@ class CronEngine:
         # DB gives us the ground truth.
         try:
             row = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
-        except Exception:  # noqa: BLE001 — DB unreadable
+        except Exception:
             # Can't read — can't supersede.  Place a marker so
             # ``stop()`` retries.  Use the in-memory version as a
             # best-effort (likely won't match, but the marker
@@ -3188,10 +3187,10 @@ class CronEngine:
                     target_version=target,
                 )
             except Exception:
-                logger.error(
+                logger.exception(
                     "cron task %s: could not write journal entry for "
                     "op %s; keeping marker for stop() retry",
-                    task.name, operation_id, exc_info=True,
+                    task.name, operation_id,
                 )
                 raise
         try:
@@ -3207,10 +3206,7 @@ class CronEngine:
             # The CAS raised — could be commit-then-raise.  Read back
             # to verify.  If the DB is already at ``target_version``
             # with the desired status, treat as success.
-            try:
-                row2 = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
-            except Exception:  # noqa: BLE001 — DB unreadable
-                raise
+            row2 = await self.db.get_scheduled_task(task.id, project_id=self._project_id)
             if (
                 row2 is not None
                 and int(row2.get("lifecycle_version", 0)) == target
@@ -3351,12 +3347,12 @@ class CronEngine:
                 return
             try:
                 row = await self.db.get_scheduled_task(task_id, project_id=self._project_id)
-            except Exception:  # noqa: BLE001 — DB unreadable
+            except Exception:
                 self._degraded = True
-                logger.error(
+                logger.exception(
                     "cron engine: could not reload task %s from DB "
                     "during sweep; entering DEGRADED mode",
-                    task_id, exc_info=True,
+                    task_id
                 )
                 return
             if row is None:
@@ -3399,7 +3395,7 @@ class CronEngine:
                 # discarded (the lease sweep's FAILED state wins).
                 self._bump_epoch(task_id)
                 exec_task.cancel()
-                done, pending = await asyncio.wait(
+                done, _pending = await asyncio.wait(
                     {exec_task}, timeout=_CANCEL_IN_FLIGHT_TIMEOUT,
                 )
                 if exec_task not in done:
@@ -3430,12 +3426,12 @@ class CronEngine:
                 recovered = await self.db.recover_one_expired_lease(
                     task_id, now_iso=now_iso,
                 )
-            except Exception:  # noqa: BLE001 — DB error
+            except Exception:
                 self._degraded = True
-                logger.error(
+                logger.exception(
                     "cron task %s: lease sweep could not write FAILED; "
                     "entering DEGRADED mode",
-                    task_id, exc_info=True,
+                    task_id
                 )
                 # M4 batch 3.1.14 (CRITICAL-1): return False so the
                 # tick loop's ``if not ok: break`` fires — no other
@@ -3534,7 +3530,7 @@ def _task_from_row(row: dict) -> ScheduledTask | None:
     )
 
 
-def _parse_dt(value) -> Optional[datetime]:
+def _parse_dt(value) -> datetime | None:
     if not value:
         return None
     try:

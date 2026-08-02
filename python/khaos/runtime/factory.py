@@ -19,11 +19,12 @@ from khaos.audit import (
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
 )
+from khaos.coding.execution import BackendSelector, ExecutionService
 from khaos.coding.task_manager import TaskManager
 from khaos.coding.verify_fix import VerifyFixLoop
 from khaos.coding.workspace.manager import WorkspaceManager
 from khaos.coding.workspace.office_authority import OfficeMutationAuthority
-from khaos.coding.execution import BackendSelector, ExecutionService
+from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.modes import ModeManager
@@ -33,7 +34,6 @@ from khaos.rust_bridge import get_token_engine
 from khaos.security.middleware import SecurityMiddleware
 from khaos.security.network_guard import NetworkGuard
 from khaos.security.sandbox import Sandbox
-from khaos.db.state_root import project_id as compute_project_id
 from khaos.skills import SkillGenerator, SkillManager
 from khaos.tools import create_runtime_registry
 from khaos.tools.scheduler import ToolScheduler
@@ -358,15 +358,9 @@ class RuntimeResult:
                 # cancellation of the *caller* does not abort the cleanup
                 # itself.
                 self._close_task = _asyncio.ensure_future(self._run_close())
-                try:
-                    await _asyncio.shield(self._close_task)
-                except _asyncio.CancelledError:
-                    # The caller was cancelled, but the cleanup task keeps
-                    # running.  Re-raise so the caller's cancellation
-                    # propagates; a subsequent aclose() will await the
-                    # still-running task (or, if the task self-cancelled and
-                    # cleared ``_close_task``, create a fresh one).
-                    raise
+                # The caller's cancellation propagates while the shielded
+                # cleanup task remains alive for a later ``aclose()`` retry.
+                await _asyncio.shield(self._close_task)
                 # Check terminal state after the task completed.
                 if self._closed:
                     return
@@ -580,6 +574,27 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     else:
         runtime_registry = create_runtime_registry()
     exec_tool_names = runtime_registry.exec_tool_names()
+    # Construct the shared audit repository before any component that can
+    # emit audit events.  Permission and error paths must use this same
+    # anchored writer; constructing it later allowed direct DB writers to
+    # bypass the chain authority.
+    audit_logger = cfg.audit_logger
+    owns_audit_logger = audit_logger is None
+    if audit_logger is None and effective_policy.audit_enabled:
+        audit_logger = AuditLogger(
+            cfg.db,
+            log_path=resolve_safe_audit_log_path(effective_policy.audit_log_path),
+            anchor_path=(
+                resolve_safe_audit_anchor_path(project_id)
+                if os.environ.get("KHAOS_DEV_MODE") != "1"
+                else None
+            ),
+            principal_id=cfg.principal_id,
+            runtime_id=cfg.runtime_id,
+            policy_digest=effective_policy.digest,
+            project_id=project_id,
+        )
+        await audit_logger.verify_anchor()
     permission_engine = PermissionEngine(
         cfg.db,
         commands_require_approval=effective_policy.commands_require_approval,
@@ -588,6 +603,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         policy_digest=effective_policy.digest,
         runtime_id=cfg.runtime_id,
         exec_tool_names=exec_tool_names,
+        audit_logger=audit_logger,
     )
     await permission_engine.load_rules()
     memory_manager = cfg.memory_manager or MemoryManager(
@@ -685,8 +701,6 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     # end (where it is stored so ``aclose`` can close its fd).  Previously
     # the variable was only assigned inside the ``if scheduler is None``
     # block, so RuntimeResult couldn't reference it — the fd leaked.
-    audit_logger = cfg.audit_logger
-    owns_audit_logger = audit_logger is None
     scheduler = cfg.tool_scheduler
     if scheduler is None:
         # B1: when a tool allowlist is configured (SubAgent path), prune the
@@ -700,33 +714,6 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # Round-14 §7: reuse the registry already built for exec_tool_names
         # derivation above, instead of constructing a second identical one.
         registry = runtime_registry
-        # M1: construct an AuditLogger from the EffectivePolicy when the
-        # caller didn't inject one.  Previously only the gRPC server path
-        # built an AuditLogger; CLI / TUI / tests passed ``None``, so
-        # ``audit_enabled`` / ``audit_log_path`` were effectively ignored
-        # outside the server.  Now every entry point uses the same trust
-        # boundary (H2: ``resolve_safe_audit_log_path`` constrains the path
-        # to ``~/.khaos/audit/`` with O_NOFOLLOW + owner/mode checks).
-        if audit_logger is None and effective_policy.audit_enabled:
-            audit_logger = AuditLogger(
-                cfg.db,
-                log_path=resolve_safe_audit_log_path(
-                    effective_policy.audit_log_path
-                ),
-                anchor_path=(
-                    resolve_safe_audit_anchor_path(project_id)
-                    if os.environ.get("KHAOS_DEV_MODE") != "1"
-                    else None
-                ),
-                principal_id=cfg.principal_id,
-                runtime_id=cfg.runtime_id,
-                policy_digest=effective_policy.digest,
-                # M4 batch 3.1.16A-5-1b: stamp the project identity on
-                # every audit row so records are cryptographically tied
-                # to the project that produced them.
-                project_id=project_id,
-            )
-            await audit_logger.verify_anchor()
         scheduler = ToolScheduler(
             registry, permission_engine,
             security_middleware=SecurityMiddleware(
@@ -778,6 +765,7 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
             compressor=compressor,
             principal_id=cfg.principal_id,
             project_id=project_id,
+            audit_logger=audit_logger,
         ),
         token_engine=get_token_engine(),
         skill_manager=skill_manager if len(skill_manager.registry) else None,

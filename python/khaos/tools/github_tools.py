@@ -293,8 +293,7 @@ def _parse_repository(remote_url: str) -> tuple[str, str]:
             raise PermissionError("unsupported GitHub repository remote")
         host, path = parsed.hostname, parsed.path
     repository = path.strip("/")
-    if repository.endswith(".git"):
-        repository = repository[:-4]
+    repository = repository.removesuffix(".git")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
         raise PermissionError("invalid GitHub repository identity")
     return host.lower(), repository

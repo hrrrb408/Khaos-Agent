@@ -9,10 +9,13 @@ import json
 import logging
 import time
 import uuid
-from dataclasses import dataclass, field, replace
+from collections.abc import Awaitable, Callable
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any
 
+from khaos.agent.approval import ApprovalBinding
+from khaos.exceptions import PermissionDeniedError
 from khaos.permissions import (
     ApprovalMode,
     GrantLifetime,
@@ -25,12 +28,9 @@ from khaos.permissions.resource import (
     resolve_authorization_resource,
 )
 from khaos.permissions.rules import typed_rule_from_authorization_resource
-from khaos.agent.approval import ApprovalBinding
-from khaos.exceptions import PermissionDeniedError
 from khaos.security.middleware import SecurityMiddleware
 from khaos.tools.registry import ToolInvocationBroker, ToolRegistry
 from khaos.tools.terminal_tools import BackgroundProcessAuthority
-
 
 ConfirmCallback = Callable[[dict], Awaitable[dict | bool] | dict | bool]
 
@@ -39,7 +39,11 @@ logger = logging.getLogger(__name__)
 EFFECT_NOT_STARTED = "not_started"
 EFFECT_NOT_APPLIED = "not_applied"
 EFFECT_APPLIED = "applied"
+EFFECT_PARTIAL = "partial"
 EFFECT_UNKNOWN = "unknown"
+# Public spelling for callers that prefer outcome terminology.  Keep the
+# historical value for wire compatibility with existing ToolResult clients.
+EFFECT_NO_EFFECT = EFFECT_NOT_APPLIED
 
 DELIVERY_COMPLETE = "complete"
 DELIVERY_DEGRADED = "degraded"
@@ -126,6 +130,22 @@ def _normalize_confirmation(value: object) -> dict[str, Any]:
 
 
 @dataclass
+class EffectOutcome:
+    """Explicit post-dispatch effect classification.
+
+    The scheduler never derives this from a permission level.  Tool
+    definitions declare the normal outcome, while exceptions/cancellation
+    downgrade side-effecting operations to ``unknown`` and retain the
+    reconciliation hint.
+    """
+
+    status: str
+    effect_id: str = ""
+    reconciliation_hint: str = ""
+    output: Any = ""
+
+
+@dataclass
 class ToolResult:
     """Normalized result for one tool call."""
 
@@ -144,6 +164,7 @@ class ToolResult:
     delivery_status: str = DELIVERY_COMPLETE
     warning: str = ""
     effect_id: str = ""
+    reconciliation_hint: str = ""
     retry_safe: bool = True
 
 
@@ -154,6 +175,18 @@ class _IdempotencyRecord:
     arguments_digest: str
     result: ToolResult
     stored_at: float = field(default_factory=time.monotonic)
+
+
+@dataclass
+class _OperationClaim:
+    """In-process view of a durable tool-operation claim."""
+
+    operation_id: str
+    owner_token: str
+    effect_id: str
+    arguments_digest: str = ""
+    result: ToolResult | None = None
+    wait_event: asyncio.Event | None = None
 
 
 @dataclass
@@ -227,7 +260,7 @@ class ToolBudget:
     def validate_batch(self, size: int) -> bool:
         return 0 <= size <= self.max_batch_calls
 
-    async def reserve(self, *, parallel: bool = False) -> "ToolBudgetReservation | None":
+    async def reserve(self, *, parallel: bool = False) -> ToolBudgetReservation | None:
         async with self._lock:
             if self._call_count + self._reserved_calls >= self.max_calls:
                 return None
@@ -248,7 +281,7 @@ class ToolBudget:
             return ToolBudgetReservation(self, output_limit, parallel)
 
     async def _finish(
-        self, reservation: "ToolBudgetReservation", *, output_chars: int | None
+        self, reservation: ToolBudgetReservation, *, output_chars: int | None
     ) -> None:
         async with self._lock:
             if not reservation.active:
@@ -414,6 +447,12 @@ class ToolScheduler:
         # ``idempotency_key`` at the tool-call envelope level.
         self._idempotency_lock = asyncio.Lock()
         self._idempotency_results: dict[str, _IdempotencyRecord] = {}
+        # A durable row is the authority; these maps only coordinate
+        # duplicate callers in this process.  A missing in-process owner on a
+        # restart is treated as UNKNOWN and is never replayed automatically.
+        self._operation_events: dict[str, asyncio.Event] = {}
+        self._operation_claims: dict[str, _OperationClaim] = {}
+        self._operation_claim_lock = asyncio.Lock()
 
     def set_office_authority(self, authority: Any) -> None:
         """Register the shared OfficeMutationAuthority (called at startup)."""
@@ -997,6 +1036,8 @@ class ToolScheduler:
         handler_started = False
         effect_id = ""
         effect_status = EFFECT_NOT_STARTED
+        reconciliation_hint = str(getattr(tool, "reconciliation_hint", "") or "")
+        operation_claim: _OperationClaim | None = None
         try:
             await self.permission_engine.validate_dispatch_epoch(
                 int(call.get("_authorization_epoch", 0))
@@ -1083,13 +1124,31 @@ class ToolScheduler:
                     warning=warning if audit_error else "",
                 )
 
-            cached = await self._get_idempotent_result(
-                call, session_id=session_id, tool_context=tool_context
+            operation_claim = await self._claim_operation(
+                call,
+                tool=tool,
+                session_id=session_id,
+                tool_context=tool_context,
             )
-            if cached is not None:
+            if operation_claim is not None and operation_claim.result is not None:
                 await self._release_best_effort(reservation)
                 return replace(
-                    cached,
+                    operation_claim.result,
+                    tool_call_id=call["id"],
+                    name=tool.name,
+                    arguments=call["arguments"],
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                )
+            if operation_claim is not None and operation_claim.wait_event is not None:
+                await self._release_best_effort(reservation)
+                waited = await self._wait_for_operation(
+                    operation_claim,
+                    call=call,
+                    tool=tool,
+                    timeout=float(tool.timeout) + 5.0,
+                )
+                return replace(
+                    waited,
                     tool_call_id=call["id"],
                     name=tool.name,
                     arguments=call["arguments"],
@@ -1100,7 +1159,11 @@ class ToolScheduler:
             # handler.  If the handler times out or raises after a partial
             # mutation, the caller still receives an identifier that must not
             # be treated as a retryable ordinary failure.
-            effect_id = uuid.uuid4().hex
+            effect_id = (
+                operation_claim.effect_id
+                if operation_claim is not None
+                else uuid.uuid4().hex
+            )
             handler_started = True
             invocation_context = dict(tool_context)
             invocation_context["process_authority"] = self.process_authority
@@ -1115,39 +1178,88 @@ class ToolScheduler:
                 invocation_context["office_authority"] = office_authority
             if call.get("_approval_context") is not None:
                 invocation_context["approval_context"] = call["_approval_context"]
+            invocation_context["effect_id"] = effect_id
             output = await asyncio.wait_for(
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
                 timeout=tool.timeout,
             )
-            effect_status = (
-                EFFECT_NOT_APPLIED
-                if tool.permission_level == "read"
-                else EFFECT_APPLIED
+            output, effect_status, effect_id, reconciliation_hint = (
+                self._normalize_effect_outcome(
+                    output,
+                    default_status=self._declared_effect_status(tool),
+                    default_effect_id=effect_id,
+                    default_reconciliation_hint=reconciliation_hint,
+                )
             )
+            if operation_claim is not None:
+                await self._update_operation_effect_id(operation_claim, effect_id)
         except asyncio.CancelledError:
             await self._release_best_effort(reservation)
             if handler_started:
-                await self._audit_best_effort(
+                effect_status = self._interrupted_effect_status(tool)
+                audit_error = await self._audit_best_effort(
                     tool.name,
                     target,
                     "cancelled",
                     {
                         "tool_call_id": call["id"],
                         "effect_id": effect_id,
-                        "effect_status": EFFECT_UNKNOWN,
+                        "effect_status": effect_status,
+                        "reconciliation_hint": reconciliation_hint,
                     },
                     session_id,
+                )
+                result = ToolResult(
+                    tool_call_id=call["id"],
+                    name=tool.name,
+                    success=False,
+                    error="tool execution cancelled after dispatch",
+                    duration_ms=int((time.monotonic() - start) * 1000),
+                    arguments=call["arguments"],
+                    effect_status=effect_status,
+                    delivery_status=(
+                        DELIVERY_AUDIT_DEGRADED
+                        if audit_error else DELIVERY_COMPLETE
+                    ),
+                    warning=(
+                        "audit persistence failed: " + audit_error
+                        if audit_error else
+                        "effect outcome is uncertain; reconcile before retry"
+                    ),
+                    effect_id=effect_id,
+                    reconciliation_hint=reconciliation_hint,
+                    retry_safe=False,
+                )
+                await self._finish_operation(
+                    operation_claim,
+                    result,
+                    terminal_status="unknown",
+                )
+                await self._store_idempotent_result(
+                    call,
+                    session_id=session_id,
+                    tool_context=tool_context,
+                    result=result,
                 )
                 logger.error(
                     "tool execution cancelled after handler dispatch: tool=%s effect_id=%s",
                     tool.name,
                     effect_id,
                 )
-            raise
-        except Exception as exc:
+                return result
+            return ToolResult(
+                tool_call_id=call["id"],
+                name=tool.name,
+                success=False,
+                error="tool execution cancelled before dispatch",
+                arguments=call["arguments"],
+                effect_status=EFFECT_NOT_STARTED,
+                retry_safe=True,
+            )
+        except Exception as exc:  # noqa: BLE001 - tool execution is an error result boundary
             await self._release_best_effort(reservation)
             if handler_started:
-                effect_status = EFFECT_UNKNOWN
+                effect_status = self._exception_effect_status(tool)
             audit_error = await self._audit_best_effort(
                 tool.name,
                 target,
@@ -1157,6 +1269,7 @@ class ToolScheduler:
                     "tool_call_id": call["id"],
                     "effect_id": effect_id,
                     "effect_status": effect_status,
+                    "reconciliation_hint": reconciliation_hint,
                 },
                 session_id,
             )
@@ -1178,7 +1291,17 @@ class ToolScheduler:
                 ),
                 warning=warning,
                 effect_id=effect_id,
+                reconciliation_hint=reconciliation_hint,
                 retry_safe=not handler_started,
+            )
+            await self._finish_operation(
+                operation_claim,
+                result,
+                terminal_status=(
+                    "unknown"
+                    if effect_status in {EFFECT_UNKNOWN, EFFECT_PARTIAL}
+                    else "completed"
+                ),
             )
             if handler_started:
                 await self._store_idempotent_result(
@@ -1200,7 +1323,7 @@ class ToolScheduler:
             )
             # Redaction can change length, so commit the post-redaction size.
             output_chars = _measure_tool_output(output, reservation.output_limit)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - delivery failure is reported separately
             await self._release_best_effort(reservation)
             delivery_status = DELIVERY_DEGRADED
             warning = f"effect completed but result delivery failed: {exc}"
@@ -1213,13 +1336,14 @@ class ToolScheduler:
                     "effect_id": effect_id,
                     "effect_status": effect_status,
                     "delivery_status": delivery_status,
+                    "reconciliation_hint": reconciliation_hint,
                 },
                 session_id,
             )
             if audit_error:
                 delivery_status = DELIVERY_AUDIT_DEGRADED
                 warning += f"; audit persistence failed: {audit_error}"
-            effect_applied = effect_status != EFFECT_NOT_APPLIED
+            effect_applied = effect_status in {EFFECT_APPLIED, EFFECT_PARTIAL}
             result = ToolResult(
                 tool_call_id=call["id"],
                 name=tool.name,
@@ -1237,7 +1361,17 @@ class ToolScheduler:
                 delivery_status=delivery_status,
                 warning=warning,
                 effect_id=effect_id,
+                reconciliation_hint=reconciliation_hint,
                 retry_safe=effect_status == EFFECT_NOT_APPLIED,
+            )
+            await self._finish_operation(
+                operation_claim,
+                result,
+                terminal_status=(
+                    "unknown"
+                    if effect_status in {EFFECT_UNKNOWN, EFFECT_PARTIAL}
+                    else "completed"
+                ),
             )
             await self._store_idempotent_result(
                 call, session_id=session_id, tool_context=tool_context, result=result
@@ -1248,6 +1382,7 @@ class ToolScheduler:
             "tool_call_id": call["id"],
             "effect_id": effect_id,
             "effect_status": effect_status,
+            "reconciliation_hint": reconciliation_hint,
             "delivery_status": DELIVERY_COMPLETE,
         }
         if resource is not None:
@@ -1264,7 +1399,7 @@ class ToolScheduler:
             warnings.append(str(call["_remember_warning"]))
         try:
             await reservation.commit(output_chars)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - budget accounting degrades delivery
             await self._release_best_effort(reservation)
             delivery_status = DELIVERY_DEGRADED
             warnings.append(f"budget accounting failed: {exc}")
@@ -1285,7 +1420,7 @@ class ToolScheduler:
         if remember_rule is not None:
             try:
                 await self.permission_engine.grant_rule(remember_rule)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - permission persistence degrades delivery
                 delivery_status = (
                     DELIVERY_AUDIT_DEGRADED
                     if delivery_status == DELIVERY_AUDIT_DEGRADED
@@ -1304,12 +1439,442 @@ class ToolScheduler:
             delivery_status=delivery_status,
             warning="; ".join(warnings),
             effect_id=effect_id,
+            reconciliation_hint=reconciliation_hint,
             retry_safe=effect_status == EFFECT_NOT_APPLIED,
+        )
+        await self._finish_operation(
+            operation_claim,
+            result,
+            terminal_status=(
+                "unknown"
+                if effect_status in {EFFECT_UNKNOWN, EFFECT_PARTIAL}
+                else "completed"
+            ),
         )
         await self._store_idempotent_result(
             call, session_id=session_id, tool_context=tool_context, result=result
         )
         return result
+
+    @staticmethod
+    def _declared_effect_status(tool: Any) -> str:
+        """Read the explicit tool contract; never infer from permission."""
+        status = str(getattr(tool, "effect_status", "") or EFFECT_UNKNOWN)
+        if status not in {
+            EFFECT_NOT_APPLIED, EFFECT_APPLIED, EFFECT_PARTIAL, EFFECT_UNKNOWN
+        }:
+            return EFFECT_UNKNOWN
+        return status
+
+    @classmethod
+    def _exception_effect_status(cls, tool: Any) -> str:
+        """A failed side-effecting handler is unresolved, not retryable."""
+        declared = cls._declared_effect_status(tool)
+        return EFFECT_NOT_APPLIED if declared == EFFECT_NOT_APPLIED else EFFECT_UNKNOWN
+
+    @classmethod
+    def _interrupted_effect_status(cls, tool: Any) -> str:
+        """Classify cancellation after dispatch conservatively."""
+        return cls._exception_effect_status(tool)
+
+    @staticmethod
+    def _normalize_effect_outcome(
+        value: Any,
+        *,
+        default_status: str,
+        default_effect_id: str,
+        default_reconciliation_hint: str,
+    ) -> tuple[Any, str, str, str]:
+        """Accept an explicit handler outcome without guessing its effect.
+
+        Legacy handlers may still return their payload directly and use the
+        registered normal effect declaration.  New mutation handlers can
+        return ``EffectOutcome`` to report a more precise status after the
+        external operation has actually run.
+        """
+        if not isinstance(value, EffectOutcome):
+            return (
+                value,
+                default_status,
+                default_effect_id,
+                default_reconciliation_hint,
+            )
+        status = str(value.status or EFFECT_UNKNOWN)
+        if status not in {
+            EFFECT_NOT_APPLIED,
+            EFFECT_APPLIED,
+            EFFECT_PARTIAL,
+            EFFECT_UNKNOWN,
+        }:
+            raise ValueError(f"invalid EffectOutcome status: {status!r}")
+        effect_id = str(value.effect_id or default_effect_id)
+        if len(effect_id) > 256 or any(char in effect_id for char in "\x00\r\n"):
+            raise ValueError("invalid EffectOutcome effect_id")
+        reconciliation_hint = str(
+            value.reconciliation_hint or default_reconciliation_hint
+        )
+        if len(reconciliation_hint) > 4096 or any(
+            char in reconciliation_hint for char in "\x00\r\n"
+        ):
+            raise ValueError("invalid EffectOutcome reconciliation_hint")
+        return value.output, status, effect_id, reconciliation_hint
+
+    @staticmethod
+    def _serialize_operation_result(result: ToolResult) -> str:
+        return json.dumps(asdict(result), ensure_ascii=False, sort_keys=True)
+
+    @staticmethod
+    def _deserialize_operation_result(
+        row: dict[str, Any],
+        *,
+        call: dict,
+        tool: Any,
+    ) -> ToolResult:
+        payload = str(row.get("result_json") or "")
+        if payload:
+            try:
+                value = json.loads(payload)
+                if isinstance(value, dict):
+                    fields = set(ToolResult.__dataclass_fields__)
+                    values = {key: item for key, item in value.items() if key in fields}
+                    return ToolResult(
+                        tool_call_id=str(values.get("tool_call_id") or call["id"]),
+                        name=str(values.get("name") or tool.name),
+                        success=bool(values.get("success", False)),
+                        output=values.get("output", ""),
+                        error=str(values.get("error") or ""),
+                        duration_ms=int(values.get("duration_ms") or 0),
+                        arguments=values.get("arguments") or call.get("arguments", {}),
+                        effect_status=str(
+                            values.get("effect_status")
+                            or row.get("effect_status")
+                            or EFFECT_UNKNOWN
+                        ),
+                        delivery_status=str(
+                            values.get("delivery_status") or DELIVERY_COMPLETE
+                        ),
+                        warning=str(values.get("warning") or ""),
+                        effect_id=str(
+                            values.get("effect_id") or row.get("effect_id") or ""
+                        ),
+                        reconciliation_hint=str(
+                            values.get("reconciliation_hint")
+                            or row.get("reconciliation_hint")
+                            or ""
+                        ),
+                        retry_safe=bool(values.get("retry_safe", False)),
+                    )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                logger.error(
+                    "durable tool operation result is malformed: operation_id=%s",
+                    row.get("operation_id"),
+                )
+        effect_status = str(row.get("effect_status") or EFFECT_UNKNOWN)
+        return ToolResult(
+            tool_call_id=call["id"],
+            name=tool.name,
+            success=False,
+            error="durable operation is unresolved; reconcile before retry",
+            arguments=call.get("arguments", {}),
+            effect_status=effect_status,
+            delivery_status=DELIVERY_DEGRADED,
+            warning=(
+                str(row.get("reconciliation_hint") or "")
+                or "the previous process may have stopped after dispatch"
+            ),
+            effect_id=str(row.get("effect_id") or ""),
+            reconciliation_hint=str(row.get("reconciliation_hint") or ""),
+            retry_safe=False,
+        )
+
+    async def _claim_operation(
+        self,
+        call: dict,
+        *,
+        tool: Any,
+        session_id: str | None,
+        tool_context: dict[str, Any],
+    ) -> _OperationClaim | None:
+        """Serialize durable claims with local owner registration."""
+        async with self._operation_claim_lock:
+            return await self._claim_operation_locked(
+                call,
+                tool=tool,
+                session_id=session_id,
+                tool_context=tool_context,
+            )
+
+    async def _claim_operation_locked(
+        self,
+        call: dict,
+        *,
+        tool: Any,
+        session_id: str | None,
+        tool_context: dict[str, Any],
+    ) -> _OperationClaim | None:
+        """Claim an idempotent operation in SQLite before handler entry."""
+        operation_id = self._idempotency_scope(
+            call, session_id=session_id, tool_context=tool_context
+        )
+        if not operation_id:
+            return None
+        arguments_digest = _canonical_digest(call.get("arguments", {}))
+        active_event = self._operation_events.get(operation_id)
+        if active_event is not None:
+            active_claim = self._operation_claims.get(operation_id)
+            if (
+                active_claim is not None
+                and active_claim.arguments_digest != arguments_digest
+            ):
+                raise PermissionDeniedError(
+                    "idempotency key was reused with different tool arguments"
+                )
+            return _OperationClaim(
+                operation_id=operation_id,
+                owner_token="",
+                effect_id=(active_claim.effect_id if active_claim else ""),
+                arguments_digest=arguments_digest,
+                wait_event=active_event,
+            )
+
+        owner_token = uuid.uuid4().hex
+        effect_id = uuid.uuid4().hex
+        db = getattr(self.permission_engine, "db", None)
+        claim_method = getattr(db, "claim_tool_operation", None)
+        if callable(claim_method):
+            row = await claim_method(
+                operation_id=operation_id,
+                tool_name=tool.name,
+                arguments_digest=arguments_digest,
+                effect_id=effect_id,
+                owner_token=owner_token,
+                principal_id=str(tool_context.get("principal_id") or ""),
+                project_id=str(tool_context.get("project_id") or ""),
+                session_id=str(session_id or tool_context.get("session_id") or ""),
+                task_id=str(tool_context.get("task_id") or ""),
+                workspace_id=str(tool_context.get("workspace_id") or ""),
+            )
+            if row.get("state") == "conflict":
+                raise PermissionDeniedError(
+                    "idempotency key was reused with different tool arguments"
+                )
+            if row.get("state") == "claimed":
+                event = asyncio.Event()
+                self._operation_events[operation_id] = event
+                claim = _OperationClaim(
+                    operation_id=operation_id,
+                    owner_token=owner_token,
+                    effect_id=str(row["effect_id"]),
+                    arguments_digest=arguments_digest,
+                    wait_event=None,
+                )
+                self._operation_claims[operation_id] = claim
+                return claim
+            if row.get("status") != "running":
+                return _OperationClaim(
+                    operation_id=operation_id,
+                    owner_token="",
+                    effect_id=str(row.get("effect_id") or ""),
+                    arguments_digest=arguments_digest,
+                    result=self._deserialize_operation_result(
+                        row, call=call, tool=tool
+                    ),
+                )
+            # A running row without a local owner is an orphan from another
+            # process or a prior crash.  Quarantine it instead of invoking
+            # the handler a second time.
+            orphan = self._deserialize_operation_result(row, call=call, tool=tool)
+            orphan = replace(
+                orphan,
+                effect_status=EFFECT_UNKNOWN,
+                success=False,
+                error="durable operation was running without a live owner",
+                retry_safe=False,
+                warning=(
+                    "previous execution ownership was lost; reconcile before retry"
+                ),
+                reconciliation_hint=(
+                    str(row.get("reconciliation_hint") or "")
+                    or "inspect the external side effect using effect_id"
+                ),
+            )
+            await db.mark_tool_operation_unknown(
+                operation_id=operation_id,
+                reconciliation_hint=orphan.reconciliation_hint,
+                result_json=self._serialize_operation_result(orphan),
+            )
+            return _OperationClaim(
+                operation_id=operation_id,
+                owner_token="",
+                effect_id=str(row.get("effect_id") or ""),
+                arguments_digest=arguments_digest,
+                result=orphan,
+            )
+
+        # Direct unit/library schedulers may use a small fake DB.  Preserve
+        # local usability, but close the old concurrent duplicate race with
+        # the same claim/event protocol.  Production runtimes always use the
+        # durable branch above.
+        async with self._idempotency_lock:
+            record = self._idempotency_results.get(operation_id)
+            if record is not None:
+                if record.arguments_digest != arguments_digest:
+                    raise PermissionDeniedError(
+                        "idempotency key was reused with different tool arguments"
+                    )
+                return _OperationClaim(
+                    operation_id=operation_id,
+                    owner_token="",
+                    effect_id=record.result.effect_id,
+                    arguments_digest=arguments_digest,
+                    result=record.result,
+                )
+            event = self._operation_events.get(operation_id)
+            if event is not None:
+                active_claim = self._operation_claims.get(operation_id)
+                if (
+                    active_claim is not None
+                    and active_claim.arguments_digest != arguments_digest
+                ):
+                    raise PermissionDeniedError(
+                        "idempotency key was reused with different tool arguments"
+                    )
+                return _OperationClaim(
+                    operation_id=operation_id,
+                    owner_token="",
+                    effect_id=(active_claim.effect_id if active_claim else ""),
+                    arguments_digest=arguments_digest,
+                    wait_event=event,
+                )
+            event = asyncio.Event()
+            self._operation_events[operation_id] = event
+            claim = _OperationClaim(
+                operation_id=operation_id,
+                owner_token=owner_token,
+                effect_id=effect_id,
+                arguments_digest=arguments_digest,
+            )
+            self._operation_claims[operation_id] = claim
+            return claim
+
+    async def _wait_for_operation(
+        self,
+        claim: _OperationClaim,
+        *,
+        call: dict,
+        tool: Any,
+        timeout: float,
+    ) -> ToolResult:
+        """Wait for an in-process owner, then disclose if it did not finish."""
+        event = claim.wait_event
+        if event is not None:
+            try:
+                await asyncio.wait_for(event.wait(), timeout=max(1.0, timeout))
+            except TimeoutError:
+                return ToolResult(
+                    tool_call_id=call["id"],
+                    name=tool.name,
+                    success=False,
+                    error="idempotent operation did not finish before the wait deadline",
+                    arguments=call.get("arguments", {}),
+                    effect_status=EFFECT_UNKNOWN,
+                    delivery_status=DELIVERY_DEGRADED,
+                    warning="reconcile effect_id before retry",
+                    effect_id=claim.effect_id,
+                    reconciliation_hint="the original handler may still be running",
+                    retry_safe=False,
+                )
+        operation_id = claim.operation_id
+        result = self._idempotency_results.get(operation_id)
+        if result is not None:
+            return result.result
+        db = getattr(self.permission_engine, "db", None)
+        claim_method = getattr(db, "claim_tool_operation", None)
+        if callable(claim_method):
+            row = await claim_method(
+                operation_id=operation_id,
+                tool_name=tool.name,
+                arguments_digest=_canonical_digest(call.get("arguments", {})),
+                effect_id=uuid.uuid4().hex,
+                owner_token=uuid.uuid4().hex,
+            )
+            if row.get("status") != "running":
+                return self._deserialize_operation_result(row, call=call, tool=tool)
+        return ToolResult(
+            tool_call_id=call["id"],
+            name=tool.name,
+            success=False,
+            error="idempotent operation completed without a durable result",
+            arguments=call.get("arguments", {}),
+            effect_status=EFFECT_UNKNOWN,
+            delivery_status=DELIVERY_DEGRADED,
+            warning="reconcile effect_id before retry",
+            effect_id=claim.effect_id,
+            reconciliation_hint="durable result missing",
+            retry_safe=False,
+        )
+
+    async def _finish_operation(
+        self,
+        claim: _OperationClaim | None,
+        result: ToolResult,
+        *,
+        terminal_status: str,
+    ) -> None:
+        """Persist a terminal result and wake duplicate callers."""
+        if claim is None:
+            return
+        db = getattr(self.permission_engine, "db", None)
+        complete_method = getattr(db, "complete_tool_operation", None)
+        if callable(complete_method) and claim.owner_token:
+            updated = await complete_method(
+                operation_id=claim.operation_id,
+                owner_token=claim.owner_token,
+                status=terminal_status,
+                effect_status=result.effect_status,
+                reconciliation_hint=result.reconciliation_hint,
+                result_json=self._serialize_operation_result(result),
+            )
+            if not updated:
+                logger.error(
+                    "durable tool operation lost ownership before finalize: %s",
+                    claim.operation_id,
+                )
+        async with self._idempotency_lock:
+            if (
+                claim.operation_id not in self._idempotency_results
+                and len(self._idempotency_results) >= _IDEMPOTENCY_CACHE_LIMIT
+            ):
+                oldest = min(
+                    self._idempotency_results,
+                    key=lambda item: self._idempotency_results[item].stored_at,
+                )
+                self._idempotency_results.pop(oldest, None)
+            self._idempotency_results[claim.operation_id] = _IdempotencyRecord(
+                arguments_digest=_canonical_digest(result.arguments or {}),
+                result=result,
+            )
+            event = self._operation_events.pop(claim.operation_id, None)
+            self._operation_claims.pop(claim.operation_id, None)
+            if event is not None:
+                event.set()
+
+    async def _update_operation_effect_id(
+        self, claim: _OperationClaim, effect_id: str
+    ) -> None:
+        """Keep a handler-provided external effect ID durable before finalize."""
+        if not claim.owner_token or not effect_id:
+            return
+        db = getattr(self.permission_engine, "db", None)
+        update_method = getattr(db, "update_tool_operation_effect_id", None)
+        if callable(update_method):
+            updated = await update_method(
+                operation_id=claim.operation_id,
+                owner_token=claim.owner_token,
+                effect_id=effect_id,
+            )
+            if not updated:
+                raise RuntimeError("durable tool operation lost ownership")
 
     def _resolve_target(
         self,
@@ -1321,7 +1886,7 @@ class ToolScheduler:
             return resource.canonical_target
         try:
             return str(self.permission_engine.normalize_target(tool_name, arguments))
-        except Exception:
+        except Exception:  # noqa: BLE001 - target normalization must fall back safely
             return tool_name
 
     @staticmethod
@@ -1374,20 +1939,20 @@ class ToolScheduler:
     ) -> str:
         """Attempt an audit without converting a completed effect to failure."""
         try:
-            await self.permission_engine.audit(
+            row_id = await self.permission_engine.audit(
                 tool_name,
                 target,
                 result,
                 detail,
                 session_id,
             )
+            if isinstance(row_id, int) and row_id < 0:
+                return "audit repository rejected the event"
         except Exception as exc:
-            logger.error(
-                "tool audit persistence failed: tool=%s result=%s error=%s",
+            logger.exception(
+                "tool audit persistence failed: tool=%s result=%s",
                 tool_name,
                 result,
-                exc,
-                exc_info=True,
             )
             return str(exc)
         return ""
@@ -1395,8 +1960,8 @@ class ToolScheduler:
     async def _release_best_effort(self, reservation: ToolBudgetReservation) -> None:
         try:
             await reservation.release()
-        except Exception as exc:
-            logger.error("tool budget release failed: %s", exc, exc_info=True)
+        except Exception:
+            logger.exception("tool budget release failed")
 
     @staticmethod
     def _idempotency_key(call: dict) -> str:
@@ -1520,7 +2085,7 @@ class ToolScheduler:
                     asyncio.to_thread(confirm_callback, payload),
                     timeout=remaining,
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return {"approved": False, "reason": "approval_callback_timeout"}
         if inspect.isawaitable(value):
             # A synchronous adapter may return an awaitable.  Preserve the
@@ -1530,7 +2095,7 @@ class ToolScheduler:
                 return {"approved": False, "reason": "approval_expired_before_callback"}
             try:
                 value = await asyncio.wait_for(value, timeout=remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return {"approved": False, "reason": "approval_callback_timeout"}
         normalized = _normalize_confirmation(value)
         if normalized.get("reason") == "invalid_confirmation_response":

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 from khaos.agent.core import AgentConfig, Message, SimpleTokenEngine
 from khaos.db.state_root import project_id as compute_project_id
@@ -41,21 +41,21 @@ class SubAgentRunner:
         db,                              # Database 实例
         mode_manager=None,               # C-1-5b: 默认 None，让 build_runtime 按 per-turn principal 构造
         tool_scheduler=None,             # B1: 不再接收裸 scheduler；默认 None
-        memory_manager: Optional["MemoryManager"] = None,  # 可选，默认不共享记忆
-        skill_manager: Optional["SkillManager"] = None,    # 可选
-        coding_context_builder: Optional["CodingContextBuilder"] = None,  # 可选
-        token_engine: Optional[SimpleTokenEngine] = None,  # SimpleTokenEngine
+        memory_manager: MemoryManager | None = None,  # 可选，默认不共享记忆
+        skill_manager: SkillManager | None = None,    # 可选
+        coding_context_builder: CodingContextBuilder | None = None,  # 可选
+        token_engine: SimpleTokenEngine | None = None,  # SimpleTokenEngine
         max_turns: int = 30,            # 子代理轮次限制（比主 agent 低）
         max_budget_tokens: int = 100000,  # 子代理 token 预算（比主 agent 低）
         stream_timeout: int = 60,        # 子代理超时（比主 agent 低）
         inherit_memory: bool = False,    # 是否从父会话继承记忆
-        office_authority: Optional[Any] = None,  # B1: 共享 Office authority
-        approval_broker: Optional[Any] = None,   # B1: 继承主 AgentService 的审批 broker
+        office_authority: Any | None = None,  # B1: 共享 Office authority
+        approval_broker: Any | None = None,   # B1: 继承主 AgentService 的审批 broker
         principal_id: str = "",                  # B1: 继承 principal
-        audit_logger: Optional[Any] = None,      # B1: 继承审计 logger
-        project_root: Optional[Path] = None,     # B1: 继承项目根（不可变）
-        config_path: Optional[Path] = None,      # B1: 继承 config 路径
-        cleanup_authority: Optional[Any] = None,
+        audit_logger: Any | None = None,      # B1: 继承审计 logger
+        project_root: Path | None = None,     # B1: 继承项目根（不可变）
+        config_path: Path | None = None,      # B1: 继承 config 路径
+        cleanup_authority: Any | None = None,
     ):
         self.router = router
         self.db = db
@@ -264,7 +264,7 @@ class SubAgentRunner:
         4. 若拼接仍为空，返回 "[子代理未产生有效输出]"
         """
         # 1. 找到最后一条 assistant 消息
-        last_assistant: Optional[Message] = None
+        last_assistant: Message | None = None
         for message in reversed(messages):
             if message.role == "assistant":
                 last_assistant = message

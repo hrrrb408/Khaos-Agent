@@ -8,10 +8,13 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 
-from khaos.agent.core import Message, SimpleTokenEngine
 from khaos.agent.context_facts import ContextLayer, is_structured_fact
+from khaos.agent.core import Message, SimpleTokenEngine
+from khaos.exceptions import CompressionCircuitOpenError
 
 logger = logging.getLogger(__name__)
+
+COMPRESSION_CIRCUIT_FAILURE_THRESHOLD = 3
 
 
 class CompressionLevel(Enum):
@@ -54,6 +57,10 @@ class ContextCompressor:
 
     async def compress(self, messages: list[Message], threshold: int) -> CompressionResult:
         """Compress context while protecting system and recent messages."""
+        if self.is_circuit_open:
+            raise CompressionCircuitOpenError(
+                "context compression circuit is open after repeated Level 2 failures"
+            )
         original_tokens = self._count_messages(messages)
         window_id = self._messages_digest(messages)
         working = [self._clone_message(message) for message in messages]
@@ -108,6 +115,10 @@ class ContextCompressor:
             except Exception as exc:
                 self._consecutive_l2_failures += 1
                 logger.warning("Level 2 compression failed: %s", exc)
+                if self.is_circuit_open:
+                    raise CompressionCircuitOpenError(
+                        "context compression circuit opened after repeated Level 2 failures"
+                    ) from exc
 
         try:
             collapsed = await self._context_collapse(collapsible_middle)
@@ -121,7 +132,7 @@ class ContextCompressor:
                 window_id=window_id,
                 replaced_message_count=len(collapsible_middle),
             )
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - compression fallback must continue
             logger.warning("Level 1 compression failed: %s", exc)
             compacted = [
                 await self._micro_compact(message, max_chars=max(1000, self.micro_max_chars // 5))
@@ -206,7 +217,10 @@ class ContextCompressor:
     @property
     def is_circuit_open(self) -> bool:
         """Return true after three consecutive Level 2 failures."""
-        return self._consecutive_l2_failures >= 3
+        return (
+            self._consecutive_l2_failures
+            >= COMPRESSION_CIRCUIT_FAILURE_THRESHOLD
+        )
 
     def _reset_circuit(self) -> None:
         self._consecutive_l2_failures = 0

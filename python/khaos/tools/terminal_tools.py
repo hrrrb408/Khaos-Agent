@@ -13,7 +13,6 @@ from typing import Any
 from khaos.permissions.engine import split_command_segments
 from khaos.security.command_guard import CommandGuard
 
-
 READ_ONLY_COMMANDS = {
     "cat",
     "date",
@@ -361,7 +360,7 @@ class BackgroundProcessAuthority:
         if action == "wait":
             try:
                 code = await asyncio.wait_for(handle.wait(), timeout=timeout)
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 raise TimeoutError(f"process wait timed out after {timeout}s") from exc
             stdout = await record.stdout_task
             return await self._finished(process_id, code, stdout, handle)

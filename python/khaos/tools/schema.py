@@ -6,7 +6,6 @@ import copy
 import re
 from typing import Any
 
-
 _ANNOTATION_KEYWORDS = frozenset({"description", "default", "title"})
 _KEYWORDS_BY_TYPE: dict[str, frozenset[str]] = {
     "object": frozenset(
@@ -72,7 +71,7 @@ def production_schema(
 def validate_schema_definition(schema: Any, *, path: str) -> None:
     """Reject schemas outside the exact subset enforced at dispatch time."""
     if not isinstance(schema, dict):
-        raise ValueError(f"{path}: schema must be an object")
+        raise ValueError(f"{path}: schema must be an object")  # noqa: TRY004 - schema API compatibility
     expected = schema.get("type")
     if expected not in _KEYWORDS_BY_TYPE:
         raise ValueError(f"{path}: unsupported or missing schema type: {expected!r}")

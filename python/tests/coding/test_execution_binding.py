@@ -11,7 +11,8 @@ from khaos.coding.execution import (
     HostExecutionBackend,
 )
 from khaos.coding.execution.binding import open_execution_directory_binding
-from khaos.coding.execution.supervisor import execution_binding_preexec
+from khaos.coding.execution.models import ResourceBudget
+from khaos.coding.execution.native_launcher import build_process_launch
 from khaos.coding.execution.supervisor import ProcessSupervisor
 from khaos.coding.workspace.manager import WorkspaceManager
 
@@ -76,26 +77,33 @@ def test_execution_service_cannot_be_rebound_to_another_runtime():
         )
 
 
-def test_child_preexec_rejects_worktree_identity_swap(tmp_path: Path):
-    """The final child-side check must fail before a swapped path can exec."""
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
-    expected = worktree.stat()
-    expected_identity = (int(expected.st_dev), int(expected.st_ino))
-
-    moved = tmp_path / "moved-aside"
-    worktree.rename(moved)
-    worktree.mkdir()
-
-    hook = execution_binding_preexec(
-        root_path=worktree,
-        root_identity=expected_identity,
-        cwd_path=worktree,
-        cwd_identity=expected_identity,
+def test_native_launcher_is_required_outside_explicit_development(
+    tmp_path: Path, monkeypatch
+):
+    """Host rlimits never silently fall back to a Python pre-exec hook."""
+    monkeypatch.delenv("KHAOS_DEV_MODE", raising=False)
+    monkeypatch.setattr(
+        "khaos.coding.execution.native_launcher._find_launcher", lambda: None
     )
-    assert hook is not None
-    with pytest.raises(PermissionError, match="identity changed"):
-        hook()
+    with pytest.raises(PermissionError, match="native execution launcher"):
+        build_process_launch(
+            ("true",),
+            cwd=tmp_path,
+            directory_binding=None,
+            budget=ResourceBudget(),
+            enforce_resource_limits=True,
+        )
+
+    monkeypatch.setenv("KHAOS_DEV_MODE", "1")
+    launch = build_process_launch(
+        ("true",),
+        cwd=tmp_path,
+        directory_binding=None,
+        budget=ResourceBudget(),
+        enforce_resource_limits=True,
+    )
+    assert launch.argv[2] == "khaos.coding.execution.native_launcher_runtime"
+    assert launch.start_new_session is False
 
 
 @pytest.mark.asyncio

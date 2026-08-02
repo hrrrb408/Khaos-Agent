@@ -25,6 +25,7 @@ from khaos.coding.planning.approval.models import (
     compute_verification_digest,
 )
 from khaos.coding.planning.approval.requirement import evaluate_approval_requirement
+
 # NOTE: these errors are defined here (not imported from service.py) to avoid
 # a circular import. service.py re-exports them for back-compat; the gate
 # imports them from here directly.
@@ -40,7 +41,9 @@ class PlanNotRequestableError(Exception):
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from khaos.coding.planning.approval.repository import PlanRepository
-    from khaos.coding.planning.approval.service import ContextProvider, CurrentRepositoryState
+    from khaos.coding.planning.approval.service import (
+        ContextProvider,
+    )
     from khaos.coding.planning.contracts import ImplementationPlan
 
 
@@ -53,8 +56,8 @@ class PlanLiveValidator:
 
     def __init__(
         self,
-        plan_repository: "PlanRepository",
-        context_provider: "ContextProvider",
+        plan_repository: PlanRepository,
+        context_provider: ContextProvider,
         planning_service: object | None = None,
     ) -> None:
         self._plan_repository = plan_repository
@@ -97,7 +100,7 @@ class PlanLiveValidator:
 
     def validate_plan(
         self,
-        plan: "ImplementationPlan",
+        plan: ImplementationPlan,
         *,
         approved_verification_plan_digest: str = "",
     ) -> PlanValidationContext:
@@ -108,7 +111,7 @@ class PlanLiveValidator:
 
     def _validate_plan(
         self,
-        plan: "ImplementationPlan",
+        plan: ImplementationPlan,
         *,
         approved_verification_plan_digest: str = "",
     ) -> PlanValidationContext:
@@ -163,7 +166,7 @@ class PlanLiveValidator:
                     )
             except PlanStaleError:
                 raise
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - planner errors become request rejection
                 raise PlanNotRequestableError(f"planner validation error: {exc}")
 
         # Server-authoritative approval requirement (IGNORES client fields).

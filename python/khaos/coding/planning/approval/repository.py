@@ -11,7 +11,7 @@ an in-memory implementation is sufficient and keeps the contract honest.
 """
 from __future__ import annotations
 
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from khaos.coding.planning.contracts import ImplementationPlan
@@ -20,7 +20,7 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
 class PlanRepository(Protocol):
     """Read-only authoritative source of plan snapshots by plan_id."""
 
-    def get(self, plan_id: str) -> "ImplementationPlan | None":  # pragma: no cover
+    def get(self, plan_id: str) -> ImplementationPlan | None:  # pragma: no cover
         ...
 
 
@@ -36,16 +36,16 @@ class PlanSnapshotStore:
     """
 
     def __init__(self) -> None:
-        self._snapshots: dict[str, "ImplementationPlan"] = {}
+        self._snapshots: dict[str, ImplementationPlan] = {}
 
-    def register(self, plan: "ImplementationPlan") -> None:
+    def register(self, plan: ImplementationPlan) -> None:
         """Register (or replace) the authoritative snapshot for a plan_id."""
         self._snapshots[plan.plan_id] = plan
 
-    def get(self, plan_id: str) -> "ImplementationPlan | None":
+    def get(self, plan_id: str) -> ImplementationPlan | None:
         return self._snapshots.get(plan_id)
 
-    def require(self, plan_id: str) -> "ImplementationPlan":
+    def require(self, plan_id: str) -> ImplementationPlan:
         """Return the snapshot or raise KeyError (caller surfaces as a refusal)."""
         plan = self._snapshots.get(plan_id)
         if plan is None:
@@ -76,9 +76,9 @@ class PersistedPlanRepository:
 
     def __init__(self, store: Any) -> None:
         self._store = store
-        self._cache: dict[str, tuple[str, "ImplementationPlan"]] = {}
+        self._cache: dict[str, tuple[str, ImplementationPlan]] = {}
 
-    def register(self, plan: "ImplementationPlan") -> bool:
+    def register(self, plan: ImplementationPlan) -> bool:
         """Persist the authoritative snapshot. Returns False if a snapshot
         with the same plan_id but DIFFERENT content_hash already exists
         (refused — use a new plan_id)."""
@@ -100,7 +100,7 @@ class PersistedPlanRepository:
             self._cache[plan.plan_id] = (self._snapshot_fingerprint(canonical, plan.content_hash, binding_digest, self.SCHEMA_VERSION), plan)
         return ok
 
-    def get(self, plan_id: str) -> "ImplementationPlan | None":
+    def get(self, plan_id: str) -> ImplementationPlan | None:
         row = self._store.load_plan_snapshot(plan_id)
         if row is None:
             return None
@@ -127,11 +127,12 @@ class PersistedPlanRepository:
     @staticmethod
     def _snapshot_fingerprint(canonical: str, content_hash: str, binding: str, schema: str) -> str:
         import hashlib
-        return hashlib.sha256(f"{schema}|{content_hash}|{binding}|{canonical}".encode("utf-8")).hexdigest()
+        return hashlib.sha256(f"{schema}|{content_hash}|{binding}|{canonical}".encode()).hexdigest()
 
     @staticmethod
-    def _recompute_plan_content_hash(plan: "ImplementationPlan") -> str:
+    def _recompute_plan_content_hash(plan: ImplementationPlan) -> str:
         from dataclasses import asdict
+
         from khaos.coding.planning.contracts import ImplementationPlan
         body = {
             "repository_id": plan.repository_id, "task_id": plan.task_id,
@@ -148,14 +149,14 @@ class PersistedPlanRepository:
         }
         return ImplementationPlan.digest(body)
 
-    def require(self, plan_id: str) -> "ImplementationPlan":
+    def require(self, plan_id: str) -> ImplementationPlan:
         plan = self.get(plan_id)
         if plan is None:
             raise KeyError(plan_id)
         return plan
 
     @staticmethod
-    def _canonicalize(plan: "ImplementationPlan") -> str:
+    def _canonicalize(plan: ImplementationPlan) -> str:
         """Deterministic JSON serialization of the plan body.
 
         Only includes the fields needed for binding/identity — NEVER source
@@ -168,7 +169,7 @@ class PersistedPlanRepository:
         return json.dumps(asdict(plan), default=str, sort_keys=True, separators=(",", ":"))
 
     @staticmethod
-    def _deserialize(canonical_json: str) -> "ImplementationPlan | None":
+    def _deserialize(canonical_json: str) -> ImplementationPlan | None:
         """Reconstruct an ImplementationPlan from its canonical JSON."""
         import json
 
@@ -188,7 +189,7 @@ class PersistedPlanRepository:
 
         try:
             data = json.loads(canonical_json)
-        except Exception:
+        except (json.JSONDecodeError, TypeError):
             return None
 
         def _tuple_of(cls, items):
@@ -277,5 +278,5 @@ class PersistedPlanRepository:
                 content_hash=data.get("content_hash", ""),
                 created_at=float(data.get("created_at", 0.0)),
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 - malformed persisted plans fail closed
             return None

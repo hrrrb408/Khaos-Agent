@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import os
 import hashlib
+import os
 import stat
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Self
 
 from khaos.coding.planning.safe_workspace_path import (
     SafePathError,
@@ -87,7 +88,7 @@ class SafeWorkspaceFS:
         except (OSError, SafePathError) as exc:
             raise WorkspaceBoundaryError(str(exc)) from exc
 
-    def __enter__(self) -> "SafeWorkspaceFS":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *_args: object) -> None:

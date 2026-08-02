@@ -17,9 +17,9 @@ contract that Batch 3 will implement on top of
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
 import secrets
-from typing import TYPE_CHECKING
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from khaos.coding.planning.approval.gate import PlanExecutionGate
@@ -37,7 +37,7 @@ class AuthorizedExecutionContext:
     :meth:`PlanExecutionGate.require_authorization` can produce.
     """
 
-    authorization: "PlanExecutionAuthorization"
+    authorization: PlanExecutionAuthorization
     plan_id: str
     task_id: str
     workspace_id: str
@@ -79,7 +79,7 @@ class PlannedExecutionGuard:
     still go through this guard.
     """
 
-    def __init__(self, gate: "PlanExecutionGate", *, lease_authority: object | None = None) -> None:
+    def __init__(self, gate: PlanExecutionGate, *, lease_authority: object | None = None) -> None:
         self._gate = gate
         self.__lease_authority = lease_authority
         self._contexts: dict[str, AuthorizedExecutionContext] = {}

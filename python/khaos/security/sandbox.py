@@ -117,7 +117,7 @@ class Sandbox:
         mode: SandboxMode = SandboxMode.WORKSPACE_WRITE,
         workspace_root: Path | None = None,
         *,
-        root_capabilities: "set[Path] | frozenset[Path] | None" = None,
+        root_capabilities: set[Path] | frozenset[Path] | None = None,
     ):
         self.mode = mode
         self.workspace_root = (
@@ -132,7 +132,7 @@ class Sandbox:
         # "no restriction", which fail-opened when ``allowed_paths: []`` or
         # ``allowed_paths: [../outside]`` compiled to an empty set.
         if root_capabilities is None:
-            self._root_capabilities: "frozenset[Path] | None" = None
+            self._root_capabilities: frozenset[Path] | None = None
         else:
             self._root_capabilities = frozenset(root_capabilities)
 
@@ -249,7 +249,7 @@ class Sandbox:
     @classmethod
     def from_policy_mode(
         cls, mode_str: str, workspace_root: Path | None = None
-    ) -> "Sandbox":
+    ) -> Sandbox:
         """Build a sandbox from a policy mode string.
 
         H3: an unknown mode now fails closed (raises ``ValueError``) instead

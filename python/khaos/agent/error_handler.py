@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import asyncio
-import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Awaitable, Callable
 
 import httpx
 
 from khaos.agent.core import Message
+from khaos.audit.logger import AuditLogger
+from khaos.exceptions import CompressionCircuitOpenError
 
 
 class ErrorCode(Enum):
@@ -83,6 +84,7 @@ class ErrorHandler:
         *,
         principal_id: str = "legacy",
         project_id: str = "",
+        audit_logger: AuditLogger | None = None,
     ):
         self.db = db
         self.router = router
@@ -90,9 +92,12 @@ class ErrorHandler:
         self.max_retries = max_retries
         self.principal_id = principal_id
         self.project_id = project_id
+        self._audit_logger = audit_logger
 
     def classify(self, error: Exception) -> ErrorCode:
         """Map an exception to a stable error code."""
+        if isinstance(error, CompressionCircuitOpenError):
+            return ErrorCode.COMPRESSION_CIRCUIT_OPEN
         if isinstance(error, asyncio.TimeoutError):
             return ErrorCode.MODEL_TIMEOUT
         if isinstance(error, httpx.TimeoutException):
@@ -121,15 +126,23 @@ class ErrorHandler:
         """Write an error event to audit_log."""
         if self.db is None:
             return
-        await self.db.insert_audit_log(
+        audit_logger = self._audit_logger
+        if audit_logger is None:
+            audit_logger = AuditLogger(
+                self.db,
+                principal_id=self.principal_id,
+                project_id=self.project_id,
+            )
+            self._audit_logger = audit_logger
+        row_id = await audit_logger.log(
             action=f"error:{code.value}",
             target=session_id or "",
             result="error",
-            detail=json.dumps({"message": message, **(detail or {})}, ensure_ascii=False),
+            detail={"message": message, **(detail or {})},
             session_id=session_id,
-            principal_id=self.principal_id,
-            project_id=self.project_id,
         )
+        if row_id < 0:
+            raise RuntimeError("audit log write was rejected")
 
     async def handle(
         self,
@@ -140,7 +153,13 @@ class ErrorHandler:
         """Classify, audit, and return an SSE error event."""
         code = self.classify(error)
         message = _format_error_message(error)
-        event = ErrorEvent(code=code, message=message, recoverable=code != ErrorCode.INTERNAL_ERROR, detail=detail)
+        event = ErrorEvent(
+            code=code,
+            message=message,
+            recoverable=code
+            not in {ErrorCode.INTERNAL_ERROR, ErrorCode.COMPRESSION_CIRCUIT_OPEN},
+            detail=detail,
+        )
         await self.audit_error(code, message, session_id, detail)
         return event
 

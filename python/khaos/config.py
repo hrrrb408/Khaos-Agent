@@ -9,10 +9,10 @@ import os
 import re
 import secrets
 import stat
+from collections.abc import Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from collections.abc import Iterator
 from typing import Any
 
 import yaml

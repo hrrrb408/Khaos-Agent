@@ -11,8 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
-from typing import AsyncIterator, Callable, Awaitable
 
 import yaml
 
@@ -43,7 +43,7 @@ class MoAConfig:
     pipelines: list[MoAPipeline] = field(default_factory=list)
 
     @classmethod
-    def from_config(cls, config: dict | None) -> "MoAConfig":
+    def from_config(cls, config: dict | None) -> MoAConfig:
         """Build a MoAConfig from a parsed config.yaml mapping.
 
         Reads the ``models.moa`` section. Unknown shapes fall back to disabled,
@@ -77,7 +77,7 @@ class MoAConfig:
         return cls(enabled=enabled, pipelines=pipelines)
 
     @classmethod
-    def from_yaml_file(cls, path) -> "MoAConfig":
+    def from_yaml_file(cls, path) -> MoAConfig:
         """Load from a YAML file path, returning disabled on any error."""
         try:
             data = yaml.safe_load(open(path, encoding="utf-8"))  # noqa: SIM115
@@ -187,4 +187,4 @@ class MoARunner:
         ]
 
 
-__all__ = ["MoAPipeline", "MoAConfig", "MoARunner", "ModelCaller"]
+__all__ = ["MoAConfig", "MoAPipeline", "MoARunner", "ModelCaller"]

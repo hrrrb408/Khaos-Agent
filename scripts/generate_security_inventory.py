@@ -17,7 +17,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "docs" / "generated" / "security-inventory.md"
 ACTION_SHA_RE = re.compile(r"^[^@\s]+@[0-9a-f]{40}$")

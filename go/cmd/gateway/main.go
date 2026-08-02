@@ -15,6 +15,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -185,9 +186,12 @@ func main() {
 		Handler:           handler.Routes(),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      2 * time.Minute,
-		IdleTimeout:       60 * time.Second,
-		MaxHeaderBytes:    1 << 20,
+		// Streaming handlers own their write deadlines and send heartbeats;
+		// a server-wide write timeout would terminate long-running SSE/NDJSON
+		// tasks while they are still making durable progress.
+		WriteTimeout:   0,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 20,
 	}
 	if strings.TrimSpace(*tlsCert) != "" {
 		// Batch 11.8 (round-11 §十五.1): load the cert/key via the
@@ -303,9 +307,12 @@ func validateTLSConfig(addr, certPath, keyPath string) error {
 // protected-file pattern, then constructs a tls.Certificate from the
 // in-memory bytes.
 //
-// Batch 12.4 (round-12 §十七): the PRIVATE KEY gets strict mode
-// enforcement (no group/other access).  The PUBLIC CERTIFICATE is allowed
-// mode 0644 (standard for Let's Encrypt and similar deployments).
+// Batch 12.4 (round-12 §十七): the PRIVATE KEY gets strict mode enforcement
+// on host paths (no group/other access). Docker Compose file-backed secrets
+// are a separate boundary: standalone Compose ignores the long-syntax mode
+// field, so a direct /run/secrets file may be read-only group/other-readable
+// but must never be writable. The PUBLIC CERTIFICATE is allowed mode 0644
+// (standard for Let's Encrypt and similar deployments).
 func loadTLSCertificateSecurely(certPath, keyPath string) (tls.Certificate, error) {
 	// Certificate: allow 0644 (public certs are not secret).
 	certPEM, err := readProtectedFileRelaxed(certPath, "TLS certificate", 1<<20)
@@ -355,9 +362,22 @@ func readProtectedFileRelaxed(path, label string, maxSize int64) ([]byte, error)
 	return content, nil
 }
 
+func protectedFileModeUnsafe(path string, mode os.FileMode) bool {
+	unsafeMode := mode.Perm() & 0o077
+	if isContainerSecretPath(path) {
+		// Standalone Docker Compose may expose a file-backed secret with the
+		// source file's mode. Read-only group/other access is acceptable in
+		// that isolated mount; write access is never acceptable.
+		unsafeMode = mode.Perm() & 0o022
+	}
+	return unsafeMode != 0
+}
+
 // readProtectedFile reads a file using the protected-file pattern:
 // Lstat (no symlink follow) → regular-file + mode check → Open →
-// SameFile TOCTOU re-verification.  Used for the TLS cert/key files.
+// SameFile TOCTOU re-verification. Host TLS private keys require strict
+// permissions; direct Docker secret mounts only reject group/other writes.
+// Used for the TLS cert/key files.
 func readProtectedFile(path, label string, maxSize int64) ([]byte, error) {
 	entryInfo, err := os.Lstat(path)
 	if err != nil {
@@ -366,7 +386,10 @@ func readProtectedFile(path, label string, maxSize int64) ([]byte, error) {
 	if !entryInfo.Mode().IsRegular() {
 		return nil, fmt.Errorf("%s must be a regular file, not a symlink or device", label)
 	}
-	if runtime.GOOS != "windows" && entryInfo.Mode().Perm()&0o077 != 0 {
+	if runtime.GOOS != "windows" && protectedFileModeUnsafe(path, entryInfo.Mode()) {
+		if isContainerSecretPath(path) {
+			return nil, fmt.Errorf("%s must not be writable by group and others (mode %o)", label, entryInfo.Mode().Perm())
+		}
 		return nil, fmt.Errorf("%s must be inaccessible to group and others (mode %o)", label, entryInfo.Mode().Perm())
 	}
 	if entryInfo.Size() > maxSize {
@@ -419,20 +442,29 @@ func loadOrCreateAPIKey(configured, configuredPath string) (string, string, erro
 			return "", "", errors.New("Windows gateway token must be inside the current user config directory")
 		}
 	}
-	if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
-		return "", "", fmt.Errorf("create gateway token directory: %w", err)
+	secretMount := isContainerSecretPath(absolute)
+	if !secretMount {
+		if err := os.MkdirAll(filepath.Dir(absolute), 0o700); err != nil {
+			return "", "", fmt.Errorf("create gateway token directory: %w", err)
+		}
 	}
 	directoryInfo, err := os.Lstat(filepath.Dir(absolute))
 	if err != nil || !directoryInfo.IsDir() || directoryInfo.Mode()&os.ModeSymlink != 0 {
 		return "", "", errors.New("gateway token parent must be a real directory")
 	}
-	if err := os.Chmod(filepath.Dir(absolute), 0o700); err != nil {
+	if secretMount {
+		if runtime.GOOS != "windows" && directoryInfo.Mode().Perm()&0o022 != 0 {
+			return "", "", errors.New("gateway token secret parent must not be writable by group or others")
+		}
+	} else if err := os.Chmod(filepath.Dir(absolute), 0o700); err != nil {
 		return "", "", fmt.Errorf("protect gateway token directory: %w", err)
 	}
-	if key, err := readProtectedToken(absolute); err == nil {
+	if key, err := readProtectedToken(absolute, secretMount); err == nil {
 		return key, absolute, nil
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", "", err
+	} else if secretMount {
+		return "", "", fmt.Errorf("gateway token secret is missing: %w", err)
 	}
 	random := make([]byte, 32)
 	if _, err := rand.Read(random); err != nil {
@@ -441,7 +473,7 @@ func loadOrCreateAPIKey(configured, configuredPath string) (string, string, erro
 	key := base64.RawURLEncoding.EncodeToString(random)
 	file, err := os.OpenFile(absolute, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if errors.Is(err, os.ErrExist) {
-		loaded, loadErr := readProtectedToken(absolute)
+		loaded, loadErr := readProtectedToken(absolute, secretMount)
 		return loaded, absolute, loadErr
 	}
 	if err != nil {
@@ -462,13 +494,31 @@ func loadOrCreateAPIKey(configured, configuredPath string) (string, string, erro
 	return key, absolute, nil
 }
 
-func readProtectedToken(path string) (string, error) {
+func isContainerSecretPath(filePath string) bool {
+	const secretRoot = "/run/secrets"
+	// /run/secrets is a POSIX path inside the container even when the
+	// Gateway binary is compiled or unit-tested on Windows. Do not use the
+	// host filepath separator rules for this virtual container path.
+	clean := pathpkg.Clean(filePath)
+	return pathpkg.Dir(clean) == secretRoot && pathpkg.Base(clean) != "."
+}
+
+func readProtectedToken(path string, containerSecret bool) (string, error) {
 	entryInfo, err := os.Lstat(path)
 	if err != nil {
 		return "", err
 	}
-	if !entryInfo.Mode().IsRegular() || (runtime.GOOS != "windows" && entryInfo.Mode().Perm()&0o077 != 0) {
-		return "", errors.New("gateway token must be a regular file inaccessible to group and others")
+	if !entryInfo.Mode().IsRegular() {
+		return "", errors.New("gateway token must be a regular file")
+	}
+	if runtime.GOOS != "windows" {
+		unsafeMode := entryInfo.Mode().Perm() & 0o077
+		if containerSecret {
+			unsafeMode = entryInfo.Mode().Perm() & 0o022
+		}
+		if unsafeMode != 0 {
+			return "", errors.New("gateway token has unsafe group/other permissions")
+		}
 	}
 	file, err := os.Open(path)
 	if err != nil {

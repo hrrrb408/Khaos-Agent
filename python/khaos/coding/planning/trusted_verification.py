@@ -8,13 +8,18 @@ import os
 import re
 import secrets
 import stat
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import Iterable
+from typing import Self
 
-from khaos.coding.planning.contracts import VerificationCatalogEntry, VerificationRequirement
-from khaos.coding.planning.verification_execution_models import TrustedVerificationCommand
-
+from khaos.coding.planning.contracts import (
+    VerificationCatalogEntry,
+    VerificationRequirement,
+)
+from khaos.coding.planning.verification_execution_models import (
+    TrustedVerificationCommand,
+)
 
 _SHELL_LAUNCHERS = {
     "sh", "bash", "dash", "zsh", "cmd", "cmd.exe", "powershell",
@@ -197,9 +202,10 @@ class TrustedCommandFactory:
         launcher = PurePosixPath(argv[0].replace("\\", "/")).name.casefold()
         if launcher in _SHELL_LAUNCHERS:
             raise PermissionError("shell and command launchers are forbidden")
-        if launcher in {"npm", "pnpm", "yarn"}:
-            if len(argv) < 3 or argv[1] not in {"run", "test"}:
-                raise PermissionError("package manager verification must use a catalog script")
+        if launcher in {"npm", "pnpm", "yarn"} and (
+            len(argv) < 3 or argv[1] not in {"run", "test"}
+        ):
+            raise PermissionError("package manager verification must use a catalog script")
         if argv[0].startswith(("./", "../", "/")):
             raise PermissionError("catalog executable must be a logical toolchain id")
 
@@ -237,7 +243,7 @@ class VerificationSnapshotCapability:
         self._root_path = root_path
 
     @classmethod
-    def open(cls, root: Path) -> "VerificationSnapshotCapability":
+    def open(cls, root: Path) -> VerificationSnapshotCapability:
         root = root.resolve(strict=True)
         fd = os.open(str(root), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         return cls(fd, root)
@@ -248,7 +254,7 @@ class VerificationSnapshotCapability:
         except OSError:
             pass
 
-    def __enter__(self) -> "VerificationSnapshotCapability":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -374,7 +380,7 @@ class ArtifactRootCapability:
     @classmethod
     def open(
         cls, root: Path, *, forbidden_roots: Iterable[Path] = (),
-    ) -> "ArtifactRootCapability":
+    ) -> ArtifactRootCapability:
         """Open the artifact root and verify it doesn't overlap protected roots.
 
         Creates the root (0o700) if it doesn't exist, then opens it with
@@ -430,7 +436,7 @@ class ArtifactRootCapability:
         except OSError:
             pass
 
-    def __enter__(self) -> "ArtifactRootCapability":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:
@@ -491,7 +497,7 @@ class ArtifactRootCapability:
             raise PermissionError(
                 f"artifact final file already exists (no-replace): {final_name}"
             ) from exc
-        except OSError as exc:
+        except OSError:
             try:
                 os.unlink(temp_name, dir_fd=self._root_fd)
             except OSError:
@@ -729,7 +735,7 @@ class DisposableStorageRootCapability:
     def open(
         cls, root: Path, *, forbidden_roots: Iterable[Path] = (),
         boot_id: str = "",
-    ) -> "DisposableStorageRootCapability":
+    ) -> DisposableStorageRootCapability:
         """Open the disposable storage root and anchor it to the boot context.
 
         Creates the root (0o700) if it doesn't exist, then opens it with
@@ -833,7 +839,7 @@ class DisposableStorageRootCapability:
         except OSError:
             pass
 
-    def __enter__(self) -> "DisposableStorageRootCapability":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, *args: object) -> None:

@@ -12,10 +12,11 @@ import hashlib
 import json
 import os
 import shlex
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 
@@ -45,6 +46,7 @@ class AuthorizationResource:
     canonical_target: str
     root_device: int | None
     root_inode: int | None
+    workspace_root: str = ""
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kind", AuthorizationResourceKind(self.kind))
@@ -122,6 +124,7 @@ def resolve_authorization_resource(
         canonical_target=target,
         root_device=int(root_stat.st_dev),
         root_inode=int(root_stat.st_ino),
+        workspace_root=os.fspath(root),
     )
 
 

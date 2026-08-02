@@ -5,9 +5,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from enum import Enum
-from typing import Optional
 
 from khaos.time_utils import utc_now_naive
 
@@ -34,7 +33,7 @@ class MemoryConfidence(Enum):
 class Memory:
     """One durable memory entry."""
 
-    id: Optional[int]
+    id: int | None
     scope: MemoryScope
     key: str
     value: str

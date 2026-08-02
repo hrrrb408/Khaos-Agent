@@ -9,14 +9,18 @@ fi
 repository="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 cd "$repository"
 
-cargo build --release --no-default-features \
+cargo build --locked --release --no-default-features \
   --manifest-path rust/khaos-core/Cargo.toml \
   --bin khaos-sandbox-launcher \
+  --bin khaos-exec-launcher \
   --bin khaos-browser-kernel-helper
 
 install -o root -g root -m 0755 \
   rust/khaos-core/target/release/khaos-sandbox-launcher \
   /usr/local/bin/khaos-sandbox-launcher
+install -o root -g root -m 0755 \
+  rust/khaos-core/target/release/khaos-exec-launcher \
+  /usr/local/bin/khaos-exec-launcher
 install -o root -g root -m 0755 \
   rust/khaos-core/target/release/khaos-browser-kernel-helper \
   /usr/local/sbin/khaos-browser-kernel-helper

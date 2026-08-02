@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-import signal
 import shutil
+import signal
 from pathlib import Path
 
 
@@ -92,7 +92,7 @@ class ManagedProcessHandle:
             await self.terminate()
             try:
                 await asyncio.wait_for(self._process.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 await self.kill()
                 await self._process.wait()
         finally:

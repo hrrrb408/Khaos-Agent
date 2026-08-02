@@ -27,6 +27,14 @@ chmod 0400 \
     "$secret_dir/browser-helper-secret" \
     "$secret_dir/gateway-api-key"
 bash "$repo_root/scripts/generate-dev-cert.sh" "$secret_dir"
+# Standalone Docker Compose ignores the long-syntax secret mode and exposes
+# file-backed secrets with the source file's mode. The temporary directory
+# remains 0700, while direct Gateway secrets must be readable by its non-root
+# UID inside the container. The runtime rejects any group/other write bit.
+chmod 0444 \
+    "$secret_dir/python-capability" \
+    "$secret_dir/gateway-api-key" \
+    "$secret_dir/tls-key.pem"
 
 export KHAOS_PYTHON_CAPABILITY_FILE="$secret_dir/python-capability"
 export KHAOS_BROWSER_HELPER_SECRET_FILE="$secret_dir/browser-helper-secret"
@@ -60,11 +68,24 @@ run_profile() {
         --project-directory "$repo_root" \
         --file "$repo_root/$compose_file" \
         config --quiet
-    docker compose \
+    if ! docker compose \
         --project-name "$project_name" \
         --project-directory "$repo_root" \
         --file "$repo_root/$compose_file" \
-        up --build --wait
+        up --build --wait; then
+        printf '%s\n' "Compose profile $compose_file failed; collecting service diagnostics"
+        docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            ps || true
+        docker compose \
+            --project-name "$project_name" \
+            --project-directory "$repo_root" \
+            --file "$repo_root/$compose_file" \
+            logs --no-color --tail=200 khaos-gateway khaos-agent || true
+        return 1
+    fi
 
     curl "${curl_options[@]}" "$health_url"
 

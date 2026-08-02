@@ -221,8 +221,7 @@ class SkillLoader:
         frontmatter = rest[:close]
         after = rest[close + 1 + len(_FRONTMATTER_DELIM) :]
         # Skip the trailing newline after the closing delim.
-        if after.startswith("\n"):
-            after = after[1:]
+        after = after.removeprefix("\n")
         return frontmatter, after
 
     @staticmethod
@@ -286,8 +285,7 @@ class SkillLoader:
                 "budget); some skills may be missed",
                 root, MAX_SKILL_DIR_ENTRIES, MAX_SKILL_TOTAL_DIRECTORY_ENTRIES,
             )
-        for path in sorted(top_level, key=lambda p: p.name):
-            yield path
+        yield from sorted(top_level, key=lambda p: p.name)
         # Subdirectory skills: <root>/<name>/SKILL.md
         # Batch 12.3 (round-12 §十三): sort subdirectories BEFORE truncating
         # so the cap is deterministic regardless of filesystem iteration order.

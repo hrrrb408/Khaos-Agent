@@ -45,8 +45,8 @@ from khaos.coding.intelligence.lsp.evidence import (
     EvidenceCacheKey,
     EvidenceSource,
     EvidenceType,
-    FusionRule,
     FusedResolution,
+    FusionRule,
     SemanticEvidence,
 )
 from khaos.coding.intelligence.lsp.positions import (
@@ -56,7 +56,6 @@ from khaos.coding.intelligence.lsp.positions import (
 )
 from khaos.coding.intelligence.lsp.uri import (
     UriMappingError,
-    WorkspaceEscapeError,
     map_lsp_uri_to_workspace_path,
     path_to_file_uri,
 )
@@ -255,7 +254,7 @@ class LspEvidenceFusionService:
         if pending is not None:
             try:
                 return await asyncio.shield(pending)
-            except (asyncio.CancelledError, RuntimeError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.CancelledError, RuntimeError):
                 return ()
 
         future: asyncio.Future[tuple[SemanticEvidence, ...]] = asyncio.get_running_loop().create_future()
@@ -268,7 +267,7 @@ class LspEvidenceFusionService:
             if not future.done():
                 future.set_result(evidence)
             return evidence
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.debug("LSP references timeout for symbol %s", target_stable_symbol_id)
             if not future.done():
                 future.set_result(())
@@ -341,7 +340,7 @@ class LspEvidenceFusionService:
         if pending is not None:
             try:
                 return await asyncio.shield(pending)
-            except (asyncio.CancelledError, RuntimeError, asyncio.TimeoutError):
+            except (TimeoutError, asyncio.CancelledError, RuntimeError):
                 return ()
 
         future: asyncio.Future[tuple[SemanticEvidence, ...]] = asyncio.get_running_loop().create_future()
@@ -352,7 +351,7 @@ class LspEvidenceFusionService:
             if not future.done():
                 future.set_result(evidence)
             return evidence
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.debug("LSP definition timeout for %s", context.file_path)
             if not future.done():
                 future.set_result(())
@@ -760,7 +759,7 @@ def _apply_definition_fusion_rules(
         evidence=all_evidence,
         conflict_reason=None,
         resolution_rule=repo_resolution.resolution_rule,
-        depends_on_lsp=True if lsp_evidence else False,
+        depends_on_lsp=bool(lsp_evidence),
     )
 
 

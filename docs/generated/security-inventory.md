@@ -21,10 +21,10 @@
 
 - Docker base/service images found with immutable digests:
   - `Dockerfile:2`: `sha256:d9c3c6f1264a547d84560e06ffd79ed7a799ce0bff0980b26cf10d29af888377`
-  - `Dockerfile:12`: `sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba`
-  - `Dockerfile:66`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
-  - `Dockerfile:79`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
-  - `Dockerfile:85`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
+  - `Dockerfile:13`: `sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba`
+  - `Dockerfile:73`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
+  - `Dockerfile:86`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
+  - `Dockerfile:93`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
 - Lockfile fingerprints:
   - `uv.lock`: `3d7ba5b093484b24b6f268b8d0edf536d6edf2525600ffb3da6561e2aba9c6e1`
   - `python/bootstrap-requirements.txt`: `72082c05288cd1b6f61b0304a4f90f01bbcae2ec6d6262d56de5a9ff03dc5acd`
@@ -32,7 +32,7 @@
 
 ## GitHub Actions governance
 
-- Workflow action references inspected: `59`; immutable SHA-pinned/local references: `59`.
+- Workflow action references inspected: `62`; immutable SHA-pinned/local references: `62`.
 - Unpinned third-party actions (must remain empty): none.
 - Security-sensitive paths are covered by `.github/CODEOWNERS`; the repository reference ruleset preserves sole-maintainer liveness, so independent approval remains an external release prerequisite and is not verified locally.
 
@@ -47,16 +47,16 @@
 
 ## Source fingerprints
 
-- `python/khaos/audit/anchor.py`: `fe9b45af4965716c253ee1e1f7028ccb75b78385147f53e01322df30a036ee82`
-- `python/khaos/channels/webhook.py`: `713c620566d4fb10da9e064e3cd119e99d822bf43a80ba3732197448ffd48c7d`
-- `python/khaos/permissions/engine.py`: `b8ae875970821df29563bda3bc201e0154e6d77e6e9462f933e57366dbb0cfee`
-- `python/khaos/permissions/rules.py`: `accca104dd6ba757d5b5353610453d4731cc58a4535944ecaf858287e5d5ef49`
-- `python/khaos/coding/execution/service.py`: `697fbdee21c1e4269f621889affbd6b7d1460682f5bb1a2187b1e027b0f1bfd0`
-- `python/khaos/coding/execution/binding.py`: `77f4ef67140f758ea8fd8b6e367519e8529d7f51e1cbfc2db175978e6f9b261d`
-- `python/khaos/coding/execution/supervisor.py`: `46bb9d8811f4490c87cdbce46063ce0119e4298924fad9e12701029a475c95df`
-- `python/khaos/grpc_server.py`: `f05524b0bab1f20414007c84ba1929c48929224e7aea85b5c452f16d022444db`
-- `go/internal/api/handler.go`: `02e1d1d1ee4cfc8cc2aad2156b68096c47a289b529fd6cc8487227d8806abd6e`
-- `go/cmd/gateway/main.go`: `92d092b1b5856984565d292732a468b71eb4171de0374678a275742df54eeeff`
+- `python/khaos/audit/anchor.py`: `1109f9ab097bdd63ef9b7d2215fa4fcd636bd38d577469ac9c6dfb9bf133be5d`
+- `python/khaos/channels/webhook.py`: `653bc2281748abc42b7ad9e295e69586ab01bba3a1aedfc92c692c80a0253232`
+- `python/khaos/permissions/engine.py`: `4e6f03ed55584e11a240dca71be91d61556f11ce240a246627f75829a1af5939`
+- `python/khaos/permissions/rules.py`: `173df51bf720843e339e026c5219a0db7e2b69beaa45576b2e24ee17764dfe6f`
+- `python/khaos/coding/execution/service.py`: `02e2c44a4d227ebdd94154bf293a68ccc584b24b4fc2e476bf6ec0ed3b7b109a`
+- `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
+- `python/khaos/coding/execution/supervisor.py`: `cd2fd041601e05effcdeb43396b008772a15f3f7557ff6fbffec516f40392787`
+- `python/khaos/grpc_server.py`: `4206e317aa42a701663e29f7651f3e9534e01c688b5769b55588947c80ac7a0f`
+- `go/internal/api/handler.go`: `5c8be560dc037bb49c553115213c0bb5a285a601da201c8361844980b7661719`
+- `go/cmd/gateway/main.go`: `919157cb7304aff7d790260ffb195621aa5a82bdf5137d5e63ed86c2128bc9fe`
 - `go/internal/platform/python_client.go`: `0d040b26828864662e872c17fb8371d0cb81dcdfd49d682d449df1754bc08d0d`
 
 ## Required release gates

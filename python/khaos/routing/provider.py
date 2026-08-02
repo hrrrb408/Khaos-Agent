@@ -110,7 +110,7 @@ class ProviderManager:
         return self.provider_clients()[spec.provider]
 
     @classmethod
-    def from_config(cls, config: dict[str, Any]) -> "ProviderManager":
+    def from_config(cls, config: dict[str, Any]) -> ProviderManager:
         """Build manager from config.yaml-style dict."""
         manager = cls()
         providers_config = config.get("providers", {})

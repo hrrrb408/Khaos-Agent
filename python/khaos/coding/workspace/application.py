@@ -63,10 +63,7 @@ class ChangeSetApplicationService:
         if not await self.approval_broker.consume_operation(approval_key, binding):
             raise PermissionError("approval is missing, stale, replayed, or bound to another requester")
         self._used.add(approval_key)
-        try:
-            return await output_changeset(self.manager, workspace_id, changeset, operation)
-        except Exception:
-            raise
+        return await output_changeset(self.manager, workspace_id, changeset, operation)
 
     def _workspace(self, task_id: str, workspace_id: str):
         workspace = self.manager.get(workspace_id)

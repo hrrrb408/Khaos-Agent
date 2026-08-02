@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import stat
@@ -33,12 +34,6 @@ from khaos.coding.planning.execution_models import (
     ValidatedRecoveryJournal,
     WorkspaceMutationResult,
 )
-from khaos.coding.workspace.models import WorkspaceState
-from khaos.coding.planning.safe_workspace_path import (
-    SafePathError,
-    MutationObjectIdentity,
-    WorkspacePathHandle,
-)
 from khaos.coding.planning.git_state import GitStateInspector
 from khaos.coding.planning.recovery_directory import (
     RecoveryDirectory,
@@ -46,9 +41,19 @@ from khaos.coding.planning.recovery_directory import (
     RecoveryRootCapability,
 )
 from khaos.coding.planning.safe_identifiers import (
-    SafeRecoveryArtifactName, SafeRecoveryRunId, SafeWorkspaceRelativePath,
+    SafeRecoveryArtifactName,
+    SafeRecoveryRunId,
+    SafeWorkspaceRelativePath,
     UnsafePersistedIdentifier,
 )
+from khaos.coding.planning.safe_workspace_path import (
+    MutationObjectIdentity,
+    SafePathError,
+    WorkspacePathHandle,
+)
+from khaos.coding.workspace.models import WorkspaceState
+
+logger = logging.getLogger(__name__)
 
 MAX_BUNDLE_FILES = 64
 MAX_BUNDLE_BYTES = 4 * 1024 * 1024
@@ -81,7 +86,7 @@ def _resolve_avp_digest(store: Any, context: Any) -> str:
         return ""
     try:
         request = store.get_request(approval_request_id)
-    except Exception:
+    except Exception:  # noqa: BLE001 - missing authority data fails closed
         return ""
     if request is None:
         return ""
@@ -232,7 +237,7 @@ class WorkspaceMutationEngine:
                 self._resolve_safe_path(workspace, edit.path)
                 if edit.destination_path:
                     self._resolve_safe_path(workspace, edit.destination_path)
-                backup, original_mode = self._journal_edit(
+                _backup, _original_mode = self._journal_edit(
                     run.execution_run_id, ordinal, edit, root, recovery
                 )
                 self._store.update_edit_event(
@@ -558,10 +563,16 @@ class WorkspaceMutationEngine:
             parent.close()
         if edit.operation == PlannedEditOperation.CREATE and (edit.new_mode or 0o600) & ~0o666:
             raise WorkspaceMutationError("mode-escalation", "create mode is unsafe")
-        if edit.operation == PlannedEditOperation.UPDATE and edit.new_mode is not None:
-            if (edit.new_mode & ~0o777 or edit.new_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
-                    or (edit.new_mode & 0o111) > ((before_mode or 0) & 0o111)):
-                raise WorkspaceMutationError("mode-escalation", "update mode is unsafe")
+        if (
+            edit.operation == PlannedEditOperation.UPDATE
+            and edit.new_mode is not None
+            and (
+                edit.new_mode & ~0o777
+                or edit.new_mode & (stat.S_ISUID | stat.S_ISGID | stat.S_ISVTX)
+                or (edit.new_mode & 0o111) > ((before_mode or 0) & 0o111)
+            )
+        ):
+            raise WorkspaceMutationError("mode-escalation", "update mode is unsafe")
         artifact = None
         if source_bytes is not None:
             artifact, backup_hash = recovery.create_backup(
@@ -932,8 +943,8 @@ class WorkspaceMutationEngine:
                     failure_code=current.failure_code if current else failure_code,
                     completed=True,
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("failed to persist poisoned rollback state", exc_info=exc)
             raise WorkspaceMutationError(reason, "rollback failed") from rollback_error
 
     def _rollback_event(
@@ -1144,7 +1155,7 @@ class WorkspaceMutationEngine:
         if not identity.exists:
             return ""
         return hashlib.sha256(
-            f"{identity.object_dev}:{identity.object_ino}".encode("utf-8")
+            f"{identity.object_dev}:{identity.object_ino}".encode()
         ).hexdigest()
 
     def _observe_rollback_identity(
@@ -2234,7 +2245,7 @@ class WorkspaceMutationEngine:
                         )
                     self._fence.clear_poison(run.workspace_id, owner=owner)
                     recovered.append(run.execution_run_id)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - recovery evidence failure is quarantined
                     current = self._store.get_execution_run(run.execution_run_id)
                     if current is not None and current.status not in {
                         ExecutionRunStatus.POISONED, ExecutionRunStatus.MUTATED,
@@ -2246,8 +2257,8 @@ class WorkspaceMutationEngine:
                                 failure_code=getattr(exc, "code", "recovery-evidence-invalid"),
                                 completed=True,
                             )
-                        except Exception:
-                            pass
+                        except Exception as state_exc:
+                            logger.debug("failed to persist poisoned recovery state", exc_info=state_exc)
                 finally:
                     self._active_recovery = None
                     if recovery is not None:
@@ -2346,7 +2357,7 @@ class WorkspaceMutationEngine:
 
     @staticmethod
     def _tombstone_name(run_id: str, seal_kind: str) -> str:
-        digest = hashlib.sha256(f"{run_id}:{seal_kind}".encode("utf-8")).hexdigest()
+        digest = hashlib.sha256(f"{run_id}:{seal_kind}".encode()).hexdigest()
         return f"seal-{digest[:32]}.json"
 
     def _write_seal_tombstone(

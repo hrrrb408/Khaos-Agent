@@ -18,7 +18,7 @@ import hashlib
 import json
 import os
 import stat
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -72,7 +72,7 @@ def _open_directory_component(parent_fd: int, name: str, label: str) -> int:
     return fd
 
 
-def _open_anchor_file(trusted_dir: Path, filename: str) -> int:
+def _open_anchor_file(trusted_dir: Path, filename: str) -> tuple[int, int]:
     """Open the anchor with dirfd-relative no-follow semantics."""
     if (
         os.open not in os.supports_dir_fd
@@ -91,6 +91,8 @@ def _open_anchor_file(trusted_dir: Path, filename: str) -> int:
         raise AuditAnchorError("invalid trusted audit anchor path")
 
     directory_fds: list[int] = []
+    keep_audit_fd = False
+    audit_fd: int | None = None
     try:
         home_fd = os.open(
             str(trusted_dir.parent.parent),
@@ -103,8 +105,7 @@ def _open_anchor_file(trusted_dir: Path, filename: str) -> int:
         directory_fds.append(audit_fd)
         try:
             fd = os.open(
-                filename,
-                os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW,
+                filename, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
                 0o600,
                 dir_fd=audit_fd,
             )
@@ -124,11 +125,14 @@ def _open_anchor_file(trusted_dir: Path, filename: str) -> int:
         except Exception:
             os.close(fd)
             raise
-        return fd
+        keep_audit_fd = True
+        return fd, audit_fd
     except OSError as exc:
         raise AuditAnchorError(f"cannot open trusted audit home: {exc}") from exc
     finally:
         for fd in reversed(directory_fds):
+            if keep_audit_fd and fd == audit_fd:
+                continue
             try:
                 os.close(fd)
             except OSError:
@@ -151,7 +155,7 @@ class AuditChainAnchor:
         if anchor_path.parent not in {Path("."), trusted_dir}:
             raise AuditAnchorError("audit chain anchor must be a trusted basename")
         self.path = trusted_dir / filename
-        self._fd = _open_anchor_file(trusted_dir, filename)
+        self._fd, self._dir_fd = _open_anchor_file(trusted_dir, filename)
         self._project_id = str(project_id or "")
         self._database_id = hashlib.sha256(
             str(Path(database_path).expanduser().resolve()).encode("utf-8")
@@ -160,9 +164,8 @@ class AuditChainAnchor:
         self._verified = False
 
     def _read_state(self) -> dict[str, Any] | None:
-        os.lseek(self._fd, 0, os.SEEK_SET)
-        raw = os.read(self._fd, 4 * 1024 * 1024)
-        if len(raw) >= 4 * 1024 * 1024:
+        raw = os.pread(self._fd, 64 * 1024, 0)
+        if len(raw) >= 64 * 1024:
             raise AuditAnchorError("audit chain anchor exceeds its size limit")
         lines = [line for line in raw.splitlines() if line.strip()]
         if not lines:
@@ -184,18 +187,61 @@ class AuditChainAnchor:
             "database_id": self._database_id,
             "head_id": head_id,
             "head_hash": head_hash,
-            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(UTC).isoformat(),
         }
         raw = (json.dumps(state, ensure_ascii=False, sort_keys=True) + "\n").encode(
             "utf-8"
         )
-        view = memoryview(raw)
-        while view:
-            written = os.write(self._fd, view)
-            if written <= 0:
-                raise AuditAnchorError("audit chain anchor write made no progress")
-            view = view[written:]
-        os.fsync(self._fd)
+        temporary_name = (
+            f".{self.path.name}.{os.getpid()}.{id(self):x}.tmp"
+        )
+        temporary_fd: int | None = None
+        replaced = False
+        try:
+            temporary_fd = os.open(
+                temporary_name,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+                dir_fd=self._dir_fd,
+            )
+            view = memoryview(raw)
+            while view:
+                written = os.write(temporary_fd, view)
+                if written <= 0:
+                    raise AuditAnchorError("audit chain anchor write made no progress")
+                view = view[written:]
+            os.fsync(temporary_fd)
+            os.close(temporary_fd)
+            temporary_fd = None
+            os.replace(
+                temporary_name,
+                self.path.name,
+                src_dir_fd=self._dir_fd,
+                dst_dir_fd=self._dir_fd,
+            )
+            replaced = True
+            os.fsync(self._dir_fd)
+            replacement_fd = os.open(
+                self.path.name,
+                os.O_RDWR | os.O_NOFOLLOW,
+                dir_fd=self._dir_fd,
+            )
+            old_fd = self._fd
+            self._fd = replacement_fd
+            os.close(old_fd)
+        except OSError as exc:
+            raise AuditAnchorError("cannot atomically replace audit chain anchor") from exc
+        finally:
+            if temporary_fd is not None:
+                try:
+                    os.close(temporary_fd)
+                except OSError:
+                    pass
+            if not replaced:
+                try:
+                    os.unlink(temporary_name, dir_fd=self._dir_fd)
+                except OSError:
+                    pass
 
     def _validate_state(self, state: dict[str, Any]) -> tuple[int, str]:
         if state.get("format") != 1:
@@ -241,6 +287,13 @@ class AuditChainAnchor:
             raise AuditAnchorError(
                 "audit chain anchor does not match the persisted database prefix"
             )
+        if anchor_id > 0 and not replay:
+            breaks = await database.verify_audit_chain_since(anchor_id)
+            if breaks:
+                raise AuditAnchorError(
+                    "SQLite audit hash chain suffix is broken: "
+                    + ", ".join(str(item.get("id")) for item in breaks)
+                )
         current_id = 0 if current is None else int(current["id"])
         if current_id < anchor_id:
             raise AuditAnchorError(
@@ -250,9 +303,9 @@ class AuditChainAnchor:
             self._write_state(current)
 
     async def verify(self, database: Any) -> None:
-        """Replay and validate the chain against the independent anchor."""
+        """Validate the chain, replaying it once per anchor lifecycle."""
         async with self._lock:
-            await self._check(database, replay=True)
+            await self._check(database, replay=not self._verified)
             self._verified = True
 
     async def observe(self, database: Any) -> None:
@@ -261,7 +314,7 @@ class AuditChainAnchor:
             # Keep the anchor update fail-closed: a forged row must not become
             # the new trusted head merely because it was appended after the
             # last startup replay.
-            await self._check(database, replay=True)
+            await self._check(database, replay=False)
             self._verified = True
 
     def close(self) -> None:
@@ -272,3 +325,9 @@ class AuditChainAnchor:
             except OSError:
                 pass
             self._fd = -1
+        if self._dir_fd >= 0:
+            try:
+                os.close(self._dir_fd)
+            except OSError:
+                pass
+            self._dir_fd = -1

@@ -31,8 +31,6 @@ def resolve_go_imports(
     for imp in imports:
         module: str = imp.get("module", "")
         alias: str | None = imp.get("alias")
-        metadata: dict[str, Any] = imp.get("metadata", {})
-
         if module_path and module.startswith(module_path):
             # Intra-module import — resolve to directory
             relative = module[len(module_path):].lstrip("/")

@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from khaos.coding.verification.models import DetectedProject, VerificationPlan, VerificationStep
+from khaos.coding.verification.models import (
+    DetectedProject,
+    VerificationPlan,
+    VerificationStep,
+)
 
 
 class VerificationPlanner:

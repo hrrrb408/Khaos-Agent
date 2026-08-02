@@ -6,7 +6,6 @@ import asyncio
 import hashlib
 import logging
 import os
-import shutil
 import stat
 import tempfile
 import uuid
@@ -14,12 +13,18 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
 
-from khaos.coding.workspace.models import ChangeSet, TaskWorkspace, WorkspaceState, WorkspaceTransition
+from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 from khaos.coding.workspace.git_identity import (
     GitIdentityError,
     capture_git_worktree_identity,
     restore_git_pointer_for_cleanup,
     verify_git_worktree_identity,
+)
+from khaos.coding.workspace.models import (
+    ChangeSet,
+    TaskWorkspace,
+    WorkspaceState,
+    WorkspaceTransition,
 )
 from khaos.coding.workspace.storage import (
     WorkspaceMutation,
@@ -28,7 +33,6 @@ from khaos.coding.workspace.storage import (
     WorkspaceStorageViolation,
     capture_workspace_snapshot,
 )
-from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
 
 logger = logging.getLogger(__name__)
 T = TypeVar("T")
@@ -643,7 +647,7 @@ class WorkspaceManager:
             if self._lease_invalidation_hook is not None:
                 try:
                     self._lease_invalidation_hook(workspace_id=workspace_id)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - lease hooks are fail-closed boundaries
                     logger.warning(
                         "lease invalidation failed for workspace %s; "
                         "cleanup refused (fail-closed): %s",
@@ -661,7 +665,7 @@ class WorkspaceManager:
                     await self._git(workspace.repository_root, "worktree", "remove", "--force", str(workspace.worktree_path))
                 else:
                     await self._git(workspace.repository_root, "worktree", "remove", str(workspace.worktree_path))
-            except Exception:
+            except Exception:  # noqa: BLE001 - worktree cleanup failure is persisted
                 workspace.state = WorkspaceState.FAILED
                 return WorkspaceTransition.FAILED
             workspace.state = WorkspaceState.CLEANED

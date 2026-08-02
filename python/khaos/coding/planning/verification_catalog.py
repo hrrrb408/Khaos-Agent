@@ -98,7 +98,7 @@ class SafeConfigSnapshot:
     reader_call_count: int
 
     @staticmethod
-    def capture(root: Path | None, filename: str, *, reader=None) -> "SafeConfigSnapshot":
+    def capture(root: Path | None, filename: str, *, reader=None) -> SafeConfigSnapshot:
         """Capture a safe snapshot of ``root / filename``.
 
         Args:
@@ -561,7 +561,4 @@ class VerificationCatalog:
     @staticmethod
     def _is_safe_argv(argv: tuple[str, ...]) -> bool:
         """Reject shell control characters — argv must stay structured."""
-        for part in argv:
-            if any(token in part for token in _CONTROL_TOKENS):
-                return False
-        return True
+        return all(not any(token in part for token in _CONTROL_TOKENS) for part in argv)

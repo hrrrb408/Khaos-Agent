@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Generic, TypeVar
 
-
 FileIdentity = tuple[int, int]
 RootIdentity = tuple[int, int]
 T = TypeVar("T")
@@ -140,7 +139,7 @@ class WorkspaceStorageAuthority:
             try:
                 mutation.rollback()
                 rollback_succeeded = True
-            except Exception:
+            except Exception:  # noqa: BLE001 - rollback failure requires quarantine
                 rollback_succeeded = False
             finally:
                 mutation.finalize()

@@ -3,6 +3,9 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -24,6 +27,66 @@ func TestValidateTLSConfig(t *testing.T) {
 			err := validateTLSConfig(tc.addr, tc.cert, tc.key)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("validateTLSConfig() error=%v wantErr=%v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestIsContainerSecretPath(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		want bool
+	}{
+		{"direct secret", "/run/secrets/gateway-api-key", true},
+		{"secret root", "/run/secrets", false},
+		{"nested path", "/run/secrets/nested/gateway-api-key", false},
+		{"path traversal", "/run/secrets/../gateway-api-key", false},
+		{"lookalike root", "/run/secrets-extra/gateway-api-key", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isContainerSecretPath(tc.path); got != tc.want {
+				t.Fatalf("isContainerSecretPath(%q) = %v, want %v", tc.path, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReadProtectedTokenContainerSecretAllowsReadOnlyGroupMode(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway-api-key")
+	if err := os.WriteFile(path, []byte("01234567890123456789012345678901\n"), 0o440); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS != "windows" {
+		if _, err := readProtectedToken(path, false); err == nil {
+			t.Fatal("host token unexpectedly accepted group-readable permissions")
+		}
+	}
+	key, err := readProtectedToken(path, true)
+	if err != nil {
+		t.Fatalf("container secret token rejected: %v", err)
+	}
+	if key != "01234567890123456789012345678901" {
+		t.Fatalf("key = %q, want trimmed secret", key)
+	}
+}
+
+func TestProtectedFileModeForContainerSecretRejectsWritesOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		path string
+		mode os.FileMode
+		want bool
+	}{
+		{"host strict", "/tmp/tls-key.pem", 0o440, true},
+		{"container read-only group", "/run/secrets/khaos_tls_key", 0o440, false},
+		{"container read-only other", "/run/secrets/khaos_tls_key", 0o444, false},
+		{"container group-write", "/run/secrets/khaos_tls_key", 0o460, true},
+		{"container other-write", "/run/secrets/khaos_tls_key", 0o402, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := protectedFileModeUnsafe(tc.path, tc.mode); got != tc.want {
+				t.Fatalf("protectedFileModeUnsafe(%q, %o) = %v, want %v", tc.path, tc.mode, got, tc.want)
 			}
 		})
 	}

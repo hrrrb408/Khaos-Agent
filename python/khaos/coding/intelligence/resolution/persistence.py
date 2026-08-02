@@ -20,8 +20,8 @@ from typing import Any
 
 from khaos.coding.intelligence.resolution.models import (
     FileResolutionResult,
-    ResolutionDiagnostic,
     RepositorySymbol,
+    ResolutionDiagnostic,
     ResolvedCallEdge,
     ResolvedImport,
     ResolvedReferenceEdge,

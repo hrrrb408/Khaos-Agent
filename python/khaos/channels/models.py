@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any
 
 
 class ChannelType(Enum):
@@ -76,7 +76,7 @@ class PlatformMessage:
     content_type: ContentType = ContentType.TEXT
     text: str = ""
     attachments: list[MediaAttachment] = field(default_factory=list)
-    reply_to: Optional[ReplyReference] = None
+    reply_to: ReplyReference | None = None
     sender: Sender = field(default_factory=Sender)
     target: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -129,6 +129,6 @@ class DeliveryResult:
     success: bool
     channel: str
     target: str
-    error: Optional[str] = None
+    error: str | None = None
     timestamp: float = 0.0
     platform_message_id: str = ""

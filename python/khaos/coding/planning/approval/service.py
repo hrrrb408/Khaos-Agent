@@ -25,7 +25,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any, Protocol, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Protocol
 
 from khaos.coding.planning.approval.models import (
     BrokerDecisionReceipt,
@@ -35,11 +35,9 @@ from khaos.coding.planning.approval.models import (
     PlanApprovalStatus,
     PlanValidationContext,
 )
-from khaos.coding.planning.approval.repository import PersistedPlanRepository, PlanRepository, PlanSnapshotStore
-from khaos.coding.planning.approval.validator import (
-    PlanLiveValidator,
-    PlanNotRequestableError as _ValidatorNotRequestable,
-    PlanStaleError as _ValidatorStale,
+from khaos.coding.planning.approval.repository import (
+    PersistedPlanRepository,
+    PlanRepository,
 )
 from khaos.coding.planning.approval.store import (
     ApprovalTransitionResult,
@@ -47,9 +45,17 @@ from khaos.coding.planning.approval.store import (
     new_event_id,
     new_request_id,
 )
+from khaos.coding.planning.approval.validator import (
+    PlanLiveValidator,
+)
+from khaos.coding.planning.approval.validator import (
+    PlanNotRequestableError as _ValidatorNotRequestable,
+)
+from khaos.coding.planning.approval.validator import (
+    PlanStaleError as _ValidatorStale,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from khaos.coding.planning.approval.models import Clock
     from khaos.coding.planning.contracts import ImplementationPlan
 
 logger = logging.getLogger(__name__)
@@ -221,7 +227,7 @@ class PlanApprovalService:
     def plan_repository(self) -> PlanRepository:
         return self._plan_repository
 
-    def register_plan(self, plan: "ImplementationPlan") -> bool:
+    def register_plan(self, plan: ImplementationPlan) -> bool:
         """Register the authoritative plan snapshot. Returns False if a
         snapshot with the same plan_id but different content_hash already
         exists (refused — use a new plan_id)."""
@@ -234,7 +240,7 @@ class PlanApprovalService:
     # ------------------------------------------------------------------
 
     def _validate_for_approval(
-        self, plan: "ImplementationPlan", *, approved_verification_plan_digest: str = "",
+        self, plan: ImplementationPlan, *, approved_verification_plan_digest: str = "",
     ) -> PlanValidationContext:
         """Validate via the shared :class:`PlanLiveValidator`.
 
@@ -259,7 +265,7 @@ class PlanApprovalService:
 
     def request_approval(
         self,
-        plan: "ImplementationPlan",
+        plan: ImplementationPlan,
         *,
         actor_id: str = "system",
         reason: str = "",
@@ -402,7 +408,7 @@ class PlanApprovalService:
     def _build_request(
         self,
         approval_request_id: str,
-        plan: "ImplementationPlan",
+        plan: ImplementationPlan,
         ctx: PlanValidationContext,
         now: float,
         *,
@@ -649,7 +655,7 @@ class PlanApprovalService:
                         plan,
                         approved_verification_plan_digest=request.approved_verification_plan_digest or "",
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - stale approval recovery must fail closed
                     self._store.transition_request_status(
                         request.approval_request_id,
                         expected={PlanApprovalStatus.REGISTERING},
@@ -667,7 +673,7 @@ class PlanApprovalService:
                     )
                     self._store.set_request_broker(request.approval_request_id, brid, pending=True)
                     counts["re_registered"] += 1
-                except Exception:
+                except Exception:  # noqa: BLE001 - broker registration failure leaves request stale
                     self._store.transition_request_status(
                         request.approval_request_id,
                         expected={PlanApprovalStatus.REGISTERING},
@@ -692,7 +698,7 @@ class PlanApprovalService:
                         plan,
                         approved_verification_plan_digest=request.approved_verification_plan_digest or "",
                     )
-                except Exception:
+                except Exception:  # noqa: BLE001 - stale approval recovery must fail closed
                     self._store.transition_request_status(
                         request.approval_request_id,
                         expected={PlanApprovalStatus.PENDING},
@@ -709,7 +715,7 @@ class PlanApprovalService:
                         expires_at=request.expires_at,
                     )
                     counts["left_pending"] += 1
-                except Exception:
+                except Exception:  # noqa: BLE001 - broker registration failure preserves pending state
                     counts["left_pending"] += 1
         return counts
 

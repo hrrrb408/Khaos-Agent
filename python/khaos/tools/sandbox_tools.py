@@ -8,8 +8,11 @@ from pathlib import Path
 from typing import Any
 
 from khaos.coding.execution.docker import DEFAULT_DOCKER_IMAGE
-from khaos.coding.execution.models import ExecutionRequest, NetworkPolicy, ResourceBudget
-
+from khaos.coding.execution.models import (
+    ExecutionRequest,
+    NetworkPolicy,
+    ResourceBudget,
+)
 
 _MEMORY_PATTERN = re.compile(r"^(\d+)([kKmMgG])$")
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 from rich.markup import escape
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
@@ -40,7 +42,11 @@ class PermissionDialog(ModalScreen[bool]):
     }
     """
 
-    BINDINGS = [("y", "approve", "Allow"), ("n", "deny", "Deny"), ("escape", "deny", "Deny")]
+    BINDINGS: ClassVar[list[tuple[str, str, str]]] = [
+        ("y", "approve", "Allow"),
+        ("n", "deny", "Deny"),
+        ("escape", "deny", "Deny"),
+    ]
 
     def __init__(self, request: dict) -> None:
         super().__init__()

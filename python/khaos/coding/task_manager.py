@@ -20,6 +20,8 @@ from datetime import datetime
 from enum import Enum
 from typing import Any
 
+from khaos.time_utils import utc_now_naive
+
 logger = logging.getLogger(__name__)
 
 #: How many recent test results are retained per task (older ones dropped).
@@ -39,7 +41,7 @@ class TaskStatus(Enum):
     CANCELLED = "cancelled"
 
     @classmethod
-    def parse(cls, value: str) -> "TaskStatus":
+    def parse(cls, value: str) -> TaskStatus:
         """Parse a status string, raising ``ValueError`` if unknown."""
         try:
             return cls(value)
@@ -114,7 +116,7 @@ class CodingTask:
 
     def touch(self) -> None:
         """Stamp ``updated_at`` to now."""
-        self.updated_at = datetime.now()
+        self.updated_at = utc_now_naive()
 
     def to_dict(self, include_internal: bool = False) -> dict[str, Any]:
         """Serialize to a JSON-safe dict for the TUI / RPC layer.
@@ -509,7 +511,7 @@ class TaskManager:
             if self._lease_invalidation_hook is not None:
                 try:
                     self._lease_invalidation_hook(task_id=task_id)
-                except Exception as exc:
+                except Exception as exc:  # noqa: BLE001 - lease hooks are fail-closed boundaries
                     logger.warning(
                         "lease invalidation failed for task %s; "
                         "cancel refused (fail-closed): %s",
@@ -640,9 +642,7 @@ class TaskManager:
             return False
         if any(task.status in ACTIVE_STATUSES for task in self._tasks.values()):
             return False
-        if any(subs for subs in self._subscribers.values()):
-            return False
-        return True
+        return not any(subs for subs in self._subscribers.values())
 
     async def begin_eviction(self) -> bool:
         """Batch 6.5 (round-6 §十七): atomically check evictability and
@@ -695,7 +695,7 @@ class TaskManager:
                                 "task_id": task_id,
                                 "sequence": 0,
                                 "type": "task.evicted",
-                                "timestamp": datetime.now().isoformat(),
+                                "timestamp": utc_now_naive().isoformat(),
                                 "payload": {"reason": "manager_evicted"},
                             }
                         )

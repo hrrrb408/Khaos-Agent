@@ -137,11 +137,14 @@ def _extract_symbol_source(symbol_names: tuple[str, ...]) -> str:
     found: dict[str, str] = {}
     for node in ast.walk(tree):
         # FunctionDef / AsyncFunctionDef / ClassDef all carry ``name``.
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-            if node.name in wanted and node.name not in found:
-                seg = ast.get_source_segment(source, node)
-                if seg is not None:
-                    found[node.name] = seg
+        if (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name in wanted
+            and node.name not in found
+        ):
+            seg = ast.get_source_segment(source, node)
+            if seg is not None:
+                found[node.name] = seg
     missing = wanted - found.keys()
     if missing:
         raise RuntimeError(
@@ -393,6 +396,18 @@ MIGRATIONS: tuple[MigrationSpec, ...] = (
             "_ensure_permission_resource_columns",
         ),
     ),
+    MigrationSpec(
+        version=12,
+        name="round18_durable_tool_operation_journal",
+        # Filled from the release-time manifest after the v12 migrator is
+        # finalized.  The literal is intentionally checked by
+        # ``verify_source_integrity`` before a database is opened.
+        sha256="a4268656f3d72b9bd36d54dbd828e9ddea15625e0123c9dbc280f8168d4b2a1a",
+        migrator_symbols=(
+            "_apply_v12_upgrades",
+            "_ensure_tool_operations_table",
+        ),
+    ),
 )
 
 
@@ -442,13 +457,13 @@ def verify_source_integrity() -> None:
 
 
 __all__ = [
+    "CURRENT_NAME",
+    "CURRENT_VERSION",
     "HISTORICAL_ACCEPTED",
     "MIGRATIONS",
     "MIGRATION_REGISTRY",
-    "MigrationSpec",
     "REGISTRY_BY_VERSION",
-    "CURRENT_VERSION",
-    "CURRENT_NAME",
+    "MigrationSpec",
     "compute_manifest_checksum",
     "is_historical",
     "verify_source_integrity",

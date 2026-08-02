@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Optional
 
 from khaos.time_utils import utc_now_naive
 
@@ -26,27 +25,27 @@ class ScheduleConfig:
     """调度配置。"""
 
     # cron 表达式（分 时 日 月 星期），或 ISO 时间戳（一次性），或间隔字符串
-    cron: Optional[str] = None
-    iso_time: Optional[str] = None      # 一次性，ISO 8601
-    interval_seconds: Optional[int] = None  # 固定间隔
-    repeat: Optional[int] = None         # 最大重复次数，None = 无限
+    cron: str | None = None
+    iso_time: str | None = None      # 一次性，ISO 8601
+    interval_seconds: int | None = None  # 固定间隔
+    repeat: int | None = None         # 最大重复次数，None = 无限
 
 
 @dataclass
 class ScheduledTask:
     """一个定时任务。"""
 
-    id: Optional[str]
+    id: str | None
     name: str
     prompt: str                         # 执行时的 prompt
     status: TaskStatus = TaskStatus.PENDING
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     created_at: datetime = field(default_factory=utc_now_naive)
-    last_run: Optional[datetime] = None
-    next_run: Optional[datetime] = None
+    last_run: datetime | None = None
+    next_run: datetime | None = None
     run_count: int = 0
-    last_result: Optional[str] = None
-    error: Optional[str] = None
+    last_result: str | None = None
+    error: str | None = None
     deliver_to: str = "local"           # local | session:<id> | all
     enabled: bool = True
     meta: dict = field(default_factory=dict)  # 额外元数据
@@ -70,8 +69,8 @@ class ScheduledTask:
     # M4 batch 3.1.10: durable execution claim.  Set atomically via
     # claim_scheduled_task() before the executor runs, so a crash
     # during execution leaves a durable marker for restart recovery.
-    execution_id: Optional[str] = None
-    lease_until: Optional[datetime] = None
+    execution_id: str | None = None
+    lease_until: datetime | None = None
     # M4 batch 3.1.16B-1 (CRITICAL): security-context snapshot at
     # creation time.  ``policy_digest`` captures the
     # ``EffectiveSecurityPolicy.digest`` when the task was created;

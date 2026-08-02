@@ -20,7 +20,6 @@ from khaos.coding.execution.models import (
 )
 from khaos.coding.execution.supervisor import ProcessSupervisor
 
-
 _DENIED_ENV_KEYS = frozenset({
     "HOME", "SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "DOCKER_HOST",
     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES",
@@ -207,6 +206,7 @@ class DockerBackend:
                 # control process from starting before a container exists.
                 enforce_resource_limits=False,
                 enforce_resource_watchdog=True,
+                use_native_launcher=False,
                 workspace_root=context.worktree_path,
                 workspace_baseline=context.workspace_baseline,
             )
@@ -355,6 +355,7 @@ class DockerBackend:
                 ),
                 env={"PATH": os.environ.get("PATH", "")},
                 enforce_resource_limits=False,
+                use_native_launcher=False,
             )
         except FileNotFoundError:
             return -1, "", "Docker CLI not installed"

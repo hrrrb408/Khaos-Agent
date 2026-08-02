@@ -89,7 +89,7 @@ async def spawn_subagent(
     *,
     principal_id: str = "",
     project_id: str = "",
-    subagent_spawner: "SubAgentSpawner | None" = None,
+    subagent_spawner: SubAgentSpawner | None = None,
 ) -> dict[str, Any]:
     """启动一个子代理执行指定任务。
 
@@ -181,7 +181,7 @@ async def collect_results(
     *,
     principal_id: str = "",
     project_id: str = "",
-    subagent_spawner: "SubAgentSpawner | None" = None,
+    subagent_spawner: SubAgentSpawner | None = None,
 ) -> dict[str, Any]:
     """等待所有子任务完成并收集结果。
 
@@ -241,7 +241,7 @@ async def execute_plan(
     *,
     principal_id: str = "",
     project_id: str = "",
-    subagent_spawner: "SubAgentSpawner | None" = None,
+    subagent_spawner: SubAgentSpawner | None = None,
 ) -> dict[str, Any]:
     """执行一个任务计划（JSON 格式）。
 
@@ -321,7 +321,7 @@ async def subagent_status(
     *,
     principal_id: str = "",
     project_id: str = "",
-    subagent_spawner: "SubAgentSpawner | None" = None,
+    subagent_spawner: SubAgentSpawner | None = None,
 ) -> dict[str, Any]:
     """查看当前所有子任务状态（不等待）。
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +24,7 @@ class FileFingerprintCache:
         """计算内容 hash。"""
         return hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-    def get_hash(self, path: str) -> Optional[str]:
+    def get_hash(self, path: str) -> str | None:
         """获取缓存的 hash，不存在返回 None。"""
         return self._cache.get(path)
 

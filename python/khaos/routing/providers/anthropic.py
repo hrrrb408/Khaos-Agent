@@ -19,8 +19,12 @@ from typing import Any
 import httpx
 
 from khaos.agent.core import Message
-from khaos.routing.provider import ModelSpec, ProviderConfig
-from khaos.routing.providers.base import BaseProvider, ProviderError, register_provider_type
+from khaos.routing.provider import ModelSpec
+from khaos.routing.providers.base import (
+    BaseProvider,
+    ProviderError,
+    register_provider_type,
+)
 
 
 class AnthropicProvider(BaseProvider):

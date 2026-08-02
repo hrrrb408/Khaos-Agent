@@ -7,9 +7,10 @@ import hashlib
 import json
 import logging
 import os
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from khaos.time_utils import utc_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +34,9 @@ def _quick_note_sync(
     normalized_tags = tags or []
     DEFAULT_NOTES_DIR.mkdir(parents=True, exist_ok=True)
 
-    created = datetime.now().isoformat(timespec="seconds")
-    now = datetime.now()
-    digest = hashlib.sha1(f"{created}\n{title}\n{content}".encode("utf-8")).hexdigest()[:6]
+    created = utc_now_naive().isoformat(timespec="seconds")
+    now = utc_now_naive()
+    digest = hashlib.sha1(f"{created}\n{title}\n{content}".encode()).hexdigest()[:6]
     file_name = f"{now.strftime('%Y-%m-%d_%H%M%S')}_{digest}.md"
     note_path = DEFAULT_NOTES_DIR / file_name
 

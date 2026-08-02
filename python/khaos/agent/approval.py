@@ -7,9 +7,9 @@ import hashlib
 import json
 import secrets
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Awaitable, Callable
-
+from typing import Self
 
 #: Namespace prefix reserved for plan-execution approval requests. This keeps
 #: plan approvals disjoint from Task approvals (keyed by tool_call_id) and
@@ -111,7 +111,7 @@ class ToolApprovalHandle(str):
 
     def __new__(
         cls, binding_digest: str, approval_id: str
-    ) -> "ToolApprovalHandle":
+    ) -> Self:
         instance = super().__new__(cls, binding_digest)
         instance.approval_id = approval_id
         instance.binding_digest = binding_digest
@@ -217,7 +217,9 @@ class ApprovalBroker:
         self._db = db
         # Broker-private Ed25519 authority for durable decision receipts.
         # Only its public verifier is persisted by the runtime.
-        from khaos.coding.planning.approval.receipt_crypto import _ReceiptSigningAuthority
+        from khaos.coding.planning.approval.receipt_crypto import (
+            _ReceiptSigningAuthority,
+        )
         self.__receipt_signing_authority = _ReceiptSigningAuthority()
         # Batch 2.6 §1: the durable receipt writer is stored name-mangled so
         # ordinary code and tests cannot read or replace it. Only the runtime
@@ -230,7 +232,9 @@ class ApprovalBroker:
         return self.__receipt_signing_authority.verifier
 
     def _rotate_receipt_signing_authority(self, boot_epoch: int, boot_id: str) -> None:
-        from khaos.coding.planning.approval.receipt_crypto import _ReceiptSigningAuthority
+        from khaos.coding.planning.approval.receipt_crypto import (
+            _ReceiptSigningAuthority,
+        )
         self.__receipt_signing_authority = _ReceiptSigningAuthority(
             boot_epoch=boot_epoch, boot_id=boot_id
         )
@@ -436,7 +440,7 @@ class ApprovalBroker:
         try:
             decision = await asyncio.wait_for(asyncio.shield(future), timeout) if timeout else await future
             return {"approved": decision.approved, "remember": decision.remember}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             async with self._lock:
                 record = self._find_tool_approval_locked(
                     tool_call_id, binding_digest

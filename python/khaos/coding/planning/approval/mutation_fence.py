@@ -27,9 +27,9 @@ stub. Real mutations arrive in Batch 3.
 from __future__ import annotations
 
 import logging
-from contextlib import asynccontextmanager
-from contextlib import contextmanager
-from typing import Any, AsyncIterator, Callable, TYPE_CHECKING
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager, contextmanager
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     import asyncio
@@ -54,14 +54,14 @@ class WorkspaceMutationFence:
     def __init__(self) -> None:
         import threading
 
-        self._locks: dict[str, "asyncio.Lock"] = {}
+        self._locks: dict[str, asyncio.Lock] = {}
         self._owners: dict[str, str] = {}
         self._poisoned: dict[str, dict[str, str]] = {}
         self._sync_locks: dict[str, Any] = {}
         # Protects _locks and _owners dicts (not the asyncio locks themselves).
         self._registry_lock = threading.Lock()
 
-    def _get_or_create_lock(self, workspace_id: str) -> "asyncio.Lock":
+    def _get_or_create_lock(self, workspace_id: str) -> asyncio.Lock:
         import asyncio
 
         with self._registry_lock:

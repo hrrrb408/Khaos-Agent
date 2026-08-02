@@ -16,7 +16,7 @@ class SafeWorkspaceRelativePath:
     value: str
 
     @classmethod
-    def parse(cls, raw: str) -> "SafeWorkspaceRelativePath":
+    def parse(cls, raw: str) -> SafeWorkspaceRelativePath:
         if not isinstance(raw, str) or not raw or raw in {".", ".."} or "\x00" in raw or "\\" in raw:
             raise UnsafePersistedIdentifier("invalid workspace path")
         normalized = unicodedata.normalize("NFC", raw)
@@ -36,7 +36,7 @@ class SafeRecoveryRunId:
     value: str
 
     @classmethod
-    def parse(cls, raw: str) -> "SafeRecoveryRunId":
+    def parse(cls, raw: str) -> SafeRecoveryRunId:
         if not isinstance(raw, str) or not re.fullmatch(r"per_[0-9a-f]{32}", raw):
             raise UnsafePersistedIdentifier("invalid recovery run id")
         return cls(raw)
@@ -47,7 +47,7 @@ class SafeRecoveryArtifactName:
     value: str
 
     @classmethod
-    def parse(cls, raw: str) -> "SafeRecoveryArtifactName":
+    def parse(cls, raw: str) -> SafeRecoveryArtifactName:
         if not isinstance(raw, str) or not re.fullmatch(r"artifact-[0-9a-f]{32}\.bak", raw):
             raise UnsafePersistedIdentifier("invalid recovery artifact name")
         return cls(raw)
@@ -58,7 +58,7 @@ class SafeSealTombstoneName:
     value: str
 
     @classmethod
-    def parse(cls, raw: str) -> "SafeSealTombstoneName":
+    def parse(cls, raw: str) -> SafeSealTombstoneName:
         if not isinstance(raw, str) or not re.fullmatch(r"seal-[0-9a-f]{32}\.json", raw):
             raise UnsafePersistedIdentifier("invalid seal tombstone name")
         return cls(raw)

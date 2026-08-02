@@ -41,7 +41,7 @@ _HIGH_RISK_CATEGORIES = {
 }
 
 
-def evaluate_approval_requirement(plan: "ImplementationPlan") -> ApprovalRequirementOutcome:
+def evaluate_approval_requirement(plan: ImplementationPlan) -> ApprovalRequirementOutcome:
     """Recompute the authoritative approval requirement for a plan.
 
     Decision rules (a plan requires human approval if ANY is true):
@@ -140,7 +140,7 @@ def evaluate_approval_requirement(plan: "ImplementationPlan") -> ApprovalRequire
 _RISK_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
 
-def _aggregate_risk_level(plan: "ImplementationPlan") -> str:
+def _aggregate_risk_level(plan: ImplementationPlan) -> str:
     """Return the highest risk level present anywhere in the plan."""
     levels: list[str] = []
     for risk in plan.risks:

@@ -20,11 +20,11 @@ import sqlite3
 import stat
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator
-
+from typing import Any
 
 PROTECTED_SCHEMA_OBJECTS: dict[str, str] = {
     "plan_execution_runs": "table",
@@ -149,7 +149,7 @@ def _append_authority_event(
         runtime_id, boot_id, event_type, detail, created_at
     )
     event_hash = hashlib.sha256(
-        f"{previous_hash}\n{payload}".encode("utf-8")
+        f"{previous_hash}\n{payload}".encode()
     ).hexdigest()
     ledger.execute(
         "INSERT INTO authority_events(runtime_id,boot_id,event_type,payload_json,"
@@ -166,7 +166,7 @@ def _verify_authority_event_chain(ledger: sqlite3.Connection) -> None:
     ).fetchall()
     for payload, stored_previous, stored_hash in rows:
         expected = hashlib.sha256(
-            f"{previous_hash}\n{payload}".encode("utf-8")
+            f"{previous_hash}\n{payload}".encode()
         ).hexdigest()
         if stored_previous != previous_hash or stored_hash != expected:
             raise PermissionError("verification authority ledger hash chain is corrupt")
@@ -451,7 +451,7 @@ def _authority_process_main(
         _verify_pinned_authority_ledger(
             database, directory_identity, directory_fd, objects, absent
         )
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - authority worker reports all protocol failures
         connection.send(("error", f"{type(exc).__name__}: {exc}"))
         connection.close()
         return
@@ -545,7 +545,7 @@ def _authority_process_main(
                     database, directory_identity, directory_fd, objects, absent
                 )
                 connection.send((True, None))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - authority request is rejected fail-closed
                 ledger.rollback()
                 _append_authority_event(
                     ledger, runtime_id, boot_id, "request-rejected",
@@ -586,7 +586,7 @@ class VerificationWriteCapability:
 class VerificationReadHandle:
     """Fixed-query read facade; it never returns its SQLite connection."""
 
-    __slots__ = ("__connection", "__authority", "__owns_connection")
+    __slots__ = ("__authority", "__connection", "__owns_connection")
 
     def __init__(
         self, connection: sqlite3.Connection, authority: Any,
@@ -650,7 +650,7 @@ class VerificationWriteAuthority:
     @classmethod
     def _activate(
         cls, connection: sqlite3.Connection, *, runtime_id: str, boot_id: str,
-    ) -> "VerificationWriteAuthority":
+    ) -> VerificationWriteAuthority:
         row = connection.execute("PRAGMA database_list").fetchone()
         database_path = str(row[2]) if row is not None else ""
         if not database_path:
@@ -965,7 +965,7 @@ class VerificationWriteAuthority:
             shutdown_error: Exception | None = None
             try:
                 self._rpc("shutdown")
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - shutdown failure is surfaced to the caller
                 shutdown_error = exc
             finally:
                 self._active = False

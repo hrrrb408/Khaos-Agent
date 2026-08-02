@@ -7,10 +7,10 @@ or external dependency resolution.
 from khaos.coding.intelligence.resolution.ids import stable_symbol_id
 from khaos.coding.intelligence.resolution.models import (
     FileResolutionResult,
-    ResolutionDiagnostic,
-    ResolutionStatus,
     RepositoryResolutionReport,
     RepositorySymbol,
+    ResolutionDiagnostic,
+    ResolutionStatus,
     ResolvedCallEdge,
     ResolvedImport,
     ResolvedReferenceEdge,

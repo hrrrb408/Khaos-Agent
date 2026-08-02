@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import json
+import os
 import shlex
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator
 
 from khaos.agent.core import Message
 from khaos.config import (
