@@ -463,6 +463,12 @@ jobs:
           python -m pip install --require-hashes -r python/bootstrap-requirements.txt
           uv sync --frozen --extra test
           echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Build native execution launcher
+        run: |
+          cargo build --locked --release --no-default-features \
+            --bin khaos-exec-launcher \
+            --manifest-path rust/khaos-core/Cargo.toml
+          echo "KHAOS_EXEC_LAUNCHER=$GITHUB_WORKSPACE/rust/khaos-core/target/release/khaos-exec-launcher" >> "$GITHUB_ENV"
       - name: Capture pre-test diagnostics
         run: |
           set +e
