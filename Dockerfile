@@ -78,7 +78,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=rust-tcb-builder /build/rust/khaos-core/target/release/khaos-browser-kernel-helper /usr/local/sbin/khaos-browser-kernel-helper
 COPY packaging/docker/kernel-helper-entrypoint.sh /usr/local/sbin/kernel-helper-entrypoint
 RUN chown root:root /usr/local/sbin/khaos-browser-kernel-helper /usr/local/sbin/kernel-helper-entrypoint \
-    && chmod 0755 /usr/local/sbin/khaos-browser-kernel-helper /usr/local/sbin/kernel-helper-entrypoint
+    && chmod 0755 /usr/local/sbin/khaos-browser-kernel-helper /usr/local/sbin/kernel-helper-entrypoint \
+    && sha256sum /usr/local/sbin/khaos-browser-kernel-helper \
+        > /usr/local/sbin/khaos-browser-kernel-helper.sha256 \
+    && chown root:root /usr/local/sbin/khaos-browser-kernel-helper.sha256 \
+    && chmod 0444 /usr/local/sbin/khaos-browser-kernel-helper.sha256
 
 ENTRYPOINT ["/usr/local/sbin/kernel-helper-entrypoint"]
 

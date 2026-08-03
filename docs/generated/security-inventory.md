@@ -23,8 +23,8 @@
   - `Dockerfile:2`: `sha256:d9c3c6f1264a547d84560e06ffd79ed7a799ce0bff0980b26cf10d29af888377`
   - `Dockerfile:13`: `sha256:b18992999dbe963a45a8a4da40ac2b1975be1a776d939d098c647482bcad5cba`
   - `Dockerfile:73`: `sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818`
-  - `Dockerfile:86`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
-  - `Dockerfile:93`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
+  - `Dockerfile:90`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
+  - `Dockerfile:97`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
 - Lockfile fingerprints:
   - `uv.lock`: `3d7ba5b093484b24b6f268b8d0edf536d6edf2525600ffb3da6561e2aba9c6e1`
   - `python/bootstrap-requirements.txt`: `72082c05288cd1b6f61b0304a4f90f01bbcae2ec6d6262d56de5a9ff03dc5acd`
@@ -40,7 +40,7 @@
 
 | Area | Current contract | Evidence class |
 | --- | --- | --- |
-| Linux namespace/cgroup/nftables and Compose isolation | Must pass real Linux CI; local Docker Desktop may lack `/run/netns` shared-mount capability | CI-only |
+| Linux namespace/cgroup/nftables and Compose isolation | Uses a helper-only netns root, but must pass real Linux CI with kernel capabilities | CI-only |
 | macOS Seatbelt | Fail-closed/native contract tests and hosted macOS security job | Local/CI |
 | Windows | Unsupported for execution; refuses Host fallback and emits fail-closed result | CI fail-closed |
 | Remote audit/WORM and independent human review | Not implemented by this repository | Unknown/external gate |
@@ -53,11 +53,11 @@
 - `python/khaos/permissions/rules.py`: `173df51bf720843e339e026c5219a0db7e2b69beaa45576b2e24ee17764dfe6f`
 - `python/khaos/coding/execution/service.py`: `02e2c44a4d227ebdd94154bf293a68ccc584b24b4fc2e476bf6ec0ed3b7b109a`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `cd2fd041601e05effcdeb43396b008772a15f3f7557ff6fbffec516f40392787`
-- `python/khaos/grpc_server.py`: `4206e317aa42a701663e29f7651f3e9534e01c688b5769b55588947c80ac7a0f`
-- `go/internal/api/handler.go`: `5c8be560dc037bb49c553115213c0bb5a285a601da201c8361844980b7661719`
+- `python/khaos/coding/execution/supervisor.py`: `11137ac9aa23f24caedb550f64d70d55ba497b870460192f9544b752df67b249`
+- `python/khaos/grpc_server.py`: `b3154e205b659f5a97d59f5130ac28f115e6c436a739d7d3c6445ef7d0d65d6f`
+- `go/internal/api/handler.go`: `4066a777cd27a92046f1eae17fe719f294a91050312659806f52290a89ab8306`
 - `go/cmd/gateway/main.go`: `919157cb7304aff7d790260ffb195621aa5a82bdf5137d5e63ed86c2128bc9fe`
-- `go/internal/platform/python_client.go`: `0d040b26828864662e872c17fb8371d0cb81dcdfd49d682d449df1754bc08d0d`
+- `go/internal/platform/python_client.go`: `96a72a622395ea859e56052bdc00cd26ba463c6882e8e269661d543de3417681`
 
 ## Required release gates
 

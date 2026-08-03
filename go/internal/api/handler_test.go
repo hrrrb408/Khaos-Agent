@@ -28,6 +28,16 @@ type mockAgent struct {
 
 type blockingAgent struct{ mockAgent }
 
+type healthProbeAgent struct {
+	mockAgent
+	response map[string]any
+	err      error
+}
+
+func (m *healthProbeAgent) Health(_ context.Context) (map[string]any, error) {
+	return m.response, m.err
+}
+
 func (m *blockingAgent) Chat(ctx context.Context, req ChatRequest) (<-chan ChatEvent, error) {
 	ch := make(chan ChatEvent, 1)
 	ch <- ChatEvent{Event: "started", Data: map[string]any{"session_id": req.SessionID}}
@@ -254,6 +264,68 @@ func TestAuthRequired(t *testing.T) {
 	}
 	if rec := serveUnauthenticated(handler, http.MethodPost, "/api/chat?key=secret", `{"message":"hello"}`); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("query key status = %d", rec.Code)
+	}
+}
+
+func TestHealthLifecycleEndpointsSeparateLiveReadyAndDetails(t *testing.T) {
+	handler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), "secret", rate.NewTokenBucket(100, 10)).Routes()
+
+	live := serveUnauthenticated(handler, http.MethodGet, "/api/live", "")
+	if live.Code != http.StatusOK {
+		t.Fatalf("live status=%d", live.Code)
+	}
+	var livePayload map[string]any
+	if err := json.NewDecoder(live.Body).Decode(&livePayload); err != nil || livePayload["status"] != "ok" {
+		t.Fatalf("live payload=%v err=%v", livePayload, err)
+	}
+
+	ready := serveUnauthenticated(handler, http.MethodGet, "/api/ready", "")
+	if ready.Code != http.StatusOK {
+		t.Fatalf("ready status=%d body=%s", ready.Code, ready.Body.String())
+	}
+	if details := serveUnauthenticated(handler, http.MethodGet, "/api/health/details", ""); details.Code != http.StatusUnauthorized {
+		t.Fatalf("anonymous health details status=%d", details.Code)
+	}
+	if details := serve(handler, http.MethodGet, "/api/health/details", "", "secret"); details.Code != http.StatusOK {
+		t.Fatalf("authenticated health details status=%d", details.Code)
+	}
+}
+
+func TestReadyFailsWhenDependenciesAreMissing(t *testing.T) {
+	handler := NewHandler(nil, nil, nil, "secret", rate.NewTokenBucket(100, 10)).Routes()
+	if rec := serveUnauthenticated(handler, http.MethodGet, "/api/live", ""); rec.Code != http.StatusOK {
+		t.Fatalf("liveness must not depend on backends: %d", rec.Code)
+	}
+	if rec := serveUnauthenticated(handler, http.MethodGet, "/api/ready", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("readiness with missing backends=%d", rec.Code)
+	}
+}
+
+func TestReadyUsesPythonHealthProbe(t *testing.T) {
+	agent := &healthProbeAgent{
+		response: map[string]any{
+			"ready":  true,
+			"checks": map[string]any{"db": map[string]any{"ok": true}},
+		},
+	}
+	handler := NewHandler(agent, NewMemoryMap(), NewMapConfig(nil), "secret", rate.NewTokenBucket(100, 10))
+	routes := handler.Routes()
+
+	if rec := serveUnauthenticated(routes, http.MethodGet, "/api/ready", ""); rec.Code != http.StatusOK {
+		t.Fatalf("ready status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	agent.response["ready"] = false
+	if rec := serveUnauthenticated(routes, http.MethodGet, "/api/ready", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unready Python status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	agent.err = errors.New("python unavailable")
+	if rec := serveUnauthenticated(routes, http.MethodGet, "/api/ready", ""); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("unreachable Python status=%d body=%s", rec.Code, rec.Body.String())
+	}
+
+	details := serve(routes, http.MethodGet, "/api/health/details", "", "secret")
+	if details.Code != http.StatusOK || !strings.Contains(details.Body.String(), "agent_error") {
+		t.Fatalf("health details=%d body=%s", details.Code, details.Body.String())
 	}
 }
 

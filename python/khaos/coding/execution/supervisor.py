@@ -71,6 +71,7 @@ class ProcessSupervisor:
         workspace_limits: WorkspaceStorageLimits | None = None,
         directory_binding: ExecutionDirectoryBinding | None = None,
         use_native_launcher: bool = True,
+        preserve_directory_fds: bool = False,
     ) -> ExecutionResult:
         """Run one foreground process with bounded, fairly split output.
 
@@ -123,6 +124,7 @@ class ProcessSupervisor:
                         else None
                     ),
                     enforce_resource_limits=enforce_resource_limits,
+                    preserve_directory_fds=preserve_directory_fds,
                 )
             else:
                 launch = None

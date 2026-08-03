@@ -46,6 +46,15 @@ type AgentClient interface {
 	SwitchMode(ctx context.Context, principalID string, sessionID string, targetMode string) (string, error)
 }
 
+// HealthProbe is the internal readiness contract implemented by the Python
+// AgentService client.  It deliberately remains separate from AgentClient so
+// lightweight test doubles and legacy adapters can still serve liveness while
+// production adapters expose the real database, audit, policy, and helper
+// checks.
+type HealthProbe interface {
+	Health(ctx context.Context) (map[string]any, error)
+}
+
 // ChatEventClient reads the Python-owned durable broadcast ledger.
 type ChatEventClient interface {
 	ChatEvents(ctx context.Context, principalID string, sessionID string, afterEventID uint64) (<-chan ChatEvent, error)

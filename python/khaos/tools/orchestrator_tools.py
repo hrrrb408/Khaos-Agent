@@ -41,6 +41,12 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from khaos.tools.scheduler import (
+    EFFECT_APPLIED,
+    EFFECT_NOT_APPLIED,
+    ToolExecutionOutcome,
+)
+
 if TYPE_CHECKING:
     from khaos.subagents.spawner import SubAgentSpawner
 
@@ -54,8 +60,23 @@ logger = logging.getLogger(__name__)
 _SPAWN_FAILURE_STATUSES = frozenset({"failed", "cancelled"})
 
 
-def _require_principal(principal_id: str) -> dict[str, Any] | None:
-    """MEDIUM (batch 3.1.9): return an ``ok=false`` error dict if
+def _failure(payload: dict[str, Any]) -> ToolExecutionOutcome:
+    return ToolExecutionOutcome(
+        ok=False,
+        output=payload,
+        error=str(payload.get("error") or "orchestrator tool failed"),
+        error_code="ORCHESTRATOR_ERROR",
+        effect_status=EFFECT_NOT_APPLIED,
+        retry_safe=True,
+    )
+
+
+def _success(payload: dict[str, Any]) -> ToolExecutionOutcome:
+    return ToolExecutionOutcome(output=payload, effect_status=EFFECT_APPLIED)
+
+
+def _require_principal(principal_id: str) -> ToolExecutionOutcome | None:
+    """MEDIUM (batch 3.1.9): return a typed failure if
     ``principal_id`` is empty, else ``None``.
 
     The orchestrator tools must not fail open to a shared pseudo-principal
@@ -66,7 +87,7 @@ def _require_principal(principal_id: str) -> dict[str, Any] | None:
     principal; the tool path now matches.
     """
     if not principal_id:
-        return {"ok": False, "error": "principal_id is required"}
+        return _failure({"ok": False, "error": "principal_id is required"})
     return None
 
 
@@ -90,7 +111,7 @@ async def spawn_subagent(
     principal_id: str = "",
     project_id: str = "",
     subagent_spawner: SubAgentSpawner | None = None,
-) -> dict[str, Any]:
+) -> ToolExecutionOutcome:
     """启动一个子代理执行指定任务。
 
     参数：
@@ -124,7 +145,7 @@ async def spawn_subagent(
         falling back to a shared pseudo-principal.
     """
     if subagent_spawner is None:
-        return {"ok": False, "error": "Orchestrator not initialized"}
+        return _failure({"ok": False, "error": "Orchestrator not initialized"})
 
     # MEDIUM (batch 3.1.9): refuse empty principal — fail closed.
     principal_error = _require_principal(principal_id)
@@ -156,25 +177,25 @@ async def spawn_subagent(
         # ok=false so the caller can branch on ``ok``.  Matches the
         # RPC SubAgentService contract.
         if result.status in _SPAWN_FAILURE_STATUSES:
-            return {
+            return _failure({
                 "ok": False,
                 "task_id": result.id,
                 "status": result.status,
                 "error": result.error or "spawn failed",
                 "principal_id": principal_id,
-            }
+            })
         # MEDIUM (batch 3.1.8): return the REAL post-spawn status
         # (typically "pending" or "initializing").  Previously this was
         # hard-coded to "running".
-        return {
+        return _success({
             "ok": True,
             "task_id": result.id,
             "status": result.status,
             "principal_id": principal_id,
-        }
+        })
     except Exception as exc:  # noqa: BLE001 — 工具层兜底，转为结构化错误
         logger.error("Failed to spawn subagent: %s", exc)
-        return {"ok": False, "error": str(exc)}
+        return _failure({"ok": False, "error": str(exc)})
 
 
 async def collect_results(
@@ -242,7 +263,7 @@ async def execute_plan(
     principal_id: str = "",
     project_id: str = "",
     subagent_spawner: SubAgentSpawner | None = None,
-) -> dict[str, Any]:
+) -> ToolExecutionOutcome:
     """执行一个任务计划（JSON 格式）。
 
     参数：
@@ -276,7 +297,7 @@ async def execute_plan(
         into ``create_session`` + ``RuntimeConfig``.
     """
     if subagent_spawner is None:
-        return {"ok": False, "error": "Orchestrator not initialized"}
+        return _failure({"ok": False, "error": "Orchestrator not initialized"})
 
     # MEDIUM (batch 3.1.9): refuse empty principal — fail closed.
     principal_error = _require_principal(principal_id)
@@ -287,7 +308,7 @@ async def execute_plan(
 
     plan = TaskPlanner.from_json(plan_json)
     if plan is None:
-        return {"ok": False, "error": "Invalid plan JSON: failed to parse"}
+        return _failure({"ok": False, "error": "Invalid plan JSON: failed to parse"})
 
     # MEDIUM (batch 3.1.8): stamp every task in the plan with the
     # caller's principal so collect_results / subagent_status can
@@ -304,17 +325,17 @@ async def execute_plan(
         results = [_task_to_dict(task) for task in tasks]
         completed = sum(1 for r in results if r["status"] == "completed")
         failed = sum(1 for r in results if r["status"] == "failed")
-        return {
+        return _success({
             "ok": True,
             "plan_id": plan.id,
             "results": results,
             "total": len(tasks),
             "completed": completed,
             "failed": failed,
-        }
+        })
     except Exception as exc:  # noqa: BLE001
         logger.error("Failed to execute plan: %s", exc)
-        return {"ok": False, "error": str(exc)}
+        return _failure({"ok": False, "error": str(exc)})
 
 
 async def subagent_status(

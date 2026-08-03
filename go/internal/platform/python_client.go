@@ -21,6 +21,7 @@ import (
 // Compile-time assertions that PythonClient satisfies the gateway interfaces.
 var (
 	_ api.AgentClient    = PythonClient{}
+	_ api.HealthProbe    = PythonClient{}
 	_ api.AuditClient    = PythonClient{}
 	_ api.SubagentClient = PythonClient{}
 	_ api.ChannelClient  = PythonClient{}
@@ -202,6 +203,25 @@ type PythonClient struct {
 	// adapters may leave it false to exercise the explicit development
 	// compatibility window without pretending that path is production-safe.
 	RequireNegotiation bool
+}
+
+// Health asks the Python AgentService for its real readiness state.  The
+// request is authenticated and deployment-bound, but intentionally carries
+// no user principal: readiness is a control-plane probe, not a user data
+// operation.  Python remains the authority for database, audit-anchor,
+// policy, and privileged-helper checks.
+func (c PythonClient) Health(ctx context.Context) (map[string]any, error) {
+	response, err := c.callMap(ctx, "Bootstrap.Health", map[string]any{}, "")
+	if err != nil {
+		return nil, err
+	}
+	if c.ProjectID != "" && stringValue(response["project_id"]) != c.ProjectID {
+		return nil, fmt.Errorf("python health project_id drift")
+	}
+	if c.PolicyDigest != "" && stringValue(response["policy_digest"]) != c.PolicyDigest {
+		return nil, fmt.Errorf("python health policy_digest drift")
+	}
+	return response, nil
 }
 
 // writeRequest serializes and signs one JSON-line RPC request.

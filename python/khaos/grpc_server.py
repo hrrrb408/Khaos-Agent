@@ -41,6 +41,7 @@ except ImportError:  # pragma: no cover — Windows
 
 from khaos.agent.approval import ApprovalBroker
 from khaos.audit import (
+    AuditAnchorError,
     AuditLogger,
     resolve_safe_audit_anchor_path,
     resolve_safe_audit_log_path,
@@ -1241,6 +1242,10 @@ class AgentService:
         # it — AgentService.shutdown does.
         self._office_authority = OfficeMutationAuthority()
         self._accepting_work = True
+        # Readiness is distinct from object construction: the process must
+        # have verified its audit anchor and started the scheduler before the
+        # Gateway may advertise that the AgentService can accept work.
+        self._ready = False
         self._active_chat_tasks: set[asyncio.Task] = set()
         self._active_runtimes: dict[int, object] = {}
         # Round-6 Batch 6.1: track active sessions to reject concurrent
@@ -1275,12 +1280,113 @@ class AgentService:
 
     async def start(self) -> None:
         """Start process-scoped background services."""
+        self._ready = False
         if self._audit_logger is not None:
             await self._audit_logger.verify_anchor()
         # C-1-5a: ``TaskService`` now lazily constructs per-principal
         # TaskManagers on first use (``_manager(ctx)``), so there's no
         # server-level ``task_manager.load()`` at startup.
         await self.cron_engine.start()
+        self._ready = True
+
+    def _browser_helper_health(self) -> dict[str, Any]:
+        """Check the privileged helper endpoint without performing a mutation.
+
+        The helper protocol requires a live, runtime-scoped capability before
+        ``status`` can be called.  A process-wide readiness probe does not
+        possess such a capability and must never mint a dummy one.  This check
+        therefore proves the protected socket endpoint is present and labels
+        the remaining live-RPC assertion explicitly for the per-sandbox path.
+        """
+        required = sys.platform.startswith("linux") and os.environ.get(
+            "KHAOS_DEV_MODE"
+        ) != "1"
+        socket_name = os.environ.get(
+            "KHAOS_BROWSER_KERNEL_HELPER_SOCKET",
+            "/run/khaos/browser-kernel-helper.sock",
+        )
+        result: dict[str, Any] = {
+            "required": required,
+            "configured": bool(socket_name),
+            "socket_present": False,
+            "socket_protected": False,
+            "probe": "socket_authority_only",
+            "live_rpc": False,
+        }
+        if not required:
+            result["ready"] = True
+            return result
+        try:
+            socket_path = Path(socket_name)
+            if not socket_path.is_absolute():
+                result["error"] = "relative_socket_path"
+                result["ready"] = False
+                return result
+            metadata = socket_path.lstat()
+            result["socket_present"] = stat.S_ISSOCK(metadata.st_mode)
+            parent = socket_path.parent
+            parent_metadata = parent.lstat()
+            parent_protected = (
+                stat.S_ISDIR(parent_metadata.st_mode)
+                and parent_metadata.st_uid == 0
+                and not bool(parent_metadata.st_mode & 0o022)
+            )
+            socket_protected = not bool(metadata.st_mode & 0o077)
+            result["socket_protected"] = socket_protected and parent_protected
+        except OSError as exc:
+            result["error"] = exc.__class__.__name__
+        result["ready"] = bool(
+            result["socket_present"] and result["socket_protected"]
+        )
+        return result
+
+    async def health(self) -> dict[str, Any]:
+        """Return the control-plane readiness contract for the Gateway."""
+        db_health = await self.db.health_check()
+        policy_compiled = bool(
+            isinstance(self._effective_policy.digest, str)
+            and len(self._effective_policy.digest) == 64
+        )
+        audit_required = bool(self._effective_policy.audit_enabled)
+        audit_configured = self._audit_logger is not None
+        audit_verified = not audit_required
+        audit_error = ""
+        if self._audit_logger is not None:
+            try:
+                await self._audit_logger.verify_anchor()
+                audit_verified = True
+            except (AuditAnchorError, OSError, RuntimeError, ValueError) as exc:
+                audit_error = exc.__class__.__name__
+                audit_verified = False
+        audit_health: dict[str, Any] = {
+            "required": audit_required,
+            "configured": audit_configured,
+            "verified": audit_verified,
+            "ok": audit_verified if audit_required else True,
+        }
+        if audit_error:
+            audit_health["error"] = audit_error
+        helper_health = self._browser_helper_health()
+        ready = bool(
+            self._ready
+            and db_health.get("ok") is True
+            and policy_compiled
+            and audit_health["ok"] is True
+            and helper_health["ready"] is True
+        )
+        return {
+            "status": "ready" if ready else "not_ready",
+            "ready": ready,
+            "project_id": self._bound_project_id,
+            "policy_digest": self._effective_policy.digest,
+            "checks": {
+                "agent_started": self._ready,
+                "db": db_health,
+                "audit_anchor": audit_health,
+                "policy": {"compiled": policy_compiled},
+                "browser_kernel_helper": helper_health,
+            },
+        }
 
     async def stop_producers(self) -> None:
         """Reject new turns and stop background producers before teardown."""
@@ -1296,6 +1402,7 @@ class AgentService:
         # chat drain via fresh snapshot, runtime drain via registry scan).
         if self._shutdown_completed:
             return
+        self._ready = False
         # Stop producers, then cancel/wait every active turn while shared
         # authorities and the database are still available.
         await self.stop_producers()
@@ -2871,6 +2978,31 @@ async def serve_json_lines(
                     writer.write((json.dumps({
                         "policy_digest": agent._effective_policy.digest,
                     }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
+                # Bootstrap.Health is an authenticated control-plane probe.
+                # Unlike GetPolicyDigest it must carry the deployment claims,
+                # so a Gateway pointed at the wrong project/policy cannot
+                # receive a misleading ready response.  It has no user
+                # principal and therefore does not enter a service context.
+                if method == "Bootstrap.Health":
+                    claim_error = _rpc_binding_claim_error(
+                        payload,
+                        bound_project_id=agent._bound_project_id,
+                        bound_policy_digest=agent._effective_policy.digest,
+                        require_claims=os.environ.get("KHAOS_DEV_MODE") != "1",
+                    )
+                    if claim_error is not None:
+                        error_code, error_message = claim_error
+                        writer.write((json.dumps({
+                            "error": error_code,
+                            "message": error_message,
+                        }) + "\n").encode("utf-8"))
+                    else:
+                        writer.write(
+                            (json.dumps(await agent.health(), ensure_ascii=False) + "\n")
+                            .encode("utf-8")
+                        )
                     await writer.drain()
                     return
                 # Internal RPC v2 is the production contract. The Gateway

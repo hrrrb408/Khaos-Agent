@@ -4894,11 +4894,38 @@ class Database:
             row = await cursor.fetchone()
             if row is not None:
                 values = dict(row)
+                scope_fields = {
+                    "principal_id": principal_id,
+                    "project_id": project_id,
+                    "session_id": session_id,
+                    "task_id": task_id,
+                    "workspace_id": workspace_id,
+                }
+                mismatched_scope = [
+                    field
+                    for field, expected in scope_fields.items()
+                    if str(values.get(field) or "") != str(expected or "")
+                ]
+                if mismatched_scope:
+                    return {
+                        "state": "conflict",
+                        "conflict_reason": (
+                            "operation scope mismatch: "
+                            + ", ".join(sorted(mismatched_scope))
+                        ),
+                        **values,
+                    }
                 if (
                     values["tool_name"] != tool_name
                     or values["arguments_digest"] != arguments_digest
                 ):
-                    return {"state": "conflict", **values}
+                    return {
+                        "state": "conflict",
+                        "conflict_reason": (
+                            "idempotency key was reused with different tool arguments"
+                        ),
+                        **values,
+                    }
                 return {"state": "existing", **values}
             now = utc_now_naive().isoformat()
             await conn.execute(
@@ -5004,14 +5031,22 @@ class Database:
     async def prune_tool_operations(
         self, *, older_than_seconds: float, now: float, limit: int = 256
     ) -> int:
-        """Expire terminal idempotency rows after an explicit replay window."""
+        """Prune only terminal operations proven to have no external effect.
+
+        A completed row with ``applied``, ``partial``, or ``unknown`` effect
+        status is also a replay-suppression tombstone.  Deleting it merely
+        because it is old can turn a later retry into a duplicate external
+        mutation.  Those rows require an explicit reconciliation/archive
+        workflow; routine maintenance may remove only ``not_applied`` rows.
+        """
         cutoff = datetime.fromtimestamp(
             now - max(0.0, older_than_seconds), UTC
         ).replace(tzinfo=None).isoformat()
         async with self.transaction() as conn:
             cursor = await conn.execute(
                 "SELECT operation_id FROM tool_operations "
-                "WHERE status IN ('completed','unknown') AND updated_at < ? "
+                "WHERE status = 'completed' AND effect_status = 'not_applied' "
+                "AND updated_at < ? "
                 "ORDER BY updated_at LIMIT ?",
                 (cutoff, max(1, min(limit, 10_000))),
             )
@@ -5037,6 +5072,38 @@ class Database:
                 "busy": int(row[0]),
                 "log_pages": int(row[1]),
                 "checkpointed_pages": int(row[2]),
+            }
+
+    async def health_check(self) -> dict[str, Any]:
+        """Return a bounded, side-effect-free database readiness check.
+
+        The check uses the writer transaction path rather than only testing
+        that a connection object exists.  ``BEGIN IMMEDIATE`` plus a rollback
+        proves that the configured database is reachable and currently
+        writable, while ``quick_check(1)`` catches an integrity failure before
+        the gateway advertises readiness.  No application row is changed.
+        """
+        try:
+            async with self.transaction() as conn:
+                cursor = await conn.execute("PRAGMA quick_check(1)")
+                row = await cursor.fetchone()
+                quick_check = str(row[0]) if row is not None else ""
+                await conn.execute("SELECT 1")
+            ok = quick_check.lower() == "ok"
+            return {
+                "ok": ok,
+                "connected": True,
+                "writable": True,
+                "quick_check": quick_check or "missing",
+            }
+        except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error) as exc:
+            logger.warning("database health check failed: %s", exc.__class__.__name__)
+            return {
+                "ok": False,
+                "connected": self._conn is not None,
+                "writable": False,
+                "quick_check": "error",
+                "error": exc.__class__.__name__,
             }
 
     # ------------------------------------------------------------------

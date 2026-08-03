@@ -27,10 +27,39 @@ from __future__ import annotations
 from typing import Any
 
 from khaos.scheduler.models import ScheduleConfig
+from khaos.tools.scheduler import (
+    EFFECT_APPLIED,
+    EFFECT_NOT_APPLIED,
+    EFFECT_UNKNOWN,
+    ToolExecutionOutcome,
+)
 
 
-def _require_principal(principal_id: str) -> dict[str, Any] | None:
-    """M4 batch 3.1.10 (CRITICAL): return an ``ok=false`` error dict if
+def _failure(
+    payload: dict[str, Any],
+    *,
+    effect_status: str = EFFECT_NOT_APPLIED,
+    retry_safe: bool = True,
+    reconciliation_hint: str = "",
+) -> ToolExecutionOutcome:
+    status = str(payload.get("status") or "error")
+    return ToolExecutionOutcome(
+        ok=False,
+        output=payload,
+        error=str(payload.get("error") or payload.get("message") or status),
+        error_code=status.upper(),
+        effect_status=effect_status,
+        reconciliation_hint=reconciliation_hint,
+        retry_safe=retry_safe,
+    )
+
+
+def _success(payload: dict[str, Any]) -> ToolExecutionOutcome:
+    return ToolExecutionOutcome(output=payload, effect_status=EFFECT_APPLIED)
+
+
+def _require_principal(principal_id: str) -> ToolExecutionOutcome | None:
+    """M4 batch 3.1.10 (CRITICAL): return a typed failure if
     ``principal_id`` is empty, else ``None``.
 
     The cron tools must not fail open to a shared pseudo-principal when
@@ -39,11 +68,15 @@ def _require_principal(principal_id: str) -> dict[str, Any] | None:
     principal is rejected.
     """
     if not principal_id:
-        return {"status": "error", "error": "principal_id is required"}
+        return _failure({"status": "error", "error": "principal_id is required"})
     return None
 
 
-def _lifecycle_lock_response(lock_error: str, task_id: str | None = None) -> dict[str, Any]:
+def _lifecycle_lock_response(
+    lock_error: str,
+    task_id: str | None = None,
+    **extra: Any,
+) -> ToolExecutionOutcome:
     """M4 batch 3.1.16B-5 (CRITICAL): convert the engine's lifecycle-
     lock return value into a structured ``{"status": "error", ...}``
     response.
@@ -85,7 +118,8 @@ def _lifecycle_lock_response(lock_error: str, task_id: str | None = None) -> dic
     }
     if task_id is not None:
         resp["task_id"] = task_id
-    return resp
+    resp.update(extra)
+    return _failure(resp)
 
 
 async def cron_create(
@@ -96,7 +130,7 @@ async def cron_create(
     principal_id: str = "",
     cron_engine: Any = None,
     **kwargs: Any,
-) -> dict:
+) -> ToolExecutionOutcome:
     """Create a new scheduled task.
 
     Args:
@@ -119,11 +153,11 @@ async def cron_create(
     deliver = kwargs.get("deliver_to") or "local"
 
     if cron_engine is None:
-        return {
+        return _failure({
             "status": "unavailable",
             "error": "cron engine not configured",
             "name": name,
-        }
+        })
     try:
         task = await cron_engine.create(
             name, prompt, config, deliver_to=deliver,
@@ -131,7 +165,7 @@ async def cron_create(
         )
     except ValueError as exc:
         # principal_id validation failure
-        return {"status": "error", "error": str(exc), "name": name}
+        return _failure({"status": "error", "error": str(exc), "name": name})
     except RuntimeError as exc:
         # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable /
         # engine_degraded) — convert to structured response.  The
@@ -140,24 +174,22 @@ async def cron_create(
         # remove return the lock_error string directly.
         lock_error = str(exc)
         if lock_error in ("engine_unavailable", "engine_degraded"):
-            resp = _lifecycle_lock_response(lock_error)
-            resp["name"] = name
-            return resp
+            return _lifecycle_lock_response(lock_error, name=name)
         # Unknown RuntimeError — re-raise (don't swallow real bugs).
         raise
-    return {
+    return _success({
         "status": "created",
         "task_id": task.id,
         "name": name,
         "schedule": schedule,
         "deliver_to": deliver,
         "next_run": task.next_run.isoformat() if task.next_run else None,
-    }
+    })
 
 
 async def cron_list(
     *, principal_id: str = "", cron_engine: Any = None, **kwargs: Any
-) -> dict:
+) -> ToolExecutionOutcome:
     """List scheduled tasks for the caller's principal.
 
     M4 batch 3.1.10 (CRITICAL): only tasks belonging to
@@ -176,9 +208,9 @@ async def cron_list(
         return principal_error
 
     if cron_engine is None:
-        return {"status": "unavailable", "error": "cron engine not configured", "tasks": []}
+        return _failure({"status": "unavailable", "error": "cron engine not configured", "tasks": []})
     tasks = await cron_engine.list_tasks(principal_id=principal_id)
-    return {
+    return ToolExecutionOutcome(output={
         "tasks": [
             {
                 "id": t.id,
@@ -202,7 +234,7 @@ async def cron_list(
             }
             for t in tasks
         ]
-    }
+    }, effect_status=EFFECT_NOT_APPLIED)
 
 
 async def cron_remove(
@@ -211,7 +243,7 @@ async def cron_remove(
     principal_id: str = "",
     cron_engine: Any = None,
     **kwargs: Any,
-) -> dict:
+) -> ToolExecutionOutcome:
     """Remove a scheduled task.
 
     M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
@@ -223,7 +255,7 @@ async def cron_remove(
         return principal_error
 
     if cron_engine is None:
-        return {"status": "unavailable", "error": "cron engine not configured"}
+        return _failure({"status": "unavailable", "error": "cron engine not configured"})
     result = await cron_engine.remove(task_id, principal_id=principal_id)
     # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
     # FIRST because the lock runs before the per-task lock and returns
@@ -231,11 +263,11 @@ async def cron_remove(
     if result in ("engine_unavailable", "engine_degraded"):
         return _lifecycle_lock_response(result, task_id=task_id)
     if result == "ok":
-        return {"status": "removed", "task_id": task_id}
+        return _success({"status": "removed", "task_id": task_id})
     if result == "not_found":
-        return {"status": "not_found", "task_id": task_id}
+        return _failure({"status": "not_found", "task_id": task_id})
     if result == "invalid_state":
-        return {
+        return _failure({
             "status": "invalid_state",
             "task_id": task_id,
             "error": "task is in a terminal execution state "
@@ -243,23 +275,25 @@ async def cron_remove(
                      "Note: drift-quarantined tasks (FAILED with "
                      "error starting 'quarantined:') CAN be removed; "
                      "use cron_list to check the error field.",
-        }
+        })
     if result == "persistence_pending":
-        return {
+        return _failure({
             "status": "persistence_pending",
             "task_id": task_id,
             "error": "executor terminated but the DB write failed; "
                      "stop() will retry — the cancelled state may not "
                      "survive a restart",
-        }
+        }, effect_status=EFFECT_UNKNOWN, retry_safe=False,
+        reconciliation_hint="task removal state may not be durable; reconcile the scheduler task before retry")
     # cancellation_pending — executor did not terminate
-    return {
+    return _failure({
         "status": "cancellation_pending",
         "task_id": task_id,
         "error": "executor did not terminate within cancel budget; "
                  "task is marked cancelled but the old executor may "
                  "still be running — retry remove() to confirm",
-    }
+    }, effect_status=EFFECT_UNKNOWN, retry_safe=False,
+    reconciliation_hint="the previous executor may still be running; reconcile task state before retry")
 
 
 async def cron_pause(
@@ -268,7 +302,7 @@ async def cron_pause(
     principal_id: str = "",
     cron_engine: Any = None,
     **kwargs: Any,
-) -> dict:
+) -> ToolExecutionOutcome:
     """Pause a scheduled task.
 
     M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
@@ -279,40 +313,42 @@ async def cron_pause(
         return principal_error
 
     if cron_engine is None:
-        return {"status": "unavailable", "error": "cron engine not configured"}
+        return _failure({"status": "unavailable", "error": "cron engine not configured"})
     result = await cron_engine.pause(task_id, principal_id=principal_id)
     # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
     # FIRST because the lock runs before the per-task lock.
     if result in ("engine_unavailable", "engine_degraded"):
         return _lifecycle_lock_response(result, task_id=task_id)
     if result == "ok":
-        return {"status": "paused", "task_id": task_id}
+        return _success({"status": "paused", "task_id": task_id})
     if result == "not_found":
-        return {"status": "not_found", "task_id": task_id}
+        return _failure({"status": "not_found", "task_id": task_id})
     if result == "invalid_state":
-        return {
+        return _failure({
             "status": "invalid_state",
             "task_id": task_id,
             "error": "task is in a state that cannot be paused "
                      "(CANCELLED tombstone or terminal COMPLETED / "
                      "FAILED) — state is unchanged",
-        }
+        })
     if result == "persistence_pending":
-        return {
+        return _failure({
             "status": "persistence_pending",
             "task_id": task_id,
             "error": "executor terminated but the DB write failed; "
                      "stop() will retry — the paused state may not "
                      "survive a restart",
-        }
+        }, effect_status=EFFECT_UNKNOWN, retry_safe=False,
+        reconciliation_hint="task pause state may not be durable; reconcile the scheduler task before retry")
     # cancellation_pending
-    return {
+    return _failure({
         "status": "cancellation_pending",
         "task_id": task_id,
         "error": "executor did not terminate within cancel budget; "
                  "task is marked paused but the old executor may "
                  "still be running — retry pause() to confirm",
-    }
+    }, effect_status=EFFECT_UNKNOWN, retry_safe=False,
+    reconciliation_hint="the previous executor may still be running; reconcile task state before retry")
 
 
 async def cron_resume(
@@ -321,7 +357,7 @@ async def cron_resume(
     principal_id: str = "",
     cron_engine: Any = None,
     **kwargs: Any,
-) -> dict:
+) -> ToolExecutionOutcome:
     """Resume a paused scheduled task.
 
     M4 batch 3.1.10 (CRITICAL): ``principal_id`` is required.  Returns
@@ -340,44 +376,46 @@ async def cron_resume(
         return principal_error
 
     if cron_engine is None:
-        return {"status": "unavailable", "error": "cron engine not configured"}
+        return _failure({"status": "unavailable", "error": "cron engine not configured"})
     result = await cron_engine.resume(task_id, principal_id=principal_id)
     # M4 batch 3.1.16B-5: lifecycle lock (engine_unavailable) — checked
     # FIRST because the lock runs before the per-task lock.
     if result in ("engine_unavailable", "engine_degraded"):
         return _lifecycle_lock_response(result, task_id=task_id)
     if result == "ok":
-        return {"status": "resumed", "task_id": task_id}
+        return _success({"status": "resumed", "task_id": task_id})
     if result == "not_found":
-        return {"status": "not_found", "task_id": task_id}
+        return _failure({"status": "not_found", "task_id": task_id})
     if result == "invalid_state":
-        return {
+        return _failure({
             "status": "invalid_state",
             "task_id": task_id,
             "error": "task is not in the PAUSED state — only PAUSED "
                      "tasks can be resumed (state is unchanged)",
-        }
+        })
     if result == "persistence_pending":
         # M4 batch 3.1.10 (MEDIUM): dedicated branch — the DB write
         # failed, NOT the executor being alive.  The task stays PAUSED
         # in memory and tick does not fire it.  The caller should
         # retry resume() to confirm.
-        return {
+        return _failure({
             "status": "persistence_pending",
             "task_id": task_id,
             "error": "DB write failed; task remains paused in memory "
                      "and will NOT be fired by tick — retry resume() "
                      "to confirm the state is durable",
-        }
+        }, effect_status=EFFECT_UNKNOWN, retry_safe=False,
+        reconciliation_hint="task resume state may not be durable; reconcile the scheduler task before retry")
     # result == "execution_pending" — PAUSED but old executor alive
-    return {
+    return _failure({
         "status": "execution_pending",
         "task_id": task_id,
         "error": "task is PAUSED but the old executor is still "
                  "alive — resuming would cause double side effects; "
                  "wait for the executor to terminate or call "
                  "remove() to force-cancel",
-    }
+    }, effect_status=EFFECT_UNKNOWN, retry_safe=False,
+    reconciliation_hint="the previous executor is still running; reconcile task state before retry")
 
 
 def _parse_schedule(schedule: str) -> ScheduleConfig:

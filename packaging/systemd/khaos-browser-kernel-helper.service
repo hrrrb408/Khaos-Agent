@@ -10,18 +10,20 @@ Group=root
 Environment=KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos-helper/browser-kernel-helper.sock
 Environment=KHAOS_BROWSER_HELPER_SECRET_FILE=/var/lib/khaos/browser-helper.secret
 Environment=KHAOS_BROWSER_HELPER_JOURNAL_ROOT=/run/khaos-helper/journal
-ExecStart=/bin/sh -ec 'client_pid="$$(systemctl show --property MainPID --value khaos-agent.service)"; test "$${client_pid}" -gt 1; client_uid="$$(id -u khaos)"; exec env KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID="$${client_pid}" KHAOS_BROWSER_KERNEL_HELPER_UID="$${client_uid}" /usr/local/sbin/khaos-browser-kernel-helper'
+Environment=KHAOS_BROWSER_HELPER_NETNS_ROOT=/run/khaos-helper/netns
+Environment=KHAOS_BROWSER_HELPER_CGROUP_ROOT=/sys/fs/cgroup/khaos-browser
+ExecStart=/bin/sh -ec 'helper=/usr/local/sbin/khaos-browser-kernel-helper; expected="$$(awk '\''{print $$1}'\'' "$${helper}.sha256")"; actual="$$(sha256sum "$${helper}" | awk '\''{print $$1}'\'')"; test -n "$${expected}"; test "$${actual}" = "$${expected}"; client_pid="$$(systemctl show --property MainPID --value khaos-agent.service)"; test "$${client_pid}" -gt 1; client_uid="$$(id -u khaos)"; exec env KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID="$${client_pid}" KHAOS_BROWSER_KERNEL_HELPER_UID="$${client_uid}" "$${helper}"'
 Restart=on-failure
 RuntimeDirectory=khaos-helper khaos-helper/journal
 RuntimeDirectoryMode=0755
 UMask=0077
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_KILL
-AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_CHOWN CAP_KILL
-NoNewPrivileges=false
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL
+NoNewPrivileges=true
 PrivateTmp=true
 ProtectHome=true
 ProtectSystem=strict
-ReadWritePaths=/run/khaos-helper /var/lib/khaos /run/netns /sys/fs/cgroup/khaos-browser
+ReadWritePaths=/run/khaos-helper /var/lib/khaos /sys/fs/cgroup/khaos-browser
 
 [Install]
 WantedBy=multi-user.target

@@ -58,10 +58,32 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from khaos.tools.scheduler import (
+    EFFECT_APPLIED,
+    EFFECT_NOT_APPLIED,
+    ToolExecutionOutcome,
+)
+
 logger = logging.getLogger(__name__)
 
 
-def _require_registry(channel_registry: Any) -> dict[str, Any] | None:
+def _failure(payload: dict[str, Any]) -> ToolExecutionOutcome:
+    status = str(payload.get("status") or "channel_error")
+    return ToolExecutionOutcome(
+        ok=False,
+        output=payload,
+        error=str(payload.get("error") or status),
+        error_code=status.upper(),
+        effect_status=EFFECT_NOT_APPLIED,
+        retry_safe=True,
+    )
+
+
+def _success(payload: dict[str, Any], *, effect_status: str) -> ToolExecutionOutcome:
+    return ToolExecutionOutcome(output=payload, effect_status=effect_status)
+
+
+def _require_registry(channel_registry: Any) -> ToolExecutionOutcome | None:
     """Return an ``unavailable`` error dict if ``channel_registry`` is
     missing, else ``None``.
 
@@ -70,11 +92,11 @@ def _require_registry(channel_registry: Any) -> dict[str, Any] | None:
     ``_registry is None`` behavior.
     """
     if channel_registry is None:
-        return {"status": "unavailable", "error": "channel registry not configured"}
+        return _failure({"status": "unavailable", "error": "channel registry not configured"})
     return None
 
 
-def _require_principal(principal_id: str) -> dict[str, Any] | None:
+def _require_principal(principal_id: str) -> ToolExecutionOutcome | None:
     """Return an ``unavailable`` error dict if ``principal_id`` is empty,
     else ``None``.
 
@@ -86,13 +108,13 @@ def _require_principal(principal_id: str) -> dict[str, Any] | None:
     ``permission_tools._require_principal``).
     """
     if not principal_id:
-        return {"status": "unavailable", "error": "principal_id is required"}
+        return _failure({"status": "unavailable", "error": "principal_id is required"})
     return None
 
 
 def _require_admin(
     principal_id: str, channel_admins: Any,
-) -> dict[str, str] | None:
+) -> ToolExecutionOutcome | None:
     """Return a ``forbidden`` error dict if ``principal_id`` is not in
     ``channel_admins``, else ``None``.
 
@@ -109,15 +131,15 @@ def _require_admin(
     cannot fall open.
     """
     if not channel_admins:
-        return {
+        return _failure({
             "status": "forbidden",
             "error": "principal is not a channel admin",
-        }
+        })
     if principal_id not in channel_admins:
-        return {
+        return _failure({
             "status": "forbidden",
             "error": "principal is not a channel admin",
-        }
+        })
     return None
 
 
@@ -126,7 +148,7 @@ async def channel_list(
     principal_id: str = "",
     channel_registry: Any = None,
     **kwargs: Any,
-) -> dict[str, Any]:
+) -> ToolExecutionOutcome | dict[str, Any]:
     """List registered communication channels.
 
     Args:
@@ -161,7 +183,7 @@ async def channel_health(
     principal_id: str = "",
     channel_registry: Any = None,
     **kwargs: Any,
-) -> dict[str, Any]:
+) -> ToolExecutionOutcome | dict[str, Any]:
     """Get channel health reports.
 
     Args:
@@ -185,7 +207,7 @@ async def channel_enable(
     channel_registry: Any = None,
     channel_admins: Any = None,
     **kwargs: Any,
-) -> dict[str, str]:
+) -> ToolExecutionOutcome:
     """Enable a registered channel (admin-gated).
 
     Args:
@@ -201,17 +223,19 @@ async def channel_enable(
     """
     principal_error = _require_principal(principal_id)
     if principal_error is not None:
-        return {"status": "unavailable", "channel_id": channel_id, "error": "principal_id is required"}
+        return _failure({"status": "unavailable", "channel_id": channel_id, "error": "principal_id is required"})
     admin_error = _require_admin(principal_id, channel_admins)
     if admin_error is not None:
-        return {"status": admin_error["status"], "channel_id": channel_id, "error": admin_error["error"]}
+        return _failure({"status": admin_error["status"], "channel_id": channel_id, "error": admin_error["error"]})
     registry_error = _require_registry(channel_registry)
     if registry_error is not None:
-        return {"status": "unavailable", "channel_id": channel_id, "error": registry_error["error"]}
-    return {
-        "status": "enabled" if channel_registry.enable(channel_id) else "not_found",
-        "channel_id": channel_id,
-    }
+        return _failure({"status": "unavailable", "channel_id": channel_id, "error": registry_error["error"]})
+    if not channel_registry.enable(channel_id):
+        return _failure({"status": "not_found", "channel_id": channel_id})
+    return _success(
+        {"status": "enabled", "channel_id": channel_id},
+        effect_status=EFFECT_APPLIED,
+    )
 
 
 async def channel_disable(
@@ -221,7 +245,7 @@ async def channel_disable(
     channel_registry: Any = None,
     channel_admins: Any = None,
     **kwargs: Any,
-) -> dict[str, str]:
+) -> ToolExecutionOutcome:
     """Disable a registered channel (admin-gated).
 
     Args:
@@ -236,17 +260,19 @@ async def channel_disable(
     """
     principal_error = _require_principal(principal_id)
     if principal_error is not None:
-        return {"status": "unavailable", "channel_id": channel_id, "error": "principal_id is required"}
+        return _failure({"status": "unavailable", "channel_id": channel_id, "error": "principal_id is required"})
     admin_error = _require_admin(principal_id, channel_admins)
     if admin_error is not None:
-        return {"status": admin_error["status"], "channel_id": channel_id, "error": admin_error["error"]}
+        return _failure({"status": admin_error["status"], "channel_id": channel_id, "error": admin_error["error"]})
     registry_error = _require_registry(channel_registry)
     if registry_error is not None:
-        return {"status": "unavailable", "channel_id": channel_id, "error": registry_error["error"]}
-    return {
-        "status": "disabled" if channel_registry.disable(channel_id) else "not_found",
-        "channel_id": channel_id,
-    }
+        return _failure({"status": "unavailable", "channel_id": channel_id, "error": registry_error["error"]})
+    if not channel_registry.disable(channel_id):
+        return _failure({"status": "not_found", "channel_id": channel_id})
+    return _success(
+        {"status": "disabled", "channel_id": channel_id},
+        effect_status=EFFECT_APPLIED,
+    )
 
 
 CHANNEL_TOOLS = [

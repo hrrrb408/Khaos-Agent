@@ -50,7 +50,11 @@ loopback、仍强制 API key、project root 和 Python capability。生产入口
 固定为 UID 10001 且没有 kernel capability；Gateway 固定为 UID 10002、只读根文件系统、
 只读 Agent runtime volume、无 capability 且不共享 Agent 的 PID namespace；Agent UDS
 通过 root-group setgid 父目录与显式 Gateway UID/GID 校验提供最小 RPC 通道；root helper 是 netns/veth/nft/cgroup
-的唯一 authority，并通过独立只读 socket volume 与 agent 通信。Linux 原生部署先
+的唯一 authority，并通过独立只读 socket volume 与 agent 通信。Compose 只把宿主上
+预先委派的 cgroup v2 subtree（默认 `/sys/fs/cgroup/khaos-browser`，可用
+`KHAOS_BROWSER_HELPER_CGROUP_SOURCE` 覆盖）挂到 helper 的
+`/run/khaos-helper/cgroup`；helper 会拒绝普通目录、符号链接或越界 journal，不能把
+整个 `/sys/fs/cgroup` 作为读写挂载。Linux 原生部署先
 审查并以 root 执行 `scripts/install-native-tcb.sh`，再启用 systemd 服务。不支持的
 Windows sandbox 路径明确拒绝执行，不回退 Host，也不报告 isolated。详细边界见
 `docs/browser-threat-model.md`、`docs/platform-security-guarantees.md` 和

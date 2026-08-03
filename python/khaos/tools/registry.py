@@ -59,12 +59,14 @@ _BUILTIN_EFFECT_STATUS: dict[str, str] = {
         name: _EFFECT_NOT_APPLIED
         for name in (
             "channel_list", "channel_health", "github_read_issue",
+            "browser_snapshot", "browser_screenshot", "browser_vision",
             "read_file", "search_files", "list_directory", "file_info",
             "tree_view", "file_search_content", "search_notes", "list_notes",
             "markdown_to_text", "extract_headings", "count_words",
             "format_markdown_table", "clipboard_read", "git_diff", "git_log",
             "git_status", "git_pr_body", "todo_read", "history_browse",
-            "history_read",
+            "history_read", "cron_list", "collect_results", "subagent_status",
+            "list_permission_rules", "query_audit_logs", "security_status",
         )
     },
     **{
@@ -76,6 +78,17 @@ _BUILTIN_EFFECT_STATUS: dict[str, str] = {
             "delete_note", "clipboard_write", "sandbox_build", "git_commit",
             "git_branch", "git_status_write", "git_smart_commit", "git_undo",
             "git_create_branch", "git_push", "todo_write", "todo_update",
+            "cron_create", "cron_remove", "cron_pause", "cron_resume",
+            "spawn_subagent", "execute_plan", "grant_permission",
+            "revoke_permission",
+            "browser_launch", "browser_close",
+        )
+    },
+    **{
+        name: _EFFECT_UNKNOWN
+        for name in (
+            "browser_navigate", "browser_click", "browser_type",
+            "browser_scroll", "browser_evaluate", "browser_file_upload",
         )
     },
 }

@@ -38,6 +38,7 @@ def build_process_launch(
     directory_binding: ExecutionDirectoryBinding | None,
     budget: ResourceBudget | None,
     enforce_resource_limits: bool,
+    preserve_directory_fds: bool = False,
 ) -> ProcessLaunch:
     """Compile a safe launch into either the native or explicit dev boundary.
 
@@ -48,6 +49,10 @@ def build_process_launch(
     command_tuple = tuple(str(value) for value in command)
     if not command_tuple:
         raise ValueError("execution command cannot be empty")
+    if preserve_directory_fds and directory_binding is None:
+        raise ValueError(
+            "preserving directory descriptors requires a directory binding"
+        )
     needs_boundary = directory_binding is not None or (
         enforce_resource_limits and budget is not None
     )
@@ -88,6 +93,8 @@ def build_process_launch(
                 str(directory_binding.cwd_identity[1]),
             )
         )
+        if preserve_directory_fds:
+            args.append("--preserve-directory-fds")
     if enforce_resource_limits and budget is not None:
         args.extend(
             (
@@ -150,7 +157,13 @@ def _find_launcher() -> str | None:
 
 
 def _is_secure_executable(path: Path) -> bool:
-    """Reject symlinks and writable binary/parent paths in production."""
+    """Reject symlinks and group/world-writable binary/parent paths.
+
+    The loader accepts a root-owned or current-EUID-owned executable so local
+    development builds remain usable; production packaging must additionally
+    provide a root-owned, read-only launcher (or an equivalent digest gate).
+    Owner-writable files are therefore not treated as production trust proof.
+    """
     try:
         info = path.lstat()
     except OSError:

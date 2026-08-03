@@ -307,10 +307,11 @@ jobs:
             fi
           done
           sudo mkdir -p /sys/fs/cgroup/khaos-browser
-          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/khaos-browser
+          sudo chown root:root /sys/fs/cgroup/khaos-browser
+          sudo chmod 0755 /sys/fs/cgroup/khaos-browser
           for controller in cpu memory pids io; do
             if grep -qw "$controller" /sys/fs/cgroup/khaos-browser/cgroup.controllers; then
-              echo "+$controller" > /sys/fs/cgroup/khaos-browser/cgroup.subtree_control
+              echo "+$controller" | sudo tee /sys/fs/cgroup/khaos-browser/cgroup.subtree_control >/dev/null
             fi
           done
           # Keep the test runner out of the delegated workloads subtree.
@@ -318,15 +319,16 @@ jobs:
           # process rule and lets the launcher atomically move Chromium into
           # its constrained per-browser child without weakening enforcement.
           sudo mkdir -p /sys/fs/cgroup/khaos-browser/runner /sys/fs/cgroup/khaos-browser/workloads
-          sudo chown -R "$(id -u):$(id -g)" /sys/fs/cgroup/khaos-browser
+          sudo chown root:root /sys/fs/cgroup/khaos-browser/runner /sys/fs/cgroup/khaos-browser/workloads
+          sudo chmod 0755 /sys/fs/cgroup/khaos-browser/runner /sys/fs/cgroup/khaos-browser/workloads
           for controller in cpu memory pids io; do
             if grep -qw "$controller" /sys/fs/cgroup/khaos-browser/workloads/cgroup.controllers; then
-              echo "+$controller" > /sys/fs/cgroup/khaos-browser/workloads/cgroup.subtree_control
+              echo "+$controller" | sudo tee /sys/fs/cgroup/khaos-browser/workloads/cgroup.subtree_control >/dev/null
             fi
           done
-          test -w /sys/fs/cgroup/khaos-browser/runner/cgroup.procs
-          test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.procs
-          test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.subtree_control
+          sudo test -w /sys/fs/cgroup/khaos-browser/runner/cgroup.procs
+          sudo test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.procs
+          sudo test -w /sys/fs/cgroup/khaos-browser/workloads/cgroup.subtree_control
       - name: Build browser kernel TCB (Rust)
         run: |
           cargo build --locked --release --no-default-features \
@@ -384,6 +386,7 @@ jobs:
           KHAOS_RUN_BROWSER_E2E: "1"
           KHAOS_RUN_KERNEL_BROWSER_E2E: "1"
           KHAOS_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser/workloads
+          KHAOS_BROWSER_HELPER_CGROUP_ROOT: /sys/fs/cgroup/khaos-browser/workloads
           # Batch 11.3: point to the root-owned copy in /usr/local/bin so
           # the parent-chain validation (root-owned /usr/local/bin → /usr/
           # local → /usr → /) passes when the test runs as root.
@@ -405,6 +408,7 @@ jobs:
             KHAOS_BROWSER_KERNEL_HELPER_CLIENT_PID="$$" \
             KHAOS_BROWSER_KERNEL_HELPER_SOCKET=/run/khaos/browser-kernel-helper.sock \
             KHAOS_BROWSER_HELPER_SECRET_FILE=/var/lib/khaos/browser-helper.secret \
+            KHAOS_BROWSER_HELPER_CGROUP_ROOT=/sys/fs/cgroup/khaos-browser/workloads \
             /usr/local/sbin/khaos-browser-kernel-helper \
             >/tmp/khaos-browser-kernel-helper.log 2>&1 &
           for attempt in $(seq 1 50); do
