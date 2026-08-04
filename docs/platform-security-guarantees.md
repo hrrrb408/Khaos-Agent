@@ -4,6 +4,38 @@ These guarantees are deliberately narrower than “absolute security”. A claim
 is valid only for a commit whose required `Security Closure Gate` passed with
 complete provenance-backed evidence.
 
+## Trust Boundary Axiom
+
+The guarantees below defend the host against **untrusted repository content**,
+**model-generated commands**, **cross-project authority drift**, and **peer
+processes outside the OS-user identity**. They are not a claim of isolation
+from every local adversary.
+
+> **The operating-system user account is a trust boundary.**
+>
+> Khaos protects the host from untrusted repository content, model-generated
+> commands and cross-project authority drift. Khaos does **not** claim to
+> isolate itself from arbitrary malicious processes already executing as the
+> same OS user.
+
+Concretely, a process already running as the same OS user can typically read
+the user's 0600 files (API keys, capability files, `~/.khaos` state), call the
+same-UID Unix domain socket, access workspaces the user owns, and impersonate
+the local CLI/TUI user. The file-mode, peer-UID, socket-ownership and
+capability-file checks throughout Khaos defend against *other* OS users, the
+model, repository payloads, path traversal and rogue Gateways — not against a
+same-UID attacker. Defending against a hostile same-UID process would require
+running the complete state writer and credential store under a separate OS
+identity, which is out of scope for the single-user local deployment model.
+
+The HTTP Gateway authenticates a single principal derived from the API key
+digest (`api-key:<sha256>`). All clients holding the same key are the *same*
+security subject. The Gateway is therefore a single-instance authentication
+boundary suitable for a single-user local Agent, one trusted Gateway, and a
+local browser UI. It is **not** multi-tenant, does not provide per-user
+independent authorization, per-device revocation, or per-client least
+privilege.
+
 | Platform | Production guarantee | Unsupported behavior |
 |---|---|---|
 | Linux | non-root, zero-capability Python; bwrap filesystem isolation; cgroup v2 budgets; root Rust helper as the sole netns/veth/nft/cgroup authority; default-deny browser egress | missing launcher/helper/cgroup delegation rejects execution; no Host, `ip`, `nft`, or proxy-only fallback |
