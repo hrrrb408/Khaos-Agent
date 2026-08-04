@@ -26,9 +26,9 @@
   - `Dockerfile:90`: `sha256:1699c10032ca2582ec89a24a1312d986a3f094aed3d5c1147b19880afe40e052`
   - `Dockerfile:97`: `sha256:6baf43584bcb78f2e5847d1de515f23499913ac9f12bdf834811a3145eb11ca1`
 - Lockfile fingerprints:
-  - `uv.lock`: `3d7ba5b093484b24b6f268b8d0edf536d6edf2525600ffb3da6561e2aba9c6e1`
+  - `uv.lock`: `7291ab982371106b5fdcb7fe0b49d86e52e3ba3c7a2efc823b8d8395ef19dae9`
   - `python/bootstrap-requirements.txt`: `72082c05288cd1b6f61b0304a4f90f01bbcae2ec6d6262d56de5a9ff03dc5acd`
-  - `python/requirements-lock.txt`: `49d43273e5a4f5f19fbb6646b65a094a8b3079a4ac84593b1adb971cfaa4c129`
+  - `python/requirements-lock.txt`: `efb21d1af83d4b03de92ce0c3a188962363a092380b4df5731bc2ddec3b206f5`
 
 ## GitHub Actions governance
 
