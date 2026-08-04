@@ -1026,3 +1026,55 @@ func TestNDJSONStream(t *testing.T) {
 		}
 	}
 }
+
+// P1-2 (tool descriptor drift): WithTools replaces the hard-coded three-tool
+// /api/tools list with the Python production registry's catalogue fetched via
+// the Bootstrap.GetToolSchemas handshake.  The default handler keeps the
+// hard-coded fallback (dev/mock path); WithTools installs the real catalogue.
+func TestWithToolsReplacesHardcodedToolList(t *testing.T) {
+	// Default handler — the legacy hard-coded three tools.
+	defaultHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).Routes()
+	rec := serve(defaultHandler, http.MethodGet, "/api/tools", "", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("default /api/tools status=%d", rec.Code)
+	}
+	var defaultTools []map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &defaultTools); err != nil {
+		t.Fatalf("default tools unmarshal: %v", err)
+	}
+	if len(defaultTools) != 3 {
+		t.Fatalf("default handler should expose the 3 hard-coded tools, got %d", len(defaultTools))
+	}
+
+	// WithTools installs a Python-derived catalogue (here simulated).
+	pythonTools := []map[string]any{
+		{"name": "read_file", "modes": []string{"all"}, "permission_level": "read", "schema_digest": "d1"},
+		{"name": "write_file", "modes": []string{"coding"}, "permission_level": "write", "schema_digest": "d2"},
+		{"name": "browser_navigate", "modes": []string{"office"}, "permission_level": "read", "schema_digest": "d3"},
+		{"name": "spawn_subagent", "modes": []string{"coding"}, "permission_level": "write", "schema_digest": "d4"},
+	}
+	productionHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).
+		WithTools(pythonTools).Routes()
+	rec2 := serve(productionHandler, http.MethodGet, "/api/tools", "", "")
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("production /api/tools status=%d", rec2.Code)
+	}
+	var productionToolList []map[string]any
+	if err := json.Unmarshal(rec2.Body.Bytes(), &productionToolList); err != nil {
+		t.Fatalf("production tools unmarshal: %v", err)
+	}
+	if len(productionToolList) != 4 {
+		t.Fatalf("WithTools should expose the 4 Python tools, got %d", len(productionToolList))
+	}
+	// Fail-closed: WithTools(nil) yields an empty list, never the stale literal.
+	closedHandler := NewHandler(&mockAgent{}, NewMemoryMap(), NewMapConfig(nil), testAPIKey, rate.NewTokenBucket(100, 10)).
+		WithTools(nil).Routes()
+	rec3 := serve(closedHandler, http.MethodGet, "/api/tools", "", "")
+	var closedTools []map[string]any
+	if err := json.Unmarshal(rec3.Body.Bytes(), &closedTools); err != nil {
+		t.Fatalf("closed tools unmarshal: %v", err)
+	}
+	if len(closedTools) != 0 {
+		t.Fatalf("WithTools(nil) should yield an empty fail-closed list, got %d", len(closedTools))
+	}
+}

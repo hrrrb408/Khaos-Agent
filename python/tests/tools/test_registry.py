@@ -216,3 +216,29 @@ def test_runtime_registry_wires_new_tool_handlers():
     assert registry.get("todo_read").handler is not None
     assert registry.get("todo_write").handler is not None
     assert registry.get("todo_update").handler is not None
+
+
+def test_gateway_view_exports_full_catalogue_with_schema_digest():
+    """P1-2 (tool descriptor drift): gateway_view() exports the Python
+    production registry's model-visible tools so the Go /api/tools endpoint
+    is the runtime fact, not a hard-coded three-tool literal."""
+    registry = create_runtime_registry()
+    view = registry.gateway_view()
+    names = {tool["name"] for tool in view}
+    # The catalogue must include far more than the legacy hard-coded three.
+    assert {"read_file", "write_file", "terminal_argv"} <= names
+    assert len(names) > 30, f"expected a broad catalogue, got {len(names)}"
+    # Every entry carries the four fields the Gateway needs.
+    for tool in view:
+        assert {"name", "modes", "permission_level", "schema_digest"} <= set(tool)
+        assert tool["schema_digest"]  # non-empty digest
+
+
+def test_gateway_view_schema_digest_matches_tool_definition():
+    """The digest exported by gateway_view must equal the ToolDefinition's
+    schema_digest so the Gateway can detect drift on the wire."""
+    registry = create_runtime_registry()
+    view = registry.gateway_view()
+    for entry in view:
+        tool = registry.get(entry["name"])
+        assert entry["schema_digest"] == tool.schema_digest

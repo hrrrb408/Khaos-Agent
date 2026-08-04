@@ -118,6 +118,7 @@ func main() {
 	// silently disabled.
 	var agent api.AgentClient
 	var pythonClient platform.PythonClient
+	var toolSchemas []map[string]any
 	if *mockAgent {
 		agent = mockAgentClient{}
 	} else {
@@ -133,6 +134,16 @@ func main() {
 		pythonClient = resolved
 		log.Printf("project-id: %s", pythonClient.ProjectID)
 		log.Printf("policy-digest: %s", pythonClient.PolicyDigest)
+		// P1-2 (tool descriptor drift): fetch the Python production registry's
+		// tool catalogue so /api/tools is the runtime fact, not a hard-coded
+		// three-tool literal.  A handshake failure is fatal — the Gateway must
+		// not serve a stale tool list that diverges from Python.
+		var toolErr error
+		toolSchemas, toolErr = pythonClient.BootstrapToolSchemas(context.Background())
+		if toolErr != nil {
+			log.Fatalf("bootstrap tool schemas: %v", toolErr)
+		}
+		log.Printf("tool-catalogue: %d tools from Python registry", len(toolSchemas))
 		agent = pythonClient
 	}
 
@@ -155,6 +166,11 @@ func main() {
 		resolvedKey,
 		rate.NewTokenBucket(60, 10),
 	)
+	// P1-2: install the Python-derived tool catalogue (empty for the mock
+	// agent path, which keeps the hard-coded fallback for dev-only use).
+	if !*mockAgent {
+		handler = handler.WithTools(toolSchemas)
+	}
 	handler = handler.WithAllowedOrigins(splitCSV(*allowedOrigins)...)
 	handler = handler.WithAllowedHosts(allowedHostnames(*addr, splitCSV(*allowedHosts))...)
 	handler = handler.WithConfigAdminPrincipals(splitCSV(*configAdmins)...)
