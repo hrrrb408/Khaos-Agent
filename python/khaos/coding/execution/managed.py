@@ -1,4 +1,18 @@
-"""Managed stdio process handles owned by ExecutionService."""
+"""Managed stdio process handles owned by ExecutionService.
+
+Review P2-2 (managed-process lifecycle): a managed process that exited
+naturally (``wait()`` returned) previously left its temporary HOME on disk,
+stayed in ``ExecutionService._active``, and never set ``_closed`` — only an
+explicit ``aclose()`` cleaned up.  A caller that only awaited ``wait()``
+leaked a temp dir and a stale execution-id entry per process.
+
+All terminal paths (``wait`` / ``terminate`` / ``kill`` / ``aclose``) now go
+through a single lock-guarded ``_finalize_once()`` so the cleanup sequence
+(stderr → watchdog → supervisor unregister → ``on_terminal`` callback →
+remove temp home → ``_closed=True``) runs exactly once regardless of which
+path observed process exit.  ``ExecutionService`` injects an ``on_terminal``
+callback that pops its own ``_active`` entry.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +20,7 @@ import asyncio
 import os
 import shutil
 import signal
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 
@@ -21,6 +36,11 @@ class ManagedProcessHandle:
         stderr_limit: int = 65536,
         supervisor=None,
         resource_watchdog: asyncio.Task[dict | None] | None = None,
+        # P2-2: invoked exactly once when the process reaches a terminal
+        # state, before the temporary home is removed.  ExecutionService
+        # uses it to pop its own ``_active`` entry, so a process that
+        # exits naturally (via ``wait()``) is no longer leaked there.
+        on_terminal: Callable[[str], Awaitable[None]] | None = None,
     ) -> None:
         self.execution_id = execution_id
         self._process = process
@@ -34,7 +54,13 @@ class ManagedProcessHandle:
         self._supervisor = supervisor
         self._resource_watchdog = resource_watchdog
         self._resource_violation: dict | None = None
+        self._on_terminal = on_terminal
         self._stderr_task = asyncio.create_task(self._collect_stderr())
+        # P2-2: serializes finalization so the cleanup sequence runs exactly
+        # once even if ``wait()`` and ``aclose()`` race (e.g. the process
+        # exits naturally while the caller is tearing it down).
+        self._finalize_lock = asyncio.Lock()
+        self._finalized = False
 
     @property
     def returncode(self) -> int | None:
@@ -59,11 +85,16 @@ class ManagedProcessHandle:
         await self.stdin.drain()
 
     async def wait(self) -> int:
+        """Block until the process exits, then run the unified finalizer.
+
+        P2-2: previously ``wait()`` only unregistered the process from the
+        ``ProcessSupervisor`` and left the temporary HOME on disk, the entry
+        in ``ExecutionService._active`` in place, and ``_closed=False``.  It
+        now delegates to ``_finalize_once()`` so every terminal path cleans
+        up identically.
+        """
         code = await self._process.wait()
-        await self._finish_stderr()
-        await self._finish_resource_watchdog()
-        if self._supervisor is not None:
-            await self._supervisor.unregister_process(self.execution_id)
+        await self._finalize_once()
         return code
 
     async def terminate(self) -> None:
@@ -85,9 +116,15 @@ class ManagedProcessHandle:
             _signal_process_tree(self._process.pid, signal.SIGKILL, self._process.kill)
 
     async def aclose(self) -> None:
+        """Force the process to terminate, wait for it, then finalize.
+
+        P2-2: this is now a thin wrapper around ``_finalize_once()`` — the
+        only difference from ``wait()`` is that ``aclose()`` signals the
+        process first (terminate → kill) instead of waiting for a natural
+        exit.
+        """
         if self._closed:
             return
-        self._closed = True
         try:
             await self.terminate()
             try:
@@ -96,12 +133,35 @@ class ManagedProcessHandle:
                 await self.kill()
                 await self._process.wait()
         finally:
-            await self._finish_stderr()
-            await self._finish_resource_watchdog()
-            if self._supervisor is not None:
-                await self._supervisor.unregister_process(self.execution_id)
-            if self._temporary_home is not None:
-                shutil.rmtree(self._temporary_home, ignore_errors=True)
+            await self._finalize_once()
+
+    async def _finalize_once(self) -> None:
+        """Run the cleanup sequence exactly once across all terminal paths.
+
+        Sequence: finish stderr collector → finish resource watchdog →
+        unregister from ProcessSupervisor → invoke ``on_terminal`` (so
+        ExecutionService can pop ``_active``) → remove temporary HOME →
+        mark ``_closed``.  Lock-guarded so a natural-exit ``wait()`` and a
+        teardown ``aclose()`` cannot both run the sequence.
+        """
+        async with self._finalize_lock:
+            if self._finalized:
+                return
+            self._finalized = True
+            try:
+                await self._finish_stderr()
+                await self._finish_resource_watchdog()
+                if self._supervisor is not None:
+                    await self._supervisor.unregister_process(self.execution_id)
+                if self._on_terminal is not None:
+                    await self._on_terminal(self.execution_id)
+                if self._temporary_home is not None:
+                    shutil.rmtree(self._temporary_home, ignore_errors=True)
+            finally:
+                # ``_closed`` gates ``write_stdin`` and is the observable
+                # terminal marker; set it even if a cleanup step raised so a
+                # later ``aclose()`` is a no-op rather than a re-finalize.
+                self._closed = True
 
     async def _collect_stderr(self) -> None:
         if self._process.stderr is None:

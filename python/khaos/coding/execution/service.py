@@ -6,6 +6,7 @@ import asyncio
 import os
 import tempfile
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 
@@ -303,6 +304,22 @@ class ExecutionService:
             result.diagnostics["workspace_cleanup"] = "failed"
             result.diagnostics["workspace_cleanup_error"] = type(exc).__name__
 
+    def _make_managed_on_terminal(self) -> "Callable[[str], Awaitable[None]]":
+        """Build the ``on_terminal`` callback injected into ManagedProcessHandle.
+
+        P2-2: when a managed process reaches a terminal state via ANY path
+        (natural exit through ``wait()``, or explicit ``aclose()``/terminate),
+        this pops the execution's entry from ``_active``.  ``dict.pop`` with a
+        default is safe against the concurrent pop already done by
+        ``terminate()`` / ``shutdown()``.
+        """
+        active = self._active
+
+        async def _on_terminal(execution_id: str) -> None:
+            active.pop(execution_id, None)
+
+        return _on_terminal
+
     async def terminate(self, execution_id: str) -> None:
         process_terminated = await self.process_supervisor.terminate(execution_id)
         active = self._active.get(execution_id)
@@ -438,6 +455,13 @@ class ExecutionService:
                     stderr_limit=request.budget.output_bytes,
                     supervisor=self.process_supervisor,
                     resource_watchdog=watchdog,
+                    # P2-2: pop this execution's entry from ``_active`` when
+                    # the process reaches a terminal state via ANY path
+                    # (natural exit through ``wait()``, or explicit
+                    # ``aclose()``).  Without this a process that exited
+                    # naturally stayed in ``_active`` forever (stale
+                    # execution id, state-API inconsistency).
+                    on_terminal=self._make_managed_on_terminal(),
                 )
         except Exception:
             import shutil
