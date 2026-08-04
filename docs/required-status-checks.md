@@ -87,6 +87,19 @@ PR checks UI), grouped by workflow.
 | `cargo audit (Rust)` | Rust dependency vulnerabilities |
 | `govulncheck (Go)` | Go dependency vulnerabilities |
 
+### `Product Integrity Gate` (`.github/workflows/product-integrity-gate.yml`)
+
+P1-3: the whole-repository product test suite, independent of the security
+subset. Security Closure proves the boundary holds; Product Integrity proves
+the product as a whole is not regressed. Both are required merge authorities.
+
+| Check name | Proves |
+|---|---|
+| `Python Product Suite` | full `python/tests/` across the Python 3.11/3.12/3.13 × Linux/macOS matrix |
+| `Go Product Suite` | full `go test -race ./...` |
+| `Rust Product Suite` | `cargo test --locked --all-targets` + `cargo clippy --all-targets -- -D warnings` |
+| `Product Integrity Gate` | aggregate — all three suites green |
+
 ## Verification
 
 After applying, open a PR against `main`. The PR view should show every
