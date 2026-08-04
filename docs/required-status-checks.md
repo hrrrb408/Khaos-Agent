@@ -97,8 +97,8 @@ check passes.
 The scheduled ruleset audit additionally requires active `main` coverage,
 deletion and non-fast-forward blocking, resolved review threads, strict status
 checks, and the complete required-check set. This repository currently has one
-maintainer, so mandatory independent approval and last-pusher approval remain
-explicit code-owner and last-push controls. Run the audit locally with:
+maintainer, so mandatory independent approval and last-pusher approval are
+disabled to avoid an impossible self-lock. Run the audit locally with:
 
 ```bash
 GITHUB_REPOSITORY=OWNER/REPO bash scripts/audit-github-ruleset.sh
