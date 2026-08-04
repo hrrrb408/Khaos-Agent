@@ -27,6 +27,7 @@ from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
+from khaos.runtime.authority import RuntimeAuthoritySeal, is_production_mode
 from khaos.runtime.lifecycle import CloseResult, CloseState
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
@@ -269,6 +270,12 @@ class RuntimeResult:
     # ``default_factory`` so each RuntimeResult gets its own Lock without
     # being passed explicitly.
     _close_lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
+    # P1-1: the authority seal minted by ``build_runtime`` binding this
+    # runtime to (principal, project, policy_digest, runtime_id).
+    # ``init=False`` so existing positional construction is unaffected;
+    # ``build_runtime`` sets it via ``object.__setattr__`` after construction.
+    # ``None`` for runtimes constructed directly in tests (no seal minted).
+    authority_seal: RuntimeAuthoritySeal | None = field(init=False, default=None)
 
     @property
     def close_state(self) -> CloseState:
@@ -279,6 +286,15 @@ class RuntimeResult:
     def close_error(self) -> Exception | None:
         """The typed failure when the runtime is quarantined, else None."""
         return self._close_error
+
+    def _with_seal(self, seal: "RuntimeAuthoritySeal") -> "RuntimeResult":
+        """Stamp the authority seal minted by ``build_runtime`` and return self.
+
+        The field is ``init=False`` so positional construction can never bind
+        a fake seal; only the factory (which mints it) sets it here.
+        """
+        self.authority_seal = seal
+        return self
 
     async def aclose(self) -> None:
         """Release runtime-owned resources; database ownership stays with caller.
@@ -572,6 +588,78 @@ class RuntimeResult:
             raise
 
 
+# P1-1: the security-critical components a production RuntimeResult must own.
+# These are NEVER injected by a production caller (AgentService / SubAgent /
+# CLI / TUI all let the factory build them from the effective policy); only
+# the test suite injects mocks (under KHAOS_DEV_MODE=1).  In production mode
+# injecting any of these is rejected fail-closed — the caller must let the
+# factory construct them so they carry the authority seal implicitly.
+_INJECTED_SECURITY_COMPONENTS: tuple[tuple[str, str], ...] = (
+    ("tool_scheduler", "ToolScheduler"),
+    ("execution_service", "ExecutionService"),
+    ("sandbox", "Sandbox"),
+    ("network_guard", "NetworkGuard"),
+    ("memory_manager", "MemoryManager"),
+)
+
+
+def _enforce_no_security_injection(cfg: RuntimeConfig) -> None:
+    """Reject injected security-critical components in production mode.
+
+    P1-1 (production Runtime injection): the historical bug shape was
+    ``build_runtime(RuntimeConfig(tool_scheduler=legacy_scheduler, ...))``
+    silently reusing a scheduler with no SecurityMiddleware.  No production
+    caller does this today, but the *type* allowed it — so any future entry
+    point could re-introduce a second security authority.  This gate makes
+    the invariant structural: in production, the five components below MUST
+    be constructed by the factory (they then carry the seal implicitly).
+    """
+    for field_name, type_name in _INJECTED_SECURITY_COMPONENTS:
+        if getattr(cfg, field_name, None) is not None:
+            raise PermissionError(
+                f"production RuntimeConfig.{field_name} must not be injected "
+                f"(a {type_name} built outside the factory cannot be proven "
+                f"to carry the runtime authority seal; let build_runtime "
+                f"construct it from the effective policy).  This injection "
+                f"is permitted only in development/test mode "
+                f"(KHAOS_DEV_MODE=1)."
+            )
+
+
+def _enforce_borrowed_authority_match(
+    cfg: RuntimeConfig, seal: RuntimeAuthoritySeal
+) -> None:
+    """Best-effort authority match for the two borrowed components.
+
+    The borrowed AuditLogger (server-shared audit trail) IS injected by
+    production callers, so it is validated rather than rejected: if it
+    exposes the binding fields, they must agree with this runtime's seal on
+    principal/project/policy (a server-shared logger legitimately serves
+    many runtimes under the SAME principal/project/policy, so runtime_id is
+    not matched — it is per-turn).
+    """
+    if cfg.audit_logger is not None:
+        injected_digest = getattr(cfg.audit_logger, "policy_digest", None)
+        injected_principal = getattr(cfg.audit_logger, "principal_id", None)
+        injected_project = getattr(cfg.audit_logger, "project_id", None)
+        if injected_digest is not None and injected_digest != seal.policy_digest:
+            raise PermissionError(
+                "injected AuditLogger policy_digest does not match the "
+                "runtime's effective policy digest — a server-shared logger "
+                "must be built from the same compiled policy."
+            )
+        if injected_principal is not None and injected_principal != seal.principal_id:
+            raise PermissionError(
+                "injected AuditLogger principal_id does not match the "
+                "runtime principal — cross-principal audit sharing is denied."
+            )
+        if injected_project is not None and injected_project != seal.project_id:
+            raise PermissionError(
+                "injected AuditLogger project_id does not match the "
+                "runtime project — cross-project audit sharing is denied."
+            )
+
+
 async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     """Build and initialize a complete runtime; this is the sole loop factory."""
     if cfg.db is None:
@@ -586,6 +674,15 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
             "RuntimeConfig.principal_id is required (CLI/TUI pass "
             "f'local-uid:{os.getuid()}'; RPC paths pass ctx.principal_id)"
         )
+    # P1-1 (production Runtime injection): reject injected security-critical
+    # components BEFORE touching any subsystem.  In production mode the five
+    # components below must be constructed by the factory (they then carry
+    # the authority seal implicitly).  This early check avoids partially
+    # initializing a runtime (e.g. loading the mode manager) only to reject
+    # it.  The borrowed AuditLogger digest match runs later, after the
+    # effective policy is loaded.
+    if is_production_mode():
+        _enforce_no_security_injection(cfg)
     root = cfg.project_root.expanduser().resolve()
     mode_manager = cfg.mode_manager or ModeManager(
         cfg.db, project_root=root,
@@ -631,6 +728,21 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     # check is the sole authority.  CLI / tests that don't set
     # ``cfg.project_id`` fall back to recompute.
     project_id = cfg.project_id or compute_project_id(root)
+    # P1-1 (production Runtime injection): mint the runtime's authority seal
+    # — the unforgeable binding of (principal, project, policy_digest,
+    # runtime_id) that every production-built security component must carry.
+    # In production mode the factory refuses to install an injected
+    # security-critical component below, closing the "second authority"
+    # backdoor.  Dev/test mode (KHAOS_DEV_MODE=1) still injects mocks freely.
+    production_mode = is_production_mode()
+    authority_seal = RuntimeAuthoritySeal.mint(
+        principal_id=cfg.principal_id,
+        project_id=project_id,
+        policy_digest=effective_policy.digest,
+        runtime_id=cfg.runtime_id,
+    )
+    if production_mode:
+        _enforce_borrowed_authority_match(cfg, authority_seal)
     # Round-14 §7: derive the exec-tool name set from the live registry so
     # the commands_require_approval gate covers every exec-style tool
     # (permission_level == "execute"), not a hard-coded literal.  Built once
@@ -893,7 +1005,9 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # for the process's lifetime.
         audit_logger=audit_logger,
         owns_audit_logger=owns_audit_logger,
-    )
+        # P1-1: stamp the authority seal so callers can verify the runtime
+        # was built under a known (principal, project, policy, runtime) tuple.
+    )._with_seal(authority_seal)
 
 
 async def close_runtime_or_register(runtime: RuntimeResult) -> None:
