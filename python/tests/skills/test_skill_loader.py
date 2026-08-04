@@ -180,9 +180,9 @@ def test_candidate_limit_counts_invalid_files(tmp_path, monkeypatch):
     load_calls = {"count": 0}
     original_load_file = SkillLoader.load_file
 
-    def counting_load_file(self, path):
+    def counting_load_file(self, path, **kwargs):
         load_calls["count"] += 1
-        return original_load_file(self, path)
+        return original_load_file(self, path, **kwargs)
 
     monkeypatch.setattr(SkillLoader, "load_file", counting_load_file)
 
@@ -365,3 +365,62 @@ def test_global_directory_budget_limits_total_entries(tmp_path):
     # The global budget prevented scanning all 9000 entries.
     # (We don't assert an exact count — just that it didn't crash and
     # the budget mechanism is in place.)
+
+
+# ─────────────────── P2-5: skill trust tiers ────────────────────
+
+
+def test_load_file_defaults_to_project_trust_tier(tmp_path):
+    """P2-5: a skill loaded without an explicit tier defaults to PROJECT
+    (the most restricted, untrusted case)."""
+    from khaos.skills.skill import SkillTrustTier
+
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: proj-skill\ndescription: project\n---\nbody\n", encoding="utf-8"
+    )
+    loader = SkillLoader([tmp_path])
+    skills = loader.load_all()
+    assert len(skills) == 1
+    assert skills[0].trust_tier is SkillTrustTier.PROJECT
+
+
+def test_load_all_user_tier_marks_skills(tmp_path):
+    """P2-5: loading from the user-global skills dir passes USER tier."""
+    from khaos.skills.skill import SkillTrustTier
+
+    skill_file = tmp_path / "SKILL.md"
+    skill_file.write_text(
+        "---\nname: user-skill\ndescription: user\n---\nbody\n", encoding="utf-8"
+    )
+    loader = SkillLoader([tmp_path])
+    skills = loader.load_all(trust_tier=SkillTrustTier.USER)
+    assert len(skills) == 1
+    assert skills[0].trust_tier is SkillTrustTier.USER
+
+
+def test_format_for_prompt_wraps_project_skills_as_untrusted():
+    """P2-5: PROJECT-tier skills render inside an untrusted_project_skill
+    marker; USER/BUILTIN skills render verbatim."""
+    from khaos.skills.manager import SkillManager
+    from khaos.skills.skill import Skill, SkillTrustTier
+
+    manager = SkillManager()
+    project_skill = Skill(
+        name="repo-skill", description="from repo", body="do thing",
+        trust_tier=SkillTrustTier.PROJECT,
+    )
+    user_skill = Skill(
+        name="my-skill", description="from user", body="do other",
+        trust_tier=SkillTrustTier.USER,
+    )
+    rendered = manager.format_for_prompt([project_skill, user_skill])
+    # PROJECT skill is wrapped.
+    assert "<untrusted_project_skill" in rendered
+    assert "source=\"repository\"" in rendered
+    assert "repo-skill" in rendered
+    assert "</untrusted_project_skill>" in rendered
+    # USER skill is NOT wrapped.
+    assert "my-skill" in rendered
+    # Only one untrusted wrapper (for the one project skill).
+    assert rendered.count("<untrusted_project_skill") == 1
