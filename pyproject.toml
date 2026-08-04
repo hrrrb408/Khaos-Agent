@@ -84,3 +84,39 @@ markers = [
     # (the privileged CI job sets it).
     "kernel_real: requires a privileged Linux runner with real netns/nft/cgroup-v2",
 ]
+
+# P2-6 (review): Pyright type checking for security-critical modules.
+# The security-critical paths below use ``strict`` (no implicit Any, full type
+# annotations required); the rest of the codebase uses ``basic`` so the gate
+# can roll out incrementally without blocking on legacy code.  The CI
+# ``Type Check`` workflow runs ``pyright`` and is currently a REPORTING gate
+# (not a required merge authority) until the strict modules reach zero errors;
+# see ``docs/type-check-rollout.md`` for the promotion plan.
+[tool.pyright]
+include = ["python/khaos"]
+exclude = ["**/__pycache__", "**/.venv", "python/tests"]
+pythonVersion = "3.11"
+
+# Security-critical modules: strict (full type safety).
+[tool.pyright.overrides.python.khaos.runtime]
+reportUnknownMemberType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"
+reportMissingTypeArgument = "error"
+reportAny = "error"
+
+[tool.pyright.overrides.python.khaos.security]
+reportUnknownMemberType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"
+
+[tool.pyright.overrides.python.khaos.permissions]
+reportUnknownMemberType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"

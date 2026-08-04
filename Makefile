@@ -30,7 +30,9 @@ test-rust:
 	else echo "rust: no crate"; fi
 
 lint:
-	@echo "P0-A lint tooling not configured yet"
+	# P2-6: Pyright type check (security-critical modules are strict; see
+	# docs/type-check-rollout.md).  Requires the `lsp` extra (pyright).
+	PYTHONPATH=python uv run pyright || echo "(pyright not installed; run: uv sync --extra lsp)"
 
 migrate:
 	PYTHONPATH=python $(PYTHON) -m khaos.db.migrate --db khaos.db
