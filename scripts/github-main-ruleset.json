@@ -24,26 +24,8 @@
         "do_not_enforce_on_create": false,
         "strict_required_status_checks_policy": true,
         "required_status_checks": [
-          {"context": "DB Transaction Adversarial"},
-          {"context": "Shared DB Project Isolation"},
-          {"context": "Browser Netns Attack E2E"},
-          {"context": "Go Race Test"},
-          {"context": "Rust Clippy"},
-          {"context": "Full Python Security Suite"},
-          {"context": "Migration Fixture Matrix"},
-          {"context": "linux-bwrap-security"},
-          {"context": "browser-kernel-isolation"},
-          {"context": "fullstack-browser-kernel"},
-          {"context": "macos-sandbox-security"},
-          {"context": "windows-fail-closed-security"},
-          {"context": "playwright-security"},
-          {"context": "contract (ubuntu-24.04)"},
-          {"context": "contract (windows-2025)"},
-          {"context": "contract (macos-14)"},
-          {"context": "docker-isolation"},
-          {"context": "pip-audit (Python)"},
-          {"context": "cargo audit (Rust)"},
-          {"context": "govulncheck (Go)"}
+          {"context": "Security Closure Gate"},
+          {"context": "Product Integrity Gate"}
         ]
       }
     }

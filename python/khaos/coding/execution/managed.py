@@ -61,6 +61,10 @@ class ManagedProcessHandle:
         # exits naturally while the caller is tearing it down).
         self._finalize_lock = asyncio.Lock()
         self._finalized = False
+        # Round-11 review Medium-High-1: a partial finalize (some cleanup
+        # steps raised) sets this so a later ``aclose()`` re-raises instead
+        # of returning a false success — mirroring Runtime QUARANTINED.
+        self._finalize_failed = False
 
     @property
     def returncode(self) -> int | None:
@@ -122,9 +126,17 @@ class ManagedProcessHandle:
         only difference from ``wait()`` is that ``aclose()`` signals the
         process first (terminate → kill) instead of waiting for a natural
         exit.
+
+        Round-11 review Medium-High-1: if a prior finalize partially failed
+        (``_finalize_failed``), re-raise instead of returning a false success.
         """
         if self._closed:
             return
+        if self._finalize_failed:
+            raise RuntimeError(
+                f"managed process {self.execution_id} was already partially "
+                f"finalized with errors; resources may not be fully released"
+            )
         try:
             await self.terminate()
             try:
@@ -138,30 +150,60 @@ class ManagedProcessHandle:
     async def _finalize_once(self) -> None:
         """Run the cleanup sequence exactly once across all terminal paths.
 
-        Sequence: finish stderr collector → finish resource watchdog →
-        unregister from ProcessSupervisor → invoke ``on_terminal`` (so
-        ExecutionService can pop ``_active``) → remove temporary HOME →
-        mark ``_closed``.  Lock-guarded so a natural-exit ``wait()`` and a
-        teardown ``aclose()`` cannot both run the sequence.
+        Round-11 review Medium-High-1: each cleanup step runs independently
+        so a failure in one (stderr collector, watchdog, supervisor
+        unregister, ``on_terminal`` callback) does NOT skip the later steps
+        (temporary HOME removal).  Errors are collected; if any step failed
+        the handle is marked ``_finalize_failed`` (not cleanly closed) so a
+        later ``aclose()`` re-raises instead of returning a false success —
+        mirroring the Runtime close false-success fix (P2-1).
         """
         async with self._finalize_lock:
             if self._finalized:
                 return
             self._finalized = True
-            try:
-                await self._finish_stderr()
-                await self._finish_resource_watchdog()
-                if self._supervisor is not None:
+            errors: list[Exception] = []
+
+            # Each step is isolated — a failure must not prevent later steps.
+            for label, step in (
+                ("stderr", self._finish_stderr),
+                ("watchdog", self._finish_resource_watchdog),
+            ):
+                try:
+                    await step()
+                except Exception as exc:  # noqa: BLE001 — collect, don't abort
+                    errors.append(exc)
+                    logger.debug("managed process finalize step %s failed", label, exc_info=True)
+
+            if self._supervisor is not None:
+                try:
                     await self._supervisor.unregister_process(self.execution_id)
-                if self._on_terminal is not None:
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    logger.debug("managed process finalize supervisor unregister failed", exc_info=True)
+
+            if self._on_terminal is not None:
+                try:
                     await self._on_terminal(self.execution_id)
-                if self._temporary_home is not None:
-                    shutil.rmtree(self._temporary_home, ignore_errors=True)
-            finally:
-                # ``_closed`` gates ``write_stdin`` and is the observable
-                # terminal marker; set it even if a cleanup step raised so a
-                # later ``aclose()`` is a no-op rather than a re-finalize.
-                self._closed = True
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(exc)
+                    logger.debug("managed process finalize on_terminal failed", exc_info=True)
+
+            # temp-home removal is always attempted (ignore_errors=True so it
+            # never raises), regardless of earlier step failures.
+            if self._temporary_home is not None:
+                shutil.rmtree(self._temporary_home, ignore_errors=True)
+
+            if errors:
+                # Partial cleanup — mark failed so aclose() re-raises rather
+                # than returning a false success.  ``_closed`` stays False.
+                self._finalize_failed = True
+                raise RuntimeError(
+                    f"managed process {self.execution_id} finalize completed "
+                    f"with {len(errors)} error(s): "
+                    + "; ".join(type(e).__name__ for e in errors)
+                ) from errors[0]
+            self._closed = True
 
     async def _collect_stderr(self) -> None:
         if self._process.stderr is None:

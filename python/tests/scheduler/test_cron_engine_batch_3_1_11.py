@@ -522,9 +522,67 @@ async def test_acceptance_6_empty_principal_rejected_in_execute(tmp_path) -> Non
         await db.close()
 
 
-# ---------------------------------------------------------------------------
-# Acceptance 7: cancellation-resistant executor 不得覆盖新 control marker
-# ---------------------------------------------------------------------------
+async def test_toctou_concurrent_principal_mutation_does_not_reach_executor(
+    tmp_path,
+) -> None:
+    """Round-11 review Critical-2/High-1: ``_execute_task`` must snapshot
+    ``principal_id`` into an immutable local before the durable-claim await,
+    so a concurrent mutation of the mutable ``task.principal_id`` field
+    cannot reach the executor.
+
+    Sequence (deterministic, barrier-synchronized — no fixed sleep):
+      1. Create a task with principal "alice".
+      2. The executor blocks on a barrier until the test corrupts the field.
+      3. _execute_task checks principal ("alice" — passes), then hits the
+         durable-claim await and yields.
+      4. The test corrupts ``task.principal_id = ""``.
+      5. The executor is unblocked and records the principal it received.
+      6. The executor MUST have received "alice" (the snapshot), NOT "".
+    """
+    db = await _make_db(tmp_path)
+    try:
+        received_principals: list[str] = []
+        executor_entered = asyncio.Event()
+        allow_executor = asyncio.Event()
+
+        async def barrier_executor(task_id: str, prompt: str, principal_id: str) -> str:
+            received_principals.append(principal_id)
+            executor_entered.set()  # signal: executor was reached
+            await asyncio.wait_for(allow_executor.wait(), timeout=2.0)
+            return "ok"
+
+        engine = CronEngine(
+            db=db, executor=barrier_executor, tick_interval=0.01,
+        )
+        await engine.start()
+        iso = utc_now_naive().isoformat()
+        task = await engine.create(
+            "toctou", "p", ScheduleConfig(iso_time=iso),
+            principal_id="alice",
+        )
+        # Wait for the executor to be entered (principal check passed,
+        # durable claim committed, executor invoked with the snapshot).
+        await asyncio.wait_for(executor_entered.wait(), timeout=3.0)
+        # NOW corrupt the mutable field — the snapshot must already be in
+        # the executor's local ``principal_id`` argument.
+        engine._tasks[task.id].principal_id = ""
+        # Release the executor.
+        allow_executor.set()
+        await asyncio.sleep(0.1)
+
+        # The executor was called exactly once and received the SNAPSHOT
+        # ("alice"), NOT the corrupted "".
+        assert len(received_principals) == 1, (
+            f"executor called {len(received_principals)} times; expected 1"
+        )
+        assert received_principals[0] == "alice", (
+            f"executor received principal_id={received_principals[0]!r}; "
+            "expected 'alice' (the pre-await snapshot) — a concurrent "
+            "mutation reached the executor (TOCTOU not closed)"
+        )
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
 
 
 async def test_acceptance_7_stale_executor_does_not_overwrite_control_marker(
