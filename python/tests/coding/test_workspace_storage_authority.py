@@ -199,6 +199,15 @@ async def test_file_tool_and_process_write_share_authority(tmp_path):
     result = await process
 
     assert result.status == "resource-exhausted"
+    # The storage-violation watchdog marks the workspace FAILED asynchronously
+    # after the over-budget process exits.  On slower/busier CI runners the
+    # transition lags the ``await process`` return, so poll for it with a
+    # bounded deadline instead of asserting instantaneously (which flaked on
+    # Ubuntu CI).
+    for _ in range(50):
+        if workspace.state is WorkspaceState.FAILED:
+            break
+        await asyncio.sleep(0.05)
     assert workspace.state is WorkspaceState.FAILED
 
 
