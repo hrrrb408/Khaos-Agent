@@ -2,16 +2,25 @@
 
 from __future__ import annotations
 
-from io import StringIO
-from pathlib import Path
+import pytest
 
-from rich.console import Console
-from rich.markdown import Markdown
+# ``rich`` and ``textual`` are optional TUI extras.  Skip the whole module
+# gracefully when either is missing so the full product test suite runs
+# cleanly without the TUI extra installed (Product Integrity Gate installs
+# only ``--extra test``).
+pytest.importorskip("rich")
+textual = pytest.importorskip("textual")  # noqa: F841 — skip guard
 
-from khaos.agent.core import Message
-from khaos.tui.brand import brand_art
-from khaos.tui.chat_panel import ChatPanel
-from khaos.tui.markdown import RenderedLine, markdown_to_rich, render_message, to_rich
+from io import StringIO  # noqa: E402
+from pathlib import Path  # noqa: E402
+
+from rich.console import Console  # noqa: E402
+from rich.markdown import Markdown  # noqa: E402
+
+from khaos.agent.core import Message  # noqa: E402
+from khaos.tui.brand import brand_art  # noqa: E402
+from khaos.tui.chat_panel import ChatPanel  # noqa: E402
+from khaos.tui.markdown import RenderedLine, markdown_to_rich, render_message, to_rich  # noqa: E402
 
 
 def test_renders_assistant_text():

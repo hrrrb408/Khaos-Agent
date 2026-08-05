@@ -10,7 +10,14 @@ from __future__ import annotations
 import io
 
 import pytest
-from rich.console import Console
+
+# ``rich`` and ``textual`` are optional TUI extras.  Skip the whole module
+# gracefully when either is missing so the full product test suite runs
+# cleanly without the TUI extra installed (Product Integrity Gate installs
+# only ``--extra test``).
+rich = pytest.importorskip("rich")
+textual = pytest.importorskip("textual")  # noqa: F841 — skip guard
+from rich.console import Console  # noqa: E402
 
 try:
     import textual  # noqa: F401
