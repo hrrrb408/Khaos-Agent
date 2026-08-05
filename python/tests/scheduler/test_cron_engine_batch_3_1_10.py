@@ -236,8 +236,13 @@ async def test_acceptance_3_executor_receives_principal_id(tmp_path) -> None:
             "principal-exec", "p", ScheduleConfig(iso_time=iso),
             principal_id="creator-alice",
         )
-        # Wait for the executor to be invoked.
-        await asyncio.sleep(0.1)
+        # Wait for the executor to be invoked.  Poll with a bounded deadline
+        # instead of a fixed sleep — on a loaded CI runner the 10ms tick can
+        # lag past a fixed 100ms window (this flaked on ubuntu-24.04 3.12).
+        for _ in range(50):
+            if "principal_id" in captured:
+                break
+            await asyncio.sleep(0.02)
         assert captured.get("principal_id") == "creator-alice", (
             "executor was not called with the task's principal_id — "
             "the scheduled prompt would run as the server UID"
