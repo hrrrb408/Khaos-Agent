@@ -273,7 +273,10 @@ def test_finalizing_recovery_rejects_artifact_attacks(tmp_path, attack):
         # macOS exposes /tmp as a symlink to /private/tmp.  Use the resolved
         # writable temporary root so sandbox path policy does not reject the
         # socket bind before the artifact verifier sees the real socket.
-        short_socket = f"/private/tmp/khaos-art-{os.getpid()}-{time.time_ns()}"
+        # ``tempfile.gettempdir()`` resolves to the real (non-symlink) temp
+        # root on every platform — /private/tmp on macOS, /tmp on Linux.
+        import tempfile
+        short_socket = f"{tempfile.gettempdir()}/khaos-art-{os.getpid()}-{time.time_ns()}"
         try:
             socket_handle.bind(short_socket)
         except PermissionError:

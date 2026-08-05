@@ -12,6 +12,14 @@ from pathlib import Path
 
 import pytest
 
+# These scenarios exercise ``RepositoryIndexer`` parse/re-export evidence,
+# which requires the tree-sitter optional grammars.  Skip the whole module
+# gracefully when tree-sitter is absent so the full product test suite runs
+# cleanly without the ``tree-sitter`` extra installed (mirrors every other
+# tree-sitter test in this directory, which all use the same guard).
+pytestmark = pytest.mark.tree_sitter_real
+pytest.importorskip("tree_sitter")
+
 from khaos.coding.intelligence.index import IndexStore, RepositoryIndexer
 from khaos.coding.intelligence.query import CodeQueryService
 from khaos.coding.intelligence.resolution.service import ResolutionService
