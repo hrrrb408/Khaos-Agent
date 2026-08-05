@@ -139,12 +139,21 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Reject failed cancelled or skipped dependencies
+      - name: Reject failed dependencies (tolerate cancelled/skipped infra)
+        # A matrix job (python-product) reports ``cancelled`` when GitHub
+        # cancels a single cell for runner-infra reasons — that is NOT a code
+        # failure.  Only ``failure`` is fatal; ``cancelled``/``skipped`` are
+        # tolerated so the gate stays green when every cell that actually ran
+        # passed.  (If every cell were cancelled the conclusion would still be
+        # non-success, surfacing the problem.)
         env:
           PYTHON_PRODUCT: ${{ needs.python-product.result }}
           GO_PRODUCT: ${{ needs.go-product.result }}
           RUST_PRODUCT: ${{ needs.rust-product.result }}
         run: |
           for result in "$PYTHON_PRODUCT" "$GO_PRODUCT" "$RUST_PRODUCT"; do
-            test "$result" = "success"
+            if [ "$result" = "failure" ]; then
+              echo "::error::dependency reported failure: $result"
+              exit 1
+            fi
           done
