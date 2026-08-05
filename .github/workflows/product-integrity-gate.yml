@@ -1,0 +1,113 @@
+name: Product Integrity Gate
+
+# P1-3 (review): the Security Closure Gate proves the security-critical test
+# subset passes, but it does NOT prove the whole product test suite is green.
+# A hand-picked contract matrix and the security/ subdirectory alone cannot
+# catch non-security regressions (new tests forgotten in the workflow, feature
+# regressions that don't touch security, pre-existing-failure debt accruing).
+#
+# This workflow is the independent whole-repository merge authority for
+# *product* integrity: it runs the FULL Python, Go and Rust suites across the
+# supported Python version matrix, separately from the security closure.
+#
+# Relationship to Security Closure Gate: both are required. Security Closure
+# proves the security boundary holds; Product Integrity proves the product as
+# a whole is not regressed. Neither substitutes for the other.
+
+permissions:
+  contents: read
+
+concurrency:
+  group: product-integrity-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  workflow_call:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main, "feature/**", "codex/**"]
+  workflow_dispatch:
+
+jobs:
+  # ─── Full Python product suite across the supported version matrix ──────
+  python-product:
+    name: Python Product Suite
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        # pyproject declares requires-python = ">=3.11". CI previously fixed
+        # 3.11 only, so 3.12/3.13 were claimed-supported but never tested.
+        os: [ubuntu-24.04, macos-14]
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install test dependencies
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Run FULL Python product suite
+        run: uv run pytest python/tests/ -q
+
+  # ─── Full Go product suite with the race detector ──────────────────────
+  go-product:
+    name: Go Product Suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: go/go.mod
+      - name: Run Go tests with race detector
+        working-directory: go
+        run: go test -race -count=1 ./...
+
+  # ─── Full Rust product suite ───────────────────────────────────────────
+  rust-product:
+    name: Rust Product Suite
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - name: Run cargo test (locked, all targets)
+        working-directory: rust/khaos-core
+        run: cargo test --locked --all-targets
+      - name: Run cargo clippy (all targets, warnings as errors)
+        working-directory: rust/khaos-core
+        run: cargo clippy --all-targets -- -D warnings
+
+  # ─── Aggregate gate ────────────────────────────────────────────────────
+  product-integrity-gate:
+    name: Product Integrity Gate
+    if: always()
+    needs:
+      - python-product
+      - go-product
+      - rust-product
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Reject failed cancelled or skipped dependencies
+        env:
+          PYTHON_PRODUCT: ${{ needs.python-product.result }}
+          GO_PRODUCT: ${{ needs.go-product.result }}
+          RUST_PRODUCT: ${{ needs.rust-product.result }}
+        run: |
+          for result in "$PYTHON_PRODUCT" "$GO_PRODUCT" "$RUST_PRODUCT"; do
+            test "$result" = "success"
+          done

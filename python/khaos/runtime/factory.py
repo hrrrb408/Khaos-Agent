@@ -27,6 +27,8 @@ from khaos.coding.workspace.office_authority import OfficeMutationAuthority
 from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
+from khaos.runtime.authority import RuntimeAuthoritySeal, is_production_mode
+from khaos.runtime.lifecycle import CloseResult, CloseState
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
@@ -66,8 +68,15 @@ class RuntimeCleanupAuthority:
         """Retry every retained runtime once and return the remaining count."""
         remaining: list[RuntimeResult] = []
         for runtime in self._runtimes:
+            # P2-1: reset the typed terminal state so a QUARANTINED runtime
+            # can be retried.  Without this reset, ``aclose()`` would
+            # re-raise the recorded error forever (the quarantine
+            # re-raise in the fast path) and the runtime could never
+            # recover even if the failing component is now available.
             runtime._close_failed = False
             runtime._close_task = None
+            runtime._close_state = CloseState.OPEN
+            runtime._close_error = None
             try:
                 await runtime.aclose()
             except RuntimeCloseError:
@@ -241,6 +250,19 @@ class RuntimeResult:
     _close_task: Any = field(default=None, init=False)
     _closed: bool = field(default=False, init=False)
     _close_failed: bool = field(default=False, init=False)
+    # P2-1 (close false-success): the typed terminal state machine.  The
+    # legacy booleans ``_closed`` / ``_close_failed`` remain as backward-compat
+    # property aliases below; new code reads ``close_state``.  ``OPEN`` means a
+    # close has not yet been attempted; ``CLOSING`` means a close task is in
+    # flight; ``CLOSED`` means every safety-critical component reached a
+    # terminal state; ``QUARANTINED`` means a component failed terminally and
+    # resources may still be live — a subsequent ``aclose()`` MUST re-raise
+    # rather than silently return (Invariant E).
+    _close_state: CloseState = field(init=False, default=CloseState.OPEN)
+    # The typed error recorded when the runtime entered QUARANTINED, so every
+    # later ``aclose()`` re-raises the SAME failure instead of an
+    # information-free success.
+    _close_error: Exception | None = field(default=None, init=False)
     # H4: serializes the aclose() retry logic so concurrent callers don't
     # each create a separate ``_close_task`` (which would run shutdown on
     # the same components multiple times concurrently).  ``init=False`` so
@@ -248,6 +270,31 @@ class RuntimeResult:
     # ``default_factory`` so each RuntimeResult gets its own Lock without
     # being passed explicitly.
     _close_lock: asyncio.Lock = field(init=False, default_factory=asyncio.Lock)
+    # P1-1: the authority seal minted by ``build_runtime`` binding this
+    # runtime to (principal, project, policy_digest, runtime_id).
+    # ``init=False`` so existing positional construction is unaffected;
+    # ``build_runtime`` sets it via ``object.__setattr__`` after construction.
+    # ``None`` for runtimes constructed directly in tests (no seal minted).
+    authority_seal: RuntimeAuthoritySeal | None = field(init=False, default=None)
+
+    @property
+    def close_state(self) -> CloseState:
+        """Typed terminal state of this runtime's close lifecycle."""
+        return self._close_state
+
+    @property
+    def close_error(self) -> Exception | None:
+        """The typed failure when the runtime is quarantined, else None."""
+        return self._close_error
+
+    def _with_seal(self, seal: "RuntimeAuthoritySeal") -> "RuntimeResult":
+        """Stamp the authority seal minted by ``build_runtime`` and return self.
+
+        The field is ``init=False`` so positional construction can never bind
+        a fake seal; only the factory (which mints it) sets it here.
+        """
+        self.authority_seal = seal
+        return self
 
     async def aclose(self) -> None:
         """Release runtime-owned resources; database ownership stays with caller.
@@ -298,6 +345,19 @@ class RuntimeResult:
         # Already fully closed — nothing to do (fast path, no lock).
         if self._closed:
             return
+        # P2-1 (close false-success): a runtime that previously entered
+        # QUARANTINED (a safety-critical component failed terminally after
+        # exhausting retries) must NOT let a later ``aclose()`` caller
+        # believe the close succeeded.  Re-raise the recorded typed error so
+        # the caller observes the same failure as the original caller — the
+        # server-scoped ``RuntimeCleanupAuthority`` is the only path that
+        # resets the quarantine state to retry.
+        if self._close_state is CloseState.QUARANTINED:
+            raise self._close_error if self._close_error is not None else RuntimeCloseError(
+                f"runtime is quarantined; safety-critical components may not "
+                f"have reached a terminal state — principal={self.principal_id} "
+                f"session={self.session_id} runtime={self.runtime_id}"
+            )
         # H4: serialize the retry logic so concurrent callers don't each
         # create a separate ``_close_task``.  The lock is held for the
         # entire retry loop; other callers wait, then observe the terminal
@@ -307,16 +367,18 @@ class RuntimeResult:
             # completed the close while we were waiting on the lock.
             if self._closed:
                 return
-            # H4: a previous caller already exhausted the auto-retries.
-            # Don't re-run them — the caller is expected to register the
-            # runtime with its cleanup authority for further retries
-            # (the authority resets ``_close_failed`` before
-            # retrying).  Returning here (rather than raising) means a
-            # concurrent caller that was waiting on the lock observes the
-            # first caller's ``RuntimeCloseError`` via ``asyncio.gather``
-            # and doesn't re-run the retries itself.
-            if self._close_failed:
-                return
+            # P2-1: same quarantine re-raise as the fast path, but inside the
+            # lock so a concurrent caller that waited on the lock also
+            # observes the first caller's terminal failure (and does not
+            # re-run the retries).  The cleanup authority is the only caller
+            # that resets ``_close_state`` before retrying.
+            if self._close_state is CloseState.QUARANTINED:
+                raise self._close_error if self._close_error is not None else RuntimeCloseError(
+                    f"runtime is quarantined; safety-critical components may "
+                    f"not have reached a terminal state — "
+                    f"principal={self.principal_id} session={self.session_id} "
+                    f"runtime={self.runtime_id}"
+                )
             # H4: limited auto-retry so transient component failures are
             # retried in-line; only persistent failures surface to the caller.
             max_attempts = 3
@@ -371,16 +433,23 @@ class RuntimeResult:
                         attempt, max_attempts,
                     )
                     continue
-                # H4: all retries exhausted — raise so the caller observes
-                # the failure and can escalate through the runtime's
-                # server-scoped cleanup authority.
+                # P2-1: all retries exhausted — transition the runtime to the
+                # QUARANTINED terminal state, record the typed error, and raise
+                # so the caller observes the failure and can escalate through
+                # the runtime's server-scoped cleanup authority.  The recorded
+                # error is re-raised by every subsequent ``aclose()`` (see the
+                # fast path above) so a quarantine can never masquerade as a
+                # clean close to a later caller.
                 if self._close_failed:
-                    raise RuntimeCloseError(
+                    err = RuntimeCloseError(
                         f"runtime cleanup failed after {max_attempts} attempts; "
                         f"safety-critical components may not have reached a "
                         f"terminal state — principal={self.principal_id} "
                         f"session={self.session_id} runtime={self.runtime_id}"
                     )
+                    self._close_state = CloseState.QUARANTINED
+                    self._close_error = err
+                    raise err
                 break
 
     async def _run_close(self) -> None:
@@ -402,6 +471,9 @@ class RuntimeResult:
         """
         if self._closed:
             return
+        # P2-1: mark the close as in-flight so observers can distinguish a
+        # running cleanup from an idle runtime (CLOSING vs OPEN).
+        self._close_state = CloseState.CLOSING
         # H4: reset _close_failed for this attempt — a previous attempt's
         # failure should not make the retry appear to have failed.
         self._close_failed = False
@@ -490,10 +562,20 @@ class RuntimeResult:
             # be idempotent).
             if failed:
                 self._close_failed = True
+                # P2-1: a failed attempt is retryable, so revert to OPEN
+                # (not QUARANTINED — the QUARANTINED terminal state is set
+                # only by ``aclose`` after exhausting retries).  This keeps
+                # the retry path working while ensuring the final
+                # exhaustion transitions to QUARANTINED and re-raises on
+                # every later call.
+                self._close_state = CloseState.OPEN
                 # Reset ``_close_task`` so a retry actually re-runs cleanup.
                 self._close_task = None
                 return
+            # P2-1: every safety-critical component reached a terminal state
+            # — transition to CLOSED (the only information-free success).
             self._closed = True
+            self._close_state = CloseState.CLOSED
         except BaseException:
             # H4: the close task itself was cancelled (CancelledError, e.g.
             # event loop shutdown) or raised an unexpected exception.  Clear
@@ -504,6 +586,78 @@ class RuntimeResult:
             # cancelled/errored state and the original caller observes it.
             self._close_task = None
             raise
+
+
+# P1-1: the security-critical components a production RuntimeResult must own.
+# These are NEVER injected by a production caller (AgentService / SubAgent /
+# CLI / TUI all let the factory build them from the effective policy); only
+# the test suite injects mocks (under KHAOS_DEV_MODE=1).  In production mode
+# injecting any of these is rejected fail-closed — the caller must let the
+# factory construct them so they carry the authority seal implicitly.
+_INJECTED_SECURITY_COMPONENTS: tuple[tuple[str, str], ...] = (
+    ("tool_scheduler", "ToolScheduler"),
+    ("execution_service", "ExecutionService"),
+    ("sandbox", "Sandbox"),
+    ("network_guard", "NetworkGuard"),
+    ("memory_manager", "MemoryManager"),
+)
+
+
+def _enforce_no_security_injection(cfg: RuntimeConfig) -> None:
+    """Reject injected security-critical components in production mode.
+
+    P1-1 (production Runtime injection): the historical bug shape was
+    ``build_runtime(RuntimeConfig(tool_scheduler=legacy_scheduler, ...))``
+    silently reusing a scheduler with no SecurityMiddleware.  No production
+    caller does this today, but the *type* allowed it — so any future entry
+    point could re-introduce a second security authority.  This gate makes
+    the invariant structural: in production, the five components below MUST
+    be constructed by the factory (they then carry the seal implicitly).
+    """
+    for field_name, type_name in _INJECTED_SECURITY_COMPONENTS:
+        if getattr(cfg, field_name, None) is not None:
+            raise PermissionError(
+                f"production RuntimeConfig.{field_name} must not be injected "
+                f"(a {type_name} built outside the factory cannot be proven "
+                f"to carry the runtime authority seal; let build_runtime "
+                f"construct it from the effective policy).  This injection "
+                f"is permitted only in development/test mode "
+                f"(KHAOS_DEV_MODE=1)."
+            )
+
+
+def _enforce_borrowed_authority_match(
+    cfg: RuntimeConfig, seal: RuntimeAuthoritySeal
+) -> None:
+    """Best-effort authority match for the two borrowed components.
+
+    The borrowed AuditLogger (server-shared audit trail) IS injected by
+    production callers, so it is validated rather than rejected: if it
+    exposes the binding fields, they must agree with this runtime's seal on
+    principal/project/policy (a server-shared logger legitimately serves
+    many runtimes under the SAME principal/project/policy, so runtime_id is
+    not matched — it is per-turn).
+    """
+    if cfg.audit_logger is not None:
+        injected_digest = getattr(cfg.audit_logger, "policy_digest", None)
+        injected_principal = getattr(cfg.audit_logger, "principal_id", None)
+        injected_project = getattr(cfg.audit_logger, "project_id", None)
+        if injected_digest is not None and injected_digest != seal.policy_digest:
+            raise PermissionError(
+                "injected AuditLogger policy_digest does not match the "
+                "runtime's effective policy digest — a server-shared logger "
+                "must be built from the same compiled policy."
+            )
+        if injected_principal is not None and injected_principal != seal.principal_id:
+            raise PermissionError(
+                "injected AuditLogger principal_id does not match the "
+                "runtime principal — cross-principal audit sharing is denied."
+            )
+        if injected_project is not None and injected_project != seal.project_id:
+            raise PermissionError(
+                "injected AuditLogger project_id does not match the "
+                "runtime project — cross-project audit sharing is denied."
+            )
 
 
 async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
@@ -520,6 +674,15 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
             "RuntimeConfig.principal_id is required (CLI/TUI pass "
             "f'local-uid:{os.getuid()}'; RPC paths pass ctx.principal_id)"
         )
+    # P1-1 (production Runtime injection): reject injected security-critical
+    # components BEFORE touching any subsystem.  In production mode the five
+    # components below must be constructed by the factory (they then carry
+    # the authority seal implicitly).  This early check avoids partially
+    # initializing a runtime (e.g. loading the mode manager) only to reject
+    # it.  The borrowed AuditLogger digest match runs later, after the
+    # effective policy is loaded.
+    if is_production_mode():
+        _enforce_no_security_injection(cfg)
     root = cfg.project_root.expanduser().resolve()
     mode_manager = cfg.mode_manager or ModeManager(
         cfg.db, project_root=root,
@@ -565,6 +728,21 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
     # check is the sole authority.  CLI / tests that don't set
     # ``cfg.project_id`` fall back to recompute.
     project_id = cfg.project_id or compute_project_id(root)
+    # P1-1 (production Runtime injection): mint the runtime's authority seal
+    # — the unforgeable binding of (principal, project, policy_digest,
+    # runtime_id) that every production-built security component must carry.
+    # In production mode the factory refuses to install an injected
+    # security-critical component below, closing the "second authority"
+    # backdoor.  Dev/test mode (KHAOS_DEV_MODE=1) still injects mocks freely.
+    production_mode = is_production_mode()
+    authority_seal = RuntimeAuthoritySeal.mint(
+        principal_id=cfg.principal_id,
+        project_id=project_id,
+        policy_digest=effective_policy.digest,
+        runtime_id=cfg.runtime_id,
+    )
+    if production_mode:
+        _enforce_borrowed_authority_match(cfg, authority_seal)
     # Round-14 §7: derive the exec-tool name set from the live registry so
     # the commands_require_approval gate covers every exec-style tool
     # (permission_level == "execute"), not a hard-coded literal.  Built once
@@ -827,7 +1005,9 @@ async def build_runtime(cfg: RuntimeConfig) -> RuntimeResult:
         # for the process's lifetime.
         audit_logger=audit_logger,
         owns_audit_logger=owns_audit_logger,
-    )
+        # P1-1: stamp the authority seal so callers can verify the runtime
+        # was built under a known (principal, project, policy, runtime) tuple.
+    )._with_seal(authority_seal)
 
 
 async def close_runtime_or_register(runtime: RuntimeResult) -> None:

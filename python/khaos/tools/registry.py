@@ -342,6 +342,28 @@ class ToolRegistry:
             if "all" in tool.modes or mode in tool.modes
         ]
 
+    def gateway_view(self) -> list[dict]:
+        """Export the model-visible tool catalogue for the Go Gateway.
+
+        P1-2 (tool descriptor drift): the Go ``/api/tools`` endpoint
+        previously hard-coded three tools (read_file, write_file, terminal)
+        while the Python production registry registers ~59.  This method is
+        the single Python-side source the Gateway reads at startup (via the
+        ``Bootstrap.GetToolSchemas`` RPC handshake) so the two never drift.
+
+        Each entry carries the tool name, modes, permission level and a
+        schema digest so the Gateway can also detect drift on the wire.
+        """
+        return [
+            {
+                "name": tool.name,
+                "modes": list(tool.modes),
+                "permission_level": tool.permission_level,
+                "schema_digest": tool.schema_digest,
+            }
+            for tool in sorted(self._tools.values(), key=lambda t: t.name)
+        ]
+
     def get_parallel_tools(self, tool_calls: list[dict]) -> tuple[list[dict], list[dict]]:
         """Split tool calls into parallel-safe and serial groups."""
         parallel_calls: list[dict] = []

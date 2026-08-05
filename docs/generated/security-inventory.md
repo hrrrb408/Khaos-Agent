@@ -32,7 +32,7 @@
 
 ## GitHub Actions governance
 
-- Workflow action references inspected: `62`; immutable SHA-pinned/local references: `62`.
+- Workflow action references inspected: `68`; immutable SHA-pinned/local references: `68`.
 - Unpinned third-party actions (must remain empty): none.
 - Security-sensitive paths are covered by `.github/CODEOWNERS`; the repository reference ruleset preserves sole-maintainer liveness, so independent approval remains an external release prerequisite and is not verified locally.
 
@@ -51,13 +51,13 @@
 - `python/khaos/channels/webhook.py`: `653bc2281748abc42b7ad9e295e69586ab01bba3a1aedfc92c692c80a0253232`
 - `python/khaos/permissions/engine.py`: `4e6f03ed55584e11a240dca71be91d61556f11ce240a246627f75829a1af5939`
 - `python/khaos/permissions/rules.py`: `173df51bf720843e339e026c5219a0db7e2b69beaa45576b2e24ee17764dfe6f`
-- `python/khaos/coding/execution/service.py`: `02e2c44a4d227ebdd94154bf293a68ccc584b24b4fc2e476bf6ec0ed3b7b109a`
+- `python/khaos/coding/execution/service.py`: `0b729fc91ccb9779ccdbc4f1eec5b189da7cfecbf6ba63be4fba5ea3155d716c`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
 - `python/khaos/coding/execution/supervisor.py`: `11137ac9aa23f24caedb550f64d70d55ba497b870460192f9544b752df67b249`
-- `python/khaos/grpc_server.py`: `b3154e205b659f5a97d59f5130ac28f115e6c436a739d7d3c6445ef7d0d65d6f`
-- `go/internal/api/handler.go`: `4066a777cd27a92046f1eae17fe719f294a91050312659806f52290a89ab8306`
-- `go/cmd/gateway/main.go`: `919157cb7304aff7d790260ffb195621aa5a82bdf5137d5e63ed86c2128bc9fe`
-- `go/internal/platform/python_client.go`: `96a72a622395ea859e56052bdc00cd26ba463c6882e8e269661d543de3417681`
+- `python/khaos/grpc_server.py`: `a98ad97f729ad985edffeaf92d1392eca3352d806f554ea83718f2bac3aa7327`
+- `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`
+- `go/cmd/gateway/main.go`: `75d14ad26917ddf15ddc38ce75f6bc0a1fcd214909c958849e7ae18054b81ed7`
+- `go/internal/platform/python_client.go`: `c4e68301ae6f54999636c9924bc832e57c46173f69ad852df7963af9d6de9df6`
 
 ## Required release gates
 

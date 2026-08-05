@@ -903,6 +903,28 @@ func (c PythonClient) BootstrapPolicyDigest(ctx context.Context) (string, error)
 	return digest, nil
 }
 
+// BootstrapToolSchemas fetches the Python production registry's model-visible
+// tool catalogue via the Bootstrap.GetToolSchemas RPC handshake (P1-2).
+// Called once at Gateway startup so /api/tools reflects the runtime fact
+// rather than a hard-coded three-tool literal that silently drifts.  Python is
+// the sole authority for which tools exist; Go never re-declares them.  An
+// error leaves the handler with an empty tool list (fail-closed) rather than
+// falling back to the stale hard-coded literal.
+func (c PythonClient) BootstrapToolSchemas(ctx context.Context) ([]map[string]any, error) {
+	response, err := c.callMap(ctx, "Bootstrap.GetToolSchemas", map[string]any{}, "")
+	if err != nil {
+		return nil, err
+	}
+	rawTools, _ := response["tools"].([]any)
+	tools := make([]map[string]any, 0, len(rawTools))
+	for _, raw := range rawTools {
+		if tool, ok := raw.(map[string]any); ok {
+			tools = append(tools, tool)
+		}
+	}
+	return tools, nil
+}
+
 func (c PythonClient) callMap(ctx context.Context, method string, payload map[string]any, principalID string) (map[string]any, error) {
 	conn, err := c.dial(ctx)
 	if err != nil {

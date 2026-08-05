@@ -510,3 +510,122 @@ async def test_concurrent_aclose_callers_do_not_create_multiple_close_tasks():
     # Each retry attempt called office.shutdown ONCE (3 attempts total),
     # NOT 6 (which would happen if both callers created separate tasks).
     assert office.shutdown.await_count == 3
+
+
+# ───────────────────────── P2-1: close false-success ──────────────────────────
+
+
+async def test_quarantined_runtime_aclose_re_raises_not_silent_success():
+    """P2-1 (close false-success): after a terminal close failure the runtime
+    enters ``QUARANTINED``.  A later ``aclose()`` from a *different* caller
+    must re-raise the same typed error — it must NOT return silently while
+    resources are still live.
+
+    Previously a failed first close set ``_close_failed`` and the next
+    ``aclose()`` returned at ``if self._close_failed: return``, so caller B
+    believed the close succeeded even though the runtime was quarantined.
+    """
+    from khaos.exceptions import RuntimeCloseError
+    from khaos.runtime.lifecycle import CloseState
+
+    office = MagicMock()
+    office.shutdown = AsyncMock(side_effect=RuntimeError("office boom"))
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        office_authority=office,
+    )
+
+    # First caller: close fails terminally after 3 retries.
+    with pytest.raises(RuntimeCloseError) as exc_info:
+        await result.aclose()
+    first_error = exc_info.value
+
+    # The runtime is QUARANTINED, not CLOSED.
+    assert result.close_state is CloseState.QUARANTINED
+    assert result._closed is False
+    assert result._close_failed is True
+    assert result.close_error is first_error
+
+    # Second caller: must observe the SAME failure, not a silent success.
+    with pytest.raises(RuntimeCloseError) as exc_info2:
+        await result.aclose()
+    assert exc_info2.value is first_error
+    # No additional retry attempts ran for the second caller.
+    assert office.shutdown.await_count == 3
+
+
+async def test_clean_close_transitions_to_closed_state():
+    """P2-1: a successful close transitions the typed state machine to CLOSED."""
+    from khaos.runtime.lifecycle import CloseState
+
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+    )
+    assert result.close_state is CloseState.OPEN
+
+    await result.aclose()
+
+    assert result.close_state is CloseState.CLOSED
+    assert result.close_error is None
+
+
+async def test_quarantined_runtime_recovers_after_cleanup_authority_reset():
+    """P2-1: the server-scoped ``RuntimeCleanupAuthority`` resets the
+    QUARANTINED state so a transiently-failing component can be retried.
+    Once it succeeds the runtime reaches CLOSED and is released.
+    """
+    from khaos.exceptions import RuntimeCloseError
+    from khaos.runtime.factory import RuntimeCleanupAuthority
+    from khaos.runtime.lifecycle import CloseState
+
+    # First call fails, subsequent calls succeed (simulating a transient
+    # component outage that recovers).
+    call_count = {"n": 0}
+
+    async def _flaky_shutdown():
+        call_count["n"] += 1
+        if call_count["n"] < 4:  # fail the first 3 attempts of the first aclose
+            raise RuntimeError("transient")
+
+    office = MagicMock()
+    office.shutdown = AsyncMock(side_effect=_flaky_shutdown)
+    result = RuntimeResult(
+        loop=MagicMock(),
+        mode_manager=MagicMock(),
+        task_manager=None,
+        skill_generator=None,
+        tool_scheduler=MagicMock(),
+        memory_manager=MagicMock(aclose=AsyncMock()),
+        skill_manager=MagicMock(),
+        new_verify_fix_loop=None,
+        office_authority=office,
+    )
+
+    authority = RuntimeCleanupAuthority()
+    with pytest.raises(RuntimeCloseError):
+        await result.aclose()
+    assert result.close_state is CloseState.QUARANTINED
+    authority.register(result)
+    assert authority.count == 1
+
+    # The authority resets the quarantine state and retries — now succeeds.
+    remaining = await authority.cleanup()
+    assert remaining == 0
+    assert result.close_state is CloseState.CLOSED
+    assert not result.quarantined
+    assert authority.count == 0
+

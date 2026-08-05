@@ -15,7 +15,7 @@ from pathlib import Path
 
 import yaml
 
-from khaos.skills.skill import Skill, SkillParseError
+from khaos.skills.skill import Skill, SkillParseError, SkillTrustTier
 
 logger = logging.getLogger(__name__)
 
@@ -63,12 +63,17 @@ class SkillLoader:
     def __init__(self, roots: list[Path] | None = None):
         self.roots = [Path(root) for root in (roots or [])]
 
-    def load_all(self) -> list[Skill]:
+    def load_all(self, trust_tier: SkillTrustTier = SkillTrustTier.PROJECT) -> list[Skill]:
         """Load every parseable skill from all roots.
 
         Order: roots are scanned in the order given; within a root, files are
         sorted by name for deterministic output. First ``name`` wins on
         collision (shadowing), mirroring Hermes' first-match-wins rule.
+
+        P2-5: ``trust_tier`` stamps every loaded skill with where it came
+        from (PROJECT by default — repository skills are the untrusted case).
+        Callers loading from the user-global ``~/.khaos/skills`` pass
+        ``SkillTrustTier.USER``.
 
         Batch 9.6 (round-9 §二十): the file-count cap now counts
         CANDIDATES (files opened/parsed), not just successfully-loaded
@@ -102,7 +107,7 @@ class SkillLoader:
                     )
                     return skills
                 try:
-                    skill = self.load_file(path)
+                    skill = self.load_file(path, trust_tier=trust_tier)
                 except SkillParseError as exc:
                     logger.warning("skipping skill %s: %s", path, exc)
                     continue
@@ -122,8 +127,13 @@ class SkillLoader:
                 skills.append(skill)
         return skills
 
-    def load_file(self, path: Path) -> Skill:
-        """Parse a single skill file. Raise SkillParseError on invalid input."""
+    def load_file(self, path: Path, trust_tier: SkillTrustTier = SkillTrustTier.PROJECT) -> Skill:
+        """Parse a single skill file. Raise SkillParseError on invalid input.
+
+        P2-5: ``trust_tier`` records where the skill was loaded from
+        (PROJECT for repository skills, USER for ~/.khaos/skills, BUILTIN for
+        shipped skills) so the prompt renderer can mark untrusted sources.
+        """
         path = Path(path)
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
@@ -197,6 +207,7 @@ class SkillLoader:
             triggers=[str(trigger) for trigger in raw_triggers],
             body=body,
             path=Path(path),
+            trust_tier=trust_tier,
         )
 
     @staticmethod

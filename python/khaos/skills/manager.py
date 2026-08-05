@@ -91,16 +91,35 @@ class SkillManager:
 
         Returns an empty string when no skills are supplied so callers can
         unconditionally concatenate the result.
+
+        P2-5: PROJECT-tier skills (loaded from the repository's ``skills/``
+        directory) are wrapped in an explicit ``untrusted_project_skill``
+        marker so the model treats them as repository-provided guidance,
+        not as trusted maintainer rules.  USER and BUILTIN skills render
+        verbatim (the OS user / the project maintainers are trusted sources).
         """
         if not skills:
             return ""
+        from khaos.skills.skill import SkillTrustTier
+
         blocks: list[str] = []
         for skill in skills:
             header = f"# Skill: {skill.name}"
             if skill.description:
                 header += f"\n# {skill.description}"
             body = skill.body.strip()
-            blocks.append(f"{header}\n\n{body}" if body else header)
+            rendered = f"{header}\n\n{body}" if body else header
+            # P2-5: wrap repository-provided skills in an untrusted marker so
+            # the model cannot mistake them for maintainer authority.  A
+            # malicious clone can place a project skill that attempts approval
+            # social engineering; the wrapper makes its provenance explicit.
+            if skill.trust_tier is SkillTrustTier.PROJECT:
+                rendered = (
+                    f"<untrusted_project_skill source=\"repository\" name=\"{skill.name}\">\n"
+                    f"{rendered}\n"
+                    f"</untrusted_project_skill>"
+                )
+            blocks.append(rendered)
         return "# Active skills\n\n" + "\n\n---\n\n".join(blocks)
 
     # --- manual load / unload (CLI) ----------------------------------------

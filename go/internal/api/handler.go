@@ -124,6 +124,20 @@ func (h *Handler) WithConfigAdminPrincipals(principals ...string) *Handler {
 	return h
 }
 
+// WithTools replaces the hard-coded /api/tools catalogue with the Python
+// production registry's model-visible tools (P1-2).  Called once at Gateway
+// startup after the Bootstrap.GetToolSchemas handshake.  An empty slice is
+// intentional: if the handshake failed the handler serves no tools (fail
+// closed) rather than falling back to the stale three-tool literal.
+func (h *Handler) WithTools(tools []map[string]any) *Handler {
+	if tools == nil {
+		h.tools = []map[string]any{}
+	} else {
+		h.tools = tools
+	}
+	return h
+}
+
 // WithAllowedHosts replaces the HTTP Host allowlist used to prevent DNS
 // rebinding. Values are host names or IP literals; ports are ignored.
 func (h *Handler) WithAllowedHosts(hosts ...string) *Handler {

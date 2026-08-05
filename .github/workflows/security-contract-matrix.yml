@@ -72,4 +72,6 @@ jobs:
         run: go test ./...
       - name: Run Rust core tests
         working-directory: rust/khaos-core
-        run: cargo test --locked
+        # P1-3: --all-targets so integration tests and benches are built/run,
+        # not just lib unit tests.
+        run: cargo test --locked --all-targets

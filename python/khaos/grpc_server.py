@@ -2980,6 +2980,18 @@ async def serve_json_lines(
                     }) + "\n").encode("utf-8"))
                     await writer.drain()
                     return
+                # P1-2 (tool descriptor drift): Bootstrap.GetToolSchemas —
+                # Gateway startup handshake returning the Python production
+                # registry's model-visible tool catalogue so /api/tools is
+                # the runtime fact, not a hard-coded three-tool literal that
+                # silently drifts.  Python is the sole authority for which
+                # tools exist; Go never re-declares them.
+                if method == "Bootstrap.GetToolSchemas":
+                    writer.write((json.dumps({
+                        "tools": create_runtime_registry().gateway_view(),
+                    }) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    return
                 # Bootstrap.Health is an authenticated control-plane probe.
                 # Unlike GetPolicyDigest it must carry the deployment claims,
                 # so a Gateway pointed at the wrong project/policy cannot
