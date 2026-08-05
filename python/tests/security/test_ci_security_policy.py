@@ -209,12 +209,9 @@ def test_single_security_closure_gate_requires_all_evidence_families():
         assert dependency in gate
     assert "name: Security Closure Gate" in gate
     assert "if: always()" in gate
-    # The aggregate must reject 'failure' (the security invariant).  It
-    # tolerates 'cancelled' (GitHub runner-infra cancellations are not code
-    # failures) — see PR #142/#143.  Assert the failure-rejection logic rather
-    # than a literal string so the contract tracks the behavior, not the
-    # implementation spelling.
-    assert '"failure"' in gate and "::error::dependency reported failure" in gate
+    # Round-11 review Critical-3: the aggregate must require exact success —
+    # cancelled/skipped must block (they are NOT proven), same as failure.
+    assert 'test "$result" = "success"' in gate
     assert "actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131" in gate
     assert "if-no-files-found: error" in gate
     assert "security-evidence.json" in gate

@@ -2660,6 +2660,19 @@ class CronEngine:
                     )
             return
 
+        # ── TOCTOU closure (round-11 review Critical-2/High-1) ──────────────
+        # Snapshot the authenticated principal_id into a LOCAL variable
+        # immediately after the check above, BEFORE any ``await`` (the
+        # durable-claim DB call below yields control).  The mutable
+        # ``task.principal_id`` can be changed concurrently (a test
+        # corrupting the row, a future ``cron_migrate``, a control op),
+        # so the executor MUST receive the snapshot, never a re-read of
+        # ``task.principal_id``.  Without this, the check at line 2629
+        # passes on ``"alice"``, an await yields, the field becomes ``""``,
+        # and line ~2773 re-reads it into the executor — a classic
+        # check-then-use race that silently executes as the server UID.
+        bound_principal_id = task.principal_id
+
         # M4 batch 3.1.16B-2 (CRITICAL): defense-in-depth drift check
         # at claim time.  ``start()`` already quarantines drifted tasks
         # after ``_load_tasks()``, but this re-check guards against:
@@ -2770,7 +2783,12 @@ class CronEngine:
                 # always 3-arg (``__init__`` wraps legacy 2-arg).
                 # Internal ``TypeError`` propagates to the
                 # ``except Exception`` branch → FAILED.
-                result = await self._executor(task.id, task.prompt, task.principal_id)
+                #
+                # TOCTOU closure (round-11 review): use the snapshot
+                # ``bound_principal_id`` captured before the durable-claim
+                # await, NOT ``task.principal_id`` (which a concurrent
+                # mutation could have cleared to empty).
+                result = await self._executor(task.id, task.prompt, bound_principal_id)
             else:
                 result = f"[no executor] prompt: {task.prompt[:100]}"
 

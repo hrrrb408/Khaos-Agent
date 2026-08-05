@@ -173,6 +173,20 @@ def test_rename_identity_churn_is_fail_closed(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_file_tool_and_process_write_share_authority(tmp_path):
+    """File-tool writes and process (terminal) writes share the same
+    WorkspaceStorageAuthority.  An over-budget process write must block a
+    subsequent file-tool write (and vice-versa).
+
+    Round-11 review: the previous version asserted ``workspace.state is
+    WorkspaceState.FAILED`` but called ``ProcessSupervisor.run()`` directly,
+    which does NOT quarantine the workspace (quarantine is an
+    ``ExecutionService`` responsibility).  The assertion was wrong on every
+    platform and timed out on CI.  The test now asserts what the shared
+    authority actually guarantees: the process is reported
+    ``resource-exhausted`` AND the file-tool write is rejected with
+    ``WorkspaceStorageViolation`` — proving the two paths share one
+    authority.
+    """
     manager, workspace = _registered_manager(tmp_path, byte_limit=1)
     supervisor = ProcessSupervisor(storage_authority=manager.storage_authority)
     command = (
@@ -194,12 +208,14 @@ async def test_file_tool_and_process_write_share_authority(tmp_path):
     )
     await asyncio.sleep(0.05)
 
+    # While the over-budget process is running, a file-tool write MUST be
+    # rejected — the two paths share the same storage authority.
     with pytest.raises(WorkspaceStorageViolation):
         await write_file("tool.txt", "tool", **_context(manager))
     result = await process
 
+    # The process MUST be reported resource-exhausted.
     assert result.status == "resource-exhausted"
-    assert workspace.state is WorkspaceState.FAILED
 
 
 @pytest.mark.asyncio

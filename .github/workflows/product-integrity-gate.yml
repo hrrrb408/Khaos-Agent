@@ -86,20 +86,12 @@ jobs:
         # lsp_real tests DO run here — they only need the optional extras
         # (installed above), not external infrastructure.
         #
-        # Deselect test_file_tool_and_process_write_share_authority: it relies
-        # on the ProcessSupervisor storage-watchdog propagating a workspace
-        # quarantine within the test's time.sleep window, which holds on macOS
-        # and local Linux but does not on ubuntu-24.04 CI runners (the watchdog
-        # cadence is environment-sensitive).  Tracked as follow-up test debt.
-        #
         # On macOS runners (no Docker daemon), test_m4_batch3_1_trusted_verification
-        # would also need --ignore (it has Docker tests lacking the skip guard).
-        # macOS is not currently in the matrix (see comment above) so this is
-        # only relevant if macOS is re-added.
+        # would need --ignore.  macOS is not currently in the matrix (see comment
+        # above) so this is only relevant if macOS is re-added.
         run: >-
           uv run pytest python/tests/ -q
           -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"
-          --deselect "python/tests/coding/test_workspace_storage_authority.py::test_file_tool_and_process_write_share_authority"
 
   # ─── Full Go product suite with the race detector ──────────────────────
   go-product:
@@ -145,21 +137,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
-      - name: Reject failed dependencies (tolerate cancelled/skipped infra)
-        # A matrix job (python-product) reports ``cancelled`` when GitHub
-        # cancels a single cell for runner-infra reasons — that is NOT a code
-        # failure.  Only ``failure`` is fatal; ``cancelled``/``skipped`` are
-        # tolerated so the gate stays green when every cell that actually ran
-        # passed.  (If every cell were cancelled the conclusion would still be
-        # non-success, surfacing the problem.)
+      - name: Reject any non-success dependency
+        # Round-11 review Critical-3: a required security gate has only two
+        # states — PROVEN or NOT PROVEN.  ``cancelled``/``skipped`` are NOT
+        # proven and must block, the same as ``failure``.  Infrastructure
+        # instability is solved by reruns, higher timeouts, and
+        # cancel-in-progress: false — NEVER by treating an unexecuted test as
+        # a pass.
         env:
           PYTHON_PRODUCT: ${{ needs.python-product.result }}
           GO_PRODUCT: ${{ needs.go-product.result }}
           RUST_PRODUCT: ${{ needs.rust-product.result }}
         run: |
           for result in "$PYTHON_PRODUCT" "$GO_PRODUCT" "$RUST_PRODUCT"; do
-            if [ "$result" = "failure" ]; then
-              echo "::error::dependency reported failure: $result"
-              exit 1
-            fi
+            test "$result" = "success"
           done

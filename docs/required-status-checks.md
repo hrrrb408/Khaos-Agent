@@ -17,15 +17,19 @@
 
 ## Required check names
 
-The only merge-authority check for M4 Closure is:
+The merge-authority checks for `main` are exactly two aggregate gates
+(round-11 review Critical-1 fix — the real GitHub ruleset now requires these,
+not the 20 individual detail checks):
 
 | Check name | Proves |
 |---|---|
-| `Security Closure Gate` | every reusable security workflow and the explicit schema/authz/process/event-loop adversarial job succeeded; mandatory evidence artifact was validated and uploaded |
+| `Security Closure Gate` | every reusable security workflow and the explicit schema/authz/process/event-loop adversarial job succeeded; mandatory evidence artifact was validated and uploaded; Product Integrity Gate succeeded |
+| `Product Integrity Gate` | the full product test suite (Python 3.11/3.12/3.13, Go, Rust) succeeded independently of the security subset |
 
-Configure this one aggregate check as required. The detailed checks below are
-diagnostic dependencies and remain visible, but branch protection must not use
-an incomplete subset of them as a substitute for the aggregate result.
+Both are required. Neither substitutes for the other: Security Closure proves
+the security boundary holds; Product Integrity proves the product as a whole is
+not regressed. The detailed checks below are diagnostic dependencies of the
+aggregates — they remain visible but are no longer direct merge authorities.
 
 The aggregate job also downloads per-test evidence emitted only after the
 owning job succeeds. Every fragment binds `commit`, Actions `run_id`, `job`,
@@ -95,10 +99,10 @@ the product as a whole is not regressed. Both are required merge authorities.
 
 | Check name | Proves |
 |---|---|
-| `Python Product Suite` | full `python/tests/` across the Python 3.11/3.12/3.13 × Linux/macOS matrix |
+| `Python Product Suite` | full `python/tests/` across the Python 3.11/3.12/3.13 × Linux matrix (macOS cross-platform *security* coverage is provided by `contract (macos-14)` in the Security Closure Gate; macOS is not in the product matrix pending stabilization of macOS-specific test debt) |
 | `Go Product Suite` | full `go test -race ./...` |
 | `Rust Product Suite` | `cargo test --locked --all-targets` + `cargo clippy --all-targets -- -D warnings` |
-| `Product Integrity Gate` | aggregate — all three suites green |
+| `Product Integrity Gate` | aggregate — all three suites green (exact success required; cancelled/skipped blocks) |
 
 ## Verification
 
