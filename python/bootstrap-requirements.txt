@@ -1,6 +1,6 @@
 # Bootstrap toolchain pinned with hashes (Batch 9.7b, round-9 review §二十一).
 #
-# CI jobs previously installed uv via ``python -m pip install uv==0.11.9``
+# CI jobs previously installed uv via ``python -m pip install uv==0.12.1``
 # with no hash verification.  A compromised PyPI mirror or download link
 # could replace the same-version wheel and control every subsequent
 # frozen install.  This file is the trust root for the uv binary: install
@@ -24,7 +24,7 @@
 # Update procedure: when bumping uv, fetch the new hashes from
 #   https://pypi.org/pypi/uv/<version>/json
 # and replace the lines below IN FULL.
-uv==0.11.9 \
+uv==0.12.1 \
     --hash=sha256:053659e258b33c88e416e508d4cf63685505c1151f3cf46e47dd47212439379c \
     --hash=sha256:12caca9460223611cfaa65d3508c3fd4c4c4bfec091e0baaef86a774748eff61 \
     --hash=sha256:29a7337a1699d4a152bdaa1ff2607e9d1451675c45bc8862d9671013b1d5392b \
