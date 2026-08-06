@@ -103,8 +103,14 @@ class ManagedProcessHandle:
         return self._resource_violation
 
     async def write_stdin(self, payload: bytes) -> None:
-        if self._closed or self.stdin is None:
-            raise RuntimeError("managed process stdin is closed")
+        # Round-14 review P0-5: reject writes when NOT OPEN (FINALIZING,
+        # QUARANTINED, CLOSED all reject).  Previously only CLOSED rejected
+        # (via the ``_closed`` property), so FINALIZING/QUARANTINED still
+        # allowed stdin writes to a process being torn down.
+        if self._finalize_state is not FinalizeState.OPEN or self.stdin is None:
+            raise RuntimeError(
+                f"managed process stdin is closed (state={self._finalize_state.value})"
+            )
         self.stdin.write(payload)
         await self.stdin.drain()
 
@@ -219,7 +225,13 @@ class ManagedProcessHandle:
                 await coro_factory()
             except asyncio.CancelledError:
                 cancel_requested = True
-                logger.debug("managed process finalize step %s cancelled", label)
+                # Round-14 review P0-5: a cancelled step did NOT complete —
+                # record it as an error so the finalize enters QUARANTINED
+                # (not CLOSED).  Without this, a cancelled unregister/on_terminal
+                # would leave the supervisor/active-entry alive while the
+                # handle reported CLOSED.
+                errors.append(RuntimeError(f"step {label} was cancelled (incomplete)"))
+                logger.debug("managed process finalize step %s cancelled (incomplete)", label)
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
                 logger.debug("managed process finalize step %s failed", label, exc_info=True)

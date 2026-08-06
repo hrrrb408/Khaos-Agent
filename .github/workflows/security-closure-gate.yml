@@ -49,6 +49,11 @@ jobs:
   type-check:
     uses: ./.github/workflows/type-check.yml
 
+  # Round-14 review CI: Ruleset Audit as a Security Closure dependency so
+  # a ruleset drift that the audit catches actually blocks the merge.
+  ruleset-audit:
+    uses: ./.github/workflows/ruleset-audit.yml
+
   # Round-12 review CI-1: Product Integrity is a SEPARATE required gate (not a
   # dependency of Security Closure).  Running it inside Security Closure caused
   # every PR to execute the full Python/Go/Rust suite TWICE (once standalone,
@@ -140,6 +145,7 @@ jobs:
       - docker-security
       - supply-chain
       - type-check
+      - ruleset-audit
       - closure-adversarial
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -153,12 +159,13 @@ jobs:
           DOCKER_SECURITY: ${{ needs.docker-security.result }}
           SUPPLY_CHAIN: ${{ needs.supply-chain.result }}
           TYPE_CHECK: ${{ needs.type-check.result }}
+          RULESET_AUDIT: ${{ needs.ruleset-audit.result }}
           CLOSURE_ADVERSARIAL: ${{ needs.closure-adversarial.result }}
         run: |
           for result in \
             "$CORE_SECURITY" "$STRICT_CONTRACTS" "$REAL_KERNEL" \
             "$PLAYWRIGHT_SECURITY" "$DOCKER_SECURITY" "$SUPPLY_CHAIN" \
-            "$TYPE_CHECK" "$CLOSURE_ADVERSARIAL"; do
+            "$TYPE_CHECK" "$RULESET_AUDIT" "$CLOSURE_ADVERSARIAL"; do
             test "$result" = "success"
           done
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
