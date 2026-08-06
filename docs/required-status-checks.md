@@ -23,7 +23,7 @@ not the 20 individual detail checks):
 
 | Check name | Proves |
 |---|---|
-| `Security Closure Gate` | every reusable security workflow and the explicit schema/authz/process/event-loop adversarial job succeeded; mandatory evidence artifact was validated and uploaded; Product Integrity Gate succeeded |
+| `Security Closure Gate` | every reusable security workflow + the explicit schema/authz/process/event-loop adversarial job + the Pyright type check succeeded; mandatory evidence artifact was validated and uploaded |
 | `Product Integrity Gate` | the full product test suite (Python 3.11/3.12/3.13, Go, Rust) succeeded independently of the security subset |
 
 Both are required. Neither substitutes for the other: Security Closure proves

@@ -3,12 +3,29 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import tempfile
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from enum import Enum
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+
+class _ShutdownState(str, Enum):
+    """Terminal state of ExecutionService shutdown (round-13 review P0-1)."""
+
+    OPEN = "open"
+    CLOSING = "closing"
+    CLOSED = "closed"
+    QUARANTINED = "quarantined"
+
+
+class ExecutionServiceShutdownError(RuntimeError):
+    """Typed error when shutdown partially fails (round-13 P0-1)."""
 
 from khaos.coding.execution.binding import open_execution_directory_binding
 from khaos.coding.execution.managed import ManagedProcessHandle
@@ -51,7 +68,12 @@ class ExecutionService:
         self.docker_backend = docker_backend
         self.managed_process_factory = managed_process_factory
         self._active: dict[str, tuple[str, str, object]] = {}
-        self._closed = False
+        # Round-13 review P0-1: typed shutdown state machine (same pattern as
+        # RuntimeResult and ManagedProcess).  ``_closed`` is a backward-compat
+        # property that reads ``_shutdown_state``.
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._shutdown_state = _ShutdownState.OPEN
+        self._shutdown_error: BaseException | None = None
         self.principal_id = principal_id
         self.project_id = project_id
         self.runtime_id = runtime_id
@@ -70,6 +92,11 @@ class ExecutionService:
             self.docker_backend.supervisor = self.process_supervisor
         if self.backend_selector is not None:
             self.backend_selector.set_supervisor(self.process_supervisor)
+
+    @property
+    def _closed(self) -> bool:
+        """Backward-compat: True only when cleanly CLOSED (not QUARANTINED)."""
+        return self._shutdown_state is _ShutdownState.CLOSED
 
     def bind_runtime_authority(
         self, *, principal_id: str, project_id: str, runtime_id: str
@@ -511,11 +538,65 @@ class ExecutionService:
         raise PermissionError("unsupported: managed process backend cannot enforce network isolation")
 
     async def shutdown(self) -> None:
-        if self._closed:
+        """Shut down all active executions, the supervisor, and the Docker backend.
+
+        Round-13 review P0-1: previously ``_closed=True`` was set BEFORE any
+        cleanup, so a ``terminate()`` exception left remaining executions,
+        the supervisor, and the Docker backend alive — and a retry returned
+        success immediately.  Now each step runs independently (one failure
+        does not skip the rest), the typed state machine tracks OPEN →
+        CLOSING → CLOSED/QUARANTINED, and every caller awaits the SAME shared
+        shutdown task so no one sees a false success.
+        """
+        if self._shutdown_state is _ShutdownState.CLOSED:
             return
-        self._closed = True
+        if self._shutdown_state is _ShutdownState.QUARANTINED:
+            raise ExecutionServiceShutdownError(
+                f"ExecutionService was already partially shut down with "
+                f"errors; resources may not be fully released"
+            ) from self._shutdown_error
+        if self._shutdown_task is not None:
+            await asyncio.shield(self._shutdown_task)
+            return
+        self._shutdown_task = asyncio.ensure_future(self._run_shutdown())
+        await asyncio.shield(self._shutdown_task)
+
+    async def _run_shutdown(self) -> None:
+        """The actual shutdown sequence — runs exactly once."""
+        self._shutdown_state = _ShutdownState.CLOSING
+        errors: list[Exception] = []
+
+        # Each active execution is terminated independently — one failure
+        # must not skip the rest.
         for execution_id in tuple(self._active):
-            await self.terminate(execution_id)
-        await self.process_supervisor.shutdown()
+            try:
+                await self.terminate(execution_id)
+            except Exception as exc:  # noqa: BLE001 — collect, don't abort
+                errors.append(exc)
+                logger.debug(
+                    "ExecutionService shutdown: terminate(%s) failed",
+                    execution_id, exc_info=True,
+                )
+
+        # Supervisor and Docker backend are always attempted.
+        try:
+            await self.process_supervisor.shutdown()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+            logger.debug("ExecutionService shutdown: supervisor shutdown failed", exc_info=True)
+
         if self.docker_backend is not None:
-            await self.docker_backend.shutdown()
+            try:
+                await self.docker_backend.shutdown()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+                logger.debug("ExecutionService shutdown: docker backend shutdown failed", exc_info=True)
+
+        if errors:
+            self._shutdown_error = errors[0]
+            self._shutdown_state = _ShutdownState.QUARANTINED
+            raise ExecutionServiceShutdownError(
+                f"ExecutionService shutdown completed with {len(errors)} "
+                f"error(s): " + "; ".join(type(e).__name__ for e in errors)
+            ) from errors[0]
+        self._shutdown_state = _ShutdownState.CLOSED
