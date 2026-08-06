@@ -227,16 +227,19 @@ class ManagedProcessHandle:
         await _try_async_step("stderr", self._finish_stderr)
         await _try_async_step("watchdog", self._finish_resource_watchdog)
 
-        if self._supervisor is not None:
+        # Capture into locals so pyright can narrow the Optional types.
+        supervisor = self._supervisor
+        if supervisor is not None:
             await _try_async_step(
                 "unregister",
-                lambda: self._supervisor.unregister_process(self.execution_id),
+                lambda: supervisor.unregister_process(self.execution_id),
             )
 
-        if self._on_terminal is not None:
+        on_terminal = self._on_terminal
+        if on_terminal is not None:
             await _try_async_step(
                 "on_terminal",
-                lambda: self._on_terminal(self.execution_id),
+                lambda: on_terminal(self.execution_id),
             )
 
         # temp-home removal: OBSERVABLE (round-13 P0-3). A real OSError
