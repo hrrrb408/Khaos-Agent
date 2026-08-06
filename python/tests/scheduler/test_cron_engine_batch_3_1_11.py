@@ -914,3 +914,105 @@ async def test_acceptance_10_lease_recovery_failure_degraded_mode(tmp_path) -> N
         await engine.stop(timeout=2.0)
     finally:
         await db.close()
+
+
+# ───── Round-12 P1-2: durable identity claim drift tests ──────────────────
+
+
+async def test_durable_claim_rejects_db_principal_drift_without_version_bump(tmp_path) -> None:
+    """Round-12 review P1-2: the durable claim CAS now binds principal_id.
+    If the DB row's principal_id was mutated (data corruption, migration,
+    a future admin tool) WITHOUT bumping lifecycle_version, the claim MUST
+    return 0 and the executor MUST NOT be called.
+    """
+    db = await _make_db(tmp_path)
+    try:
+        executor_calls: list[str] = []
+        async def recording_executor(task_id, prompt, principal_id):
+            executor_calls.append(principal_id)
+            return "ok"
+        engine = CronEngine(db=db, executor=recording_executor, tick_interval=0.01)
+        await engine.start()
+        iso = utc_now_naive().isoformat()
+        task = await engine.create(
+            "drift-principal", "p", ScheduleConfig(iso_time=iso),
+            principal_id="alice",
+        )
+        # Corrupt ONLY the DB row's principal_id (no version bump).
+        conn = await db._require_writer_conn()
+        await conn.execute(
+            "UPDATE scheduled_tasks SET principal_id = 'bob' WHERE id = ?", (task.id,)
+        )
+        await conn.commit()
+        # The in-memory task still says alice.
+        assert engine._tasks[task.id].principal_id == "alice"
+        # Let tick fire.
+        await asyncio.sleep(0.3)
+        # The executor MUST NOT have been called — the claim rejected the drift.
+        assert len(executor_calls) == 0, (
+            "executor was called despite DB principal_id drift — the durable "
+            "claim did not bind identity"
+        )
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+
+async def test_durable_claim_rejects_db_project_drift(tmp_path) -> None:
+    """Round-12 review P1-2: project_id drift in the DB row (without version
+    bump) must also block the claim."""
+    db = await _make_db(tmp_path)
+    try:
+        executor_calls: list[str] = []
+        async def recording_executor(task_id, prompt, principal_id):
+            executor_calls.append(principal_id)
+            return "ok"
+        engine = CronEngine(db=db, executor=recording_executor, tick_interval=0.01)
+        await engine.start()
+        iso = utc_now_naive().isoformat()
+        task = await engine.create(
+            "drift-project", "p", ScheduleConfig(iso_time=iso),
+            principal_id="alice",
+        )
+        conn = await db._require_writer_conn()
+        await conn.execute(
+            "UPDATE scheduled_tasks SET project_id = 'wrong-project' WHERE id = ?", (task.id,)
+        )
+        await conn.commit()
+        await asyncio.sleep(0.3)
+        assert len(executor_calls) == 0, (
+            "executor was called despite DB project_id drift"
+        )
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()
+
+
+async def test_durable_claim_rejects_db_policy_digest_drift(tmp_path) -> None:
+    """Round-12 review P1-2: policy_digest drift in the DB row (without
+    version bump) must also block the claim."""
+    db = await _make_db(tmp_path)
+    try:
+        executor_calls: list[str] = []
+        async def recording_executor(task_id, prompt, principal_id):
+            executor_calls.append(principal_id)
+            return "ok"
+        engine = CronEngine(db=db, executor=recording_executor, tick_interval=0.01)
+        await engine.start()
+        iso = utc_now_naive().isoformat()
+        task = await engine.create(
+            "drift-policy", "p", ScheduleConfig(iso_time=iso),
+            principal_id="alice",
+        )
+        conn = await db._require_writer_conn()
+        await conn.execute(
+            "UPDATE scheduled_tasks SET policy_digest = 'wrong-digest' WHERE id = ?", (task.id,)
+        )
+        await conn.commit()
+        await asyncio.sleep(0.3)
+        assert len(executor_calls) == 0, (
+            "executor was called despite DB policy_digest drift"
+        )
+        await engine.stop(timeout=2.0)
+    finally:
+        await db.close()

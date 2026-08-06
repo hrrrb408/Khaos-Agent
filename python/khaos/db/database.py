@@ -4458,6 +4458,9 @@ class Database:
         started_at: str,
         lease_until: str,
         expected_version: int,
+        expected_principal_id: str | None = None,
+        expected_project_id: str | None = None,
+        expected_policy_digest: str | None = None,
     ) -> int:
         """Atomically claim a task for execution (durable lease).
 
@@ -4473,26 +4476,47 @@ class Database:
         behind the real start time during execution — corrupting
         audit timelines and crash-recovery forensics.
 
+        Round-12 review P1-2: the CAS WHERE clause now also binds
+        ``principal_id``, ``project_id`` and ``policy_digest`` when
+        provided, so a DB row whose identity drifted (concurrent
+        migration, data corruption, a future admin tool that forgot
+        to bump lifecycle_version) cannot be claimed under a stale
+        in-memory snapshot.  The claim returns 0 (not claimed) if any
+        identity field mismatches — the executor is never called.
+
         Returns rowcount:
-          - 1 = claim succeeded (status was PENDING, version matched)
-          - 0 = claim failed (task was not PENDING, or a control op
-                bumped the version since the executor captured it)
+          - 1 = claim succeeded (status, version AND identity matched)
+          - 0 = claim failed (task was not PENDING, version changed,
+                or identity drifted)
 
         The UPDATE does NOT bump ``lifecycle_version`` — execution
-        claims are not control operations.  This keeps the version
-        stable across multiple sequential executions of a recurring
-        task.
+        claims are not control operations.
         """
+        # Build the WHERE clause with optional identity bindings.
+        where_parts = [
+            "id = ?", "status = 'pending'", "lifecycle_version = ?"
+        ]
+        params: list = [task_id, expected_version]
+        if expected_principal_id is not None:
+            where_parts.append("principal_id = ?")
+            params.append(expected_principal_id)
+        if expected_project_id is not None:
+            where_parts.append("project_id = ?")
+            params.append(expected_project_id)
+        if expected_policy_digest is not None:
+            where_parts.append("policy_digest = ?")
+            params.append(expected_policy_digest)
+        where_clause = " AND ".join(where_parts)
+        sql = (
+            "UPDATE scheduled_tasks "
+            "SET status = 'running', execution_id = ?, lease_until = ?, "
+            "last_run = ? "
+            f"WHERE {where_clause}"
+        )
+        # INSERT execution params at the front (SET clause), then WHERE params.
+        all_params = (execution_id, lease_until, started_at, *params)
         async with self.transaction() as conn:
-            cursor = await conn.execute(
-                """
-                UPDATE scheduled_tasks
-                SET status = 'running', execution_id = ?, lease_until = ?,
-                    last_run = ?
-                WHERE id = ? AND status = 'pending' AND lifecycle_version = ?
-                """,
-                (execution_id, lease_until, started_at, task_id, expected_version),
-            )
+            cursor = await conn.execute(sql, all_params)
             return cursor.rowcount
 
     async def clear_scheduled_task_lease(

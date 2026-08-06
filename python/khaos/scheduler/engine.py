@@ -2672,6 +2672,11 @@ class CronEngine:
         # and line ~2773 re-reads it into the executor — a classic
         # check-then-use race that silently executes as the server UID.
         bound_principal_id = task.principal_id
+        # Round-12 review P1-2: also snapshot project_id and policy_digest
+        # before the durable-claim await, and bind them into the DB CAS so a
+        # drifted DB row cannot be claimed under a stale in-memory identity.
+        bound_project_id = task.project_id
+        bound_policy_digest = task.policy_digest
 
         # M4 batch 3.1.16B-2 (CRITICAL): defense-in-depth drift check
         # at claim time.  ``start()`` already quarantines drifted tasks
@@ -2711,6 +2716,9 @@ class CronEngine:
                     started_at=started_at_dt.isoformat(),
                     lease_until=lease_until_dt.isoformat(),
                     expected_version=version_at_start,
+                    expected_principal_id=bound_principal_id,
+                    expected_project_id=bound_project_id,
+                    expected_policy_digest=bound_policy_digest,
                 )
                 if rowcount == 1:
                     claim_committed = True

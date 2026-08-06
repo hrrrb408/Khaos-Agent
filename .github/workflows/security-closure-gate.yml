@@ -39,13 +39,13 @@ jobs:
   supply-chain:
     uses: ./.github/workflows/supply-chain-audit.yml
 
-  # P1-3: Product Integrity Gate — the whole-repository test suite (full
-  # Python/Go/Rust) across the supported Python version matrix, independent of
-  # the security subset above.  Security Closure proves the boundary holds;
-  # this proves the product as a whole is not regressed.
-  product-integrity:
-    uses: ./.github/workflows/product-integrity-gate.yml
-
+  # Round-12 review CI-1: Product Integrity is a SEPARATE required gate (not a
+  # dependency of Security Closure).  Running it inside Security Closure caused
+  # every PR to execute the full Python/Go/Rust suite TWICE (once standalone,
+  # once via the reusable-workflow call) — doubling runner consumption and
+  # merge time for zero additional safety.  Both gates are independently
+  # required by the GitHub ruleset.
+  #
   # Schema Fuzz, Authorization Drift E2E, Process Lifecycle E2E, and
   # Event-loop Starvation Tests are explicit independent gate dependencies.
   closure-adversarial:
@@ -128,11 +128,10 @@ jobs:
       - docker-security
       - supply-chain
       - closure-adversarial
-      - product-integrity
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Reject failed cancelled or skipped dependencies
+      - name: Reject any non-success dependency
         env:
           CORE_SECURITY: ${{ needs.core-security.result }}
           STRICT_CONTRACTS: ${{ needs.strict-contracts.result }}
@@ -141,17 +140,11 @@ jobs:
           DOCKER_SECURITY: ${{ needs.docker-security.result }}
           SUPPLY_CHAIN: ${{ needs.supply-chain.result }}
           CLOSURE_ADVERSARIAL: ${{ needs.closure-adversarial.result }}
-          PRODUCT_INTEGRITY: ${{ needs.product-integrity.result }}
         run: |
-          # Round-11 review Critical-3: a required security gate has only two
-          # states — PROVEN or NOT PROVEN.  ``cancelled``/``skipped`` are NOT
-          # proven and must block, the same as ``failure``.  Infrastructure
-          # instability is solved by reruns and higher timeouts — NEVER by
-          # treating an unexecuted test as a pass.
           for result in \
             "$CORE_SECURITY" "$STRICT_CONTRACTS" "$REAL_KERNEL" \
             "$PLAYWRIGHT_SECURITY" "$DOCKER_SECURITY" "$SUPPLY_CHAIN" \
-            "$CLOSURE_ADVERSARIAL" "$PRODUCT_INTEGRITY"; do
+            "$CLOSURE_ADVERSARIAL"; do
             test "$result" = "success"
           done
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

@@ -1,27 +1,28 @@
-"""Runtime authority seal — the unforgeable binding of a runtime to its
-security authority (principal, project, policy digest, runtime id).
+"""Runtime authority seal — a factory-issued runtime binding assertion.
 
 Review P1-1 (production Runtime injection): ``RuntimeConfig`` allowed
 injecting every security-critical component (ToolScheduler, ExecutionService,
 Sandbox, NetworkGuard, MemoryManager, ModeManager, AuditLogger) without
-re-proving any of their security properties.  An injected ToolScheduler could
-carry no SecurityMiddleware; an injected Sandbox could be ``FULL_ACCESS``
-while the policy said ``read_only``; an injected NetworkGuard could be wide
-open while the policy denied network.  The ``build_runtime`` default path is
-safe, but the *type* did not enforce that — any future entry point could
-re-introduce a "second security authority".
+re-proving any of their security properties.  The seal is the typed binding
+every production-built runtime carries, so the factory can detect mismatches
+between a borrowed component's authority and the current runtime's authority.
 
-The seal is the typed binding every production-built runtime carries.  In
-production mode (``KHAOS_DEV_MODE != "1"``) the factory refuses to install an
-injected security-critical component unless it proves it was built for the
-same seal — closing the injection backdoor while keeping the dev/test path
-(which injects mocks) working unchanged.
+**Scope limitation (round-12 review P1-3):** the seal is a *factory-issued
+binding assertion*, NOT a cryptographic boundary against in-process malicious
+code.  ``RuntimeAuthoritySeal.mint()`` is a public classmethod and the MAC key
+is a module-level variable; arbitrary Python code running in the same
+interpreter can mint a forged seal.  This is acceptable because the threat
+model does not include same-process malicious code (the OS-user boundary is a
+separate trust boundary — see ``docs/platform-security-guarantees.md``).  The
+seal prevents *unintentional* misconfiguration, detects component-binding
+drift, and strengthens factory invariants — it is not claimed to defend
+against a hostile in-process caller.
 
 Invariant A (single execution authority): every model command, git operation,
 test, build, LSP, or browser subprocess runs only through a RuntimeFactory-
-built and sealed ExecutionService.  Invariant D (no silent host fallback):
-the seal's policy_digest ties execution to exactly the compiled
-EffectiveSecurityPolicy.
+built ExecutionService whose authority matches this seal.  Invariant D (no
+silent host fallback): the seal's policy_digest ties execution to exactly the
+compiled EffectiveSecurityPolicy.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class RuntimeAuthoritySeal:
-    """Immutable binding of a runtime to its security authority.
+    """Factory-issued runtime binding assertion (NOT a crypto boundary).
 
     The four fields uniquely identify the security context every component of
     a runtime must be built from:
