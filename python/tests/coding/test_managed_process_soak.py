@@ -133,7 +133,8 @@ async def test_wait_and_aclose_race_finalize_exactly_once(tmp_path: Path):
     await asyncio.gather(handle.wait(), handle.aclose())
 
     assert handle._closed is True
-    assert handle._finalized is True
+    from khaos.coding.execution.managed import FinalizeState
+    assert handle._finalize_state is FinalizeState.CLOSED
     assert temp_home is not None and not temp_home.exists()
 
 
@@ -206,3 +207,105 @@ async def test_on_terminal_callback_pops_active_entry_on_natural_exit(tmp_path: 
         "natural-exit wait() must pop _active via on_terminal callback"
     )
     assert handle._closed is True
+
+
+# ───── Round-12 P1-1: fault-injection tests (each step independent) ──────
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")
+async def test_finalize_stderr_failure_does_not_skip_later_steps(tmp_path: Path):
+    """If the stderr collector raises, the watchdog/unregister/on_terminal
+    steps and temp-home removal MUST still run (round-12 P1-1)."""
+    from khaos.coding.execution.managed import FinalizeState, ManagedProcessFinalizeError
+
+    temp_home = tmp_path / "home-stderr"
+    temp_home.mkdir()
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "pass",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, start_new_session=True,
+    )
+    handle = ManagedProcessHandle(
+        "fault-stderr", process, temporary_home=temp_home,
+        on_terminal=_noop_on_terminal,
+    )
+    # Inject a failing _finish_stderr.
+    async def _boom():
+        raise RuntimeError("stderr boom")
+    handle._finish_stderr = _boom
+
+    with pytest.raises(ManagedProcessFinalizeError):
+        await handle.aclose()
+    # State is QUARANTINED, not CLOSED.
+    assert handle._finalize_state is FinalizeState.QUARANTINED
+    # temp-home STILL removed despite the stderr failure.
+    assert not temp_home.exists()
+    # Second aclose re-raises the same typed error (no false success).
+    with pytest.raises(ManagedProcessFinalizeError):
+        await handle.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")
+async def test_finalize_on_terminal_failure_still_removes_temp_home(tmp_path: Path):
+    """If on_terminal raises, temp-home removal MUST still run."""
+    from khaos.coding.execution.managed import FinalizeState, ManagedProcessFinalizeError
+
+    temp_home = tmp_path / "home-cb"
+    temp_home.mkdir()
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "pass",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, start_new_session=True,
+    )
+    async def _failing_on_terminal(eid):
+        raise RuntimeError("on_terminal boom")
+    handle = ManagedProcessHandle(
+        "fault-cb", process, temporary_home=temp_home,
+        on_terminal=_failing_on_terminal,
+    )
+    with pytest.raises(ManagedProcessFinalizeError):
+        await handle.aclose()
+    assert handle._finalize_state is FinalizeState.QUARANTINED
+    assert not temp_home.exists()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX process-group semantics")
+async def test_concurrent_callers_observe_same_finalize_result(tmp_path: Path):
+    """wait() and aclose() racing must both observe the SAME result —
+    if finalize fails, both receive the error; no caller sees a false success."""
+    from khaos.coding.execution.managed import ManagedProcessFinalizeError
+
+    process = await asyncio.create_subprocess_exec(
+        sys.executable, "-c", "pass",
+        stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE, start_new_session=True,
+    )
+    async def _failing_on_terminal(eid):
+        raise RuntimeError("concurrent boom")
+    handle = ManagedProcessHandle(
+        "race-fault", process, temporary_home=None,
+        on_terminal=_failing_on_terminal,
+    )
+    results: list[str] = []
+    async def _wait():
+        try:
+            await handle.wait()
+            results.append("ok")
+        except ManagedProcessFinalizeError:
+            results.append("error")
+    async def _aclose():
+        try:
+            await handle.aclose()
+            results.append("ok")
+        except ManagedProcessFinalizeError:
+            results.append("error")
+    await asyncio.gather(_wait(), _aclose())
+    # Both callers observed the SAME result (error), not one ok + one error.
+    assert results == ["error", "error"], f"callers saw different results: {results}"
+
+
+async def _noop_on_terminal(execution_id: str) -> None:
+    pass

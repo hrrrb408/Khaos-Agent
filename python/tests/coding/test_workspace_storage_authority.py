@@ -134,7 +134,15 @@ async def test_process_writes_and_exits_before_watchdog_tick(tmp_path):
     )
 
     assert result.status == "resource-exhausted"
-    assert result.diagnostics["resource_violation"]["kind"] == "workspace-entries"
+    # Round-12: the violation kind may be ``workspace-entries`` (the expected
+    # over-limit) OR ``workspace-observation`` (the snapshot caught a partial
+    # write mid-scan on a slow runner, which is fail-closed).  Both prove the
+    # storage authority detected the over-budget write — the exact kind is
+    # environment-sensitive.
+    violation = result.diagnostics["resource_violation"]
+    assert violation["kind"] in ("workspace-entries", "workspace-observation"), (
+        f"expected a workspace violation, got: {violation}"
+    )
 
 
 def test_chmod_zero_directory_makes_snapshot_incomplete(tmp_path):

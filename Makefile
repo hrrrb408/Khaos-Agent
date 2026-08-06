@@ -30,9 +30,13 @@ test-rust:
 	else echo "rust: no crate"; fi
 
 lint:
-	# P2-6: Pyright type check (security-critical modules are strict; see
-	# docs/type-check-rollout.md).  Requires the `lsp` extra (pyright).
-	PYTHONPATH=python uv run pyright || echo "(pyright not installed; run: uv sync --extra lsp)"
+	# Round-12 review CI-3: Pyright type check on security-critical modules.
+	# HARD failure — no soft-fail echo.  The missing-logger NameError in
+	# managed.py is exactly the kind of bug this catches before tests do.
+	PYTHONPATH=python uv run pyright \
+		python/khaos/runtime/authority.py \
+		python/khaos/runtime/lifecycle.py \
+		python/khaos/coding/execution/managed.py
 
 migrate:
 	PYTHONPATH=python $(PYTHON) -m khaos.db.migrate --db khaos.db
