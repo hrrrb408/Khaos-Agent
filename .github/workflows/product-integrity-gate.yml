@@ -37,10 +37,10 @@ jobs:
   python-product:
     name: Python Product Suite
     runs-on: ${{ matrix.os }}
-    # The full 3800-test suite can take ~15-30 min on a slow shared runner
-    # (Ubuntu 3.11 was hitting the 30-min ceiling). Give it headroom so the
+    # The full 3800-test suite can take ~30-40 min on a slow shared runner
+    # (Ubuntu 3.11 was hitting the 45-min ceiling). Give it headroom so the
     # cell completes rather than being force-cancelled mid-suite.
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

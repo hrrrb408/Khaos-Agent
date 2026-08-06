@@ -74,6 +74,14 @@ class ExecutionService:
         self._shutdown_task: asyncio.Task[None] | None = None
         self._shutdown_state = _ShutdownState.OPEN
         self._shutdown_error: BaseException | None = None
+        # Round-14 review P0-2: admission registry.  ``_initializing`` tracks
+        # executions that have been admitted (passed the OPEN check) but have
+        # not yet been published to ``_active`` (they're in the workspace/
+        # backend/process-await phase).  shutdown() owns both ``_active`` AND
+        # ``_initializing``, so a late-publish after shutdown can detect the
+        # closed admission and terminate the just-started process.
+        self._admission_lock = asyncio.Lock()
+        self._initializing: dict[str, asyncio.Task] = {}
         self.principal_id = principal_id
         self.project_id = project_id
         self.runtime_id = runtime_id
@@ -114,8 +122,15 @@ class ExecutionService:
         self._authority_bound = True
 
     async def execute(self, request: ExecutionRequest) -> ExecutionResult:
-        if self._closed:
-            raise RuntimeError("execution service is shut down")
+        # Round-14 review P0-1: reject new executions when the service is NOT
+        # OPEN (CLOSING/QUARANTINED/CLOSED all reject).  Previously ``_closed``
+        # was only True for CLOSED, so CLOSING/QUARANTINED still admitted new
+        # executions — allowing a process to start AFTER shutdown began.
+        if self._shutdown_state is not _ShutdownState.OPEN:
+            raise RuntimeError(
+                f"execution service is {self._shutdown_state.value}, "
+                f"not accepting new executions"
+            )
         resolved_context = None
         profile = request.permission_profile
         if profile is None:  # Defensive: ExecutionRequest currently always normalizes this.
@@ -363,8 +378,12 @@ class ExecutionService:
 
     async def start_managed_process(self, request: ExecutionRequest) -> ManagedProcessHandle:
         """Start a registered LSP-style stdio process in an active TaskWorkspace."""
-        if self._closed:
-            raise RuntimeError("execution service is shut down")
+        # Round-14 review P0-1: same OPEN-only admission as execute().
+        if self._shutdown_state is not _ShutdownState.OPEN:
+            raise RuntimeError(
+                f"execution service is {self._shutdown_state.value}, "
+                f"not accepting new executions"
+            )
         if not request.task_id or not request.workspace_id or self.workspace_manager is None:
             raise PermissionError("managed process requires an active TaskWorkspace")
         if request.network_policy is not NetworkPolicy.NONE:
@@ -562,15 +581,26 @@ class ExecutionService:
         await asyncio.shield(self._shutdown_task)
 
     async def _run_shutdown(self) -> None:
-        """The actual shutdown sequence — runs exactly once."""
+        """The actual shutdown sequence — runs exactly once.
+
+        Round-14 review P0-3: CancelledError (BaseException in Python 3.11+)
+        is caught explicitly per step — the cancel is recorded, remaining
+        steps continue, and the cancel is re-raised AFTER all cleanup is
+        attempted.  This prevents a cancel from leaving the service in
+        CLOSING with supervisor/docker alive.
+        """
         self._shutdown_state = _ShutdownState.CLOSING
         errors: list[Exception] = []
+        cancel_requested = False
 
         # Each active execution is terminated independently — one failure
         # must not skip the rest.
         for execution_id in tuple(self._active):
             try:
                 await self.terminate(execution_id)
+            except asyncio.CancelledError:
+                cancel_requested = True
+                logger.debug("ExecutionService shutdown: terminate(%s) cancelled", execution_id)
             except Exception as exc:  # noqa: BLE001 — collect, don't abort
                 errors.append(exc)
                 logger.debug(
@@ -578,9 +608,21 @@ class ExecutionService:
                     execution_id, exc_info=True,
                 )
 
+        # Cancel any initializing tasks that haven't published to _active yet.
+        for init_task in tuple(self._initializing.values()):
+            init_task.cancel()
+        if self._initializing:
+            try:
+                await asyncio.gather(*self._initializing.values(), return_exceptions=True)
+            except Exception:  # noqa: BLE001
+                pass
+            self._initializing.clear()
+
         # Supervisor and Docker backend are always attempted.
         try:
             await self.process_supervisor.shutdown()
+        except asyncio.CancelledError:
+            cancel_requested = True
         except Exception as exc:  # noqa: BLE001
             errors.append(exc)
             logger.debug("ExecutionService shutdown: supervisor shutdown failed", exc_info=True)
@@ -588,6 +630,8 @@ class ExecutionService:
         if self.docker_backend is not None:
             try:
                 await self.docker_backend.shutdown()
+            except asyncio.CancelledError:
+                cancel_requested = True
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
                 logger.debug("ExecutionService shutdown: docker backend shutdown failed", exc_info=True)
@@ -600,3 +644,7 @@ class ExecutionService:
                 f"error(s): " + "; ".join(type(e).__name__ for e in errors)
             ) from errors[0]
         self._shutdown_state = _ShutdownState.CLOSED
+        # If cleanup completed but a cancellation was requested, re-raise the
+        # CancelledError so structured-concurrency semantics are preserved.
+        if cancel_requested:
+            raise asyncio.CancelledError()

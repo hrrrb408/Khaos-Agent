@@ -90,7 +90,7 @@ async def test_execution_service_shutdown_terminates_parent_child_and_grandchild
     assert all([await _eventually_dead(pid) for pid in pids])
     assert not handle._temporary_home.exists()
     await service.shutdown()  # idempotent
-    with pytest.raises(RuntimeError, match="shut down"):
+    with pytest.raises(RuntimeError, match="not accepting new executions"):
         await service.start_managed_process(
             ExecutionRequest((sys.executable, "-c", "pass"), workspace.worktree_path, task_id=workspace.task_id, workspace_id=workspace.id)
         )

@@ -63,6 +63,11 @@ class LspClient:
     async def start(self, root_uri: str) -> dict:
         if self._closed:
             return {"ok": False, "diagnostic": LspDiagnostic("closed", "LSP client is closed")}
+        # Round-14 review: reject duplicate start — previously the second
+        # call would overwrite _process and _reader_task, orphaning the
+        # first LSP process with no client-side reference.
+        if self._started:
+            return {"ok": False, "diagnostic": LspDiagnostic("already-started", "LSP client already started")}
         if not self.argv:
             return {"ok": False, "diagnostic": LspDiagnostic("empty-command", "LSP command is empty")}
         if self.trusted_argv != self.argv:
@@ -119,9 +124,11 @@ class LspClient:
         await _write_message(self._process, {"jsonrpc": "2.0", "method": method, "params": params})
 
     async def close(self) -> None:
+        # Round-14 review: do NOT set _closed=True before cleanup completes.
+        # If close() raises, a retry should be able to attempt cleanup again.
+        # Set _closed only in the finally AFTER cleanup is done.
         if self._closed:
             return
-        self._closed = True
         process = self._process
         try:
             if process is not None and process.returncode is None:
@@ -142,9 +149,14 @@ class LspClient:
                 await asyncio.gather(self._reader_task, return_exceptions=True)
             self._fail_pending(RuntimeError("LSP client closed"))
             if process is not None:
-                await self.execution_service.terminate(process.execution_id)
+                try:
+                    await self.execution_service.terminate(process.execution_id)
+                except Exception:  # noqa: BLE001 — terminate during close
+                    pass
             self._process = None
             self._reader_task = None
+            # Only mark closed after cleanup is attempted.
+            self._closed = True
 
     async def _request_during_close(self, method: str, params: dict) -> dict:
         process = self._process

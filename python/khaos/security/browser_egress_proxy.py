@@ -121,6 +121,11 @@ class BrowserEgressProxy:
         self._bind_host = bind_host
         self._active_connections = 0
         self._connection_semaphore = asyncio.Semaphore(max_concurrent)
+        # Round-14 review P0-8: track active relay tasks and client writers so
+        # close() can terminate in-flight connections, not just the listener.
+        self._client_tasks: set[asyncio.Task] = set()
+        self._client_writers: set[asyncio.StreamWriter] = set()
+        self._closing = False
         # C-07: random auth token — only the browser that receives this
         # token can use the proxy.  Other host processes that can reach
         # the bind address are rejected with 407.
@@ -146,19 +151,58 @@ class BrowserEgressProxy:
     async def start(self) -> None:
         if self._server is not None:
             return
+
+        # Round-14 review P0-8: wrap _handle_client so each connection's task
+        # and writer are tracked, enabling close() to terminate active relays.
+        async def _tracked_handler(
+            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+        ) -> None:
+            if self._closing:
+                writer.close()
+                return
+            self._client_writers.add(writer)
+            try:
+                await self._handle_client(reader, writer)
+            finally:
+                self._client_writers.discard(writer)
+
         self._server = await asyncio.start_server(
-            self._handle_client,
+            _tracked_handler,
             host=self._bind_host,
             port=0,
             limit=_MAX_HEADER_BYTES,
         )
 
     async def close(self) -> None:
+        """Close the listener AND terminate all active relay connections.
+
+        Round-14 review P0-8: previously close() only closed the listening
+        socket — existing relays kept running until idle/byte-limit timeout.
+        Now it sets an admission fence, closes the listener, closes all client
+        writers (which breaks the relay read loop), cancels handler tasks,
+        and bounded-awaits their completion so close() proves all relays
+        terminated before returning.
+        """
         if self._server is None:
             return
+        self._closing = True
         self._server.close()
         await self._server.wait_closed()
         self._server = None
+        # Close all client writers to break the relay read loops.
+        for w in tuple(self._client_writers):
+            try:
+                w.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._client_writers.clear()
+        # Cancel and bounded-await all handler tasks.
+        tasks = tuple(self._client_tasks)
+        for t in tasks:
+            t.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._client_tasks.clear()
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -334,6 +378,39 @@ class BrowserEgressProxy:
         )
         origin_target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         lines = header.decode("latin-1").split("\r\n")
+        # Round-14 review P0-6: validate that the client's Host header matches
+        # the authorized absolute target.  A compromised Chromium in the
+        # browser netns can craft a proxy request with an allowed target but
+        # a different Host header — if both domains share a CDN/IP, the
+        # upstream virtual host would serve the blocked domain.  Reject any
+        # mismatch (or duplicate Host headers) fail-closed.
+        expected_host = parsed.hostname.lower()
+        expected_port = parsed.port  # None if not explicit
+        host_headers = [
+            line for line in lines[1:]
+            if line.split(":", 1)[0].strip().lower() == "host"
+        ]
+        if len(host_headers) > 1:
+            raise ValueError("proxy rejected duplicate Host headers")
+        if host_headers:
+            client_host_value = host_headers[0].split(":", 1)[1].strip().lower()
+            # Strip the port from the client Host for hostname comparison.
+            client_hostname = client_host_value.rsplit(":", 1)[0] \
+                if ":" in client_host_value else client_host_value
+            if client_hostname != expected_host:
+                raise ValueError(
+                    f"proxy Host header ({client_hostname}) does not match "
+                    f"authorized target ({expected_host})"
+                )
+            # If the target had an explicit port, the Host port must match too.
+            if expected_port is not None:
+                client_port_str = client_host_value.rsplit(":", 1)[1] \
+                    if ":" in client_host_value else ""
+                if client_port_str and int(client_port_str) != expected_port:
+                    raise ValueError(
+                        f"proxy Host port ({client_port_str}) does not match "
+                        f"authorized target port ({expected_port})"
+                    )
         forwarded = [f"{method} {origin_target} {version}"]
         for line in lines[1:]:
             if not line:
