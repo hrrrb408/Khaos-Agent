@@ -11,8 +11,12 @@ permissions:
   contents: read
 
 concurrency:
-  group: security-closure-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Round-13 review High-2: a main push (merge) must NOT cancel a prior main
+  # push's evidence run — every exact main SHA needs its own evidence.  PR
+  # pushes CAN cancel prior attempts of the same PR (github.ref is the PR ref).
+  group: >-
+    security-closure-${{ github.event_name }}-${{ github.event_name == 'push' && github.sha || github.ref }}
+  cancel-in-progress: ${{ github.event_name != 'push' }}
 
 jobs:
   # Python Security Suite, Go Race, Rust Clippy, Browser Kernel Attack E2E.
@@ -38,6 +42,12 @@ jobs:
   # Supply Chain Audit.
   supply-chain:
     uses: ./.github/workflows/supply-chain-audit.yml
+
+  # Round-13 review CI-1: Pyright static type check as a Security Closure
+  # dependency (so it's a REAL required gate, not just a named workflow that
+  # the ruleset doesn't enforce).
+  type-check:
+    uses: ./.github/workflows/type-check.yml
 
   # Round-12 review CI-1: Product Integrity is a SEPARATE required gate (not a
   # dependency of Security Closure).  Running it inside Security Closure caused
@@ -98,6 +108,8 @@ jobs:
           python -m pytest \
             python/tests/coding/test_process_supervisor.py \
             python/tests/coding/test_managed_process_lifecycle.py \
+            python/tests/coding/test_managed_process_soak.py \
+            python/tests/coding/test_execution_service.py \
             python/tests/runtime/test_aclose.py \
             -q -v
           python scripts/build_security_closure_evidence.py test-fragment \
@@ -127,6 +139,7 @@ jobs:
       - playwright-security
       - docker-security
       - supply-chain
+      - type-check
       - closure-adversarial
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -139,12 +152,13 @@ jobs:
           PLAYWRIGHT_SECURITY: ${{ needs.playwright-security.result }}
           DOCKER_SECURITY: ${{ needs.docker-security.result }}
           SUPPLY_CHAIN: ${{ needs.supply-chain.result }}
+          TYPE_CHECK: ${{ needs.type-check.result }}
           CLOSURE_ADVERSARIAL: ${{ needs.closure-adversarial.result }}
         run: |
           for result in \
             "$CORE_SECURITY" "$STRICT_CONTRACTS" "$REAL_KERNEL" \
             "$PLAYWRIGHT_SECURITY" "$DOCKER_SECURITY" "$SUPPLY_CHAIN" \
-            "$CLOSURE_ADVERSARIAL"; do
+            "$TYPE_CHECK" "$CLOSURE_ADVERSARIAL"; do
             test "$result" = "success"
           done
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5

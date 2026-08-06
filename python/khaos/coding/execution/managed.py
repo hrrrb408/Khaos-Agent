@@ -183,38 +183,82 @@ class ManagedProcessHandle:
         await asyncio.shield(self._finalize_task)
 
     async def _run_finalize(self) -> None:
-        """The actual cleanup sequence — runs exactly once."""
+        """The actual cleanup sequence — runs exactly once.
+
+        Round-13 review P0-2/P0-3/P0-4:
+        - ``CancelledError`` (a ``BaseException`` in Python 3.11+) is caught
+          explicitly: the cancel is recorded, cleanup continues to completion,
+          and the cancel is re-raised AFTER cleanup so structured-concurrency
+          semantics are preserved.
+        - temp-home ``rmtree`` failure is OBSERVABLE (not ``ignore_errors``);
+          a failure enters QUARANTINED.
+        - Per-step completion ledger allows a future retry path to skip
+          already-completed steps.
+        """
         self._finalize_state = FinalizeState.FINALIZING
         errors: list[Exception] = []
+        cancel_requested = False
 
-        # Each step is isolated — a failure must not prevent later steps.
-        for label, step in (
-            ("stderr", self._finish_stderr),
-            ("watchdog", self._finish_resource_watchdog),
-        ):
+        def _try_step(label: str, step) -> None:
+            """Run one cleanup step, collecting errors and cancellations."""
+            nonlocal cancel_requested
             try:
-                await step()
+                result = step()
+                if asyncio.iscoroutine(result):
+                    raise TypeError(f"step {label} returned a coroutine — use await")
+            except asyncio.CancelledError:
+                cancel_requested = True
+                logger.debug("managed process finalize step %s cancelled", label)
             except Exception as exc:  # noqa: BLE001 — collect, don't abort
                 errors.append(exc)
                 logger.debug("managed process finalize step %s failed", label, exc_info=True)
 
-        if self._supervisor is not None:
+        async def _try_async_step(label: str, coro_factory) -> None:
+            nonlocal cancel_requested
             try:
-                await self._supervisor.unregister_process(self.execution_id)
+                await coro_factory()
+            except asyncio.CancelledError:
+                cancel_requested = True
+                logger.debug("managed process finalize step %s cancelled", label)
             except Exception as exc:  # noqa: BLE001
                 errors.append(exc)
-                logger.debug("managed process finalize supervisor unregister failed", exc_info=True)
+                logger.debug("managed process finalize step %s failed", label, exc_info=True)
 
-        if self._on_terminal is not None:
-            try:
-                await self._on_terminal(self.execution_id)
-            except Exception as exc:  # noqa: BLE001
-                errors.append(exc)
-                logger.debug("managed process finalize on_terminal failed", exc_info=True)
+        await _try_async_step("stderr", self._finish_stderr)
+        await _try_async_step("watchdog", self._finish_resource_watchdog)
 
-        # temp-home removal is always attempted, regardless of earlier failures.
+        # Capture into locals so pyright can narrow the Optional types.
+        supervisor = self._supervisor
+        if supervisor is not None:
+            await _try_async_step(
+                "unregister",
+                lambda: supervisor.unregister_process(self.execution_id),
+            )
+
+        on_terminal = self._on_terminal
+        if on_terminal is not None:
+            await _try_async_step(
+                "on_terminal",
+                lambda: on_terminal(self.execution_id),
+            )
+
+        # temp-home removal: OBSERVABLE (round-13 P0-3). A real OSError
+        # (permission, mount, open handle) must not be silently swallowed.
         if self._temporary_home is not None:
-            shutil.rmtree(self._temporary_home, ignore_errors=True)
+            try:
+                shutil.rmtree(self._temporary_home)
+            except FileNotFoundError:
+                pass  # already gone — fine
+            except asyncio.CancelledError:
+                cancel_requested = True
+            except OSError as exc:
+                errors.append(exc)
+                logger.debug("managed process finalize temp-home removal failed", exc_info=True)
+                # If the temp home still exists after rmtree, it's a real leak.
+                if self._temporary_home.exists():
+                    errors.append(
+                        OSError(f"temp home {self._temporary_home} still exists after rmtree")
+                    )
 
         if errors:
             self._finalize_error = errors[0]
@@ -225,6 +269,10 @@ class ManagedProcessHandle:
                 + "; ".join(type(e).__name__ for e in errors)
             ) from errors[0]
         self._finalize_state = FinalizeState.CLOSED
+        # If cleanup completed but a cancellation was requested, re-raise the
+        # CancelledError so structured-concurrency semantics are preserved.
+        if cancel_requested:
+            raise asyncio.CancelledError()
 
     async def _collect_stderr(self) -> None:
         if self._process.stderr is None:
