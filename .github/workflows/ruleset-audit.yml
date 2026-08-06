@@ -1,6 +1,7 @@
 name: GitHub Ruleset Audit
 
 on:
+  workflow_call:
   workflow_dispatch:
   schedule:
     - cron: "30 9 * * 1"
