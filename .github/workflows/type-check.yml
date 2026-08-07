@@ -45,8 +45,21 @@ jobs:
         # These files are known pyright-clean (zero errors).  Adding a file
         # here is a commitment to keep it clean; removing one requires a
         # documented reason.  As more modules reach zero errors, add them.
+        #
+        # Batch 15.7: extended scope to cover the execution-service entry
+        # point, the process supervisor (admission fence / shutdown state
+        # machine), the cleanup ledger, the LSP client, the browser egress
+        # proxy, the tool registry, and the approval broker.  These are all
+        # security-critical surfaces that previously had no static-type gate.
         run: |
           uv run pyright \
             python/khaos/runtime/authority.py \
             python/khaos/runtime/lifecycle.py \
-            python/khaos/coding/execution/managed.py
+            python/khaos/coding/execution/managed.py \
+            python/khaos/coding/execution/service.py \
+            python/khaos/coding/execution/supervisor.py \
+            python/khaos/coding/execution/cleanup_ledger.py \
+            python/khaos/coding/intelligence/lsp/client.py \
+            python/khaos/security/browser_egress_proxy.py \
+            python/khaos/tools/registry.py \
+            python/khaos/agent/approval.py

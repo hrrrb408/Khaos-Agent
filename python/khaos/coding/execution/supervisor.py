@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import os
 import signal
@@ -11,6 +12,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 from khaos.coding.execution.binding import (
@@ -26,6 +28,26 @@ from khaos.coding.workspace.storage import (
     capture_workspace_snapshot,
 )
 
+logger = logging.getLogger(__name__)
+
+
+class _SupervisorState(str, Enum):
+    """Round-15 review P0-B: ProcessSupervisor admission fence state machine.
+
+    Invariants:
+      CLOSED  ⇒ _active == ∅ AND future registration impossible
+      CLOSING ⇒ no new registrations accepted
+    """
+
+    OPEN = "open"
+    CLOSING = "closing"
+    CLOSED = "closed"
+    QUARANTINED = "quarantined"
+
+
+class SupervisorClosedError(RuntimeError):
+    """Raised when a registration is attempted after shutdown."""
+
 
 @dataclass
 class _ActiveProcess:
@@ -36,7 +58,15 @@ class _ActiveProcess:
 
 
 class ProcessSupervisor:
-    """Own process groups, bounded output, cancellation, and teardown."""
+    """Own process groups, bounded output, cancellation, and teardown.
+
+    Round-15 review P0-B: the supervisor now carries its own admission fence
+    (``_SupervisorState``) so that ``run()`` and ``register_process()``
+    reject new children once ``shutdown()`` has begun — even if a future
+    caller bypasses ``ExecutionService``.  Previously the supervisor only
+    snapshotted ``_active`` at shutdown time, so a process spawned *after*
+    the snapshot but *before* ``CLOSED`` would survive undetected.
+    """
 
     def __init__(
         self,
@@ -50,10 +80,16 @@ class ProcessSupervisor:
         self.storage_authority = storage_authority or WorkspaceStorageAuthority()
         self._active: dict[str, _ActiveProcess] = {}
         self._registry_lock = asyncio.Lock()
+        self._state = _SupervisorState.OPEN
 
     @property
     def active_execution_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._active))
+
+    @property
+    def is_closed(self) -> bool:
+        """True when the supervisor no longer accepts new children."""
+        return self._state is not _SupervisorState.OPEN
 
     async def run(
         self,
@@ -84,6 +120,14 @@ class ProcessSupervisor:
         execution_id = request.correlation_id
         if not execution_id:
             raise ValueError("supervised execution requires a correlation id")
+        # Round-15 review P0-B: admission fence — reject if the supervisor
+        # has begun shutdown.  This is the defence-in-depth that survives
+        # even if a future caller bypasses ExecutionService.
+        if self._state is not _SupervisorState.OPEN:
+            raise SupervisorClosedError(
+                f"ProcessSupervisor is {self._state.value}, "
+                f"not accepting new executions"
+            )
         watchdog_enabled = (
             enforce_resource_limits
             if enforce_resource_watchdog is None
@@ -111,23 +155,35 @@ class ProcessSupervisor:
                 expected_root_identity=request.workspace_root_identity,
                 expected_cwd_identity=request.workspace_cwd_identity,
             )
+        started = time.monotonic()
+        if use_native_launcher:
+            launch = build_process_launch(
+                request.argv,
+                cwd=cwd or request.cwd,
+                directory_binding=directory_binding,
+                budget=(
+                    request.permission_profile.resources
+                    if enforce_resource_limits
+                    else None
+                ),
+                enforce_resource_limits=enforce_resource_limits,
+                preserve_directory_fds=preserve_directory_fds,
+            )
+        else:
+            launch = None
+        # Round-15 review P0-B: re-check the admission fence immediately
+        # before spawn.  The check at the top guards against the common
+        # case; this one closes the window between the top-of-method check
+        # and the actual ``create_subprocess_exec`` (which may follow
+        # several awaits for workspace baseline / directory binding).
+        if self._state is not _SupervisorState.OPEN:
+            if directory_binding is not None:
+                directory_binding.close()
+            raise SupervisorClosedError(
+                f"ProcessSupervisor is {self._state.value}, "
+                f"not accepting new executions"
+            )
         try:
-            started = time.monotonic()
-            if use_native_launcher:
-                launch = build_process_launch(
-                    request.argv,
-                    cwd=cwd or request.cwd,
-                    directory_binding=directory_binding,
-                    budget=(
-                        request.permission_profile.resources
-                        if enforce_resource_limits
-                        else None
-                    ),
-                    enforce_resource_limits=enforce_resource_limits,
-                    preserve_directory_fds=preserve_directory_fds,
-                )
-            else:
-                launch = None
             process = await asyncio.create_subprocess_exec(
                 *(launch.argv if launch is not None else request.argv),
                 cwd=(
@@ -144,10 +200,19 @@ class ProcessSupervisor:
                 pass_fds=(launch.pass_fds if launch is not None else ()),
             )
         finally:
+            # ``finally`` (not ``except``) so ``CancelledError`` — a
+            # ``BaseException`` — still closes the directory binding.
             if directory_binding is not None:
                 directory_binding.close()
         active = _ActiveProcess(process)
-        await self._register(execution_id, active)
+        try:
+            await self._register(execution_id, active)
+        except BaseException:
+            # Round-15 review P0-2: spawn committed but registration
+            # failed (supervisor closed during spawn, or duplicate id).
+            # Kill the just-spawned process group so we don't leak it.
+            await _kill_orphaned_process(process)
+            raise
         storage_roots = _storage_roots(
             process.pid, tmp_root, sandbox_storage_paths
         )
@@ -307,9 +372,26 @@ class ProcessSupervisor:
         tmp_root: Path | None = None,
         sandbox_storage_paths: tuple[str, ...] = (),
     ) -> asyncio.Task[dict | None] | None:
-        """Register and resource-watch a managed stdio process."""
+        """Register and resource-watch a managed stdio process.
+
+        Round-15 review P0-B: rejects registration after shutdown has begun.
+        If registration fails for ANY reason (supervisor closed, duplicate
+        id), the just-spawned process is killed so the caller doesn't leak it.
+        """
+        if self._state is not _SupervisorState.OPEN:
+            await _kill_orphaned_process(process)
+            raise SupervisorClosedError(
+                f"ProcessSupervisor is {self._state.value}, "
+                f"not accepting new registrations"
+            )
         active = _ActiveProcess(process)
-        await self._register(execution_id, active)
+        try:
+            await self._register(execution_id, active)
+        except BaseException:
+            # Round-15 review P0-2: spawn committed but registration
+            # failed — kill the process group so we don't leak it.
+            await _kill_orphaned_process(process)
+            raise
         if budget is not None:
             storage_roots = _storage_roots(
                 process.pid, tmp_root, sandbox_storage_paths
@@ -343,15 +425,60 @@ class ProcessSupervisor:
         return True
 
     async def shutdown(self) -> None:
+        """Round-15 review P0-B: shutdown now uses a state machine.
+
+        ``OPEN → CLOSING`` (rejects all new registrations) → terminate every
+        active child → ``CLOSED``.  A registration that races with shutdown
+        is rejected at the fence instead of silently being added after the
+        snapshot.  If any terminate raises, the supervisor enters
+        ``QUARANTINED`` (not ``CLOSED``) so callers can detect the partial
+        teardown.
+        """
+        if self._state is _SupervisorState.CLOSED:
+            return
+        if self._state is _SupervisorState.QUARANTINED:
+            raise SupervisorClosedError(
+                "ProcessSupervisor already quarantined; resources may be live"
+            )
+        self._state = _SupervisorState.CLOSING
+        errors: list[Exception] = []
+        cancel_requested = False
         for execution_id in self.active_execution_ids:
-            await self.terminate(execution_id)
+            try:
+                await self.terminate(execution_id)
+            except asyncio.CancelledError:
+                cancel_requested = True
+                logger.debug(
+                    "ProcessSupervisor shutdown: terminate(%s) cancelled",
+                    execution_id,
+                )
+            except Exception as exc:  # noqa: BLE001 — collect, don't abort
+                errors.append(exc)
+                logger.debug(
+                    "ProcessSupervisor shutdown: terminate(%s) failed",
+                    execution_id, exc_info=True,
+                )
+        if errors:
+            self._state = _SupervisorState.QUARANTINED
+            raise SupervisorClosedError(
+                f"ProcessSupervisor shutdown completed with "
+                f"{len(errors)} error(s): "
+                + "; ".join(type(e).__name__ for e in errors)
+            ) from errors[0]
+        self._state = _SupervisorState.CLOSED
+        if cancel_requested:
+            raise asyncio.CancelledError()
 
     async def _register(
         self, execution_id: str, active: _ActiveProcess
     ) -> None:
         async with self._registry_lock:
+            if self._state is not _SupervisorState.OPEN:
+                raise SupervisorClosedError(
+                    f"ProcessSupervisor is {self._state.value}, "
+                    f"cannot register execution {execution_id}"
+                )
             if execution_id in self._active:
-                await self._terminate_active(active)
                 raise RuntimeError(f"execution id is already active: {execution_id}")
             self._active[execution_id] = active
 
@@ -421,6 +548,22 @@ def _signal_process_group(
         process.kill()
     else:
         process.terminate()
+
+
+async def _kill_orphaned_process(process: asyncio.subprocess.Process) -> None:
+    """Round-15 review P0-2: best-effort kill+wait for a process whose
+    ownership publication failed.  Swallows all errors — this is cleanup
+    of a half-spawned child that the caller is about to abandon."""
+    if process.returncode is not None:
+        return
+    try:
+        _signal_process_group(process, signal.SIGKILL, force=True)
+    except BaseException:  # noqa: BLE001 — best-effort
+        return
+    try:
+        await asyncio.wait_for(process.wait(), timeout=2.0)
+    except BaseException:  # noqa: BLE001 — best-effort
+        pass
 
 
 def _resource_limit_diagnostics(budget) -> dict[str, object]:

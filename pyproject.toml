@@ -62,6 +62,11 @@ khaos = "khaos.cli.main:main"
 asyncio_mode = "auto"
 pythonpath = ["python"]
 testpaths = ["python/tests"]
+# Exclude the khaos source tree from test collection.  Source modules like
+# ``khaos/tools/test_tools.py`` implement Agent-facing tools (e.g. ``test_run``)
+# and are not pytest tests, but their ``test_`` prefix would otherwise cause
+# pytest to collect them as test functions when invoked from ``python/``.
+norecursedirs = [".git", ".venv", "node_modules", "khaos", "rust", "go"]
 markers = [
     "security_contract: cross-platform security contract without a real OS sandbox",
     "platform_sandbox_real: requires a real OS-enforced platform sandbox",
@@ -97,8 +102,26 @@ include = ["python/khaos"]
 exclude = ["**/__pycache__", "**/.venv", "python/tests"]
 pythonVersion = "3.11"
 
+# Batch 15.7 (review §二十八): per-module strict overrides.
+#
+# Previously these used ``[tool.pyright.overrides.python.khaos.*]`` (nested
+# TOML tables) which pyright does NOT recognise — it emitted
+# ``Config contains unrecognized setting "overrides"`` and silently fell
+# back to ``basic`` for every module, so the "strict" gate was never
+# actually enforced.  The correct format is an array-of-tables
+# (``[[tool.pyright.overrides]]``) with a ``module`` key whose value is a
+# Python import path (``khaos.*``, NOT ``python.khaos.*`` — ``package-dir``
+# maps ``python/`` to the import root).
+#
+# Modules below are the security-critical surface from review §二十八:
+#   execution/service.py, execution/supervisor.py, lsp/client.py,
+#   browser_egress_proxy.py, browser_tools.py, tools/scheduler.py,
+#   tools/registry.py, agent/approval.py, grpc_server.py
+# ``browser_egress_proxy.py`` is covered by the ``khaos.security`` override.
+
 # Security-critical modules: strict (full type safety).
-[tool.pyright.overrides.python.khaos.runtime]
+[[tool.pyright.overrides]]
+module = "khaos.runtime"
 reportUnknownMemberType = "error"
 reportUnknownArgumentType = "error"
 reportUnknownVariableType = "error"
@@ -107,14 +130,57 @@ reportMissingParameterType = "error"
 reportMissingTypeArgument = "error"
 reportAny = "error"
 
-[tool.pyright.overrides.python.khaos.security]
+[[tool.pyright.overrides]]
+module = "khaos.security"
 reportUnknownMemberType = "error"
 reportUnknownArgumentType = "error"
 reportUnknownVariableType = "error"
 reportUnknownParameterType = "error"
 reportMissingParameterType = "error"
 
-[tool.pyright.overrides.python.khaos.permissions]
+[[tool.pyright.overrides]]
+module = "khaos.permissions"
+reportUnknownMemberType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"
+
+[[tool.pyright.overrides]]
+module = "khaos.coding.execution"
+reportUnknownMemberType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"
+reportMissingTypeArgument = "error"
+
+[[tool.pyright.overrides]]
+module = "khaos.coding.intelligence.lsp"
+reportUnknownMemberType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"
+
+[[tool.pyright.overrides]]
+module = "khaos.tools"
+reportUnknownMemberType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"
+
+[[tool.pyright.overrides]]
+module = "khaos.agent"
+reportUnknownMemberType = "error"
+reportUnknownArgumentType = "error"
+reportUnknownVariableType = "error"
+reportUnknownParameterType = "error"
+reportMissingParameterType = "error"
+
+[[tool.pyright.overrides]]
+module = "khaos.grpc_server"
 reportUnknownMemberType = "error"
 reportUnknownArgumentType = "error"
 reportUnknownVariableType = "error"

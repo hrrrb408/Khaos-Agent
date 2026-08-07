@@ -6,7 +6,7 @@ import hashlib
 import json
 import os
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
@@ -222,9 +222,30 @@ _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
 }
 
 
+# Batch 15.6 (round-15 review §三十一–§三十四): the set of ToolDefinition
+# fields that constitute the *security contract*.  After ``register()`` calls
+# ``freeze()``, these fields cannot be mutated — the tool's security
+# semantics are immutable for the lifetime of the registry.  ``handler`` is
+# intentionally excluded: it is runtime wiring, not a security property.
+_SECURITY_FIELDS: frozenset[str] = frozenset({
+    "name", "parameters", "modes", "permission_level",
+    "parallel", "timeout", "capabilities", "resource_resolver",
+    "effect_status", "reconciliation_hint",
+})
+
+
 @dataclass
 class ToolDefinition:
-    """Declarative tool definition."""
+    """Declarative tool definition.
+
+    Batch 15.6: security-relevant fields (see ``_SECURITY_FIELDS``) are
+    frozen after :meth:`freeze` is called (typically at the end of
+    :meth:`ToolRegistry.register`).  The ``handler`` field remains mutable
+    so ``create_runtime_registry`` can wire up runtime callables after
+    registration.  The :attr:`security_digest` property covers ALL security
+    fields and is cached at freeze time so post-registration mutations are
+    both prevented (``__setattr__``) and detectable (digest mismatch).
+    """
 
     name: str
     description: str
@@ -238,13 +259,102 @@ class ToolDefinition:
     resource_resolver: ResourceResolver | None = None
     effect_status: str = ""
     reconciliation_hint: str = ""
+    # Batch 15.6: internal freeze state — not part of the public contract.
+    _frozen: bool = field(default=False, repr=False, compare=False)
+    _security_digest: str | None = field(default=None, repr=False, compare=False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        # Allow internal fields (starting with ``_``) and non-security fields
+        # (notably ``handler``) to be set freely.  Security fields are
+        # rejected once ``_frozen`` is True.  During ``__init__`` the
+        # ``_frozen`` attribute may not exist yet, so ``getattr`` with a
+        # default is used.
+        if (
+            not name.startswith("_")
+            and getattr(self, "_frozen", False)
+            and name in _SECURITY_FIELDS
+        ):
+            raise PermissionError(
+                f"cannot mutate frozen security field '{name}' after "
+                f"registration; the tool security contract is immutable"
+            )
+        object.__setattr__(self, name, value)
+
+    def freeze(self) -> None:
+        """Freeze security fields and cache the security digest.
+
+        Called by :meth:`ToolRegistry.register` after all register-time
+        mutations (effect_status, capabilities, resource_resolver,
+        parameters) are complete.  After this call, any attempt to set a
+        security field raises :class:`PermissionError`.  The
+        :attr:`security_digest` is cached so subsequent reads are O(1)
+        and reflect the frozen snapshot.
+        """
+        if self._frozen:
+            return
+        object.__setattr__(self, "_security_digest", self._compute_security_digest())
+        object.__setattr__(self, "_frozen", True)
 
     @property
     def schema_digest(self) -> str:
-        """Stable digest of the model-visible tool contract."""
+        """Stable digest of the model-visible tool contract (name + parameters).
+
+        Kept for backward compatibility with the Go Gateway ``/api/tools``
+        handshake and existing approval bindings.  For the full security
+        contract digest, use :attr:`security_digest`.
+        """
         payload = {
             "name": self.name,
             "parameters": self.parameters,
+        }
+        encoded = json.dumps(
+            payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8")
+        return hashlib.sha256(encoded).hexdigest()
+
+    @property
+    def security_digest(self) -> str:
+        """Stable digest of the COMPLETE tool security contract.
+
+        Batch 15.6: unlike :attr:`schema_digest` (which covers only
+        ``name`` + ``parameters``), this digest covers ALL
+        security-relevant fields: capabilities, permission_level,
+        resource_resolver, effect_status, modes, parallel, timeout, and
+        reconciliation_hint.  If the definition has been frozen, the
+        cached value is returned; otherwise the digest is computed live
+        (for pre-registration inspection).
+        """
+        if self._security_digest is not None:
+            return self._security_digest
+        return self._compute_security_digest()
+
+    def _compute_security_digest(self) -> str:
+        """Compute the security digest over all security-relevant fields."""
+        resolver_id = ""
+        if self.resource_resolver is not None:
+            resolver_id = (
+                getattr(self.resource_resolver, "__qualname__", "")
+                or getattr(self.resource_resolver, "__name__", "")
+                or repr(self.resource_resolver)
+            )
+        payload = {
+            "name": self.name,
+            "parameters": self.parameters,
+            "modes": sorted(self.modes),
+            "permission_level": self.permission_level,
+            "parallel": self.parallel,
+            "timeout": self.timeout,
+            "capabilities": [
+                {
+                    "name": str(cap.name),
+                    "modes": sorted(cap.modes),
+                    "scopes": sorted(cap.scopes),
+                }
+                for cap in self.capabilities
+            ],
+            "resource_resolver": resolver_id,
+            "effect_status": self.effect_status,
+            "reconciliation_hint": self.reconciliation_hint,
         }
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -308,6 +418,13 @@ class ToolRegistry:
             definition.parameters = tool_schema.production_schema(
                 definition.parameters
             )
+        # Batch 15.6: freeze security fields and cache the security digest
+        # AFTER all register-time mutations are complete.  Subsequent
+        # attempts to mutate security fields (name, parameters, modes,
+        # permission_level, parallel, timeout, capabilities,
+        # resource_resolver, effect_status, reconciliation_hint) raise
+        # PermissionError.  ``handler`` remains mutable for runtime wiring.
+        definition.freeze()
         self._tools[definition.name] = definition
 
     def get(self, name: str) -> ToolDefinition:
@@ -360,6 +477,11 @@ class ToolRegistry:
                 "modes": list(tool.modes),
                 "permission_level": tool.permission_level,
                 "schema_digest": tool.schema_digest,
+                # Batch 15.6: export the full security contract digest so
+                # the Gateway can detect drift on security-relevant fields
+                # (capabilities, resource_resolver, effect_status, etc.)
+                # that schema_digest (name + parameters only) does not cover.
+                "security_digest": tool.security_digest,
             }
             for tool in sorted(self._tools.values(), key=lambda t: t.name)
         ]

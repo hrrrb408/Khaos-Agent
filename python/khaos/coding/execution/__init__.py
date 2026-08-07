@@ -19,6 +19,6 @@ from khaos.coding.execution.platform import (
     UnsupportedBackend,
 )
 from khaos.coding.execution.service import ExecutionService
-from khaos.coding.execution.supervisor import ProcessSupervisor
+from khaos.coding.execution.supervisor import ProcessSupervisor, SupervisorClosedError
 
-__all__ = ["BackendSelector", "DockerBackend", "ExecutionRequest", "ExecutionResult", "ExecutionService", "FileSystemAccess", "HostExecutionBackend", "LinuxBubblewrapBackend", "MacOSSandboxBackend", "ManagedProcessHandle", "NetworkPolicy", "PermissionProfile", "ProcessSupervisor", "ResolvedExecutionContext", "ResourceBudget", "UnsupportedBackend"]
+__all__ = ["BackendSelector", "DockerBackend", "ExecutionRequest", "ExecutionResult", "ExecutionService", "FileSystemAccess", "HostExecutionBackend", "LinuxBubblewrapBackend", "MacOSSandboxBackend", "ManagedProcessHandle", "NetworkPolicy", "PermissionProfile", "ProcessSupervisor", "ResolvedExecutionContext", "ResourceBudget", "SupervisorClosedError", "UnsupportedBackend"]

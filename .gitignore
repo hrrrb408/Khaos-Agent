@@ -28,3 +28,8 @@ target/
 .idea/
 .vscode/
 *.swp
+
+# Local-only review notes and IDE scratch files
+review/
+.zcode/
+large

@@ -106,8 +106,10 @@ def test_queries_are_packaged_resources_only() -> None:
     for spec in GRAMMARS.values():
         for name in ("symbols.scm", "imports.scm", "calls.scm", "references.scm"):
             assert root.joinpath(spec.query_resource_path, name).is_file()
-    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
-    assert '"khaos.coding.intelligence" = ["queries/**/*.scm"]' in pyproject
+    # Anchor pyproject.toml to the project root (parents[3] = repo root
+    # from python/tests/coding/test_tree_sitter_real.py) so the test is CWD-independent.
+    pyproject = Path(__file__).resolve().parents[3] / "pyproject.toml"
+    assert '"khaos.coding.intelligence" = ["queries/**/*.scm"]' in pyproject.read_text(encoding="utf-8")
 
 
 def test_loader_missing_version_abi_and_query_failures_are_structured(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -25,6 +25,8 @@ from collections.abc import Awaitable, Callable
 from enum import Enum
 from pathlib import Path
 
+from khaos.coding.execution.cleanup_ledger import CleanupLedger
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,6 +82,13 @@ class ManagedProcessHandle:
         self._finalize_task: asyncio.Task[None] | None = None
         self._finalize_state: FinalizeState = FinalizeState.OPEN
         self._finalize_error: BaseException | None = None
+        # Batch 15.3 (round-15 review §十): per-step completion ledger so a
+        # QUARANTINED finalize is retryable.  Previously a second
+        # ``aclose()`` re-raised the original error without retrying the
+        # remaining steps (stderr drain / supervisor unregister /
+        # on_terminal / temp-home removal).  The ledger records which
+        # steps completed so a retry only runs the incomplete ones.
+        self._cleanup_ledger = CleanupLedger()
 
     @property
     def returncode(self) -> int | None:
@@ -153,14 +162,21 @@ class ManagedProcessHandle:
         or the same typed error).  A partial finalize transitions to
         QUARANTINED and every subsequent call re-raises — no second caller
         can see a false success.
+
+        Batch 15.3 (round-15 review §十): QUARANTINED is now retryable.
+        A second ``aclose()`` after a partial failure uses the
+        ``CleanupLedger`` to skip already-completed steps and only retries
+        the failed ones.  Previously a second call re-raised the original
+        error without attempting any remaining cleanup.
         """
         if self._finalize_state is FinalizeState.CLOSED:
             return
-        if self._finalize_state is FinalizeState.QUARANTINED:
-            raise ManagedProcessFinalizeError(
-                f"managed process {self.execution_id} was already partially "
-                f"finalized with errors; resources may not be fully released"
-            ) from self._finalize_error
+        # Reuse an in-flight finalize task so concurrent callers observe
+        # the same result.  A completed (failed) task is NOT reused —
+        # QUARANTINED is retryable.
+        if self._finalize_task is not None and not self._finalize_task.done():
+            await asyncio.shield(self._finalize_task)
+            return
         try:
             await self.terminate()
             try:
@@ -172,24 +188,26 @@ class ManagedProcessHandle:
             await self._finalize_once()
 
     async def _finalize_once(self) -> None:
-        """Run the cleanup sequence exactly once via a shared task.
+        """Run the cleanup sequence via a shared task.
 
         Round-12 review P1-1: the FIRST caller creates ``_finalize_task``;
-        every concurrent or later caller awaits the SAME task.  Each cleanup
-        step runs independently (a failure in one does not skip later steps).
+        every concurrent caller awaits the SAME task.  Each cleanup step
+        runs independently (a failure in one does not skip later steps).
         Partial failure → QUARANTINED + typed error; full success → CLOSED.
-        temp-home removal always runs (it is ignore_errors=True).
+
+        Batch 15.3: a completed (failed) task is not reused — a new task
+        is created to retry the incomplete steps via the ledger.
         """
-        if self._finalize_task is not None:
-            # A finalize is already in flight (or completed) — await the SAME
-            # task so we observe the identical result.
+        if self._finalize_task is not None and not self._finalize_task.done():
+            # A finalize is already in flight — await the SAME task so we
+            # observe the identical result.
             await asyncio.shield(self._finalize_task)
             return
         self._finalize_task = asyncio.ensure_future(self._run_finalize())
         await asyncio.shield(self._finalize_task)
 
     async def _run_finalize(self) -> None:
-        """The actual cleanup sequence — runs exactly once.
+        """The actual cleanup sequence — may run multiple times via retry.
 
         Round-13 review P0-2/P0-3/P0-4:
         - ``CancelledError`` (a ``BaseException`` in Python 3.11+) is caught
@@ -198,31 +216,23 @@ class ManagedProcessHandle:
           semantics are preserved.
         - temp-home ``rmtree`` failure is OBSERVABLE (not ``ignore_errors``);
           a failure enters QUARANTINED.
-        - Per-step completion ledger allows a future retry path to skip
-          already-completed steps.
+
+        Batch 15.3: the ``CleanupLedger`` records each completed step so a
+        retry (after QUARANTINED) skips them.  This converts QUARANTINED
+        from a permanent failure into a retained resource owner that can
+        make forward progress on retry.
         """
         self._finalize_state = FinalizeState.FINALIZING
-        errors: list[Exception] = []
+        self._cleanup_ledger.reset_errors()
         cancel_requested = False
-
-        def _try_step(label: str, step) -> None:
-            """Run one cleanup step, collecting errors and cancellations."""
-            nonlocal cancel_requested
-            try:
-                result = step()
-                if asyncio.iscoroutine(result):
-                    raise TypeError(f"step {label} returned a coroutine — use await")
-            except asyncio.CancelledError:
-                cancel_requested = True
-                logger.debug("managed process finalize step %s cancelled", label)
-            except Exception as exc:  # noqa: BLE001 — collect, don't abort
-                errors.append(exc)
-                logger.debug("managed process finalize step %s failed", label, exc_info=True)
 
         async def _try_async_step(label: str, coro_factory) -> None:
             nonlocal cancel_requested
+            if self._cleanup_ledger.is_done(label):
+                return
             try:
                 await coro_factory()
+                self._cleanup_ledger.mark_done(label)
             except asyncio.CancelledError:
                 cancel_requested = True
                 # Round-14 review P0-5: a cancelled step did NOT complete —
@@ -230,10 +240,12 @@ class ManagedProcessHandle:
                 # (not CLOSED).  Without this, a cancelled unregister/on_terminal
                 # would leave the supervisor/active-entry alive while the
                 # handle reported CLOSED.
-                errors.append(RuntimeError(f"step {label} was cancelled (incomplete)"))
+                self._cleanup_ledger.record_error(
+                    label, RuntimeError(f"step {label} was cancelled (incomplete)"),
+                )
                 logger.debug("managed process finalize step %s cancelled (incomplete)", label)
             except Exception as exc:  # noqa: BLE001
-                errors.append(exc)
+                self._cleanup_ledger.record_error(label, exc)
                 logger.debug("managed process finalize step %s failed", label, exc_info=True)
 
         await _try_async_step("stderr", self._finish_stderr)
@@ -256,22 +268,25 @@ class ManagedProcessHandle:
 
         # temp-home removal: OBSERVABLE (round-13 P0-3). A real OSError
         # (permission, mount, open handle) must not be silently swallowed.
-        if self._temporary_home is not None:
+        if self._temporary_home is not None and not self._cleanup_ledger.is_done("temp_home"):
             try:
                 shutil.rmtree(self._temporary_home)
+                self._cleanup_ledger.mark_done("temp_home")
             except FileNotFoundError:
-                pass  # already gone — fine
+                self._cleanup_ledger.mark_done("temp_home")  # already gone — fine
             except asyncio.CancelledError:
                 cancel_requested = True
             except OSError as exc:
-                errors.append(exc)
+                self._cleanup_ledger.record_error("temp_home", exc)
                 logger.debug("managed process finalize temp-home removal failed", exc_info=True)
                 # If the temp home still exists after rmtree, it's a real leak.
                 if self._temporary_home.exists():
-                    errors.append(
-                        OSError(f"temp home {self._temporary_home} still exists after rmtree")
+                    self._cleanup_ledger.record_error(
+                        "temp_home",
+                        OSError(f"temp home {self._temporary_home} still exists after rmtree"),
                     )
 
+        errors = self._cleanup_ledger.errors
         if errors:
             self._finalize_error = errors[0]
             self._finalize_state = FinalizeState.QUARANTINED
