@@ -11,6 +11,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from khaos.coding.workspace.manager import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +57,7 @@ class ExecutionService:
     def __init__(
         self,
         backend=None,
-        workspace_manager=None,
+        workspace_manager: WorkspaceManager | None = None,
         docker_backend=None,
         managed_process_factory=None,
         backend_selector=None,
@@ -259,6 +263,8 @@ class ExecutionService:
                 workspace_root_identity=root_identity,
                 workspace_cwd_identity=cwd_identity,
             )
+            assert request.task_id is not None
+            assert request.workspace_id is not None
             resolved_context = ResolvedExecutionContext(
                 request.task_id, request.workspace_id, workspace.state.value,
                 repository_root, root, cwd,
@@ -349,6 +355,7 @@ class ExecutionService:
         self, workspace_id: str
     ) -> None:
         """Never return from execution after linked-worktree metadata drift."""
+        assert self.workspace_manager is not None
         try:
             await self.workspace_manager.verify_git_identity(workspace_id)
         except Exception as exc:
@@ -361,6 +368,7 @@ class ExecutionService:
         self, context: ResolvedExecutionContext
     ) -> None:
         """Account a cancelled process after its tree has been terminated."""
+        assert self.workspace_manager is not None
         authority = getattr(self.workspace_manager, "storage_authority", None)
         workspace = self.workspace_manager.get(context.workspace_id)
         limits = getattr(workspace, "storage_limits", None)
@@ -379,6 +387,7 @@ class ExecutionService:
     async def _cleanup_workspace_on_storage_violation(
         self, workspace_id: str, result: ExecutionResult
     ) -> None:
+        assert self.workspace_manager is not None
         violation = result.diagnostics.get("resource_violation")
         if not isinstance(violation, dict) or violation.get("kind") not in {
             "workspace-bytes",
@@ -425,7 +434,7 @@ class ExecutionService:
         if isinstance(backend, ManagedProcessHandle):
             await backend.aclose()
         else:
-            await backend.terminate(execution_id)
+            await cast("Any", backend).terminate(execution_id)
         self._active.pop(execution_id, None)
 
     async def start_managed_process(self, request: ExecutionRequest) -> ManagedProcessHandle:
@@ -669,6 +678,7 @@ class ExecutionService:
         backend,
         temporary_home: Path,
     ) -> tuple[str, ...]:
+        assert context.permission_profile is not None
         backend_name = backend.__class__.__name__
         if backend_name == "MacOSSandboxBackend":
             sandbox_profile = backend.profile(
@@ -695,7 +705,7 @@ class ExecutionService:
                 writable=False,
                 unreadable_roots=context.permission_profile.unreadable_roots,
                 synthetic_home=temporary_home,
-                resources=context.resources,
+                resources=context.budget,
                 command=context.argv,
                 environment=context.environment,
             )

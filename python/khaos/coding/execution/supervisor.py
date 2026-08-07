@@ -14,6 +14,7 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from typing import Any
 
 from khaos.coding.execution.binding import (
     ExecutionDirectoryBinding,
@@ -139,6 +140,7 @@ class ProcessSupervisor:
             )
         if workspace_baseline is not None and not workspace_baseline.complete:
             raise PermissionError("TaskWorkspace storage baseline is incomplete")
+        assert request.permission_profile is not None
         if workspace_limits is None:
             workspace_limits = WorkspaceStorageLimits(
                 request.permission_profile.resources.workspace_bytes,
@@ -265,7 +267,7 @@ class ProcessSupervisor:
                     deadline_task = asyncio.create_task(
                         asyncio.sleep(timeout_seconds)
                     )
-                wait_set = {process_wait_task}
+                wait_set: set[asyncio.Task[Any]] = {process_wait_task}
                 if deadline_task is not None:
                     wait_set.add(deadline_task)
                 done, _pending = await asyncio.wait(
@@ -322,7 +324,7 @@ class ProcessSupervisor:
             # path so no pending task outlives run().  This closes the
             # leak where a cancelled long-timeout run left the deadline
             # sleeper alive until its original deadline.
-            pending_tasks = [t for t in (process_wait_task, deadline_task) if t is not None]
+            pending_tasks: list[asyncio.Task[Any]] = [t for t in (process_wait_task, deadline_task) if t is not None]
             for t in pending_tasks:
                 if not t.done():
                     t.cancel()

@@ -150,7 +150,7 @@ class BrowserEgressProxy:
         bind_host: str = "127.0.0.1",
     ) -> None:
         self._guard = guard
-        self._server: asyncio.AbstractServer | None = None
+        self._server: asyncio.Server | None = None
         self._max_concurrent = max_concurrent
         self._idle_timeout = idle_timeout
         self._max_upload = max_upload
