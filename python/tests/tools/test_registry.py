@@ -242,3 +242,124 @@ def test_gateway_view_schema_digest_matches_tool_definition():
     for entry in view:
         tool = registry.get(entry["name"])
         assert entry["schema_digest"] == tool.schema_digest
+
+
+# ---------------------------------------------------------------------------
+# Batch 15.6: Typed Security Contracts (frozen ToolDefinition + security_digest)
+# ---------------------------------------------------------------------------
+
+
+def test_security_fields_are_frozen_after_registration():
+    """Batch 15.6: after register() calls freeze(), mutating any security
+    field raises PermissionError.  The tool's security contract is
+    immutable for the lifetime of the registry."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+
+    security_fields = [
+        "name", "parameters", "modes", "permission_level",
+        "parallel", "timeout", "capabilities", "resource_resolver",
+        "effect_status", "reconciliation_hint",
+    ]
+    for field_name in security_fields:
+        # Use a sentinel value — the type doesn't matter, only that
+        # setattr is rejected before it reaches object.__setattr__.
+        with pytest.raises(PermissionError, match="frozen security field"):
+            setattr(tool, field_name, None)
+
+
+def test_handler_remains_mutable_after_registration():
+    """Batch 15.6: ``handler`` is runtime wiring, NOT a security field.
+    It must remain mutable after freeze() so create_runtime_registry()
+    can wire up callables post-registration."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+
+    def new_handler(**kwargs):
+        return {"ok": True}
+
+    # This must NOT raise — handler is excluded from _SECURITY_FIELDS.
+    tool.handler = new_handler
+    assert tool.handler is new_handler
+
+
+def test_security_digest_covers_more_than_schema_digest():
+    """Batch 15.6: security_digest covers ALL security-relevant fields
+    (capabilities, permission_level, modes, etc.), not just name +
+    parameters.  Two tools with the same name+parameters but different
+    capabilities must have different security_digests."""
+    from khaos.tools.registry import ToolDefinition, ToolRegistry
+    from khaos.permissions.resource import resolve_single_workspace_path
+
+    cap_a = ToolCapability("filesystem.read", frozenset({"all"}), frozenset({"task-workspace"}))
+    cap_b = ToolCapability("filesystem.write", frozenset({"all"}), frozenset({"task-workspace"}))
+
+    def make_tool(caps):
+        return ToolDefinition(
+            name="test_tool",
+            description="test",
+            parameters={"type": "object", "properties": {}},
+            modes=["coding"],
+            permission_level="read",
+            parallel=True,
+            capabilities=caps,
+        )
+
+    reg_a = ToolRegistry(enforce_capabilities=False)
+    reg_a.register(make_tool((cap_a,)))
+    reg_b = ToolRegistry(enforce_capabilities=False)
+    reg_b.register(make_tool((cap_b,)))
+
+    tool_a = reg_a.get("test_tool")
+    tool_b = reg_b.get("test_tool")
+
+    # schema_digest is the same (name + parameters are identical)
+    assert tool_a.schema_digest == tool_b.schema_digest
+    # security_digest differs (capabilities differ)
+    assert tool_a.security_digest != tool_b.security_digest
+
+
+def test_security_digest_is_stable_across_instances():
+    """Batch 15.6: security_digest is deterministic — two fresh registry
+    instances produce the same digest for every tool."""
+    left = create_builtin_registry()
+    right = create_builtin_registry()
+    for tool in left._tools.values():
+        assert tool.security_digest == right.get(tool.name).security_digest
+
+
+def test_security_digest_differs_from_schema_digest():
+    """Batch 15.6: security_digest and schema_digest are different
+    values because security_digest covers a broader set of fields."""
+    registry = create_builtin_registry()
+    for tool in registry._tools.values():
+        # They COULD theoretically collide if the extra fields hash to
+        # the same value, but in practice they never will because the
+        # payload structure is different.
+        assert tool.security_digest != tool.schema_digest, (
+            f"{tool.name}: security_digest should differ from schema_digest"
+        )
+
+
+def test_gateway_view_exports_security_digest():
+    """Batch 15.6: gateway_view() exports security_digest alongside
+    schema_digest so the Go Gateway can detect full security contract
+    drift, not just model-schema drift."""
+    registry = create_runtime_registry()
+    view = registry.gateway_view()
+    for entry in view:
+        assert "security_digest" in entry
+        assert entry["security_digest"]  # non-empty
+        tool = registry.get(entry["name"])
+        assert entry["security_digest"] == tool.security_digest
+
+
+def test_prune_shares_frozen_definitions():
+    """Batch 15.6: prune() shares the same frozen ToolDefinition
+    reference — mutations via the pruned registry are also prevented."""
+    registry = create_builtin_registry()
+    pruned = registry.prune(["read_file", "write_file"])
+    tool = pruned.get("read_file")
+    # The definition is frozen — mutation raises.
+    with pytest.raises(PermissionError, match="frozen security field"):
+        tool.permission_level = "execute"

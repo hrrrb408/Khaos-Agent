@@ -285,16 +285,47 @@ async def test_test_run_unknown_command_reports_failure(tmp_path):
 
 
 async def test_test_run_timeout(monkeypatch, tmp_path):
-    # Force a tiny timeout so the hung process branch is exercised.
+    # Batch 15.7: deterministic timeout-classification test.
+    #
+    # Previously this set ``TEST_RUN_TIMEOUT=0`` (converted to 1ms by
+    # ``max(float(TEST_RUN_TIMEOUT), 0.001)``) and spawned a real
+    # ``python3 -c "time.sleep(5)"`` subprocess.  The 1ms deadline races
+    # with OS scheduling — sometimes the timeout fired before
+    # ``create_subprocess_exec`` even returned, sometimes after the child
+    # was alive but before it reached ``time.sleep``.  That made the test
+    # flaky on CI runners under load.
+    #
+    # The timeout *classification* (``result.status == "timed-out"`` →
+    # summary) is pure Python and does not need a real process.  We still
+    # set ``TEST_RUN_TIMEOUT=0`` to exercise the 0 → 0.001s ResourceBudget
+    # conversion (so validation does not reject the request), but the
+    # ExecutionService is mocked to return a ``timed-out`` result directly,
+    # eliminating the subprocess race.
+    from unittest.mock import AsyncMock
+
+    from khaos.coding.execution.models import ExecutionResult
+
     monkeypatch.setattr(test_tools, "TEST_RUN_TIMEOUT", 0)
-    execution, workspace = await _workspace_execution(tmp_path)
+
+    mock_execution = AsyncMock()
+    mock_execution.execute = AsyncMock(
+        return_value=ExecutionResult(
+            execution_id="test-timeout",
+            status="timed-out",
+            return_code=None,
+            stdout="",
+            stderr="",
+            duration_ms=1,
+        )
+    )
+
     result = json.loads(
         await test_tools.test_run(
             "python3 -c \"import time; time.sleep(5)\"",
-            cwd=str(workspace.worktree_path),
-            execution_service=execution,
+            cwd=str(tmp_path),
+            execution_service=mock_execution,
             task_id="task",
-            workspace_id=workspace.id,
+            workspace_id="ws",
         )
     )
 

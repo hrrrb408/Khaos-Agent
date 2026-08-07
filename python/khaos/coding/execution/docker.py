@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import secrets
@@ -18,7 +19,9 @@ from khaos.coding.execution.models import (
     ResolvedExecutionContext,
     ResourceBudget,
 )
-from khaos.coding.execution.supervisor import ProcessSupervisor
+from khaos.coding.execution.supervisor import ProcessSupervisor, SupervisorClosedError
+
+logger = logging.getLogger(__name__)
 
 _DENIED_ENV_KEYS = frozenset({
     "HOME", "SSH_AUTH_SOCK", "GH_TOKEN", "GITHUB_TOKEN", "DOCKER_HOST",
@@ -249,7 +252,10 @@ class DockerBackend:
             await self._cleanup_container(lease)
 
     async def shutdown(self) -> None:
-        await self.supervisor.shutdown()
+        # Clean up containers.  Do NOT close the supervisor here — the
+        # supervisor is shared with ExecutionService which owns its
+        # lifecycle.  ExecutionService._run_shutdown() closes the
+        # supervisor after docker_backend.shutdown() returns.
         async with self._lock:
             active = tuple(self._active.values())
         for lease in active:
@@ -315,15 +321,27 @@ class DockerBackend:
 
     async def _cleanup_container(self, lease: _ContainerLease) -> None:
         async with lease.cleanup_lock:
-            inspected = await self._run_cli(
-                (
-                    "inspect",
-                    "--format",
-                    f'{{{{ index .Config.Labels "{_OWNER_LABEL}" }}}}',
-                    lease.name,
-                ),
-                timeout=5,
-            )
+            try:
+                inspected = await self._run_cli(
+                    (
+                        "inspect",
+                        "--format",
+                        f'{{{{ index .Config.Labels "{_OWNER_LABEL}" }}}}',
+                        lease.name,
+                    ),
+                    timeout=5,
+                )
+            except SupervisorClosedError:
+                # The supervisor was closed by ExecutionService.shutdown()
+                # while this cleanup was racing (e.g. from execute()'s
+                # finally block).  The container will be cleaned up by
+                # docker system prune or a future restart; we cannot run
+                # docker CLI commands without the supervisor.
+                logger.warning(
+                    "docker container cleanup skipped (supervisor closed): "
+                    "%s", lease.name,
+                )
+                return
             if inspected[0] != 0:
                 return
             if inspected[1].strip() != lease.owner_nonce:

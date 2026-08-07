@@ -44,6 +44,14 @@ class ApprovalBinding:
     authorization_epoch: int = 0
     policy_digest: str = ""
     tool_schema_digest: str = ""
+    # Batch 15.6: the COMPLETE tool security contract digest (covers
+    # capabilities, permission_level, resource_resolver, effect_status,
+    # modes, parallel, timeout, reconciliation_hint — not just
+    # name + parameters).  When non-empty, the scheduler's dispatch
+    # drift check verifies the live ``ToolDefinition.security_digest``
+    # matches this value, so any post-approval mutation to a security
+    # field is detected and refused.
+    tool_security_digest: str = ""
 
     def __post_init__(self) -> None:
         required = (
@@ -82,6 +90,7 @@ class ApprovalBinding:
             "authorization_epoch": self.authorization_epoch,
             "policy_digest": self.policy_digest,
             "tool_schema_digest": self.tool_schema_digest,
+            "tool_security_digest": self.tool_security_digest,
         }
         canonical = json.dumps(
             payload, sort_keys=True, separators=(",", ":")
@@ -108,6 +117,12 @@ class ToolApprovalHandle(str):
     persist/pass ``binding_digest``. ``approval_id`` is a separate random
     server identity and is the Broker's internal primary key.
     """
+
+    # Batch 15.7: declare instance attributes so pyright recognises them
+    # (``str`` subclasses don't carry these by default; ``__new__`` sets
+    # them but pyright cannot infer that without class-level annotations).
+    approval_id: str
+    binding_digest: str
 
     def __new__(
         cls, binding_digest: str, approval_id: str
@@ -146,7 +161,7 @@ class _ToolApprovalStore(dict[str, _ToolApprovalRecord]):
                 raise
             return record
 
-    def get(
+    def get(  # type: ignore[override]
         self, key: str, default: _ToolApprovalRecord | None = None
     ) -> _ToolApprovalRecord | None:
         record = dict.get(self, key)

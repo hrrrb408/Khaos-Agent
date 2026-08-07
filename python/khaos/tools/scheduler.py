@@ -266,6 +266,7 @@ class PermissionRequest:
     authorization_epoch: int = 0
     policy_digest: str = ""
     tool_schema_digest: str = ""
+    tool_security_digest: str = ""
     approval_id: str = ""
 
 
@@ -884,6 +885,7 @@ class ToolScheduler:
                     authorization_epoch=authorization_epoch,
                     policy_digest=self.permission_engine.policy_digest,
                     tool_schema_digest=tool.schema_digest,
+                    tool_security_digest=tool.security_digest,
                 )
                 broker = tool_context.get("approval_broker")
                 if broker is None:
@@ -904,6 +906,7 @@ class ToolScheduler:
                     approval_handle, "approval_id", ""
                 )
                 normalized["_approval_schema_digest"] = binding.tool_schema_digest
+                normalized["_approval_security_digest"] = binding.tool_security_digest
                 normalized["_approval_policy_digest"] = binding.policy_digest
                 normalized["_approval_authorization_epoch"] = binding.authorization_epoch
                 # Round-14 §5: stash the approved arguments digest so dispatch
@@ -936,6 +939,7 @@ class ToolScheduler:
                     authorization_epoch=binding.authorization_epoch,
                     policy_digest=binding.policy_digest,
                     tool_schema_digest=binding.tool_schema_digest,
+                    tool_security_digest=binding.tool_security_digest,
                 )
                 yield SchedulerEvent(event="permission_request", permission_request=request)
                 confirmation = await self._confirm(request, confirm_callback)
@@ -1160,6 +1164,17 @@ class ToolScheduler:
             if expected_schema and expected_schema != tool.schema_digest:
                 raise PermissionDeniedError(
                     "Tool schema changed before dispatch; re-approval required"
+                )
+            # Batch 15.6: verify the COMPLETE security contract digest
+            # (capabilities, permission_level, resource_resolver,
+            # effect_status, modes, parallel, timeout) has not drifted
+            # since approval.  This catches mutations that schema_digest
+            # (name + parameters only) would miss.
+            expected_security = call.get("_approval_security_digest")
+            if expected_security and expected_security != tool.security_digest:
+                raise PermissionDeniedError(
+                    "Tool security contract changed before dispatch; "
+                    "re-approval required"
                 )
             expected_policy = call.get("_approval_policy_digest")
             if expected_policy and expected_policy != self.permission_engine.policy_digest:
@@ -2420,6 +2435,7 @@ class ToolScheduler:
             "authorization_epoch": request.authorization_epoch,
             "policy_digest": request.policy_digest,
             "tool_schema_digest": request.tool_schema_digest,
+            "tool_security_digest": request.tool_security_digest,
         }
         try:
             if inspect.iscoroutinefunction(confirm_callback):

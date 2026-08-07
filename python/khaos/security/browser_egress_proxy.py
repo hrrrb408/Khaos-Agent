@@ -28,6 +28,7 @@ import time
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit, urlunsplit
 
+from khaos.coding.execution.cleanup_ledger import CleanupLedger
 from khaos.security.network_guard import NetworkGuard
 
 logger = logging.getLogger(__name__)
@@ -39,6 +40,9 @@ _IDLE_TIMEOUT = 60.0  # seconds with no data transfer → close
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MiB upload per connection
 _MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200 MiB download per connection
 _MAX_CONCURRENT_CONNECTIONS = 20  # per proxy instance (per browser context)
+# Batch 15.5: TLS ClientHello SNI validation bounds.
+_MAX_TLS_CLIENT_HELLO_BYTES = 16 * 1024
+_TLS_READ_TIMEOUT = 10.0
 
 
 @dataclass
@@ -86,6 +90,27 @@ class _ProxyAuthError(Exception):
     """
 
 
+class _SniMismatchError(Exception):
+    """Batch 15.5: raised when the TLS ClientHello SNI does not match the
+    CONNECT authority.
+
+    A compromised Chromium can send ``CONNECT allowed.example:443`` (which
+    the proxy authorizes) but then emit a TLS ClientHello whose SNI is
+    ``blocked.example``.  If both domains share a CDN / ALB, the upstream
+    would serve the blocked virtual host.  The proxy must prove the TLS
+    layer matches the authorized CONNECT authority before relaying.
+    """
+
+    def __init__(self, expected: str, actual: str | None) -> None:
+        actual_repr = actual if actual is not None else "<absent>"
+        super().__init__(
+            f"SNI mismatch: CONNECT authority={expected!r} "
+            f"but TLS SNI={actual_repr!r}"
+        )
+        self.expected = expected
+        self.actual = actual
+
+
 class BrowserEgressProxy:
     """A loopback-only proxy that authorizes and pins every connection.
 
@@ -100,6 +125,18 @@ class BrowserEgressProxy:
     C-11 (round-4): policy-violation exceptions (byte-limit, idle-timeout)
     are now re-raised from ``_relay_bidirectional`` instead of being
     silently swallowed by ``gather(return_exceptions=True)``.
+
+    Round-15 review P0-C: the handler task is now tracked in
+    ``_client_tasks`` (previously the field existed but was never
+    populated, so ``close()`` could not prove all relays terminated).
+    ``close()`` bounded-awaits every handler task so no relay survives
+    past ``CLOSED``.
+
+    Round-15 review P1 (Host header): the proxy no longer trusts the
+    client's ``Host`` header.  It strips ALL client Host headers and
+    generates a canonical ``Host: <authorized-host>[:<port>]`` from the
+    absolute target.  A compromised Chromium cannot use a missing or
+    mismatched Host to reach a different virtual host on a shared CDN.
     """
 
     def __init__(
@@ -113,7 +150,7 @@ class BrowserEgressProxy:
         bind_host: str = "127.0.0.1",
     ) -> None:
         self._guard = guard
-        self._server: asyncio.AbstractServer | None = None
+        self._server: asyncio.Server | None = None
         self._max_concurrent = max_concurrent
         self._idle_timeout = idle_timeout
         self._max_upload = max_upload
@@ -121,11 +158,20 @@ class BrowserEgressProxy:
         self._bind_host = bind_host
         self._active_connections = 0
         self._connection_semaphore = asyncio.Semaphore(max_concurrent)
-        # Round-14 review P0-8: track active relay tasks and client writers so
-        # close() can terminate in-flight connections, not just the listener.
+        # Round-14 review P0-8 / Round-15 review P0-C: track active relay
+        # tasks AND client writers so close() can terminate in-flight
+        # connections and PROVE they terminated before returning.
         self._client_tasks: set[asyncio.Task] = set()
         self._client_writers: set[asyncio.StreamWriter] = set()
         self._closing = False
+        self._closed = False
+        # Batch 15.3 (round-15 review §十六): per-step completion ledger so
+        # a partial close() is retryable.  Previously the first close()
+        # cleared ``_client_writers`` and set ``_server = None``, so a
+        # second close() saw ``_server is None`` and returned immediately
+        # — even if handler tasks were still alive.  The ledger records
+        # which steps completed so a retry only runs the incomplete ones.
+        self._cleanup_ledger = CleanupLedger()
         # C-07: random auth token — only the browser that receives this
         # token can use the proxy.  Other host processes that can reach
         # the bind address are rejected with 407.
@@ -152,19 +198,28 @@ class BrowserEgressProxy:
         if self._server is not None:
             return
 
-        # Round-14 review P0-8: wrap _handle_client so each connection's task
-        # and writer are tracked, enabling close() to terminate active relays.
+        # Round-14 review P0-8 / Round-15 review P0-C: wrap _handle_client so
+        # each connection's TASK and writer are tracked, enabling close() to
+        # terminate active relays AND prove they terminated.  Previously
+        # ``_client_tasks`` was never populated (only ``_client_writers``),
+        # so close() gathered an empty set and returned while handlers were
+        # still running.
         async def _tracked_handler(
             reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
         ) -> None:
-            if self._closing:
+            if self._closing or self._closed:
                 writer.close()
                 return
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._client_tasks.add(current_task)
             self._client_writers.add(writer)
             try:
                 await self._handle_client(reader, writer)
             finally:
                 self._client_writers.discard(writer)
+                if current_task is not None:
+                    self._client_tasks.discard(current_task)
 
         self._server = await asyncio.start_server(
             _tracked_handler,
@@ -176,33 +231,85 @@ class BrowserEgressProxy:
     async def close(self) -> None:
         """Close the listener AND terminate all active relay connections.
 
-        Round-14 review P0-8: previously close() only closed the listening
-        socket — existing relays kept running until idle/byte-limit timeout.
-        Now it sets an admission fence, closes the listener, closes all client
-        writers (which breaks the relay read loop), cancels handler tasks,
-        and bounded-awaits their completion so close() proves all relays
-        terminated before returning.
+        Round-14 review P0-8 / Round-15 review P0-C: previously close()
+        only closed the listening socket — existing relays kept running
+        until idle/byte-limit timeout.  Now it sets an admission fence,
+        closes the listener, closes all client writers (which breaks the
+        relay read loop), cancels handler tasks, and bounded-awaits their
+        completion so close() proves all relays terminated before
+        returning.
+
+        Batch 15.3 (round-15 review §十六): the per-step ``CleanupLedger``
+        records which steps completed so a partial close() is retryable.
+        Previously the first close() cleared ``_client_writers`` and set
+        ``_server = None``, so a second close() saw ``_server is None``
+        and returned immediately — even if handler tasks were still
+        alive.  Now the ledger tracks ``listener_close``,
+        ``writers_close``, and ``handlers_drain`` independently; a retry
+        only runs the incomplete steps.  This aligns with the Browser
+        threat model: "Partial cleanup remains registered and makes
+        shutdown fail until a retry succeeds; it is never reported as
+        closed."
         """
-        if self._server is None:
+        if self._closed:
             return
         self._closing = True
-        self._server.close()
-        await self._server.wait_closed()
-        self._server = None
-        # Close all client writers to break the relay read loops.
-        for w in tuple(self._client_writers):
-            try:
-                w.close()
-            except Exception:  # noqa: BLE001
-                pass
-        self._client_writers.clear()
-        # Cancel and bounded-await all handler tasks.
-        tasks = tuple(self._client_tasks)
-        for t in tasks:
-            t.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        self._client_tasks.clear()
+        self._cleanup_ledger.reset_errors()
+
+        # Step 1: close the listener so no new connections are accepted.
+        if not self._cleanup_ledger.is_done("listener_close"):
+            if self._server is not None:
+                self._server.close()
+                try:
+                    await self._server.wait_closed()
+                except Exception:  # noqa: BLE001 — best-effort listener close
+                    pass
+                self._server = None
+            self._cleanup_ledger.mark_done("listener_close")
+
+        # Step 2: close all client writers to break the relay read loops.
+        if not self._cleanup_ledger.is_done("writers_close"):
+            for w in tuple(self._client_writers):
+                try:
+                    w.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._client_writers.clear()
+            self._cleanup_ledger.mark_done("writers_close")
+
+        # Step 3: cancel and bounded-await all handler tasks.  Each task's
+        # finally block removes it from ``_client_tasks``, so after gather
+        # the set should be empty.  If any task survived cancellation, do
+        # NOT set ``_closed`` — a retry can finish the job.
+        if not self._cleanup_ledger.is_done("handlers_drain"):
+            tasks = tuple(self._client_tasks)
+            for t in tasks:
+                if not t.done():
+                    t.cancel()
+            if tasks:
+                await asyncio.gather(*tasks, return_exceptions=True)
+            if self._client_tasks:
+                # Tasks survived cancellation — do not claim closed.
+                self._cleanup_ledger.record_error(
+                    "handlers_drain",
+                    RuntimeError(
+                        f"BrowserEgressProxy close() did not fully drain: "
+                        f"{len(self._client_tasks)} handler task(s) still active"
+                    ),
+                )
+            else:
+                self._client_tasks.clear()
+                self._cleanup_ledger.mark_done("handlers_drain")
+
+        if self._cleanup_ledger.has_errors():
+            self._closing = False
+            errors = self._cleanup_ledger.errors
+            raise RuntimeError(
+                f"BrowserEgressProxy close() partially failed: "
+                + "; ".join(type(e).__name__ for e in errors)
+            ) from errors[0]
+        self._closed = True
+        self._closing = False
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -345,6 +452,47 @@ class BrowserEgressProxy:
         )
         client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await client_writer.drain()
+        # Batch 15.5: read the first bytes from the client.  If they look
+        # like a TLS ClientHello (ContentType=0x16 Handshake), parse the
+        # SNI and prove it matches the CONNECT authority — a compromised
+        # Chromium can send ``CONNECT allowed.example:443`` (which passes
+        # the domain guard) but then emit a ClientHello whose SNI is
+        # ``blocked.example`` (shared CDN/ALB virtual-host bypass).
+        #
+        # If the first byte is NOT 0x16, the tunnel is carrying plain TCP
+        # (e.g. ``ws://`` WebSocket upgrade).  SNI validation does not
+        # apply — the CONNECT authority is the only identity, and it was
+        # already validated by ``authorize_url`` above.  Forward the
+        # buffered bytes as-is.
+        try:
+            first_bytes = await asyncio.wait_for(
+                client_reader.read(_MAX_TLS_CLIENT_HELLO_BYTES),
+                timeout=_TLS_READ_TIMEOUT,
+            )
+            if first_bytes and first_bytes[0] == 0x16:
+                # TLS ClientHello — validate SNI.
+                sni = _parse_tls_sni(first_bytes)
+                if sni is None or sni.lower() != host.lower():
+                    raise _SniMismatchError(host, sni)
+                logger.debug(
+                    "browser egress SNI validated: %s for CONNECT %s:%d",
+                    sni, host, port,
+                )
+            # else: plain TCP tunnel (non-TLS).  Forward without SNI check.
+        except Exception:
+            # SNI validation failed (mismatch, timeout, parse error) —
+            # close the upstream connection before propagating so we do
+            # not leak it.  _relay_bidirectional owns cleanup on the
+            # success path.
+            upstream_writer.close()
+            with contextlib.suppress(Exception):
+                await upstream_writer.wait_closed()
+            raise
+        # Forward the buffered first bytes to upstream so the TLS
+        # handshake (or plain TCP protocol) proceeds normally, then
+        # start the blind relay.
+        upstream_writer.write(first_bytes)
+        await upstream_writer.drain()
         await _relay_bidirectional(
             client_reader, client_writer,
             upstream_reader, upstream_writer,
@@ -378,47 +526,33 @@ class BrowserEgressProxy:
         )
         origin_target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         lines = header.decode("latin-1").split("\r\n")
-        # Round-14 review P0-6: validate that the client's Host header matches
-        # the authorized absolute target.  A compromised Chromium in the
-        # browser netns can craft a proxy request with an allowed target but
-        # a different Host header — if both domains share a CDN/IP, the
-        # upstream virtual host would serve the blocked domain.  Reject any
-        # mismatch (or duplicate Host headers) fail-closed.
-        expected_host = parsed.hostname.lower()
-        expected_port = parsed.port  # None if not explicit
-        host_headers = [
-            line for line in lines[1:]
-            if line.split(":", 1)[0].strip().lower() == "host"
-        ]
-        if len(host_headers) > 1:
-            raise ValueError("proxy rejected duplicate Host headers")
-        if host_headers:
-            client_host_value = host_headers[0].split(":", 1)[1].strip().lower()
-            # Strip the port from the client Host for hostname comparison.
-            client_hostname = client_host_value.rsplit(":", 1)[0] \
-                if ":" in client_host_value else client_host_value
-            if client_hostname != expected_host:
-                raise ValueError(
-                    f"proxy Host header ({client_hostname}) does not match "
-                    f"authorized target ({expected_host})"
-                )
-            # If the target had an explicit port, the Host port must match too.
-            if expected_port is not None:
-                client_port_str = client_host_value.rsplit(":", 1)[1] \
-                    if ":" in client_host_value else ""
-                if client_port_str and int(client_port_str) != expected_port:
-                    raise ValueError(
-                        f"proxy Host port ({client_port_str}) does not match "
-                        f"authorized target port ({expected_port})"
-                    )
+        # Round-15 review P1 (Host header authority binding): the proxy
+        # does NOT trust the client's Host header.  A compromised Chromium
+        # in the browser netns can craft a proxy request with an allowed
+        # absolute target but a different (or missing) Host header — if
+        # both domains share a CDN/IP, the upstream virtual host would
+        # serve the blocked domain.  Instead of validating the client
+        # Host (which still allowed a missing Host to pass through), the
+        # proxy now STRIPS all client Host headers and generates a
+        # canonical ``Host: <authorized-host>[:<port>]`` from the
+        # absolute target.  Protocol interpretation authority is entirely
+        # in the security proxy, not the compromised browser.
+        canonical_host = parsed.hostname.lower()
+        if parsed.port is not None:
+            canonical_host = f"{canonical_host}:{parsed.port}"
+        elif port != 80:
+            canonical_host = f"{canonical_host}:{port}"
         forwarded = [f"{method} {origin_target} {version}"]
         for line in lines[1:]:
             if not line:
                 continue
             name = line.split(":", 1)[0].strip().lower()
-            if name in {"proxy-authorization", "proxy-connection", "connection"}:
+            # Strip ALL client Host headers — the proxy owns the canonical
+            # Host.  Also strip hop-by-hop headers.
+            if name in {"host", "proxy-authorization", "proxy-connection", "connection"}:
                 continue
             forwarded.append(line)
+        forwarded.append(f"Host: {canonical_host}")
         forwarded.extend(("Connection: close", "", ""))
         upstream_writer.write("\r\n".join(forwarded).encode("latin-1"))
         await upstream_writer.drain()
@@ -448,6 +582,118 @@ def _split_authority(authority: str, default_port: int) -> tuple[str, int]:
     if not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("invalid CONNECT authority")
     return parsed.hostname, parsed.port or default_port
+
+
+def _parse_tls_sni(data: bytes) -> str | None:
+    """Extract the SNI host_name from a TLS ClientHello record.
+
+    Batch 15.5: parses the TLS record header (type=0x16 Handshake), the
+    Handshake header (type=0x01 ClientHello), and the ClientHello fields
+    to locate the SNI extension (extension type 0x0000).  Returns the
+    first ``host_name`` (name_type=0) decoded as ASCII, or ``None`` if
+    the data is not a valid TLS ClientHello, the SNI extension is absent,
+    or any parse error occurs.  Never raises — callers rely on ``None``
+    to signal "reject (fail-closed)".
+    """
+    try:
+        # --- TLS record header (RFC 5246 §6.2.1) ---
+        # ContentType(1) + ProtocolVersion(2) + length(2)
+        if len(data) < 5:
+            return None
+        if data[0] != 0x16:  # handshake
+            return None
+        record_length = int.from_bytes(data[3:5], "big")
+        if record_length + 5 > len(data):
+            # Fragment does not contain the full record — the
+            # ClientHello may have been split, but a real ClientHello
+            # fits in one record on loopback.  Fail closed.
+            return None
+        # --- Handshake header (RFC 5246 §7.4) ---
+        # HandshakeType(1) + length(3)
+        if len(data) < 9:
+            return None
+        if data[5] != 0x01:  # ClientHello
+            return None
+        offset = 9  # start of ClientHello body
+        # --- ClientHello body (RFC 5246 §7.4.1.2) ---
+        # client_version(2)
+        if offset + 2 > len(data):
+            return None
+        offset += 2
+        # random(32)
+        if offset + 32 > len(data):
+            return None
+        offset += 32
+        # session_id(1-byte length + variable)
+        if offset + 1 > len(data):
+            return None
+        session_id_len = data[offset]
+        offset += 1
+        if offset + session_id_len > len(data):
+            return None
+        offset += session_id_len
+        # cipher_suites(2-byte length + variable)
+        if offset + 2 > len(data):
+            return None
+        cipher_suites_len = int.from_bytes(data[offset:offset + 2], "big")
+        offset += 2
+        if offset + cipher_suites_len > len(data):
+            return None
+        offset += cipher_suites_len
+        # compression_methods(1-byte length + variable)
+        if offset + 1 > len(data):
+            return None
+        compression_len = data[offset]
+        offset += 1
+        if offset + compression_len > len(data):
+            return None
+        offset += compression_len
+        # extensions(2-byte total length + variable) — optional
+        if offset + 2 > len(data):
+            return None
+        extensions_len = int.from_bytes(data[offset:offset + 2], "big")
+        offset += 2
+        if extensions_len == 0:
+            return None  # no extensions → no SNI → fail closed
+        if offset + extensions_len > len(data):
+            return None
+        extensions_end = offset + extensions_len
+        # --- Extension loop ---
+        # Each: ExtensionType(2) + extension_data(2-byte length + variable)
+        while offset + 4 <= extensions_end:
+            ext_type = int.from_bytes(data[offset:offset + 2], "big")
+            ext_len = int.from_bytes(data[offset + 2:offset + 4], "big")
+            offset += 4
+            if offset + ext_len > extensions_end:
+                return None
+            if ext_type == 0x0000:  # server_name (RFC 6066 §3)
+                # server_name_list(2-byte length) + entries
+                if ext_len < 2:
+                    return None
+                list_len = int.from_bytes(
+                    data[offset:offset + 2], "big",
+                )
+                list_start = offset + 2
+                list_end = list_start + list_len
+                if list_end > offset + ext_len:
+                    return None
+                pos = list_start
+                # Each entry: name_type(1) + host_name(2-byte length + bytes)
+                while pos + 3 <= list_end:
+                    name_type = data[pos]
+                    name_len = int.from_bytes(
+                        data[pos + 1:pos + 3], "big",
+                    )
+                    pos += 3
+                    if pos + name_len > list_end:
+                        return None
+                    if name_type == 0x00:  # host_name
+                        return data[pos:pos + name_len].decode("ascii")
+                    pos += name_len
+            offset += ext_len
+        return None
+    except (IndexError, ValueError, UnicodeDecodeError):
+        return None
 
 
 async def _open_pinned(

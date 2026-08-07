@@ -11,6 +11,10 @@ from collections.abc import Awaitable, Callable
 from dataclasses import replace
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING, Any, cast
+
+if TYPE_CHECKING:
+    from khaos.coding.workspace.manager import WorkspaceManager
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +32,7 @@ class ExecutionServiceShutdownError(RuntimeError):
     """Typed error when shutdown partially fails (round-13 P0-1)."""
 
 from khaos.coding.execution.binding import open_execution_directory_binding
+from khaos.coding.execution.cleanup_ledger import CleanupLedger
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.models import (
     ExecutionRequest,
@@ -52,7 +57,7 @@ class ExecutionService:
     def __init__(
         self,
         backend=None,
-        workspace_manager=None,
+        workspace_manager: WorkspaceManager | None = None,
         docker_backend=None,
         managed_process_factory=None,
         backend_selector=None,
@@ -82,6 +87,13 @@ class ExecutionService:
         # closed admission and terminate the just-started process.
         self._admission_lock = asyncio.Lock()
         self._initializing: dict[str, asyncio.Task] = {}
+        # Batch 15.3 (round-15 review §九): per-step completion ledger so
+        # a QUARANTINED shutdown is retryable — only failed steps are
+        # retried, completed steps (supervisor/docker/individual
+        # terminates) are skipped.  Previously QUARANTINED was a permanent
+        # graveyard: a second shutdown() re-raised the original error and
+        # never attempted the remaining steps.
+        self._cleanup_ledger = CleanupLedger()
         self.principal_id = principal_id
         self.project_id = project_id
         self.runtime_id = runtime_id
@@ -122,10 +134,39 @@ class ExecutionService:
         self._authority_bound = True
 
     async def execute(self, request: ExecutionRequest) -> ExecutionResult:
-        # Round-14 review P0-1: reject new executions when the service is NOT
-        # OPEN (CLOSING/QUARANTINED/CLOSED all reject).  Previously ``_closed``
-        # was only True for CLOSED, so CLOSING/QUARANTINED still admitted new
-        # executions — allowing a process to start AFTER shutdown began.
+        # Round-15 review P0-A: admission transaction.  Previously the OPEN
+        # check was a bare ``if`` with no lock, so a shutdown that began
+        # after the check but before the backend spawned would leave a
+        # late-spawned process unowned.  Now the OPEN check + admission
+        # reservation are atomic under ``_admission_lock``, and the
+        # reservation is popped only after the execution publishes to
+        # ``_active`` (or fails).  ``shutdown()`` cancels every
+        # ``_initializing`` task so a late publish is impossible.
+        async with self._admission_lock:
+            if self._shutdown_state is not _ShutdownState.OPEN:
+                raise RuntimeError(
+                    f"execution service is {self._shutdown_state.value}, "
+                    f"not accepting new executions"
+                )
+            admission_id = request.correlation_id or uuid.uuid4().hex[:12]
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._initializing[admission_id] = current_task
+        try:
+            return await self._execute_after_admission(request, admission_id)
+        finally:
+            # Pop the admission reservation so shutdown() can observe an
+            # empty ``_initializing`` once every in-flight execution has
+            # either published to ``_active`` or exited.
+            async with self._admission_lock:
+                self._initializing.pop(admission_id, None)
+
+    async def _execute_after_admission(
+        self, request: ExecutionRequest, admission_id: str
+    ) -> ExecutionResult:
+        """The body of ``execute()`` after the admission reservation."""
+        # Round-15 review P0-A: re-check OPEN after every significant await.
+        # If shutdown raced us, abort before spawning.
         if self._shutdown_state is not _ShutdownState.OPEN:
             raise RuntimeError(
                 f"execution service is {self._shutdown_state.value}, "
@@ -194,7 +235,7 @@ class ExecutionService:
                     raise PermissionError("task Worktree cannot be the main repository")
                 if not (root / ".git").is_file():
                     raise PermissionError("workspace is not an active Git Worktree")
-            correlation_id = request.correlation_id or uuid.uuid4().hex[:12]
+            correlation_id = admission_id
             profile = replace(
                 profile,
                 resources=replace(
@@ -222,6 +263,8 @@ class ExecutionService:
                 workspace_root_identity=root_identity,
                 workspace_cwd_identity=cwd_identity,
             )
+            assert request.task_id is not None
+            assert request.workspace_id is not None
             resolved_context = ResolvedExecutionContext(
                 request.task_id, request.workspace_id, workspace.state.value,
                 repository_root, root, cwd,
@@ -264,11 +307,26 @@ class ExecutionService:
             and request.workspace_id
         ):
             await self.workspace_manager.verify_execution_root(request.workspace_id)
+        # Round-15 review P0-A: final re-check before publishing to _active.
+        # If shutdown began during any of the awaits above, abort now —
+        # the backend's subprocess spawn is the irrevocable step.
+        if self._shutdown_state is not _ShutdownState.OPEN:
+            raise RuntimeError(
+                f"execution service is {self._shutdown_state.value}, "
+                f"not accepting new executions"
+            )
         try:
             if resolved_context is not None and hasattr(backend, "execute_resolved"):
                 self._active[resolved_context.correlation_id] = (
                     resolved_context.task_id, resolved_context.workspace_id, backend
                 )
+                # Pop from _initializing now that we've published to _active.
+                # shutdown()'s initializing:cancel step must NOT cancel this
+                # task — it's handled by the terminate() loop above.  Without
+                # this pop, a shutdown mid-execute cancels the task and
+                # triggers the CancelledError quarantine path even though the
+                # execution was already being terminated via backend.terminate().
+                self._initializing.pop(resolved_context.correlation_id, None)
                 try:
                     result = await backend.execute_resolved(resolved_context)
                 finally:
@@ -297,6 +355,7 @@ class ExecutionService:
         self, workspace_id: str
     ) -> None:
         """Never return from execution after linked-worktree metadata drift."""
+        assert self.workspace_manager is not None
         try:
             await self.workspace_manager.verify_git_identity(workspace_id)
         except Exception as exc:
@@ -309,6 +368,7 @@ class ExecutionService:
         self, context: ResolvedExecutionContext
     ) -> None:
         """Account a cancelled process after its tree has been terminated."""
+        assert self.workspace_manager is not None
         authority = getattr(self.workspace_manager, "storage_authority", None)
         workspace = self.workspace_manager.get(context.workspace_id)
         limits = getattr(workspace, "storage_limits", None)
@@ -327,6 +387,7 @@ class ExecutionService:
     async def _cleanup_workspace_on_storage_violation(
         self, workspace_id: str, result: ExecutionResult
     ) -> None:
+        assert self.workspace_manager is not None
         violation = result.diagnostics.get("resource_violation")
         if not isinstance(violation, dict) or violation.get("kind") not in {
             "workspace-bytes",
@@ -373,12 +434,55 @@ class ExecutionService:
         if isinstance(backend, ManagedProcessHandle):
             await backend.aclose()
         else:
-            await backend.terminate(execution_id)
+            await cast("Any", backend).terminate(execution_id)
         self._active.pop(execution_id, None)
 
     async def start_managed_process(self, request: ExecutionRequest) -> ManagedProcessHandle:
-        """Start a registered LSP-style stdio process in an active TaskWorkspace."""
-        # Round-14 review P0-1: same OPEN-only admission as execute().
+        """Start a registered LSP-style stdio process in an active TaskWorkspace.
+
+        Round-15 review P0-A/P0-2: this method now uses the SAME admission
+        transaction as ``execute()`` — the OPEN check + ``_initializing``
+        reservation are atomic under ``_admission_lock``, and the
+        reservation is popped only after the handle publishes to
+        ``_active`` (or fails).  ``shutdown()`` cancels every
+        ``_initializing`` task so a late publish is impossible.
+
+        Round-15 review P0-2 (CancelledError rollback): the spawn
+        transaction wraps ``create_subprocess_exec`` through
+        ``register_process`` in a ``try/except BaseException`` so a
+        ``CancelledError`` (a ``BaseException`` in 3.11+) that arrives
+        AFTER the process was spawned but BEFORE ownership publication
+        kills+waits the orphaned process and removes the temporary HOME
+        before re-raising.  Previously ``except Exception`` left the
+        process alive when the caller was cancelled mid-spawn.
+        """
+        # Round-15 review P0-A: admission transaction — atomically check
+        # OPEN and reserve a slot in ``_initializing`` so shutdown() owns
+        # this in-flight spawn.
+        async with self._admission_lock:
+            if self._shutdown_state is not _ShutdownState.OPEN:
+                raise RuntimeError(
+                    f"execution service is {self._shutdown_state.value}, "
+                    f"not accepting new executions"
+                )
+            admission_id = request.correlation_id or uuid.uuid4().hex[:12]
+            current_task = asyncio.current_task()
+            if current_task is not None:
+                self._initializing[admission_id] = current_task
+        try:
+            return await self._start_managed_after_admission(request, admission_id)
+        finally:
+            # Pop the admission reservation so shutdown() can observe an
+            # empty ``_initializing`` once every in-flight managed spawn
+            # has either published to ``_active`` or exited.
+            async with self._admission_lock:
+                self._initializing.pop(admission_id, None)
+
+    async def _start_managed_after_admission(
+        self, request: ExecutionRequest, admission_id: str
+    ) -> ManagedProcessHandle:
+        """The body of ``start_managed_process`` after the admission reservation."""
+        # Round-15 review P0-A: re-check OPEN after every significant await.
         if self._shutdown_state is not _ShutdownState.OPEN:
             raise RuntimeError(
                 f"execution service is {self._shutdown_state.value}, "
@@ -426,7 +530,7 @@ class ExecutionService:
             and backend.__class__.__name__ in {"HostExecutionBackend", "UnsupportedBackend"}
         ):
             raise PermissionError("unsupported: managed process backend is unavailable")
-        execution_id = request.correlation_id or uuid.uuid4().hex[:12]
+        execution_id = admission_id
         temporary_home = Path(tempfile.mkdtemp(prefix="khaos-lsp-home-"))
         temporary_tmp = temporary_home / "tmp"
         temporary_tmp.mkdir(mode=0o700)
@@ -450,6 +554,25 @@ class ExecutionService:
             workspace_root_identity=root_identity,
             workspace_cwd_identity=cwd_identity,
         )
+        # Round-15 review P0-A: final re-check before the irrevocable spawn.
+        # If shutdown began during any of the awaits above, abort now —
+        # ``create_subprocess_exec`` is the irrevocable step.
+        if self._shutdown_state is not _ShutdownState.OPEN:
+            import shutil
+
+            shutil.rmtree(temporary_home, ignore_errors=True)
+            raise RuntimeError(
+                f"execution service is {self._shutdown_state.value}, "
+                f"not accepting new executions"
+            )
+        # Round-15 review P0-2: spawn transaction.  ``except BaseException``
+        # (not ``except Exception``) so a ``CancelledError`` arriving after
+        # ``create_subprocess_exec`` succeeded but before ownership
+        # publication triggers a kill+wait of the orphaned process and
+        # removal of the temporary HOME.  Without this the process would
+        # leak: the caller has abandoned the coroutine, the supervisor
+        # hasn't been told about it, and ``_active`` doesn't reference it.
+        spawned_process: asyncio.subprocess.Process | None = None
         try:
             if self.managed_process_factory is not None:
                 handle = await self.managed_process_factory(resolved, temporary_home)
@@ -481,6 +604,7 @@ class ExecutionService:
                     )
                 finally:
                     directory_binding.close()
+                spawned_process = process
                 watchdog = await self.process_supervisor.register_process(
                     execution_id,
                     process,
@@ -509,12 +633,43 @@ class ExecutionService:
                     # execution id, state-API inconsistency).
                     on_terminal=self._make_managed_on_terminal(),
                 )
-        except Exception:
+        except BaseException:
+            # Round-15 review P0-2: spawn committed but ownership
+            # publication failed (caller cancelled, supervisor closed
+            # during spawn, register_process raised, etc.).  Kill the
+            # just-spawned process group so it cannot outlive the
+            # transaction, then remove the temporary HOME.  The supervisor
+            # helper ``_kill_orphaned_process`` swallows all errors because
+            # this is best-effort cleanup of a half-spawned child the
+            # caller is about to abandon.
             import shutil
 
+            if spawned_process is not None:
+                from khaos.coding.execution.supervisor import _kill_orphaned_process
+
+                await _kill_orphaned_process(spawned_process)
             shutil.rmtree(temporary_home, ignore_errors=True)
             raise
+        # Round-15 review P0-A: publish to ``_active`` only after the
+        # transaction committed.  If shutdown began between the OPEN
+        # re-check above and here, the handle is fully formed — terminate
+        # it immediately so the process doesn't outlive the service.
+        if self._shutdown_state is not _ShutdownState.OPEN:
+            try:
+                await handle.aclose()
+            except Exception:  # noqa: BLE001 — best-effort during shutdown
+                logger.debug(
+                    "managed process %s aclose failed during late shutdown detection",
+                    execution_id, exc_info=True,
+                )
+            raise RuntimeError(
+                f"execution service is {self._shutdown_state.value}, "
+                f"not accepting new executions"
+            )
         self._active[execution_id] = (request.task_id, request.workspace_id, handle)
+        # Pop from _initializing — see _execute_after_admission for rationale.
+        # shutdown()'s initializing:cancel must not cancel this task.
+        self._initializing.pop(execution_id, None)
         return handle
 
     def _managed_argv(
@@ -523,6 +678,7 @@ class ExecutionService:
         backend,
         temporary_home: Path,
     ) -> tuple[str, ...]:
+        assert context.permission_profile is not None
         backend_name = backend.__class__.__name__
         if backend_name == "MacOSSandboxBackend":
             sandbox_profile = backend.profile(
@@ -549,7 +705,7 @@ class ExecutionService:
                 writable=False,
                 unreadable_roots=context.permission_profile.unreadable_roots,
                 synthetic_home=temporary_home,
-                resources=context.resources,
+                resources=context.budget,
                 command=context.argv,
                 environment=context.environment,
             )
@@ -566,35 +722,48 @@ class ExecutionService:
         does not skip the rest), the typed state machine tracks OPEN →
         CLOSING → CLOSED/QUARANTINED, and every caller awaits the SAME shared
         shutdown task so no one sees a false success.
+
+        Batch 15.3 (round-15 review §八/§九): QUARANTINED is now retryable.
+        A second ``shutdown()`` call after a partial failure uses the
+        ``CleanupLedger`` to skip already-completed steps (successful
+        terminates, supervisor, docker) and only retries the failed ones.
+        Previously QUARANTINED was a permanent graveyard that re-raised the
+        original error without attempting any remaining cleanup.
         """
         if self._shutdown_state is _ShutdownState.CLOSED:
             return
-        if self._shutdown_state is _ShutdownState.QUARANTINED:
-            raise ExecutionServiceShutdownError(
-                f"ExecutionService was already partially shut down with "
-                f"errors; resources may not be fully released"
-            ) from self._shutdown_error
-        if self._shutdown_task is not None:
+        # Reuse an in-flight shutdown task so concurrent callers observe the
+        # same result.  A completed (failed) task is NOT reused —
+        # QUARANTINED is retryable and a new task is created to use the
+        # ledger to skip completed steps.
+        if self._shutdown_task is not None and not self._shutdown_task.done():
             await asyncio.shield(self._shutdown_task)
             return
         self._shutdown_task = asyncio.ensure_future(self._run_shutdown())
         await asyncio.shield(self._shutdown_task)
 
     async def _run_shutdown(self) -> None:
-        """The actual shutdown sequence — runs exactly once.
+        """The actual shutdown sequence — may run multiple times via retry.
 
         Round-14 review P0-3: CancelledError (BaseException in Python 3.11+)
         is caught explicitly per step — the cancel is recorded, remaining
         steps continue, and the cancel is re-raised AFTER all cleanup is
         attempted.  This prevents a cancel from leaving the service in
         CLOSING with supervisor/docker alive.
+
+        Batch 15.3: the ``CleanupLedger`` records each completed step so a
+        retry (after QUARANTINED) skips them.  ``_active.pop()`` on
+        successful terminate is the natural per-execution ledger — only
+        failed terminates remain in ``_active`` for the retry.
         """
         self._shutdown_state = _ShutdownState.CLOSING
-        errors: list[Exception] = []
+        self._cleanup_ledger.reset_errors()
         cancel_requested = False
 
         # Each active execution is terminated independently — one failure
-        # must not skip the rest.
+        # must not skip the rest.  ``_active`` serves as the per-execution
+        # ledger: a successful ``terminate()`` pops the entry, so a retry
+        # only sees the remaining (failed) executions.
         for execution_id in tuple(self._active):
             try:
                 await self.terminate(execution_id)
@@ -602,40 +771,57 @@ class ExecutionService:
                 cancel_requested = True
                 logger.debug("ExecutionService shutdown: terminate(%s) cancelled", execution_id)
             except Exception as exc:  # noqa: BLE001 — collect, don't abort
-                errors.append(exc)
+                self._cleanup_ledger.record_error(f"terminate:{execution_id}", exc)
                 logger.debug(
                     "ExecutionService shutdown: terminate(%s) failed",
                     execution_id, exc_info=True,
                 )
 
         # Cancel any initializing tasks that haven't published to _active yet.
-        for init_task in tuple(self._initializing.values()):
-            init_task.cancel()
-        if self._initializing:
+        if not self._cleanup_ledger.is_done("initializing:cancel"):
             try:
-                await asyncio.gather(*self._initializing.values(), return_exceptions=True)
-            except Exception:  # noqa: BLE001
-                pass
-            self._initializing.clear()
+                for init_task in tuple(self._initializing.values()):
+                    init_task.cancel()
+                if self._initializing:
+                    await asyncio.gather(
+                        *self._initializing.values(), return_exceptions=True,
+                    )
+                self._initializing.clear()
+                self._cleanup_ledger.mark_done("initializing:cancel")
+            except asyncio.CancelledError:
+                cancel_requested = True
+                logger.debug("ExecutionService shutdown: initializing cancel cancelled")
+            except Exception as exc:  # noqa: BLE001
+                self._cleanup_ledger.record_error("initializing:cancel", exc)
+                logger.debug(
+                    "ExecutionService shutdown: initializing cancel failed", exc_info=True,
+                )
 
-        # Supervisor and Docker backend are always attempted.
-        try:
-            await self.process_supervisor.shutdown()
-        except asyncio.CancelledError:
-            cancel_requested = True
-        except Exception as exc:  # noqa: BLE001
-            errors.append(exc)
-            logger.debug("ExecutionService shutdown: supervisor shutdown failed", exc_info=True)
-
-        if self.docker_backend is not None:
+        # Docker backend must be shut down BEFORE the supervisor — Docker
+        # cleanup runs ``docker rm/stop/kill`` via ``supervisor.run()``, so
+        # closing the supervisor first causes SupervisorClosedError during
+        # container cleanup.  The supervisor is the last resource to close.
+        if self.docker_backend is not None and not self._cleanup_ledger.is_done("docker:shutdown"):
             try:
                 await self.docker_backend.shutdown()
+                self._cleanup_ledger.mark_done("docker:shutdown")
             except asyncio.CancelledError:
                 cancel_requested = True
             except Exception as exc:  # noqa: BLE001
-                errors.append(exc)
+                self._cleanup_ledger.record_error("docker:shutdown", exc)
                 logger.debug("ExecutionService shutdown: docker backend shutdown failed", exc_info=True)
 
+        if not self._cleanup_ledger.is_done("supervisor:shutdown"):
+            try:
+                await self.process_supervisor.shutdown()
+                self._cleanup_ledger.mark_done("supervisor:shutdown")
+            except asyncio.CancelledError:
+                cancel_requested = True
+            except Exception as exc:  # noqa: BLE001
+                self._cleanup_ledger.record_error("supervisor:shutdown", exc)
+                logger.debug("ExecutionService shutdown: supervisor shutdown failed", exc_info=True)
+
+        errors = self._cleanup_ledger.errors
         if errors:
             self._shutdown_error = errors[0]
             self._shutdown_state = _ShutdownState.QUARANTINED

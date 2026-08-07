@@ -12,6 +12,10 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[3]
 
+# macOS exposes open FDs via /dev/fd (same as Linux's /proc/self/fd).
+# Use whichever is available so the FD-sanitization tests run on both.
+_FD_DIR = "/proc/self/fd" if Path("/proc/self/fd").is_dir() else "/dev/fd"
+
 
 def _fd_probe_command(*fds: int) -> str:
     """Probe only the descriptors passed to the launcher under test."""
@@ -19,7 +23,7 @@ def _fd_probe_command(*fds: int) -> str:
     return (
         "import json, os; "
         f"print(json.dumps([fd for fd in ({values}) "
-        "if os.path.exists('/proc/self/fd/' + str(fd))]))"
+        f"if os.path.exists('{_FD_DIR}/' + str(fd))]))"
     )
 
 
@@ -37,8 +41,8 @@ def test_rust_launcher_has_stdio_only_fd_policy() -> None:
 
 
 @pytest.mark.skipif(
-    not Path("/proc/self/fd").is_dir(),
-    reason="child FD inspection requires /proc/self/fd",
+    not Path(_FD_DIR).is_dir(),
+    reason=f"child FD inspection requires {_FD_DIR}",
 )
 def test_python_development_launcher_closes_authority_fds(tmp_path) -> None:
     root = tmp_path / "root"
@@ -95,8 +99,8 @@ def test_python_development_launcher_closes_authority_fds(tmp_path) -> None:
 
 
 @pytest.mark.skipif(
-    not Path("/proc/self/fd").is_dir(),
-    reason="child FD inspection requires /proc/self/fd",
+    not Path(_FD_DIR).is_dir(),
+    reason=f"child FD inspection requires {_FD_DIR}",
 )
 def test_python_development_launcher_preserves_only_bound_directory_fds(tmp_path) -> None:
     root = tmp_path / "root"
@@ -153,12 +157,18 @@ def test_python_development_launcher_preserves_only_bound_directory_fds(tmp_path
 
 
 @pytest.mark.skipif(
-    sys.platform != "linux", reason="the Rust integration check inspects /proc"
+    not Path(_FD_DIR).is_dir(),
+    reason=f"the Rust integration check inspects {_FD_DIR}",
 )
 def test_rust_launcher_closes_authority_fds_when_binary_is_provided(tmp_path) -> None:
     launcher = os.environ.get("KHAOS_EXEC_LAUNCHER_FD_TEST", "")
     if not launcher or not Path(launcher).is_file():
-        pytest.skip("set KHAOS_EXEC_LAUNCHER_FD_TEST to a built Rust launcher")
+        # Auto-detect a release build so the test runs without manual env setup.
+        candidate = ROOT / "rust/khaos-core/target/release/khaos-exec-launcher"
+        if candidate.is_file():
+            launcher = str(candidate)
+        else:
+            pytest.skip("set KHAOS_EXEC_LAUNCHER_FD_TEST to a built Rust launcher")
 
     root = tmp_path / "root"
     root.mkdir()
