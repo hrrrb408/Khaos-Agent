@@ -124,7 +124,11 @@ class CapabilityName(str, Enum):
 
 @dataclass(frozen=True)
 class ToolCapability:
-    name: CapabilityName
+    # ``name`` accepts a string literal at construction sites (e.g.
+    # ``ToolCapability("process.execute", ...)``); ``__post_init__`` normalises
+    # it to ``CapabilityName`` at runtime.  Pyright strict mode requires the
+    # field type to admit both.
+    name: CapabilityName | str
     modes: frozenset[str]
     scopes: frozenset[str]
 
@@ -755,13 +759,14 @@ class ToolInvocationBroker:
             for capability in capabilities
         ):
             manager = context.get("workspace_manager")
-            manager.require(
-                str(context.get("workspace_id") or ""),
-                task_id=str(context.get("task_id") or ""),
-                principal_id=str(context.get("principal_id") or ""),
-                project_id=str(context.get("project_id") or ""),
-                runtime_id=str(context.get("runtime_id") or ""),
-            )
+            if manager is not None:
+                manager.require(
+                    str(context.get("workspace_id") or ""),
+                    task_id=str(context.get("task_id") or ""),
+                    principal_id=str(context.get("principal_id") or ""),
+                    project_id=str(context.get("project_id") or ""),
+                    runtime_id=str(context.get("runtime_id") or ""),
+                )
             handler_params["workspace_manager"] = context.get("workspace_manager")
             handler_params["task_id"] = context.get("task_id")
             handler_params["workspace_id"] = context.get("workspace_id")
