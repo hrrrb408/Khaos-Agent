@@ -186,6 +186,27 @@ async def test_run_step_generation_invalidate_when_changed():
 
 
 @pytest.mark.asyncio
+async def test_generation_tracking_invalidates_legacy_generationless_done():
+    """A legacy mark_done() is not proof for a generation-aware retry."""
+    ledger = CleanupLedger()
+    ledger.mark_done("listener")
+    calls = 0
+
+    async def action() -> None:
+        nonlocal calls
+        calls += 1
+
+    generation = object()
+    assert await ledger.run_step(
+        "listener",
+        action=action,
+        resource_generation=generation,
+    ) is True
+    assert calls == 1
+    assert ledger.generation_of("listener") is generation
+
+
+@pytest.mark.asyncio
 async def test_run_step_retry_after_error_succeeds():
     """A failed step can be retried: the second successful call clears
     the error and marks done."""

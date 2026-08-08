@@ -8,10 +8,13 @@ release-ready merely because the maintainer can approve it.
 
 1. Protect `main` against force-push and deletion.
 2. Require the `Security Closure Gate` on the exact pull-request head.
-3. Require at least one approving review from a reviewer who is not the
-   author of the change for paths covered by `.github/CODEOWNERS`.
-4. Require signed release tags and retain the commit-bound Security Evidence
-   Artifact with the release record.
+3. When a second maintainer is available, require at least one approving
+   review from a reviewer who is not the author of the change for paths
+   covered by `.github/CODEOWNERS`. Until then, record the independent-review
+   control as an explicit release prerequisite rather than claiming that the
+   single-maintainer ruleset provides it.
+4. Require signed release tags, a commit-bound SBOM/provenance attestation,
+   and retain the Security Evidence Artifact with the release record.
 5. Keep GitHub Actions pinned to immutable commit SHAs; the generated
    inventory check must fail if an unpinned action is introduced.
 6. Do not merge Docker, lockfile, workflow, permission, audit, RPC, or native
@@ -44,5 +47,7 @@ Export/archive evidence before reducing any window.
 - `python scripts/generate_browser_kernel_protocol.py --check`
 - `git diff --check`
 - Security Closure Gate passed for the release commit.
+- Release SBOM, checksum manifest, and GitHub artifact provenance attestation
+  are attached to the release; the release workflow must fail on digest drift.
 - Evidence artifact, reviewer identity, signed tag, and any CI-only skips are
   recorded together.

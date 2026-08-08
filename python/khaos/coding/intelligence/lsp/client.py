@@ -68,6 +68,13 @@ class LspClient:
         self.timeout = timeout
         self.restart_limit = restart_limit
         self._process = None
+        # A process returned from ExecutionService is owned immediately,
+        # before lifecycle publication.  This closes the acquisition gap
+        # where a spawned process existed only in a local variable while a
+        # concurrent close could prove ``_process is None`` and transition
+        # CLOSED.
+        self._pending_process = None
+        self._execution_id: str | None = None
         self._reader_task: asyncio.Task | None = None
         self._pending: dict[int, asyncio.Future[dict]] = {}
         self._next_id = 0
@@ -108,8 +115,18 @@ class LspClient:
 
     @property
     def admission_closed(self) -> bool:
-        """True when new start() is permanently rejected (not NEW)."""
+        """Compatibility alias for the generation admission fence."""
         return self._lifecycle_state is not _LspState.NEW
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        """True when a new LSP process generation must be rejected."""
+        return self._lifecycle_state is not _LspState.NEW
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """True when this LSP generation cannot admit child work."""
+        return self._lifecycle_state is not _LspState.RUNNING
 
     @property
     def terminal_closed(self) -> bool:
@@ -126,10 +143,16 @@ class LspClient:
         """Descriptors of currently-held resources: LSP process, reader
         task, and ExecutionService ownership."""
         resources: list[str] = []
-        if self._process is not None:
-            resources.append(f"lsp_process:{self._process.execution_id}")
+        process = self._process or self._pending_process
+        if process is not None:
+            label = "lsp_process" if process is self._process else "lsp_pending_process"
+            resources.append(f"{label}:{process.execution_id}")
+        if self._execution_service_owns(process):
+            resources.append("execution_service:managed_process")
         if self._reader_task is not None and not self._reader_task.done():
             resources.append("lsp_reader_task")
+        if self._pending:
+            resources.append("lsp_request_transactions")
         if self._start_task is not None and not self._start_task.done():
             resources.append("lsp_start_transaction")
         return tuple(resources)
@@ -139,9 +162,23 @@ class LspClient:
         start transaction is in flight."""
         return (
             self._process is None
+            and self._pending_process is None
             and (self._reader_task is None or self._reader_task.done())
             and (self._start_task is None or self._start_task.done())
+            and not self._pending
+            and not self._execution_service_owns(None)
         )
+
+    def _execution_service_owns(self, process) -> bool:
+        """Return independent evidence that ExecutionService still owns us."""
+        execution_id = getattr(process, "execution_id", None) or self._execution_id
+        if execution_id is None:
+            return False
+        owns_execution = getattr(self.execution_service, "owns_execution", None)
+        if callable(owns_execution):
+            return bool(owns_execution(execution_id))
+        active = getattr(self.execution_service, "_active", None)
+        return isinstance(active, dict) and execution_id in active
 
     @property
     def stderr(self) -> str:
@@ -196,12 +233,19 @@ class LspClient:
                 backend_hint="managed",
             )
             process = await self.execution_service.start_managed_process(request)
+            # No await is allowed between receiving the acquired process and
+            # recording it as pending ownership.  Publication may still race
+            # with close(), but the process can no longer disappear from the
+            # owner's graph while rollback is in progress.
+            self._pending_process = process
+            self._execution_id = process.execution_id
             # Round-17 review §三: ownership publication with generation
             # validation.  After spawn returns, re-check state/generation
             # under the lock before publishing ``self._process``.  If
             # close() won the race (transitioned to CLOSING/CLOSED),
             # rollback the spawned process instead of publishing it to a
             # closed client.  This closes the spawn-after-close window.
+            published = False
             async with self._lifecycle_lock:
                 if (
                     self._lifecycle_state is not _LspState.STARTING
@@ -212,7 +256,9 @@ class LspClient:
                     pass
                 else:
                     self._process = process
-            if self._process is not process:
+                    self._pending_process = None
+                    published = True
+            if not published:
                 await self._rollback_spawned_process(process)
                 return {"ok": False, "diagnostic": LspDiagnostic("closed", "LSP client closed during start")}
             self._reader_task = asyncio.create_task(self._reader_loop())
@@ -381,79 +427,93 @@ class LspClient:
             if self._lifecycle_state is _LspState.CLOSED:
                 return
             self._cleanup_ledger.reset_errors()
-            process = self._process
+            # Include an acquired-but-not-yet-published process in cleanup.
+            # The pending slot is the ownership lease for the spawn
+            # transaction; it must not be dropped merely because publication
+            # lost the start/close race.
+            process = self._process or self._pending_process
 
-            # Steps 1+2: ensure the LSP process is terminated.
-            if process is not None and not self._cleanup_ledger.is_done("process_terminate"):
-                if process.returncode is None:
-                    try:
-                        await self._request_during_close("shutdown", {})
-                        await _write_message(process, {"jsonrpc": "2.0", "method": "exit", "params": {}})
-                        await asyncio.wait_for(process.wait(), self.timeout)
-                    except asyncio.CancelledError:
-                        cancel_requested = True
-                    except (TimeoutError, OSError, RuntimeError):
-                        pass
-                    if process.returncode is None:
-                        try:
-                            await process.terminate()
-                            try:
-                                await asyncio.wait_for(process.wait(), 2.0)
-                            except TimeoutError:
-                                await process.kill()
-                                await process.wait()
-                        except asyncio.CancelledError:
-                            cancel_requested = True
-                        except Exception as exc:  # noqa: BLE001
-                            self._cleanup_ledger.record_error("process_terminate", exc)
-                            logger.debug("LSP force-terminate failed: %s", exc)
-                if process.returncode is not None:
-                    self._cleanup_ledger.mark_done("process_terminate")
-                elif "process_terminate" not in self._cleanup_ledger.failed_steps:
-                    self._cleanup_ledger.record_error(
-                        "process_terminate",
-                        RuntimeError("process_terminate postcondition not met: returncode is None"),
-                    )
-
-            # Step 3: cancel and await reader task.
-            if not self._cleanup_ledger.is_done("reader_cancel"):
-                if self._reader_task is not None:
-                    try:
-                        self._reader_task.cancel()
-                        await asyncio.gather(self._reader_task, return_exceptions=True)
-                    except asyncio.CancelledError:
-                        cancel_requested = True
-                    except Exception as exc:  # noqa: BLE001
-                        self._cleanup_ledger.record_error("reader_cancel", exc)
-                if self._reader_task is None or self._reader_task.done():
-                    self._cleanup_ledger.mark_done("reader_cancel")
-                elif "reader_cancel" not in self._cleanup_ledger.failed_steps:
-                    self._cleanup_ledger.record_error(
-                        "reader_cancel",
-                        RuntimeError("reader_cancel postcondition not met: task still active"),
-                    )
-
-            # Step 4: fail pending requests.
-            if not self._cleanup_ledger.is_done("fail_pending"):
-                self._fail_pending(RuntimeError("LSP client closed"))
-                self._cleanup_ledger.mark_done("fail_pending")
-
-            # Step 5: terminate via ExecutionService (unregister ownership).
-            # Round-17 review §三: CancelledError during exec_terminate now
-            # enters QUARANTINED (not CLOSED) because ownership release is
-            # unproven — ExecutionService may still hold the execution_id.
-            if process is not None and not self._cleanup_ledger.is_done("exec_terminate"):
+            async def _run_step(
+                step: str,
+                action,
+                verify,
+                resource_generation=None,
+            ) -> None:
+                nonlocal cancel_requested
                 try:
-                    await self.execution_service.terminate(process.execution_id)
-                    self._cleanup_ledger.mark_done("exec_terminate")
-                except asyncio.CancelledError:
-                    self._cleanup_ledger.record_error(
-                        "exec_terminate",
-                        RuntimeError("exec_terminate cancelled — ownership release unproven"),
+                    await self._cleanup_ledger.run_step(
+                        step,
+                        action=action,
+                        verify=verify,
+                        resource_generation=resource_generation,
                     )
-                except Exception as exc:  # noqa: BLE001 — terminate during close
-                    self._cleanup_ledger.record_error("exec_terminate", exc)
-                    logger.debug("LSP execution_service.terminate failed: %s", exc)
+                except asyncio.CancelledError:
+                    # The ledger retains the failed step; continue collecting
+                    # proof for the other resources before retry/quarantine.
+                    cancel_requested = True
+
+            async def _terminate_process() -> None:
+                if process is None or process.returncode is not None:
+                    return
+                try:
+                    if process is self._process:
+                        await self._request_during_close("shutdown", {})
+                        await _write_message(
+                            process,
+                            {"jsonrpc": "2.0", "method": "exit", "params": {}},
+                        )
+                    await asyncio.wait_for(process.wait(), self.timeout)
+                except (TimeoutError, OSError, RuntimeError):
+                    pass
+                if process.returncode is None:
+                    await process.terminate()
+                    try:
+                        await asyncio.wait_for(process.wait(), 2.0)
+                    except TimeoutError:
+                        await process.kill()
+                        await process.wait()
+
+            await _run_step(
+                "process_terminate",
+                _terminate_process,
+                lambda: process is None or process.returncode is not None,
+                getattr(process, "execution_id", None),
+            )
+
+            async def _cancel_reader() -> None:
+                if self._reader_task is not None:
+                    self._reader_task.cancel()
+                    await asyncio.gather(self._reader_task, return_exceptions=True)
+
+            await _run_step(
+                "reader_cancel",
+                _cancel_reader,
+                lambda: self._reader_task is None or self._reader_task.done(),
+            )
+
+            async def _fail_pending_requests() -> None:
+                self._fail_pending(RuntimeError("LSP client closed"))
+
+            await _run_step(
+                "fail_pending",
+                _fail_pending_requests,
+                lambda: not self._pending,
+            )
+
+            # Terminate via ExecutionService and independently prove that
+            # the parent service no longer owns the execution id.
+            execution_id = getattr(process, "execution_id", None) or self._execution_id
+
+            async def _terminate_execution() -> None:
+                if execution_id is not None:
+                    await self.execution_service.terminate(execution_id)
+
+            await _run_step(
+                "exec_terminate",
+                _terminate_execution,
+                lambda: not self._execution_service_owns(process),
+                execution_id,
+            )
 
             errors = self._cleanup_ledger.errors
             if errors:
@@ -465,6 +525,8 @@ class LspClient:
                 ) from errors[0]
             self._lifecycle_state = _LspState.CLOSED
             self._process = None
+            self._pending_process = None
+            self._execution_id = None
             self._reader_task = None
             if cancel_requested:
                 raise asyncio.CancelledError()
@@ -474,9 +536,12 @@ class LspClient:
         publication failed because close() won the start/close race.
 
         Terminates the process and unregisters it from ExecutionService so
-        no resource is leaked.  Best-effort — errors are logged, not raised,
-        because the caller is already on an error path.
+        no resource is leaked.  Failure is retained as ownership: the
+        pending slot is cleared only after both the process and the service
+        ownership have terminal proof.  The concurrent close path can then
+        quarantine and retry instead of observing a false CLOSED state.
         """
+        errors: list[BaseException] = []
         try:
             if process.returncode is None:
                 try:
@@ -486,13 +551,28 @@ class LspClient:
                     except TimeoutError:
                         await process.kill()
                         await process.wait()
-                except Exception as exc:  # noqa: BLE001
+                except BaseException as exc:  # noqa: BLE001 — retain ownership on cancellation
+                    errors.append(exc)
                     logger.debug("LSP rollback: process terminate failed: %s", exc)
-        finally:
+            if process.returncode is None:
+                errors.append(RuntimeError("LSP rollback process remains live"))
             try:
                 await self.execution_service.terminate(process.execution_id)
-            except Exception as exc:  # noqa: BLE001
+            except BaseException as exc:  # noqa: BLE001 — retain ownership on cancellation
+                errors.append(exc)
                 logger.debug("LSP rollback: exec terminate failed: %s", exc)
+            if self._execution_service_owns(process):
+                errors.append(RuntimeError("LSP rollback execution ownership remains active"))
+        finally:
+            if not errors and process.returncode is not None and not self._execution_service_owns(process):
+                if self._pending_process is process:
+                    self._pending_process = None
+                self._execution_id = None
+        if errors:
+            raise RuntimeError(
+                "LSP rollback did not prove terminal ownership: "
+                + "; ".join(type(error).__name__ for error in errors)
+            ) from errors[0]
 
     async def _request_during_close(self, method: str, params: dict) -> dict:
         process = self._process
@@ -530,6 +610,10 @@ class LspClient:
         for future in tuple(self._pending.values()):
             if not future.done():
                 future.set_exception(error)
+        # Once every waiter has been given a terminal exception, the owner
+        # no longer retains a request transaction.  Individual request
+        # ``finally`` blocks may still call pop(), which is harmless.
+        self._pending.clear()
 
     def _validate_root_uri(self, root_uri: str) -> Path:
         parsed = urlparse(root_uri)

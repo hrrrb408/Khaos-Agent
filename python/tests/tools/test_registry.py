@@ -289,7 +289,6 @@ def test_security_digest_covers_more_than_schema_digest():
     parameters.  Two tools with the same name+parameters but different
     capabilities must have different security_digests."""
     from khaos.tools.registry import ToolDefinition, ToolRegistry
-    from khaos.permissions.resource import resolve_single_workspace_path
 
     cap_a = ToolCapability("filesystem.read", frozenset({"all"}), frozenset({"task-workspace"}))
     cap_b = ToolCapability("filesystem.write", frozenset({"all"}), frozenset({"task-workspace"}))
@@ -590,3 +589,8 @@ def test_runtime_registry_handlers_have_implementation_id():
             assert tool.implementation_id != "", (
                 f"{tool.name} has a handler but no implementation_id"
             )
+            assert ";generation=" in tool.implementation_id
+            assert ";build=" in tool.implementation_id
+            assert ";source=sha256:" in tool.implementation_id
+            assert tool.implementation_generation
+            assert tool.build_identity

@@ -94,6 +94,10 @@ class ProcessSupervisor:
     def active_execution_ids(self) -> tuple[str, ...]:
         return tuple(sorted(self._active))
 
+    def owns_execution(self, execution_id: str) -> bool:
+        """Return whether the supervisor still owns an execution id."""
+        return execution_id in self._active
+
     @property
     def is_closed(self) -> bool:
         """True when the supervisor no longer accepts new children.
@@ -110,6 +114,16 @@ class ProcessSupervisor:
         return self._state is not _SupervisorState.OPEN
 
     @property
+    def generation_admission_closed(self) -> bool:
+        """True when this supervisor cannot admit another process generation."""
+        return self._state is not _SupervisorState.OPEN
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """True when this supervisor cannot register another child process."""
+        return self._state is not _SupervisorState.OPEN
+
+    @property
     def terminal_closed(self) -> bool:
         """Round-17: True only when CLOSED (all resources proven terminated)."""
         return self._state is _SupervisorState.CLOSED
@@ -122,21 +136,32 @@ class ProcessSupervisor:
     def owned_resources(self) -> tuple[str, ...]:
         """Round-17 review §十四: descriptors of currently-held processes.
 
-        Returns one ``"execution:<id>"`` per active registration.  The
-        CLOSED invariant requires this to be empty — if it is non-empty
-        when ``terminal_closed`` is True, the invariant is violated.
+        Returns one descriptor per active process and per child watchdog.
+        The watchdog is part of the transitive ownership graph: removing a
+        process entry before its watchdog is settled would make an empty
+        registry a false terminal proof.
         """
-        return tuple(f"execution:{eid}" for eid in self.active_execution_ids)
+        resources: list[str] = []
+        for execution_id in self.active_execution_ids:
+            resources.append(f"execution:{execution_id}")
+            active = self._active.get(execution_id)
+            if active is not None and active.watchdog_task is not None and not active.watchdog_task.done():
+                resources.append(f"watchdog:{execution_id}")
+        return tuple(resources)
 
     def terminal_postcondition(self) -> bool:
         """Round-17 review §十四: True when every owned process is reaped.
 
-        For the supervisor this means: no active registrations remain in
-        ``_active`` (every process group has been terminated AND its
-        registry entry released).  This is the postcondition that
-        distinguishes CLOSED from QUARANTINED — a quarantined supervisor
-        may still have live processes whose death is unproven.
+        For the supervisor this means every retained process is terminal and
+        every child watchdog has settled.  The registry is intentionally
+        checked rather than treated as a source of truth: a cleanup path may
+        remove an entry only after these proofs succeed.
         """
+        for active in self._active.values():
+            if active.process.returncode is None:
+                return False
+            if active.watchdog_task is not None and not active.watchdog_task.done():
+                return False
         return len(self._active) == 0
 
     async def close(self) -> None:
@@ -260,17 +285,13 @@ class ProcessSupervisor:
             if directory_binding is not None:
                 directory_binding.close()
         active = _ActiveProcess(process)
-        try:
-            await self._register(execution_id, active)
-        except BaseException:
-            # Round-15 review P0-2: spawn committed but registration
-            # failed (supervisor closed during spawn, or duplicate id).
-            # Kill the just-spawned process group so we don't leak it.
-            await _kill_orphaned_process(process)
-            raise
         storage_roots = _storage_roots(
             process.pid, tmp_root, sandbox_storage_paths
         )
+        # Create and publish the watchdog before registering the process.
+        # Once the process enters ``_active``, the registry entry is a
+        # complete ownership record; shutdown cannot observe a process and
+        # then race with a later watchdog publication.
         watchdog_task = asyncio.create_task(
             _resource_watchdog(
                 process, active, request.permission_profile.resources,
@@ -282,6 +303,19 @@ class ProcessSupervisor:
                 storage_authority=self.storage_authority,
             ) if watchdog_enabled else _no_resource_violation()
         )
+        active.watchdog_task = watchdog_task
+        try:
+            await self._register(execution_id, active)
+        except BaseException:
+            # Round-15 review P0-2: spawn committed but registration
+            # failed (supervisor closed during spawn, or duplicate id).
+            # Kill the just-spawned process group so we don't leak it.
+            try:
+                await _kill_orphaned_process(process)
+            finally:
+                watchdog_task.cancel()
+                await asyncio.gather(watchdog_task, return_exceptions=True)
+            raise
         total_limit = request.permission_profile.resources.output_bytes
         stdout_limit = (total_limit + 1) // 2
         stderr_limit = total_limit // 2
@@ -440,34 +474,45 @@ class ProcessSupervisor:
                 f"not accepting new registrations"
             )
         active = _ActiveProcess(process)
-        try:
-            await self._register(execution_id, active)
-        except BaseException:
-            # Round-15 review P0-2: spawn committed but registration
-            # failed — kill the process group so we don't leak it.
-            await _kill_orphaned_process(process)
-            raise
+        watchdog_task: asyncio.Task[dict | None] | None = None
         if budget is not None:
             storage_roots = _storage_roots(
                 process.pid, tmp_root, sandbox_storage_paths
             )
-            active.watchdog_task = asyncio.create_task(
+            watchdog_task = asyncio.create_task(
                 _resource_watchdog(
                     process, active, budget, self._terminate_active,
                     storage_roots=storage_roots,
                 )
             )
-        return active.watchdog_task
+            active.watchdog_task = watchdog_task
+        try:
+            await self._register(execution_id, active)
+        except BaseException:
+            # Round-15 review P0-2: spawn committed but registration
+            # failed — kill the process group so we don't leak it.
+            try:
+                await _kill_orphaned_process(process)
+            finally:
+                if watchdog_task is not None:
+                    watchdog_task.cancel()
+                    await asyncio.gather(watchdog_task, return_exceptions=True)
+            raise
+        return watchdog_task
 
     async def unregister_process(self, execution_id: str) -> None:
         async with self._registry_lock:
-            active = self._active.pop(execution_id, None)
-        if (
-            active is not None
-            and active.watchdog_task is not None
-            and not active.watchdog_task.done()
-        ):
-            active.watchdog_task.cancel()
+            active = self._active.get(execution_id)
+        if active is None:
+            return
+        if active.process.returncode is None:
+            raise RuntimeError(
+                f"cannot unregister live process {execution_id}; terminal proof is missing"
+            )
+        await self._settle_watchdog(active)
+        async with self._registry_lock:
+            if self._active.get(execution_id) is active:
+                self._active.pop(execution_id, None)
 
     async def terminate(self, execution_id: str) -> bool:
         """Terminate one complete process group, returning whether it existed."""
@@ -494,8 +539,10 @@ class ProcessSupervisor:
         was swallowed as ``cancel_requested`` and the supervisor
         transitioned to CLOSED, losing the retry opportunity forever.
 
-        Round-17 review §四: CLOSED ⇒ ``_active == ∅``.  The registry is
-        cleared on successful termination so the invariant holds.
+        The registry is released one entry at a time only after the process
+        and its watchdog have both reached terminal state.  A final
+        ``dict.clear()`` is deliberately forbidden: dropping an entry is not
+        evidence that its real resource disappeared.
 
         Round-17 review §四 (amendment): the admission fence (OPEN →
         CLOSING) is set IMMEDIATELY in ``shutdown()`` before the
@@ -548,10 +595,24 @@ class ProcessSupervisor:
                 # inside terminate), record it as an error — ownership
                 # release is unproven.
                 await asyncio.shield(self.terminate(execution_id))
-                # Round-17: unregister after successful terminate so
-                # CLOSED ⇒ _active == ∅ holds.
                 async with self._registry_lock:
-                    self._active.pop(execution_id, None)
+                    active = self._active.get(execution_id)
+                if active is None:
+                    raise RuntimeError(
+                        f"execution {execution_id} disappeared before watchdog proof"
+                    )
+                await asyncio.shield(self._settle_watchdog(active))
+                if active.process.returncode is None:
+                    raise RuntimeError(
+                        f"process {execution_id} remains live after terminate"
+                    )
+                async with self._registry_lock:
+                    if self._active.get(execution_id) is active:
+                        self._active.pop(execution_id, None)
+                    else:
+                        raise RuntimeError(
+                            f"execution {execution_id} ownership changed during shutdown"
+                        )
             except asyncio.CancelledError:
                 cancel_requested = True
                 errors.append(RuntimeError(
@@ -574,11 +635,14 @@ class ProcessSupervisor:
                 f"{len(errors)} error(s): "
                 + "; ".join(type(e).__name__ for e in errors)
             ) from errors[0]
-        # Round-17: CLOSED invariant — _active must be empty.  Any entries
-        # that survived (e.g. added by a racing run() before the admission
-        # fence took effect) are cleared here.
-        async with self._registry_lock:
-            self._active.clear()
+        # Do not clear the registry to manufacture the CLOSED invariant.
+        # Any surviving entry is a failed terminal proof and must remain
+        # visible for quarantine/retry.
+        if self._active:
+            self._state = _SupervisorState.QUARANTINED
+            raise SupervisorClosedError(
+                "ProcessSupervisor shutdown left owned resources after cleanup"
+            )
         self._state = _SupervisorState.CLOSED
         if cancel_requested:
             raise asyncio.CancelledError()
@@ -599,9 +663,36 @@ class ProcessSupervisor:
     async def _unregister(
         self, execution_id: str, active: _ActiveProcess
     ) -> None:
+        if active.process.returncode is None:
+            raise RuntimeError(
+                f"cannot unregister live process {execution_id}; terminal proof is missing"
+            )
+        await self._settle_watchdog(active)
         async with self._registry_lock:
             if self._active.get(execution_id) is active:
                 self._active.pop(execution_id, None)
+
+    async def _settle_watchdog(self, active: _ActiveProcess) -> None:
+        """Cancel and await a watchdog before releasing its owner entry."""
+        watchdog = active.watchdog_task
+        if watchdog is None:
+            return
+        if not watchdog.done():
+            watchdog.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(watchdog, return_exceptions=True),
+                timeout=max(self.termination_grace_seconds, 0.1),
+            )
+        except TimeoutError as exc:
+            raise RuntimeError("process watchdog did not reach terminal state") from exc
+        if not watchdog.done():
+            raise RuntimeError("process watchdog remains pending after cancellation")
+        if watchdog.cancelled():
+            return
+        watchdog_error = watchdog.exception()
+        if watchdog_error is not None and not isinstance(watchdog_error, asyncio.CancelledError):
+            raise RuntimeError("process watchdog failed before terminal proof") from watchdog_error
 
     async def _terminate_active(self, active: _ActiveProcess) -> None:
         async with active.termination_lock:

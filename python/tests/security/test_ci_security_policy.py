@@ -38,7 +38,17 @@ def test_security_workflows_have_read_only_token_and_no_soft_failures():
     for workflow in _workflow_files():
         text = workflow.read_text(encoding="utf-8")
         parsed = yaml.safe_load(text)
-        assert parsed["permissions"] == {"contents": "read"}, workflow.name
+        if workflow.name == "release-provenance.yml":
+            # Publishing a GitHub Release and its signed attestation bundles
+            # is the one deliberate write-capable workflow.  Keep the scope
+            # exact so a future edit cannot silently grant broader access.
+            assert parsed["permissions"] == {
+                "contents": "write",
+                "id-token": "write",
+                "attestations": "write",
+            }, workflow.name
+        else:
+            assert parsed["permissions"] == {"contents": "read"}, workflow.name
         assert "continue-on-error" not in text, workflow.name
         assert "persist-credentials: false" in text, workflow.name
 

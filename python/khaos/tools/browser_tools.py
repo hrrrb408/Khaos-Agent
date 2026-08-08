@@ -204,6 +204,65 @@ class BrowserManager:
         self._process_principal: str | None = None
 
     @property
+    def admission_closed(self) -> bool:
+        """Compatibility alias for the monotonic browser-generation fence."""
+        return self.generation_admission_closed
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        """True once browser teardown has been requested."""
+        return self._closing_requested or self._closed
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """True when this manager cannot accept another page/context."""
+        return self._closing_requested or self._closed
+
+    @property
+    def terminal_closed(self) -> bool:
+        """True only when all browser-owned resources are released."""
+        return self._closed
+
+    @property
+    def is_quarantined(self) -> bool:
+        """True when teardown failed and references are intentionally retained."""
+        return self._close_failed and not self._closed
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Describe browser, contexts, sandbox, and rollback transactions."""
+        resources: list[str] = []
+        resources.extend(f"context:{key}" for key in self._contexts)
+        if self._browser is not None:
+            resources.append("browser")
+        if self._playwright is not None:
+            resources.append("playwright")
+        if self._browser_sandbox is not None:
+            resources.append("browser_sandbox")
+        resources.extend(
+            "quarantined_browser_sandbox" for _ in self._quarantined_sandboxes
+        )
+        resources.extend(
+            "quarantined_context_transaction"
+            for _ in self._quarantined_context_transactions
+        )
+        return tuple(resources)
+
+    def owned_runtime_resources(self, runtime_id: str) -> tuple[str, ...]:
+        """Describe only contexts retained by one runtime owner."""
+        if not runtime_id:
+            return ()
+        resources = [
+            f"context:{key}"
+            for key, entry in self._contexts.items()
+            if runtime_id in entry.get("_runtime_owners", set())
+        ]
+        return tuple(resources)
+
+    def terminal_postcondition(self) -> bool:
+        """Require closed state and an empty independent resource inventory."""
+        return self.terminal_closed and not self.owned_resources()
+
+    @property
     def is_ready(self) -> bool:
         """Playwright 是否已初始化且可用（至少有一个活跃 page）。"""
         return any(entry.get("page") is not None for entry in self._contexts.values())
@@ -647,11 +706,20 @@ class BrowserManager:
         teardown.  Any failure is logged but does not abort the rest of
         the teardown (we are already in a degraded state).
         """
+        # A few recovery callers construct a manager with ``__new__`` while
+        # injecting only the resources under test.  Keep the fail-closed
+        # cleanup path total for those objects without weakening the normal
+        # constructor's ownership registries.
+        if not hasattr(self, "_quarantined_sandboxes"):
+            self._quarantined_sandboxes = []
+        if not hasattr(self, "_quarantined_context_transactions"):
+            self._quarantined_context_transactions = []
         # Step 1: close every context's egress proxy + remove its nft
         # egress-pin port.  ``_close_all_contexts`` already encapsulates
         # this (force=True ignores refcounts and does proxy.close() +
         # remove_egress_port per entry).  Best-effort: a single context's
         # failure must not skip the rest or the sandbox teardown.
+        failures: list[str] = []
         try:
             await self._close_all_contexts()
         except Exception as exc:  # noqa: BLE001 — degraded-path cleanup
@@ -660,24 +728,29 @@ class BrowserManager:
                 "to browser/playwright/sandbox teardown (some proxies "
                 "or nft ports may leak)", exc,
             )
+            failures.append("contexts")
         # Batch 11.2: retry cleanup of retained rollback-failure transactions.
         try:
-            await self._cleanup_quarantined_transactions()
+            if not await self._cleanup_quarantined_transactions():
+                failures.append("quarantined_context_transactions")
         except Exception as exc:  # noqa: BLE001 — degraded-path cleanup
             logger.error("force-close: quarantine cleanup raised: %s", exc)
+            failures.append("quarantined_context_transactions")
         # Step 2: stop the browser + playwright runtime.
         if self._browser is not None:
             try:
                 await self._browser.close()
+                self._browser = None
             except Exception as exc:  # noqa: BLE001
                 logger.warning("force-close: browser.close() failed: %s", exc)
+                failures.append("browser")
         if self._playwright is not None:
             try:
                 await self._playwright.stop()
+                self._playwright = None
             except Exception as exc:  # noqa: BLE001
                 logger.warning("force-close: playwright.stop() failed: %s", exc)
-        self._browser = None
-        self._playwright = None
+                failures.append("playwright")
         # Step 3: tear down the OS-level netns sandbox (Linux).  This
         # deletes the per-sandbox nft table, veth pair, netns, cgroup, and
         # registry file.  On failure we retain ``_browser_sandbox`` so the
@@ -692,13 +765,9 @@ class BrowserManager:
                     # Partial cleanup: kernel resources remain.  Retain
                     # the sandbox reference and the context authority map
                     # so the startup Reaper can recover on next launch.
-                    self._close_failed = True
-                    return {
-                        "ok": False,
-                        "error": "browser kernel resources remain",
-                        "cleanup": cleanup.to_dict(),
-                    }
-                self._browser_sandbox = None
+                    failures.append("browser_sandbox")
+                else:
+                    self._browser_sandbox = None
             except Exception as exc:  # noqa: BLE001
                 # Batch 9.4 (round-9 §十三): teardown RAISED.  Kernel
                 # resource state is unknown — do NOT clear contexts and
@@ -709,15 +778,33 @@ class BrowserManager:
                     "sandbox reference for startup Reaper; netns/veth/"
                     "cgroup/nft may leak until next launch", exc,
                 )
-                self._close_failed = True
-                return {
-                    "ok": False,
-                    "error": "browser sandbox teardown raised",
-                    "quarantined": True,
-                    "detail": str(exc),
-                }
-        self._contexts.clear()
-        self._context_close_failures.clear()
+                failures.append("browser_sandbox teardown raised")
+        for candidate in list(self._quarantined_sandboxes):
+            try:
+                cleanup = await asyncio.to_thread(candidate.teardown)
+            except Exception as exc:  # noqa: BLE001 — retain quarantine
+                logger.error("force-close: quarantined sandbox teardown raised: %s", exc)
+                failures.append("quarantined_browser_sandbox")
+                continue
+            if cleanup.fully_closed:
+                self._quarantined_sandboxes.remove(candidate)
+            else:
+                failures.append("quarantined_browser_sandbox")
+
+        for key in tuple(self._context_close_failures):
+            if key not in self._contexts:
+                self._context_close_failures.pop(key, None)
+        remaining = self.owned_resources()
+        if failures or remaining:
+            self._close_failed = True
+            detail = ", ".join(failures) or "owned resources remain"
+            return {
+                "ok": False,
+                "error": f"browser resources remain after force-close: {detail}",
+                "failures": tuple(failures),
+                "owned_resources": remaining,
+                "quarantined": True,
+            }
         return {"ok": True}
 
     @staticmethod
@@ -774,18 +861,22 @@ class BrowserManager:
                 await self._close_all_contexts()
                 # Batch 11.2: retry cleanup of any retained rollback-failure
                 # transactions (proxy/context/port not in _contexts).
-                await self._cleanup_quarantined_transactions()
+                if not await self._cleanup_quarantined_transactions():
+                    self._close_failed = True
+                    return {
+                        "ok": False,
+                        "error": "quarantined browser resources remain",
+                    }
                 if self._browser:
                     await self._browser.close()
                 if self._playwright:
                     await self._playwright.stop()
                 self._browser = None
                 self._playwright = None
-                self._context_close_failures.clear()
                 # F-05: tear down the OS-level netns sandbox (Linux only).
-                # Best-effort: a failure here must not prevent ``_closed``
-                # from being set, since the browser and playwright are
-                # already stopped.
+                # A partial or raised teardown is safety-critical: retain
+                # the sandbox reference and return failure so ``_closed``
+                # cannot hide residual kernel ownership.
                 if self._browser_sandbox is not None:
                     try:
                         # Round-5 Batch 5.4: teardown() invokes
@@ -835,6 +926,13 @@ class BrowserManager:
                             "cleanup": cleanup.to_dict(),
                         }
                     self._quarantined_sandboxes.remove(candidate)
+                if self.owned_resources():
+                    self._close_failed = True
+                    return {
+                        "ok": False,
+                        "error": "browser cleanup completed without terminal proof",
+                        "owned_resources": self.owned_resources(),
+                    }
                 # All resources terminated cleanly — only now is the
                 # manager truly closed.  The idempotent short-circuit
                 # above will fire on subsequent calls.
@@ -1235,19 +1333,28 @@ class BrowserManager:
                     all_cleaned = False
             if port_revoked:
                 # Port revoked (or no port to revoke) → safe to close.
+                transaction_clean = True
                 ctx = tx.get("context")
                 if ctx is not None:
                     try:
                         await ctx.close()
                     except Exception as exc:  # noqa: BLE001 — best-effort
                         logger.debug("quarantine cleanup: context.close() failed: %s", exc)
+                        transaction_clean = False
                 proxy = tx.get("egress_proxy")
                 if proxy is not None:
                     try:
-                        await proxy.close()
+                        result = await proxy.close()
+                        if isinstance(result, dict) and not result.get("ok", True):
+                            transaction_clean = False
                     except Exception as exc:  # noqa: BLE001 — best-effort
                         logger.debug("quarantine cleanup: proxy.close() failed: %s", exc)
-                # Transaction fully cleaned — do NOT retain it.
+                        transaction_clean = False
+                if transaction_clean:
+                    # Transaction fully cleaned — do NOT retain it.
+                    continue
+                all_cleaned = False
+                remaining.append(tx)
             else:
                 # Port still not revoked → retain proxy + context + tx.
                 remaining.append(tx)

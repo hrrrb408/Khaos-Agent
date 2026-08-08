@@ -99,7 +99,7 @@ the product as a whole is not regressed. Both are required merge authorities.
 
 | Check name | Proves |
 |---|---|
-| `Python Product Suite` | full `python/tests/` across the Python 3.11/3.12/3.13 × Linux matrix (macOS cross-platform *security* coverage is provided by `contract (macos-14)` in the Security Closure Gate; macOS is not in the product matrix pending stabilization of macOS-specific test debt) |
+| `Python Product Suite` | full `python/tests/` across the Python 3.11/3.12/3.13 × Ubuntu 24.04 and macOS 14 matrix (infrastructure-only suites remain owned by their dedicated security workflows) |
 | `Go Product Suite` | full `go test -race ./...` |
 | `Rust Product Suite` | `cargo test --locked --all-targets` + `cargo clippy --all-targets -- -D warnings` |
 | `Product Integrity Gate` | aggregate — all three suites green (exact success required; cancelled/skipped blocks) |

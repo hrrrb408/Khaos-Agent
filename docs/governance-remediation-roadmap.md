@@ -137,27 +137,28 @@ and track findings to closure.
 **Current state.** Supply-chain engineering is strong on the *dependency*
 side: `uv.lock`, `go.sum`, `Cargo.lock`, hash-pinned requirements, SHA-pinned
 Actions, pip-audit / cargo-audit / govulncheck, Dependabot, and a provenance
-job that sha256sums the lockfiles (`supply-chain-audit.yml:36-62`). However
-there is **no signed release artifact, no SBOM, no build provenance
-attestation**, and no guarantee that a published binary's digest matches a CI
-build.
+job that sha256sums the lockfiles (`supply-chain-audit.yml:36-62`). The
+`Release Provenance` workflow now builds commit-bound source/native subjects,
+generates an SPDX SBOM plus a checksum manifest, and stores signed GitHub
+artifact-attestation bundles as release assets. A signed Git/GPG release tag
+and an independent release approver remain governance controls outside the
+workflow.
 
-**Risk.** A consumer of a Khaos binary cannot independently verify its
-provenance or composition — only rebuild from source. This weakens the
-"continuously validated" claim for anyone consuming artifacts instead of
-building from the audited commit.
+**Risk.** A consumer of a Khaos binary can now verify the workflow attestation,
+SBOM, and digest manifest, but the repository still cannot enforce signed tag
+creation or independent release approval while it has one maintainer.
 
 **Proposed resolution.**
-1. Add a release workflow producing signed artifacts (sigstore /
-   GPG-signed checksums) with **SLSA build provenance** attestations.
-2. Generate an **SBOM** (CycloneDX or SPDX) from `uv.lock` + `Cargo.lock` +
-   `go.mod` and attach it to the release.
-3. Assert that the released binary digest matches the CI-built digest
-   (reproducible-build check) and surface a mismatch as a failed gate.
-4. Align release tags with the double-approval rule from G1.
+1. Keep `.github/workflows/release-provenance.yml` as the release path;
+   it produces Sigstore-backed SLSA provenance and SBOM attestations.
+2. Keep the generated SPDX document and checksum/manifest assets attached to
+   the GitHub Release, not only in an expiring Actions artifact.
+3. Require signed release tags and independent release approval once the G1
+   maintainer prerequisite is satisfied.
 
-**Prerequisite.** A defined release process (currently there is no release
-pipeline); once it exists, provenance is additive.
+**Prerequisite.** A release owner must publish releases from the workflow and
+the repository must move from the current single-maintainer exception to
+independent tag/release approval when the second maintainer exists.
 
 ---
 

@@ -213,17 +213,20 @@ class CleanupLedger:
         done for the same generation, or this call completed it
         successfully and the postcondition held).
         """
-        # Skip if already done for the same (or untracked) generation.
+        # Skip only when an explicitly tracked generation was completed for
+        # this exact resource instance.  A caller that supplies a current
+        # generation is asking for generation-bound proof; an older
+        # generation-less ``mark_done()`` must therefore be treated as stale,
+        # not as a reusable success.  Otherwise a legacy DONE record can hide
+        # a newly acquired listener/process on the first v2 retry.
         if step in self._completed:
             if resource_generation is not None:
                 recorded = self._generations.get(step)
-                if recorded is not None and recorded != resource_generation:
+                if recorded != resource_generation:
                     # Stale DONE — the resource instance has changed.
-                    # Invalidate so the step is re-run for the new
-                    # instance.  This closes the round-17 review §五
-                    # "stale DONE" bug where a partial close + reopen
-                    # produced a new listener that the retry's ledger
-                    # skipped.
+                    # This also invalidates a legacy ``mark_done()`` with no
+                    # recorded generation.  A generation-aware caller must
+                    # never inherit an unbound completion proof.
                     self._completed.discard(step)
                     self._generations.pop(step, None)
                     self._errors.pop(step, None)
