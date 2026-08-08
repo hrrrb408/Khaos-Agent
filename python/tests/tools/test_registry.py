@@ -363,3 +363,168 @@ def test_prune_shares_frozen_definitions():
     # The definition is frozen — mutation raises.
     with pytest.raises(PermissionError, match="frozen security field"):
         tool.permission_level = "execute"
+
+
+# ---------------------------------------------------------------------------
+# Batch 16.5 (round-16 review §二十–§二十二): Deep immutable ToolDefinition
+# regression tests — nested mutations that bypass __setattr__ must be rejected.
+# ---------------------------------------------------------------------------
+
+
+def test_modes_is_tuple_after_freeze():
+    """Batch 16.5: after freeze(), ``modes`` is a tuple, not a list."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    assert isinstance(tool.modes, tuple)
+    assert not isinstance(tool.modes, list)
+
+
+def test_modes_append_rejected_after_freeze():
+    """Batch 16.5: ``tool.modes.append(...)`` must fail (tuple has no append)."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    with pytest.raises(AttributeError):
+        tool.modes.append("office")  # type: ignore[attr-defined]
+
+
+def test_modes_item_assignment_rejected_after_freeze():
+    """Batch 16.5: ``tool.modes[0] = ...`` must fail (tuple is immutable)."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    with pytest.raises(TypeError):
+        tool.modes[0] = "office"  # type: ignore[index]
+
+
+def test_parameters_nested_setitem_rejected_after_freeze():
+    """Batch 16.5: ``tool.parameters["properties"]["x"] = ...`` must raise
+    TypeError.  This is the core regression: previously __setattr__ only
+    blocked top-level reassignment, so nested mutations changed the live
+    security semantics without invalidating the cached security_digest."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    properties = tool.parameters.get("properties", {})
+    if properties:
+        with pytest.raises(TypeError, match="frozen security contract"):
+            properties["arbitrary_new_key"] = {"type": "string"}
+
+
+def test_parameters_deep_nested_setitem_rejected_after_freeze():
+    """Batch 16.5: deeply nested ``tool.parameters["properties"]["x"]["y"] = ...``
+    must also raise TypeError — _deep_freeze is recursive."""
+    from khaos.tools.registry import ToolDefinition, ToolRegistry
+
+    tool = ToolDefinition(
+        name="test_deep_freeze",
+        description="test",
+        parameters={
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "deep": {"type": "string"},
+                    },
+                },
+            },
+        },
+        modes=["coding"],
+        permission_level="read",
+        parallel=True,
+    )
+    registry = ToolRegistry(enforce_capabilities=False)
+    registry.register(tool)
+    # The deeply nested "deep" property's parent should be a _FrozenDict.
+    nested = tool.parameters["properties"]["nested"]["properties"]
+    with pytest.raises(TypeError, match="frozen security contract"):
+        nested["new_key"] = {"type": "string"}
+
+
+def test_parameters_pop_rejected_after_freeze():
+    """Batch 16.5: ``tool.parameters.pop(...)`` must raise TypeError."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    with pytest.raises(TypeError, match="frozen security contract"):
+        tool.parameters.pop("type", None)
+
+
+def test_parameters_clear_rejected_after_freeze():
+    """Batch 16.5: ``tool.parameters.clear()`` must raise TypeError."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    with pytest.raises(TypeError, match="frozen security contract"):
+        tool.parameters.clear()
+
+
+def test_parameters_update_rejected_after_freeze():
+    """Batch 16.5: ``tool.parameters.update({...})`` must raise TypeError."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    with pytest.raises(TypeError, match="frozen security contract"):
+        tool.parameters.update({"new_key": "value"})
+
+
+def test_parameters_list_value_is_frozen_after_freeze():
+    """Batch 16.5: list values inside parameters are converted to _FrozenList.
+
+    _FrozenList IS a ``list`` subclass (so ``isinstance(x, list)`` and
+    equality with regular lists work for JSON schema compatibility) but
+    rejects all mutations (``append``, ``__setitem__``, etc.).
+    """
+    from khaos.tools.registry import ToolDefinition, ToolRegistry
+
+    tool = ToolDefinition(
+        name="test_list_freeze",
+        description="test",
+        parameters={
+            "type": "object",
+            "properties": {},
+            "required": ["name", "path"],
+        },
+        modes=["coding"],
+        permission_level="read",
+        parallel=True,
+    )
+    registry = ToolRegistry(enforce_capabilities=False)
+    registry.register(tool)
+    required = tool.parameters["required"]
+    # _FrozenList is a list subclass, so isinstance check passes.
+    assert isinstance(required, list)
+    # Equality with a regular list works (critical for schema assertions).
+    assert required == ["name", "path"]
+    # Mutations are rejected.
+    with pytest.raises(TypeError, match="frozen security contract"):
+        required.append("new_field")
+    with pytest.raises(TypeError, match="frozen security contract"):
+        required[0] = "other"
+    with pytest.raises(TypeError, match="frozen security contract"):
+        del required[0]
+
+
+def test_security_digest_stable_after_attempted_mutation():
+    """Batch 16.5: the cached security_digest must NOT change even if
+    someone attempts a nested mutation (which is rejected).  This proves
+    the digest is genuinely tamper-proof."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    digest_before = tool.security_digest
+    # Attempt mutations that should all be rejected.
+    with pytest.raises(AttributeError):
+        tool.modes.append("office")  # type: ignore[attr-defined]
+    with pytest.raises(TypeError):
+        tool.parameters.pop("type", None)  # type: ignore[union-attr]
+    digest_after = tool.security_digest
+    assert digest_before == digest_after
+
+
+def test_json_serialization_works_with_frozen_parameters():
+    """Batch 16.5: _FrozenDict IS a dict subclass, so json.dumps and
+    isinstance(x, dict) continue to work — only writes are rejected."""
+    import json
+
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    # json.dumps must work (used by schema_digest and security_digest).
+    serialized = json.dumps(tool.parameters, sort_keys=True)
+    assert isinstance(json.loads(serialized), dict)
+    # isinstance(x, dict) must be True (used by validate_schema_definition).
+    assert isinstance(tool.parameters, dict)

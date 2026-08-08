@@ -11,7 +11,7 @@ import pytest
 from khaos.coding.execution.host import HostExecutionBackend
 from khaos.coding.execution.managed import ManagedProcessHandle
 from khaos.coding.execution.service import ExecutionService
-from khaos.coding.intelligence.lsp.client import LspClient, _read_message
+from khaos.coding.intelligence.lsp.client import LspClient, LspCloseError, _LspState, _read_message
 from khaos.coding.workspace.models import WorkspaceState
 
 
@@ -262,3 +262,141 @@ def test_lsp_client_has_no_direct_subprocess():
     source = inspect.getsource(module)
     assert "create_subprocess_exec" not in source
     assert "create_subprocess_shell" not in source
+
+
+# Batch 16.1/16.6 — fault-injection tests for the LSP cleanup ledger.
+#
+# Round-16 review found that ``record_error`` followed by an unconditional
+# ``mark_done`` erased errors, producing a false CLOSED state.  The fix adds
+# postcondition checks: ``process_terminate`` is only marked done when
+# ``process.returncode is not None`` and ``reader_cancel`` only when the
+# reader task is ``None`` or ``done()``.  These tests inject failures into
+# each cleanup step and assert the client enters QUARANTINED (never CLOSED)
+# on failure and transitions to CLOSED only once a retry satisfies the
+# postcondition.
+
+
+class _TerminateFailingProcess(_FakeManagedProcess):
+    """Fake LSP process whose ``terminate()`` fails on the first call.
+
+    ``wait()`` raises while the process is still alive so the graceful
+    shutdown path cannot complete, forcing the force-terminate path where
+    ``terminate()`` raises ``RuntimeError`` on the first attempt and
+    succeeds on the second.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._terminate_calls = 0
+
+    async def wait(self):
+        if self.returncode is None:
+            raise RuntimeError("process still running")
+        return self.returncode
+
+    async def terminate(self):
+        self._terminate_calls += 1
+        if self._terminate_calls == 1:
+            raise RuntimeError("terminate failed on first attempt")
+        self.returncode = -15
+        self.stdout.feed_eof()
+
+
+class _UndyingFuture(asyncio.Future):
+    """Future whose ``done()`` reports False — simulates a reader task that
+    survives ``cancel()`` + ``gather()``, violating the reader_cancel
+    postcondition."""
+
+    def done(self) -> bool:
+        return False
+
+
+async def test_lsp_close_enters_quarantined_when_terminate_fails(tmp_path: Path):
+    """``process.terminate()`` raising must enter QUARANTINED, not CLOSED."""
+    service, workspace = _runtime(tmp_path)
+    fake = _TerminateFailingProcess()
+    service.start_managed_process = AsyncMock(return_value=fake)
+    service.terminate = AsyncMock()
+    client = _client(service, workspace, tmp_path / "server", timeout=0.2)
+    assert (await client.start(workspace.worktree_path.as_uri()))["ok"]
+
+    # First close: force-terminate raises → QUARANTINED (a false CLOSED would
+    # have nulled _process and hidden the still-alive server).
+    with pytest.raises(LspCloseError):
+        await client.close()
+    assert client._lifecycle_state is _LspState.QUARANTINED
+    assert client._process is fake
+
+    # Second close: terminate() now succeeds, postcondition met → CLOSED.
+    await client.close()
+    assert client._lifecycle_state is _LspState.CLOSED
+    assert client._process is None
+    assert client._reader_task is None
+
+
+async def test_lsp_close_enters_quarantined_when_reader_task_not_done(tmp_path: Path):
+    """A reader task that survives cancel+gather must enter QUARANTINED."""
+    service, workspace = _runtime(tmp_path)
+    fake = _FakeManagedProcess()
+    service.start_managed_process = AsyncMock(return_value=fake)
+    service.terminate = AsyncMock()
+    client = _client(service, workspace, tmp_path / "server", timeout=0.2)
+    assert (await client.start(workspace.worktree_path.as_uri()))["ok"]
+
+    # Swap in a reader task whose done() stays False even though gather()
+    # completes — the reader_cancel postcondition is violated.
+    real_task = client._reader_task
+    real_task.cancel()
+    await asyncio.gather(real_task, return_exceptions=True)
+    undying = _UndyingFuture()
+    undying.set_result(None)
+    client._reader_task = undying
+    # Process already exited so process_terminate is not the failure source.
+    fake.returncode = 0
+
+    with pytest.raises(LspCloseError):
+        await client.close()
+    assert client._lifecycle_state is _LspState.QUARANTINED
+    assert client._process is fake
+
+
+async def test_lsp_close_quarantined_retry_succeeds(tmp_path: Path):
+    """A QUARANTINED close retries only the failed step and reaches CLOSED."""
+    service, workspace = _runtime(tmp_path)
+    fake = _TerminateFailingProcess()
+    service.start_managed_process = AsyncMock(return_value=fake)
+    service.terminate = AsyncMock()
+    client = _client(service, workspace, tmp_path / "server", timeout=0.2)
+    assert (await client.start(workspace.worktree_path.as_uri()))["ok"]
+
+    with pytest.raises(LspCloseError):
+        await client.close()
+    assert client._lifecycle_state is _LspState.QUARANTINED
+    assert not client._cleanup_ledger.is_done("process_terminate")
+
+    # Retry: the failed step is re-run and the postcondition is now met.
+    await client.close()
+    assert client._lifecycle_state is _LspState.CLOSED
+    assert client._cleanup_ledger.is_done("process_terminate")
+    assert client._process is None
+    assert client._reader_task is None
+    # exec_terminate completed on the first attempt and is not redone.
+    service.terminate.assert_awaited_once_with(fake.execution_id)
+
+
+async def test_lsp_close_exec_terminate_failure_enters_quarantined(tmp_path: Path):
+    """``execution_service.terminate()`` raising must enter QUARANTINED."""
+    service, workspace = _runtime(tmp_path)
+    fake = _FakeManagedProcess()
+    service.start_managed_process = AsyncMock(return_value=fake)
+    service.terminate = AsyncMock(side_effect=RuntimeError("exec terminate failed"))
+    client = _client(service, workspace, tmp_path / "server", timeout=0.2)
+    assert (await client.start(workspace.worktree_path.as_uri()))["ok"]
+
+    with pytest.raises(LspCloseError):
+        await client.close()
+    assert client._lifecycle_state is _LspState.QUARANTINED
+    # Only exec_terminate failed; the earlier steps completed cleanly.
+    assert client._cleanup_ledger.is_done("process_terminate")
+    assert client._cleanup_ledger.is_done("reader_cancel")
+    assert not client._cleanup_ledger.is_done("exec_terminate")

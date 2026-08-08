@@ -4,8 +4,11 @@ import asyncio
 import base64
 from urllib.parse import urlsplit
 
+import pytest
+
 from khaos.security.browser_egress_proxy import BrowserEgressProxy
 from khaos.security.browser_egress_proxy import _parse_tls_sni
+from khaos.security.browser_egress_proxy import _read_tls_client_hello
 from khaos.security.host_network import ValidatedTarget
 
 
@@ -300,17 +303,20 @@ async def test_connect_sni_missing_is_rejected():
         await server.wait_closed()
 
 
-async def test_connect_non_tls_tunnel_is_forwarded():
-    """CONNECT allowed.example + non-TLS data (plain TCP) → forwarded.
+async def test_connect_non_tls_is_rejected():
+    """Batch 16.3: CONNECT + non-TLS data → rejected.
 
-    Batch 15.5 revision: CONNECT tunnels that carry plain TCP (e.g.
-    ``ws://`` WebSocket upgrades) are forwarded without SNI validation —
-    the SNI check only applies when the first byte is 0x16 (TLS
-    Handshake).  The CONNECT authority was already validated by
-    ``authorize_url``, so the destination is authorized regardless of
-    whether TLS is used.
+    Production CONNECT is TLS-only.  A compromised Chromium can send
+    ``CONNECT allowed.example:80`` (which the proxy authorizes at the
+    domain level) and then emit a plain HTTP request whose ``Host``
+    header is ``blocked.example`` — if both domains share a CDN / ALB,
+    the upstream would serve the blocked virtual host.  By requiring
+    the first bytes to be a TLS ClientHello, the proxy prevents this
+    virtual-host identity bypass.  Plain HTTP (http://, ws://) must use
+    the normal HTTP proxy absolute-form request path, not CONNECT.
     """
     async def echo(reader, writer):
+        # Should never receive data — non-TLS is rejected before relay.
         data = await reader.read(4096)
         if data:
             writer.write(data)
@@ -333,19 +339,61 @@ async def test_connect_non_tls_tunnel_is_forwarded():
         assert await reader.readuntil(b"\r\n\r\n") == (
             b"HTTP/1.1 200 Connection Established\r\n\r\n"
         )
-        # Send non-TLS data (plain HTTP GET — e.g. a WebSocket upgrade).
-        plain_request = b"GET / HTTP/1.1\r\nHost: allowed.example\r\n\r\n"
+        # Send non-TLS data (plain HTTP GET — the virtual-host bypass
+        # attack vector).
+        plain_request = b"GET / HTTP/1.1\r\nHost: blocked.example\r\n\r\n"
         writer.write(plain_request)
         await writer.drain()
-        # Non-TLS data is forwarded (not rejected) — the echo server
-        # returns it.
-        echoed = await asyncio.wait_for(
-            reader.readexactly(len(plain_request)), timeout=5.0,
-        )
-        assert echoed == plain_request
+        # The proxy must reject — connection closed or 403.
+        response = await asyncio.wait_for(reader.read(), timeout=5.0)
+        assert response == b"" or b"403" in response
         writer.close()
         await writer.wait_closed()
     finally:
         await proxy.close()
         server.close()
         await server.wait_closed()
+
+
+async def test_read_tls_client_hello_handles_split_record():
+    """Batch 16.4: incremental TLS parser handles TCP-fragmented ClientHello.
+
+    ``StreamReader.read(n)`` does not guarantee a complete TLS record in
+    one call — TCP may fragment it.  ``readexactly`` blocks until the
+    exact number of bytes is available, correctly handling split
+    ClientHellos that would previously cause false-deny on legitimate
+    HTTPS.
+    """
+    hello = _build_tls_client_hello("allowed.example")
+    reader = asyncio.StreamReader()
+    # Split the ClientHello at an arbitrary boundary (e.g. after 5 bytes
+    # — the record header — and then the rest).
+    reader.feed_data(hello[:5])
+    reader.feed_data(hello[5:])
+    reader.feed_eof()
+    result = await _read_tls_client_hello(reader)
+    assert result == hello
+    assert _parse_tls_sni(result) == "allowed.example"
+
+
+async def test_read_tls_client_hello_rejects_non_tls():
+    """Batch 16.4: non-TLS first byte → _NonTlsConnectError."""
+    from khaos.security.browser_egress_proxy import _NonTlsConnectError
+
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"GET / HTTP/1.1\r\n\r\n")
+    reader.feed_eof()
+    with pytest.raises(_NonTlsConnectError, match="requires TLS"):
+        await _read_tls_client_hello(reader)
+
+
+async def test_read_tls_client_hello_rejects_oversized_record():
+    """Batch 16.4: TLS record body exceeding the bound → ValueError."""
+    reader = asyncio.StreamReader()
+    # Craft a TLS record header claiming a body larger than the limit.
+    oversized_length = 32 * 1024  # > _MAX_TLS_RECORD_BYTES (16 KiB)
+    header = b"\x16\x03\x01" + oversized_length.to_bytes(2, "big")
+    reader.feed_data(header)
+    reader.feed_eof()
+    with pytest.raises(ValueError, match="exceeds limit"):
+        await _read_tls_client_hello(reader)

@@ -435,14 +435,39 @@ class ProcessSupervisor:
         snapshot.  If any terminate raises, the supervisor enters
         ``QUARANTINED`` (not ``CLOSED``) so callers can detect the partial
         teardown.
+
+        Batch 16.2 (round-16 review §八–§十): QUARANTINED is now retryable.
+        Previously QUARANTINED was a permanent terminal state — a second
+        ``shutdown()`` call immediately raised ``SupervisorClosedError``
+        without attempting to terminate remaining active processes.  This
+        broke the ``CleanupLedger`` retry semantics in ExecutionService:
+        the ledger recorded ``supervisor:shutdown`` as failed, retried on
+        the next ``shutdown()`` call, but the Supervisor refused to
+        cooperate.  Now QUARANTINED → CLOSING on retry, and only the
+        still-active executions are terminated.
         """
         if self._state is _SupervisorState.CLOSED:
             return
+        # Batch 16.2: QUARANTINED is retryable — transition back to
+        # CLOSING so we attempt to terminate any remaining active
+        # processes.  If there are no active processes, the supervisor
+        # transitions cleanly to CLOSED.
         if self._state is _SupervisorState.QUARANTINED:
-            raise SupervisorClosedError(
-                "ProcessSupervisor already quarantined; resources may be live"
-            )
-        self._state = _SupervisorState.CLOSING
+            if not self._active:
+                # All processes were cleaned up on a prior attempt;
+                # the quarantine was caused by a transient error that
+                # has since resolved.  Transition to CLOSED.
+                self._state = _SupervisorState.CLOSED
+                return
+            # Retry: transition to CLOSING and attempt to terminate
+            # the remaining active processes.
+            self._state = _SupervisorState.CLOSING
+        elif self._state is _SupervisorState.CLOSING:
+            # Concurrent shutdown call — let the first one proceed.
+            return
+        else:
+            # OPEN → CLOSING.
+            self._state = _SupervisorState.CLOSING
         errors: list[Exception] = []
         cancel_requested = False
         for execution_id in self.active_execution_ids:

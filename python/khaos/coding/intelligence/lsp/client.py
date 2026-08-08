@@ -216,8 +216,13 @@ class LspClient:
             # Steps 1+2: ensure the LSP process is terminated.  The graceful
             # ``shutdown`` request is best-effort — its failure (timeout,
             # stream error) just triggers force-terminate.  The combined
-            # step ``process_terminate`` is marked done when the process is
-            # confirmed dead (returncode is not None).
+            # step ``process_terminate`` is marked done ONLY when the
+            # postcondition is met: process.returncode is not None.
+            # Batch 16.1 (round-16 review §四–§六): previously mark_done
+            # was called unconditionally after record_error, which erased
+            # the error via CleanupLedger.mark_done's ``_errors.pop()``.
+            # This was a textbook false-close: the ledger reported no
+            # errors even though the process was still alive.
             if process is not None and not self._cleanup_ledger.is_done("process_terminate"):
                 if process.returncode is None:
                     # Try graceful shutdown first.
@@ -246,9 +251,20 @@ class LspClient:
                         except Exception as exc:  # noqa: BLE001
                             self._cleanup_ledger.record_error("process_terminate", exc)
                             logger.debug("LSP force-terminate failed: %s", exc)
-                self._cleanup_ledger.mark_done("process_terminate")
+                # Postcondition: process must be confirmed dead.
+                if process.returncode is not None:
+                    self._cleanup_ledger.mark_done("process_terminate")
+                elif not self._cleanup_ledger.failed_steps or "process_terminate" not in self._cleanup_ledger.failed_steps:
+                    # No error was recorded but postcondition is not met
+                    # (e.g. CancelledError interrupted before terminate
+                    # could run).  Record a postcondition violation.
+                    self._cleanup_ledger.record_error(
+                        "process_terminate",
+                        RuntimeError("process_terminate postcondition not met: returncode is None"),
+                    )
 
             # Step 3: cancel and await reader task.
+            # Batch 16.1: mark_done only when reader_task is None or done().
             if not self._cleanup_ledger.is_done("reader_cancel"):
                 if self._reader_task is not None:
                     try:
@@ -258,7 +274,14 @@ class LspClient:
                         cancel_requested = True
                     except Exception as exc:  # noqa: BLE001
                         self._cleanup_ledger.record_error("reader_cancel", exc)
-                self._cleanup_ledger.mark_done("reader_cancel")
+                # Postcondition: reader_task is None or done.
+                if self._reader_task is None or self._reader_task.done():
+                    self._cleanup_ledger.mark_done("reader_cancel")
+                elif not self._cleanup_ledger.failed_steps or "reader_cancel" not in self._cleanup_ledger.failed_steps:
+                    self._cleanup_ledger.record_error(
+                        "reader_cancel",
+                        RuntimeError("reader_cancel postcondition not met: task still active"),
+                    )
 
             # Step 4: fail pending requests.
             if not self._cleanup_ledger.is_done("fail_pending"):
@@ -266,6 +289,7 @@ class LspClient:
                 self._cleanup_ledger.mark_done("fail_pending")
 
             # Step 5: terminate via ExecutionService (unregister from supervisor).
+            # Batch 16.1: mark_done only after successful terminate.
             if process is not None and not self._cleanup_ledger.is_done("exec_terminate"):
                 try:
                     await self.execution_service.terminate(process.execution_id)

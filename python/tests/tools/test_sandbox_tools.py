@@ -183,13 +183,13 @@ async def test_sandbox_build_is_internal_fail_closed(tmp_path):
 def test_sandbox_registry_capabilities_and_static_process_audit():
     registry = create_runtime_registry()
     sandbox = registry.get("sandbox_exec")
-    assert sandbox.modes == ["coding"]
+    assert sandbox.modes == ("coding",)
     assert {capability.name for capability in sandbox.capabilities} == {
         "process.execute", "filesystem.write",
     }
     assert all(capability.scopes == frozenset({"task-workspace"}) for capability in sandbox.capabilities)
     build = registry.get("sandbox_build")
-    assert build.modes == ["internal"]
+    assert build.modes == ("internal",)
     assert {capability.name for capability in build.capabilities} == {"host.integration"}
     import khaos.tools.sandbox_tools as module
     source = inspect.getsource(module)

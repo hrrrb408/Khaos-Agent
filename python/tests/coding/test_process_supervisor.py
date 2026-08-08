@@ -506,6 +506,143 @@ async def test_legacy_host_subclass_without_super_init_is_still_supervised(
     assert backend.supervisor.active_execution_ids == ()
 
 
+# ---------------------------------------------------------------------------
+# Batch 16.2 (round-16 review §八–§十): ProcessSupervisor QUARANTINED retry
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_supervisor_quarantined_retry_terminates_remaining_processes():
+    """Batch 16.2: QUARANTINED is retryable — a second shutdown() call
+    transitions back to CLOSING and terminates remaining active processes.
+
+    Round-16 review §八–§十: previously QUARANTINED was a permanent
+    terminal state that raised SupervisorClosedError on every subsequent
+    shutdown() call.  This broke the CleanupLedger retry semantics in
+    ExecutionService: the ledger recorded ``supervisor:shutdown`` as
+    failed and retried on the next call, but the Supervisor refused to
+    cooperate.  Now QUARANTINED → CLOSING on retry.
+    """
+    from khaos.coding.execution.supervisor import (
+        SupervisorClosedError,
+        _SupervisorState,
+    )
+
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+
+    # Register a mock process that is "alive" (returncode is None).
+    class _MockProcess:
+        def __init__(self):
+            self.pid = None  # type: ignore[assignment]
+            self.returncode: int | None = None
+
+        async def wait(self):
+            return self.returncode or 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    mock_process = _MockProcess()
+    await supervisor.register_process("quarantine-retry", mock_process)  # type: ignore[arg-type]
+
+    # Patch _terminate_active to fail on the first call.
+    original_terminate = supervisor._terminate_active
+    call_count = 0
+
+    async def failing_terminate(active):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise RuntimeError("transient termination failure")
+        # Second call: mark the process as dead and call the original.
+        active.process.returncode = -15  # type: ignore[attr-defined]
+        await original_terminate(active)
+
+    supervisor._terminate_active = failing_terminate  # type: ignore[assignment]
+
+    # First shutdown → QUARANTINED (terminate raised).
+    with pytest.raises(SupervisorClosedError, match="1 error"):
+        await supervisor.shutdown()
+    assert supervisor._state is _SupervisorState.QUARANTINED
+    # The process is still registered — QUARANTINED retains ownership.
+    assert "quarantine-retry" in supervisor.active_execution_ids
+
+    # Second shutdown → retry: QUARANTINED → CLOSING → terminates remaining.
+    await supervisor.shutdown()
+    assert supervisor._state is _SupervisorState.CLOSED
+    # The process was terminated (returncode set) — shutdown() terminates
+    # but does not unregister (that is run()'s responsibility via finally).
+    # The key invariant: the supervisor reached CLOSED, proving the retry
+    # successfully terminated the remaining process.
+
+
+@pytest.mark.asyncio
+async def test_supervisor_quarantined_with_no_active_transitions_to_closed():
+    """Batch 16.2: if all processes were cleaned up on a prior attempt,
+    a QUARANTINED supervisor transitions directly to CLOSED on retry."""
+    from khaos.coding.execution.supervisor import _SupervisorState
+
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+
+    # Manually set the state to QUARANTINED with no active processes.
+    supervisor._state = _SupervisorState.QUARANTINED
+    assert supervisor.active_execution_ids == ()
+
+    # Retry: no active processes → CLOSED.
+    await supervisor.shutdown()
+    assert supervisor._state is _SupervisorState.CLOSED
+
+
+@pytest.mark.asyncio
+async def test_supervisor_quarantined_not_closed():
+    """Batch 16.2: after a failed shutdown, is_closed must NOT be True.
+    QUARANTINED is a retained-resource-owner state, not a terminal state."""
+    from khaos.coding.execution.supervisor import (
+        SupervisorClosedError,
+        _SupervisorState,
+    )
+
+    supervisor = ProcessSupervisor(termination_grace_seconds=0.1)
+
+    class _MockProcess:
+        def __init__(self):
+            self.pid = None  # type: ignore[assignment]
+            self.returncode: int | None = None
+
+        async def wait(self):
+            return self.returncode or 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    mock_process = _MockProcess()
+    await supervisor.register_process("quarantine-check", mock_process)  # type: ignore[arg-type]
+
+    async def always_failing(active):
+        raise RuntimeError("persistent failure")
+
+    supervisor._terminate_active = always_failing  # type: ignore[assignment]
+
+    with pytest.raises(SupervisorClosedError):
+        await supervisor.shutdown()
+
+    # QUARANTINED, not CLOSED — is_closed should be True because
+    # the state is not OPEN (admission fence is active), but the
+    # process is still owned.
+    assert supervisor._state is _SupervisorState.QUARANTINED
+    assert supervisor.is_closed is True  # not OPEN → admission fence active
+    assert "quarantine-check" in supervisor.active_execution_ids
+    # Registration must be rejected (admission fence).
+    with pytest.raises(SupervisorClosedError):
+        await supervisor.register_process("new", _MockProcess())  # type: ignore[arg-type]
+
+
 async def _wait_until_active(
     supervisor: ProcessSupervisor, execution_id: str
 ) -> None:

@@ -238,6 +238,110 @@ _SECURITY_FIELDS: frozenset[str] = frozenset({
 })
 
 
+class _FrozenDict(dict):
+    """Batch 16.5: a dict subclass that rejects mutations after freezing.
+
+    Round-16 review §二十–§二十二: ``ToolDefinition.__setattr__`` only
+    prevents top-level reassignment (``tool.parameters = ...``), but
+    nested mutations (``tool.parameters["properties"]["x"] = ...``) bypass
+    ``__setattr__`` entirely.  ``_FrozenDict`` overrides every mutator to
+    raise ``TypeError``, and ``_deep_freeze`` recursively converts nested
+    dicts and lists so the entire security contract is deeply immutable.
+
+    ``_FrozenDict`` IS a ``dict`` subclass, so ``isinstance(x, dict)`` and
+    ``json.dumps(x)`` continue to work — only writes are rejected.
+    """
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        raise TypeError(
+            f"frozen security contract: cannot set {key!r}"
+        )
+
+    def __delitem__(self, key: Any) -> None:
+        raise TypeError(
+            f"frozen security contract: cannot delete {key!r}"
+        )
+
+    def pop(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot pop")
+
+    def popitem(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot popitem")
+
+    def clear(self) -> None:
+        raise TypeError("frozen security contract: cannot clear")
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot update")
+
+    def setdefault(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot setdefault")
+
+
+class _FrozenList(list):
+    """Batch 16.5: a list subclass that rejects mutations after freezing.
+
+    Unlike converting lists to tuples (which breaks ``isinstance(x, list)``
+    and equality checks like ``["path"] == ("path",)``), ``_FrozenList``
+    IS a ``list`` subclass so JSON serialization, ``isinstance`` checks,
+    and equality comparisons with regular lists all work correctly.
+    Only writes (``append``, ``__setitem__``, ``extend``, etc.) are
+    rejected.
+    """
+
+    def __setitem__(self, index: Any, value: Any) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot set list item")
+
+    def __delitem__(self, index: Any) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot delete list item")
+
+    def append(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot append")
+
+    def extend(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot extend")
+
+    def insert(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot insert")
+
+    def remove(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot remove")
+
+    def pop(self, *args: Any, **kwargs: Any) -> Any:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot pop")
+
+    def clear(self) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot clear")
+
+    def sort(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot sort")
+
+    def reverse(self) -> None:  # type: ignore[override]
+        raise TypeError("frozen security contract: cannot reverse")
+
+
+def _deep_freeze(obj: Any) -> Any:
+    """Recursively convert mutable containers to frozen subclasses.
+
+    dict → ``_FrozenDict`` (dict subclass, rejects writes)
+    list → ``_FrozenList`` (list subclass, rejects writes)
+    Other types → as-is
+
+    This prevents nested mutations like
+    ``tool.parameters["properties"]["x"] = ...`` or
+    ``tool.parameters["required"].append("secret")`` after the
+    ``ToolDefinition`` is frozen.  Both ``_FrozenDict`` and
+    ``_FrozenList`` are subclasses of their respective base types, so
+    ``isinstance`` checks, ``json.dumps``, and equality comparisons with
+    regular dicts/lists all work correctly — only writes are rejected.
+    """
+    if isinstance(obj, dict):
+        return _FrozenDict({k: _deep_freeze(v) for k, v in obj.items()})
+    if isinstance(obj, list):
+        return _FrozenList(_deep_freeze(item) for item in obj)
+    return obj
+
+
 @dataclass
 class ToolDefinition:
     """Declarative tool definition.
@@ -249,6 +353,19 @@ class ToolDefinition:
     registration.  The :attr:`security_digest` property covers ALL security
     fields and is cached at freeze time so post-registration mutations are
     both prevented (``__setattr__``) and detectable (digest mismatch).
+
+    Batch 16.5 (round-16 review §二十–§二十二): the freeze is now DEEP.
+    Previously ``__setattr__`` only prevented top-level reassignment
+    (``tool.modes = ...``), but nested mutations
+    (``tool.modes.append("office")``, ``tool.parameters["properties"]["x"]
+    = ...``) bypassed ``__setattr__`` entirely because they operate on the
+    mutable container object, not the attribute slot.  Now ``freeze()``
+    converts ``modes`` to ``tuple`` (no ``.append``) and ``parameters`` to
+    a recursively frozen ``_FrozenDict`` (every mutator raises
+    ``TypeError``).  This makes the cached ``security_digest`` genuinely
+    tamper-proof: no post-registration mutation can change the live
+    security semantics without going through ``__setattr__`` (which is
+    blocked) or the frozen containers (which reject writes).
     """
 
     name: str
@@ -293,9 +410,22 @@ class ToolDefinition:
         security field raises :class:`PermissionError`.  The
         :attr:`security_digest` is cached so subsequent reads are O(1)
         and reflect the frozen snapshot.
+
+        Batch 16.5: the freeze is now DEEP.  ``modes`` is converted to
+        ``tuple`` (``.append`` / ``.extend`` / ``__setitem__`` all fail
+        on tuples) and ``parameters`` is recursively converted to
+        ``_FrozenDict`` (every dict mutator raises ``TypeError``).  This
+        prevents nested mutations that bypass ``__setattr__`` and would
+        otherwise change the live security semantics without invalidating
+        the cached ``security_digest``.
         """
         if self._frozen:
             return
+        # Batch 16.5: deep-freeze mutable security containers BEFORE
+        # computing the digest so the cached digest reflects the frozen
+        # (immutable) structure, not the pre-freeze mutable one.
+        object.__setattr__(self, "modes", tuple(self.modes))
+        object.__setattr__(self, "parameters", _deep_freeze(self.parameters))
         object.__setattr__(self, "_security_digest", self._compute_security_digest())
         object.__setattr__(self, "_frozen", True)
 
