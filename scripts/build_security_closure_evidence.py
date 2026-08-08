@@ -18,6 +18,7 @@ REQUIRED_TESTS = (
     "browser_dns_rebinding",
     "helper_confused_deputy",
     "process_tree_escape",
+    "resource_ownership_closure",
 )
 
 

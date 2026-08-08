@@ -121,6 +121,23 @@ jobs:
             --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
             --job closure-adversarial --test process_tree_escape \
             --runner-os "$RUNNER_OS" --output evidence/process_tree_escape.json
+      - name: Resource Ownership Closure E2E
+        # Round-17 review §十五: unified lifecycle proof matrix.
+        # Every ResourceOwner (LSP, ProcessSupervisor, BrowserEgressProxy)
+        # must pass the same behaviour matrix: start-after-close rejected,
+        # concurrent close joins same task, first-close-failure retries,
+        # cleanup exception → QUARANTINED, CancelledError → QUARANTINED,
+        # CLOSED ⇒ no owned resources.  Also runs the CleanupLedger v2
+        # suite (run_step postcondition / generation invalidation).
+        run: |
+          python -m pytest \
+            python/tests/coding/test_resource_owner_closure.py \
+            python/tests/coding/test_cleanup_ledger.py \
+            -q -v
+          python scripts/build_security_closure_evidence.py test-fragment \
+            --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
+            --job closure-adversarial --test resource_ownership_closure \
+            --runner-os "$RUNNER_OS" --output evidence/resource_ownership_closure.json
       - name: Event-loop Starvation Tests
         run: |
           python -m pytest \

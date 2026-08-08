@@ -51,6 +51,7 @@ jobs:
         # machine), the cleanup ledger, the LSP client, the browser egress
         # proxy, the tool registry, and the approval broker.  These are all
         # security-critical surfaces that previously had no static-type gate.
+        # Round-17: added resource_owner.py (unified ResourceOwner protocol).
         run: |
           uv run pyright \
             python/khaos/runtime/authority.py \
@@ -59,6 +60,7 @@ jobs:
             python/khaos/coding/execution/service.py \
             python/khaos/coding/execution/supervisor.py \
             python/khaos/coding/execution/cleanup_ledger.py \
+            python/khaos/coding/execution/resource_owner.py \
             python/khaos/coding/intelligence/lsp/client.py \
             python/khaos/security/browser_egress_proxy.py \
             python/khaos/tools/registry.py \
