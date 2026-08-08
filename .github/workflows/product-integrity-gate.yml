@@ -47,14 +47,11 @@ jobs:
         # pyproject declares requires-python = ">=3.11". CI previously fixed
         # 3.11 only, so 3.12/3.13 were claimed-supported but never tested.
         #
-        # Linux is the production deployment target — the suite must be green
-        # there.  macOS is covered for the *security contract* by the
-        # ``contract (macos-14)`` job in the Security Closure Gate; the full
-        # product suite is not run on macOS here because the repo has a tail
-        # of macOS-specific test flakes (no Docker daemon, git-commit SIGTERM
-        # timing) that are pre-existing debt unrelated to this gate's purpose.
-        # Re-add ``macos-14`` to ``os`` once those flakes are stabilized.
-        os: [ubuntu-24.04]
+        # The full product suite is required on both supported desktop
+        # platforms.  Linux remains the production deployment target; the
+        # macOS cell prevents the separate security-contract matrix from
+        # masking product regressions in the desktop build.
+        os: [ubuntu-24.04, macos-14]
         python-version: ["3.11", "3.12", "3.13"]
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
@@ -86,9 +83,6 @@ jobs:
         # lsp_real tests DO run here — they only need the optional extras
         # (installed above), not external infrastructure.
         #
-        # On macOS runners (no Docker daemon), test_m4_batch3_1_trusted_verification
-        # would need --ignore.  macOS is not currently in the matrix (see comment
-        # above) so this is only relevant if macOS is re-added.
         run: >-
           uv run pytest python/tests/ -q
           -m "not browser_real and not docker_sandbox_real and not production_sandbox_real and not kernel_real and not platform_sandbox_real"

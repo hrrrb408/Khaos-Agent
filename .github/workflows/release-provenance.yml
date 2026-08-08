@@ -1,0 +1,70 @@
+name: Release Provenance
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attest
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release-provenance:
+    name: Release SBOM and provenance
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: "1.24.x"
+          cache-dependency-path: go/go.mod
+      - name: Build release subjects
+        run: |
+          set -euo pipefail
+          release_commit="$(git rev-parse HEAD)"
+          tag_commit="$(git rev-list -n 1 "refs/tags/${RELEASE_TAG}")"
+          test "$release_commit" = "$tag_commit"
+          mkdir -p dist
+          git archive --format=tar.gz --prefix="khaos-${RELEASE_TAG}/" \
+            -o "dist/khaos-${RELEASE_TAG}-source.tar.gz" HEAD
+          (cd go && go build -trimpath -o "../dist/khaos-gateway-linux-amd64" ./cmd/gateway)
+          cargo build --locked --release --no-default-features \
+            --bin khaos-exec-launcher --manifest-path rust/khaos-core/Cargo.toml
+          cp rust/khaos-core/target/release/khaos-exec-launcher \
+            dist/khaos-exec-launcher-linux-amd64
+          python3 scripts/generate_release_evidence.py \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --artifact-dir "$GITHUB_WORKSPACE/dist" \
+            --commit "$release_commit" --tag "$RELEASE_TAG"
+      - name: Generate signed SLSA provenance attestation
+        id: provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/release-checksums.txt
+      - name: Generate signed SBOM attestation
+        id: sbom
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-checksums: dist/release-checksums.txt
+          sbom-path: dist/sbom.spdx.json
+      - name: Preserve attestation bundles in the release record
+        run: |
+          cp "${{ steps.provenance.outputs.bundle-path }}" dist/release-provenance.sigstore.json
+          cp "${{ steps.sbom.outputs.bundle-path }}" dist/release-sbom.sigstore.json
+      - name: Upload immutable release evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" dist/* --clobber

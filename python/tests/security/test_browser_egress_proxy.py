@@ -103,6 +103,49 @@ async def test_http_proxy_uses_authorized_ip_not_browser_dns():
         await server.wait_closed()
 
 
+async def test_proxy_close_proves_relay_children_and_upstream_terminal():
+    """Closing the authority must settle relay tasks and the upstream socket."""
+    origin_started = asyncio.Event()
+    origin_closed = asyncio.Event()
+
+    async def origin(reader, writer):
+        try:
+            await reader.readuntil(b"\r\n\r\n")
+            origin_started.set()
+            await reader.read()
+        finally:
+            writer.close()
+            await writer.wait_closed()
+            origin_closed.set()
+
+    server = await asyncio.start_server(origin, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    proxy = BrowserEgressProxy(_PinnedGuard())  # type: ignore[arg-type]
+    await proxy.start()
+    reader, writer = await asyncio.open_connection(
+        "127.0.0.1", int(urlsplit(proxy.server_url).port or 0),
+    )
+    writer.write(
+        f"GET http://relay.example.invalid:{port}/ HTTP/1.1\r\n"
+        f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
+    )
+    await writer.drain()
+    await asyncio.wait_for(origin_started.wait(), timeout=5.0)
+
+    await asyncio.wait_for(proxy.close(), timeout=5.0)
+    assert proxy.terminal_closed
+    assert proxy.terminal_postcondition()
+    assert proxy.owned_resources() == ()
+    assert await reader.read() == b""
+    # External oracle: the origin handler observed EOF and completed; this is
+    # independent of the proxy's internal task/resource inventory.
+    await asyncio.wait_for(origin_closed.wait(), timeout=5.0)
+    writer.close()
+    await writer.wait_closed()
+    server.close()
+    await server.wait_closed()
+
+
 async def test_connect_tunnel_is_authorized_and_dns_pinned():
     async def echo(reader, writer):
         # Read whatever the proxy forwards (the ClientHello) and echo it

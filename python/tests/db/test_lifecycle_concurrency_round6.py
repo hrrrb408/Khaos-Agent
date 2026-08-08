@@ -223,7 +223,7 @@ async def test_s18_close_waits_for_in_flight_read(tmp_path):
         await db.close()
         close_done.set()
 
-    reader = asyncio.create_task(hold_read())
+    reader_task = asyncio.create_task(hold_read())
     closer = asyncio.create_task(do_close())
     # Give close a moment to reach the drain wait.
     await asyncio.sleep(0.1)
@@ -233,6 +233,7 @@ async def test_s18_close_waits_for_in_flight_read(tmp_path):
     await asyncio.wait_for(read_done.wait(), timeout=2.0)
     # Now close() should complete promptly.
     await asyncio.wait_for(closer, timeout=_READER_DRAIN_TIMEOUT + 2)
+    await asyncio.wait_for(reader_task, timeout=2.0)
 
 
 async def test_s18_read_lease_tracks_active_readers(tmp_path):
@@ -293,10 +294,14 @@ async def test_s16_maintenance_failure_skips_everything_downstream():
     all skipped (nothing downstream runs)."""
     from khaos.grpc_server import _emergency_instance_cleanup
 
-    agent = MagicMock(); agent.shutdown = AsyncMock()
-    sub = MagicMock(); sub.shutdown = AsyncMock()
-    maint = MagicMock(); maint.stop = AsyncMock(side_effect=RuntimeError("x"))
-    db = MagicMock(); db.close = AsyncMock()
+    agent = MagicMock()
+    agent.shutdown = AsyncMock()
+    sub = MagicMock()
+    sub.shutdown = AsyncMock()
+    maint = MagicMock()
+    maint.stop = AsyncMock(side_effect=RuntimeError("x"))
+    db = MagicMock()
+    db.close = AsyncMock()
 
     result = await _emergency_instance_cleanup(
         agent=agent, db=db, subagent_service=sub, maintenance=maint,
@@ -313,10 +318,14 @@ async def test_s16_all_succeed_closes_db():
     work after the fail-stop change)."""
     from khaos.grpc_server import _emergency_instance_cleanup
 
-    agent = MagicMock(); agent.shutdown = AsyncMock()
-    sub = MagicMock(); sub.shutdown = AsyncMock()
-    maint = MagicMock(); maint.stop = AsyncMock()
-    db = MagicMock(); db.close = AsyncMock()
+    agent = MagicMock()
+    agent.shutdown = AsyncMock()
+    sub = MagicMock()
+    sub.shutdown = AsyncMock()
+    maint = MagicMock()
+    maint.stop = AsyncMock()
+    db = MagicMock()
+    db.close = AsyncMock()
 
     result = await _emergency_instance_cleanup(
         agent=agent, db=db, subagent_service=sub, maintenance=maint,
@@ -355,17 +364,20 @@ async def test_s15_force_close_invokes_close_all_contexts_and_sandbox_teardown()
     with patch.object(
         mgr, "_close_all_contexts", new=AsyncMock()
     ) as mock_close_all:
-        await mgr._force_close_browser_locked()
+        result = await mgr._force_close_browser_locked()
 
     mock_close_all.assert_awaited_once()
     browser_mock.close.assert_awaited_once()
     playwright_mock.stop.assert_awaited_once()
     sandbox_mock.teardown.assert_called_once()
-    # Implementation nulls the references after a clean teardown.
+    # The injected close-all mock intentionally leaves the context registry;
+    # force-close must retain that ownership and report failure rather than
+    # manufacture a clean terminal state.
+    assert result["ok"] is False
     assert mgr._browser is None
     assert mgr._playwright is None
     assert mgr._browser_sandbox is None
-    assert mgr._contexts == {}
+    assert "k1" in mgr._contexts
 
 
 async def test_s15_force_close_retains_sandbox_on_teardown_failure():
@@ -375,8 +387,10 @@ async def test_s15_force_close_retains_sandbox_on_teardown_failure():
     from khaos.tools.browser_tools import BrowserManager
 
     mgr = BrowserManager.__new__(BrowserManager)
-    mgr._browser = MagicMock(); mgr._browser.close = AsyncMock()
-    mgr._playwright = MagicMock(); mgr._playwright.stop = AsyncMock()
+    mgr._browser = MagicMock()
+    mgr._browser.close = AsyncMock()
+    mgr._playwright = MagicMock()
+    mgr._playwright.stop = AsyncMock()
     mgr._contexts = {}
     mgr._context_close_failures = {}
     sandbox = MagicMock()

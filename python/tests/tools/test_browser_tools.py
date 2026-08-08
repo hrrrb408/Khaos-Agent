@@ -281,7 +281,7 @@ async def test_context_close_failure_retains_owner_for_retry():
 
 
 async def test_repeated_context_close_failure_forces_browser_generation_closed():
-    """H4: the third Context failure may terminate the owning Browser."""
+    """H4: repeated Context failure quarantines without hiding ownership."""
     class FailingContext:
         async def close(self):
             raise RuntimeError("context still running")
@@ -306,9 +306,13 @@ async def test_repeated_context_close_failure_forces_browser_generation_closed()
         with pytest.raises(RuntimeError, match="still running"):
             await manager.close_runtime("r")
     result = await manager.close_runtime("r")
-    assert result["forced_browser_close"] is True
+    # The browser generation may be stopped as a containment action, but the
+    # failing Context remains owned and the operation cannot report success.
+    assert result["ok"] is False
+    assert result["owned_resources"]
+    assert manager.is_quarantined
+    assert key in manager._contexts
     assert browser.closed == 1
-    assert not manager._contexts
 
 
 async def test_context_lifecycle_has_no_unbounded_per_key_lock_table():

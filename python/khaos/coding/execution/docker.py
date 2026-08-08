@@ -42,13 +42,48 @@ import os, signal, stat, subprocess, sys, time
 limit = int(sys.argv[1])
 command = sys.argv[3:]
 process = subprocess.Popen(command, start_new_session=True)
+process_group = str(process.pid)
+
+def process_group_pids(group_id):
+    members = []
+    complete = True
+    try:
+        pids = os.listdir('/proc')
+    except OSError:
+        return members, False
+    for pid in pids:
+        if not pid.isdigit():
+            continue
+        stat_path = f'/proc/{pid}/stat'
+        try:
+            with open(stat_path, encoding='ascii') as stat_file:
+                stat_line = stat_file.read()
+            closing_parenthesis = stat_line.rfind(')')
+            if closing_parenthesis < 0:
+                if pid == group_id:
+                    complete = False
+                continue
+            fields = stat_line[closing_parenthesis + 2:].split()
+            if len(fields) < 3 or fields[2] != group_id:
+                continue
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            # Unrelated namespace processes may be hidden from this user;
+            # only an observation failure for our own process is fatal.
+            if pid == group_id:
+                complete = False
+            continue
+        members.append(pid)
+    return members, complete
+
 while process.poll() is None:
     total = 0
     seen = set()
     complete = True
-    for pid in os.listdir('/proc'):
-        if not pid.isdigit():
-            continue
+    pids, group_complete = process_group_pids(process_group)
+    complete = complete and group_complete
+    for pid in pids:
         root = f'/proc/{pid}/fd'
         try:
             names = os.listdir(root)

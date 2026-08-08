@@ -102,6 +102,34 @@ class OfficeMutationAuthority:
         # caught by the re-check inside the lock.
         self._closing: bool = False
 
+    @property
+    def generation_admission_closed(self) -> bool:
+        """True once this authority refuses another mutation generation."""
+        return self._closing
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """True once no new mutation worker can be admitted."""
+        return self._closing
+
+    @property
+    def terminal_closed(self) -> bool:
+        """True after shutdown fenced admission and all workers settled."""
+        return self._closing and not self._inflight
+
+    @property
+    def is_quarantined(self) -> bool:
+        """Office workspaces are fail-closed, but not a separate quarantine."""
+        return False
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Expose in-flight mutation workers as transitive ownership."""
+        return tuple(f"office_mutation:{id(task)}" for task in self._inflight)
+
+    def terminal_postcondition(self) -> bool:
+        """Return the shutdown proof consumed by the Runtime owner."""
+        return self.terminal_closed and not self.owned_resources()
+
     async def workspace_for_root(self, root: Path) -> OfficeWorkspace:
         """Return (creating if necessary) the Office workspace for ``root``.
 

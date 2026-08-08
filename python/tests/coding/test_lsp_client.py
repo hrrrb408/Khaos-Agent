@@ -235,6 +235,38 @@ async def test_lsp_works_with_fake_managed_process(tmp_path):
     service.terminate.assert_awaited_once_with("fake-lsp")
 
 
+async def test_lsp_pending_spawn_stays_owned_until_rollback(tmp_path):
+    """A returned-but-unpublished process cannot disappear from ownership."""
+    service, workspace = _runtime(tmp_path)
+    fake = _FakeManagedProcess()
+    spawned = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_start(_request):
+        spawned.set()
+        await release.wait()
+        return fake
+
+    service.start_managed_process = delayed_start
+    service.terminate = AsyncMock()
+    client = _client(service, workspace, tmp_path / "trusted-server")
+
+    start_task = asyncio.create_task(client.start(workspace.worktree_path.as_uri()))
+    await spawned.wait()
+    close_task = asyncio.create_task(client.close())
+    await asyncio.sleep(0)
+    assert client.generation_admission_closed
+    release.set()
+
+    result = await start_task
+    await close_task
+    assert result["ok"] is False
+    assert fake.returncode is not None
+    assert client.terminal_closed
+    assert client._pending_process is None
+    assert client.owned_resources() == ()
+
+
 async def test_execution_service_managed_process_backend_and_environment_fail_closed(tmp_path):
     service, workspace = _runtime(tmp_path)
     server = tmp_path / "server.py"

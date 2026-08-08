@@ -1,6 +1,8 @@
-# Security-critical ownership.  Repository rules must require an independent
-# approval for these paths; CODEOWNERS alone is not a substitute for branch
-# protection or a second human reviewer.
+# Security-critical ownership.  Once a second maintainer is available, the
+# repository ruleset must require an independent approval for these paths.
+# CODEOWNERS alone is not a substitute for branch protection or a second human
+# reviewer; the current single-maintainer exception is audited and recorded
+# as an external release prerequisite.
 
 /python/khaos/security/ @hrrrb408
 /python/khaos/permissions/ @hrrrb408

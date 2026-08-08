@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import os
 from collections.abc import Awaitable, Callable
@@ -396,6 +397,12 @@ class ToolDefinition:
     # :meth:`bind_handler` to change implementations invalidates old
     # approval bindings.
     implementation_id: str = ""
+    # Round-18: production bindings additionally carry a reviewed
+    # implementation generation and the build/commit identity that produced
+    # the callable.  These remain runtime-wiring fields but are included in
+    # the approval security digest below.
+    implementation_generation: str = ""
+    build_identity: str = ""
     # Batch 15.6: internal freeze state — not part of the public contract.
     _frozen: bool = field(default=False, repr=False, compare=False)
     _security_digest: str | None = field(default=None, repr=False, compare=False)
@@ -449,6 +456,9 @@ class ToolDefinition:
         self,
         handler: Callable[..., Awaitable[Any]],
         implementation_id: str,
+        *,
+        implementation_generation: str = "",
+        build_identity: str = "",
     ) -> None:
         """Wire up the runtime handler AND record its implementation identity.
 
@@ -469,7 +479,9 @@ class ToolDefinition:
         """
         object.__setattr__(self, "handler", handler)
         object.__setattr__(self, "implementation_id", implementation_id)
-        # Recompute the cached digest so it includes implementation_id.
+        object.__setattr__(self, "implementation_generation", implementation_generation)
+        object.__setattr__(self, "build_identity", build_identity)
+        # Recompute the cached digest so it includes the complete binding.
         object.__setattr__(self, "_security_digest", self._compute_security_digest())
 
     @property
@@ -543,6 +555,8 @@ class ToolDefinition:
             # the security contract so swapping the handler invalidates
             # old approval bindings.
             "implementation_id": self.implementation_id,
+            "implementation_generation": self.implementation_generation,
+            "build_identity": self.build_identity,
         }
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -2493,6 +2507,22 @@ def create_builtin_registry() -> ToolRegistry:
     return registry
 
 
+def _handler_source_digest(handler: Callable[..., Awaitable[Any]]) -> str:
+    """Hash the reviewed callable source/code for runtime binding identity."""
+    try:
+        payload = inspect.getsource(handler).encode("utf-8")
+    except (OSError, TypeError):
+        code = getattr(handler, "__code__", None)
+        payload = repr(
+            (
+                getattr(code, "co_code", b""),
+                getattr(code, "co_consts", ()),
+                getattr(code, "co_names", ()),
+            )
+        ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def create_runtime_registry() -> ToolRegistry:
     """Create a built-in registry with concrete P0-B tool handlers.
 
@@ -2524,9 +2554,24 @@ def create_runtime_registry() -> ToolRegistry:
     registry = create_builtin_registry()
 
     def _bind(name: str, handler: Callable[..., Awaitable[Any]], module: str) -> None:
-        """Bind a handler with its qualified implementation identity."""
-        impl_id = f"{module}.{getattr(handler, '__qualname__', handler.__name__)}"
-        registry.get(name).bind_handler(handler, impl_id)
+        """Bind a handler to source, generation, and build identity."""
+        qualname = getattr(handler, "__qualname__", handler.__name__)
+        generation = os.environ.get("KHAOS_IMPLEMENTATION_GENERATION", "round18")
+        build_identity = (
+            os.environ.get("KHAOS_BUILD_ID")
+            or os.environ.get("GITHUB_SHA")
+            or "unattested-source"
+        )
+        impl_id = (
+            f"{module}.{qualname};generation={generation};"
+            f"build={build_identity};source=sha256:{_handler_source_digest(handler)}"
+        )
+        registry.get(name).bind_handler(
+            handler,
+            impl_id,
+            implementation_generation=generation,
+            build_identity=build_identity,
+        )
 
     _bind("channel_list", channel_tools.channel_list, "khaos.tools.channel_tools")
     _bind("channel_health", channel_tools.channel_health, "khaos.tools.channel_tools")

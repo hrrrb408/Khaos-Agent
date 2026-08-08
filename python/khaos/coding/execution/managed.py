@@ -100,6 +100,52 @@ class ManagedProcessHandle:
         return self._finalize_state is FinalizeState.CLOSED
 
     @property
+    def admission_closed(self) -> bool:
+        """Compatibility alias for the process-generation fence."""
+        return self.generation_admission_closed
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        """True once finalization has begun and a new process is impossible."""
+        return self._finalize_state is not FinalizeState.OPEN
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """True once this managed process can no longer accept child work."""
+        return self._finalize_state is not FinalizeState.OPEN
+
+    @property
+    def terminal_closed(self) -> bool:
+        """True only after every handle-owned resource is finalized."""
+        return self._finalize_state is FinalizeState.CLOSED
+
+    @property
+    def is_quarantined(self) -> bool:
+        """True when finalization failed and ownership is retained."""
+        return self._finalize_state is FinalizeState.QUARANTINED
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Describe process, child tasks, and temporary storage still owned."""
+        resources: list[str] = []
+        if not self.terminal_closed:
+            resources.append(f"managed_process:{self.execution_id}")
+        if not self._stderr_task.done():
+            resources.append("managed_stderr_task")
+        if self._resource_watchdog is not None and not self._resource_watchdog.done():
+            resources.append("managed_watchdog_task")
+        if self._temporary_home is not None and self._temporary_home.exists():
+            resources.append("managed_temporary_home")
+        return tuple(resources)
+
+    def terminal_postcondition(self) -> bool:
+        """Return independent terminal proof for this managed process."""
+        return self.terminal_closed and not self.owned_resources()
+
+    async def close(self) -> None:
+        """ResourceOwner alias for :meth:`aclose`."""
+        await self.aclose()
+
+    @property
     def stderr_text(self) -> str:
         return self._stderr.decode("utf-8", errors="replace")
 
@@ -226,65 +272,77 @@ class ManagedProcessHandle:
         self._cleanup_ledger.reset_errors()
         cancel_requested = False
 
-        async def _try_async_step(label: str, coro_factory) -> None:
+        async def _run_step(label: str, coro_factory, verify) -> None:
             nonlocal cancel_requested
-            if self._cleanup_ledger.is_done(label):
-                return
             try:
-                await coro_factory()
-                self._cleanup_ledger.mark_done(label)
+                await self._cleanup_ledger.run_step(
+                    label,
+                    action=coro_factory,
+                    verify=verify,
+                    resource_generation=(
+                        self.execution_id
+                        if label in {"unregister", "on_terminal"}
+                        else None
+                    ),
+                )
             except asyncio.CancelledError:
                 cancel_requested = True
-                # Round-14 review P0-5: a cancelled step did NOT complete —
-                # record it as an error so the finalize enters QUARANTINED
-                # (not CLOSED).  Without this, a cancelled unregister/on_terminal
-                # would leave the supervisor/active-entry alive while the
-                # handle reported CLOSED.
-                self._cleanup_ledger.record_error(
-                    label, RuntimeError(f"step {label} was cancelled (incomplete)"),
-                )
                 logger.debug("managed process finalize step %s cancelled (incomplete)", label)
-            except Exception as exc:  # noqa: BLE001
-                self._cleanup_ledger.record_error(label, exc)
+            except Exception:  # noqa: BLE001
                 logger.debug("managed process finalize step %s failed", label, exc_info=True)
 
-        await _try_async_step("stderr", self._finish_stderr)
-        await _try_async_step("watchdog", self._finish_resource_watchdog)
+        await _run_step(
+            "stderr",
+            self._finish_stderr,
+            lambda: self._stderr_task.done(),
+        )
+        await _run_step(
+            "watchdog",
+            self._finish_resource_watchdog,
+            lambda: self._resource_watchdog is None
+            or self._resource_watchdog.done(),
+        )
 
         # Capture into locals so pyright can narrow the Optional types.
         supervisor = self._supervisor
         if supervisor is not None:
-            await _try_async_step(
+            await _run_step(
                 "unregister",
                 lambda: supervisor.unregister_process(self.execution_id),
+                lambda: not _supervisor_owns(supervisor, self.execution_id),
             )
 
         on_terminal = self._on_terminal
         if on_terminal is not None:
-            await _try_async_step(
+            callback_done = False
+
+            async def _notify_terminal() -> None:
+                nonlocal callback_done
+                await on_terminal(self.execution_id)
+                callback_done = True
+
+            await _run_step(
                 "on_terminal",
-                lambda: on_terminal(self.execution_id),
+                _notify_terminal,
+                lambda: callback_done,
             )
 
         # temp-home removal: OBSERVABLE (round-13 P0-3). A real OSError
         # (permission, mount, open handle) must not be silently swallowed.
-        if self._temporary_home is not None and not self._cleanup_ledger.is_done("temp_home"):
-            try:
-                shutil.rmtree(self._temporary_home)
-                self._cleanup_ledger.mark_done("temp_home")
-            except FileNotFoundError:
-                self._cleanup_ledger.mark_done("temp_home")  # already gone — fine
-            except asyncio.CancelledError:
-                cancel_requested = True
-            except OSError as exc:
-                self._cleanup_ledger.record_error("temp_home", exc)
-                logger.debug("managed process finalize temp-home removal failed", exc_info=True)
-                # If the temp home still exists after rmtree, it's a real leak.
-                if self._temporary_home.exists():
-                    self._cleanup_ledger.record_error(
-                        "temp_home",
-                        OSError(f"temp home {self._temporary_home} still exists after rmtree"),
-                    )
+        if self._temporary_home is not None:
+            temporary_home = self._temporary_home
+
+            async def _remove_temp_home() -> None:
+                try:
+                    await asyncio.to_thread(shutil.rmtree, temporary_home)
+                except FileNotFoundError:
+                    return
+
+            await _run_step(
+                "temp_home",
+                _remove_temp_home,
+                lambda: not temporary_home.exists(),
+            )
 
         errors = self._cleanup_ledger.errors
         if errors:
@@ -327,6 +385,17 @@ class ManagedProcessHandle:
             self._resource_violation = await self._resource_watchdog
         except asyncio.CancelledError:
             return
+
+
+def _supervisor_owns(supervisor, execution_id: str) -> bool:
+    """Return a fail-closed supervisor ownership result for cleanup proof."""
+    owns = getattr(supervisor, "owns_execution", None)
+    if callable(owns):
+        return bool(owns(execution_id))
+    active_ids = getattr(supervisor, "active_execution_ids", None)
+    if active_ids is not None:
+        return execution_id in active_ids
+    return True
 
 
 def _signal_process_tree(pid: int | None, sig: signal.Signals, fallback) -> None:

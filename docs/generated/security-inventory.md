@@ -32,7 +32,7 @@
 
 ## GitHub Actions governance
 
-- Workflow action references inspected: `71`; immutable SHA-pinned/local references: `71`.
+- Workflow action references inspected: `75`; immutable SHA-pinned/local references: `75`.
 - Unpinned third-party actions (must remain empty): none.
 - Security-sensitive paths are covered by `.github/CODEOWNERS`; the repository reference ruleset preserves sole-maintainer liveness, so independent approval remains an external release prerequisite and is not verified locally.
 
@@ -51,9 +51,9 @@
 - `python/khaos/channels/webhook.py`: `653bc2281748abc42b7ad9e295e69586ab01bba3a1aedfc92c692c80a0253232`
 - `python/khaos/permissions/engine.py`: `4e6f03ed55584e11a240dca71be91d61556f11ce240a246627f75829a1af5939`
 - `python/khaos/permissions/rules.py`: `173df51bf720843e339e026c5219a0db7e2b69beaa45576b2e24ee17764dfe6f`
-- `python/khaos/coding/execution/service.py`: `3b61b9cd181a5cd2faae5732f46fd1a8d82e6d964a526cc2e473248e99b76ff7`
+- `python/khaos/coding/execution/service.py`: `a5a75afe57a5ff8064fea5188e29defc9aa355242d675251b7585aec7ee52af7`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `4fa9fd1cefb35f50b6c5d3a64e5f1c7d2bb22eba66c77b917fd22246e37c1a1f`
+- `python/khaos/coding/execution/supervisor.py`: `8543643b63f00cbb7b24e77c3e6a1eec6651280479509223314c04e27f2da5ef`
 - `python/khaos/grpc_server.py`: `a98ad97f729ad985edffeaf92d1392eca3352d806f554ea83718f2bac3aa7327`
 - `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`
 - `go/cmd/gateway/main.go`: `75d14ad26917ddf15ddc38ce75f6bc0a1fcd214909c958849e7ae18054b81ed7`

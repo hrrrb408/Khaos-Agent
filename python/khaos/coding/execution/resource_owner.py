@@ -51,15 +51,36 @@ from typing import Protocol, runtime_checkable
 class ResourceOwner(Protocol):
     """Unified lifecycle contract for security resource owners.
 
-    Implementations: :class:`~khaos.coding.execution.supervisor.ProcessSupervisor`,
-    :class:`~khaos.coding.intelligence.lsp.client.LspClient`,
+    Implementations include :class:`~khaos.coding.execution.service.ExecutionService`,
+    :class:`~khaos.coding.execution.managed.ManagedProcessHandle`,
+    :class:`~khaos.coding.execution.supervisor.ProcessSupervisor`,
+    :class:`~khaos.coding.intelligence.lsp.client.LspClient`, and
     :class:`~khaos.security.browser_egress_proxy.BrowserEgressProxy`.
 
-    The three admission/terminal properties form a partition:
+    Admission is deliberately split into two independent fences:
 
-      - ``admission_closed`` is True for every non-NEW/non-OPEN state
-        (CLOSING, QUARANTINED, CLOSED).  Once True, ``start()`` / new
-        resource admission is permanently rejected.
+      - ``generation_admission_closed`` prevents another owner generation
+        from being started after the current generation is opened or close
+        has been requested.
+      - ``child_admission_closed`` controls resources accepted by an already
+        running generation (for example, BrowserEgressProxy client
+        connections).
+
+    ``admission_closed`` remains a compatibility alias for the generation
+    fence.  New lifecycle code must use the explicit property that matches
+    the resource being admitted.
+
+    The terminal properties form a partition:
+
+      - ``generation_admission_closed`` is True once a generation has been
+        opened or close has been requested.  It permanently rejects
+        ``start()`` for that owner.
+      - ``child_admission_closed`` is True while the owner is not accepting
+        child resources.  A running Browser proxy intentionally has
+        ``generation_admission_closed=True`` and
+        ``child_admission_closed=False``.
+      - ``admission_closed`` aliases ``generation_admission_closed`` for
+        older callers.
 
       - ``is_quarantined`` is True only for QUARANTINED.  Resources may
         still be alive; a retry via ``close()`` can make forward progress.
@@ -79,13 +100,21 @@ class ResourceOwner(Protocol):
 
     @property
     def admission_closed(self) -> bool:
-        """True when new resource admission is permanently rejected.
+        """Compatibility alias for ``generation_admission_closed``.
 
-        This becomes True as soon as ``close()`` begins (CLOSING) and
-        stays True through QUARANTINED and CLOSED.  It is the
-        "spawn-after-close" fence: once True, ``start()`` must raise,
-        not silently re-create a listener/process.
+        Use ``generation_admission_closed`` or
+        ``child_admission_closed`` for new code.
         """
+        ...
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        """True when a new owner generation must be rejected."""
+        ...
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """True when this generation cannot accept another child resource."""
         ...
 
     @property

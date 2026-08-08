@@ -73,6 +73,49 @@ class _ConnectionStats:
         )
 
 
+@dataclass(eq=False)
+class _RelayLease:
+    """Structured owner for one bidirectional upstream connection.
+
+    The handler owns this lease, and the lease owns both relay tasks and the
+    upstream writer.  A handler cannot become terminal until ``close()`` has
+    cancelled/awaited both children and ``wait_closed()`` has completed for
+    the upstream transport.
+    """
+
+    upstream_writer: asyncio.StreamWriter
+    tasks: set[asyncio.Task] = field(default_factory=set)
+    terminal: bool = False
+    _close_error: BaseException | None = None
+
+    def create_task(self, coroutine) -> asyncio.Task:
+        """Create and publish a child task before the next cancellable await."""
+        task = asyncio.create_task(coroutine)
+        self.tasks.add(task)
+        return task
+
+    async def close(self) -> None:
+        """Cancel, settle, and close every resource in this lease."""
+        for task in tuple(self.tasks):
+            if not task.done():
+                task.cancel()
+        if self.tasks:
+            await asyncio.gather(*tuple(self.tasks), return_exceptions=True)
+        self.tasks = {task for task in self.tasks if not task.done()}
+        errors: list[BaseException] = []
+        try:
+            self.upstream_writer.close()
+            await self.upstream_writer.wait_closed()
+        except BaseException as exc:  # noqa: BLE001 — retain lease on failure
+            errors.append(exc)
+        if errors:
+            self._close_error = errors[0]
+            self.terminal = False
+            raise RuntimeError("relay upstream transport did not reach terminal state") from errors[0]
+        self.tasks.clear()
+        self.terminal = True
+
+
 class _ByteLimitExceeded(Exception):
     """Raised when a connection exceeds its upload or download byte cap."""
 
@@ -200,12 +243,19 @@ class BrowserEgressProxy:
         self._connection_semaphore = asyncio.Semaphore(max_concurrent)
         self._client_tasks: set[asyncio.Task] = set()
         self._client_writers: set[asyncio.StreamWriter] = set()
+        self._relay_leases: set[_RelayLease] = set()
+        self._upstream_writers: set[asyncio.StreamWriter] = set()
         self._cleanup_ledger = CleanupLedger()
         self._auth_token = secrets.token_urlsafe(32)
         # Round-17 review §五: typed lifecycle state + lock + shared task.
         self._state = _ProxyState.NEW
         self._lifecycle_lock = asyncio.Lock()
         self._close_task: asyncio.Task | None = None
+        # Monotonic close fence set synchronously by close(), before the
+        # cleanup task gets a scheduling turn.  This prevents start() from
+        # admitting a new listener generation in that window.
+        self._close_requested = False
+        self._server_generation = 0
         # Round-17 review §七: policy-based local-service exception for
         # non-TLS CONNECT.  Previously the proxy used an IP-based check
         # (``all(addr.is_loopback for addr in target.addresses)``) to
@@ -233,8 +283,18 @@ class BrowserEgressProxy:
 
     @property
     def admission_closed(self) -> bool:
-        """Round-17: True when new start() is permanently rejected."""
-        return self._state is not _ProxyState.NEW
+        """Compatibility alias for the generation admission fence."""
+        return self.generation_admission_closed
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        """True after the listener generation has been opened or fenced."""
+        return self._close_requested or self._state is not _ProxyState.NEW
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """True unless this open generation is accepting client connections."""
+        return self._state is not _ProxyState.OPEN
 
     @property
     def terminal_closed(self) -> bool:
@@ -249,9 +309,10 @@ class BrowserEgressProxy:
     def owned_resources(self) -> tuple[str, ...]:
         """Round-17 review §十四: descriptors of currently-held resources.
 
-        Returns one descriptor per live listener, in-flight handler task,
-        and open client writer.  The CLOSED invariant requires this to
-        be empty.
+        Returns one descriptor per listener, handler, relay lease, and
+        transport still retained by this owner.  Relay child tasks and the
+        upstream writer are explicit transitive ownership, not naked tasks
+        hidden behind a handler.
         """
         resources: list[str] = []
         if self._server is not None:
@@ -260,8 +321,15 @@ class BrowserEgressProxy:
             if not task.done():
                 resources.append(f"handler:{id(task)}")
         for writer in self._client_writers:
-            if not writer.is_closing():
-                resources.append(f"writer:{id(writer)}")
+            resources.append(f"writer:{id(writer)}")
+        for lease in self._relay_leases:
+            if not lease.terminal:
+                resources.append(f"relay:{id(lease)}")
+                for task in lease.tasks:
+                    if not task.done():
+                        resources.append(f"relay_task:{id(task)}")
+        for writer in self._upstream_writers:
+            resources.append(f"upstream_writer:{id(writer)}")
         return tuple(resources)
 
     def terminal_postcondition(self) -> bool:
@@ -269,8 +337,11 @@ class BrowserEgressProxy:
         handler tasks are done, and all client writers are closed."""
         return (
             self._server is None
-            and all(t.done() for t in self._client_tasks)
-            and all(w.is_closing() for w in self._client_writers)
+            and not self._client_tasks
+            and not self._client_writers
+            and not self._upstream_writers
+            and all(lease.terminal for lease in self._relay_leases)
+            and not self._relay_leases
         )
 
     @property
@@ -314,17 +385,21 @@ class BrowserEgressProxy:
             async def _tracked_handler(
                 reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
             ) -> None:
-                if self._state is not _ProxyState.OPEN:
-                    writer.close()
-                    return
                 current_task = asyncio.current_task()
                 if current_task is not None:
                     self._client_tasks.add(current_task)
                 self._client_writers.add(writer)
                 try:
+                    if self._state is not _ProxyState.OPEN:
+                        writer.close()
+                        try:
+                            await writer.wait_closed()
+                        except BaseException:  # noqa: BLE001 — retain ownership
+                            return
+                        self._client_writers.discard(writer)
+                        return
                     await self._handle_client(reader, writer)
                 finally:
-                    self._client_writers.discard(writer)
                     if current_task is not None:
                         self._client_tasks.discard(current_task)
 
@@ -334,6 +409,7 @@ class BrowserEgressProxy:
                 port=0,
                 limit=_MAX_HEADER_BYTES,
             )
+            self._server_generation += 1
             self._state = _ProxyState.OPEN
 
     async def close(self) -> None:
@@ -345,8 +421,12 @@ class BrowserEgressProxy:
         retryable, (3) CLOSED is only reached when all resources are
         proven terminated.
         """
-        if self._state is _ProxyState.CLOSED:
-            return
+        async with self._lifecycle_lock:
+            if self._state is _ProxyState.CLOSED:
+                return
+            self._close_requested = True
+            if self._state is not _ProxyState.QUARANTINED:
+                self._state = _ProxyState.CLOSING
         if self._close_task is not None and not self._close_task.done():
             await asyncio.shield(self._close_task)
             return
@@ -358,76 +438,110 @@ class BrowserEgressProxy:
         async with self._lifecycle_lock:
             if self._state is _ProxyState.CLOSED:
                 return
-            if self._state is _ProxyState.QUARANTINED:
-                # Retryable — transition to CLOSING.
-                pass
-            elif self._state is _ProxyState.CLOSING:
-                return
             self._state = _ProxyState.CLOSING
             self._cleanup_ledger.reset_errors()
 
-            # Step 1: close the listener so no new connections are accepted.
-            if not self._cleanup_ledger.is_done("listener_close"):
-                if self._server is not None:
-                    self._server.close()
-                    try:
-                        await self._server.wait_closed()
-                    except Exception:  # noqa: BLE001 — best-effort
-                        pass
-                    self._server = None
-                self._cleanup_ledger.mark_done("listener_close")
+            # Step 1: stop the listener so no new connections are accepted.
+            # ``Server.wait_closed()`` also waits for accepted connections on
+            # Python 3.13, so the actual wait must happen after handlers have
+            # been drained below.
+            async def _close_listener() -> None:
+                server = self._server
+                if server is None:
+                    return
+                server.close()
 
-            # Step 2: close all client writers to break relay read loops.
-            if not self._cleanup_ledger.is_done("writers_close"):
-                for w in tuple(self._client_writers):
-                    try:
-                        w.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-                self._client_writers.clear()
-                self._cleanup_ledger.mark_done("writers_close")
+            await self._cleanup_ledger.run_step(
+                "listener_close",
+                action=_close_listener,
+                verify=lambda: (
+                    self._server is None or not self._server.is_serving()
+                ),
+                resource_generation=self._server_generation,
+            )
 
-            # Step 3: cancel and bounded-await all handler tasks.
-            if not self._cleanup_ledger.is_done("handlers_drain"):
+            # Step 2: cancel and bounded-await all handler tasks before
+            # waiting on transports.  A relay handler can be blocked in a
+            # client-side read while its upstream is still open; cancelling
+            # the owner first makes its lease settle both relay children and
+            # the upstream writer instead of waiting for the idle timeout.
+            async def _drain_handlers() -> None:
                 tasks = tuple(self._client_tasks)
                 for t in tasks:
                     if not t.done():
                         t.cancel()
                 if tasks:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*tasks, return_exceptions=True),
-                            timeout=_HANDLER_DRAIN_TIMEOUT,
-                        )
-                    except TimeoutError:
-                        self._cleanup_ledger.record_error(
-                            "handlers_drain",
-                            TimeoutError(
-                                f"BrowserEgressProxy close() timed out after "
-                                f"{_HANDLER_DRAIN_TIMEOUT}s: "
-                                f"{len(self._client_tasks)} handler task(s) still active"
-                            ),
-                        )
-                if self._client_tasks:
-                    if not self._cleanup_ledger.has_errors():
-                        self._cleanup_ledger.record_error(
-                            "handlers_drain",
-                            RuntimeError(
-                                f"BrowserEgressProxy close() did not fully drain: "
-                                f"{len(self._client_tasks)} handler task(s) still active"
-                            ),
-                        )
-                else:
-                    self._client_tasks.clear()
-                    self._cleanup_ledger.mark_done("handlers_drain")
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=_HANDLER_DRAIN_TIMEOUT,
+                    )
+
+            await self._cleanup_ledger.run_step(
+                "handlers_drain",
+                action=_drain_handlers,
+                verify=lambda: (
+                    not self._client_tasks
+                    and not self._upstream_writers
+                    and not self._relay_leases
+                ),
+            )
+
+            # Step 3: wait for the stopped listener after accepted handlers
+            # have drained.  Keep the server reference until wait_closed()
+            # succeeds so a partial close remains owned and retryable.
+            async def _wait_listener_closed() -> None:
+                server = self._server
+                if server is None:
+                    return
+                await server.wait_closed()
+                self._server = None
+
+            await self._cleanup_ledger.run_step(
+                "listener_wait_closed",
+                action=_wait_listener_closed,
+                verify=lambda: self._server is None,
+                resource_generation=self._server_generation,
+            )
+
+            # Step 4: close all client and upstream writers.  A reference is
+            # removed only after wait_closed() succeeds; an exception keeps
+            # the transport owned for quarantine/retry.  This final pass also
+            # covers transports that were admitted before a handler was
+            # published or that survived handler cancellation.
+            async def _close_writers() -> None:
+                errors: list[BaseException] = []
+                for writer_set in (self._client_writers, self._upstream_writers):
+                    for writer in tuple(writer_set):
+                        try:
+                            writer.close()
+                            await writer.wait_closed()
+                        except BaseException as exc:  # noqa: BLE001 — retain on failure
+                            errors.append(exc)
+                        else:
+                            writer_set.discard(writer)
+                if errors:
+                    raise RuntimeError(
+                        f"{len(errors)} browser transport(s) did not close"
+                    ) from errors[0]
+
+            await self._cleanup_ledger.run_step(
+                "writers_close",
+                action=_close_writers,
+                verify=lambda: not self._client_writers and not self._upstream_writers,
+            )
 
             if self._cleanup_ledger.has_errors():
                 self._state = _ProxyState.QUARANTINED
                 errors = self._cleanup_ledger.errors
                 raise RuntimeError(
-                    f"BrowserEgressProxy close() partially failed: "
+                    "BrowserEgressProxy close() partially failed: "
                     + "; ".join(type(e).__name__ for e in errors)
                 ) from errors[0]
+            if not self.terminal_postcondition():
+                self._state = _ProxyState.QUARANTINED
+                raise RuntimeError(
+                    "BrowserEgressProxy cleanup completed without terminal proof"
+                )
             self._state = _ProxyState.CLOSED
 
     async def _handle_client(
@@ -501,8 +615,12 @@ class BrowserEgressProxy:
             self._active_connections -= 1
             self._connection_semaphore.release()
             writer.close()
-            with contextlib.suppress(Exception):
+            try:
                 await writer.wait_closed()
+            except BaseException:  # noqa: BLE001 — retain writer for close/retry
+                logger.debug("browser client writer did not reach terminal state", exc_info=True)
+            else:
+                self._client_writers.discard(writer)
 
     def _validate_proxy_auth(self, header: bytes) -> None:
         """C-07: enforce per-proxy authentication on every request.
@@ -552,6 +670,49 @@ class BrowserEgressProxy:
         with contextlib.suppress(Exception):
             await writer.drain()
 
+    async def _relay(
+        self,
+        client_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+        upstream_reader: asyncio.StreamReader,
+        upstream_writer: asyncio.StreamWriter,
+        stats: _ConnectionStats,
+    ) -> None:
+        """Relay through a registered transitive ownership lease."""
+        lease = _RelayLease(upstream_writer)
+        self._relay_leases.add(lease)
+        self._upstream_writers.add(upstream_writer)
+        try:
+            await _relay_bidirectional(
+                client_reader,
+                client_writer,
+                upstream_reader,
+                upstream_writer,
+                stats,
+                self._idle_timeout,
+                self._max_upload,
+                self._max_download,
+                lease=lease,
+            )
+        finally:
+            if lease.terminal:
+                self._relay_leases.discard(lease)
+                self._upstream_writers.discard(upstream_writer)
+
+    async def _close_upstream_writer(self, writer: asyncio.StreamWriter) -> bool:
+        """Close one pre-relay upstream and release it only after proof."""
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except BaseException:  # noqa: BLE001 — retain ownership on failure
+            logger.debug(
+                "browser upstream writer did not reach terminal state",
+                exc_info=True,
+            )
+            return False
+        self._upstream_writers.discard(writer)
+        return True
+
     async def _tunnel_connect(
         self,
         authority: str,
@@ -569,8 +730,13 @@ class BrowserEgressProxy:
         upstream_reader, upstream_writer = await _open_pinned(
             target.addresses, port,
         )
-        client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-        await client_writer.drain()
+        self._upstream_writers.add(upstream_writer)
+        try:
+            client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await client_writer.drain()
+        except BaseException:
+            await self._close_upstream_writer(upstream_writer)
+            raise
         # Batch 16.3 (round-16 review §十三–§十五): CONNECT is TLS-only
         # for remote hosts.  A compromised Chromium can send
         # ``CONNECT allowed.example:80`` (which the proxy authorizes at the
@@ -595,11 +761,10 @@ class BrowserEgressProxy:
         # The host is matched case-insensitively against the CONNECT
         # authority host.  Endpoints NOT in the policy must use TLS.
         if (host.lower(), port) in self._local_service_endpoints:
-            await _relay_bidirectional(
+            await self._relay(
                 client_reader, client_writer,
                 upstream_reader, upstream_writer,
-                stats, self._idle_timeout,
-                self._max_upload, self._max_download,
+                stats,
             )
             return
         # Batch 16.4 (round-16 review §十六): the TLS ClientHello is now
@@ -620,24 +785,27 @@ class BrowserEgressProxy:
                 "browser egress SNI validated: %s for CONNECT %s:%d",
                 sni, host, port,
             )
-        except Exception:
+        except BaseException:
             # Non-TLS data, SNI mismatch, timeout, or parse error —
             # close the upstream connection before propagating so we do
             # not leak it.  _relay_bidirectional owns cleanup on the
-            # success path.
-            upstream_writer.close()
-            with contextlib.suppress(Exception):
-                await upstream_writer.wait_closed()
+            # success path.  Cancellation is included: the upstream is
+            # already in the owner graph, but the relay lease has not been
+            # created yet.
+            await self._close_upstream_writer(upstream_writer)
             raise
         # Forward the buffered ClientHello to upstream so the TLS
         # handshake proceeds normally, then start the blind relay.
-        upstream_writer.write(first_bytes)
-        await upstream_writer.drain()
-        await _relay_bidirectional(
+        try:
+            upstream_writer.write(first_bytes)
+            await upstream_writer.drain()
+        except BaseException:
+            await self._close_upstream_writer(upstream_writer)
+            raise
+        await self._relay(
             client_reader, client_writer,
             upstream_reader, upstream_writer,
-            stats, self._idle_timeout,
-            self._max_upload, self._max_download,
+            stats,
         )
 
     async def _forward_http(
@@ -664,6 +832,7 @@ class BrowserEgressProxy:
         upstream_reader, upstream_writer = await _open_pinned(
             target.addresses, port,
         )
+        self._upstream_writers.add(upstream_writer)
         origin_target = urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
         lines = header.decode("latin-1").split("\r\n")
         # Round-15 review P1 (Host header authority binding): the proxy
@@ -694,13 +863,16 @@ class BrowserEgressProxy:
             forwarded.append(line)
         forwarded.append(f"Host: {canonical_host}")
         forwarded.extend(("Connection: close", "", ""))
-        upstream_writer.write("\r\n".join(forwarded).encode("latin-1"))
-        await upstream_writer.drain()
-        await _relay_bidirectional(
+        try:
+            upstream_writer.write("\r\n".join(forwarded).encode("latin-1"))
+            await upstream_writer.drain()
+        except BaseException:
+            await self._close_upstream_writer(upstream_writer)
+            raise
+        await self._relay(
             client_reader, client_writer,
             upstream_reader, upstream_writer,
-            stats, self._idle_timeout,
-            self._max_upload, self._max_download,
+            stats,
         )
 
     @staticmethod
@@ -934,18 +1106,18 @@ async def _relay_bidirectional(
     idle_timeout: float,
     max_upload: int,
     max_download: int,
+    *,
+    lease: _RelayLease | None = None,
 ) -> None:
+    relay_lease = lease or _RelayLease(upstream_writer)
     async def upload() -> None:
-        try:
-            await _copy_stream(
-                client_reader, upstream_writer,
-                direction="upload",
-                byte_limit=max_upload,
-                stats=stats,
-                idle_timeout=idle_timeout,
-            )
-        finally:
-            upstream_writer.close()
+        await _copy_stream(
+            client_reader, upstream_writer,
+            direction="upload",
+            byte_limit=max_upload,
+            stats=stats,
+            idle_timeout=idle_timeout,
+        )
 
     async def download() -> None:
         await _copy_stream(
@@ -956,26 +1128,23 @@ async def _relay_bidirectional(
             idle_timeout=idle_timeout,
         )
 
-    tasks = (asyncio.create_task(upload()), asyncio.create_task(download()))
-    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-    for task in pending:
-        task.cancel()
-    # C-11: re-raise the first policy-violation exception instead of
-    # silently swallowing it via ``gather(return_exceptions=True)``.
-    # ``_ByteLimitExceeded`` (upload/download cap) and
-    # ``asyncio.TimeoutError`` (idle timeout) are the policy signals
-    # that ``_handle_client`` maps to 413 / 408 responses; if we swallow
-    # them here the audit log lies about why the connection was closed
-    # and the 413 branch becomes dead code.  We only swallow exceptions
-    # from the *cancelled* pending tasks (CancelledError / connection
-    # reset), which are expected side-effects of tearing down a relay.
-    for task in done:
-        exc = task.exception()
-        if isinstance(exc, (_ByteLimitExceeded, asyncio.TimeoutError)):
-            # Let the pending tasks finish cancelling before propagating.
-            await asyncio.gather(*pending, return_exceptions=True)
-            raise exc
-    await asyncio.gather(*done, *pending, return_exceptions=True)
-    upstream_writer.close()
-    with contextlib.suppress(Exception):
-        await upstream_writer.wait_closed()
+    # The lease publishes every child task before waiting for either side.
+    # Parent cancellation enters the ``finally`` block and cannot return
+    # until both children and the upstream writer have reached terminal
+    # state.
+    tasks = (relay_lease.create_task(upload()), relay_lease.create_task(download()))
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        # C-11: re-raise the first policy-violation exception instead of
+        # silently swallowing it via ``gather(return_exceptions=True)``.
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if isinstance(exc, (_ByteLimitExceeded, asyncio.TimeoutError)):
+                raise exc
+        await asyncio.gather(*done, *pending, return_exceptions=True)
+    finally:
+        await relay_lease.close()

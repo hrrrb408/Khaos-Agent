@@ -28,7 +28,7 @@ from khaos.db.state_root import project_id as compute_project_id
 from khaos.exceptions import RuntimeCloseError
 from khaos.memory import MemoryBudget, MemoryManager, MemoryStore
 from khaos.runtime.authority import RuntimeAuthoritySeal, is_production_mode
-from khaos.runtime.lifecycle import CloseResult, CloseState
+from khaos.runtime.lifecycle import CloseState
 from khaos.modes import ModeManager
 from khaos.permissions import PermissionEngine
 from khaos.routing.router import create_default_router
@@ -286,6 +286,86 @@ class RuntimeResult:
     def close_error(self) -> Exception | None:
         """The typed failure when the runtime is quarantined, else None."""
         return self._close_error
+
+    @property
+    def admission_closed(self) -> bool:
+        """Compatibility alias for the runtime generation fence."""
+        return self.generation_admission_closed
+
+    @property
+    def generation_admission_closed(self) -> bool:
+        """True once runtime teardown has been requested."""
+        return self._close_state is not CloseState.OPEN
+
+    @property
+    def child_admission_closed(self) -> bool:
+        """True once runtime teardown prevents child authority admission."""
+        return self._close_state is not CloseState.OPEN
+
+    @property
+    def terminal_closed(self) -> bool:
+        """True only after the runtime cleanup task reports CLOSED."""
+        return self._close_state is CloseState.CLOSED and self._closed
+
+    @property
+    def is_quarantined(self) -> bool:
+        """True when one or more runtime-owned resources remain unproven."""
+        return self._close_state is CloseState.QUARANTINED
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Aggregate child-owner resources without hiding their references."""
+        resources: list[str] = []
+        for name, component in (
+            ("execution_service", self.execution_service),
+            ("browser_manager", self.browser_manager),
+            (
+                "office_authority",
+                self.office_authority if self.owns_office_authority else None,
+            ),
+        ):
+            if component is None:
+                continue
+            owned = getattr(component, "owned_runtime_resources", None)
+            if callable(owned):
+                resources.extend(
+                    f"{name}:{item}" for item in owned(self.runtime_id)
+                )
+                continue
+            owned = getattr(component, "owned_resources", None)
+            if callable(owned):
+                resources.extend(f"{name}:{item}" for item in owned())
+            elif not self.terminal_closed:
+                resources.append(name)
+        if not self.terminal_closed and not resources:
+            resources.append("runtime")
+        return tuple(resources)
+
+    def terminal_postcondition(self) -> bool:
+        """Require CLOSED plus terminal child-owner proofs."""
+        if not self.terminal_closed:
+            return False
+        return not self.owned_resources()
+
+    def _child_terminal_proofs_hold(self) -> bool:
+        """Verify every runtime-owned child exposes an independent proof."""
+        for name, component in (
+            ("execution_service", self.execution_service),
+            ("browser_manager", self.browser_manager),
+            (
+                "office_authority",
+                self.office_authority if self.owns_office_authority else None,
+            ),
+        ):
+            if component is None:
+                continue
+            proof = getattr(component, "terminal_postcondition", None)
+            if callable(proof) and not bool(proof()):
+                logger.error("runtime child %s lacks terminal proof", name)
+                return False
+            if not callable(proof):
+                logger.error("runtime child %s has no terminal proof API", name)
+                return False
+        return True
 
     def _with_seal(self, seal: "RuntimeAuthoritySeal") -> "RuntimeResult":
         """Stamp the authority seal minted by ``build_runtime`` and return self.
@@ -572,6 +652,11 @@ class RuntimeResult:
                 # Reset ``_close_task`` so a retry actually re-runs cleanup.
                 self._close_task = None
                 return
+            if not self._child_terminal_proofs_hold():
+                self._close_failed = True
+                self._close_state = CloseState.OPEN
+                self._close_task = None
+                return
             # P2-1: every safety-critical component reached a terminal state
             # — transition to CLOSED (the only information-free success).
             self._closed = True
@@ -594,12 +679,15 @@ class RuntimeResult:
 # the test suite injects mocks (under KHAOS_DEV_MODE=1).  In production mode
 # injecting any of these is rejected fail-closed — the caller must let the
 # factory construct them so they carry the authority seal implicitly.
+# BrowserManager is included explicitly because it owns browser contexts,
+# egress proxies, and their kernel-facing cleanup authority.
 _INJECTED_SECURITY_COMPONENTS: tuple[tuple[str, str], ...] = (
     ("tool_scheduler", "ToolScheduler"),
     ("execution_service", "ExecutionService"),
     ("sandbox", "Sandbox"),
     ("network_guard", "NetworkGuard"),
     ("memory_manager", "MemoryManager"),
+    ("browser_manager", "BrowserManager"),
 )
 
 
@@ -611,8 +699,9 @@ def _enforce_no_security_injection(cfg: RuntimeConfig) -> None:
     silently reusing a scheduler with no SecurityMiddleware.  No production
     caller does this today, but the *type* allowed it — so any future entry
     point could re-introduce a second security authority.  This gate makes
-    the invariant structural: in production, the five components below MUST
-    be constructed by the factory (they then carry the seal implicitly).
+    the invariant structural: in production, the security-critical components
+    below MUST be constructed by the factory (they then carry the seal
+    implicitly).
     """
     for field_name, type_name in _INJECTED_SECURITY_COMPONENTS:
         if getattr(cfg, field_name, None) is not None:

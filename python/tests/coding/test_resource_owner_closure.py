@@ -54,9 +54,8 @@ from khaos.coding.execution import (
 from khaos.coding.execution.supervisor import (
     ProcessSupervisor,
     SupervisorClosedError,
-    _SupervisorState,
 )
-from khaos.coding.intelligence.lsp.client import LspClient, LspCloseError, _LspState
+from khaos.coding.intelligence.lsp.client import LspClient, LspCloseError
 from khaos.security.browser_egress_proxy import BrowserEgressProxy, _ProxyState
 from khaos.security.host_network import ValidatedTarget
 
@@ -233,6 +232,22 @@ async def test_supervisor_closed_implies_no_owned_resources(tmp_path: str) -> No
     )
     await supervisor.run(request)
     await supervisor.shutdown()
+    assert supervisor.terminal_closed
+    assert supervisor.terminal_postcondition()
+    assert supervisor.owned_resources() == ()
+
+
+async def test_supervisor_shutdown_settles_watchdog_before_unregister() -> None:
+    """CLOSED must not hide a still-pending child watchdog task."""
+    supervisor = ProcessSupervisor(termination_grace_seconds=_SHORT_GRACE)
+    mock_proc = _MockProcess()
+    await supervisor.register_process("watchdog-owner", mock_proc)
+    watchdog = asyncio.create_task(asyncio.sleep(30))
+    active = supervisor._active["watchdog-owner"]
+    active.watchdog_task = watchdog
+
+    await supervisor.shutdown()
+    assert watchdog.done()
     assert supervisor.terminal_closed
     assert supervisor.terminal_postcondition()
     assert supervisor.owned_resources() == ()
