@@ -22,6 +22,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import ipaddress
 import logging
 import secrets
 import time
@@ -40,9 +41,17 @@ _IDLE_TIMEOUT = 60.0  # seconds with no data transfer → close
 _MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MiB upload per connection
 _MAX_DOWNLOAD_BYTES = 200 * 1024 * 1024  # 200 MiB download per connection
 _MAX_CONCURRENT_CONNECTIONS = 20  # per proxy instance (per browser context)
-# Batch 15.5: TLS ClientHello SNI validation bounds.
-_MAX_TLS_CLIENT_HELLO_BYTES = 16 * 1024
+# Batch 16.4: incremental TLS ClientHello parser bounds.  The record body
+# is bounded so a malicious client cannot stream unlimited data during the
+# SNI validation phase.
+_MAX_TLS_RECORD_BYTES = 16 * 1024
 _TLS_READ_TIMEOUT = 10.0
+# Batch 16.4: bounded wait for handler tasks during close().  Previously
+# close() used ``asyncio.gather(*tasks, return_exceptions=True)`` without a
+# timeout — if a handler was stuck in a future that swallowed cancellation,
+# shutdown could block indefinitely.  Now a timeout enters QUARANTINED
+# (retryable) instead of hanging.
+_HANDLER_DRAIN_TIMEOUT = 10.0
 
 
 @dataclass
@@ -109,6 +118,28 @@ class _SniMismatchError(Exception):
         )
         self.expected = expected
         self.actual = actual
+
+
+class _NonTlsConnectError(Exception):
+    """Batch 16.3: raised when a CONNECT tunnel receives non-TLS data.
+
+    Production CONNECT is restricted to TLS traffic only (https:// and
+    wss://).  A compromised Chromium can send ``CONNECT allowed.example:80``
+    (which the proxy authorizes at the domain level) and then emit a plain
+    HTTP request whose ``Host`` header is ``blocked.example`` — if both
+    domains share a CDN / ALB, the upstream would serve the blocked
+    virtual host.  By requiring the first bytes to be a TLS ClientHello,
+    the proxy proves the application-layer identity matches the authorized
+    CONNECT authority.  Plain HTTP (http://, ws://) must use the normal
+    HTTP proxy absolute-form request path, not CONNECT.
+    """
+
+    def __init__(self, first_byte: int) -> None:
+        super().__init__(
+            f"CONNECT tunnel requires TLS; first byte=0x{first_byte:02x} "
+            f"is not Handshake (0x16)"
+        )
+        self.first_byte = first_byte
 
 
 class BrowserEgressProxy:
@@ -281,22 +312,47 @@ class BrowserEgressProxy:
         # finally block removes it from ``_client_tasks``, so after gather
         # the set should be empty.  If any task survived cancellation, do
         # NOT set ``_closed`` — a retry can finish the job.
+        #
+        # Batch 16.4: the gather is now wrapped in ``wait_for`` with a
+        # bounded deadline (``_HANDLER_DRAIN_TIMEOUT``).  Previously close()
+        # used ``asyncio.gather(*tasks, return_exceptions=True)`` without a
+        # timeout — if a handler was stuck in a future that swallowed
+        # cancellation, shutdown could block indefinitely.  Now a timeout
+        # enters QUARANTINED (retryable) instead of hanging.
         if not self._cleanup_ledger.is_done("handlers_drain"):
             tasks = tuple(self._client_tasks)
             for t in tasks:
                 if not t.done():
                     t.cancel()
             if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*tasks, return_exceptions=True),
+                        timeout=_HANDLER_DRAIN_TIMEOUT,
+                    )
+                except TimeoutError:
+                    # Handler tasks did not finish within the deadline.
+                    # Do NOT clear ``_client_tasks`` — a retry can attempt
+                    # to finish the job.  Record an error so close() enters
+                    # a retryable partial state instead of claiming CLOSED.
+                    self._cleanup_ledger.record_error(
+                        "handlers_drain",
+                        TimeoutError(
+                            f"BrowserEgressProxy close() timed out after "
+                            f"{_HANDLER_DRAIN_TIMEOUT}s: "
+                            f"{len(self._client_tasks)} handler task(s) still active"
+                        ),
+                    )
             if self._client_tasks:
-                # Tasks survived cancellation — do not claim closed.
-                self._cleanup_ledger.record_error(
-                    "handlers_drain",
-                    RuntimeError(
-                        f"BrowserEgressProxy close() did not fully drain: "
-                        f"{len(self._client_tasks)} handler task(s) still active"
-                    ),
-                )
+                # Tasks survived cancellation or timeout — do not claim closed.
+                if not self._cleanup_ledger.has_errors():
+                    self._cleanup_ledger.record_error(
+                        "handlers_drain",
+                        RuntimeError(
+                            f"BrowserEgressProxy close() did not fully drain: "
+                            f"{len(self._client_tasks)} handler task(s) still active"
+                        ),
+                    )
             else:
                 self._client_tasks.clear()
                 self._cleanup_ledger.mark_done("handlers_drain")
@@ -452,35 +508,54 @@ class BrowserEgressProxy:
         )
         client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await client_writer.drain()
-        # Batch 15.5: read the first bytes from the client.  If they look
-        # like a TLS ClientHello (ContentType=0x16 Handshake), parse the
-        # SNI and prove it matches the CONNECT authority — a compromised
-        # Chromium can send ``CONNECT allowed.example:443`` (which passes
-        # the domain guard) but then emit a ClientHello whose SNI is
-        # ``blocked.example`` (shared CDN/ALB virtual-host bypass).
+        # Batch 16.3 (round-16 review §十三–§十五): CONNECT is TLS-only
+        # for remote hosts.  A compromised Chromium can send
+        # ``CONNECT allowed.example:80`` (which the proxy authorizes at the
+        # domain level) and then emit a plain HTTP request whose ``Host``
+        # header is ``blocked.example`` — if both domains share a CDN / ALB,
+        # the upstream would serve the blocked virtual host.  By requiring
+        # the first bytes to be a TLS ClientHello and validating SNI ==
+        # authority, the proxy proves the application-layer identity matches
+        # the authorized CONNECT authority.
         #
-        # If the first byte is NOT 0x16, the tunnel is carrying plain TCP
-        # (e.g. ``ws://`` WebSocket upgrade).  SNI validation does not
-        # apply — the CONNECT authority is the only identity, and it was
-        # already validated by ``authorize_url`` above.  Forward the
-        # buffered bytes as-is.
-        try:
-            first_bytes = await asyncio.wait_for(
-                client_reader.read(_MAX_TLS_CLIENT_HELLO_BYTES),
-                timeout=_TLS_READ_TIMEOUT,
+        # Loopback exception: Chromium sends CONNECT for ``ws://``
+        # (non-TLS WebSocket) through a proxy — it does NOT fall back to
+        # absolute-form.  For loopback targets the virtual-host bypass
+        # risk does not apply (there is only one server on the loopback
+        # address), so non-TLS CONNECT is permitted to keep ``ws://``
+        # functional.  The domain-level allowlist still applies.
+        is_loopback = all(
+            ipaddress.ip_address(addr).is_loopback
+            for addr in target.addresses
+        )
+        if is_loopback:
+            await _relay_bidirectional(
+                client_reader, client_writer,
+                upstream_reader, upstream_writer,
+                stats, self._idle_timeout,
+                self._max_upload, self._max_download,
             )
-            if first_bytes and first_bytes[0] == 0x16:
-                # TLS ClientHello — validate SNI.
-                sni = _parse_tls_sni(first_bytes)
-                if sni is None or sni.lower() != host.lower():
-                    raise _SniMismatchError(host, sni)
-                logger.debug(
-                    "browser egress SNI validated: %s for CONNECT %s:%d",
-                    sni, host, port,
-                )
-            # else: plain TCP tunnel (non-TLS).  Forward without SNI check.
+            return
+        # Batch 16.4 (round-16 review §十六): the TLS ClientHello is now
+        # read incrementally via ``readexactly(5)`` (record header) +
+        # ``readexactly(record_length)`` (record body) instead of a single
+        # bare ``read(n)``.  ``StreamReader.read(n)`` does not guarantee
+        # that a complete TLS record is returned in one call — TCP may
+        # fragment it, causing the parser to see a truncated record and
+        # fail-closed (false-deny).  ``readexactly`` blocks until the
+        # exact number of bytes is available, correctly handling split
+        # ClientHellos.
+        try:
+            first_bytes = await _read_tls_client_hello(client_reader)
+            sni = _parse_tls_sni(first_bytes)
+            if sni is None or sni.lower() != host.lower():
+                raise _SniMismatchError(host, sni)
+            logger.debug(
+                "browser egress SNI validated: %s for CONNECT %s:%d",
+                sni, host, port,
+            )
         except Exception:
-            # SNI validation failed (mismatch, timeout, parse error) —
+            # Non-TLS data, SNI mismatch, timeout, or parse error —
             # close the upstream connection before propagating so we do
             # not leak it.  _relay_bidirectional owns cleanup on the
             # success path.
@@ -488,9 +563,8 @@ class BrowserEgressProxy:
             with contextlib.suppress(Exception):
                 await upstream_writer.wait_closed()
             raise
-        # Forward the buffered first bytes to upstream so the TLS
-        # handshake (or plain TCP protocol) proceeds normally, then
-        # start the blind relay.
+        # Forward the buffered ClientHello to upstream so the TLS
+        # handshake proceeds normally, then start the blind relay.
         upstream_writer.write(first_bytes)
         await upstream_writer.drain()
         await _relay_bidirectional(
@@ -582,6 +656,43 @@ def _split_authority(authority: str, default_port: int) -> tuple[str, int]:
     if not parsed.hostname or parsed.username or parsed.password:
         raise ValueError("invalid CONNECT authority")
     return parsed.hostname, parsed.port or default_port
+
+
+async def _read_tls_client_hello(reader: asyncio.StreamReader) -> bytes:
+    """Batch 16.4: incrementally read a TLS ClientHello record.
+
+    Uses ``readexactly`` to read the record header (5 bytes) and body
+    separately, so a ClientHello split across TCP segments is handled
+    correctly.  ``StreamReader.read(n)`` does not guarantee that a
+    complete TLS record is returned in one call — TCP may fragment it,
+    causing the parser to see a truncated record and fail-closed
+    (false-deny on legitimate HTTPS).  ``readexactly`` blocks until the
+    exact number of bytes is available.
+
+    Batch 16.3: the first byte must be ``0x16`` (TLS Handshake).  If it
+    is not, the tunnel is carrying non-TLS data (e.g. plain HTTP) and
+    is rejected — production CONNECT is TLS-only.
+
+    Returns the complete TLS record (header + body) on success.
+    Raises ``_NonTlsConnectError`` if the first byte is not 0x16,
+    ``ValueError`` if the record body exceeds the bound, or
+    ``asyncio.IncompleteReadError`` / ``TimeoutError`` on read failure.
+    """
+    header = await asyncio.wait_for(
+        reader.readexactly(5), timeout=_TLS_READ_TIMEOUT,
+    )
+    if header[0] != 0x16:  # ContentType: Handshake
+        raise _NonTlsConnectError(header[0])
+    record_length = int.from_bytes(header[3:5], "big")
+    if record_length > _MAX_TLS_RECORD_BYTES:
+        raise ValueError(
+            f"TLS record body exceeds limit: {record_length} > "
+            f"{_MAX_TLS_RECORD_BYTES}"
+        )
+    body = await asyncio.wait_for(
+        reader.readexactly(record_length), timeout=_TLS_READ_TIMEOUT,
+    )
+    return header + body
 
 
 def _parse_tls_sni(data: bytes) -> str | None:
