@@ -22,6 +22,7 @@ import asyncio
 import base64
 import contextlib
 import hmac
+import ipaddress
 import logging
 import secrets
 import time
@@ -507,17 +508,34 @@ class BrowserEgressProxy:
         )
         client_writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await client_writer.drain()
-        # Batch 16.3 (round-16 review §十三–§十五): CONNECT is TLS-only.
-        # A compromised Chromium can send ``CONNECT allowed.example:80``
-        # (which the proxy authorizes at the domain level) and then emit
-        # a plain HTTP request whose ``Host`` header is ``blocked.example``
-        # — if both domains share a CDN / ALB, the upstream would serve
-        # the blocked virtual host.  By requiring the first bytes to be a
-        # TLS ClientHello and validating SNI == authority, the proxy proves
-        # the application-layer identity matches the authorized CONNECT
-        # authority.  Plain HTTP (http://, ws://) must use the normal HTTP
-        # proxy absolute-form request path, not CONNECT.
+        # Batch 16.3 (round-16 review §十三–§十五): CONNECT is TLS-only
+        # for remote hosts.  A compromised Chromium can send
+        # ``CONNECT allowed.example:80`` (which the proxy authorizes at the
+        # domain level) and then emit a plain HTTP request whose ``Host``
+        # header is ``blocked.example`` — if both domains share a CDN / ALB,
+        # the upstream would serve the blocked virtual host.  By requiring
+        # the first bytes to be a TLS ClientHello and validating SNI ==
+        # authority, the proxy proves the application-layer identity matches
+        # the authorized CONNECT authority.
         #
+        # Loopback exception: Chromium sends CONNECT for ``ws://``
+        # (non-TLS WebSocket) through a proxy — it does NOT fall back to
+        # absolute-form.  For loopback targets the virtual-host bypass
+        # risk does not apply (there is only one server on the loopback
+        # address), so non-TLS CONNECT is permitted to keep ``ws://``
+        # functional.  The domain-level allowlist still applies.
+        is_loopback = all(
+            ipaddress.ip_address(addr).is_loopback
+            for addr in target.addresses
+        )
+        if is_loopback:
+            await _relay_bidirectional(
+                client_reader, client_writer,
+                upstream_reader, upstream_writer,
+                stats, self._idle_timeout,
+                self._max_upload, self._max_download,
+            )
+            return
         # Batch 16.4 (round-16 review §十六): the TLS ClientHello is now
         # read incrementally via ``readexactly(5)`` (record header) +
         # ``readexactly(record_length)`` (record body) instead of a single
