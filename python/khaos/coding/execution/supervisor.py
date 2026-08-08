@@ -391,7 +391,21 @@ class ProcessSupervisor:
                 )
                 watchdog_task.cancel()
                 raise
-            resource_violation = await watchdog_task
+            try:
+                # The supervisor owns the watchdog task, so shutdown may
+                # cancel it after proving that the process has terminated.
+                # Shield the child await and distinguish that owner-side
+                # cancellation from cancellation of this run itself; the
+                # latter must still propagate to the caller.
+                resource_violation = await asyncio.shield(watchdog_task)
+            except asyncio.CancelledError:
+                current_task = asyncio.current_task()
+                if (
+                    not watchdog_task.cancelled()
+                    or (current_task is not None and current_task.cancelling())
+                ):
+                    raise
+                resource_violation = None
             if resource_violation is None and workspace_root is not None:
                 resource_violation = await asyncio.to_thread(
                     self.storage_authority.assess,
