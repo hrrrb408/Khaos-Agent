@@ -400,14 +400,22 @@ async def test_connect_non_tls_is_rejected_for_remote_host():
         await server.wait_closed()
 
 
-async def test_connect_non_tls_is_allowed_for_loopback():
-    """Batch 16.3: non-TLS CONNECT to loopback is allowed.
+async def test_connect_non_tls_is_allowed_for_declared_local_service():
+    """Round-17 §七: non-TLS CONNECT is allowed ONLY for operator-declared
+    local-service endpoints.
 
     Chromium sends CONNECT for ``ws://`` (non-TLS WebSocket) through a
-    proxy — it does NOT fall back to absolute-form.  For loopback targets
-    the virtual-host bypass risk does not apply (there is only one
-    server on the loopback address), so non-TLS CONNECT is permitted to
-    keep ``ws://`` functional.  The domain-level allowlist still applies.
+    proxy — it does NOT fall back to absolute-form.  The previous
+    loopback exception (``all(addr.is_loopback …)``) was unsound: a
+    loopback address can host a reverse proxy that routes by ``Host``
+    header.  The fix replaces the IP check with an explicit operator
+    policy: each ``(host, port)`` pair in ``local_service_endpoints`` is
+    a declared endpoint authorized for plain (non-TLS) CONNECT.
+
+    This test authorizes ``("allowed.example", <port>)`` and verifies
+    non-TLS data is relayed.  The companion test
+    (:func:`test_connect_non_tls_is_rejected_for_undeclared_loopback`)
+    verifies that a loopback endpoint NOT in the policy must use TLS.
     """
     async def echo(reader, writer):
         data = await reader.read(4096)
@@ -419,7 +427,10 @@ async def test_connect_non_tls_is_allowed_for_loopback():
     server = await asyncio.start_server(echo, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
     guard = _PinnedGuard(address="127.0.0.1")
-    proxy = BrowserEgressProxy(guard)  # type: ignore[arg-type]
+    proxy = BrowserEgressProxy(
+        guard,  # type: ignore[arg-type]
+        local_service_endpoints=frozenset({("allowed.example", port)}),
+    )
     await proxy.start()
     try:
         proxy_port = int(urlsplit(proxy.server_url).port or 0)
@@ -439,6 +450,54 @@ async def test_connect_non_tls_is_allowed_for_loopback():
         # The proxy relays to the echo server — should get a response.
         response = await asyncio.wait_for(reader.read(4096), timeout=5.0)
         assert response == plain_request  # echo server echoes back
+        writer.close()
+        await writer.wait_closed()
+    finally:
+        await proxy.close()
+        server.close()
+        await server.wait_closed()
+
+
+async def test_connect_non_tls_is_rejected_for_undeclared_loopback():
+    """Round-17 §七: non-TLS CONNECT to a loopback endpoint NOT in the
+    local-service policy is rejected (must use TLS).
+
+    This closes the virtual-host bypass risk: a loopback address can
+    host a reverse proxy (nginx/Caddy) that routes by ``Host`` header to
+    different virtual hosts.  Without an explicit policy entry, the
+    proxy must require TLS + SNI just like a remote host.
+    """
+    async def echo(reader, writer):
+        data = await reader.read(4096)
+        if data:
+            writer.write(data)
+            await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(echo, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    guard = _PinnedGuard(address="127.0.0.1")
+    # No local_service_endpoints — the loopback endpoint is NOT declared.
+    proxy = BrowserEgressProxy(guard)  # type: ignore[arg-type]
+    await proxy.start()
+    try:
+        proxy_port = int(urlsplit(proxy.server_url).port or 0)
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        writer.write(
+            f"CONNECT allowed.example:{port} HTTP/1.1\r\n"
+            f"{_proxy_auth_header(proxy)}\r\n".encode("ascii")
+        )
+        await writer.drain()
+        assert await reader.readuntil(b"\r\n\r\n") == (
+            b"HTTP/1.1 200 Connection Established\r\n\r\n"
+        )
+        # Send non-TLS data (the virtual-host bypass attack vector).
+        plain_request = b"GET / HTTP/1.1\r\nHost: blocked.example\r\n\r\n"
+        writer.write(plain_request)
+        await writer.drain()
+        # The proxy must reject — connection closed or 403.
+        response = await asyncio.wait_for(reader.read(), timeout=5.0)
+        assert response == b"" or b"403" in response
         writer.close()
         await writer.wait_closed()
     finally:

@@ -903,9 +903,21 @@ async def test_websocket_to_allowlisted_domain_is_not_aborted_by_guard(
     The WS code is embedded in the HTML page for the same reason as
     the blocked-domain test — ``browser_evaluate``'s blocklist rejects
     expressions containing 'WebSocket'.
+
+    Round-17 review §七: the WebSocket echo server runs on loopback
+    without TLS.  The proxy's policy-based local-service exception
+    requires the endpoint to be explicitly declared in
+    ``local_service_endpoints`` — non-TLS CONNECT to undeclared
+    loopback addresses is rejected (virtual-host bypass risk).
     """
     host = urlparse(http_server.url).hostname or "127.0.0.1"
     guard = _browser_guard([host])
+    # Declare the WS echo server as a local-service endpoint so the
+    # proxy allows non-TLS CONNECT (ws://) to it.
+    ws_parsed = urlparse(websocket_echo_server)
+    ws_host = ws_parsed.hostname or "127.0.0.1"
+    ws_port = ws_parsed.port or 0
+    fresh_manager._local_service_endpoints = frozenset({(ws_host, ws_port)})
 
     (tmp_path / "index.html").write_text(
         f"""
