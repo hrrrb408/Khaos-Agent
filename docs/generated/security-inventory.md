@@ -53,7 +53,7 @@
 - `python/khaos/permissions/rules.py`: `173df51bf720843e339e026c5219a0db7e2b69beaa45576b2e24ee17764dfe6f`
 - `python/khaos/coding/execution/service.py`: `a5a75afe57a5ff8064fea5188e29defc9aa355242d675251b7585aec7ee52af7`
 - `python/khaos/coding/execution/binding.py`: `99f3d8eb14d80a837ecf0f0d076d556ccdb366b8798c9e0fde6c69d0bb1a5501`
-- `python/khaos/coding/execution/supervisor.py`: `1dfaf06c4e9f654d8b1292a7308c91302759777297fa13de96e47595d2db5242`
+- `python/khaos/coding/execution/supervisor.py`: `8543643b63f00cbb7b24e77c3e6a1eec6651280479509223314c04e27f2da5ef`
 - `python/khaos/grpc_server.py`: `a98ad97f729ad985edffeaf92d1392eca3352d806f554ea83718f2bac3aa7327`
 - `go/internal/api/handler.go`: `119a049cdc45ea2c949f558a179752edaa30409a744f3f352e888e7e829343f3`
 - `go/cmd/gateway/main.go`: `75d14ad26917ddf15ddc38ce75f6bc0a1fcd214909c958849e7ae18054b81ed7`
