@@ -46,6 +46,10 @@ class _SupervisorState(str, Enum):
     QUARANTINED = "quarantined"
 
 
+class SupervisorQuarantinedError(RuntimeError):
+    """Round-17: raised when the supervisor is quarantined (resources retained)."""
+
+
 class SupervisorClosedError(RuntimeError):
     """Raised when a registration is attempted after shutdown."""
 
@@ -82,6 +86,9 @@ class ProcessSupervisor:
         self._active: dict[str, _ActiveProcess] = {}
         self._registry_lock = asyncio.Lock()
         self._state = _SupervisorState.OPEN
+        # Round-17 review §四: shared shutdown task so concurrent shutdown()
+        # callers observe the same result (like ExecutionService).
+        self._shutdown_task: asyncio.Task[None] | None = None
 
     @property
     def active_execution_ids(self) -> tuple[str, ...]:
@@ -89,8 +96,54 @@ class ProcessSupervisor:
 
     @property
     def is_closed(self) -> bool:
-        """True when the supervisor no longer accepts new children."""
+        """True when the supervisor no longer accepts new children.
+
+        Round-17 review §四: this is the admission fence property (not OPEN).
+        Use ``terminal_closed`` to check whether all resources are proven
+        terminated.  Kept for backward compatibility.
+        """
         return self._state is not _SupervisorState.OPEN
+
+    @property
+    def admission_closed(self) -> bool:
+        """Round-17: True when new registrations are permanently rejected."""
+        return self._state is not _SupervisorState.OPEN
+
+    @property
+    def terminal_closed(self) -> bool:
+        """Round-17: True only when CLOSED (all resources proven terminated)."""
+        return self._state is _SupervisorState.CLOSED
+
+    @property
+    def is_quarantined(self) -> bool:
+        """Round-17: True when QUARANTINED (resources may still be alive)."""
+        return self._state is _SupervisorState.QUARANTINED
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Round-17 review §十四: descriptors of currently-held processes.
+
+        Returns one ``"execution:<id>"`` per active registration.  The
+        CLOSED invariant requires this to be empty — if it is non-empty
+        when ``terminal_closed`` is True, the invariant is violated.
+        """
+        return tuple(f"execution:{eid}" for eid in self.active_execution_ids)
+
+    def terminal_postcondition(self) -> bool:
+        """Round-17 review §十四: True when every owned process is reaped.
+
+        For the supervisor this means: no active registrations remain in
+        ``_active`` (every process group has been terminated AND its
+        registry entry released).  This is the postcondition that
+        distinguishes CLOSED from QUARANTINED — a quarantined supervisor
+        may still have live processes whose death is unproven.
+        """
+        return len(self._active) == 0
+
+    async def close(self) -> None:
+        """Round-17 review §十四: ResourceOwner protocol — alias for
+        :meth:`shutdown`.  Concurrent callers observe the same result
+        via the shared ``_shutdown_task``."""
+        await self.shutdown()
 
     async def run(
         self,
@@ -427,54 +480,83 @@ class ProcessSupervisor:
         return True
 
     async def shutdown(self) -> None:
-        """Round-15 review P0-B: shutdown now uses a state machine.
+        """Shut down all active child processes.
 
-        ``OPEN → CLOSING`` (rejects all new registrations) → terminate every
-        active child → ``CLOSED``.  A registration that races with shutdown
-        is rejected at the fence instead of silently being added after the
-        snapshot.  If any terminate raises, the supervisor enters
-        ``QUARANTINED`` (not ``CLOSED``) so callers can detect the partial
-        teardown.
+        Round-17 review §四: shutdown now uses a shared ``_shutdown_task``
+        so concurrent callers observe the same result — the second caller
+        no longer sees ``CLOSING`` and returns a false success while the
+        first caller may still fail to QUARANTINED.  All callers await the
+        SAME task.
 
-        Batch 16.2 (round-16 review §八–§十): QUARANTINED is now retryable.
-        Previously QUARANTINED was a permanent terminal state — a second
-        ``shutdown()`` call immediately raised ``SupervisorClosedError``
-        without attempting to terminate remaining active processes.  This
-        broke the ``CleanupLedger`` retry semantics in ExecutionService:
-        the ledger recorded ``supervisor:shutdown`` as failed, retried on
-        the next ``shutdown()`` call, but the Supervisor refused to
-        cooperate.  Now QUARANTINED → CLOSING on retry, and only the
-        still-active executions are terminated.
+        Round-17 review §四: CancelledError during ``terminate()`` now
+        enters QUARANTINED (not CLOSED) because the process may still be
+        alive — ownership release is unproven.  Previously CancelledError
+        was swallowed as ``cancel_requested`` and the supervisor
+        transitioned to CLOSED, losing the retry opportunity forever.
+
+        Round-17 review §四: CLOSED ⇒ ``_active == ∅``.  The registry is
+        cleared on successful termination so the invariant holds.
+
+        Round-17 review §四 (amendment): the admission fence (OPEN →
+        CLOSING) is set IMMEDIATELY in ``shutdown()`` before the
+        ``_run_shutdown`` task is scheduled, so that ``register_process``
+        and ``run()`` reject even before ``_run_shutdown`` starts running.
+        Previously the state transition happened inside ``_run_shutdown``,
+        creating a race window where registration could slip in after
+        ``shutdown()`` was called but before the task ran.
         """
         if self._state is _SupervisorState.CLOSED:
             return
-        # Batch 16.2: QUARANTINED is retryable — transition back to
-        # CLOSING so we attempt to terminate any remaining active
-        # processes.  If there are no active processes, the supervisor
-        # transitions cleanly to CLOSED.
+        # Set the admission fence IMMEDIATELY (before creating the task)
+        # so register_process/run() reject even before _run_shutdown
+        # starts.  QUARANTINED is already admission-closed (not OPEN).
+        if self._state is _SupervisorState.OPEN:
+            self._state = _SupervisorState.CLOSING
+        # Reuse an in-flight shutdown task so concurrent callers observe
+        # the same result.  A completed (failed) task is NOT reused —
+        # QUARANTINED is retryable and a new task is created.
+        if self._shutdown_task is not None and not self._shutdown_task.done():
+            await asyncio.shield(self._shutdown_task)
+            return
+        self._shutdown_task = asyncio.ensure_future(self._run_shutdown())
+        await asyncio.shield(self._shutdown_task)
+
+    async def _run_shutdown(self) -> None:
+        """The actual shutdown sequence — may run multiple times via retry."""
+        if self._state is _SupervisorState.CLOSED:
+            return
+        # QUARANTINED is retryable — transition back to CLOSING so we
+        # attempt to terminate any remaining active processes.
         if self._state is _SupervisorState.QUARANTINED:
             if not self._active:
-                # All processes were cleaned up on a prior attempt;
-                # the quarantine was caused by a transient error that
-                # has since resolved.  Transition to CLOSED.
                 self._state = _SupervisorState.CLOSED
                 return
-            # Retry: transition to CLOSING and attempt to terminate
-            # the remaining active processes.
             self._state = _SupervisorState.CLOSING
-        elif self._state is _SupervisorState.CLOSING:
-            # Concurrent shutdown call — let the first one proceed.
-            return
-        else:
-            # OPEN → CLOSING.
+        # CLOSING (set by shutdown()) or OPEN (direct call) — proceed
+        # with the actual cleanup.  No early return for CLOSING: the
+        # admission fence was set by shutdown() before scheduling this
+        # task, and we need to actually run the cleanup.
+        elif self._state is _SupervisorState.OPEN:
             self._state = _SupervisorState.CLOSING
         errors: list[Exception] = []
         cancel_requested = False
         for execution_id in self.active_execution_ids:
             try:
-                await self.terminate(execution_id)
+                # Round-17: shield each terminate so an outer cancellation
+                # does not interrupt the process kill before returncode
+                # is confirmed.  If CancelledError still occurs (from
+                # inside terminate), record it as an error — ownership
+                # release is unproven.
+                await asyncio.shield(self.terminate(execution_id))
+                # Round-17: unregister after successful terminate so
+                # CLOSED ⇒ _active == ∅ holds.
+                async with self._registry_lock:
+                    self._active.pop(execution_id, None)
             except asyncio.CancelledError:
                 cancel_requested = True
+                errors.append(RuntimeError(
+                    f"terminate({execution_id}) cancelled — process death unproven"
+                ))
                 logger.debug(
                     "ProcessSupervisor shutdown: terminate(%s) cancelled",
                     execution_id,
@@ -492,6 +574,11 @@ class ProcessSupervisor:
                 f"{len(errors)} error(s): "
                 + "; ".join(type(e).__name__ for e in errors)
             ) from errors[0]
+        # Round-17: CLOSED invariant — _active must be empty.  Any entries
+        # that survived (e.g. added by a racing run() before the admission
+        # fence took effect) are cleared here.
+        async with self._registry_lock:
+            self._active.clear()
         self._state = _SupervisorState.CLOSED
         if cancel_requested:
             raise asyncio.CancelledError()

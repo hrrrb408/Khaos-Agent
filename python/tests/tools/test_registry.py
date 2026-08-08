@@ -528,3 +528,65 @@ def test_json_serialization_works_with_frozen_parameters():
     assert isinstance(json.loads(serialized), dict)
     # isinstance(x, dict) must be True (used by validate_schema_definition).
     assert isinstance(tool.parameters, dict)
+
+
+# Round-17 review §十: ToolSecurityDescriptor/RuntimeBinding split —
+# ``bind_handler`` records the implementation identity in the security
+# digest so swapping the handler invalidates old approval bindings.
+
+async def _dummy_handler_1(**kwargs):
+    return {}
+
+
+async def _dummy_handler_2(**kwargs):
+    return {}
+
+
+def test_bind_handler_includes_implementation_id_in_digest():
+    """Round-17: bind_handler sets implementation_id AND recomputes the
+    security_digest so the handler binding is part of the approval
+    contract."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+    digest_before = tool.security_digest
+    assert tool.implementation_id == ""
+    assert tool.handler is None
+
+    tool.bind_handler(_dummy_handler_1, "khaos.test.handler_1")
+    digest_after = tool.security_digest
+
+    assert tool.implementation_id == "khaos.test.handler_1"
+    assert tool.handler is _dummy_handler_1
+    # The digest MUST change — the implementation binding is now part of
+    # the security contract.
+    assert digest_before != digest_after
+
+
+def test_bind_handler_swapping_changes_digest():
+    """Round-17: swapping the handler via bind_handler changes the
+    digest, invalidating approval bindings that referenced the old
+    implementation."""
+    registry = create_builtin_registry()
+    tool = registry.get("read_file")
+
+    tool.bind_handler(_dummy_handler_1, "khaos.test.handler_1")
+    digest_1 = tool.security_digest
+
+    tool.bind_handler(_dummy_handler_2, "khaos.test.handler_2")
+    digest_2 = tool.security_digest
+
+    assert digest_1 != digest_2
+    assert tool.implementation_id == "khaos.test.handler_2"
+    assert tool.handler is _dummy_handler_2
+
+
+def test_runtime_registry_handlers_have_implementation_id():
+    """Round-17: every tool wired by create_runtime_registry has a
+    non-empty implementation_id, so the security digest reflects the
+    actual implementation."""
+    registry = create_runtime_registry()
+    for tool in registry._tools.values():
+        if tool.handler is not None:
+            assert tool.implementation_id != "", (
+                f"{tool.name} has a handler but no implementation_id"
+            )

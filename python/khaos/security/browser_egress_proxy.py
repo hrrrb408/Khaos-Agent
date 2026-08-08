@@ -22,7 +22,6 @@ import asyncio
 import base64
 import contextlib
 import hmac
-import ipaddress
 import logging
 import secrets
 import time
@@ -142,6 +141,26 @@ class _NonTlsConnectError(Exception):
         self.first_byte = first_byte
 
 
+class _ProxyState:
+    """Round-17 review §五: BrowserEgressProxy lifecycle state machine.
+
+    NEW → OPEN → CLOSING → CLOSED (or CLOSING → QUARANTINED → CLOSING).
+
+    Once close() begins (CLOSING), ``start()`` is permanently forbidden —
+    even if close() fails and enters QUARANTINED, a new listener cannot be
+    created.  This eliminates the spawn-after-close / stale-ledger
+    generation bug where a partial close + reopen produced a new listener
+    that the retry's ledger skipped (it had already marked ``listener_close``
+    as done for the old listener).
+    """
+
+    NEW = "new"
+    OPEN = "open"
+    CLOSING = "closing"
+    QUARANTINED = "quarantined"
+    CLOSED = "closed"
+
+
 class BrowserEgressProxy:
     """A loopback-only proxy that authorizes and pins every connection.
 
@@ -153,21 +172,10 @@ class BrowserEgressProxy:
     browser context can use the proxy.  The token is validated on every
     request (including CONNECT) via ``Proxy-Authorization: Basic …``.
 
-    C-11 (round-4): policy-violation exceptions (byte-limit, idle-timeout)
-    are now re-raised from ``_relay_bidirectional`` instead of being
-    silently swallowed by ``gather(return_exceptions=True)``.
-
-    Round-15 review P0-C: the handler task is now tracked in
-    ``_client_tasks`` (previously the field existed but was never
-    populated, so ``close()`` could not prove all relays terminated).
-    ``close()`` bounded-awaits every handler task so no relay survives
-    past ``CLOSED``.
-
-    Round-15 review P1 (Host header): the proxy no longer trusts the
-    client's ``Host`` header.  It strips ALL client Host headers and
-    generates a canonical ``Host: <authorized-host>[:<port>]`` from the
-    absolute target.  A compromised Chromium cannot use a missing or
-    mismatched Host to reach a different virtual host on a shared CDN.
+    Round-17 review §五: full state machine (NEW/OPEN/CLOSING/QUARANTINED/
+    CLOSED) with a lifecycle lock so: (1) close permanently forbids start,
+    (2) concurrent start is serialized, (3) concurrent close callers join
+    the same shared task.
     """
 
     def __init__(
@@ -179,6 +187,7 @@ class BrowserEgressProxy:
         max_upload: int = _MAX_UPLOAD_BYTES,
         max_download: int = _MAX_DOWNLOAD_BYTES,
         bind_host: str = "127.0.0.1",
+        local_service_endpoints: frozenset[tuple[str, int]] = frozenset(),
     ) -> None:
         self._guard = guard
         self._server: asyncio.Server | None = None
@@ -189,24 +198,80 @@ class BrowserEgressProxy:
         self._bind_host = bind_host
         self._active_connections = 0
         self._connection_semaphore = asyncio.Semaphore(max_concurrent)
-        # Round-14 review P0-8 / Round-15 review P0-C: track active relay
-        # tasks AND client writers so close() can terminate in-flight
-        # connections and PROVE they terminated before returning.
         self._client_tasks: set[asyncio.Task] = set()
         self._client_writers: set[asyncio.StreamWriter] = set()
-        self._closing = False
-        self._closed = False
-        # Batch 15.3 (round-15 review §十六): per-step completion ledger so
-        # a partial close() is retryable.  Previously the first close()
-        # cleared ``_client_writers`` and set ``_server = None``, so a
-        # second close() saw ``_server is None`` and returned immediately
-        # — even if handler tasks were still alive.  The ledger records
-        # which steps completed so a retry only runs the incomplete ones.
         self._cleanup_ledger = CleanupLedger()
-        # C-07: random auth token — only the browser that receives this
-        # token can use the proxy.  Other host processes that can reach
-        # the bind address are rejected with 407.
         self._auth_token = secrets.token_urlsafe(32)
+        # Round-17 review §五: typed lifecycle state + lock + shared task.
+        self._state = _ProxyState.NEW
+        self._lifecycle_lock = asyncio.Lock()
+        self._close_task: asyncio.Task | None = None
+        # Round-17 review §七: policy-based local-service exception for
+        # non-TLS CONNECT.  Previously the proxy used an IP-based check
+        # (``all(addr.is_loopback for addr in target.addresses)``) to
+        # permit non-TLS CONNECT.  This was unsound: a loopback address
+        # can host a reverse proxy (nginx/Caddy) that routes by Host
+        # header to different virtual hosts — the same bypass risk as
+        # remote CONNECT.  The fix replaces the IP check with an
+        # explicit policy: each ``(host, port)`` pair in this set is a
+        # declared local-service endpoint that the operator has
+        # authorized for plain (non-TLS) CONNECT.  The host is matched
+        # case-insensitively against the CONNECT authority host.
+        self._local_service_endpoints = frozenset(
+            (h.lower(), p) for h, p in local_service_endpoints
+        )
+
+    @property
+    def _closed(self) -> bool:
+        """Backward-compat: True only when cleanly CLOSED."""
+        return self._state is _ProxyState.CLOSED
+
+    @property
+    def _closing(self) -> bool:
+        """Backward-compat: True when CLOSING or QUARANTINED."""
+        return self._state in (_ProxyState.CLOSING, _ProxyState.QUARANTINED)
+
+    @property
+    def admission_closed(self) -> bool:
+        """Round-17: True when new start() is permanently rejected."""
+        return self._state is not _ProxyState.NEW
+
+    @property
+    def terminal_closed(self) -> bool:
+        """Round-17: True only when CLOSED (all resources proven terminated)."""
+        return self._state is _ProxyState.CLOSED
+
+    @property
+    def is_quarantined(self) -> bool:
+        """Round-17: True when QUARANTINED (resources may still be alive)."""
+        return self._state is _ProxyState.QUARANTINED
+
+    def owned_resources(self) -> tuple[str, ...]:
+        """Round-17 review §十四: descriptors of currently-held resources.
+
+        Returns one descriptor per live listener, in-flight handler task,
+        and open client writer.  The CLOSED invariant requires this to
+        be empty.
+        """
+        resources: list[str] = []
+        if self._server is not None:
+            resources.append("listener")
+        for task in self._client_tasks:
+            if not task.done():
+                resources.append(f"handler:{id(task)}")
+        for writer in self._client_writers:
+            if not writer.is_closing():
+                resources.append(f"writer:{id(writer)}")
+        return tuple(resources)
+
+    def terminal_postcondition(self) -> bool:
+        """Round-17 review §十四: True when listener is closed, all
+        handler tasks are done, and all client writers are closed."""
+        return (
+            self._server is None
+            and all(t.done() for t in self._client_tasks)
+            and all(w.is_closing() for w in self._client_writers)
+        )
 
     @property
     def proxy_username(self) -> str:
@@ -226,146 +291,144 @@ class BrowserEgressProxy:
         return f"http://{self._bind_host}:{port}"
 
     async def start(self) -> None:
-        if self._server is not None:
-            return
+        """Start the listening socket.
 
-        # Round-14 review P0-8 / Round-15 review P0-C: wrap _handle_client so
-        # each connection's TASK and writer are tracked, enabling close() to
-        # terminate active relays AND prove they terminated.  Previously
-        # ``_client_tasks`` was never populated (only ``_client_writers``),
-        # so close() gathered an empty set and returned while handlers were
-        # still running.
-        async def _tracked_handler(
-            reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
-        ) -> None:
-            if self._closing or self._closed:
-                writer.close()
-                return
-            current_task = asyncio.current_task()
-            if current_task is not None:
-                self._client_tasks.add(current_task)
-            self._client_writers.add(writer)
-            try:
-                await self._handle_client(reader, writer)
-            finally:
-                self._client_writers.discard(writer)
+        Round-17 review §五: only NEW → OPEN is allowed.  Once close()
+        begins (CLOSING/QUARANTINED/CLOSED), start() is permanently
+        forbidden — a partial close + reopen can no longer produce a new
+        listener that the retry's ledger skips.  The lifecycle lock
+        serializes concurrent start() calls so two tasks cannot both
+        pass the ``_server is None`` check and create two listeners.
+        """
+        async with self._lifecycle_lock:
+            if self._state is not _ProxyState.NEW:
+                # Already started, or close() has begun — permanently
+                # forbidden.  Silently return for OPEN (idempotent),
+                # raise for terminal states.
+                if self._state is _ProxyState.OPEN:
+                    return
+                raise RuntimeError(
+                    f"BrowserEgressProxy cannot start: state is {self._state}"
+                )
+
+            async def _tracked_handler(
+                reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+            ) -> None:
+                if self._state is not _ProxyState.OPEN:
+                    writer.close()
+                    return
+                current_task = asyncio.current_task()
                 if current_task is not None:
-                    self._client_tasks.discard(current_task)
+                    self._client_tasks.add(current_task)
+                self._client_writers.add(writer)
+                try:
+                    await self._handle_client(reader, writer)
+                finally:
+                    self._client_writers.discard(writer)
+                    if current_task is not None:
+                        self._client_tasks.discard(current_task)
 
-        self._server = await asyncio.start_server(
-            _tracked_handler,
-            host=self._bind_host,
-            port=0,
-            limit=_MAX_HEADER_BYTES,
-        )
+            self._server = await asyncio.start_server(
+                _tracked_handler,
+                host=self._bind_host,
+                port=0,
+                limit=_MAX_HEADER_BYTES,
+            )
+            self._state = _ProxyState.OPEN
 
     async def close(self) -> None:
         """Close the listener AND terminate all active relay connections.
 
-        Round-14 review P0-8 / Round-15 review P0-C: previously close()
-        only closed the listening socket — existing relays kept running
-        until idle/byte-limit timeout.  Now it sets an admission fence,
-        closes the listener, closes all client writers (which breaks the
-        relay read loop), cancels handler tasks, and bounded-awaits their
-        completion so close() proves all relays terminated before
-        returning.
-
-        Batch 15.3 (round-15 review §十六): the per-step ``CleanupLedger``
-        records which steps completed so a partial close() is retryable.
-        Previously the first close() cleared ``_client_writers`` and set
-        ``_server = None``, so a second close() saw ``_server is None``
-        and returned immediately — even if handler tasks were still
-        alive.  Now the ledger tracks ``listener_close``,
-        ``writers_close``, and ``handlers_drain`` independently; a retry
-        only runs the incomplete steps.  This aligns with the Browser
-        threat model: "Partial cleanup remains registered and makes
-        shutdown fail until a retry succeeds; it is never reported as
-        closed."
+        Round-17 review §五: close() now uses a shared ``_close_task`` so
+        concurrent callers observe the same result.  The state machine
+        ensures: (1) close permanently forbids start, (2) QUARANTINED is
+        retryable, (3) CLOSED is only reached when all resources are
+        proven terminated.
         """
-        if self._closed:
+        if self._state is _ProxyState.CLOSED:
             return
-        self._closing = True
-        self._cleanup_ledger.reset_errors()
+        if self._close_task is not None and not self._close_task.done():
+            await asyncio.shield(self._close_task)
+            return
+        self._close_task = asyncio.ensure_future(self._run_close())
+        await asyncio.shield(self._close_task)
 
-        # Step 1: close the listener so no new connections are accepted.
-        if not self._cleanup_ledger.is_done("listener_close"):
-            if self._server is not None:
-                self._server.close()
-                try:
-                    await self._server.wait_closed()
-                except Exception:  # noqa: BLE001 — best-effort listener close
-                    pass
-                self._server = None
-            self._cleanup_ledger.mark_done("listener_close")
+    async def _run_close(self) -> None:
+        """The actual cleanup sequence — may run multiple times via retry."""
+        async with self._lifecycle_lock:
+            if self._state is _ProxyState.CLOSED:
+                return
+            if self._state is _ProxyState.QUARANTINED:
+                # Retryable — transition to CLOSING.
+                pass
+            elif self._state is _ProxyState.CLOSING:
+                return
+            self._state = _ProxyState.CLOSING
+            self._cleanup_ledger.reset_errors()
 
-        # Step 2: close all client writers to break the relay read loops.
-        if not self._cleanup_ledger.is_done("writers_close"):
-            for w in tuple(self._client_writers):
-                try:
-                    w.close()
-                except Exception:  # noqa: BLE001
-                    pass
-            self._client_writers.clear()
-            self._cleanup_ledger.mark_done("writers_close")
+            # Step 1: close the listener so no new connections are accepted.
+            if not self._cleanup_ledger.is_done("listener_close"):
+                if self._server is not None:
+                    self._server.close()
+                    try:
+                        await self._server.wait_closed()
+                    except Exception:  # noqa: BLE001 — best-effort
+                        pass
+                    self._server = None
+                self._cleanup_ledger.mark_done("listener_close")
 
-        # Step 3: cancel and bounded-await all handler tasks.  Each task's
-        # finally block removes it from ``_client_tasks``, so after gather
-        # the set should be empty.  If any task survived cancellation, do
-        # NOT set ``_closed`` — a retry can finish the job.
-        #
-        # Batch 16.4: the gather is now wrapped in ``wait_for`` with a
-        # bounded deadline (``_HANDLER_DRAIN_TIMEOUT``).  Previously close()
-        # used ``asyncio.gather(*tasks, return_exceptions=True)`` without a
-        # timeout — if a handler was stuck in a future that swallowed
-        # cancellation, shutdown could block indefinitely.  Now a timeout
-        # enters QUARANTINED (retryable) instead of hanging.
-        if not self._cleanup_ledger.is_done("handlers_drain"):
-            tasks = tuple(self._client_tasks)
-            for t in tasks:
-                if not t.done():
-                    t.cancel()
-            if tasks:
-                try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*tasks, return_exceptions=True),
-                        timeout=_HANDLER_DRAIN_TIMEOUT,
-                    )
-                except TimeoutError:
-                    # Handler tasks did not finish within the deadline.
-                    # Do NOT clear ``_client_tasks`` — a retry can attempt
-                    # to finish the job.  Record an error so close() enters
-                    # a retryable partial state instead of claiming CLOSED.
-                    self._cleanup_ledger.record_error(
-                        "handlers_drain",
-                        TimeoutError(
-                            f"BrowserEgressProxy close() timed out after "
-                            f"{_HANDLER_DRAIN_TIMEOUT}s: "
-                            f"{len(self._client_tasks)} handler task(s) still active"
-                        ),
-                    )
-            if self._client_tasks:
-                # Tasks survived cancellation or timeout — do not claim closed.
-                if not self._cleanup_ledger.has_errors():
-                    self._cleanup_ledger.record_error(
-                        "handlers_drain",
-                        RuntimeError(
-                            f"BrowserEgressProxy close() did not fully drain: "
-                            f"{len(self._client_tasks)} handler task(s) still active"
-                        ),
-                    )
-            else:
-                self._client_tasks.clear()
-                self._cleanup_ledger.mark_done("handlers_drain")
+            # Step 2: close all client writers to break relay read loops.
+            if not self._cleanup_ledger.is_done("writers_close"):
+                for w in tuple(self._client_writers):
+                    try:
+                        w.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                self._client_writers.clear()
+                self._cleanup_ledger.mark_done("writers_close")
 
-        if self._cleanup_ledger.has_errors():
-            self._closing = False
-            errors = self._cleanup_ledger.errors
-            raise RuntimeError(
-                f"BrowserEgressProxy close() partially failed: "
-                + "; ".join(type(e).__name__ for e in errors)
-            ) from errors[0]
-        self._closed = True
-        self._closing = False
+            # Step 3: cancel and bounded-await all handler tasks.
+            if not self._cleanup_ledger.is_done("handlers_drain"):
+                tasks = tuple(self._client_tasks)
+                for t in tasks:
+                    if not t.done():
+                        t.cancel()
+                if tasks:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.gather(*tasks, return_exceptions=True),
+                            timeout=_HANDLER_DRAIN_TIMEOUT,
+                        )
+                    except TimeoutError:
+                        self._cleanup_ledger.record_error(
+                            "handlers_drain",
+                            TimeoutError(
+                                f"BrowserEgressProxy close() timed out after "
+                                f"{_HANDLER_DRAIN_TIMEOUT}s: "
+                                f"{len(self._client_tasks)} handler task(s) still active"
+                            ),
+                        )
+                if self._client_tasks:
+                    if not self._cleanup_ledger.has_errors():
+                        self._cleanup_ledger.record_error(
+                            "handlers_drain",
+                            RuntimeError(
+                                f"BrowserEgressProxy close() did not fully drain: "
+                                f"{len(self._client_tasks)} handler task(s) still active"
+                            ),
+                        )
+                else:
+                    self._client_tasks.clear()
+                    self._cleanup_ledger.mark_done("handlers_drain")
+
+            if self._cleanup_ledger.has_errors():
+                self._state = _ProxyState.QUARANTINED
+                errors = self._cleanup_ledger.errors
+                raise RuntimeError(
+                    f"BrowserEgressProxy close() partially failed: "
+                    + "; ".join(type(e).__name__ for e in errors)
+                ) from errors[0]
+            self._state = _ProxyState.CLOSED
 
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
@@ -518,17 +581,20 @@ class BrowserEgressProxy:
         # authority, the proxy proves the application-layer identity matches
         # the authorized CONNECT authority.
         #
-        # Loopback exception: Chromium sends CONNECT for ``ws://``
-        # (non-TLS WebSocket) through a proxy — it does NOT fall back to
-        # absolute-form.  For loopback targets the virtual-host bypass
-        # risk does not apply (there is only one server on the loopback
-        # address), so non-TLS CONNECT is permitted to keep ``ws://``
-        # functional.  The domain-level allowlist still applies.
-        is_loopback = all(
-            ipaddress.ip_address(addr).is_loopback
-            for addr in target.addresses
-        )
-        if is_loopback:
+        # Round-17 review §七: policy-based local-service exception.
+        # Chromium sends CONNECT for ``ws://`` (non-TLS WebSocket) through
+        # a proxy — it does NOT fall back to absolute-form.  The previous
+        # loopback exception (``all(addr.is_loopback for addr in
+        # target.addresses)``) was unsound: a loopback address can host a
+        # reverse proxy (nginx/Caddy) that routes by ``Host`` header to
+        # different virtual hosts — the same bypass risk as remote
+        # CONNECT.  The fix replaces the IP check with an explicit
+        # operator-declared policy: each ``(host, port)`` pair in
+        # ``_local_service_endpoints`` is a declared local-service endpoint
+        # that the operator has authorized for plain (non-TLS) CONNECT.
+        # The host is matched case-insensitively against the CONNECT
+        # authority host.  Endpoints NOT in the policy must use TLS.
+        if (host.lower(), port) in self._local_service_endpoints:
             await _relay_bidirectional(
                 client_reader, client_writer,
                 upstream_reader, upstream_writer,

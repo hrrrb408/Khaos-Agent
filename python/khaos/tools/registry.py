@@ -231,6 +231,12 @@ _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
 # ``freeze()``, these fields cannot be mutated — the tool's security
 # semantics are immutable for the lifetime of the registry.  ``handler`` is
 # intentionally excluded: it is runtime wiring, not a security property.
+# Round-17 review §十: ``implementation_id`` is also excluded from the
+# frozen set (it must be settable after registration via
+# :meth:`ToolDefinition.bind_handler`), but it IS included in
+# :attr:`security_digest` so the handler binding is part of the approval
+# contract — swapping the handler changes the digest and invalidates old
+# approvals.
 _SECURITY_FIELDS: frozenset[str] = frozenset({
     "name", "parameters", "modes", "permission_level",
     "parallel", "timeout", "capabilities", "resource_resolver",
@@ -380,6 +386,16 @@ class ToolDefinition:
     resource_resolver: ResourceResolver | None = None
     effect_status: str = ""
     reconciliation_hint: str = ""
+    # Round-17 review §十: implementation identity.  Set via
+    # :meth:`bind_handler` when the runtime handler is wired.  This field
+    # is NOT a frozen security field (it must be settable after
+    # registration), but it IS included in :attr:`security_digest` so the
+    # handler binding is part of the approval contract.  Swapping the
+    # handler without updating ``implementation_id`` is a same-process
+    # mutation (out of threat model); the digest ensures that using
+    # :meth:`bind_handler` to change implementations invalidates old
+    # approval bindings.
+    implementation_id: str = ""
     # Batch 15.6: internal freeze state — not part of the public contract.
     _frozen: bool = field(default=False, repr=False, compare=False)
     _security_digest: str | None = field(default=None, repr=False, compare=False)
@@ -429,6 +445,33 @@ class ToolDefinition:
         object.__setattr__(self, "_security_digest", self._compute_security_digest())
         object.__setattr__(self, "_frozen", True)
 
+    def bind_handler(
+        self,
+        handler: Callable[..., Awaitable[Any]],
+        implementation_id: str,
+    ) -> None:
+        """Wire up the runtime handler AND record its implementation identity.
+
+        Round-17 review §十: ``handler`` is not a frozen security field
+        (it must be settable after registration via
+        :meth:`create_runtime_registry`), but the ``implementation_id``
+        IS included in :attr:`security_digest`.  This method sets both
+        atomically and recomputes the cached digest so the handler
+        binding becomes part of the approval contract.
+
+        After this call, ``security_digest`` reflects the specific
+        implementation that will execute the tool.  Swapping the handler
+        via a subsequent ``bind_handler`` call changes the digest and
+        invalidates approval bindings that referenced the old digest.
+        Direct ``tool.handler = ...`` assignment remains possible for
+        backward compatibility but does NOT update the digest —
+        :meth:`bind_handler` is the contract-aware way to wire handlers.
+        """
+        object.__setattr__(self, "handler", handler)
+        object.__setattr__(self, "implementation_id", implementation_id)
+        # Recompute the cached digest so it includes implementation_id.
+        object.__setattr__(self, "_security_digest", self._compute_security_digest())
+
     @property
     def schema_digest(self) -> str:
         """Stable digest of the model-visible tool contract (name + parameters).
@@ -463,7 +506,14 @@ class ToolDefinition:
         return self._compute_security_digest()
 
     def _compute_security_digest(self) -> str:
-        """Compute the security digest over all security-relevant fields."""
+        """Compute the security digest over all security-relevant fields.
+
+        Round-17 review §十: ``implementation_id`` is included so the
+        handler binding is part of the approval contract.  When
+        :meth:`bind_handler` is used to wire (or swap) a handler, the
+        digest changes and old approval bindings that referenced the
+        previous digest are invalidated.
+        """
         resolver_id = ""
         if self.resource_resolver is not None:
             resolver_id = (
@@ -489,6 +539,10 @@ class ToolDefinition:
             "resource_resolver": resolver_id,
             "effect_status": self.effect_status,
             "reconciliation_hint": self.reconciliation_hint,
+            # Round-17 review §十: bind the implementation identity into
+            # the security contract so swapping the handler invalidates
+            # old approval bindings.
+            "implementation_id": self.implementation_id,
         }
         encoded = json.dumps(
             payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
@@ -2440,7 +2494,13 @@ def create_builtin_registry() -> ToolRegistry:
 
 
 def create_runtime_registry() -> ToolRegistry:
-    """Create a built-in registry with concrete P0-B tool handlers."""
+    """Create a built-in registry with concrete P0-B tool handlers.
+
+    Round-17 review §十: handlers are wired via :meth:`bind_handler` so
+    the ``implementation_id`` is recorded in the security digest.  This
+    binds approval contracts to the specific implementation that will
+    execute the tool.
+    """
     from khaos.tools import (
         browser_tools,
         channel_tools,
@@ -2462,91 +2522,97 @@ def create_runtime_registry() -> ToolRegistry:
     )
 
     registry = create_builtin_registry()
-    registry.get("channel_list").handler = channel_tools.channel_list
-    registry.get("channel_health").handler = channel_tools.channel_health
-    registry.get("channel_enable").handler = channel_tools.channel_enable
-    registry.get("channel_disable").handler = channel_tools.channel_disable
-    registry.get("github_create_pr").handler = github_tools.github_create_pr
-    registry.get("github_read_issue").handler = github_tools.github_read_issue
-    registry.get("github_comment_issue").handler = github_tools.github_comment_issue
-    registry.get("github_request_review").handler = github_tools.github_request_review
-    registry.get("read_file").handler = file_tools.read_file
-    registry.get("write_file").handler = file_tools.write_file
-    registry.get("patch").handler = file_tools.patch
-    registry.get("multi_edit").handler = file_tools.multi_edit
-    registry.get("search_files").handler = file_tools.search_files
-    registry.get("list_directory").handler = file_tools.list_directory
-    registry.get("file_info").handler = file_tools.file_info
-    registry.get("tree_view").handler = file_tools.tree_view
-    registry.get("copy_file").handler = file_tools.copy_file
-    registry.get("move_file").handler = file_tools.move_file
-    registry.get("file_search_content").handler = file_tools.file_search_content
-    registry.get("quick_note").handler = note_tools.quick_note
-    registry.get("search_notes").handler = note_tools.search_notes
-    registry.get("list_notes").handler = note_tools.list_notes
-    registry.get("delete_note").handler = note_tools.delete_note
-    registry.get("markdown_to_text").handler = markdown_tools.markdown_to_text
-    registry.get("extract_headings").handler = markdown_tools.extract_headings
-    registry.get("count_words").handler = markdown_tools.count_words
-    registry.get("format_markdown_table").handler = markdown_tools.format_markdown_table
-    registry.get("clipboard_read").handler = clipboard_tools.clipboard_read
-    registry.get("clipboard_write").handler = clipboard_tools.clipboard_write
-    registry.get("terminal_argv").handler = terminal_tools.terminal_argv
-    registry.get("terminal_shell").handler = terminal_tools.terminal_shell
-    registry.get("process").handler = terminal_tools.process
-    registry.get("sandbox_exec").handler = sandbox_tools.sandbox_exec
-    registry.get("sandbox_build").handler = sandbox_tools.sandbox_build
-    registry.get("git_diff").handler = git_tools.git_diff
-    registry.get("git_commit").handler = git_tools.git_commit
-    registry.get("git_branch").handler = git_tools.git_branch
-    registry.get("git_log").handler = git_tools.git_log
-    registry.get("git_status").handler = git_tools.git_status
-    registry.get("git_smart_commit").handler = git_tools.git_smart_commit
-    registry.get("git_undo").handler = git_tools.git_undo
-    registry.get("git_create_branch").handler = git_tools.git_create_branch
-    registry.get("git_push").handler = git_tools.git_push
-    registry.get("git_pr_body").handler = git_tools.git_pr_body
-    registry.get("test_run").handler = test_tools.test_run
+
+    def _bind(name: str, handler: Callable[..., Awaitable[Any]], module: str) -> None:
+        """Bind a handler with its qualified implementation identity."""
+        impl_id = f"{module}.{getattr(handler, '__qualname__', handler.__name__)}"
+        registry.get(name).bind_handler(handler, impl_id)
+
+    _bind("channel_list", channel_tools.channel_list, "khaos.tools.channel_tools")
+    _bind("channel_health", channel_tools.channel_health, "khaos.tools.channel_tools")
+    _bind("channel_enable", channel_tools.channel_enable, "khaos.tools.channel_tools")
+    _bind("channel_disable", channel_tools.channel_disable, "khaos.tools.channel_tools")
+    _bind("github_create_pr", github_tools.github_create_pr, "khaos.tools.github_tools")
+    _bind("github_read_issue", github_tools.github_read_issue, "khaos.tools.github_tools")
+    _bind("github_comment_issue", github_tools.github_comment_issue, "khaos.tools.github_tools")
+    _bind("github_request_review", github_tools.github_request_review, "khaos.tools.github_tools")
+    _bind("read_file", file_tools.read_file, "khaos.tools.file_tools")
+    _bind("write_file", file_tools.write_file, "khaos.tools.file_tools")
+    _bind("patch", file_tools.patch, "khaos.tools.file_tools")
+    _bind("multi_edit", file_tools.multi_edit, "khaos.tools.file_tools")
+    _bind("search_files", file_tools.search_files, "khaos.tools.file_tools")
+    _bind("list_directory", file_tools.list_directory, "khaos.tools.file_tools")
+    _bind("file_info", file_tools.file_info, "khaos.tools.file_tools")
+    _bind("tree_view", file_tools.tree_view, "khaos.tools.file_tools")
+    _bind("copy_file", file_tools.copy_file, "khaos.tools.file_tools")
+    _bind("move_file", file_tools.move_file, "khaos.tools.file_tools")
+    _bind("file_search_content", file_tools.file_search_content, "khaos.tools.file_tools")
+    _bind("quick_note", note_tools.quick_note, "khaos.tools.note_tools")
+    _bind("search_notes", note_tools.search_notes, "khaos.tools.note_tools")
+    _bind("list_notes", note_tools.list_notes, "khaos.tools.note_tools")
+    _bind("delete_note", note_tools.delete_note, "khaos.tools.note_tools")
+    _bind("markdown_to_text", markdown_tools.markdown_to_text, "khaos.tools.markdown_tools")
+    _bind("extract_headings", markdown_tools.extract_headings, "khaos.tools.markdown_tools")
+    _bind("count_words", markdown_tools.count_words, "khaos.tools.markdown_tools")
+    _bind("format_markdown_table", markdown_tools.format_markdown_table, "khaos.tools.markdown_tools")
+    _bind("clipboard_read", clipboard_tools.clipboard_read, "khaos.tools.clipboard_tools")
+    _bind("clipboard_write", clipboard_tools.clipboard_write, "khaos.tools.clipboard_tools")
+    _bind("terminal_argv", terminal_tools.terminal_argv, "khaos.tools.terminal_tools")
+    _bind("terminal_shell", terminal_tools.terminal_shell, "khaos.tools.terminal_tools")
+    _bind("process", terminal_tools.process, "khaos.tools.terminal_tools")
+    _bind("sandbox_exec", sandbox_tools.sandbox_exec, "khaos.tools.sandbox_tools")
+    _bind("sandbox_build", sandbox_tools.sandbox_build, "khaos.tools.sandbox_tools")
+    _bind("git_diff", git_tools.git_diff, "khaos.tools.git_tools")
+    _bind("git_commit", git_tools.git_commit, "khaos.tools.git_tools")
+    _bind("git_branch", git_tools.git_branch, "khaos.tools.git_tools")
+    _bind("git_log", git_tools.git_log, "khaos.tools.git_tools")
+    _bind("git_status", git_tools.git_status, "khaos.tools.git_tools")
+    _bind("git_smart_commit", git_tools.git_smart_commit, "khaos.tools.git_tools")
+    _bind("git_undo", git_tools.git_undo, "khaos.tools.git_tools")
+    _bind("git_create_branch", git_tools.git_create_branch, "khaos.tools.git_tools")
+    _bind("git_push", git_tools.git_push, "khaos.tools.git_tools")
+    _bind("git_pr_body", git_tools.git_pr_body, "khaos.tools.git_tools")
+    _bind("test_run", test_tools.test_run, "khaos.tools.test_tools")
     # Phase 6 browser tools — all backed by browser_tools (Playwright or mock)
-    registry.get("browser_launch").handler = browser_tools.browser_launch
-    registry.get("browser_close").handler = browser_tools.browser_close
-    registry.get("browser_navigate").handler = browser_tools.browser_navigate
-    registry.get("browser_click").handler = browser_tools.browser_click
-    registry.get("browser_type").handler = browser_tools.browser_type
-    registry.get("browser_snapshot").handler = browser_tools.browser_snapshot
-    registry.get("browser_screenshot").handler = browser_tools.browser_screenshot
-    registry.get("browser_scroll").handler = browser_tools.browser_scroll
-    registry.get("browser_vision").handler = browser_tools.browser_vision
-    registry.get("browser_evaluate").handler = browser_tools.browser_evaluate
-    registry.get("browser_file_upload").handler = browser_tools.browser_file_upload
+    _bind("browser_launch", browser_tools.browser_launch, "khaos.tools.browser_tools")
+    _bind("browser_close", browser_tools.browser_close, "khaos.tools.browser_tools")
+    _bind("browser_navigate", browser_tools.browser_navigate, "khaos.tools.browser_tools")
+    _bind("browser_click", browser_tools.browser_click, "khaos.tools.browser_tools")
+    _bind("browser_type", browser_tools.browser_type, "khaos.tools.browser_tools")
+    _bind("browser_snapshot", browser_tools.browser_snapshot, "khaos.tools.browser_tools")
+    _bind("browser_screenshot", browser_tools.browser_screenshot, "khaos.tools.browser_tools")
+    _bind("browser_scroll", browser_tools.browser_scroll, "khaos.tools.browser_tools")
+    _bind("browser_vision", browser_tools.browser_vision, "khaos.tools.browser_tools")
+    _bind("browser_evaluate", browser_tools.browser_evaluate, "khaos.tools.browser_tools")
+    _bind("browser_file_upload", browser_tools.browser_file_upload, "khaos.tools.browser_tools")
     # Phase 6 web content tools
-    registry.get("web_fetch").handler = web_tools.web_fetch
-    registry.get("web_extract_tables").handler = web_tools.web_extract_tables
-    registry.get("web_metadata").handler = web_tools.web_metadata
-    registry.get("code_search").handler = code_search_tools.code_search
-    registry.get("code_symbols").handler = code_search_tools.code_symbols
-    registry.get("todo_write").handler = todo_tools.todo_write
-    registry.get("todo_read").handler = todo_tools.todo_read
-    registry.get("todo_update").handler = todo_tools.todo_update
+    _bind("web_fetch", web_tools.web_fetch, "khaos.tools.web_tools")
+    _bind("web_extract_tables", web_tools.web_extract_tables, "khaos.tools.web_tools")
+    _bind("web_metadata", web_tools.web_metadata, "khaos.tools.web_tools")
+    _bind("code_search", code_search_tools.code_search, "khaos.tools.code_search_tools")
+    _bind("code_symbols", code_search_tools.code_symbols, "khaos.tools.code_search_tools")
+    _bind("todo_write", todo_tools.todo_write, "khaos.tools.todo_tools")
+    _bind("todo_read", todo_tools.todo_read, "khaos.tools.todo_tools")
+    _bind("todo_update", todo_tools.todo_update, "khaos.tools.todo_tools")
     # Phase 8.3 orchestrator tools
     from khaos.tools import orchestrator_tools
 
-    registry.get("spawn_subagent").handler = orchestrator_tools.spawn_subagent
-    registry.get("collect_results").handler = orchestrator_tools.collect_results
-    registry.get("execute_plan").handler = orchestrator_tools.execute_plan
-    registry.get("subagent_status").handler = orchestrator_tools.subagent_status
-    registry.get("list_permission_rules").handler = permission_tools.list_permission_rules
-    registry.get("grant_permission").handler = permission_tools.grant_permission
-    registry.get("revoke_permission").handler = permission_tools.revoke_permission
-    registry.get("query_audit_logs").handler = permission_tools.query_audit_logs
-    registry.get("security_status").handler = permission_tools.security_status
+    _bind("spawn_subagent", orchestrator_tools.spawn_subagent, "khaos.tools.orchestrator_tools")
+    _bind("collect_results", orchestrator_tools.collect_results, "khaos.tools.orchestrator_tools")
+    _bind("execute_plan", orchestrator_tools.execute_plan, "khaos.tools.orchestrator_tools")
+    _bind("subagent_status", orchestrator_tools.subagent_status, "khaos.tools.orchestrator_tools")
+    _bind("list_permission_rules", permission_tools.list_permission_rules, "khaos.tools.permission_tools")
+    _bind("grant_permission", permission_tools.grant_permission, "khaos.tools.permission_tools")
+    _bind("revoke_permission", permission_tools.revoke_permission, "khaos.tools.permission_tools")
+    _bind("query_audit_logs", permission_tools.query_audit_logs, "khaos.tools.permission_tools")
+    _bind("security_status", permission_tools.security_status, "khaos.tools.permission_tools")
     # Hermes batch 5: cron + history tool handlers.
-    registry.get("cron_create").handler = cron_tools.cron_create
-    registry.get("cron_list").handler = cron_tools.cron_list
-    registry.get("cron_remove").handler = cron_tools.cron_remove
-    registry.get("cron_pause").handler = cron_tools.cron_pause
-    registry.get("cron_resume").handler = cron_tools.cron_resume
-    registry.get("history_search").handler = history_tools.history_search
-    registry.get("history_browse").handler = history_tools.history_browse
-    registry.get("history_read").handler = history_tools.history_read
+    _bind("cron_create", cron_tools.cron_create, "khaos.tools.cron_tools")
+    _bind("cron_list", cron_tools.cron_list, "khaos.tools.cron_tools")
+    _bind("cron_remove", cron_tools.cron_remove, "khaos.tools.cron_tools")
+    _bind("cron_pause", cron_tools.cron_pause, "khaos.tools.cron_tools")
+    _bind("cron_resume", cron_tools.cron_resume, "khaos.tools.cron_tools")
+    _bind("history_search", history_tools.history_search, "khaos.tools.history_tools")
+    _bind("history_browse", history_tools.history_browse, "khaos.tools.history_tools")
+    _bind("history_read", history_tools.history_read, "khaos.tools.history_tools")
     return registry

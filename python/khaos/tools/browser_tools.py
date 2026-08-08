@@ -189,6 +189,12 @@ class BrowserManager:
         # and retry their cleanup — without this they leak because they
         # were never published to _contexts.
         self._quarantined_context_transactions: list[dict[str, Any]] = []
+        # Round-17 review §七: operator-declared local-service endpoints
+        # that are authorized for plain (non-TLS) CONNECT.  Each entry is
+        # a ``(host, port)`` tuple.  Passed to BrowserEgressProxy so that
+        # ws:// connections to declared local services are not rejected
+        # by the TLS-only CONNECT policy.
+        self._local_service_endpoints: frozenset[tuple[str, int]] = frozenset()
         # Round 8: a Chromium process generation is leased to exactly one
         # authenticated principal. BrowserContext isolation is useful for
         # sessions, but it is not a process-security boundary: a compromised
@@ -993,7 +999,11 @@ class BrowserManager:
             if self._browser_sandbox is not None
             else "127.0.0.1"
         )
-        egress_proxy = BrowserEgressProxy(network_guard, bind_host=proxy_bind_host)
+        egress_proxy = BrowserEgressProxy(
+            network_guard,
+            bind_host=proxy_bind_host,
+            local_service_endpoints=self._local_service_endpoints,
+        )
         # Batch 10.2 (round-10 §五): context creation is now a local
         # transaction.  We track which kernel/user-space resources have
         # been acquired so a failure at ANY later step (new_context,
