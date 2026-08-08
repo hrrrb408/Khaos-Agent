@@ -55,6 +55,20 @@ def _profile(*, network=False, read_only=True):
     )
 
 
+def _unit_backend(profile=None):
+    """Build a backend without requiring a host Docker installation.
+
+    Unit tests exercise validation and attestation decisions before any Docker
+    process is launched.  Injecting an executable keeps those tests portable
+    across the Product Integrity macOS runners, while real-Docker tests below
+    continue to use normal executable discovery and fail closed when Docker is
+    unavailable.
+    """
+    return DockerVerificationSandboxBackend(
+        profile=profile or _profile(), docker_executable=Path("/usr/bin/env"),
+    )
+
+
 def _entry(argv=("python", "-m", "pytest", "-q"), *, language="python", kind="unit-test"):
     return VerificationCatalogEntry(
         language, kind, argv, "repository", "pyproject.toml",
@@ -155,7 +169,7 @@ def test_caller_command_field_tampering_is_rejected_before_process(tmp_path, fie
     workspace_root = tmp_path / "copy"
     workspace_root.mkdir()
     workspace = type("Workspace", (), {"root": workspace_root})()
-    backend = DockerVerificationSandboxBackend(profile=_profile())
+    backend = _unit_backend()
     with pytest.raises(PermissionError):
         asyncio.run(backend.execute(tampered, workspace))
 
@@ -200,7 +214,7 @@ def test_unsafe_verification_cwd_rejected_before_process(tmp_path, cwd):
     workspace_root = tmp_path / "copy"
     workspace_root.mkdir()
     workspace = type("Workspace", (), {"root": workspace_root})()
-    backend = DockerVerificationSandboxBackend(profile=_profile())
+    backend = _unit_backend()
     with pytest.raises(PermissionError):
         asyncio.run(backend.execute(command, workspace))
 
@@ -697,7 +711,7 @@ def test_production_authority_requires_factory_marker_to_sign():
         DockerVerificationSandboxBackend, ProductionVerificationAuthority,
     )
 
-    backend = DockerVerificationSandboxBackend(profile=_profile())
+    backend = _unit_backend()
     # No factory marker — sign should fail.
     authority = ProductionVerificationAuthority()
     with pytest.raises(PermissionError, match="factory marker"):
@@ -710,7 +724,7 @@ def test_production_authority_rejects_wrong_factory_marker():
         DockerVerificationSandboxBackend, ProductionVerificationAuthority,
     )
 
-    backend = DockerVerificationSandboxBackend(profile=_profile())
+    backend = _unit_backend()
     # Set a wrong factory marker.
     object.__setattr__(backend, "_runtime_factory_marker", object())
     authority = ProductionVerificationAuthority(factory_marker=object())
@@ -1514,7 +1528,7 @@ def test_attest_toolchains_rejects_image_mismatch():
         "python", "python", "/usr/local/bin/python3", "3.13",
         "sha256:wrong",
     ),)
-    backend = DockerVerificationSandboxBackend(profile=_profile())
+    backend = _unit_backend()
     import asyncio as _aio
     with pytest.raises(RuntimeError, match="image mismatch"):
         _aio.run(backend.attest_toolchains(
@@ -1525,7 +1539,7 @@ def test_attest_toolchains_rejects_image_mismatch():
 def test_attest_toolchain_rejects_unknown_executable():
     """Batch 3.1.2 §5: unknown executable_id (no version argv) is rejected."""
     from khaos.coding.planning.trusted_verification import TrustedToolchain
-    backend = DockerVerificationSandboxBackend(profile=_profile())
+    backend = _unit_backend()
     toolchain = TrustedToolchain(
         "ruby", "ruby", "/usr/local/bin/ruby", "3.3", IMAGE,
     )
