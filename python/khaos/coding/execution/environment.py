@@ -2,8 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 from collections.abc import Iterable, Mapping
+
+
+_PINNED_GIT_CONFIG_SUPPRESSIONS = frozenset(
+    {"GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM"}
+)
 
 # Exact names cover provider credentials, local capability handles, credential
 # stores, and transport endpoints that are commonly present in a developer
@@ -104,5 +110,9 @@ def scrub_spawn_environment(
     return {
         key: value
         for key, value in environment.items()
-        if not is_non_inheritable_secret_key(key, preserve=preserved)
+        if (
+            key in _PINNED_GIT_CONFIG_SUPPRESSIONS
+            and value == os.devnull
+        )
+        or not is_non_inheritable_secret_key(key, preserve=preserved)
     }

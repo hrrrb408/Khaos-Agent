@@ -306,6 +306,10 @@ async def test_local_git_writes_use_execution_service_with_fixed_policy(
     assert write_request.network_policy is NetworkPolicy.NONE
     assert write_request.environment["GIT_EDITOR"] == ":"
     assert write_request.environment["GIT_TERMINAL_PROMPT"] == "0"
+    assert write_request.environment["GIT_CONFIG_GLOBAL"] == os.devnull
+    assert write_request.environment["GIT_CONFIG_SYSTEM"] == os.devnull
+    assert "core.fsmonitor=false" in write_request.argv
+    assert "core.untrackedCache=false" in write_request.argv
     assert "HOME" not in write_request.allowed_environment_keys
     assert "--no-verify" in write_request.argv or "branch" in write_request.argv
     assert result["returncode"] == 0

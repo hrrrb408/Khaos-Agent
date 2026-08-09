@@ -23,7 +23,20 @@ _PROTECTED_BRANCHES = frozenset({"main", "master", "develop", "development", "pr
 _WRITABLE_WORKSPACE_STATES = frozenset(
     {WorkspaceState.READY, WorkspaceState.RUNNING, WorkspaceState.VERIFYING}
 )
-_GIT_SAFE_CONFIG = ("-c", "core.pager=cat", "-c", f"core.hooksPath={os.devnull}")
+_GIT_SAFE_CONFIG = (
+    "-c",
+    "core.pager=cat",
+    "-c",
+    f"core.hooksPath={os.devnull}",
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.untrackedCache=false",
+    "-c",
+    "diff.external=",
+    "-c",
+    "credential.helper=",
+)
 
 
 @dataclass(frozen=True)
@@ -45,7 +58,7 @@ def _context(task_id: str | None, workspace_id: str | None, access_mode: str, ex
 
 async def git_diff(repo: str = ".", staged: bool = False, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
     """Return git diff output."""
-    args = ["git", "-c", "core.pager=cat", "diff", "--no-ext-diff"]
+    args = ["git", *_GIT_SAFE_CONFIG, "diff", "--no-ext-diff"]
     if staged:
         args.append("--staged")
     return await _git(args, repo, _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none"))
@@ -72,12 +85,12 @@ async def git_branch(repo: str = ".", name: str = "", checkout: bool = False, *,
     if name:
         _validate_branch_name(name)
         return await _git(["git", *_GIT_SAFE_CONFIG, "branch", name], repo, _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, "none"))
-    return await _git(["git", "branch", "--show-current"], repo, _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none"))
+    return await _git(["git", *_GIT_SAFE_CONFIG, "branch", "--show-current"], repo, _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none"))
 
 
 async def git_log(repo: str = ".", limit: int = 10, *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> dict[str, Any]:
     """Return concise git log."""
-    return await _git(["git", "-c", "core.pager=cat", "log", f"--max-count={limit}", "--oneline"], repo, _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none"))
+    return await _git(["git", *_GIT_SAFE_CONFIG, "log", f"--max-count={limit}", "--oneline"], repo, _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none"))
 
 
 async def git_status(cwd: str = ".", *, task_id: str | None = None, workspace_id: str | None = None, access_mode: str = "read-only", execution_service: Any = None, approval_context: dict[str, Any] | None = None, network_policy: str = "none") -> str:
@@ -87,11 +100,11 @@ async def git_status(cwd: str = ".", *, task_id: str | None = None, workspace_id
     untracked/staged buckets and an ``is_clean`` flag.
     """
     ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
-    branch_result = await _git(["git", "branch", "--show-current"], cwd, ctx)
+    branch_result = await _git(["git", *_GIT_SAFE_CONFIG, "branch", "--show-current"], cwd, ctx)
     branch = branch_result["stdout"].strip()
 
     porcelain = await _git(
-        ["git", "status", "--porcelain"], cwd, ctx
+        ["git", *_GIT_SAFE_CONFIG, "status", "--porcelain"], cwd, ctx
     )
     status: dict[str, Any] = {
         "branch": branch,
@@ -182,7 +195,7 @@ async def git_smart_commit(cwd: str = ".", message: str = "", *, task_id: str | 
     # the trailing 7-char hash out of the brackets, fall back to rev-parse.
     revision = _extract_commit_hash(commit["stdout"])
     if not revision:
-        rev = await _git(["git", "rev-parse", "--short", "HEAD"], cwd, read_ctx)
+        rev = await _git(["git", *_GIT_SAFE_CONFIG, "rev-parse", "--short", "HEAD"], cwd, read_ctx)
         revision = rev["stdout"].strip()
     logger.info("git_smart_commit: %s on %s (%d files)", message, branch, len(files))
     return json.dumps(
@@ -204,7 +217,7 @@ async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: 
     """
     destructive_ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none", principal_id=principal_id, requester=requester)
     read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
-    log = await _git(["git", "log", "-1", "--pretty=%H%x09%s"], cwd, read_ctx)
+    log = await _git(["git", *_GIT_SAFE_CONFIG, "log", "-1", "--pretty=%H%x09%s"], cwd, read_ctx)
     if log["returncode"] != 0 or not log["stdout"].strip():
         return json.dumps(
             {"error": "no commit history to undo"}, ensure_ascii=False
@@ -224,7 +237,7 @@ async def git_undo(cwd: str = ".", *, task_id: str | None = None, workspace_id: 
             ensure_ascii=False,
         )
 
-    porcelain = await _git(["git", "status", "--porcelain"], cwd, read_ctx)
+    porcelain = await _git(["git", *_GIT_SAFE_CONFIG, "status", "--porcelain"], cwd, read_ctx)
     files = [line[3:] for line in porcelain["stdout"].splitlines() if line.strip()]
     logger.info("git_undo: undid %s (%s)", revision[:8], subject)
     return json.dumps(
@@ -264,7 +277,7 @@ async def git_create_branch(
     _validate_revision(base)
     destructive_ctx = _context(task_id, workspace_id, "vcs.destructive-write", execution_service, approval_context, "none", principal_id=principal_id, requester=requester)
     read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
-    base_lookup = await _git(["git", "rev-parse", "--verify", f"{base}^{{commit}}"], cwd, read_ctx)
+    base_lookup = await _git(["git", *_GIT_SAFE_CONFIG, "rev-parse", "--verify", f"{base}^{{commit}}"], cwd, read_ctx)
     if base_lookup["returncode"] != 0:
         return json.dumps(
             {
@@ -276,7 +289,7 @@ async def git_create_branch(
             ensure_ascii=False,
         )
 
-    existing = await _git(["git", "rev-parse", "--verify", f"refs/heads/{branch_name}"], cwd, read_ctx)
+    existing = await _git(["git", *_GIT_SAFE_CONFIG, "rev-parse", "--verify", f"refs/heads/{branch_name}"], cwd, read_ctx)
     if existing["returncode"] == 0:
         return json.dumps(
             {"branch": branch_name, "base": base, "created": False, "error": "branch already exists"},
@@ -326,7 +339,7 @@ async def git_push(
     _validate_remote_name(remote)
     ctx = _context(task_id, workspace_id, "vcs.remote-write", execution_service, approval_context, network_policy, credential_context, principal_id, requester)
     read_ctx = _context(task_id, workspace_id, "read-only", execution_service, approval_context, "none")
-    branch_result = await _git(["git", "branch", "--show-current"], cwd, read_ctx)
+    branch_result = await _git(["git", *_GIT_SAFE_CONFIG, "branch", "--show-current"], cwd, read_ctx)
     current_branch = branch_result["stdout"].strip()
     if branch and branch != current_branch:
         raise PermissionError("git_push only permits the current TaskWorkspace branch")
@@ -406,9 +419,9 @@ async def git_pr_body(cwd: str = ".", *, task_id: str | None = None, workspace_i
     body_lines.append("")
     body = "\n".join(body_lines)
 
-    diff = await _git(["git", "-c", "core.pager=cat", "diff", "--no-ext-diff", f"{base}...HEAD", "--name-only"], cwd, ctx)
+    diff = await _git(["git", *_GIT_SAFE_CONFIG, "diff", "--no-ext-diff", f"{base}...HEAD", "--name-only"], cwd, ctx)
     if diff["returncode"] != 0:
-        diff = await _git(["git", "-c", "core.pager=cat", "diff", "--no-ext-diff", "--name-only", "HEAD"], cwd, ctx)
+        diff = await _git(["git", *_GIT_SAFE_CONFIG, "diff", "--no-ext-diff", "--name-only", "HEAD"], cwd, ctx)
     files = [line for line in diff["stdout"].splitlines() if line.strip()]
 
     logger.info(
@@ -1097,6 +1110,10 @@ def _git_environment(home: str | None = None) -> dict[str, str]:
         "GIT_EDITOR": ":",
         "GIT_SEQUENCE_EDITOR": ":",
         "GIT_CONFIG_NOSYSTEM": "1",
+        # These are pinned internal controls, not inherited configuration.
+        # The final spawn scrubber retains only these exact /dev/null values.
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
     }
     if home is not None:
         environment["HOME"] = home
@@ -1175,9 +1192,14 @@ def _credential_material(
 
 
 def _legacy_git_result(args: list[str], result: Any) -> dict[str, Any]:
-    return {
+    payload = {
         "command": args,
         "returncode": int(result.return_code) if result.return_code is not None else -1,
         "stdout": result.stdout,
         "stderr": result.stderr,
     }
+    if result.status != "passed":
+        payload["status"] = result.status
+    if result.diagnostics:
+        payload["diagnostics"] = result.diagnostics
+    return payload

@@ -39,6 +39,21 @@ def test_scrub_spawn_environment_only_preserves_explicit_trusted_contract():
     assert scrubbed == {"KHAOS_BROWSER_SANDBOX_TOKEN": "launcher-only"}
 
 
+def test_scrub_spawn_environment_keeps_only_pinned_git_config_suppression():
+    assert scrub_spawn_environment(
+        {
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+        }
+    ) == {
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+    assert scrub_spawn_environment(
+        {"GIT_CONFIG_GLOBAL": "/tmp/attacker.gitconfig"}
+    ) == {}
+
+
 @pytest.mark.asyncio
 async def test_supervisor_final_spawn_scrubs_secret_after_allowlist(tmp_path: Path):
     """A real child cannot read a credential even when the caller allowed it."""
