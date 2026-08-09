@@ -179,6 +179,19 @@ def test_product_infra_marker_exclusions_have_dedicated_owners():
     assert "real_macos" in platform
 
 
+def test_production_docker_image_reference_matches_preload():
+    """Production Docker tests and CI must use the same pinned reference."""
+    workflow = (WORKFLOWS / "docker-security.yml").read_text(encoding="utf-8")
+    trusted = (ROOT / "python/tests/coding/test_m4_batch3_1_trusted_verification.py").read_text(
+        encoding="utf-8"
+    )
+    image_match = re.search(r'^IMAGE = "(sha256:[0-9a-f]{64})"$', trusted, re.MULTILINE)
+    assert image_match, "trusted verification test image digest is missing or malformed"
+    image_digest = image_match.group(1)
+    assert f"python@{image_digest}" in workflow
+    assert "requested_image_reference=IMAGE_REFERENCE" in trusted
+
+
 def test_browser_e2e_workflow_is_mandatory():
     """M4: ``browser-e2e.yml`` must exist and actually run the real
     Playwright security E2E suite.

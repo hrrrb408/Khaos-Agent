@@ -186,6 +186,11 @@ class TrustedVerificationRunner:
         # inspect_and_attest_instance so the container's .Image is verified
         # against the approved local_config_image_id (not the manifest digest).
         self._image_attestation = image_attestation
+        self._image_reference = profile.effective_image_reference
+        self._expected_local_image_id = (
+            getattr(image_attestation, "local_config_image_id", "")
+            or profile.image_digest
+        )
         self._store.recover_interrupted()
         # Batch 3.1.2 §8: reconcile disposable workspaces from previous boots.
         self._reconcile_disposable_workspaces()
@@ -988,8 +993,8 @@ class TrustedVerificationRunner:
                     backend_instance_name=instance_name,
                     runtime_epoch=self._boot.server_epoch,
                     boot_id=self._boot.boot_id,
-                    image_reference=self._profile.image_digest,
-                    expected_image_digest=self._profile.image_digest,
+                    image_reference=self._image_reference,
+                    expected_image_digest=self._expected_local_image_id,
                     workspace_manifest_digest=disposable.manifest_digest,
                     state=SandboxInstanceState.PREPARED,
                 )
@@ -1014,7 +1019,7 @@ class TrustedVerificationRunner:
                     # Step 2: docker create --pull=never (no project code)
                     container_id = await self._backend.create_instance(
                         instance_name=instance_name,
-                        image_digest=self._profile.image_digest,
+                        image_digest=self._image_reference,
                         command=command, workspace_root=disposable.root,
                         labels=labels,
                     )
@@ -1025,7 +1030,7 @@ class TrustedVerificationRunner:
                     attestation = await self._backend.inspect_and_attest_instance(
                         container_id_or_name=container_id,
                         expected_labels=labels,
-                        expected_image_digest=self._profile.image_digest,
+                        expected_image_digest=self._expected_local_image_id,
                         expected_manifest_digest=disposable.manifest_digest,
                         image_attestation=self._image_attestation,
                     )
