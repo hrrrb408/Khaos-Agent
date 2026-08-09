@@ -299,9 +299,15 @@ class DockerBackend:
         lease = _ContainerLease(container_name, secrets.token_hex(16))
         relative_cwd = context.cwd.relative_to(context.worktree_path)
         container_cwd = Path("/workspace") / relative_cwd
+        # ProcessSupervisor owns the host-side Docker CLI timeout/cancel and
+        # DockerBackend owns container cleanup.  Disable Docker's default
+        # signal proxy so a supervisor SIGTERM cannot be forwarded to the
+        # payload and returned as 128+signal (143 for SIGTERM), which races
+        # the supervisor deadline and makes a real timeout look like a
+        # payload failure.
         argv = [
             self.docker_binary, "run", "--name", container_name, "--rm",
-            "--pull", "never", "--init", "--ipc", "none",
+            "--pull", "never", "--init", "--sig-proxy=false", "--ipc", "none",
             "--label", f"{_OWNER_LABEL}={lease.owner_nonce}",
             "--label", f"io.khaos.execution={execution_id}",
             "--read-only", "--tmpfs", f"/tmp:rw,noexec,nosuid,nodev,size={context.budget.tmpfs_bytes}",
