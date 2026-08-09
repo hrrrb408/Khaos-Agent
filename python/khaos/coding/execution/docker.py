@@ -525,16 +525,25 @@ class DockerBackend:
                 raise PermissionError(
                     "refusing to clean up a container not owned by this execution"
                 )
-            for command in (
-                ("stop", "--time", "2", lease.name),
-                ("kill", lease.name),
-                ("rm", "-f", lease.name),
-            ):
-                result = await self._run_cli(command, timeout=5)
-                if result[0] != 0 and not _docker_object_absent(result):
+            stop_command = ("stop", "--time", "2", lease.name)
+            stop_result = await self._run_cli(stop_command, timeout=5)
+            if stop_result[0] != 0 and not _docker_object_absent(stop_result):
+                # ``docker stop`` already terminates the container.  Calling
+                # ``docker kill`` unconditionally afterwards turns a
+                # successful stop into a false cleanup failure because Docker
+                # reports "container is not running" for the redundant kill.
+                kill_command = ("kill", lease.name)
+                kill_result = await self._run_cli(kill_command, timeout=5)
+                if kill_result[0] != 0 and not _docker_object_absent(kill_result):
                     raise RuntimeError(
-                        f"Docker cleanup command failed: {' '.join(command)}"
+                        f"Docker cleanup command failed: {' '.join(kill_command)}"
                     )
+            rm_command = ("rm", "-f", lease.name)
+            rm_result = await self._run_cli(rm_command, timeout=5)
+            if rm_result[0] != 0 and not _docker_object_absent(rm_result):
+                raise RuntimeError(
+                    f"Docker cleanup command failed: {' '.join(rm_command)}"
+                )
             verified = await self._run_cli(
                 ("inspect", lease.name), timeout=5
             )
