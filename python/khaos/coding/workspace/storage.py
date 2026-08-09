@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import stat
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ T = TypeVar("T")
 DEFAULT_WORKSPACE_BYTES = 512 * 1024 * 1024
 DEFAULT_WORKSPACE_ENTRIES = 100_000
 _CAPTURE_ATTEMPTS = 3
+_CAPTURE_RETRY_DELAY_SECONDS = 0.01
 
 
 @dataclass(frozen=True)
@@ -167,28 +169,35 @@ class WorkspaceStorageAuthority:
 def capture_workspace_snapshot(root: Path) -> WorkspaceStorageSnapshot:
     """Require two stable, complete scans and conservatively merge maxima.
 
-    A third scan is used only to let a just-completed rename settle.  Any
-    traversal error in any attempt remains fail-closed, and continuous path or
-    inode churn is reported as an incomplete observation.
+    Git and other trusted workspace writers use atomic rename/unlink sequences.
+    A scan can therefore observe a short-lived missing entry while the writer
+    is still finishing.  Incomplete scans are retried within this bounded
+    window; only a stable pair of complete scans proves the observation.  A
+    continuous traversal error or path/inode churn remains fail-closed.
     """
     canonical = root.expanduser().resolve()
     scans: list[WorkspaceStorageSnapshot] = []
     stable = False
     for _ in range(_CAPTURE_ATTEMPTS):
+        if scans:
+            time.sleep(_CAPTURE_RETRY_DELAY_SECONDS)
         scans.append(_capture_once(canonical))
         if len(scans) >= 2 and _same_identity_view(scans[-2], scans[-1]):
             stable = True
             break
 
     allocated: dict[FileIdentity, int] = {}
-    for snapshot in scans:
+    usable_scans = [snapshot for snapshot in scans if snapshot.complete]
+    for snapshot in usable_scans:
         for identity, size in snapshot.allocated_by_inode.items():
             allocated[identity] = max(size, allocated.get(identity, 0))
-    final = scans[-1]
+    final = usable_scans[-1] if usable_scans else scans[-1]
     return WorkspaceStorageSnapshot(
         allocated_by_inode=allocated,
-        entries=max(snapshot.entries for snapshot in scans),
-        complete=stable and all(snapshot.complete for snapshot in scans),
+        entries=max(snapshot.entries for snapshot in usable_scans)
+        if usable_scans
+        else 0,
+        complete=stable,
         identity_by_path=dict(final.identity_by_path),
         root_identity=final.root_identity,
     )

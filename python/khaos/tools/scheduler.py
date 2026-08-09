@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import json
 import logging
+import os
 import shlex
 import time
 import uuid
@@ -16,9 +17,16 @@ from pathlib import Path
 from typing import Any, cast
 
 from khaos.agent.approval import ApprovalBinding, StepExecutionAuthority
-from khaos.coding.execution.capability import SandboxDecision
+from khaos.coding.execution.capability import DockerSandboxDecision, SandboxDecision
 from khaos.coding.execution.environment import is_non_inheritable_secret_key
 from khaos.coding.execution.identity import executable_identity
+from khaos.coding.execution.models import (
+    FileSystemAccess,
+    NetworkPolicy,
+    PermissionProfile,
+    ResolvedSpawnPlan,
+    ResourceBudget,
+)
 from khaos.exceptions import PermissionDeniedError
 from khaos.permissions import (
     ApprovalMode,
@@ -702,7 +710,7 @@ class ToolScheduler:
                 normalized["_authorization_resource"] = resource
 
             execution_error = self._execution_preflight_error(
-                tool.name, mode, tool_context
+                tool, mode, tool_context
             )
             if execution_error:
                 target = self._resolve_target(
@@ -1383,6 +1391,8 @@ class ToolScheduler:
                 invocation_context["executable_identity"] = call[
                     "_executable_identity"
                 ]
+            if call.get("_spawn_plan") is not None:
+                invocation_context["spawn_plan"] = call["_spawn_plan"]
             invocation_context["effect_id"] = effect_id
             output = await asyncio.wait_for(
                 self.invocation_broker.invoke(tool.name, mode=mode, context=invocation_context, **call.get("arguments", {})),
@@ -2412,6 +2422,8 @@ class ToolScheduler:
         )
         if not normalized_environment_keys:
             normalized_environment_keys = ("LANG", "LC_ALL", "PATH", "TMPDIR")
+        if getattr(tool, "execution_kind", "host-sandbox") == "docker":
+            normalized_environment_keys = ("KHAOS_DOCKER_IMAGE",)
 
         execution_service = tool_context.get("execution_service")
         backend = call.get("_sandbox_backend") or tool_context.get("sandbox_backend")
@@ -2439,6 +2451,12 @@ class ToolScheduler:
             )
 
         environment_values = tool_context.get("environment")
+        if getattr(tool, "execution_kind", "host-sandbox") == "docker":
+            environment_values = {
+                "KHAOS_DOCKER_IMAGE": str(
+                    call.get("arguments", {}).get("image") or ""
+                )
+            }
         if isinstance(environment_values, dict):
             environment_payload = {
                 str(key): str(environment_values[key])
@@ -2447,20 +2465,18 @@ class ToolScheduler:
                 and not is_non_inheritable_secret_key(str(key))
             }
         else:
-            # Do not fingerprint a value that was not supplied by the trusted
-            # runtime context.  The key set remains bound separately.
             environment_payload = {
-                "keys": normalized_environment_keys,
-                "values": "not-supplied",
+                key: os.environ.get(key, _default_environment_value(key))
+                for key in normalized_environment_keys
             }
         environment_digest = _canonical_digest(environment_payload)
         executable_scope = call.get("_executable_identity") or tool_context.get(
             "executable_identity"
         )
+        argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
         if not executable_scope:
-            argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
             executable_scope = (
-                executable_identity(argv)
+                executable_identity(argv, environment_payload)
                 if argv
                 else "executable:not-applicable"
             )
@@ -2494,6 +2510,24 @@ class ToolScheduler:
         authorization_resource_digest = (
             resource.digest() if resource is not None else "resource:none"
         )
+        spawn_plan = call.get("_spawn_plan")
+        if spawn_plan is None:
+            spawn_plan = _build_spawn_plan(
+                tool=tool,
+                call=call,
+                tool_context=tool_context,
+                workspace_generation=workspace_generation,
+                permission_profile_digest=permission_profile_digest,
+                sandbox_decision_digest=sandbox_decision_digest,
+                network_authority=network_authority,
+                environment_payload=environment_payload,
+                executable_scope=str(executable_scope),
+                argv=argv,
+            )
+            call["_spawn_plan"] = spawn_plan
+        elif not isinstance(spawn_plan, ResolvedSpawnPlan):
+            raise PermissionDeniedError("resolved spawn plan is not immutable")
+        permission_profile_digest = spawn_plan.permission_profile_digest
         return StepExecutionAuthority(
             principal_id=principal_id,
             project_id=project_id,
@@ -2523,6 +2557,7 @@ class ToolScheduler:
             ),
             tool_schema_digest=tool.schema_digest,
             tool_security_digest=tool.security_digest,
+            spawn_plan_digest=spawn_plan.digest(),
             approval_receipt_digest=str(approval_receipt_digest or ""),
         )
 
@@ -2534,15 +2569,53 @@ class ToolScheduler:
         tool_context: dict[str, Any],
     ) -> None:
         """Bind concrete sandbox evidence before the approval snapshot."""
-        process_tools = {"terminal", "terminal_argv", "terminal_shell", "test_run"}
+        if not _tool_has_capability(tool, "process.execute"):
+            return
         argv = _execution_argv_for_authority(tool.name, call.get("arguments", {}))
         if argv:
             call["_executable_identity"] = executable_identity(
-                argv, tool_context.get("environment")
+                argv, tool_context.get("environment") or os.environ
             )
-        if tool.name not in process_tools:
+        execution_kind = str(getattr(tool, "execution_kind", "host-sandbox"))
+        if execution_kind == "process-control":
             return
         service = tool_context.get("execution_service")
+        if execution_kind == "docker":
+            decision = call.get("_sandbox_decision") or tool_context.get(
+                "sandbox_decision"
+            )
+            if decision is not None:
+                if not isinstance(decision, DockerSandboxDecision):
+                    raise PermissionError(
+                        "Docker execution requires a concrete DockerSandboxDecision"
+                    )
+                call["_sandbox_decision"] = decision
+                call["_sandbox_backend"] = decision.backend_name
+                return
+            resolver = getattr(service, "prepare_docker_decision", None)
+            if not callable(resolver):
+                if tool_context.get("production_runtime") or tool_context.get(
+                    "coding_workspace_enforced"
+                ):
+                    raise PermissionError(
+                        "Docker execution requires a preflight DockerSandboxDecision"
+                    )
+                return
+            resolve_docker = cast(
+                Callable[..., Awaitable[DockerSandboxDecision]], resolver
+            )
+            decision = await resolve_docker(
+                tool_name=tool.name,
+                arguments=call.get("arguments", {}),
+                tool_context=tool_context,
+            )
+            if not isinstance(decision, DockerSandboxDecision):
+                raise PermissionError(
+                    "Docker decision resolver returned an invalid authority"
+                )
+            call["_sandbox_decision"] = decision
+            call["_sandbox_backend"] = decision.backend_name
+            return
         selector = getattr(service, "backend_selector", None)
         selector_method = getattr(selector, "select_async_with_decision", None)
         if selector is None:
@@ -2638,16 +2711,12 @@ class ToolScheduler:
 
     @staticmethod
     def _execution_preflight_error(
-        tool_name: str, mode: str, tool_context: dict[str, Any]
+        tool, mode: str, tool_context: dict[str, Any]
     ) -> str:
         """Reject coding execution before approval when no safe backend exists."""
-        if mode != "coding" or tool_name not in {
-            "terminal",
-            "terminal_argv",
-            "terminal_shell",
-            "test_run",
-        }:
+        if mode != "coding" or not _tool_has_capability(tool, "process.execute"):
             return ""
+        tool_name = tool.name
         # Small library/test schedulers may intentionally provide a recording
         # handler without an AgentLoop execution authority.  Enforce this
         # preflight only when the runtime has supplied the authority slot;
@@ -2902,6 +2971,9 @@ def _execution_argv_for_authority(
         if tool_name == "terminal":
             command = str(arguments.get("command") or "")
             return tuple(shlex.split(command)) if command else ()
+        if tool_name == "sandbox_exec":
+            command = str(arguments.get("command") or "")
+            return tuple(shlex.split(command)) if command else ()
     except ValueError:
         return ()
     return ()
@@ -2934,6 +3006,180 @@ def _authority_identity(value: object) -> str:
     if isinstance(value, (tuple, list)):
         return json.dumps(list(value), separators=(",", ":"), ensure_ascii=False)
     return f"{type(value).__module__}.{type(value).__qualname__}"
+
+
+def _tool_has_capability(tool: object, capability_name: str) -> bool:
+    """Check the declarative capability contract, never a tool-name list."""
+    for capability in getattr(tool, "capabilities", ()):
+        name = getattr(capability, "name", "")
+        value = getattr(name, "value", name)
+        if str(value) == capability_name:
+            return True
+    return False
+
+
+def _default_environment_value(key: str) -> str:
+    """Return the value used when a trusted runtime omitted an allowlisted key."""
+    if key == "PATH":
+        return os.defpath
+    if key == "LANG":
+        return "C.UTF-8"
+    return ""
+
+
+def _authority_identity_parts(value: object) -> tuple[int | None, int | None]:
+    """Extract a filesystem device/inode pair without resolving untrusted paths."""
+    if isinstance(value, (tuple, list)) and len(value) == 2:
+        device, inode = value
+        if isinstance(device, int) and isinstance(inode, int):
+            return int(device), int(inode)
+    return None, None
+
+
+def _authority_budget(
+    tool_name: str, arguments: dict[str, Any], tool_timeout: int = 120
+) -> ResourceBudget:
+    """Mirror the bounded budgets used by process-backed tool handlers."""
+    timeout_value = arguments.get("timeout_seconds")
+    if timeout_value is None:
+        timeout_value = arguments.get("timeout")
+    if timeout_value is None:
+        if tool_name == "test_run":
+            timeout_value = 120
+        elif tool_name == "sandbox_exec":
+            timeout_value = 30
+        else:
+            timeout_value = tool_timeout
+    try:
+        timeout = max(float(timeout_value), 0.001)
+    except (TypeError, ValueError):
+        timeout = float(tool_timeout)
+    kwargs: dict[str, Any] = {"timeout_seconds": timeout}
+    if tool_name == "sandbox_exec":
+        try:
+            kwargs["cpu_count"] = float(arguments.get("cpus", 1.0))
+        except (TypeError, ValueError):
+            kwargs["cpu_count"] = 1.0
+        kwargs["memory_bytes"] = _authority_memory_bytes(arguments.get("memory", "512m"))
+        kwargs["tmpfs_bytes"] = 256 * 1024 * 1024
+    return ResourceBudget(**kwargs)
+
+
+def _authority_memory_bytes(value: object) -> int:
+    """Parse sandbox memory using the same units and bounds as sandbox_exec."""
+    if not isinstance(value, str):
+        return 512 * 1024 * 1024
+    text = value.strip()
+    if len(text) < 2 or text[-1].lower() not in {"k", "m", "g"}:
+        return 512 * 1024 * 1024
+    try:
+        amount = int(text[:-1])
+    except ValueError:
+        return 512 * 1024 * 1024
+    result = amount * {"k": 1024, "m": 1024**2, "g": 1024**3}[text[-1].lower()]
+    return result if 64 * 1024**2 <= result <= 16 * 1024**3 else 512 * 1024 * 1024
+
+
+def _authority_profile(
+    *,
+    tool,
+    arguments: dict[str, Any],
+    tool_context: dict[str, Any],
+    environment_keys: tuple[str, ...],
+) -> PermissionProfile | None:
+    """Build the same profile projection consumed by ExecutionService."""
+    root_value = tool_context.get("workspace_root")
+    if not root_value:
+        supplied = tool_context.get("permission_profile")
+        return supplied if isinstance(supplied, PermissionProfile) else None
+    try:
+        root = Path(str(root_value)).expanduser().resolve()
+        writable = _sandbox_writable_for_authority(tool.name, arguments)
+        access_mode = (
+            FileSystemAccess.WORKSPACE_WRITE
+            if writable
+            else FileSystemAccess.READ_ONLY
+        )
+        network = NetworkPolicy(
+            str(tool_context.get("network_policy") or NetworkPolicy.NONE.value)
+        )
+        return PermissionProfile.from_legacy(
+            access_mode=access_mode.value,
+            network_policy=network,
+            roots=(root,),
+            environment_keys=frozenset(environment_keys),
+            resources=_authority_budget(tool.name, arguments, int(getattr(tool, "timeout", 120))),
+        ).bind_workspace(root)
+    except (OSError, TypeError, ValueError, PermissionError):
+        return None
+
+
+def _build_spawn_plan(
+    *,
+    tool,
+    call: dict[str, Any],
+    tool_context: dict[str, Any],
+    workspace_generation: int,
+    permission_profile_digest: str,
+    sandbox_decision_digest: str,
+    network_authority: str,
+    environment_payload: dict[str, str],
+    executable_scope: str,
+    argv: tuple[str, ...],
+) -> ResolvedSpawnPlan:
+    """Create one immutable, pre-approval spawn authority."""
+    arguments = call.get("arguments", {})
+    root_identity = _authority_identity_parts(
+        tool_context.get("workspace_root_identity")
+        or tool_context.get("cwd_identity")
+    )
+    cwd_identity = _authority_identity_parts(
+        tool_context.get("workspace_cwd_identity")
+        or tool_context.get("cwd_identity")
+    )
+    root_value = tool_context.get("workspace_root")
+    requested_cwd = arguments.get("cwd")
+    if root_value and requested_cwd:
+        try:
+            root = Path(str(root_value)).expanduser().resolve()
+            requested = Path(str(requested_cwd)).expanduser()
+            candidate = requested if requested.is_absolute() else root / requested
+            info = candidate.stat()
+            cwd_identity = (int(info.st_dev), int(info.st_ino))
+        except (OSError, ValueError):
+            # ExecutionService performs the authoritative lexical and inode
+            # check; keep the pre-approval plan fail-closed if unavailable.
+            cwd_identity = (None, None)
+    profile = _authority_profile(
+        tool=tool,
+        arguments=arguments,
+        tool_context=tool_context,
+        environment_keys=tuple(sorted(environment_payload)),
+    )
+    if profile is not None:
+        permission_profile_digest = profile.digest()
+    plan_argv = argv or (tool.name,)
+    budget = _authority_budget(tool.name, arguments, int(getattr(tool, "timeout", 120)))
+    return ResolvedSpawnPlan(
+        principal_id=str(tool_context.get("principal_id") or "legacy-principal"),
+        project_id=str(tool_context.get("project_id") or "legacy-project"),
+        session_id=str(tool_context.get("session_id") or "legacy-session"),
+        task_id=str(tool_context.get("task_id") or "legacy-task"),
+        turn_id=str(tool_context.get("turn_id") or f"turn:{call['id']}"),
+        step_id=str(tool_context.get("attempt_id") or f"step:{call['id']}"),
+        workspace_generation=workspace_generation,
+        workspace_root_device=root_identity[0],
+        workspace_root_inode=root_identity[1],
+        workspace_cwd_device=cwd_identity[0],
+        workspace_cwd_inode=cwd_identity[1],
+        permission_profile_digest=permission_profile_digest,
+        sandbox_decision_digest=sandbox_decision_digest,
+        network_authority=network_authority,
+        environment=tuple(sorted(environment_payload.items())),
+        executable_identity=executable_scope,
+        argv=plan_argv,
+        budget_digest=budget.digest(),
+    )
 
 
 def _authority_sequence(value: object) -> tuple[str, ...]:

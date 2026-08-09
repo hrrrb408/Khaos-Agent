@@ -1,0 +1,46 @@
+name: Docker Lifecycle Soak
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      iterations:
+        description: Number of sequential Docker ownership cycles (100-500)
+        required: false
+        default: "100"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-lifecycle-soak
+  cancel-in-progress: false
+
+jobs:
+  lifecycle-soak:
+    name: Docker ownership lifecycle soak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    env:
+      KHAOS_RUN_DOCKER_LIFECYCLE_SOAK: "1"
+      KHAOS_DOCKER_SOAK_ITERATIONS: ${{ inputs.iterations || '100' }}
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.11"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --require-hashes -r python/bootstrap-requirements.txt
+          uv sync --frozen --extra test
+          echo "$GITHUB_WORKSPACE/.venv/bin" >> "$GITHUB_PATH"
+      - name: Preload the pinned sandbox image
+        run: docker pull python@sha256:eb43ff125d8d58d7449dcba7d336c23bcac412f526d861db493b9994d8010280
+      - name: Run lifecycle soak
+        run: |
+          python -m pytest python/tests/tools/test_sandbox_tools.py \
+            -q -v -m docker_lifecycle_soak

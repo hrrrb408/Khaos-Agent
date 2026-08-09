@@ -242,7 +242,7 @@ _BUILTIN_RESOURCE_RESOLVERS: dict[str, ResourceResolver] = {
 _SECURITY_FIELDS: frozenset[str] = frozenset({
     "name", "parameters", "modes", "permission_level",
     "parallel", "timeout", "capabilities", "resource_resolver",
-    "effect_status", "reconciliation_hint",
+    "effect_status", "reconciliation_hint", "execution_kind",
 })
 
 
@@ -388,6 +388,10 @@ class ToolDefinition:
     resource_resolver: ResourceResolver | None = None
     effect_status: str = ""
     reconciliation_hint: str = ""
+    # Concrete dispatch authority used by the execution resolver.  This is a
+    # security field: a tool approved for a host sandbox must never silently
+    # dispatch through Docker (or vice versa).
+    execution_kind: str = "host-sandbox"
     # Round-17 review §十: implementation identity.  Set via
     # :meth:`bind_handler` when the runtime handler is wired.  This field
     # is NOT a frozen security field (it must be settable after
@@ -552,6 +556,7 @@ class ToolDefinition:
             "resource_resolver": resolver_id,
             "effect_status": self.effect_status,
             "reconciliation_hint": self.reconciliation_hint,
+            "execution_kind": self.execution_kind,
             # Round-17 review §十: bind the implementation identity into
             # the security contract so swapping the handler invalidates
             # old approval bindings.
@@ -823,6 +828,7 @@ class ToolInvocationBroker:
             handler_params["executable_identity"] = context.get(
                 "executable_identity"
             )
+            handler_params["spawn_plan"] = context.get("spawn_plan")
         if any(capability.name.startswith("vcs.") for capability in capabilities):
             handler_params["execution_service"] = context.get("execution_service")
             handler_params["task_id"] = context.get("task_id")
@@ -1596,6 +1602,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["coding"],
             permission_level="execute",
             parallel=False,
+            execution_kind="process-control",
         )
     )
     registry.register(
@@ -1616,6 +1623,7 @@ def register_builtin_tools(registry: ToolRegistry) -> None:
             modes=["coding"],
             permission_level="execute",
             parallel=False,
+            execution_kind="docker",
             capabilities=(
                 ToolCapability("process.execute", frozenset({"coding"}), frozenset({"task-workspace"})),
                 ToolCapability("filesystem.write", frozenset({"coding"}), frozenset({"task-workspace"})),

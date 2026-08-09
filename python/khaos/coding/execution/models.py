@@ -48,6 +48,25 @@ class ResourceBudget:
     file_bytes: int = 64 * 1024 * 1024
     open_files: int = 256
 
+    def digest(self) -> str:
+        """Return the immutable resource authority digest."""
+        return _canonical_digest(
+            {
+                "timeout_seconds": self.timeout_seconds,
+                "output_bytes": self.output_bytes,
+                "pids": self.pids,
+                "cpu_count": self.cpu_count,
+                "cpu_time_seconds": self.cpu_time_seconds,
+                "memory_bytes": self.memory_bytes,
+                "tmpfs_bytes": self.tmpfs_bytes,
+                "filesystem_entries": self.filesystem_entries,
+                "workspace_bytes": self.workspace_bytes,
+                "workspace_entries": self.workspace_entries,
+                "file_bytes": self.file_bytes,
+                "open_files": self.open_files,
+            }
+        )
+
 
 @dataclass(frozen=True)
 class PermissionProfile:
@@ -195,6 +214,101 @@ class PermissionProfile:
 
 
 @dataclass(frozen=True)
+class ResolvedSpawnPlan:
+    """Immutable plan consumed by approval and the final spawn boundary.
+
+    The plan deliberately contains the final, non-secret environment values
+    used for executable resolution.  Backends may add an implementation
+    wrapper (for example a native launcher or ``docker run``), but they must
+    retain this plan as the authority for the model-controlled command,
+    workspace identities, sandbox decision and resource budget.
+    """
+
+    principal_id: str
+    project_id: str
+    session_id: str
+    task_id: str
+    turn_id: str
+    step_id: str
+    workspace_generation: int
+    workspace_root_device: int | None
+    workspace_root_inode: int | None
+    workspace_cwd_device: int | None
+    workspace_cwd_inode: int | None
+    permission_profile_digest: str
+    sandbox_decision_digest: str
+    network_authority: str
+    environment: tuple[tuple[str, str], ...]
+    executable_identity: str
+    argv: tuple[str, ...]
+    budget_digest: str
+    plan_digest: str = ""
+
+    def __post_init__(self) -> None:
+        required = (
+            self.principal_id,
+            self.project_id,
+            self.session_id,
+            self.task_id,
+            self.turn_id,
+            self.step_id,
+            self.permission_profile_digest,
+            self.sandbox_decision_digest,
+            self.network_authority,
+            self.executable_identity,
+            self.budget_digest,
+        )
+        if any(not isinstance(value, str) or not value for value in required):
+            raise ValueError("resolved spawn plan identity fields must not be empty")
+        if self.workspace_generation < 0:
+            raise ValueError("resolved spawn plan workspace generation must be non-negative")
+        if not self.argv or any(not isinstance(value, str) or not value for value in self.argv):
+            raise ValueError("resolved spawn plan argv must contain non-empty strings")
+        normalized_environment = tuple(
+            (str(key), str(value)) for key, value in self.environment
+        )
+        if tuple(sorted(normalized_environment)) != normalized_environment:
+            raise ValueError("resolved spawn plan environment must be sorted")
+        if len({key for key, _ in normalized_environment}) != len(normalized_environment):
+            raise ValueError("resolved spawn plan environment keys must be unique")
+        object.__setattr__(self, "environment", normalized_environment)
+        calculated = _canonical_digest(self._payload())
+        if self.plan_digest and self.plan_digest != calculated:
+            raise ValueError("resolved spawn plan digest does not match its contents")
+        object.__setattr__(self, "plan_digest", calculated)
+
+    def _payload(self) -> dict[str, object]:
+        return {
+            "principal_id": self.principal_id,
+            "project_id": self.project_id,
+            "session_id": self.session_id,
+            "task_id": self.task_id,
+            "turn_id": self.turn_id,
+            "step_id": self.step_id,
+            "workspace_generation": self.workspace_generation,
+            "workspace_root_device": self.workspace_root_device,
+            "workspace_root_inode": self.workspace_root_inode,
+            "workspace_cwd_device": self.workspace_cwd_device,
+            "workspace_cwd_inode": self.workspace_cwd_inode,
+            "permission_profile_digest": self.permission_profile_digest,
+            "sandbox_decision_digest": self.sandbox_decision_digest,
+            "network_authority": self.network_authority,
+            "environment": self.environment,
+            "executable_identity": self.executable_identity,
+            "argv": self.argv,
+            "budget_digest": self.budget_digest,
+        }
+
+    def digest(self) -> str:
+        """Return the canonical authority digest for this plan."""
+        return self.plan_digest
+
+    def is_valid(self) -> bool:
+        """Return whether the stored digest still covers every field."""
+        return self.plan_digest == _canonical_digest(self._payload())
+
+
+@dataclass(frozen=True)
 class ExecutionRequest:
     argv: tuple[str, ...]
     cwd: Path
@@ -217,6 +331,7 @@ class ExecutionRequest:
     workspace_cwd_identity: tuple[int, int] | None = None
     executable_identity: str = ""
     sandbox_decision: SandboxDecision | None = None
+    spawn_plan: ResolvedSpawnPlan | None = None
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
@@ -269,6 +384,8 @@ class ResolvedExecutionContext:
     workspace_cwd_identity: tuple[int, int] | None = None
     executable_identity: str = ""
     sandbox_decision: SandboxDecision | None = None
+    spawn_plan: ResolvedSpawnPlan | None = None
+    workspace_generation: int = 0
 
     def __post_init__(self) -> None:
         profile = self.permission_profile or PermissionProfile.from_legacy(
@@ -331,3 +448,10 @@ def _validate_resource_budget(budget: ResourceBudget) -> None:
         raise ValueError("resource memory limits must be positive")
     if budget.file_bytes <= 0 or budget.open_files <= 0:
         raise ValueError("resource file and open-file limits must be positive")
+
+
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

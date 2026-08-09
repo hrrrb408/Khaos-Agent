@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import subprocess
 import tomllib
@@ -43,6 +44,43 @@ def _git_timestamp(repo_root: Path, commit: str) -> str:
     return datetime.fromtimestamp(int(timestamp), tz=timezone.utc).isoformat().replace(
         "+00:00", "Z"
     )
+
+
+def _toolchain_identity(repo_root: Path) -> dict[str, Any]:
+    """Capture the exact toolchain and runner identity in release evidence."""
+    commands = {
+        "python": ["python3", "--version"],
+        "go": ["go", "version"],
+        "rustc": ["rustc", "--version", "--verbose"],
+        "cargo": ["cargo", "--version", "--verbose"],
+    }
+    versions: dict[str, str] = {}
+    for name, command in commands.items():
+        try:
+            versions[name] = subprocess.check_output(
+                command,
+                cwd=repo_root,
+                text=True,
+                stderr=subprocess.STDOUT,
+            ).strip()
+        except (OSError, subprocess.CalledProcessError) as exc:
+            raise SystemExit(
+                f"release evidence toolchain probe failed for {name}: {exc}"
+            ) from exc
+    toolchain_files = {
+        name: _sha256(repo_root / name)
+        for name in (".go-version", "rust-toolchain.toml")
+        if (repo_root / name).is_file()
+    }
+    return {
+        "versions": versions,
+        "declared_files": toolchain_files,
+        "runner": {
+            "os": os.environ.get("RUNNER_OS", "local"),
+            "image": os.environ.get("ImageOS", "unknown"),
+            "arch": os.environ.get("RUNNER_ARCH", "unknown"),
+        },
+    }
 
 
 def _spdx_id(value: str) -> str:
@@ -251,6 +289,7 @@ def main() -> int:
         str(path.relative_to(repo_root)): _sha256(path) for path in lock_paths
     }
     sbom = _build_sbom(repo_root, args.commit, args.tag, lock_digests)
+    toolchain = _toolchain_identity(repo_root)
     sbom_path = artifact_dir / "sbom.spdx.json"
     sbom_path.write_text(json.dumps(sbom, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -272,6 +311,7 @@ def main() -> int:
         "schema": "khaos.release-evidence.v1",
         "tag": args.tag,
         "commit": args.commit,
+        "toolchain": toolchain,
         "lockfiles": lock_digests,
         "artifacts": artifact_records,
         "sbom": {

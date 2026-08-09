@@ -138,6 +138,9 @@ jobs:
             python/tests/coding/test_resource_owner_closure.py \
             python/tests/coding/test_cleanup_ledger.py \
             -q -v
+          python -m pytest \
+            python/tests/tools/test_sandbox_tools.py \
+            -q -v -k docker_backend_shutdown_spawn_barrier
           python scripts/build_security_closure_evidence.py test-fragment \
             --commit "$GITHUB_SHA" --run-id "$GITHUB_RUN_ID" \
             --job closure-adversarial --test resource_ownership_closure \

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import re
@@ -20,7 +22,9 @@ from khaos.coding.execution.models import (
     ResolvedExecutionContext,
     ResourceBudget,
 )
+from khaos.coding.execution.capability import DockerSandboxDecision
 from khaos.coding.execution.environment import scrub_spawn_environment
+from khaos.coding.execution.identity import executable_identity
 from khaos.coding.execution.supervisor import ProcessSupervisor, SupervisorClosedError
 
 logger = logging.getLogger(__name__)
@@ -39,12 +43,14 @@ _DIGEST_PINNED_IMAGE = re.compile(
 _SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _OWNER_LABEL = "io.khaos.owner-nonce"
 _DELETED_FILE_EXIT_CODE = 173
+_DOCKER_HARDENING_GENERATION = "docker-hardened-v2"
 _DELETED_FILE_WATCHDOG = r'''
 import os, signal, stat, subprocess, sys, time
 limit = int(sys.argv[1])
 command = sys.argv[3:]
 process = subprocess.Popen(command, start_new_session=True)
 process_group = str(process.pid)
+observation_failures = 0
 
 def process_group_pids(group_id):
     members = []
@@ -114,13 +120,33 @@ while process.poll() is None:
             seen.add(identity)
             blocks = getattr(info, 'st_blocks', 0) * 512
             total += blocks if blocks > 0 else info.st_size
-    if not complete or total > limit:
+    if total > limit:
+        # A child can become a zombie between poll() and /proc/<pid>/fd
+        # inspection. Its descriptors are no longer observable, but it is
+        # already terminal and no deleted-open allocation can continue to
+        # grow. Preserve fail-closed behavior while the child is live.
+        if process.poll() is not None:
+            break
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         process.wait()
         raise SystemExit(173)
+    if not complete:
+        if process.poll() is not None:
+            break
+        observation_failures += 1
+        if observation_failures < 3:
+            time.sleep(0.01)
+            continue
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+        raise SystemExit(173)
+    observation_failures = 0
     time.sleep(0.05)
 raise SystemExit(process.returncode)
 '''.strip()
@@ -159,6 +185,9 @@ class _InflightLease:
     execution_id: str
     completion_event: asyncio.Event
     finalizer_task: asyncio.Task[None]
+    container_lease: _ContainerLease | None = None
+    diagnostics: dict[str, object] | None = None
+    cleanup_paths: tuple[Path, ...] = ()
 
 
 class DockerBackend:
@@ -291,6 +320,8 @@ class DockerBackend:
         inspected = await self._run_cli(("image", "inspect", image), timeout=10)
         if inspected[0] != 0:
             raise PermissionError("Docker image is unavailable locally; automatic pull is disabled")
+        if context.sandbox_decision is not None:
+            await self._verify_docker_decision(context, image)
 
         execution_id = context.correlation_id
         if _SAFE_EXECUTION_ID.fullmatch(execution_id) is None:
@@ -347,6 +378,11 @@ class DockerBackend:
             *context.argv,
         ])
 
+        diagnostics: dict[str, object] = {
+            "container_id": container_name,
+            "cleanup": "pending",
+        }
+
         try:
             async with self._lock:
                 self._require_open_locked()
@@ -355,6 +391,21 @@ class DockerBackend:
                         f"Docker execution is already active: {execution_id}"
                     )
                 self._active[execution_id] = lease
+                inflight = self._inflight_leases.get(execution_id)
+                if inflight is None:
+                    self._active.pop(execution_id, None)
+                    raise RuntimeError(
+                        f"Docker execution lost its in-flight ownership: {execution_id}"
+                    )
+                # The owner finalizer now owns container cleanup.  Publishing
+                # this lease before the host Docker CLI spawn makes the
+                # acquisition transaction monotonic: shutdown can never
+                # observe an unowned late-spawn window.
+                inflight.container_lease = lease
+                inflight.diagnostics = diagnostics
+                inflight.cleanup_paths = (
+                    (env_file,) if env_file is not None else ()
+                )
         except BaseException:
             # Admission can close after the env file is created but before
             # the container lease is published.  The normal execution
@@ -363,20 +414,20 @@ class DockerBackend:
             if env_file is not None:
                 env_file.unlink(missing_ok=True)
             raise
-        diagnostics: dict[str, object] = {
-            "container_id": container_name,
-            "cleanup": "pending",
-        }
         try:
+            await self._before_supervisor_run(execution_id)
+            docker_environment = {"PATH": os.environ.get("PATH", os.defpath)}
             docker_request = ExecutionRequest(
                 argv=tuple(argv),
                 cwd=context.cwd,
+                environment=docker_environment,
                 permission_profile=context.permission_profile,
                 correlation_id=execution_id,
                 workspace_root_identity=context.workspace_root_identity,
                 workspace_cwd_identity=context.workspace_cwd_identity,
-                executable_identity=context.executable_identity,
+                executable_identity=executable_identity(tuple(argv), docker_environment),
                 sandbox_decision=context.sandbox_decision,
+                spawn_plan=context.spawn_plan,
             )
             result = await self.supervisor.run(
                 docker_request,
@@ -412,38 +463,99 @@ class DockerBackend:
                 diagnostics=diagnostics,
             )
         finally:
-            cleanup_succeeded = False
-            try:
-                cleanup_succeeded = await self._cleanup_container(lease)
-                if not cleanup_succeeded:
-                    raise RuntimeError(
-                        f"Docker container cleanup remained unproven: {lease.name}"
-                    )
-                diagnostics["cleanup"] = "removed"
-            finally:
-                if cleanup_succeeded:
-                    async with self._lock:
-                        if self._active.get(execution_id) is lease:
-                            self._active.pop(execution_id, None)
-                if env_file is not None:
-                    env_file.unlink(missing_ok=True)
+            # Cleanup is deliberately performed by the owner-created
+            # in-flight finalizer after the execution transaction reaches its
+            # terminal point.  A caller cancellation cannot cancel the only
+            # task that knows the container lease and its external oracle.
+            pass
+
+    async def _before_supervisor_run(self, execution_id: str) -> None:
+        """Test seam kept before the supervisor's monotonic spawn reserve."""
+        _ = execution_id
+        return None
+
+    async def prepare_decision(
+        self,
+        *,
+        image: str,
+        workspace: Path,
+        budget: ResourceBudget,
+        argv: tuple[str, ...],
+        filesystem_mode: str = "workspace-write",
+    ) -> DockerSandboxDecision:
+        """Resolve the concrete Docker daemon/image/hardening authority."""
+        if image not in self.allowed_images:
+            raise PermissionError("Docker image is not in the configured allowlist")
+        if _DIGEST_PINNED_IMAGE.fullmatch(image) is None:
+            raise PermissionError("Docker image must be pinned by sha256 digest")
+        image_result = await self._run_cli(("image", "inspect", image), timeout=10)
+        if image_result[0] != 0:
+            raise PermissionError(
+                "Docker image is unavailable locally; automatic pull is disabled"
+            )
+        daemon_result = await self._run_cli(
+            ("info", "--format", "{{.ID}}|{{.Driver}}|{{.SecurityOptions}}"),
+            timeout=10,
+        )
+        if daemon_result[0] != 0:
+            raise PermissionError("Docker daemon identity could not be verified")
+        docker_env = {"PATH": os.environ.get("PATH", os.defpath)}
+        binary_identity = executable_identity((self.docker_binary,), docker_env)
+        daemon_identity = _canonical_digest(
+            {"stdout": daemon_result[1].strip(), "stderr": daemon_result[2].strip()}
+        )
+        image_digest = image.split("@sha256:", 1)[1]
+        return DockerSandboxDecision(
+            backend_name="docker",
+            capability_evidence_digest=_canonical_digest(
+                {"binary": binary_identity, "daemon": daemon_identity}
+            ),
+            filesystem_mode=filesystem_mode,
+            network_mode=NetworkPolicy.NONE.value,
+            kernel_enforced=True,
+            platform=os.uname().sysname.lower() if hasattr(os, "uname") else "unknown",
+            launcher_digest=binary_identity,
+            docker_binary_identity=binary_identity,
+            daemon_identity_digest=daemon_identity,
+            image_reference=image,
+            image_digest=image_digest,
+            uid="65534:65534",
+            capabilities=("ALL",),
+            no_new_privileges=True,
+            read_only_rootfs=True,
+            workspace_mount_policy_digest=_workspace_mount_policy_digest(workspace),
+            budget_digest=budget.digest(),
+            hardening_generation=_DOCKER_HARDENING_GENERATION,
+            command_digest=_canonical_digest(argv),
+        )
+
+    async def _verify_docker_decision(
+        self, context: ResolvedExecutionContext, image: str
+    ) -> None:
+        decision = context.sandbox_decision
+        if not isinstance(decision, DockerSandboxDecision):
+            raise PermissionError(
+                "Docker execution requires a concrete DockerSandboxDecision"
+            )
+        observed = await self.prepare_decision(
+            image=image,
+            workspace=context.worktree_path,
+            budget=context.budget,
+            argv=context.argv,
+            filesystem_mode=context.access_mode,
+        )
+        if observed.digest() != decision.digest():
+            raise PermissionError(
+                "Docker sandbox decision changed before execution"
+            )
 
     async def execute(self, request):
         raise PermissionError("DockerBackend requires ResolvedExecutionContext")
 
     async def terminate(self, execution_id: str) -> None:
         await self.supervisor.terminate(execution_id)
-        async with self._lock:
-            lease = self._active.get(execution_id)
-        if lease is not None:
-            if not await self._cleanup_container(lease):
-                raise RuntimeError(
-                    f"Docker container cleanup remained unproven: {lease.name}"
-                )
-            async with self._lock:
-                if self._active.get(execution_id) is lease:
-                    self._active.pop(execution_id, None)
         await self._wait_for_execution_idle(execution_id)
+        await self._release_retained_lease(execution_id)
 
     async def shutdown(self) -> None:
         # Clean up containers.  Do NOT close the supervisor here — the
@@ -476,25 +588,22 @@ class DockerBackend:
         errors: list[BaseException] = []
         try:
             async with self._lock:
-                active = tuple(self._active.items())
-            for execution_id, lease in active:
+                execution_ids = tuple(
+                    sorted(set(self._active) | set(self._inflight))
+                )
+            for execution_id in execution_ids:
                 try:
-                    # Stop the host-side Docker CLI as well as the container.
-                    # The caller normally does this through ExecutionService
-                    # first; this direct backend path must be safe on its own.
+                    # Stop the host-side Docker CLI.  The owner finalizer
+                    # performs Docker stop/rm and keeps the lease until the
+                    # external inspect oracle proves disappearance.
                     await self.supervisor.terminate(execution_id)
-                    if not await self._cleanup_container(lease):
-                        raise RuntimeError(
-                            f"Docker container cleanup remained unproven: {lease.name}"
-                        )
+                    await self._wait_for_execution_idle(execution_id)
+                    await self._release_retained_lease(execution_id)
                 except asyncio.CancelledError:
                     raise
                 except BaseException as exc:  # noqa: BLE001 — retain lease for retry
                     errors.append(exc)
                     continue
-                async with self._lock:
-                    if self._active.get(execution_id) is lease:
-                        self._active.pop(execution_id, None)
 
             async with self._lock:
                 finalizers = tuple(
@@ -591,16 +700,39 @@ class DockerBackend:
     ) -> None:
         await completion_event.wait()
         async with self._lock:
-            lease = self._inflight_leases.get(execution_id)
-            if lease is None:
-                return
-            if lease.completion_event is not completion_event:
-                return
-            self._inflight_leases.pop(execution_id, None)
-            self._inflight_events.pop(execution_id, None)
-            self._inflight.discard(execution_id)
-            if not self._inflight:
-                self._inflight_idle.set()
+            inflight = self._inflight_leases.get(execution_id)
+        if inflight is None or inflight.completion_event is not completion_event:
+            return
+        try:
+            container = inflight.container_lease
+            if container is not None:
+                cleaned = await asyncio.shield(self._cleanup_container(container))
+                if not cleaned:
+                    raise RuntimeError(
+                        f"Docker container cleanup remained unproven: {container.name}"
+                    )
+                async with self._lock:
+                    if self._active.get(execution_id) is container:
+                        self._active.pop(execution_id, None)
+                if inflight.diagnostics is not None:
+                    inflight.diagnostics["cleanup"] = "removed"
+        except BaseException as exc:
+            if inflight.diagnostics is not None:
+                inflight.diagnostics["cleanup"] = "unproven"
+                inflight.diagnostics["cleanup_error"] = type(exc).__name__
+            await self._enter_quarantine(exc)
+            raise
+        finally:
+            for path in inflight.cleanup_paths:
+                path.unlink(missing_ok=True)
+            async with self._lock:
+                current = self._inflight_leases.get(execution_id)
+                if current is inflight:
+                    self._inflight_leases.pop(execution_id, None)
+                    self._inflight_events.pop(execution_id, None)
+                    self._inflight.discard(execution_id)
+                    if not self._inflight:
+                        self._inflight_idle.set()
 
     async def _wait_for_execution_idle(self, execution_id: str) -> None:
         async with self._lock:
@@ -612,15 +744,39 @@ class DockerBackend:
                 asyncio.shield(lease.finalizer_task),
                 timeout=self.shutdown_timeout_seconds,
             )
-        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
+        except asyncio.TimeoutError as exc:
             await self._enter_quarantine(
-                TimeoutError(
-                    f"Docker execution finalizer did not settle: {execution_id}"
-                )
-                if isinstance(exc, asyncio.TimeoutError)
-                else exc
+                TimeoutError(f"Docker execution finalizer did not settle: {execution_id}")
             )
             raise
+        except asyncio.CancelledError as exc:
+            await self._enter_quarantine(exc)
+            raise
+        except Exception:
+            # The finalizer has already retained the external lease and
+            # entered QUARANTINED.  A subsequent release attempt below is the
+            # explicit recovery path; never manufacture an empty registry.
+            logger.debug(
+                "Docker execution finalizer retained lease: %s",
+                execution_id,
+                exc_info=True,
+            )
+
+    async def _release_retained_lease(self, execution_id: str) -> None:
+        """Retry a lease left in quarantine after its finalizer failed."""
+        async with self._lock:
+            if execution_id in self._inflight_leases:
+                return
+            lease = self._active.get(execution_id)
+        if lease is None:
+            return
+        if not await self._cleanup_container(lease):
+            raise RuntimeError(
+                f"Docker container cleanup remained unproven: {lease.name}"
+            )
+        async with self._lock:
+            if self._active.get(execution_id) is lease:
+                self._active.pop(execution_id, None)
 
     async def _enter_quarantine(self, error: BaseException) -> None:
         async with self._lock:
@@ -799,4 +955,26 @@ def _docker_object_absent(result: tuple[int, str, str]) -> bool:
     return any(
         marker in message
         for marker in ("no such object", "not found", "no such container")
+    )
+
+
+def _canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _workspace_mount_policy_digest(workspace: Path) -> str:
+    from khaos.coding.workspace.boundary import PROTECTED_WORKSPACE_NAMES
+
+    return _canonical_digest(
+        {
+            "workspace": str(workspace.expanduser().absolute()),
+            "writable": ["/workspace"],
+            "readonly": [
+                f"/workspace/{name}"
+                for name in sorted(PROTECTED_WORKSPACE_NAMES)
+            ],
+        }
     )

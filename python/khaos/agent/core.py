@@ -26,6 +26,15 @@ from khaos.exceptions import CompressionCircuitOpenError
 logger = logging.getLogger(__name__)
 
 
+def _default_runtime_environment(key: str) -> str:
+    """Return the deterministic value used in the spawn authority snapshot."""
+    if key == "PATH":
+        return os.defpath
+    if key == "LANG":
+        return "C.UTF-8"
+    return ""
+
+
 class StopReason(Enum):
     """Reasons an agent turn can stop."""
 
@@ -515,9 +524,17 @@ class AgentLoop:
                         ),
                         "cwd_identity": workspace_root_identity,
                         "workspace_cwd_identity": workspace_root_identity,
+                        "workspace_root_identity": workspace_root_identity,
+                        "workspace_root": str(
+                            getattr(active_workspace, "worktree_path", "")
+                        ),
                         "environment_keys": (
                             "LANG", "LC_ALL", "PATH", "TMPDIR"
                         ),
+                        "environment": {
+                            key: os.environ.get(key, _default_runtime_environment(key))
+                            for key in ("LANG", "LC_ALL", "PATH", "TMPDIR")
+                        },
                         "sandbox_backend": execution_backend_identity,
                         "workspace_manager": self.workspace_manager,
                         "coding_workspace_enforced": self.active_workspace is not None,
