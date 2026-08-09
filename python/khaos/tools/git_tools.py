@@ -33,6 +33,12 @@ _GIT_SAFE_CONFIG = (
     "-c",
     "core.untrackedCache=false",
     "-c",
+    "core.preloadIndex=false",
+    "-c",
+    "index.threads=1",
+    "-c",
+    "maintenance.auto=false",
+    "-c",
     "diff.external=",
     "-c",
     "credential.helper=",
@@ -68,7 +74,7 @@ async def git_commit(repo: str = ".", message: str = "", *, task_id: str | None 
     """Create a git commit."""
     if not message:
         raise ValueError("commit message is required")
-    args = ["git", *_GIT_SAFE_CONFIG, "-c", "commit.gpgSign=false", "commit", "--no-verify", "--no-gpg-sign", "-m", message]
+    args = ["git", *_GIT_SAFE_CONFIG, "-c", "commit.gpgSign=false", "commit", "--no-status", "--no-verify", "--no-gpg-sign", "-m", message]
     return await _git(args, repo, _context(task_id, workspace_id, "vcs.write", execution_service, approval_context, "none"))
 
 
@@ -176,18 +182,20 @@ async def git_smart_commit(cwd: str = ".", message: str = "", *, task_id: str | 
         message = _generate_message(files)
 
     commit = await _git(
-        ["git", *_GIT_SAFE_CONFIG, "-c", "commit.gpgSign=false", "commit", "--no-verify", "--no-gpg-sign", "-m", message],
+        ["git", *_GIT_SAFE_CONFIG, "-c", "commit.gpgSign=false", "commit", "--no-status", "--no-verify", "--no-gpg-sign", "-m", message],
         cwd,
         write_ctx,
     )
     if commit["returncode"] != 0:
-        return json.dumps(
-            {
-                "error": commit["stderr"].strip() or commit["stdout"].strip(),
-                "returncode": commit["returncode"],
-            },
-            ensure_ascii=False,
-        )
+        failure = {
+            "error": commit["stderr"].strip() or commit["stdout"].strip(),
+            "returncode": commit["returncode"],
+        }
+        if "status" in commit:
+            failure["status"] = commit["status"]
+        if "diagnostics" in commit:
+            failure["diagnostics"] = commit["diagnostics"]
+        return json.dumps(failure, ensure_ascii=False)
 
     branch_result = await _git(["git", "branch", "--show-current"], cwd, read_ctx)
     branch = branch_result["stdout"].strip()
@@ -1110,6 +1118,7 @@ def _git_environment(home: str | None = None) -> dict[str, str]:
         "GIT_EDITOR": ":",
         "GIT_SEQUENCE_EDITOR": ":",
         "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
         # These are pinned internal controls, not inherited configuration.
         # The final spawn scrubber retains only these exact /dev/null values.
         "GIT_CONFIG_GLOBAL": os.devnull,
